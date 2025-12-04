@@ -1,0 +1,726 @@
+const std = @import("std");
+const Address = @import("../types/address.zig").Address;
+const Hash = @import("../types/hash.zig").Hash;
+
+/// Helper to write JSON values for RPC params (Zig 0.15 compatible)
+fn writeJsonValue(writer: anytype, value: anytype) !void {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .@"bool" => try writer.print("{}", .{value}),
+        .int, .comptime_int => try writer.print("{d}", .{value}),
+        .float, .comptime_float => try writer.print("{d}", .{value}),
+        .pointer => |ptr_info| {
+            if (ptr_info.size == .slice and ptr_info.child == u8) {
+                // String
+                try writer.print("\"{s}\"", .{value});
+            } else {
+                @compileError("Unsupported pointer type for JSON");
+            }
+        },
+        .@"struct" => {
+            // Check if it's a JSON ObjectMap
+            if (T == std.json.ObjectMap) {
+                // Serialize as JSON object
+                try writer.writeAll("{");
+                var it = value.iterator();
+                var first = true;
+                while (it.next()) |entry| {
+                    if (!first) try writer.writeAll(",");
+                    first = false;
+                    try writer.print("\"{s}\":", .{entry.key_ptr.*});
+                    try writeJsonValue(writer, entry.value_ptr.*);
+                }
+                try writer.writeAll("}");
+                return;
+            }
+            // Otherwise handle as regular struct
+            try writer.writeAll("{");
+            inline for (@typeInfo(T).@"struct".fields, 0..) |field, i| {
+                if (i > 0) try writer.writeAll(",");
+                try writer.print("\"{s}\":", .{field.name});
+                try writeJsonValue(writer, @field(value, field.name));
+            }
+            try writer.writeAll("}");
+        },
+        .@"union" => {
+            // Handle JSON Value union
+            if (T == std.json.Value) {
+                switch (value) {
+                    .null => try writer.writeAll("null"),
+                    .bool => |b| try writer.print("{}", .{b}),
+                    .integer => |n| try writer.print("{d}", .{n}),
+                    .float => |f| try writer.print("{d}", .{f}),
+                    .number_string => |s| try writer.writeAll(s),
+                    .string => |s| try writer.print("\"{s}\"", .{s}),
+                    .array => |arr| {
+                        try writer.writeAll("[");
+                        for (arr.items, 0..) |item, i| {
+                            if (i > 0) try writer.writeAll(",");
+                            try writeJsonValue(writer, item);
+                        }
+                        try writer.writeAll("]");
+                    },
+                    .object => |obj| {
+                        try writer.writeAll("{");
+                        var it = obj.iterator();
+                        var first = true;
+                        while (it.next()) |entry| {
+                            if (!first) try writer.writeAll(",");
+                            first = false;
+                            try writer.print("\"{s}\":", .{entry.key_ptr.*});
+                            try writeJsonValue(writer, entry.value_ptr.*);
+                        }
+                        try writer.writeAll("}");
+                    },
+                }
+                return;
+            }
+            @compileError("Unsupported union type for JSON: " ++ @typeName(T));
+        },
+        else => @compileError("Unsupported type for JSON: " ++ @typeName(T)),
+    }
+}
+
+pub const Block = struct {
+    number: u64,
+    hash: Hash,
+    parent_hash: Hash,
+    timestamp: u64,
+};
+
+pub const Log = struct {
+    address: Address,
+    topics: []Hash,
+    data: []u8,
+    block_number: u64,
+    transaction_hash: Hash,
+    transaction_index: u32,
+    log_index: u32,
+    removed: bool,
+
+    pub fn deinit(self: *Log, allocator: std.mem.Allocator) void {
+        allocator.free(self.topics);
+        allocator.free(self.data);
+    }
+};
+
+pub const Transaction = struct {
+    hash: Hash,
+    block_number: u64,
+    from: Address,
+    to: ?Address,
+    input: []u8,
+    value: []const u8,
+    gas: u64,
+    gas_price: []const u8,
+
+    pub fn deinit(self: *Transaction, allocator: std.mem.Allocator) void {
+        allocator.free(self.input);
+    }
+};
+
+pub const Client = struct {
+    allocator: std.mem.Allocator,
+    rpc_url: []const u8,
+    request_id: std.atomic.Value(u64),
+    http_client: *std.http.Client,
+    owns_http_client: bool,
+
+    pub fn init(allocator: std.mem.Allocator, rpc_url: []const u8) !*Client {
+        const http_client = try allocator.create(std.http.Client);
+        http_client.* = std.http.Client{ .allocator = allocator };
+
+        const client = try allocator.create(Client);
+        client.* = .{
+            .allocator = allocator,
+            .rpc_url = rpc_url,
+            .request_id = std.atomic.Value(u64).init(1),
+            .http_client = http_client,
+            .owns_http_client = true,
+        };
+        return client;
+    }
+
+    pub fn initWithSharedHttpClient(allocator: std.mem.Allocator, rpc_url: []const u8, http_client: *std.http.Client) !*Client {
+        const client = try allocator.create(Client);
+        client.* = .{
+            .allocator = allocator,
+            .rpc_url = rpc_url,
+            .request_id = std.atomic.Value(u64).init(1),
+            .http_client = http_client,
+            .owns_http_client = false,
+        };
+        return client;
+    }
+
+    pub fn deinit(self: *Client) void {
+        if (self.owns_http_client) {
+            self.http_client.deinit();
+            self.allocator.destroy(self.http_client);
+        }
+        self.allocator.destroy(self);
+    }
+
+    fn nextRequestId(self: *Client) u64 {
+        return self.request_id.fetchAdd(1, .monotonic);
+    }
+
+    fn makeRpcCall(self: *Client, method: []const u8, params: anytype) !std.json.Parsed(std.json.Value) {
+        const request_id = self.nextRequestId();
+
+        // Use arena allocator for request/response buffers
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        // Build JSON-RPC request manually for Zig 0.15
+        var request_buf: std.ArrayList(u8) = .{};
+        const writer = request_buf.writer(arena_allocator);
+        try writer.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":", .{ request_id, method });
+
+        // Handle params
+        const ParamsType = @TypeOf(params);
+        const params_type_info = @typeInfo(ParamsType);
+
+        switch (params_type_info) {
+            .@"struct" => |struct_info| {
+                if (struct_info.fields.len == 0) {
+                    // Empty struct = empty array
+                    try writer.writeAll("[]");
+                } else {
+                    // Write params as array
+                    try writer.writeAll("[");
+                    inline for (struct_info.fields, 0..) |field, i| {
+                        if (i > 0) try writer.writeAll(",");
+                        const value = @field(params, field.name);
+                        try writeJsonValue(writer, value);
+                    }
+                    try writer.writeAll("]");
+                }
+            },
+            else => try writer.writeAll("[]"),
+        }
+
+        try writer.writeAll("}");
+
+        // WORKAROUND: Zig 0.15.1 TLS has cipher suite compatibility issues with many RPC providers.
+        // Use curl which has mature TLS support until Zig's TLS implementation improves.
+        // See: https://github.com/ziglang/zig/issues/17213
+        const curl_result = try std.process.Child.run(.{
+            .allocator = arena_allocator,
+            .argv = &.{
+                "curl",
+                "-s",             // Silent mode
+                "-X",
+                "POST",
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                request_buf.items,
+                self.rpc_url,
+            },
+            .max_output_bytes = 10 * 1024 * 1024, // 10MB max response
+        });
+
+        if (curl_result.term != .Exited or curl_result.term.Exited != 0) {
+            std.log.err("curl process failed: {}", .{curl_result.term});
+            return error.HttpError;
+        }
+
+        // Parse JSON response with main allocator (result will outlive this function)
+        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, curl_result.stdout, .{});
+        errdefer parsed.deinit();
+
+        const response = parsed.value.object;
+
+        // Check for errors
+        if (response.get("error")) |err| {
+            const error_obj = err.object;
+            const error_message = error_obj.get("message").?.string;
+            std.log.err("RPC error: {s}", .{error_message});
+            return error.RpcError;
+        }
+
+        return parsed;
+    }
+
+    /// Batch request descriptor
+    pub const BatchRequest = struct {
+        method: []const u8,
+        params: std.json.Value,
+    };
+
+    /// Make multiple RPC calls in a single HTTP request (JSON-RPC batch)
+    /// Returns array of responses in the same order as requests
+    fn makeBatchRpcCall(self: *Client, requests: []const BatchRequest) !std.json.Parsed(std.json.Value) {
+        // Use arena allocator for request/response buffers
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        // Build JSON-RPC batch request array
+        var request_buf: std.ArrayList(u8) = .{};
+        const writer = request_buf.writer(arena_allocator);
+        try writer.writeAll("[");
+
+        for (requests, 0..) |req, i| {
+            const request_id = self.nextRequestId();
+
+            if (i > 0) try writer.writeAll(",");
+            try writer.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":", .{ request_id, req.method });
+            try writeJsonValue(writer, req.params);
+            try writer.writeAll("}");
+        }
+
+        try writer.writeAll("]");
+
+        // Use curl for the HTTP request (same as makeRpcCall)
+        const curl_result = try std.process.Child.run(.{
+            .allocator = arena_allocator,
+            .argv = &.{
+                "curl",
+                "-s",
+                "-X",
+                "POST",
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                request_buf.items,
+                self.rpc_url,
+            },
+            .max_output_bytes = 10 * 1024 * 1024, // 10MB max response
+        });
+
+        if (curl_result.term != .Exited or curl_result.term.Exited != 0) {
+            std.log.err("curl process failed: {}", .{curl_result.term});
+            return error.HttpError;
+        }
+
+        // Parse JSON response with main allocator (result will outlive this function)
+        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, curl_result.stdout, .{});
+        errdefer parsed.deinit();
+
+        // Batch responses are returned as an array
+        if (parsed.value != .array) {
+            std.log.err("Expected array response for batch request", .{});
+            return error.RpcError;
+        }
+
+        // IMPORTANT: JSON-RPC batch responses can be returned in any order!
+        // We must sort them by ID to match the original request order.
+        const ResponseSort = struct {
+            pub fn lessThan(_: void, lhs: std.json.Value, rhs: std.json.Value) bool {
+                const lhs_id = lhs.object.get("id").?.integer;
+                const rhs_id = rhs.object.get("id").?.integer;
+                return lhs_id < rhs_id;
+            }
+        };
+        std.mem.sort(std.json.Value, parsed.value.array.items, {}, ResponseSort.lessThan);
+
+        // Check each response for errors
+        for (parsed.value.array.items) |response_value| {
+            const response = response_value.object;
+            if (response.get("error")) |err| {
+                const error_obj = err.object;
+                const error_message = error_obj.get("message").?.string;
+                std.log.err("RPC batch error: {s}", .{error_message});
+                return error.RpcError;
+            }
+        }
+
+        return parsed;
+    }
+
+    pub fn getBlockNumber(self: *Client) !u64 {
+        const parsed = try self.makeRpcCall("eth_blockNumber", .{});
+        defer parsed.deinit();
+
+        const result = parsed.value.object.get("result").?;
+        const hex_str = result.string;
+        const block_num = try std.fmt.parseInt(u64, hex_str[2..], 16);
+        return block_num;
+    }
+
+    pub fn getBlockByNumber(self: *Client, block_number: u64, include_txs: bool) !Block {
+        const block_hex = try std.fmt.allocPrint(self.allocator, "0x{x}", .{block_number});
+        defer self.allocator.free(block_hex);
+
+        const parsed = try self.makeRpcCall("eth_getBlockByNumber", .{ block_hex, include_txs });
+        defer parsed.deinit();
+
+        const result = parsed.value.object.get("result").?;
+        if (result == .null) {
+            return error.BlockNotFound;
+        }
+
+        const block_obj = result.object;
+
+        return Block{
+            .number = try std.fmt.parseInt(u64, block_obj.get("number").?.string[2..], 16),
+            .hash = try Hash.fromHex(block_obj.get("hash").?.string),
+            .parent_hash = try Hash.fromHex(block_obj.get("parentHash").?.string),
+            .timestamp = try std.fmt.parseInt(u64, block_obj.get("timestamp").?.string[2..], 16),
+        };
+    }
+
+    pub fn getLogs(self: *Client, from_block: u64, to_block: u64, address: ?Address, topics: []const ?Hash) ![]Log {
+        // Use arena allocator to keep all filter strings alive during the call
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        // Build filter object with arena-allocated strings
+        const from_hex = try std.fmt.allocPrint(arena_allocator, "0x{x}", .{from_block});
+        const to_hex = try std.fmt.allocPrint(arena_allocator, "0x{x}", .{to_block});
+
+        var filter = std.json.ObjectMap.init(arena_allocator);
+        try filter.put("fromBlock", .{ .string = from_hex });
+        try filter.put("toBlock", .{ .string = to_hex });
+
+        if (address) |addr| {
+            const addr_hex = try addr.toHex(arena_allocator);
+            try filter.put("address", .{ .string = addr_hex });
+        }
+
+        // Convert topics to JSON array
+        if (topics.len > 0) {
+            var topics_array = std.json.Array.init(arena_allocator);
+
+            for (topics) |topic_opt| {
+                if (topic_opt) |topic| {
+                    const topic_hex = try topic.toHex(arena_allocator);
+                    try topics_array.append(.{ .string = topic_hex });
+                } else {
+                    try topics_array.append(.null);
+                }
+            }
+
+            try filter.put("topics", .{ .array = topics_array });
+        }
+
+        const parsed = try self.makeRpcCall("eth_getLogs", .{filter});
+        defer parsed.deinit();
+
+        const result = parsed.value.object.get("result").?;
+        const logs_array = result.array;
+        var logs = try self.allocator.alloc(Log, logs_array.items.len);
+
+        for (logs_array.items, 0..) |log_value, i| {
+            const log_obj = log_value.object;
+
+            // Parse topics
+            const topics_json = log_obj.get("topics").?.array;
+            var log_topics = try self.allocator.alloc(Hash, topics_json.items.len);
+            for (topics_json.items, 0..) |topic_val, j| {
+                log_topics[j] = try Hash.fromHex(topic_val.string);
+            }
+
+            // Parse data
+            const data_hex = log_obj.get("data").?.string;
+            const data_bytes = try self.hexToBytes(data_hex);
+
+            logs[i] = Log{
+                .address = try Address.fromHex(log_obj.get("address").?.string),
+                .topics = log_topics,
+                .data = data_bytes,
+                .block_number = try std.fmt.parseInt(u64, log_obj.get("blockNumber").?.string[2..], 16),
+                .transaction_hash = try Hash.fromHex(log_obj.get("transactionHash").?.string),
+                .transaction_index = @intCast(try std.fmt.parseInt(u64, log_obj.get("transactionIndex").?.string[2..], 16)),
+                .log_index = @intCast(try std.fmt.parseInt(u64, log_obj.get("logIndex").?.string[2..], 16)),
+                .removed = if (log_obj.get("removed")) |r| r.bool else false,
+            };
+        }
+
+        return logs;
+    }
+
+    /// Descriptor for a single getLogs request in a batch
+    pub const BatchGetLogsRequest = struct {
+        from_block: u64,
+        to_block: u64,
+        address: ?Address,
+        topics: []const ?Hash,
+    };
+
+    /// Batch version of getLogs - fetches multiple log queries in a single HTTP request
+    /// Returns array of log arrays in the same order as requests
+    /// Caller must free each log array and its contents
+    pub fn getLogsBatch(self: *Client, requests: []const BatchGetLogsRequest) ![][]Log {
+        // Use arena allocator for building batch request params
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        // Build batch requests
+        var batch_requests = try arena_allocator.alloc(BatchRequest, requests.len);
+
+        for (requests, 0..) |req, i| {
+            // Build filter object
+            const from_hex = try std.fmt.allocPrint(arena_allocator, "0x{x}", .{req.from_block});
+            const to_hex = try std.fmt.allocPrint(arena_allocator, "0x{x}", .{req.to_block});
+
+            var filter = std.json.ObjectMap.init(arena_allocator);
+            try filter.put("fromBlock", .{ .string = from_hex });
+            try filter.put("toBlock", .{ .string = to_hex });
+
+            if (req.address) |addr| {
+                const addr_hex = try addr.toHex(arena_allocator);
+                try filter.put("address", .{ .string = addr_hex });
+            }
+
+            // Convert topics to JSON array
+            if (req.topics.len > 0) {
+                var topics_array = std.json.Array.init(arena_allocator);
+
+                for (req.topics) |topic_opt| {
+                    if (topic_opt) |topic| {
+                        const topic_hex = try topic.toHex(arena_allocator);
+                        try topics_array.append(.{ .string = topic_hex });
+                    } else {
+                        try topics_array.append(.null);
+                    }
+                }
+
+                try filter.put("topics", .{ .array = topics_array });
+            }
+
+            // Create batch request with filter as param array
+            var params_array = std.json.Array.init(arena_allocator);
+            try params_array.append(.{ .object = filter });
+
+            batch_requests[i] = .{
+                .method = "eth_getLogs",
+                .params = .{ .array = params_array },
+            };
+        }
+
+        // Make batch RPC call
+        const parsed = try self.makeBatchRpcCall(batch_requests);
+        defer parsed.deinit();
+
+        const responses = parsed.value.array;
+
+        // Allocate array for results
+        var results = try self.allocator.alloc([]Log, requests.len);
+        errdefer {
+            for (results, 0..) |logs, i| {
+                if (i > 0) { // Only free already-processed results
+                    for (logs) |*log| {
+                        log.deinit(self.allocator);
+                    }
+                    self.allocator.free(logs);
+                }
+            }
+            self.allocator.free(results);
+        }
+
+        // Parse each response
+        for (responses.items, 0..) |response_value, i| {
+            const response = response_value.object;
+            const result = response.get("result").?;
+            const logs_array = result.array;
+
+            var logs = try self.allocator.alloc(Log, logs_array.items.len);
+            errdefer {
+                for (logs, 0..) |*log, j| {
+                    if (j > 0) log.deinit(self.allocator);
+                }
+                self.allocator.free(logs);
+            }
+
+            for (logs_array.items, 0..) |log_value, j| {
+                const log_obj = log_value.object;
+
+                // Parse topics
+                const topics_json = log_obj.get("topics").?.array;
+                var log_topics = try self.allocator.alloc(Hash, topics_json.items.len);
+                for (topics_json.items, 0..) |topic_val, k| {
+                    log_topics[k] = try Hash.fromHex(topic_val.string);
+                }
+
+                // Parse data
+                const data_hex = log_obj.get("data").?.string;
+                const data_bytes = try self.hexToBytes(data_hex);
+
+                logs[j] = Log{
+                    .address = try Address.fromHex(log_obj.get("address").?.string),
+                    .topics = log_topics,
+                    .data = data_bytes,
+                    .block_number = try std.fmt.parseInt(u64, log_obj.get("blockNumber").?.string[2..], 16),
+                    .transaction_hash = try Hash.fromHex(log_obj.get("transactionHash").?.string),
+                    .transaction_index = @intCast(try std.fmt.parseInt(u64, log_obj.get("transactionIndex").?.string[2..], 16)),
+                    .log_index = @intCast(try std.fmt.parseInt(u64, log_obj.get("logIndex").?.string[2..], 16)),
+                    .removed = if (log_obj.get("removed")) |r| r.bool else false,
+                };
+            }
+
+            results[i] = logs;
+        }
+
+        return results;
+    }
+
+    /// Fetch a single transaction by hash
+    pub fn getTransactionByHash(self: *Client, tx_hash: Hash) !Transaction {
+        const tx_hash_hex = try tx_hash.toHex(self.allocator);
+        defer self.allocator.free(tx_hash_hex);
+
+        const parsed = try self.makeRpcCall("eth_getTransactionByHash", .{tx_hash_hex});
+        defer parsed.deinit();
+
+        const result = parsed.value.object.get("result").?;
+        if (result == .null) {
+            return error.TransactionNotFound;
+        }
+
+        const tx_obj = result.object;
+
+        // Parse input data
+        const input_hex = tx_obj.get("input").?.string;
+        const input_bytes = try self.hexToBytes(input_hex);
+
+        return Transaction{
+            .hash = try Hash.fromHex(tx_obj.get("hash").?.string),
+            .block_number = try std.fmt.parseInt(u64, tx_obj.get("blockNumber").?.string[2..], 16),
+            .from = try Address.fromHex(tx_obj.get("from").?.string),
+            .to = if (tx_obj.get("to")) |to_val|
+                if (to_val == .null) null else try Address.fromHex(to_val.string)
+            else
+                null,
+            .input = input_bytes,
+            .value = tx_obj.get("value").?.string,
+            .gas = try std.fmt.parseInt(u64, tx_obj.get("gas").?.string[2..], 16),
+            .gas_price = tx_obj.get("gasPrice").?.string,
+        };
+    }
+
+    /// Batch version of getTransactionByHash - fetches multiple transactions in a single HTTP request
+    /// Returns array of transactions in the same order as requested hashes
+    /// Caller must free the returned array and each transaction's contents
+    pub fn getTransactionsByHashBatch(self: *Client, tx_hashes: []const Hash) ![]Transaction {
+        // Use arena allocator for building batch request params
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        // Build batch requests
+        var batch_requests = try arena_allocator.alloc(BatchRequest, tx_hashes.len);
+
+        for (tx_hashes, 0..) |tx_hash, i| {
+            const tx_hash_hex = try tx_hash.toHex(arena_allocator);
+
+            // Build params array as JSON value
+            var params_array = std.json.Array.init(arena_allocator);
+            try params_array.append(.{ .string = tx_hash_hex });
+
+            batch_requests[i] = BatchRequest{
+                .method = "eth_getTransactionByHash",
+                .params = .{ .array = params_array },
+            };
+        }
+
+        // Make batch call
+        const parsed = try self.makeBatchRpcCall(batch_requests);
+        defer parsed.deinit();
+
+        const responses = parsed.value.array.items;
+
+        // Allocate result array
+        var transactions = try self.allocator.alloc(Transaction, tx_hashes.len);
+        errdefer self.allocator.free(transactions);
+
+        // Parse each response
+        for (responses, 0..) |response_value, i| {
+            const response = response_value.object;
+            const result = response.get("result").?;
+
+            if (result == .null) {
+                // Transaction not found - clean up and return error
+                for (transactions[0..i]) |*tx| {
+                    tx.deinit(self.allocator);
+                }
+                self.allocator.free(transactions);
+                return error.TransactionNotFound;
+            }
+
+            const tx_obj = result.object;
+
+            // Parse input data
+            const input_hex = tx_obj.get("input").?.string;
+            const input_bytes = try self.hexToBytes(input_hex);
+
+            transactions[i] = Transaction{
+                .hash = try Hash.fromHex(tx_obj.get("hash").?.string),
+                .block_number = try std.fmt.parseInt(u64, tx_obj.get("blockNumber").?.string[2..], 16),
+                .from = try Address.fromHex(tx_obj.get("from").?.string),
+                .to = if (tx_obj.get("to")) |to_val|
+                    if (to_val == .null) null else try Address.fromHex(to_val.string)
+                else
+                    null,
+                .input = input_bytes,
+                .value = tx_obj.get("value").?.string,
+                .gas = try std.fmt.parseInt(u64, tx_obj.get("gas").?.string[2..], 16),
+                .gas_price = tx_obj.get("gasPrice").?.string,
+            };
+        }
+
+        return transactions;
+    }
+
+    pub fn call(self: *Client, to: Address, data: []const u8, block_number: ?u64) ![]u8 {
+        const to_hex = try to.toHex(self.allocator);
+        defer self.allocator.free(to_hex);
+
+        const data_hex = try self.bytesToHex(data);
+        defer self.allocator.free(data_hex);
+
+        const block_param = if (block_number) |bn|
+            try std.fmt.allocPrint(self.allocator, "0x{x}", .{bn})
+        else
+            try self.allocator.dupe(u8, "latest");
+        defer self.allocator.free(block_param);
+
+        var call_obj = std.json.ObjectMap.init(self.allocator);
+        defer call_obj.deinit();
+
+        try call_obj.put("to", .{ .string = to_hex });
+        try call_obj.put("data", .{ .string = data_hex });
+
+        const parsed = try self.makeRpcCall("eth_call", .{ call_obj, block_param });
+        defer parsed.deinit();
+
+        const result = parsed.value.object.get("result").?;
+        return try self.hexToBytes(result.string);
+    }
+
+    fn hexToBytes(self: *Client, hex: []const u8) ![]u8 {
+        const hex_data = if (std.mem.startsWith(u8, hex, "0x")) hex[2..] else hex;
+
+        if (hex_data.len % 2 != 0) {
+            return error.InvalidHexLength;
+        }
+
+        // SECURITY: Use built-in std.fmt.hexToBytes (industry standard hex decoding)
+        const bytes = try self.allocator.alloc(u8, hex_data.len / 2);
+        _ = try std.fmt.hexToBytes(bytes, hex_data);
+
+        return bytes;
+    }
+
+    fn bytesToHex(self: *Client, bytes: []const u8) ![]u8 {
+        // SECURITY: Use built-in std.fmt.bytesToHex (industry standard hex encoding)
+        var result = try self.allocator.alloc(u8, 2 + bytes.len * 2);
+        result[0] = '0';
+        result[1] = 'x';
+
+        // bytesToHex returns a fixed-size array, we need to use allocPrint for dynamic sizes
+        const hex_slice = result[2..];
+        for (bytes, 0..) |byte, i| {
+            const hex_byte = std.fmt.bytesToHex(&[_]u8{byte}, .lower);
+            hex_slice[i * 2] = hex_byte[0];
+            hex_slice[i * 2 + 1] = hex_byte[1];
+        }
+
+        return result;
+    }
+};

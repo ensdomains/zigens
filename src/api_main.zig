@@ -1,0 +1,75 @@
+const std = @import("std");
+const config = @import("config.zig");
+const api = @import("api/server.zig");
+const db = @import("storage/database.zig");
+
+pub fn main() !void {
+    // Configure SQLite for thread safety BEFORE any other operations
+    const sqlite_result = db.c.sqlite3_config(db.c.SQLITE_CONFIG_SERIALIZED);
+    if (sqlite_result == db.c.SQLITE_OK) {
+        std.log.info("SQLite configured for serialized (thread-safe) mode", .{});
+    } else {
+        std.log.warn("Failed to configure SQLite thread safety: {d}", .{sqlite_result});
+    }
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Load configuration from .env
+    var cfg = try config.Config.fromEnv(allocator);
+    defer cfg.deinit();
+
+    // Parse command line arguments (override env vars)
+    var args = std.process.args();
+    _ = args.skip(); // Skip program name
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--port")) {
+            if (args.next()) |port_str| {
+                cfg.api_port = std.fmt.parseInt(u16, port_str, 10) catch {
+                    std.log.err("Invalid port: {s}", .{port_str});
+                    return error.InvalidPort;
+                };
+            }
+        } else if (std.mem.startsWith(u8, arg, "--port=")) {
+            const port_str = arg[7..];
+            cfg.api_port = std.fmt.parseInt(u16, port_str, 10) catch {
+                std.log.err("Invalid port: {s}", .{port_str});
+                return error.InvalidPort;
+            };
+        }
+    }
+
+    std.log.info("ENSv2 API Server starting...", .{});
+    std.log.info("Network: {s}", .{cfg.network.toString()});
+    std.log.info("Database: {s}", .{cfg.database_path});
+    std.log.info("Port: {d}", .{cfg.api_port});
+    std.log.info("GraphQL Max Depth: {d}", .{cfg.graphql_max_depth});
+    std.log.info("GraphQL Max Cost: {d}", .{cfg.graphql_max_cost});
+
+    // Initialize database (read-only for API - skip schema loading)
+    var database = try db.Database.initWithoutSchema(allocator, cfg.database_path);
+    defer database.deinit();
+
+    std.log.info("Database connected", .{});
+
+    // Check database integrity
+    const integrity_ok = try database.checkIntegrity();
+    if (!integrity_ok) {
+        std.log.err("Database integrity check failed!", .{});
+        return error.DatabaseCorrupted;
+    }
+
+    // Start API server with complexity limits and metrics from config
+    const webhook_db_path = "./data/webhooks.db";
+    var server = try api.Server.init(allocator, &database, webhook_db_path, cfg.api_port, cfg.graphql_max_depth, cfg.graphql_max_cost, cfg.metrics_enabled);
+    defer server.deinit();
+
+    std.log.info("Ready to serve requests", .{});
+
+    try server.start();
+}
+
+test {
+    std.testing.refAllDecls(@This());
+}

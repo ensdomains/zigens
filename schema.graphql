@@ -1,0 +1,448 @@
+# ENSv2 Indexer GraphQL Schema
+# This schema defines the GraphQL API for querying ENS V2 data
+
+type Query {
+  """Get a single domain by name or namehash"""
+  domain(id: String!): Domain
+
+  """Get multiple domains with pagination and filtering (legacy offset-based)"""
+  domains(first: Int = 100, skip: Int = 0, where: DomainFilter, orderBy: Domain_orderBy, orderDirection: OrderDirection): [Domain!]!
+
+  """Get multiple domains with cursor-based pagination (recommended)"""
+  domainConnection(first: Int, after: String, last: Int, before: String, where: DomainFilter, orderBy: Domain_orderBy, orderDirection: OrderDirection): DomainConnection!
+
+  """Get account information by address"""
+  account(id: String!): Account
+
+  """Get domain registrations with pagination (legacy offset-based)"""
+  registrations(first: Int = 100, skip: Int = 0, where: RegistrationFilter, orderBy: Registration_orderBy, orderDirection: OrderDirection): [Registration!]!
+
+  """Get domain registrations with cursor-based pagination (recommended)"""
+  registrationConnection(first: Int, after: String, last: Int, before: String, where: RegistrationFilter, orderBy: Registration_orderBy, orderDirection: OrderDirection): RegistrationConnection!
+
+  """Get events with pagination (legacy offset-based)"""
+  events(first: Int = 100, skip: Int = 0): [Event!]!
+
+  """Get events with cursor-based pagination (recommended)"""
+  eventConnection(first: Int, after: String, last: Int, before: String): EventConnection!
+
+  """Get EAC role assignments"""
+  roles(resource: String, account: String): [EACRoleAssignment!]!
+
+  """Get dedicated resolvers for an account"""
+  resolvers(account: String!): [ResolverInfo!]!
+
+  """Get registries owned by an account"""
+  registries(owner: String!): [RegistryInfo!]!
+
+  """Get ENSIP-16 resolver metadata (offchain GraphQL endpoint)"""
+  metadata(resolver: String!): ResolverMetadata
+
+  """Get ENSIP-16 resolver approvals/delegations"""
+  approvals(namehash: String, delegate: String): [ResolverApproval!]!
+}
+
+# ============================================================================
+# Cursor-Based Pagination Types (Relay Specification)
+# ============================================================================
+
+"""
+Information about pagination in a connection
+Follows the Relay Cursor Connections Specification
+"""
+type PageInfo {
+  """When paginating forwards, are there more items?"""
+  hasNextPage: Boolean!
+
+  """When paginating backwards, are there more items?"""
+  hasPreviousPage: Boolean!
+
+  """When paginating backwards, the cursor to continue"""
+  startCursor: String
+
+  """When paginating forwards, the cursor to continue"""
+  endCursor: String
+}
+
+"""An edge in a Domain connection"""
+type DomainEdge {
+  """A cursor for use in pagination"""
+  cursor: String!
+
+  """The item at the end of the edge"""
+  node: Domain!
+}
+
+"""A connection to a list of Domains"""
+type DomainConnection {
+  """Information to aid in pagination"""
+  pageInfo: PageInfo!
+
+  """A list of edges"""
+  edges: [DomainEdge!]!
+
+  """Total count of items (may be expensive to compute)"""
+  totalCount: Int
+}
+
+"""An edge in a Registration connection"""
+type RegistrationEdge {
+  """A cursor for use in pagination"""
+  cursor: String!
+
+  """The item at the end of the edge"""
+  node: Registration!
+}
+
+"""A connection to a list of Registrations"""
+type RegistrationConnection {
+  """Information to aid in pagination"""
+  pageInfo: PageInfo!
+
+  """A list of edges"""
+  edges: [RegistrationEdge!]!
+
+  """Total count of items (may be expensive to compute)"""
+  totalCount: Int
+}
+
+"""An edge in an Event connection"""
+type EventEdge {
+  """A cursor for use in pagination"""
+  cursor: String!
+
+  """The item at the end of the edge"""
+  node: Event!
+}
+
+"""A connection to a list of Events"""
+type EventConnection {
+  """Information to aid in pagination"""
+  pageInfo: PageInfo!
+
+  """A list of edges"""
+  edges: [EventEdge!]!
+
+  """Total count of items (may be expensive to compute)"""
+  totalCount: Int
+}
+
+"""An ENS domain name"""
+type Domain {
+  """Domain identifier (name or namehash)"""
+  id: String!
+
+  """Full domain name (e.g., 'vitalik.eth')"""
+  name: String
+
+  """Label only (e.g., 'vitalik' for 'vitalik.eth')"""
+  labelName: String
+
+  """Keccak256 hash of the label"""
+  labelhash: String
+
+  """Parent domain"""
+  parent: Domain
+
+  """Subdomains of this domain"""
+  subdomains: [Domain!]!
+
+  """Address this domain resolves to"""
+  resolvedAddress: Account
+
+  """Current owner of the domain"""
+  owner: Account!
+
+  """Resolver contract for this domain"""
+  resolver: Resolver
+
+  """Time-to-live for DNS records"""
+  ttl: Int
+
+  """Whether this domain has been migrated to V2"""
+  isMigrated: Boolean!
+
+  """Timestamp when domain was created"""
+  createdAt: Int!
+
+  """Original registrant of the domain"""
+  registrant: Account
+
+  """Timestamp when domain expires"""
+  expiryDate: Int
+
+  """ERC-721 token ID for this domain"""
+  tokenId: String
+
+  """Canonical token ID (without version bits)"""
+  canonicalId: String
+
+  """Token version number"""
+  tokenVersion: Int
+
+  """ENSIP-15 normalized name (null if normalization fails)"""
+  normalizedName: String
+
+  """Whether the name passes ENSIP-15 normalization"""
+  isNormalized: Boolean!
+}
+
+"""An Ethereum account (address)"""
+type Account {
+  """Ethereum address"""
+  id: String!
+
+  """Domains owned by this account"""
+  domains: [Domain!]!
+
+  """Registrations made by this account"""
+  registrations: [Registration!]!
+}
+
+"""A resolver contract for an ENS domain"""
+type Resolver {
+  """Resolver contract address"""
+  id: String!
+
+  """Resolver contract address (same as id)"""
+  address: String!
+
+  """Address record (forward resolution)"""
+  addr: String
+
+  """Content hash (IPFS, Arweave, etc.)"""
+  contentHash: String
+
+  """Text records"""
+  texts: [String!]
+}
+
+"""A domain registration record"""
+type Registration {
+  """Registration identifier"""
+  id: String!
+
+  """Name of the registered domain"""
+  name: String!
+
+  """The domain that was registered"""
+  domain: Domain!
+
+  """Timestamp when domain was registered"""
+  registrationDate: Int!
+
+  """Timestamp when domain expires"""
+  expiryDate: Int!
+
+  """Account that registered the domain"""
+  registrant: Account!
+}
+
+"""An event emitted by ENS contracts"""
+type Event {
+  """Event identifier"""
+  id: String!
+
+  """Type of event"""
+  type: String!
+
+  """Block number where event occurred"""
+  blockNumber: Int!
+
+  """Transaction hash"""
+  transactionHash: String!
+
+  """Timestamp when event occurred"""
+  timestamp: Int!
+
+  """Domain associated with this event (if applicable)"""
+  domain: Domain
+}
+
+"""Filter criteria for querying domains"""
+input DomainFilter {
+  """Exact name match"""
+  name: String
+
+  """Partial name match (contains)"""
+  name_contains: String
+
+  """Case-insensitive partial name match"""
+  name_contains_nocase: String
+
+  """Name starts with prefix"""
+  name_starts_with: String
+
+  """Name ends with suffix"""
+  name_ends_with: String
+
+  """Filter by owner address"""
+  owner: String
+
+  """Filter by owner address in list"""
+  owner_in: [String!]
+
+  """Filter by resolved address"""
+  resolvedAddress: String
+}
+
+"""Filter criteria for querying registrations"""
+input RegistrationFilter {
+  """Filter by registrant address"""
+  registrant: String
+
+  """Filter by registrant address in list"""
+  registrant_in: [String!]
+
+  """Filter by expiry date greater than"""
+  expiryDate_gt: Int
+
+  """Filter by expiry date greater than or equal"""
+  expiryDate_gte: Int
+
+  """Filter by expiry date less than"""
+  expiryDate_lt: Int
+
+  """Filter by expiry date less than or equal"""
+  expiryDate_lte: Int
+}
+
+"""EAC (Enhanced Access Control) role assignment"""
+type EACRoleAssignment {
+  """Assignment identifier"""
+  id: String!
+
+  """Resource (token ID) this role applies to"""
+  resource: String!
+
+  """Account that has the role"""
+  account: String!
+
+  """Role bitmap (hex string)"""
+  roleBitmap: String!
+
+  """Block number when assigned"""
+  blockNumber: Int!
+
+  """Transaction hash"""
+  transactionHash: String!
+
+  """Timestamp when assigned"""
+  timestamp: Int!
+}
+
+"""Resolver information"""
+type ResolverInfo {
+  """Resolver contract address"""
+  address: String!
+
+  """Name this resolver is set for"""
+  name: String!
+
+  """Namehash of the name"""
+  namehash: String!
+
+  """Block when resolver was set"""
+  setBlock: Int!
+
+  """Timestamp when resolver was set"""
+  setAt: Int!
+}
+
+"""Registry information"""
+type RegistryInfo {
+  """Registry contract address"""
+  address: String!
+
+  """Name this registry manages"""
+  name: String!
+
+  """Namehash of the name"""
+  namehash: String!
+
+  """Parent registry address"""
+  parentRegistry: String!
+
+  """Block when registry was created"""
+  createdBlock: Int!
+
+  """Timestamp when registry was created"""
+  createdAt: Int!
+}
+
+"""ENSIP-16 resolver metadata (offchain data endpoint)"""
+type ResolverMetadata {
+  """Metadata identifier"""
+  id: String!
+
+  """Resolver contract address"""
+  resolver: String!
+
+  """GraphQL endpoint URL for offchain data"""
+  graphqlUrl: String!
+
+  """Block when metadata was set"""
+  blockNumber: Int!
+
+  """Transaction hash"""
+  transactionHash: String!
+
+  """Timestamp when metadata was set"""
+  timestamp: Int!
+}
+
+"""ENSIP-16 resolver approval/delegation"""
+type ResolverApproval {
+  """Approval identifier"""
+  id: String!
+
+  """Resolver contract address"""
+  resolver: String!
+
+  """Namehash being delegated"""
+  namehash: String!
+
+  """Optional context for namespacing (typically owner address)"""
+  context: String
+
+  """Delegate address"""
+  delegate: String!
+
+  """Whether approved (true) or revoked (false)"""
+  approved: Boolean!
+
+  """Block when approval was set"""
+  blockNumber: Int!
+
+  """Transaction hash"""
+  transactionHash: String!
+
+  """Log index"""
+  logIndex: Int!
+
+  """Timestamp when approval was set"""
+  timestamp: Int!
+}
+
+"""Order direction for sorting"""
+enum OrderDirection {
+  asc
+  desc
+}
+
+"""Fields to order Domain results by"""
+enum Domain_orderBy {
+  id
+  name
+  createdAt
+  expiryDate
+  registrationDate
+}
+
+"""Fields to order Registration results by"""
+enum Registration_orderBy {
+  id
+  name
+  registrationDate
+  expiryDate
+}

@@ -1,0 +1,34 @@
+# Zig
+.zig-cache/
+zig-out/
+
+# Database
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Configuration
+config.json
+
+# Data
+data/
+rainbow_data/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local

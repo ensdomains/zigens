@@ -1,0 +1,101 @@
+version: '3.8'
+
+# ENSv2 Indexer + GraphQL API for Coolify deployment
+#
+# For V2 (NameChain/Sepolia) indexing:
+#   Set NETWORK_L2=sepolia and L2_RPC_URL to your Sepolia RPC
+#
+# For V1 (Mainnet) indexing:
+#   Set NETWORK_L1=mainnet and L1_RPC_URL to your Mainnet RPC
+
+services:
+  # L2 Indexer (NameChain/Sepolia V2)
+  indexer-l2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ensv2-indexer-l2
+    restart: unless-stopped
+    command: ["/app/ensv2-indexer-l2"]
+    volumes:
+      - ens-data:/app/data
+    environment:
+      # Database
+      - DATABASE_PATH=/app/data/ens_v2.db
+      # Rainbow table (auto-downloaded on first startup)
+      - RAINBOW_PATH=/app/data/ens_rainbow.db
+      - DOWNLOAD_RAINBOW=true
+      # L2 RPC (Sepolia for V2)
+      - L2_RPC_URL=${L2_RPC_URL}
+      - NETWORK_L2=sepolia
+      # Indexing settings
+      - BATCH_SIZE=10000
+      - POLL_INTERVAL=12
+      - RATE_LIMIT_PER_SECOND=25
+      # Status server
+      - STATUS_PORT=3001
+      # Webhooks (optional)
+      - WEBHOOKS_ENABLED=false
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3001/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # Extended start period to allow rainbow download on first startup (10-20 min)
+      start_period: 1800s
+    networks:
+      - ens-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # GraphQL API Server
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ensv2-api
+    restart: unless-stopped
+    command: ["/app/ensv2-api"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ens-data:/app/data:ro  # Read-only access to database
+    environment:
+      # Database (same as indexer)
+      - DATABASE_PATH=/app/data/ens_v2.db
+      # Rainbow table (shared with indexer via volume)
+      - RAINBOW_PATH=/app/data/ens_rainbow.db
+      - DOWNLOAD_RAINBOW=false
+      # API settings
+      - API_PORT=8080
+      - GRAPHQL_MAX_DEPTH=10
+      - GRAPHQL_MAX_COST=1000
+      # Metrics (optional)
+      - METRICS_ENABLED=false
+    depends_on:
+      indexer-l2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - ens-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  ens-network:
+    driver: bridge
+
+volumes:
+  ens-data:
+    driver: local
