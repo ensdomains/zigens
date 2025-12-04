@@ -58,8 +58,9 @@ services:
     container_name: ensv2-api
     restart: unless-stopped
     command: ["/app/ensv2-api"]
-    ports:
-      - "8080:8080"
+    # Note: Don't expose ports here - Coolify handles port mapping via its proxy
+    # ports:
+    #   - "8080:8080"
     volumes:
       - ens-data:/app/data:ro  # Read-only access to database
     environment:
