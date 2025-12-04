@@ -8,9 +8,12 @@ set -e
 
 RAINBOW_DB="${RAINBOW_PATH:-/app/data/ens_rainbow.db}"
 RAINBOW_DATA_DIR="/app/rainbow_data"
+RAINBOW_DOWNLOADING_MARKER="/app/data/.rainbow_downloading"
 
 # Function to download and build rainbow table
 build_rainbow() {
+    # Create marker file so health check knows we're downloading
+    touch "$RAINBOW_DOWNLOADING_MARKER"
     echo "╔════════════════════════════════════════════╗"
     echo "║   ENS Rainbow Table Download               ║"
     echo "║   Source: The Graph Protocol (MIT)         ║"
@@ -49,8 +52,12 @@ build_rainbow() {
                 # Cleanup downloaded files to save space
                 rm -rf "$RAINBOW_DATA_DIR"
                 echo "Cleaned up temporary files"
+
+                # Remove downloading marker
+                rm -f "$RAINBOW_DOWNLOADING_MARKER"
             else
                 echo "ERROR: Rainbow database was not created"
+                rm -f "$RAINBOW_DOWNLOADING_MARKER"
             fi
         else
             echo "ERROR: parse_rainbow.py not found"

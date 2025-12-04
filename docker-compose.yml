@@ -37,12 +37,11 @@ services:
       # Webhooks (optional)
       - WEBHOOKS_ENABLED=false
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3001/status"]
+      test: ["CMD", "/app/healthcheck.sh"]
       interval: 30s
       timeout: 10s
       retries: 3
-      # Extended start period to allow rainbow download on first startup (10-20 min)
-      start_period: 1800s
+      start_period: 60s
     networks:
       - ens-network
     logging:
@@ -76,8 +75,9 @@ services:
       # Metrics (optional)
       - METRICS_ENABLED=false
     depends_on:
-      indexer-l2:
-        condition: service_healthy
+      - indexer-l2
+    # Note: Removed service_healthy condition because indexer takes 10-20 min
+    # for rainbow download on first startup. API will retry DB connection.
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
       interval: 30s

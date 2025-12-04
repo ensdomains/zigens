@@ -76,8 +76,9 @@ COPY --from=builder /app/schema.graphql /app/schema.graphql
 # Copy rainbow build tools
 COPY --from=builder /app/tools/parse_rainbow.py /app/tools/parse_rainbow.py
 
-# Copy entrypoint script
+# Copy entrypoint and healthcheck scripts
 COPY --from=builder /app/docker-entrypoint.sh /app/docker-entrypoint.sh
+COPY --from=builder /app/healthcheck.sh /app/healthcheck.sh
 
 # Create data directory
 RUN mkdir -p /app/data /app/rainbow_data && \
