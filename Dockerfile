@@ -47,8 +47,12 @@ RUN apk add --no-cache \
     sqlite \
     ca-certificates \
     python3 \
+    py3-pip \
     curl \
     bash
+
+# Install Python packages for rainbow table parsing
+RUN pip3 install --break-system-packages eth-hash[pycryptodome]
 
 # Install Google Cloud SDK for gsutil (needed for rainbow table download)
 RUN curl -sSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --install-dir=/opt
@@ -78,6 +82,7 @@ COPY --from=builder /app/tools/parse_rainbow.py /app/tools/parse_rainbow.py
 
 # Copy entrypoint and healthcheck scripts
 COPY --from=builder /app/docker-entrypoint.sh /app/docker-entrypoint.sh
+COPY --from=builder /app/api-entrypoint.sh /app/api-entrypoint.sh
 COPY --from=builder /app/healthcheck.sh /app/healthcheck.sh
 
 # Create data directory

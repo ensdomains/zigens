@@ -1,5 +1,3 @@
-version: '3.8'
-
 # ENSv2 Indexer + GraphQL API for Coolify deployment
 #
 # For V2 (NameChain/Sepolia) indexing:
@@ -57,7 +55,7 @@ services:
       dockerfile: Dockerfile
     container_name: ensv2-api
     restart: unless-stopped
-    command: ["/app/ensv2-api"]
+    command: ["/app/api-entrypoint.sh"]
     # Note: Don't expose ports here - Coolify handles port mapping via its proxy
     # ports:
     #   - "8080:8080"
