@@ -56,9 +56,9 @@ services:
     container_name: ensv2-api
     restart: unless-stopped
     command: ["/app/api-entrypoint.sh"]
-    # Note: Don't expose ports here - Coolify handles port mapping via its proxy
-    # ports:
-    #   - "8080:8080"
+    # Expose port for Coolify/Traefik to route traffic
+    ports:
+      - "5655:5655"
     volumes:
       - ens-data:/app/data:ro  # Read-only access to database
     environment:
@@ -68,7 +68,7 @@ services:
       - RAINBOW_PATH=/app/data/ens_rainbow.db
       - DOWNLOAD_RAINBOW=false
       # API settings
-      - API_PORT=8080
+      - API_PORT=5655
       - GRAPHQL_MAX_DEPTH=10
       - GRAPHQL_MAX_COST=1000
       # Metrics (optional)
@@ -78,7 +78,7 @@ services:
     # Note: Removed service_healthy condition because indexer takes 10-20 min
     # for rainbow download on first startup. API will retry DB connection.
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:5655/health"]
       interval: 30s
       timeout: 10s
       retries: 3

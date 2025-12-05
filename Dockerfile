@@ -93,13 +93,13 @@ RUN mkdir -p /app/data /app/rainbow_data && \
 # Switch to app user
 USER ens
 
-# Expose ports (API=8080, Status=3001)
-EXPOSE 8080 3001
+# Expose ports (API=5655, Status=3001)
+EXPOSE 5655 3001
 
 # Set default environment variables
 ENV DATABASE_PATH=/app/data/ens.db
 ENV RAINBOW_PATH=/app/data/ens_rainbow.db
-ENV API_PORT=8080
+ENV API_PORT=5655
 ENV STATUS_PORT=3001
 ENV DOWNLOAD_RAINBOW=true
 
