@@ -85,8 +85,9 @@ COPY --from=builder /app/docker-entrypoint.sh /app/docker-entrypoint.sh
 COPY --from=builder /app/api-entrypoint.sh /app/api-entrypoint.sh
 COPY --from=builder /app/healthcheck.sh /app/healthcheck.sh
 
-# Create data directory
+# Create data directory and make scripts executable
 RUN mkdir -p /app/data /app/rainbow_data && \
+    chmod +x /app/docker-entrypoint.sh /app/api-entrypoint.sh /app/healthcheck.sh && \
     chown -R ens:ens /app
 
 # Switch to app user
