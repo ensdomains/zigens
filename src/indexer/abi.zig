@@ -26,22 +26,48 @@ pub const EventSignatures = struct {
     pub const name_burned = "NameBurned(uint256,address)";
     pub const name_burned_hash: Hash = eventHash(name_burned);
 
-    /// SubregistryUpdate(uint256 indexed id, address subregistry)
+    /// SubregistryUpdate(uint256 indexed id, address subregistry) - OLD signature (pre-deployment)
     pub const subregistry_update = "SubregistryUpdate(uint256,address)";
     pub const subregistry_update_hash: Hash = eventHash(subregistry_update);
 
-    /// ResolverUpdate(uint256 indexed id, address resolver)
+    /// SubregistryUpdated(uint256 indexed id, address subregistry) - NEW signature (current deployment)
+    pub const subregistry_updated = "SubregistryUpdated(uint256,address)";
+    pub const subregistry_updated_hash: Hash = eventHash(subregistry_updated);
+
+    /// ResolverUpdate(uint256 indexed id, address resolver) - OLD signature (pre-deployment)
     pub const resolver_update = "ResolverUpdate(uint256,address)";
     pub const resolver_update_hash: Hash = eventHash(resolver_update);
 
-    /// TokenRegenerated(uint256 oldTokenId, uint256 newTokenId)
+    /// ResolverUpdated(uint256 indexed id, address resolver) - NEW signature (current deployment)
+    pub const resolver_updated = "ResolverUpdated(uint256,address)";
+    pub const resolver_updated_hash: Hash = eventHash(resolver_updated);
+
+    /// TokenRegenerated(uint256 oldTokenId, uint256 newTokenId) - OLD signature (2 params)
     pub const token_regenerated = "TokenRegenerated(uint256,uint256)";
     pub const token_regenerated_hash: Hash = eventHash(token_regenerated);
+
+    /// TokenRegenerated(uint256 oldTokenId, uint256 newTokenId, uint256 flags) - NEW signature (3 params)
+    pub const token_regenerated_v2 = "TokenRegenerated(uint256,uint256,uint256)";
+    pub const token_regenerated_v2_hash: Hash = eventHash(token_regenerated_v2);
 
     /// NewSubname(uint256 indexed tokenId, string label)
     /// This event is emitted by UserRegistry contracts instead of NameRegistered
     pub const new_subname = "NewSubname(uint256,string)";
     pub const new_subname_hash: Hash = eventHash(new_subname);
+
+    /// ExpiryUpdated(uint256 indexed tokenId, uint64 newExpiry, address changedBy)
+    /// New event signature that replaces NameRenewed in current namechain deployment
+    pub const expiry_updated = "ExpiryUpdated(uint256,uint64,address)";
+    pub const expiry_updated_hash: Hash = eventHash(expiry_updated);
+
+    // ========================================================================
+    // Enhanced Access Control events (from common/access-control/interfaces/IEnhancedAccessControl.sol)
+    // ========================================================================
+
+    /// EACRolesChanged(uint256 indexed resource, address indexed account, uint256 oldRoleBitmap, uint256 newRoleBitmap)
+    /// Emitted when roles are changed for an account on a resource (tokenId)
+    pub const eac_roles_changed = "EACRolesChanged(uint256,address,uint256,uint256)";
+    pub const eac_roles_changed_hash: Hash = eventHash(eac_roles_changed);
 
     // ========================================================================
     // IETHRegistrar events (from L2/registrar/interfaces/IETHRegistrar.sol)

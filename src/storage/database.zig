@@ -315,7 +315,7 @@ pub const Database = struct {
     pub const getAllNames = names.getAllNames;
     pub const getRegistriesByOwner = names.getRegistriesByOwner;
 
-    // Resolver module (9 functions)
+    // Resolver module (11 functions)
     pub const storeResolverAddress = resolvers.storeResolverAddress;
     pub const storeResolverContentHash = resolvers.storeResolverContentHash;
     pub const storeResolverText = resolvers.storeResolverText;
@@ -323,6 +323,8 @@ pub const Database = struct {
     pub const getResolverContentHash = resolvers.getResolverContentHash;
     pub const getResolverTextKeys = resolvers.getResolverTextKeys;
     pub const getResolverText = resolvers.getResolverText;
+    pub const getResolverTextKeysByResolver = resolvers.getResolverTextKeysByResolver;
+    pub const getResolverTextByResolver = resolvers.getResolverTextByResolver;
     pub const getResolversToIndex = resolvers.getResolversToIndex;
     pub const getResolversByOwner = resolvers.getResolversByOwner;
 

@@ -3090,8 +3090,8 @@ fn buildResolverJson(
             }
             first = false;
         } else if (std.mem.eql(u8, field.name, "texts")) {
-            // Fetch text record keys
-            const text_keys = try ctx.database.getResolverTextKeys(domain_namehash);
+            // Fetch text record keys by resolver address (V2 names have different namehashes)
+            const text_keys = try ctx.database.getResolverTextKeysByResolver(resolver);
             defer {
                 for (text_keys) |key| {
                     ctx.allocator.free(key);
@@ -3120,7 +3120,8 @@ fn buildResolverJson(
             }
 
             if (key_arg) |key| {
-                const text_value = try ctx.database.getResolverText(domain_namehash, key);
+                // Use resolver address for lookup (V2 names have different namehashes)
+                const text_value = try ctx.database.getResolverTextByResolver(resolver, key);
                 defer if (text_value) |val| ctx.allocator.free(val);
 
                 if (text_value) |val| {

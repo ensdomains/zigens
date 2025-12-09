@@ -240,7 +240,7 @@ pub const Indexer = struct {
     }
 
     inline fn getBridgeController(self: *Indexer, chain: models.Chain) Address {
-        return if (chain == .l1) self.config.l1_contracts.l1_bridge_controller else self.config.l2_contracts.l2_ejection_controller;
+        return if (chain == .l1) self.config.l1_contracts.l1_bridge_controller else self.config.l2_contracts.l2_bridge_controller;
     }
 
     inline fn getClient(self: *Indexer, chain: models.Chain) *rpc.Client {
@@ -327,6 +327,8 @@ pub const Indexer = struct {
         .{ .event_hash = abi.EventSignatures.name_renewed_hash, .handler = handleNameRenewed, .name = "NameRenewed" },
         .{ .event_hash = abi.EventSignatures.name_burned_hash, .handler = handleNameBurned, .name = "NameBurned" },
         .{ .event_hash = abi.EventSignatures.token_regenerated_hash, .handler = handleTokenRegenerated, .name = "TokenRegenerated" },
+        // NEW: TokenRegenerated V2 with 3 params (oldTokenId, newTokenId, flags) - current Sepolia deployment
+        .{ .event_hash = abi.EventSignatures.token_regenerated_v2_hash, .handler = handleTokenRegenerated, .name = "TokenRegeneratedV2" },
     };
 
     const ETH_REGISTRAR_EVENTS = [_]RegistryEventConfig{
@@ -1184,13 +1186,14 @@ pub const Indexer = struct {
     }
 
     fn indexDatastoreEvents(self: *Indexer, chain: models.Chain, client: *rpc.Client, from_block: u64, to_block: u64) !void {
-        // SubregistryUpdate and ResolverUpdate events are emitted from the Registry contract, not the Datastore
+        // SubregistryUpdate/Updated and ResolverUpdate/Updated events are emitted from the Registry contract
         const registry_addr = self.getEthRegistry(chain);
 
-        // Fetch all event types in parallel by making separate curl calls
-        // This is much faster than sequential calls
+        // Fetch all event types - need to handle both old and new event signatures
+        // OLD: SubregistryUpdate, ResolverUpdate (pre-deployment)
+        // NEW: SubregistryUpdated, ResolverUpdated (current deployment on Sepolia)
 
-        // SubregistryUpdate events
+        // SubregistryUpdate events (OLD signature)
         const topics = [_]?Hash{abi.EventSignatures.subregistry_update_hash};
         const logs = try client.getLogs(from_block, to_block, registry_addr, &topics);
         defer {
@@ -1204,7 +1207,21 @@ pub const Indexer = struct {
             try self.handleSubregistryUpdate(chain, log);
         }
 
-        // ResolverUpdate events
+        // SubregistryUpdated events (NEW signature - current Sepolia deployment)
+        const topics_new = [_]?Hash{abi.EventSignatures.subregistry_updated_hash};
+        const logs_new = try client.getLogs(from_block, to_block, registry_addr, &topics_new);
+        defer {
+            for (logs_new) |*log| {
+                log.deinit(self.allocator);
+            }
+            self.allocator.free(logs_new);
+        }
+
+        for (logs_new) |log| {
+            try self.handleSubregistryUpdate(chain, log);
+        }
+
+        // ResolverUpdate events (OLD signature)
         const topics2 = [_]?Hash{abi.EventSignatures.resolver_update_hash};
         const logs2 = try client.getLogs(from_block, to_block, registry_addr, &topics2);
         defer {
@@ -1215,6 +1232,20 @@ pub const Indexer = struct {
         }
 
         for (logs2) |log| {
+            try self.handleResolverUpdate(chain, log);
+        }
+
+        // ResolverUpdated events (NEW signature - current Sepolia deployment)
+        const topics2_new = [_]?Hash{abi.EventSignatures.resolver_updated_hash};
+        const logs2_new = try client.getLogs(from_block, to_block, registry_addr, &topics2_new);
+        defer {
+            for (logs2_new) |*log| {
+                log.deinit(self.allocator);
+            }
+            self.allocator.free(logs2_new);
+        }
+
+        for (logs2_new) |log| {
             try self.handleResolverUpdate(chain, log);
         }
     }

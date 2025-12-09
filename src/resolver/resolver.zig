@@ -229,8 +229,9 @@ pub const ResolverInfo = struct {
 };
 
 test "Resolver init" {
-    const std = @import("std");
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const std_test = @import("std");
+    const contracts = @import("../contracts.zig");
+    var gpa = std_test.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -243,31 +244,55 @@ test "Resolver init" {
     var l2_client = try rpc.Client.init(allocator, "http://localhost:8546");
     defer l2_client.deinit();
 
+    const test_contracts = contracts.ContractAddresses{
+        .temporary_registrar = Address.zero,
+        .ens_registry = Address.zero,
+        .base_registrar = Address.zero,
+        .eth_registrar_controller = Address.zero,
+        .public_resolver = Address.zero,
+        .reverse_registrar = Address.zero,
+        .name_wrapper = Address.zero,
+        .root_registry = Address.zero,
+        .eth_registry = Address.zero,
+        .registry_datastore = Address.zero,
+        .eth_reverse_registrar = Address.zero,
+        .l2_eth_registry = Address.zero,
+        .l2_eth_registrar = Address.zero,
+        .l2_registry_datastore = Address.zero,
+        .l1_bridge_controller = Address.zero,
+        .l2_bridge_controller = Address.zero,
+        .v1_deployment_block = 0,
+        .l1_deployment_block = 0,
+        .l2_deployment_block = 0,
+    };
+
     const cfg = config.Config{
+        .allocator = allocator,
         .l1_rpc_url = "http://localhost:8545",
         .l2_rpc_url = "http://localhost:8546",
-        .l1_root_registry = Address.zero,
-        .l2_root_registry = Address.zero,
-        .l1_eth_registry = Address.zero,
-        .l2_eth_registry = Address.zero,
-        .l1_datastore = Address.zero,
-        .l2_datastore = Address.zero,
-        .l1_universal_resolver = Address.zero,
-        .l1_fallback_resolver = Address.zero,
-        .l1_migration_contract = Address.zero,
-        .l2_migration_contract = Address.zero,
-        .l1_ejection_controller = Address.zero,
-        .l2_ejection_controller = Address.zero,
-        .l1_start_block = 0,
-        .l2_start_block = 0,
-        .l1_confirmations = 12,
-        .l2_confirmations = 2,
-        .poll_interval = 12,
         .database_path = ":memory:",
+        .network_l1 = .sepolia,
+        .network_l2 = .sepolia,
+        .start_block = 0,
+        .end_block = null,
+        .poll_interval = 12,
+        .batch_size = 1000,
+        .max_blocks_per_request = 1000,
+        .rate_limit_per_second = 10,
         .api_port = 8080,
+        .api_enabled = true,
+        .status_port = null,
         .webhooks_enabled = false,
         .webhook_max_retries = 3,
-        .log_level = "info",
+        .max_memory_mb = 512,
+        .checkpoint_interval = 100,
+        .graphql_max_depth = 10,
+        .graphql_max_cost = 1000,
+        .metrics_enabled = false,
+        .l1_contracts = test_contracts,
+        .l2_contracts = test_contracts,
+        .network = .sepolia,
+        .contracts = test_contracts,
     };
 
     const resolver = Resolver.init(allocator, &database, l1_client, l2_client, cfg);
