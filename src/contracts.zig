@@ -44,7 +44,7 @@ pub const ContractAddresses = struct {
 
     // Bridge Contracts
     l1_bridge_controller: Address,
-    l2_ejection_controller: Address,
+    l2_bridge_controller: Address,
 
     // Deployment blocks for efficient sync start
     v1_deployment_block: u64,
@@ -72,20 +72,20 @@ fn sepoliaAddresses() ContractAddresses {
         .reverse_registrar = Address.fromHex("0xf79f9970030fe60bd89d21591c7f2d80d7d21242") catch unreachable,
         .name_wrapper = Address.fromHex("0xca7e6d0ddc5f373197bbe6fc2f09c2314399f028") catch unreachable,
 
-        // L1 Sepolia Contracts
-        .root_registry = Address.fromHex("0x401c2a8c06c847e9378a857524237d2f63bab05e") catch unreachable,
-        .eth_registry = Address.fromHex("0x37afa22dbdafa3e26541e1036b99c58a6be04f5e") catch unreachable,
-        .registry_datastore = Address.fromHex("0x2770e294aae7d0659b1d03113440aee47ef1e8f0") catch unreachable,
-        .eth_reverse_registrar = Address.fromHex("0xcbac6ee19b750c07e8454c031948c7a71a7ef88c") catch unreachable,
+        // L1 Sepolia Contracts (from DEPLOYMENTS.v2.md)
+        .root_registry = Address.fromHex("0x245de1984f9bb890c5db0b1fb839470c6a4c7e08") catch unreachable,
+        .eth_registry = Address.fromHex("0x3f0920aa92c5f9bce54643c09955c5f241f1f763") catch unreachable,
+        .registry_datastore = Address.fromHex("0x2a1d9588f3931fc7495867c82cd0d78cfb144945") catch unreachable,
+        .eth_reverse_registrar = Address.fromHex("0xeb8269fb39290f31c4c29cec548807ca2133abb4") catch unreachable,
 
-        // L2 Sepolia Contracts (same addresses on L2)
-        .l2_eth_registry = Address.fromHex("0x5fb63bbd34de21688c8aa8131be1c3b4a477109c") catch unreachable,
-        .l2_eth_registrar = Address.fromHex("0x774faadcd7e8c4b7441aa2927f10845fea083ea1") catch unreachable,
-        .l2_registry_datastore = Address.fromHex("0xed7c8d71a3c6e17a62393436456e65e77195d76e") catch unreachable,
+        // L2 Sepolia Contracts (from DEPLOYMENTS.v2.md)
+        .l2_eth_registry = Address.fromHex("0xf332544e6234f1ca149907d0d4658afd5feb6831") catch unreachable,
+        .l2_eth_registrar = Address.fromHex("0x3334f0ebcbc4b5b7067f3aff25c6da8973690d54") catch unreachable, // FastTestETHRegistrar
+        .l2_registry_datastore = Address.fromHex("0xe82b3bef599d45806fcce747df176808ff6244cf") catch unreachable,
 
-        // Bridge Contracts (TODO: Update with actual deployment addresses)
-        .l1_bridge_controller = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .l2_ejection_controller = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
+        // Bridge Contracts (from DEPLOYMENTS.v2.md)
+        .l1_bridge_controller = Address.fromHex("0xf951f03ad34d000af619da491cf369b7992a6f72") catch unreachable,
+        .l2_bridge_controller = Address.fromHex("0xbb84d5d658bbdb48bf99689f3a14f780ab2f9220") catch unreachable,
 
         // Deployment blocks (verified from on-chain)
         // For Sepolia testnet, these are the actual deployment blocks
@@ -122,7 +122,7 @@ fn mainnetAddresses() ContractAddresses {
 
         // Bridge Contracts (Not yet deployed)
         .l1_bridge_controller = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .l2_ejection_controller = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
+        .l2_bridge_controller = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
 
         // Deployment blocks
         // ENS Registry + Temporary Registrar deployed in block 3327417 (May 2017)
@@ -150,11 +150,20 @@ pub const EventSignatures = struct {
     pub const NameRegistered = "0x69e37f151eb98a09618ddaa80c8cfaf1ce5996867c489f45b555d412271ebf27"; // NameRegistered(string,bytes32,address,uint256,uint256)
     pub const NameRenewed = "0x3da24c024582931cfaf8267d8ed24d13a82a8068d5bd337d30ec45cea4e506ae"; // NameRenewed(string,bytes32,uint256,uint256)
 
-    // V2 Registry Events
-    pub const SubregistryUpdate = "0x335721b01866dc23fbee8b6b2c7b1e14d6f05c28cd35a2c934239f94095602a0"; // SubregistryUpdate(address,uint256,address)
-    pub const ResolverUpdate = "0x8bf46bf4cfd674fa735a3d63ec1c9ad4153f033c290341f3a588b75685141b35"; // ResolverUpdate(address,uint256,address)
+    // V2 Registry Events (OLD signatures - pre-deployment)
+    pub const SubregistryUpdate = "0x335721b01866dc23fbee8b6b2c7b1e14d6f05c28cd35a2c934239f94095602a0"; // SubregistryUpdate(uint256,address)
+    pub const ResolverUpdate = "0x8bf46bf4cfd674fa735a3d63ec1c9ad4153f033c290341f3a588b75685141b35"; // ResolverUpdate(uint256,address)
+
+    // V2 Registry Events (NEW signatures - current Sepolia deployment)
+    pub const SubregistryUpdated = "0xca01ade22fed8a886bda52d1fb12deaff178499347b6c13b1a892a60985a51e2"; // SubregistryUpdated(uint256,address)
+    pub const ResolverUpdated = "0x3c055b8ebff34805cc0c0216cfd96bfe2613c75002ce000f6268324952541d06"; // ResolverUpdated(uint256,address)
+    pub const TokenRegeneratedV2 = "0x88d074c8fc078bb1c0b9cfa9e3ca1f65a96141df8b0da854fe3083df813cbcca"; // TokenRegenerated(uint256,uint256,uint256)
+    pub const ExpiryUpdated = "0x3260962d42d8f7ae0af25cbfdb2983c214a859cfa2ac6df8ea29b534c267d429"; // ExpiryUpdated(uint256,uint64,address)
+
+    // Enhanced Access Control Events (from IEnhancedAccessControl.sol)
+    pub const EACRolesChanged = "0x0d35bf721a39b614de00ca5038e1deb0cb0c69a278645e83405a7226cf80ba3c"; // EACRolesChanged(uint256,address,uint256,uint256)
 
     // V2 Datastore Events
-    pub const RecordSet = "0x851..." ; // RecordSet(bytes32,bytes)
+    pub const RecordSet = "0x851..."; // RecordSet(bytes32,bytes)
     pub const RecordDeleted = "0x852..."; // RecordDeleted(bytes32)
 };

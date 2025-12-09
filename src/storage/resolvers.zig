@@ -324,6 +324,87 @@ pub fn getResolverText(db: *Database, namehash: Hash, key: []const u8) !?[]u8 {
     return null;
 }
 
+/// Get all text record keys for a resolver address (for V2 names)
+/// NOTE: V2 names have different namehashes than V1 resolver events, so we
+/// must look up by resolver address to find text records for V2 names.
+pub fn getResolverTextKeysByResolver(db: *Database, resolver: Address) ![][]u8 {
+    const sql =
+        \\SELECT DISTINCT key FROM resolver_texts
+        \\WHERE resolver = ?
+        \\ORDER BY key
+    ;
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    defer {
+        if (stmt) |s| _ = c.sqlite3_finalize(s);
+    }
+
+    if (c.sqlite3_prepare_v2(db.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+        return error.PrepareFailed;
+    }
+
+    const resolver_str = try resolver.toHex(db.allocator);
+    defer db.allocator.free(resolver_str);
+
+    _ = c.sqlite3_bind_text(stmt, 1, resolver_str.ptr, @intCast(resolver_str.len), SQLITE_TRANSIENT());
+
+    var keys: std.ArrayList([]u8) = .{};
+    errdefer {
+        for (keys.items) |key| {
+            db.allocator.free(key);
+        }
+        keys.deinit(db.allocator);
+    }
+
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        const key_text = c.sqlite3_column_text(stmt, 0);
+        if (key_text != null) {
+            const key_len = c.sqlite3_column_bytes(stmt, 0);
+            const key_slice = key_text[0..@intCast(key_len)];
+            const key_copy = try db.allocator.dupe(u8, key_slice);
+            try keys.append(db.allocator, key_copy);
+        }
+    }
+
+    return keys.toOwnedSlice(db.allocator);
+}
+
+/// Get a specific text record value by resolver address and key (for V2 names)
+pub fn getResolverTextByResolver(db: *Database, resolver: Address, key: []const u8) !?[]u8 {
+    const sql =
+        \\SELECT value FROM resolver_texts
+        \\WHERE resolver = ? AND key = ?
+        \\ORDER BY block_number DESC
+        \\LIMIT 1
+    ;
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    defer {
+        if (stmt) |s| _ = c.sqlite3_finalize(s);
+    }
+
+    if (c.sqlite3_prepare_v2(db.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+        return error.PrepareFailed;
+    }
+
+    const resolver_str = try resolver.toHex(db.allocator);
+    defer db.allocator.free(resolver_str);
+
+    _ = c.sqlite3_bind_text(stmt, 1, resolver_str.ptr, @intCast(resolver_str.len), SQLITE_TRANSIENT());
+    _ = c.sqlite3_bind_text(stmt, 2, key.ptr, @intCast(key.len), SQLITE_TRANSIENT());
+
+    if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        const value_text = c.sqlite3_column_text(stmt, 0);
+        if (value_text != null) {
+            const value_len = c.sqlite3_column_bytes(stmt, 0);
+            const value_slice = value_text[0..@intCast(value_len)];
+            return try db.allocator.dupe(u8, value_slice);
+        }
+    }
+
+    return null;
+}
+
 /// Get resolvers to index for a block range
 /// Uses cache table for O(1) lookup, falls back to full scan on first run
 pub fn getResolversToIndex(db: *Database, chain: models.Chain, from_block: u64, to_block: u64) ![][]u8 {

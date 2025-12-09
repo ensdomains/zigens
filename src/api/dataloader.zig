@@ -753,6 +753,9 @@ pub fn batchLoadContentHashes(
 
 /// Batch load text records for multiple namehashes
 /// Returns all text records for each namehash in the same order as input
+/// NOTE: This function uses a two-step approach because V2 names have different
+/// namehashes than V1 resolver events. We first lookup resolver addresses from
+/// the names table, then query resolver_texts by resolver address.
 pub fn batchLoadTextRecords(
     database: *db.Database,
     allocator: std.mem.Allocator,
@@ -765,32 +768,30 @@ pub fn batchLoadTextRecords(
     const Hash = @import("../types/hash.zig").Hash;
     const c = @import("../storage/database.zig").c;
 
-    // Build SQL query with WHERE IN clause for batch fetching
-    var query: std.ArrayList(u8) = .{};
-    defer query.deinit(allocator);
+    // Step 1: Get resolver addresses for each namehash from the names table
+    var resolver_query: std.ArrayList(u8) = .{};
+    defer resolver_query.deinit(allocator);
 
-    try query.appendSlice(allocator, "SELECT namehash, key, value FROM resolver_texts WHERE namehash IN (");
-
+    try resolver_query.appendSlice(allocator, "SELECT namehash, resolver FROM names WHERE namehash IN (");
     for (namehashes, 0..) |_, i| {
-        if (i > 0) try query.appendSlice(allocator, ", ");
-        try query.appendSlice(allocator, "?");
+        if (i > 0) try resolver_query.appendSlice(allocator, ", ");
+        try resolver_query.appendSlice(allocator, "?");
     }
-    try query.appendSlice(allocator, ") ORDER BY namehash, key");
+    try resolver_query.appendSlice(allocator, ")");
 
-    // Add null terminator for C string
-    const query_z = try allocator.dupeZ(u8, query.items);
-    defer allocator.free(query_z);
+    const resolver_query_z = try allocator.dupeZ(u8, resolver_query.items);
+    defer allocator.free(resolver_query_z);
 
-    var stmt: ?*c.sqlite3_stmt = null;
+    var resolver_stmt: ?*c.sqlite3_stmt = null;
     defer {
-        if (stmt) |s| _ = c.sqlite3_finalize(s);
+        if (resolver_stmt) |s| _ = c.sqlite3_finalize(s);
     }
 
-    if (c.sqlite3_prepare_v2(database.db, query_z.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+    if (c.sqlite3_prepare_v2(database.db, resolver_query_z.ptr, -1, &resolver_stmt, null) != c.SQLITE_OK) {
         return error.PrepareFailed;
     }
 
-    // Bind all namehash parameters
+    // Bind namehash parameters and prepare hex strings
     var namehash_hexes = try allocator.alloc([]u8, namehashes.len);
     defer {
         for (namehash_hexes) |hex| {
@@ -802,13 +803,62 @@ pub fn batchLoadTextRecords(
     for (namehashes, 0..) |namehash, i| {
         const hash = Hash{ .bytes = namehash };
         namehash_hexes[i] = try hash.toHex(allocator);
-        _ = c.sqlite3_bind_text(stmt, @intCast(i + 1), namehash_hexes[i].ptr, @intCast(namehash_hexes[i].len), null);
+        _ = c.sqlite3_bind_text(resolver_stmt, @intCast(i + 1), namehash_hexes[i].ptr, @intCast(namehash_hexes[i].len), null);
     }
 
-    // Create a map to store lists of text records by namehash
-    var result_map = std.StringHashMap(std.ArrayList(TextRecord)).init(allocator);
+    // Map: namehash_hex -> resolver_address
+    var namehash_to_resolver = std.StringHashMap([]const u8).init(allocator);
     defer {
-        var it = result_map.iterator();
+        var it = namehash_to_resolver.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        namehash_to_resolver.deinit();
+    }
+
+    // Collect unique resolver addresses
+    var unique_resolvers = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = unique_resolvers.keyIterator();
+        while (it.next()) |key| {
+            allocator.free(key.*);
+        }
+        unique_resolvers.deinit();
+    }
+
+    while (c.sqlite3_step(resolver_stmt) == c.SQLITE_ROW) {
+        const nh_text = c.sqlite3_column_text(resolver_stmt, 0);
+        const resolver_text = c.sqlite3_column_text(resolver_stmt, 1);
+
+        if (nh_text != null and resolver_text != null) {
+            const nh_len = c.sqlite3_column_bytes(resolver_stmt, 0);
+            const nh_slice = nh_text[0..@intCast(nh_len)];
+
+            const resolver_len = c.sqlite3_column_bytes(resolver_stmt, 1);
+            const resolver_slice = resolver_text[0..@intCast(resolver_len)];
+
+            // Skip if resolver is null/zero address
+            if (resolver_len > 0 and !std.mem.eql(u8, resolver_slice, "0x0000000000000000000000000000000000000000")) {
+                const nh_copy = try allocator.dupe(u8, nh_slice);
+                const resolver_copy = try allocator.dupe(u8, resolver_slice);
+                try namehash_to_resolver.put(nh_copy, resolver_copy);
+
+                // Track unique resolvers
+                const resolver_key = try allocator.dupe(u8, resolver_slice);
+                const put_result = try unique_resolvers.getOrPut(resolver_key);
+                if (put_result.found_existing) {
+                    allocator.free(resolver_key);
+                }
+            }
+        }
+    }
+
+    // Step 2: Query resolver_texts by resolver addresses
+    // Map: resolver_address -> list of text records
+    var resolver_to_texts = std.StringHashMap(std.ArrayList(TextRecord)).init(allocator);
+    defer {
+        var it = resolver_to_texts.iterator();
         while (it.next()) |entry| {
             for (entry.value_ptr.*.items) |record| {
                 allocator.free(record.key);
@@ -816,68 +866,113 @@ pub fn batchLoadTextRecords(
             }
             entry.value_ptr.*.deinit(allocator);
         }
-        result_map.deinit();
+        resolver_to_texts.deinit();
     }
 
-    // Execute query and collect results
-    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const namehash_text = c.sqlite3_column_text(stmt, 0);
-        const key_text = c.sqlite3_column_text(stmt, 1);
-        const value_text = c.sqlite3_column_text(stmt, 2);
+    if (unique_resolvers.count() > 0) {
+        var text_query: std.ArrayList(u8) = .{};
+        defer text_query.deinit(allocator);
 
-        if (namehash_text != null and key_text != null and value_text != null) {
-            const namehash_len = c.sqlite3_column_bytes(stmt, 0);
-            const namehash_slice = namehash_text[0..@intCast(namehash_len)];
-            const namehash_key = try allocator.dupe(u8, namehash_slice);
-            defer allocator.free(namehash_key);
+        try text_query.appendSlice(allocator, "SELECT resolver, key, value FROM resolver_texts WHERE resolver IN (");
+        var first = true;
+        var resolver_it = unique_resolvers.keyIterator();
+        while (resolver_it.next()) |_| {
+            if (!first) try text_query.appendSlice(allocator, ", ");
+            try text_query.appendSlice(allocator, "?");
+            first = false;
+        }
+        try text_query.appendSlice(allocator, ") ORDER BY resolver, key");
 
-            const key_len = c.sqlite3_column_bytes(stmt, 1);
-            const key_slice = key_text[0..@intCast(key_len)];
-            const key_copy = try allocator.dupe(u8, key_slice);
+        const text_query_z = try allocator.dupeZ(u8, text_query.items);
+        defer allocator.free(text_query_z);
 
-            const value_len = c.sqlite3_column_bytes(stmt, 2);
-            const value_slice = value_text[0..@intCast(value_len)];
-            const value_copy = try allocator.dupe(u8, value_slice);
+        var text_stmt: ?*c.sqlite3_stmt = null;
+        defer {
+            if (text_stmt) |s| _ = c.sqlite3_finalize(s);
+        }
 
-            // Get or create list for this namehash
-            const result = try result_map.getOrPut(namehash_key);
-            if (!result.found_existing) {
-                result.key_ptr.* = try allocator.dupe(u8, namehash_key);
-                result.value_ptr.* = std.ArrayList(TextRecord){};
+        if (c.sqlite3_prepare_v2(database.db, text_query_z.ptr, -1, &text_stmt, null) != c.SQLITE_OK) {
+            return error.PrepareFailed;
+        }
+
+        // Bind resolver addresses
+        var bind_idx: c_int = 1;
+        var bind_it = unique_resolvers.keyIterator();
+        while (bind_it.next()) |key| {
+            _ = c.sqlite3_bind_text(text_stmt, bind_idx, key.*.ptr, @intCast(key.*.len), null);
+            bind_idx += 1;
+        }
+
+        // Execute and collect text records
+        while (c.sqlite3_step(text_stmt) == c.SQLITE_ROW) {
+            const resolver_col = c.sqlite3_column_text(text_stmt, 0);
+            const key_col = c.sqlite3_column_text(text_stmt, 1);
+            const value_col = c.sqlite3_column_text(text_stmt, 2);
+
+            if (resolver_col != null and key_col != null and value_col != null) {
+                const resolver_len = c.sqlite3_column_bytes(text_stmt, 0);
+                const resolver_slice = resolver_col[0..@intCast(resolver_len)];
+
+                const key_len = c.sqlite3_column_bytes(text_stmt, 1);
+                const key_slice = key_col[0..@intCast(key_len)];
+                const key_copy = try allocator.dupe(u8, key_slice);
+
+                const value_len = c.sqlite3_column_bytes(text_stmt, 2);
+                const value_slice = value_col[0..@intCast(value_len)];
+                const value_copy = try allocator.dupe(u8, value_slice);
+
+                // Get or create list for this resolver
+                const result = try resolver_to_texts.getOrPut(resolver_slice);
+                if (!result.found_existing) {
+                    result.key_ptr.* = try allocator.dupe(u8, resolver_slice);
+                    result.value_ptr.* = std.ArrayList(TextRecord){};
+                }
+
+                try result.value_ptr.*.append(allocator, .{
+                    .key = key_copy,
+                    .value = value_copy,
+                });
             }
-
-            try result.value_ptr.*.append(allocator, .{
-                .key = key_copy,
-                .value = value_copy,
-            });
         }
     }
 
-    // Build result array in the same order as input namehashes
+    // Step 3: Build result array mapping namehashes -> text records via resolver
     const results = try allocator.alloc(TextRecords, namehashes.len);
     for (results, namehashes) |*result, namehash| {
         const hash = Hash{ .bytes = namehash };
         const namehash_hex = try hash.toHex(allocator);
         defer allocator.free(namehash_hex);
 
-        if (result_map.get(namehash_hex)) |records_list| {
-            result.* = .{
-                .records = try records_list.toOwnedSlice(allocator),
-                .allocator = allocator,
-            };
+        // Look up resolver for this namehash
+        if (namehash_to_resolver.get(namehash_hex)) |resolver_addr| {
+            // Look up text records for this resolver
+            if (resolver_to_texts.get(resolver_addr)) |records_list| {
+                // Copy the records for this result
+                const records = try allocator.alloc(TextRecord, records_list.items.len);
+                for (records_list.items, 0..) |record, j| {
+                    records[j] = .{
+                        .key = try allocator.dupe(u8, record.key),
+                        .value = try allocator.dupe(u8, record.value),
+                    };
+                }
+                result.* = .{
+                    .records = records,
+                    .allocator = allocator,
+                };
+            } else {
+                // Resolver exists but no text records
+                result.* = .{
+                    .records = try allocator.alloc(TextRecord, 0),
+                    .allocator = allocator,
+                };
+            }
         } else {
-            // No text records for this namehash
+            // No resolver for this namehash
             result.* = .{
                 .records = try allocator.alloc(TextRecord, 0),
                 .allocator = allocator,
             };
         }
-    }
-
-    // Clean up the map keys
-    var it = result_map.keyIterator();
-    while (it.next()) |key| {
-        allocator.free(key.*);
     }
 
     return results;

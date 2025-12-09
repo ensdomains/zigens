@@ -108,7 +108,8 @@ pub fn main() !void {
     defer cfg.deinit();
 
     std.log.info("ENSv2 Indexer starting...", .{});
-    std.log.info("Network: {s}", .{cfg.network.toString()});
+    std.log.info("L1 Network: {s}", .{cfg.network_l1.toString()});
+    std.log.info("L2 Network: {s}", .{cfg.network_l2.toString()});
     std.log.info("L1 RPC: [CONFIGURED]", .{});
     std.log.info("L2 RPC: [CONFIGURED]", .{});
     std.log.info("Start block: {d}", .{cfg.start_block});
