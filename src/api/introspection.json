@@ -1043,6 +1043,25 @@
                   }
                 }
               }
+            },
+            {
+              "name": "text",
+              "args": [
+                {
+                  "name": "key",
+                  "type": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "SCALAR",
+                      "name": "String"
+                    }
+                  }
+                }
+              ],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
             }
           ]
         },

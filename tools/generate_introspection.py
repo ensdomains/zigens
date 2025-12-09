@@ -12,7 +12,10 @@ from typing import Dict, List, Any
 def parse_graphql_schema(schema_text: str) -> Dict[str, Any]:
     """Parse GraphQL SDL and generate introspection response"""
 
-    # Remove comments and normalize whitespace
+    # Remove comments and doc strings, normalize whitespace
+    # First remove triple-quote doc strings
+    schema_text = re.sub(r'"""[^"]*"""', '', schema_text)
+
     lines = []
     for line in schema_text.split('\n'):
         # Remove comments

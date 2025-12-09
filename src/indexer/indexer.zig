@@ -34,6 +34,8 @@ pub const Indexer = struct {
     end_block: ?u64,
     indexer_status: ?*IndexerStatus,
     status_server: ?*status_mod.StatusServer,
+    // Block timestamp cache to avoid repeated RPC calls
+    block_timestamp_cache: std.AutoHashMap(u64, i64),
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.Config, database: *db.Database, end_block: ?u64) !Indexer {
         // Create ONE shared HTTP client for both L1 and L2
@@ -116,6 +118,7 @@ pub const Indexer = struct {
             .end_block = end_block,
             .indexer_status = indexer_status,
             .status_server = status_server,
+            .block_timestamp_cache = std.AutoHashMap(u64, i64).init(allocator),
         };
     }
 
@@ -199,6 +202,7 @@ pub const Indexer = struct {
             .end_block = end_block,
             .indexer_status = indexer_status,
             .status_server = status_server,
+            .block_timestamp_cache = std.AutoHashMap(u64, i64).init(allocator),
         };
     }
 
@@ -228,6 +232,36 @@ pub const Indexer = struct {
         if (self.webhook_manager) |wm| {
             wm.deinit();
         }
+        self.block_timestamp_cache.deinit();
+    }
+
+    /// Get block timestamp, using cache to avoid repeated RPC calls
+    fn getBlockTimestamp(self: *Indexer, chain: models.Chain, block_number: u64) i64 {
+        // Check cache first
+        if (self.block_timestamp_cache.get(block_number)) |ts| {
+            return ts;
+        }
+
+        // Fetch from RPC
+        const client = self.getClient(chain);
+        const block = client.getBlockByNumber(block_number, false) catch |err| {
+            std.log.warn("Failed to fetch block {d} timestamp: {}, using current time", .{ block_number, err });
+            return std.time.timestamp();
+        };
+
+        const timestamp: i64 = @intCast(block.timestamp);
+
+        // Cache the result
+        self.block_timestamp_cache.put(block_number, timestamp) catch {
+            // If cache fails, just return the timestamp without caching
+        };
+
+        return timestamp;
+    }
+
+    /// Clear block timestamp cache (call after processing a batch to free memory)
+    fn clearBlockTimestampCache(self: *Indexer) void {
+        self.block_timestamp_cache.clearRetainingCapacity();
     }
 
     // Helper methods to eliminate chain-specific conditionals
@@ -1011,11 +1045,17 @@ pub const Indexer = struct {
     }
 
     fn indexChain(self: *Indexer, chain: models.Chain, client: *rpc.Client) !void {
+        // Use chain-specific deployment block as fallback for fresh databases
+        const deployment_block = switch (chain) {
+            .l1 => self.config.l1_contracts.l1_deployment_block,
+            .l2 => self.config.l2_contracts.l2_deployment_block,
+        };
+
         // Get last synced block from database (resumability)
-        var last_synced = try self.database.getSyncState(chain) orelse self.config.start_block;
+        var last_synced = try self.database.getSyncState(chain) orelse deployment_block;
 
         // REORG DETECTION: Check if we need to roll back
-        if (last_synced > self.config.start_block) {
+        if (last_synced > deployment_block) {
             const stored_hash = try self.database.getBlockHash(chain, last_synced);
 
             if (stored_hash) |expected_hash| {
@@ -1608,7 +1648,7 @@ pub const Indexer = struct {
             .namehash = namehash,
             .parent_registry = log.address, // The contract that emitted this event
             .created_block = log.block_number,
-            .created_at = std.time.timestamp(),
+            .created_at = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.database.insertRegistry(registry);
@@ -1807,7 +1847,7 @@ pub const Indexer = struct {
             .migrated = false,
             .ejected = false,
             .created_block = log.block_number,
-            .created_at = std.time.timestamp(),
+            .created_at = self.getBlockTimestamp(chain, log.block_number),
             .updated_block = log.block_number,
             .updated_at = std.time.timestamp(),
             .is_wrapped = false,
@@ -1978,7 +2018,7 @@ pub const Indexer = struct {
             .migrated = false,
             .ejected = false,
             .created_block = log.block_number,
-            .created_at = std.time.timestamp(),
+            .created_at = self.getBlockTimestamp(chain, log.block_number),
             .updated_block = log.block_number,
             .updated_at = std.time.timestamp(),
             .is_wrapped = false,
@@ -2231,7 +2271,7 @@ pub const Indexer = struct {
             .migrated = false,
             .ejected = false,
             .created_block = log.block_number,
-            .created_at = std.time.timestamp(),
+            .created_at = self.getBlockTimestamp(chain, log.block_number),
             .updated_block = log.block_number,
             .updated_at = std.time.timestamp(),
             .is_wrapped = false,
@@ -4072,7 +4112,7 @@ pub const Indexer = struct {
                 .migrated = false, // This is a native V1 name
                 .ejected = false, // V1 names on L1 are not ejected
                 .created_block = log.block_number,
-                .created_at = std.time.timestamp(),
+                .created_at = self.getBlockTimestamp(chain, log.block_number),
                 .updated_block = log.block_number,
                 .updated_at = std.time.timestamp(),
                 .is_wrapped = false, // Not wrapped initially

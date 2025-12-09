@@ -213,8 +213,11 @@ type Resolver {
   """Content hash (IPFS, Arweave, etc.)"""
   contentHash: String
 
-  """Text records"""
+  """Text record keys"""
   texts: [String!]
+
+  """Get a specific text record value by key"""
+  text(key: String!): String
 }
 
 """A domain registration record"""
