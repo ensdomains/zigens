@@ -19,6 +19,7 @@ pub const OrderDir = names.OrderDir;
 const sync = @import("sync.zig");
 const events = @import("events.zig");
 pub const EventOrderDir = events.OrderDir;
+pub const EventFilterOptions = events.EventFilterOptions;
 const webhooks = @import("webhooks.zig");
 const transactions = @import("transactions.zig");
 const roles = @import("roles.zig");
@@ -303,10 +304,11 @@ pub const Database = struct {
     // All functions below delegate to their respective module implementations.
     // This maintains the exact same API: db.insertName(...) still works!
 
-    // Names module (14 functions)
+    // Names module (15 functions)
     pub const insertRegistry = names.insertRegistry;
     pub const insertName = names.insertName;
     pub const getNameByNamehash = names.getNameByNamehash;
+    pub const getNamehashByResolver = names.getNamehashByResolver;
     pub const updateNameExpiry = names.updateNameExpiry;
     pub const updateNameOwner = names.updateNameOwner;
     pub const updateNameSubregistry = names.updateNameSubregistry;
@@ -352,11 +354,15 @@ pub const Database = struct {
     pub const insertTokenObserver = sync.insertTokenObserver;
     pub const deleteDataAfterBlock = sync.deleteDataAfterBlock;
 
-    // Events module (4 functions)
+    // Events module
     pub const insertEvent = events.insertEvent;
     pub const getRecentEvents = events.getRecentEvents;
     pub const getRecentEventsWithOrder = events.getRecentEventsWithOrder;
     pub const EventOrderDir = events.OrderDir;
+    pub const EventFilterOptions = events.EventFilterOptions;
+    pub const getEventsFiltered = events.getEventsFiltered;
+    pub const getEventsByNamehash = events.getEventsByNamehash;
+    pub const getEventsByDomain = events.getEventsByDomain;
     pub const insertApproval = events.insertApproval;
 
     // Webhooks module (3 functions)

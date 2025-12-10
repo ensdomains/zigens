@@ -243,6 +243,36 @@ pub fn getNameByNamehash(db: *Database, namehash: Hash) !?models.Name {
     return null;
 }
 
+/// Get namehash by resolver address
+/// In ENSv2, each name typically has its own dedicated resolver, so we can look up
+/// the name's namehash from the resolver address
+pub fn getNamehashByResolver(db: *Database, resolver: Address) !?Hash {
+    const sql = "SELECT namehash FROM names WHERE resolver = ? LIMIT 1";
+
+    const sql_z = try db.allocator.dupeZ(u8, sql);
+    defer db.allocator.free(sql_z);
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    const prepare_result = c.sqlite3_prepare_v2(db.db, sql_z.ptr, -1, &stmt, null);
+    if (prepare_result != c.SQLITE_OK) {
+        std.log.err("Failed to prepare SQL statement: {s}", .{c.sqlite3_errmsg(db.db)});
+        return error.PrepareFailed;
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+
+    const resolver_hex = try resolver.toHex(db.allocator);
+    defer db.allocator.free(resolver_hex);
+
+    _ = c.sqlite3_bind_text(stmt, 1, resolver_hex.ptr, @intCast(resolver_hex.len), SQLITE_TRANSIENT());
+
+    if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        const namehash_str = std.mem.span(c.sqlite3_column_text(stmt, 0));
+        return try Hash.fromHex(namehash_str);
+    }
+
+    return null;
+}
+
 /// Update name expiry (for renewals)
 pub fn updateNameExpiry(db: *Database, namehash: Hash, expiry: i64) !void {
     const sql = "UPDATE names SET expiry = ?, updated_at = ?, updated_block = updated_block + 1 WHERE namehash = ?";
