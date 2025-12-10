@@ -649,7 +649,18 @@ pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Nam
 }
 
 /// Get all names with filtering and pagination
+/// Order direction for queries
+pub const OrderDir = enum {
+    asc,
+    desc,
+};
+
 pub fn getAllNames(db: *Database, owner: ?Address, skip: u32, limit: u32) ![]models.Name {
+    return getAllNamesWithOrder(db, owner, skip, limit, .desc);
+}
+
+/// Get all names with configurable order direction (for backward pagination support)
+pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u32, order_dir: OrderDir) ![]models.Name {
     var sql_buf: [512]u8 = undefined;
     var sql_len: usize = 0;
 
@@ -663,7 +674,11 @@ pub fn getAllNames(db: *Database, owner: ?Address, skip: u32, limit: u32) ![]mod
         sql_len += where_sql.len;
     }
 
-    const order_sql = " ORDER BY created_at DESC LIMIT ? OFFSET ?";
+    // Use order direction for backward pagination support
+    const order_sql = if (order_dir == .desc)
+        " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    else
+        " ORDER BY created_at ASC LIMIT ? OFFSET ?";
     @memcpy(sql_buf[sql_len..][0..order_sql.len], order_sql);
     sql_len += order_sql.len;
 
@@ -758,6 +773,60 @@ pub fn getAllNames(db: *Database, owner: ?Address, skip: u32, limit: u32) ![]mod
     }
 
     return names.toOwnedSlice(db.allocator);
+}
+
+/// Count direct subdomains for a given parent name (one level down only)
+/// For example, if parent_name is "eth", this counts "vitalik.eth", "nick.eth", etc.
+/// but NOT "sub.vitalik.eth" (which would be a subdomain of "vitalik.eth")
+pub fn countDirectSubdomains(db: *Database, parent_name: []const u8) !u32 {
+    const sql = "SELECT COUNT(*) FROM names WHERE parent_name = ?";
+
+    const sql_z = try db.allocator.dupeZ(u8, sql);
+    defer db.allocator.free(sql_z);
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    const prepare_result = c.sqlite3_prepare_v2(db.db, sql_z.ptr, -1, &stmt, null);
+    if (prepare_result != c.SQLITE_OK) {
+        std.log.err("Failed to prepare SQL statement: {s}", .{c.sqlite3_errmsg(db.db)});
+        return error.PrepareFailed;
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+
+    const parent_name_z = try db.allocator.dupeZ(u8, parent_name);
+    defer db.allocator.free(parent_name_z);
+
+    _ = c.sqlite3_bind_text(stmt, 1, parent_name_z.ptr, @intCast(parent_name_z.len), null);
+
+    const step_result = c.sqlite3_step(stmt);
+    if (step_result == c.SQLITE_ROW) {
+        return @intCast(c.sqlite3_column_int(stmt, 0));
+    }
+
+    return 0;
+}
+
+/// Check if a domain has any direct subdomains (one level down only)
+pub fn hasDirectSubdomains(db: *Database, parent_name: []const u8) !bool {
+    const sql = "SELECT 1 FROM names WHERE parent_name = ? LIMIT 1";
+
+    const sql_z = try db.allocator.dupeZ(u8, sql);
+    defer db.allocator.free(sql_z);
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    const prepare_result = c.sqlite3_prepare_v2(db.db, sql_z.ptr, -1, &stmt, null);
+    if (prepare_result != c.SQLITE_OK) {
+        std.log.err("Failed to prepare SQL statement: {s}", .{c.sqlite3_errmsg(db.db)});
+        return error.PrepareFailed;
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+
+    const parent_name_z = try db.allocator.dupeZ(u8, parent_name);
+    defer db.allocator.free(parent_name_z);
+
+    _ = c.sqlite3_bind_text(stmt, 1, parent_name_z.ptr, @intCast(parent_name_z.len), null);
+
+    const step_result = c.sqlite3_step(stmt);
+    return step_result == c.SQLITE_ROW;
 }
 
 /// Get all registries owned by an account (i.e., registries for names owned by the account)

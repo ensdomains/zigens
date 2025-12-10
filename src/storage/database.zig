@@ -13,8 +13,12 @@ const Hash = @import("../types/hash.zig").Hash;
 // Import all module functions
 const names = @import("names.zig");
 const resolvers = @import("resolvers.zig");
+
+// Re-export types for use by other modules
+pub const OrderDir = names.OrderDir;
 const sync = @import("sync.zig");
 const events = @import("events.zig");
+pub const EventOrderDir = events.OrderDir;
 const webhooks = @import("webhooks.zig");
 const transactions = @import("transactions.zig");
 const roles = @import("roles.zig");
@@ -313,7 +317,11 @@ pub const Database = struct {
     pub const updateNameTokenId = names.updateNameTokenId;
     pub const getNamesByOwner = names.getNamesByOwner;
     pub const getAllNames = names.getAllNames;
+    pub const getAllNamesWithOrder = names.getAllNamesWithOrder;
+    pub const OrderDir = names.OrderDir;
     pub const getRegistriesByOwner = names.getRegistriesByOwner;
+    pub const countDirectSubdomains = names.countDirectSubdomains;
+    pub const hasDirectSubdomains = names.hasDirectSubdomains;
 
     // Resolver module (11 functions)
     pub const storeResolverAddress = resolvers.storeResolverAddress;
@@ -344,9 +352,11 @@ pub const Database = struct {
     pub const insertTokenObserver = sync.insertTokenObserver;
     pub const deleteDataAfterBlock = sync.deleteDataAfterBlock;
 
-    // Events module (3 functions)
+    // Events module (4 functions)
     pub const insertEvent = events.insertEvent;
     pub const getRecentEvents = events.getRecentEvents;
+    pub const getRecentEventsWithOrder = events.getRecentEventsWithOrder;
+    pub const EventOrderDir = events.OrderDir;
     pub const insertApproval = events.insertApproval;
 
     // Webhooks module (3 functions)

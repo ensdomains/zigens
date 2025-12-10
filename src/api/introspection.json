@@ -1679,6 +1679,27 @@
                 "kind": "SCALAR",
                 "name": "String"
               }
+            },
+            {
+              "name": "hasSubdomains",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Boolean"
+              }
+            },
+            {
+              "name": "subdomainCount_gt",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "subdomainCount_lt",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
             }
           ]
         },
