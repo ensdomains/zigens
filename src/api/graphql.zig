@@ -1446,7 +1446,7 @@ pub const Schema = struct {
         \\  domains(first: Int = 100, skip: Int = 0, where: DomainFilter): [Domain!]!
         \\  account(id: String!): Account
         \\  registrations(first: Int = 100, skip: Int = 0, where: RegistrationFilter): [Registration!]!
-        \\  events(first: Int = 100, skip: Int = 0): [Event!]!
+        \\  events(first: Int = 100, skip: Int = 0, where: EventFilter): [Event!]!
         \\}
         \\
         \\type Domain {
@@ -1500,6 +1500,9 @@ pub const Schema = struct {
         \\  blockNumber: Int!
         \\  transactionHash: String!
         \\  timestamp: Int!
+        \\  contractAddress: String!
+        \\  name: String
+        \\  namehash: String
         \\  domain: Domain
         \\}
         \\
@@ -1517,6 +1520,17 @@ pub const Schema = struct {
         \\  registrant: String
         \\  expiryDate_gt: Int
         \\  expiryDate_lt: Int
+        \\}
+        \\
+        \\input EventFilter {
+        \\  type: String
+        \\  type_in: [String!]
+        \\  domain: String
+        \\  namehash: String
+        \\  blockNumber_gt: Int
+        \\  blockNumber_lt: Int
+        \\  timestamp_gt: Int
+        \\  timestamp_lt: Int
         \\}
     ;
 };
@@ -3664,6 +3678,29 @@ fn buildEventJson(
         } else if (std.mem.eql(u8, field.name, "timestamp")) {
             try writer.print("\"{s}\":{d}", .{ output_key, event.timestamp });
             first = false;
+        } else if (std.mem.eql(u8, field.name, "contractAddress")) {
+            const addr_hex = try event.contract_address.toHex(ctx.allocator);
+            defer ctx.allocator.free(addr_hex);
+            try writer.print("\"{s}\":\"{s}\"", .{ output_key, addr_hex });
+            first = false;
+        } else if (std.mem.eql(u8, field.name, "name")) {
+            if (event.name) |n| {
+                const escaped = try escapeJsonString(ctx.allocator, n);
+                defer ctx.allocator.free(escaped);
+                try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
+            } else {
+                try writer.print("\"{s}\":null", .{output_key});
+            }
+            first = false;
+        } else if (std.mem.eql(u8, field.name, "namehash")) {
+            if (event.namehash) |nh| {
+                const hash_hex = try nh.toHex(ctx.allocator);
+                defer ctx.allocator.free(hash_hex);
+                try writer.print("\"{s}\":\"{s}\"", .{ output_key, hash_hex });
+            } else {
+                try writer.print("\"{s}\":null", .{output_key});
+            }
+            first = false;
         } else if (std.mem.eql(u8, field.name, "domain")) {
             // Nested Domain object
             if (event.namehash) |nh| {
@@ -3688,7 +3725,12 @@ fn buildEventJson(
                 try writer.print("\"{s}\":null", .{output_key});
                 first = false;
             }
+        } else if (std.mem.eql(u8, field.name, "__typename")) {
+            // Handle GraphQL introspection field
+            try writer.print("\"{s}\":\"Event\"", .{output_key});
+            first = false;
         }
+        // Unknown fields are silently ignored (GraphQL spec allows this)
     }
 
     try writer.writeAll("}");
