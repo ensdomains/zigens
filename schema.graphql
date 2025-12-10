@@ -261,6 +261,15 @@ type Event {
   """Timestamp when event occurred"""
   timestamp: Int!
 
+  """Contract address that emitted the event"""
+  contractAddress: String!
+
+  """Name affected by this event"""
+  name: String
+
+  """Namehash of the name"""
+  namehash: String
+
   """Domain associated with this event (if applicable)"""
   domain: Domain
 }
