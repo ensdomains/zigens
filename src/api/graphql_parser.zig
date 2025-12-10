@@ -1187,7 +1187,7 @@ pub const Executor = struct {
         };
     }
 
-    pub fn executeDocument(self: *Executor, document: *const Document, variables_json: ?std.json.Value) ![]u8 {
+    pub fn executeDocument(self: *Executor, document: *const Document, variables_json: ?std.json.Value, operation_name: ?[]const u8) ![]u8 {
         // Store fragments for use during execution
         self.fragments = document.fragments;
         defer self.fragments = &.{};
@@ -1205,8 +1205,46 @@ pub const Executor = struct {
             }
         }
 
-        // Apply default values from variable definitions for any missing variables
-        for (document.operations) |*operation| {
+        // Find operations to execute based on operationName
+        // Per GraphQL spec: if operationName is provided, execute only that operation
+        // If not provided and there's exactly one operation, execute it
+        // If not provided and there are multiple operations, return error
+        var operations_to_execute: []const *const Operation = &.{};
+        var ops_buf: [16]*const Operation = undefined;
+        var ops_count: usize = 0;
+
+        if (operation_name) |name| {
+            // Find the operation with the given name
+            for (document.operations) |*operation| {
+                if (operation.name) |op_name| {
+                    if (std.mem.eql(u8, op_name, name)) {
+                        if (ops_count < ops_buf.len) {
+                            ops_buf[ops_count] = operation;
+                            ops_count += 1;
+                        }
+                        break;
+                    }
+                }
+            }
+            if (ops_count == 0) {
+                return error.OperationNotFound;
+            }
+            operations_to_execute = ops_buf[0..ops_count];
+        } else {
+            // No operationName provided
+            if (document.operations.len == 1) {
+                // Execute the single operation
+                ops_buf[0] = &document.operations[0];
+                operations_to_execute = ops_buf[0..1];
+            } else if (document.operations.len > 1) {
+                // Multiple operations require operationName
+                return error.OperationNameRequired;
+            }
+            // If no operations, operations_to_execute stays empty
+        }
+
+        // Apply default values from variable definitions for operations we'll execute
+        for (operations_to_execute) |operation| {
             for (operation.variables) |*var_def| {
                 // If variable wasn't provided and has a default value, use the default
                 if (!variables_map.contains(var_def.name)) {
@@ -1227,8 +1265,8 @@ pub const Executor = struct {
 
         try response.appendSlice(self.allocator, "{\"data\":{");
 
-        // Execute all operations (typically just one)
-        for (document.operations, 0..) |*operation, i| {
+        // Execute selected operations
+        for (operations_to_execute, 0..) |operation, i| {
             if (i > 0) try response.appendSlice(self.allocator, ",");
             const result = try self.executeOperation(operation);
             defer self.allocator.free(result);
@@ -1253,6 +1291,21 @@ pub const Executor = struct {
         };
     }
 
+    /// Free expanded fields recursively (frees nested selections that were allocated by expandSelections)
+    /// Note: expandSelections ALWAYS creates new allocations for any non-empty selections,
+    /// so all non-empty selections in the returned fields are safe to free.
+    fn freeExpandedFields(self: *Executor, fields: []Field) void {
+        for (fields) |*field| {
+            if (field.selections.len > 0) {
+                // Recursively free nested selections
+                // Note: the recursive call will free field.selections via its final free(fields) call
+                self.freeExpandedFields(@constCast(field.selections));
+            }
+        }
+        // Free this level's array (this also frees what was passed as field.selections to recursive calls)
+        self.allocator.free(fields);
+    }
+
     /// Expand selections, replacing fragment spreads with actual fragment fields
     /// Also filters out fields that should be skipped due to directives (@skip, @include)
     pub fn expandSelections(self: *Executor, selections: []const Field) ![]Field {
@@ -1270,11 +1323,14 @@ pub const Executor = struct {
                 if (self.getFragment(frag_name)) |frag| {
                     // Recursively expand the fragment's selections
                     const frag_fields = try self.expandSelections(frag.selections);
-                    defer self.allocator.free(frag_fields);
+                    // Note: we don't free frag_fields here because we're transferring ownership
+                    // of the nested selections to our result. The caller will free via freeExpandedFields.
 
                     for (frag_fields) |frag_field| {
                         try expanded.append(self.allocator, frag_field);
                     }
+                    // Free just the array, not the contents (ownership transferred)
+                    self.allocator.free(frag_fields);
                 } else {
                     std.log.warn("Unknown fragment: {s}", .{frag_name});
                 }
@@ -1298,7 +1354,7 @@ pub const Executor = struct {
 
         // Expand fragments and filter by directives (@skip, @include)
         const expanded_fields = try self.expandSelections(operation.fields);
-        defer self.allocator.free(expanded_fields);
+        defer self.freeExpandedFields(expanded_fields);
 
         // Execute all root fields (with fragments expanded and directives applied)
         var first = true;
@@ -1327,10 +1383,16 @@ pub const Executor = struct {
     }
 
     fn executeField(self: *Executor, field: *const Field) ![]u8 {
+        const field_name = field.alias orelse field.name;
+
+        // Handle __typename at root level - always returns "Query"
+        if (std.mem.eql(u8, field.name, "__typename")) {
+            return try std.fmt.allocPrint(self.allocator, "\"{s}\":\"Query\"", .{field_name});
+        }
+
         // Look up resolver for this field
         const resolver = self.resolvers.get(field.name) orelse {
             // No resolver found - return null
-            const field_name = field.alias orelse field.name;
             return try std.fmt.allocPrint(self.allocator, "\"{s}\":null", .{field_name});
         };
 
@@ -1346,8 +1408,7 @@ pub const Executor = struct {
         var result = try resolver(self.context, &resolved_field);
         defer result.deinit(self.allocator);
 
-        // Wrap result with field name
-        const field_name = field.alias orelse field.name;
+        // Wrap result with field name (field_name already defined at start of function)
         return try std.fmt.allocPrint(self.allocator, "\"{s}\":{s}", .{ field_name, result.json });
     }
 };
