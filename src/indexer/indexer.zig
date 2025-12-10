@@ -54,8 +54,7 @@ pub const Indexer = struct {
 
         var webhook_manager: ?*webhooks.WebhookManager = null;
         if (cfg.webhooks_enabled) {
-            const webhook_db_path = "./data/webhooks.db";
-            webhook_manager = try webhooks.WebhookManager.init(allocator, webhook_db_path, cfg.webhook_max_retries, 1000); // 1000ms rate limit per endpoint
+            webhook_manager = try webhooks.WebhookManager.init(allocator, cfg.webhook_db_path, cfg.webhook_max_retries, 1000); // 1000ms rate limit per endpoint
             // Workers disabled during indexing to avoid SQLite contention
             // Webhooks are queued and can be processed separately
             // try webhook_manager.?.startWorkers(1);
@@ -137,8 +136,7 @@ pub const Indexer = struct {
 
         var webhook_manager: ?*webhooks.WebhookManager = null;
         if (cfg.webhooks_enabled) {
-            const webhook_db_path = "./data/webhooks.db";
-            webhook_manager = try webhooks.WebhookManager.init(allocator, webhook_db_path, cfg.webhook_max_retries, 1000); // 1000ms rate limit per endpoint
+            webhook_manager = try webhooks.WebhookManager.init(allocator, cfg.webhook_db_path, cfg.webhook_max_retries, 1000); // 1000ms rate limit per endpoint
             // Workers disabled during indexing to avoid SQLite contention
             // Webhooks are queued and can be processed separately
             // try webhook_manager.?.startWorkers(1);

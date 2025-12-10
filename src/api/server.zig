@@ -13,16 +13,19 @@ const validation = @import("../utils/validation.zig");
 pub const Server = struct {
     allocator: std.mem.Allocator,
     database: *db.Database,
-    webhook_database: *db.Database,  // Separate database for webhooks
+    webhook_database: ?*db.Database,  // Optional - only initialized if webhooks enabled
     port: u16,
     server: ?std.net.Server,
     graphql_handler: graphql.GraphQLHandler,
 
-    pub fn init(allocator: std.mem.Allocator, database: *db.Database, webhook_db_path: []const u8, port: u16, complexity_max_depth: u32, complexity_max_cost: u32, metrics_enabled: bool) !Server {
-        // Open webhook database connection
-        const webhook_db_value = try db.Database.initWithoutSchema(allocator, webhook_db_path);
-        const webhook_db = try allocator.create(db.Database);
-        webhook_db.* = webhook_db_value;
+    pub fn init(allocator: std.mem.Allocator, database: *db.Database, webhook_db_path: ?[]const u8, port: u16, complexity_max_depth: u32, complexity_max_cost: u32, metrics_enabled: bool) !Server {
+        // Only open webhook database if path is provided (webhooks enabled)
+        var webhook_db: ?*db.Database = null;
+        if (webhook_db_path) |path| {
+            const webhook_db_value = try db.Database.initWithoutSchema(allocator, path);
+            webhook_db = try allocator.create(db.Database);
+            webhook_db.?.* = webhook_db_value;
+        }
 
         return .{
             .allocator = allocator,
@@ -36,8 +39,10 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         self.graphql_handler.deinit();
-        self.webhook_database.deinit();
-        self.allocator.destroy(self.webhook_database);
+        if (self.webhook_database) |webhook_db| {
+            webhook_db.deinit();
+            self.allocator.destroy(webhook_db);
+        }
         if (self.server) |*s| {
             s.deinit();
         }
@@ -534,7 +539,10 @@ pub const Server = struct {
     }
 
     fn handleListWebhooks(self: *Server, stream: std.net.Stream) !void {
-        const webhooks = try self.webhook_database.getWebhooks();
+        const webhook_db = self.webhook_database orelse {
+            return try self.sendJsonResponse(stream, 503, "{\"error\":\"Webhooks not enabled\"}");
+        };
+        const webhooks = try webhook_db.getWebhooks();
         defer {
             for (webhooks) |*wh| {
                 wh.deinit(self.allocator);
@@ -605,6 +613,10 @@ pub const Server = struct {
     }
 
     fn handleCreateWebhook(self: *Server, stream: std.net.Stream, request: []const u8) !void {
+        if (self.webhook_database == null) {
+            return try self.sendJsonResponse(stream, 503, "{\"error\":\"Webhooks not enabled\"}");
+        }
+
         // Extract JSON body
         const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse std.mem.indexOf(u8, request, "\n\n") orelse {
             return try self.sendBadRequest(stream, "Invalid request format");
@@ -665,7 +677,7 @@ pub const Server = struct {
             .created_at = std.time.timestamp(),
         };
 
-        const webhook_id = try self.webhook_database.insertWebhook(webhook);
+        const webhook_id = try self.webhook_database.?.insertWebhook(webhook);
 
         const response = try std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"message\":\"Webhook created\"}}", .{webhook_id});
         defer self.allocator.free(response);
@@ -674,6 +686,10 @@ pub const Server = struct {
     }
 
     fn handleUpdateWebhook(self: *Server, stream: std.net.Stream, webhook_id: u64, request: []const u8) !void {
+        if (self.webhook_database == null) {
+            return try self.sendJsonResponse(stream, 503, "{\"error\":\"Webhooks not enabled\"}");
+        }
+
         // Extract JSON body
         const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse std.mem.indexOf(u8, request, "\n\n") orelse {
             return try self.sendBadRequest(stream, "Invalid request format");
@@ -714,7 +730,7 @@ pub const Server = struct {
         const active: ?bool = if (obj.get("active")) |a| a.bool else null;
 
         // Update webhook
-        try self.webhook_database.updateWebhook(webhook_id, url, event_types, active);
+        try self.webhook_database.?.updateWebhook(webhook_id, url, event_types, active);
 
         // Cleanup event_types if allocated
         if (event_types) |et| {
@@ -728,7 +744,10 @@ pub const Server = struct {
     }
 
     fn handleDeleteWebhook(self: *Server, stream: std.net.Stream, webhook_id: u64) !void {
-        try self.webhook_database.deleteWebhook(webhook_id);
+        if (self.webhook_database == null) {
+            return try self.sendJsonResponse(stream, 503, "{\"error\":\"Webhooks not enabled\"}");
+        }
+        try self.webhook_database.?.deleteWebhook(webhook_id);
 
         const response = try std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"message\":\"Webhook deleted\"}}", .{webhook_id});
         defer self.allocator.free(response);

@@ -34,6 +34,7 @@ services:
       - STATUS_PORT=3001
       # Webhooks (optional)
       - WEBHOOKS_ENABLED=false
+      - WEBHOOK_DB_PATH=/app/data/webhooks.db
     healthcheck:
       test: ["CMD", "/app/healthcheck.sh"]
       interval: 30s
@@ -71,6 +72,8 @@ services:
       - API_PORT=5655
       - GRAPHQL_MAX_DEPTH=10
       - GRAPHQL_MAX_COST=1000
+      # Webhooks database
+      - WEBHOOK_DB_PATH=/app/data/webhooks.db
       # Metrics (optional)
       - METRICS_ENABLED=false
     depends_on:

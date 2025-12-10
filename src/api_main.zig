@@ -61,8 +61,9 @@ pub fn main() !void {
     }
 
     // Start API server with complexity limits and metrics from config
-    const webhook_db_path = "./data/webhooks.db";
-    var server = try api.Server.init(allocator, &database, webhook_db_path, cfg.api_port, cfg.graphql_max_depth, cfg.graphql_max_cost, cfg.metrics_enabled);
+    // Only pass webhook_db_path if webhooks are enabled
+    const webhook_path: ?[]const u8 = if (cfg.webhooks_enabled) cfg.webhook_db_path else null;
+    var server = try api.Server.init(allocator, &database, webhook_path, cfg.api_port, cfg.graphql_max_depth, cfg.graphql_max_cost, cfg.metrics_enabled);
     defer server.deinit();
 
     std.log.info("Ready to serve requests", .{});
