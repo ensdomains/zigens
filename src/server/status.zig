@@ -45,7 +45,7 @@ pub const StatusServer = struct {
 
     pub fn init(allocator: std.mem.Allocator, status: *IndexerStatus, port: u16) !*StatusServer {
         const self = try allocator.create(StatusServer);
-        const address = try std.net.Address.parseIp("127.0.0.1", port);
+        const address = try std.net.Address.parseIp("0.0.0.0", port);
 
         self.* = StatusServer{
             .allocator = allocator,
@@ -60,7 +60,7 @@ pub const StatusServer = struct {
 
     pub fn start(self: *StatusServer) !void {
         self.running.store(true, .seq_cst);
-        std.log.info("Status server listening on http://127.0.0.1:{d}/status", .{self.port});
+        std.log.info("Status server listening on http://0.0.0.0:{d}/status", .{self.port});
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
