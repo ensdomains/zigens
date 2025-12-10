@@ -212,6 +212,7 @@ pub const EventFilterOptions = struct {
     event_type: ?[]const u8 = null,
     event_types: ?[]const []const u8 = null,
     domain: ?[]const u8 = null,
+    contract_address: ?[]const u8 = null,
     namehash: ?[]const u8 = null,
     block_number_gt: ?i64 = null,
     block_number_lt: ?i64 = null,
@@ -258,6 +259,9 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     }
     if (filter.domain != null) {
         try conditions.append(db.allocator, "name = ?");
+    }
+    if (filter.contract_address != null) {
+        try conditions.append(db.allocator, "contract_address = ?");
     }
     if (filter.namehash != null) {
         try conditions.append(db.allocator, "namehash = ?");
@@ -329,6 +333,10 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     }
     if (filter.domain) |d| {
         _ = c.sqlite3_bind_text(stmt, param_idx, d.ptr, @intCast(d.len), SQLITE_TRANSIENT());
+        param_idx += 1;
+    }
+    if (filter.contract_address) |ca| {
+        _ = c.sqlite3_bind_text(stmt, param_idx, ca.ptr, @intCast(ca.len), SQLITE_TRANSIENT());
         param_idx += 1;
     }
     if (filter.namehash) |nh| {
