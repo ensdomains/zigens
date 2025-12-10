@@ -287,6 +287,15 @@ input DomainFilter {
 
   """Filter by resolved address"""
   resolvedAddress: String
+
+  """Filter by whether domain has direct subdomains (one level only)"""
+  hasSubdomains: Boolean
+
+  """Filter by direct subdomain count greater than (one level only)"""
+  subdomainCount_gt: Int
+
+  """Filter by direct subdomain count less than (one level only)"""
+  subdomainCount_lt: Int
 }
 
 """Filter criteria for querying registrations"""

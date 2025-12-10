@@ -66,14 +66,101 @@ pub const Server = struct {
     }
 
     fn handleConnection(self: *Server, connection: std.net.Server.Connection) !void {
-        // SECURITY: Fixed buffer size provides DoS protection by limiting request size to 4KB
-        // This prevents memory exhaustion attacks from extremely large requests
-        var buffer: [4096]u8 = undefined;
-        const bytes_read = try connection.stream.read(&buffer);
+        // Read headers first (up to 4KB for headers)
+        var header_buffer: [4096]u8 = undefined;
+        var total_header_bytes: usize = 0;
 
-        if (bytes_read == 0) return;
+        // Read until we find the end of headers (\r\n\r\n or \n\n)
+        while (total_header_bytes < header_buffer.len) {
+            const bytes_read = connection.stream.read(header_buffer[total_header_bytes..]) catch |err| {
+                std.log.warn("Error reading request: {}", .{err});
+                return;
+            };
+            if (bytes_read == 0) return;
+            total_header_bytes += bytes_read;
 
-        const request = buffer[0..bytes_read];
+            // Check if we have complete headers
+            if (std.mem.indexOf(u8, header_buffer[0..total_header_bytes], "\r\n\r\n") != null or
+                std.mem.indexOf(u8, header_buffer[0..total_header_bytes], "\n\n") != null)
+            {
+                break;
+            }
+        }
+
+        if (total_header_bytes == 0) return;
+
+        const header_data = header_buffer[0..total_header_bytes];
+
+        // Find end of headers
+        const header_end_crlf = std.mem.indexOf(u8, header_data, "\r\n\r\n");
+        const header_end_lf = std.mem.indexOf(u8, header_data, "\n\n");
+        const header_end = if (header_end_crlf) |pos| pos else if (header_end_lf) |pos| pos else {
+            return; // No complete headers found
+        };
+        const body_offset: usize = if (header_end_crlf != null) 4 else 2;
+
+        // Parse Content-Length from headers
+        var content_length: usize = 0;
+        var header_lines = std.mem.splitSequence(u8, header_data[0..header_end], "\r\n");
+        while (header_lines.next()) |line| {
+            if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
+                const value = std.mem.trim(u8, line["content-length:".len..], " \t");
+                content_length = std.fmt.parseInt(usize, value, 10) catch 0;
+                break;
+            }
+        }
+        // Also try \n separator
+        if (content_length == 0) {
+            var header_lines_lf = std.mem.splitScalar(u8, header_data[0..header_end], '\n');
+            while (header_lines_lf.next()) |line| {
+                const trimmed = std.mem.trimRight(u8, line, "\r");
+                if (std.ascii.startsWithIgnoreCase(trimmed, "content-length:")) {
+                    const value = std.mem.trim(u8, trimmed["content-length:".len..], " \t");
+                    content_length = std.fmt.parseInt(usize, value, 10) catch 0;
+                    break;
+                }
+            }
+        }
+
+        // SECURITY: Limit max body size to 64KB to prevent DoS
+        const max_body_size: usize = 65536;
+        if (content_length > max_body_size) {
+            try self.sendBadRequest(connection.stream, "Request body too large (max 64KB)");
+            return;
+        }
+
+        // Calculate how much body we already have in buffer
+        const body_start_in_buffer = header_end + body_offset;
+        const body_already_read = if (body_start_in_buffer < total_header_bytes)
+            total_header_bytes - body_start_in_buffer
+        else
+            0;
+
+        // Allocate full request buffer
+        const total_size = header_end + body_offset + content_length;
+        const request = self.allocator.alloc(u8, total_size) catch {
+            try self.sendBadRequest(connection.stream, "Out of memory");
+            return;
+        };
+        defer self.allocator.free(request);
+
+        // Copy what we have
+        @memcpy(request[0..total_header_bytes], header_data[0..total_header_bytes]);
+
+        // Read remaining body if needed
+        if (body_already_read < content_length) {
+            var remaining = content_length - body_already_read;
+            var offset = total_header_bytes;
+            while (remaining > 0) {
+                const bytes_read = connection.stream.read(request[offset..]) catch |err| {
+                    std.log.warn("Error reading request body: {}", .{err});
+                    return;
+                };
+                if (bytes_read == 0) break;
+                offset += bytes_read;
+                remaining -= @min(remaining, bytes_read);
+            }
+        }
 
         // Parse HTTP request line
         var lines = std.mem.splitScalar(u8, request, '\n');

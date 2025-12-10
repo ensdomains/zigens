@@ -175,6 +175,24 @@ pub fn build(b: *std.Build) void {
     const graphql_test_step = b.step("test-graphql", "Run GraphQL parser tests");
     graphql_test_step.dependOn(&run_graphql_tests.step);
 
+    // GraphQL feature tests (full coverage)
+    const graphql_features_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/api/graphql_features_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    graphql_features_tests.linkLibC();
+    graphql_features_tests.linkSystemLibrary("sqlite3");
+
+    const run_graphql_features_tests = b.addRunArtifact(graphql_features_tests);
+    const graphql_features_test_step = b.step("test-graphql-features", "Run all GraphQL feature tests");
+    graphql_features_test_step.dependOn(&run_graphql_features_tests.step);
+
+    // Also add to the main graphql test step
+    graphql_test_step.dependOn(&run_graphql_features_tests.step);
+
     // Filter logic tests
     const filter_tests = b.addTest(.{
         .root_module = b.createModule(.{

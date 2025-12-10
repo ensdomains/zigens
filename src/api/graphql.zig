@@ -1270,7 +1270,31 @@ pub const GraphQLHandler = struct {
         return response.toOwnedSlice(self.allocator);
     }
 
+    /// GraphQL error location (line and column in the query)
+    const ErrorLocation = struct {
+        line: u32,
+        column: u32,
+    };
+
+    /// Build a GraphQL spec-compliant error response
+    /// Format: {"errors":[{"message":"...", "locations":[...], "path":[...], "extensions":{...}}], "data":null}
     fn buildErrorResponse(self: *GraphQLHandler, message: []const u8) ![]u8 {
+        return self.buildErrorResponseFull(message, null, null, null);
+    }
+
+    /// Build a GraphQL error response with optional locations
+    fn buildErrorResponseWithLocation(self: *GraphQLHandler, message: []const u8, locations: ?[]const ErrorLocation) ![]u8 {
+        return self.buildErrorResponseFull(message, locations, null, null);
+    }
+
+    /// Build a full GraphQL spec-compliant error response with all optional fields
+    fn buildErrorResponseFull(
+        self: *GraphQLHandler,
+        message: []const u8,
+        locations: ?[]const ErrorLocation,
+        path: ?[]const []const u8,
+        extensions: ?[]const u8,
+    ) ![]u8 {
         var response: std.ArrayList(u8) = .{};
         errdefer response.deinit(self.allocator);
 
@@ -1278,7 +1302,61 @@ pub const GraphQLHandler = struct {
         defer self.allocator.free(message_escaped);
 
         const writer = response.writer(self.allocator);
-        try writer.print("{{\"errors\":[{{\"message\":\"{s}\"}}]}}", .{message_escaped});
+
+        // Start errors array
+        try writer.writeAll("{\"errors\":[{\"message\":\"");
+        try writer.writeAll(message_escaped);
+        try writer.writeAll("\"");
+
+        // Add locations if provided
+        if (locations) |locs| {
+            try writer.writeAll(",\"locations\":[");
+            for (locs, 0..) |loc, i| {
+                if (i > 0) try writer.writeAll(",");
+                try writer.print("{{\"line\":{d},\"column\":{d}}}", .{ loc.line, loc.column });
+            }
+            try writer.writeAll("]");
+        }
+
+        // Add path if provided
+        if (path) |p| {
+            try writer.writeAll(",\"path\":[");
+            for (p, 0..) |segment, i| {
+                if (i > 0) try writer.writeAll(",");
+                const escaped_segment = try escapeJsonString(self.allocator, segment);
+                defer self.allocator.free(escaped_segment);
+                try writer.print("\"{s}\"", .{escaped_segment});
+            }
+            try writer.writeAll("]");
+        }
+
+        // Add extensions if provided
+        if (extensions) |ext| {
+            try writer.writeAll(",\"extensions\":");
+            try writer.writeAll(ext);
+        }
+
+        // Close error object and array, add null data
+        try writer.writeAll("}],\"data\":null}");
+
+        return response.toOwnedSlice(self.allocator);
+    }
+
+    /// Build a multi-error response (for multiple errors in one query)
+    fn buildMultiErrorResponse(self: *GraphQLHandler, errors: []const []const u8) ![]u8 {
+        var response: std.ArrayList(u8) = .{};
+        errdefer response.deinit(self.allocator);
+
+        const writer = response.writer(self.allocator);
+
+        try writer.writeAll("{\"errors\":[");
+        for (errors, 0..) |err_msg, i| {
+            if (i > 0) try writer.writeAll(",");
+            const escaped = try escapeJsonString(self.allocator, err_msg);
+            defer self.allocator.free(escaped);
+            try writer.print("{{\"message\":\"{s}\"}}", .{escaped});
+        }
+        try writer.writeAll("],\"data\":null}");
 
         return response.toOwnedSlice(self.allocator);
     }
@@ -1393,6 +1471,9 @@ pub const Schema = struct {
         \\  name_contains: String
         \\  owner: String
         \\  resolvedAddress: String
+        \\  hasSubdomains: Boolean
+        \\  subdomainCount_gt: Int
+        \\  subdomainCount_lt: Int
         \\}
         \\
         \\input RegistrationFilter {
@@ -1425,6 +1506,9 @@ fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) !par
     var filter_owner: ?Address = null;
     var filter_owner_in: ?[]Address = null;
     var filter_resolved_address: ?Address = null;
+    var filter_has_subdomains: ?bool = null;
+    var filter_subdomain_count_gt: ?i64 = null;
+    var filter_subdomain_count_lt: ?i64 = null;
 
     // Look for "where" argument
     for (field.arguments) |arg| {
@@ -1472,6 +1556,18 @@ fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) !par
                             }
                             filter_owner_in = try addresses.toOwnedSlice(allocator);
                         }
+                    } else if (std.mem.eql(u8, filter_arg.name, "hasSubdomains")) {
+                        if (filter_arg.value == .boolean) {
+                            filter_has_subdomains = filter_arg.value.boolean;
+                        }
+                    } else if (std.mem.eql(u8, filter_arg.name, "subdomainCount_gt")) {
+                        if (filter_arg.value == .int) {
+                            filter_subdomain_count_gt = filter_arg.value.int;
+                        }
+                    } else if (std.mem.eql(u8, filter_arg.name, "subdomainCount_lt")) {
+                        if (filter_arg.value == .int) {
+                            filter_subdomain_count_lt = filter_arg.value.int;
+                        }
                     }
                 }
             }
@@ -1498,7 +1594,8 @@ fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) !par
     // Get names from database (fetch more than needed for filtering)
     const fetch_limit = if (filter_name != null or filter_name_contains != null or filter_name_contains_nocase != null or
         filter_name_starts_with != null or filter_name_ends_with != null or filter_owner != null or
-        filter_owner_in != null or filter_resolved_address != null)
+        filter_owner_in != null or filter_resolved_address != null or
+        filter_has_subdomains != null or filter_subdomain_count_gt != null or filter_subdomain_count_lt != null)
         @min(first * 10, 1000) // Fetch more if we need to filter
     else
         first;
@@ -1631,6 +1728,39 @@ fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) !par
             if (!found) matches = false;
         }
 
+        // Filter by hasSubdomains - only counts direct children (one level down)
+        if (matches and filter_has_subdomains != null) {
+            if (name.name) |domain_name| {
+                const has_subs = try database.hasDirectSubdomains(domain_name);
+                if (filter_has_subdomains.? != has_subs) matches = false;
+            } else {
+                // Domain without a name can't have subdomains checked
+                if (filter_has_subdomains.?) matches = false;
+            }
+        }
+
+        // Filter by subdomainCount_gt - only counts direct children (one level down)
+        if (matches and filter_subdomain_count_gt != null) {
+            if (name.name) |domain_name| {
+                const subdomain_count = try database.countDirectSubdomains(domain_name);
+                if (subdomain_count <= @as(u32, @intCast(filter_subdomain_count_gt.?))) matches = false;
+            } else {
+                // Domain without a name has 0 subdomains
+                matches = false;
+            }
+        }
+
+        // Filter by subdomainCount_lt - only counts direct children (one level down)
+        if (matches and filter_subdomain_count_lt != null) {
+            if (name.name) |domain_name| {
+                const subdomain_count = try database.countDirectSubdomains(domain_name);
+                if (subdomain_count >= @as(u32, @intCast(filter_subdomain_count_lt.?))) matches = false;
+            } else {
+                // Domain without a name has 0 subdomains - always passes lt filter unless lt=0
+                if (filter_subdomain_count_lt.? <= 0) matches = false;
+            }
+        }
+
         if (matches) {
             try filtered_names.append(allocator, name);
         }
@@ -1724,7 +1854,11 @@ fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parser.Fi
 
     // Fetch one extra item to determine hasNextPage/hasPreviousPage
     const fetch_limit = params.limit + 1;
-    const names = try database.getAllNames(null, skip, @intCast(fetch_limit));
+
+    // For backward pagination (last/before), reverse the query order
+    // This ensures we get the "last N items" from the end of the result set
+    const order_dir: db.OrderDir = if (params.direction == .backward) .asc else .desc;
+    const names = try database.getAllNamesWithOrder(null, skip, @intCast(fetch_limit), order_dir);
     defer {
         for (names) |*name| {
             name.deinit(allocator);
@@ -1734,6 +1868,13 @@ fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parser.Fi
 
     // Determine actual items to return (exclude the extra item)
     const actual_items = @min(names.len, params.limit);
+
+    // For backward pagination, reverse the results to maintain proper edge order
+    // (Query returned oldest-first, but we want newest-first in the edges)
+    if (params.direction == .backward and actual_items > 1) {
+        std.mem.reverse(models.Name, names[0..actual_items]);
+    }
+
     const items_slice = names[0..actual_items];
 
     // Build connection using pagination module
@@ -1882,7 +2023,10 @@ fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const par
 
     // Fetch one extra item to determine hasNextPage/hasPreviousPage
     const fetch_limit = params.limit + 1;
-    const events = try database.getRecentEvents(null, .name_registered, @intCast(fetch_limit));
+
+    // For backward pagination (last/before), reverse the query order
+    const order_dir: db.EventOrderDir = if (params.direction == .backward) .asc else .desc;
+    const events = try database.getRecentEventsWithOrder(null, .name_registered, @intCast(fetch_limit), order_dir);
     defer {
         for (events) |*event| {
             event.deinit(allocator);
@@ -1892,6 +2036,12 @@ fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const par
 
     // Determine actual items to return
     const actual_items = @min(events.len, params.limit);
+
+    // For backward pagination, reverse the results to maintain proper edge order
+    if (params.direction == .backward and actual_items > 1) {
+        std.mem.reverse(models.Event, events[0..actual_items]);
+    }
+
     const items_slice = events[0..actual_items];
 
     // Wrapper type for registrations
@@ -2040,7 +2190,10 @@ fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser.Fie
 
     // Fetch one extra item to determine hasNextPage/hasPreviousPage
     const fetch_limit = params.limit + 1;
-    const events = try database.getRecentEvents(null, null, @intCast(fetch_limit));
+
+    // For backward pagination (last/before), reverse the query order
+    const order_dir: db.EventOrderDir = if (params.direction == .backward) .asc else .desc;
+    const events = try database.getRecentEventsWithOrder(null, null, @intCast(fetch_limit), order_dir);
     defer {
         for (events) |*event| {
             event.deinit(allocator);
@@ -2050,6 +2203,12 @@ fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser.Fie
 
     // Determine actual items to return
     const actual_items = @min(events.len, params.limit);
+
+    // For backward pagination, reverse the results to maintain proper edge order
+    if (params.direction == .backward and actual_items > 1) {
+        std.mem.reverse(models.Event, events[0..actual_items]);
+    }
+
     const items_slice = events[0..actual_items];
 
     // Wrapper type for events
@@ -2754,10 +2913,13 @@ fn buildAccountJson(
     for (selections) |*field| {
         if (!first) try writer.writeAll(",");
 
+        // Use alias if provided, otherwise use field name (GraphQL spec compliance)
+        const output_key = field.alias orelse field.name;
+
         if (std.mem.eql(u8, field.name, "id")) {
             const addr_hex = try address.toHex(ctx.allocator);
             defer ctx.allocator.free(addr_hex);
-            try writer.print("\"id\":\"{s}\"", .{addr_hex});
+            try writer.print("\"{s}\":\"{s}\"", .{ output_key, addr_hex });
             first = false;
         } else if (std.mem.eql(u8, field.name, "domains")) {
             // Nested query: fetch domains owned by this account
@@ -2772,7 +2934,7 @@ fn buildAccountJson(
                 ctx.allocator.free(domains);
             }
 
-            try writer.writeAll("\"domains\":[");
+            try writer.print("\"{s}\":[", .{output_key});
             for (domains, 0..) |*domain, i| {
                 if (i > 0) try writer.writeAll(",");
                 const domain_json = try buildDomainJson(domain, field.selections, .{
@@ -2802,7 +2964,7 @@ fn buildAccountJson(
             const account_hex = try address.toHex(ctx.allocator);
             defer ctx.allocator.free(account_hex);
 
-            try writer.writeAll("\"registrations\":[");
+            try writer.print("\"{s}\":[", .{output_key});
             var count: usize = 0;
             for (all_events) |*event| {
                 if (count >= first_arg) break;
@@ -2869,27 +3031,30 @@ fn buildDomainJson(
     for (selections) |*field| {
         if (!first) try writer.writeAll(",");
 
+        // Use alias if provided, otherwise use field name (GraphQL spec compliance)
+        const output_key = field.alias orelse field.name;
+
         if (std.mem.eql(u8, field.name, "id") or std.mem.eql(u8, field.name, "name")) {
             const escaped = try escapeJsonString(ctx.allocator, domain.name orelse "[unknown]");
             defer ctx.allocator.free(escaped);
-            try writer.print("\"{s}\":\"{s}\"", .{ field.name, escaped });
+            try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
             first = false;
         } else if (std.mem.eql(u8, field.name, "labelName")) {
             const escaped = try escapeJsonString(ctx.allocator, domain.label orelse "[unknown]");
             defer ctx.allocator.free(escaped);
-            try writer.print("\"labelName\":\"{s}\"", .{escaped});
+            try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
             first = false;
         } else if (std.mem.eql(u8, field.name, "labelhash")) {
             const hash_hex = try domain.label_hash.toHex(ctx.allocator);
             defer ctx.allocator.free(hash_hex);
-            try writer.print("\"labelhash\":\"{s}\"", .{hash_hex});
+            try writer.print("\"{s}\":\"{s}\"", .{ output_key, hash_hex });
             first = false;
         } else if (std.mem.eql(u8, field.name, "expiryDate")) {
-            try writer.print("\"expiryDate\":{d}", .{domain.expiry});
+            try writer.print("\"{s}\":{d}", .{ output_key, domain.expiry });
             first = false;
         } else if (std.mem.eql(u8, field.name, "owner")) {
             // Nested Account object
-            try writer.writeAll("\"owner\":");
+            try writer.print("\"{s}\":", .{output_key});
             const owner_json = try buildAccountJson(domain.owner, field.selections, .{
                 .database = ctx.database,
                 .depth = ctx.depth + 1,
@@ -2900,7 +3065,7 @@ fn buildDomainJson(
             first = false;
         } else if (std.mem.eql(u8, field.name, "resolver")) {
             // Nested Resolver object
-            try writer.writeAll("\"resolver\":");
+            try writer.print("\"{s}\":", .{output_key});
             if (!domain.resolver.isZero()) {
                 const resolver_json = try buildResolverJson(domain.resolver, domain.namehash, field.selections, .{
                     .database = ctx.database,
@@ -2916,24 +3081,24 @@ fn buildDomainJson(
         } else if (std.mem.eql(u8, field.name, "tokenId")) {
             const token_id_hex = try std.fmt.allocPrint(ctx.allocator, "0x{x}", .{domain.token_id});
             defer ctx.allocator.free(token_id_hex);
-            try writer.print("\"tokenId\":\"{s}\"", .{token_id_hex});
+            try writer.print("\"{s}\":\"{s}\"", .{ output_key, token_id_hex });
             first = false;
         } else if (std.mem.eql(u8, field.name, "canonicalId")) {
             const canonical_hex = try std.fmt.allocPrint(ctx.allocator, "0x{x}", .{domain.canonical_id});
             defer ctx.allocator.free(canonical_hex);
-            try writer.print("\"canonicalId\":\"{s}\"", .{canonical_hex});
+            try writer.print("\"{s}\":\"{s}\"", .{ output_key, canonical_hex });
             first = false;
         } else if (std.mem.eql(u8, field.name, "tokenVersion")) {
-            try writer.print("\"tokenVersion\":{d}", .{domain.token_version});
+            try writer.print("\"{s}\":{d}", .{ output_key, domain.token_version });
             first = false;
         } else if (std.mem.eql(u8, field.name, "isMigrated")) {
-            try writer.print("\"isMigrated\":{s}", .{if (domain.migrated) "true" else "false"});
+            try writer.print("\"{s}\":{s}", .{ output_key, if (domain.migrated) "true" else "false" });
             first = false;
         } else if (std.mem.eql(u8, field.name, "createdAt")) {
-            try writer.print("\"createdAt\":{d}", .{domain.created_at});
+            try writer.print("\"{s}\":{d}", .{ output_key, domain.created_at });
             first = false;
         } else if (std.mem.eql(u8, field.name, "registrationDate")) {
-            try writer.print("\"registrationDate\":{d}", .{domain.created_at});
+            try writer.print("\"{s}\":{d}", .{ output_key, domain.created_at });
             first = false;
         } else if (std.mem.eql(u8, field.name, "normalizedName")) {
             // Compute ENSIP-15 normalized name on-the-fly
@@ -2942,13 +3107,13 @@ fn buildDomainJson(
                     defer ctx.allocator.free(normalized);
                     const escaped = try escapeJsonString(ctx.allocator, normalized);
                     defer ctx.allocator.free(escaped);
-                    try writer.print("\"normalizedName\":\"{s}\"", .{escaped});
+                    try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
                 } else |_| {
                     // Normalization failed - name is not ENSIP-15 compliant
-                    try writer.writeAll("\"normalizedName\":null");
+                    try writer.print("\"{s}\":null", .{output_key});
                 }
             } else {
-                try writer.writeAll("\"normalizedName\":null");
+                try writer.print("\"{s}\":null", .{output_key});
             }
             first = false;
         } else if (std.mem.eql(u8, field.name, "isNormalized")) {
@@ -2958,19 +3123,19 @@ fn buildDomainJson(
                     defer ctx.allocator.free(normalized);
                     // Name is normalized if it equals its normalized form
                     const is_normalized = std.mem.eql(u8, name, normalized);
-                    try writer.print("\"isNormalized\":{s}", .{if (is_normalized) "true" else "false"});
+                    try writer.print("\"{s}\":{s}", .{ output_key, if (is_normalized) "true" else "false" });
                 } else |_| {
                     // Normalization failed - definitely not normalized
-                    try writer.writeAll("\"isNormalized\":false");
+                    try writer.print("\"{s}\":false", .{output_key});
                 }
             } else {
                 // No name - consider not normalized
-                try writer.writeAll("\"isNormalized\":false");
+                try writer.print("\"{s}\":false", .{output_key});
             }
             first = false;
         } else if (std.mem.eql(u8, field.name, "parent")) {
             // Nested parent Domain
-            try writer.writeAll("\"parent\":");
+            try writer.print("\"{s}\":", .{output_key});
             if (!domain.parent_namehash.isZero()) {
                 const parent_opt = try ctx.database.getNameByNamehash(domain.parent_namehash);
                 if (parent_opt) |parent| {
@@ -3005,7 +3170,7 @@ fn buildDomainJson(
                 ctx.allocator.free(all_names);
             }
 
-            try writer.writeAll("\"subdomains\":[");
+            try writer.print("\"{s}\":[", .{output_key});
             var count: usize = 0;
             for (all_names) |*subdomain| {
                 if (count >= first_arg) break;
@@ -3060,10 +3225,13 @@ fn buildResolverJson(
     for (selections) |*field| {
         if (!first) try writer.writeAll(",");
 
+        // Use alias if provided, otherwise use field name (GraphQL spec compliance)
+        const output_key = field.alias orelse field.name;
+
         if (std.mem.eql(u8, field.name, "id") or std.mem.eql(u8, field.name, "address")) {
             const addr_hex = try resolver.toHex(ctx.allocator);
             defer ctx.allocator.free(addr_hex);
-            try writer.print("\"{s}\":\"{s}\"", .{ field.name, addr_hex });
+            try writer.print("\"{s}\":\"{s}\"", .{ output_key, addr_hex });
             first = false;
         } else if (std.mem.eql(u8, field.name, "addr")) {
             // Fetch ETH address (coin type 60)
@@ -3072,9 +3240,9 @@ fn buildResolverJson(
                 defer ctx.allocator.free(addr);
                 const escaped = try escapeJsonString(ctx.allocator, addr);
                 defer ctx.allocator.free(escaped);
-                try writer.print("\"addr\":\"{s}\"", .{escaped});
+                try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
             } else {
-                try writer.writeAll("\"addr\":null");
+                try writer.print("\"{s}\":null", .{output_key});
             }
             first = false;
         } else if (std.mem.eql(u8, field.name, "contentHash")) {
@@ -3084,9 +3252,9 @@ fn buildResolverJson(
                 defer ctx.allocator.free(hash);
                 const escaped = try escapeJsonString(ctx.allocator, hash);
                 defer ctx.allocator.free(escaped);
-                try writer.print("\"contentHash\":\"{s}\"", .{escaped});
+                try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
             } else {
-                try writer.writeAll("\"contentHash\":null");
+                try writer.print("\"{s}\":null", .{output_key});
             }
             first = false;
         } else if (std.mem.eql(u8, field.name, "texts")) {
@@ -3098,7 +3266,7 @@ fn buildResolverJson(
                 }
                 ctx.allocator.free(text_keys);
             }
-            try writer.writeAll("\"texts\":[");
+            try writer.print("\"{s}\":[", .{output_key});
             for (text_keys, 0..) |key, i| {
                 if (i > 0) try writer.writeAll(",");
                 const escaped = try escapeJsonString(ctx.allocator, key);
@@ -3127,12 +3295,12 @@ fn buildResolverJson(
                 if (text_value) |val| {
                     const escaped = try escapeJsonString(ctx.allocator, val);
                     defer ctx.allocator.free(escaped);
-                    try writer.print("\"text\":\"{s}\"", .{escaped});
+                    try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
                 } else {
-                    try writer.writeAll("\"text\":null");
+                    try writer.print("\"{s}\":null", .{output_key});
                 }
             } else {
-                try writer.writeAll("\"text\":null");
+                try writer.print("\"{s}\":null", .{output_key});
             }
             first = false;
         }
@@ -3163,11 +3331,14 @@ fn buildRegistrationJson(
     for (selections) |*field| {
         if (!first) try writer.writeAll(",");
 
+        // Use alias if provided, otherwise use field name (GraphQL spec compliance)
+        const output_key = field.alias orelse field.name;
+
         if (std.mem.eql(u8, field.name, "name") or std.mem.eql(u8, field.name, "id")) {
             if (event.name) |n| {
                 const escaped = try escapeJsonString(ctx.allocator, n);
                 defer ctx.allocator.free(escaped);
-                try writer.print("\"{s}\":\"{s}\"", .{ field.name, escaped });
+                try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
                 first = false;
             }
         } else if (std.mem.eql(u8, field.name, "domain")) {
@@ -3177,7 +3348,7 @@ fn buildRegistrationJson(
                 if (domain_opt) |domain| {
                     var domain_mut = domain;
                     defer domain_mut.deinit(ctx.allocator);
-                    try writer.writeAll("\"domain\":");
+                    try writer.print("\"{s}\":", .{output_key});
                     const domain_json = try buildDomainJson(&domain_mut, field.selections, .{
                         .database = ctx.database,
                         .depth = ctx.depth + 1,
@@ -3189,15 +3360,15 @@ fn buildRegistrationJson(
                 }
             }
         } else if (std.mem.eql(u8, field.name, "registrationDate")) {
-            try writer.print("\"registrationDate\":{d}", .{event.timestamp});
+            try writer.print("\"{s}\":{d}", .{ output_key, event.timestamp });
             first = false;
         } else if (std.mem.eql(u8, field.name, "expiryDate")) {
-            try writer.print("\"expiryDate\":{d}", .{event.timestamp + 31536000}); // +1 year placeholder
+            try writer.print("\"{s}\":{d}", .{ output_key, event.timestamp + 31536000 }); // +1 year placeholder
             first = false;
         } else if (std.mem.eql(u8, field.name, "registrant")) {
             // Parse event.data JSON to extract the owner (registrant) address
             const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, event.data, .{}) catch {
-                try writer.writeAll("\"registrant\":null");
+                try writer.print("\"{s}\":null", .{output_key});
                 first = false;
                 continue;
             };
@@ -3211,12 +3382,12 @@ fn buildRegistrationJson(
             if (owner_str) |owner| {
                 // Parse the owner address and build nested Account object
                 const owner_addr = Address.fromHex(owner) catch {
-                    try writer.writeAll("\"registrant\":null");
+                    try writer.print("\"{s}\":null", .{output_key});
                     first = false;
                     continue;
                 };
 
-                try writer.writeAll("\"registrant\":");
+                try writer.print("\"{s}\":", .{output_key});
                 const registrant_json = try buildAccountJson(owner_addr, field.selections, .{
                     .database = ctx.database,
                     .depth = ctx.depth + 1,
@@ -3225,7 +3396,7 @@ fn buildRegistrationJson(
                 defer ctx.allocator.free(registrant_json);
                 try writer.writeAll(registrant_json);
             } else {
-                try writer.writeAll("\"registrant\":null");
+                try writer.print("\"{s}\":null", .{output_key});
             }
             first = false;
         }
@@ -3256,24 +3427,27 @@ fn buildEventJson(
     for (selections) |*field| {
         if (!first) try writer.writeAll(",");
 
+        // Use alias if provided, otherwise use field name (GraphQL spec compliance)
+        const output_key = field.alias orelse field.name;
+
         if (std.mem.eql(u8, field.name, "id")) {
             const tx_hash = try event.tx_hash.toHex(ctx.allocator);
             defer ctx.allocator.free(tx_hash);
-            try writer.print("\"id\":\"{s}-{d}\"", .{ tx_hash, event.log_index });
+            try writer.print("\"{s}\":\"{s}-{d}\"", .{ output_key, tx_hash, event.log_index });
             first = false;
         } else if (std.mem.eql(u8, field.name, "type")) {
-            try writer.print("\"type\":\"{s}\"", .{event.event_type.toString()});
+            try writer.print("\"{s}\":\"{s}\"", .{ output_key, event.event_type.toString() });
             first = false;
         } else if (std.mem.eql(u8, field.name, "blockNumber")) {
-            try writer.print("\"blockNumber\":{d}", .{event.block_number});
+            try writer.print("\"{s}\":{d}", .{ output_key, event.block_number });
             first = false;
         } else if (std.mem.eql(u8, field.name, "transactionHash")) {
             const tx_hash = try event.tx_hash.toHex(ctx.allocator);
             defer ctx.allocator.free(tx_hash);
-            try writer.print("\"transactionHash\":\"{s}\"", .{tx_hash});
+            try writer.print("\"{s}\":\"{s}\"", .{ output_key, tx_hash });
             first = false;
         } else if (std.mem.eql(u8, field.name, "timestamp")) {
-            try writer.print("\"timestamp\":{d}", .{event.timestamp});
+            try writer.print("\"{s}\":{d}", .{ output_key, event.timestamp });
             first = false;
         } else if (std.mem.eql(u8, field.name, "domain")) {
             // Nested Domain object
@@ -3282,7 +3456,7 @@ fn buildEventJson(
                 if (domain_opt) |domain| {
                     var domain_mut = domain;
                     defer domain_mut.deinit(ctx.allocator);
-                    try writer.writeAll("\"domain\":");
+                    try writer.print("\"{s}\":", .{output_key});
                     const domain_json = try buildDomainJson(&domain_mut, field.selections, .{
                         .database = ctx.database,
                         .depth = ctx.depth + 1,
@@ -3292,11 +3466,11 @@ fn buildEventJson(
                     try writer.writeAll(domain_json);
                     first = false;
                 } else {
-                    try writer.writeAll("\"domain\":null");
+                    try writer.print("\"{s}\":null", .{output_key});
                     first = false;
                 }
             } else {
-                try writer.writeAll("\"domain\":null");
+                try writer.print("\"{s}\":null", .{output_key});
                 first = false;
             }
         }
@@ -3310,7 +3484,9 @@ fn buildEventJson(
 const FieldHandler = struct {
     /// Called for each requested field, should append JSON value to writer
     /// Returns true if field was handled, false if field is unknown
-    handleFn: *const fn (ctx: *anyopaque, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) anyerror!bool,
+    /// output_key: the alias if provided, otherwise field_name (use this for JSON keys)
+    /// field_name: the actual field name (use this for field matching logic)
+    handleFn: *const fn (ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) anyerror!bool,
     context: *anyopaque,
 };
 
@@ -3327,12 +3503,15 @@ fn buildJsonWithFields(
 
     var first = true;
     for (selections) |*field| {
+        // Use alias if provided, otherwise use field name (GraphQL spec compliance)
+        const output_key = field.alias orelse field.name;
+
         // Create a temporary buffer for this field
         var field_json: std.ArrayList(u8) = .{};
         defer field_json.deinit(allocator);
 
         // Try to handle the field in the temporary buffer
-        const handled = try handler.handleFn(handler.context, field.name, field_json.writer(allocator), allocator);
+        const handled = try handler.handleFn(handler.context, output_key, field.name, field_json.writer(allocator), allocator);
         if (handled) {
             if (!first) {
                 try json.appendSlice(allocator, ",");
@@ -3347,297 +3526,297 @@ fn buildJsonWithFields(
 }
 
 /// Name field handler
-fn handleNameField(ctx: *anyopaque, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn handleNameField(ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
     const name: *const models.Name = @ptrCast(@alignCast(ctx));
 
     if (std.mem.eql(u8, field_name, "id") or std.mem.eql(u8, field_name, "name")) {
         const escaped = try escapeJsonString(allocator, name.name);
         defer allocator.free(escaped);
-        try writer.print("\"{s}\":\"{s}\"", .{ field_name, escaped });
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         return true;
     } else if (std.mem.eql(u8, field_name, "owner")) {
         const owner_hex = try name.owner.toHex(allocator);
         defer allocator.free(owner_hex);
-        try writer.print("\"owner\":{{\"id\":\"{s}\"}}", .{owner_hex});
+        try writer.print("\"{s}\":{{\"id\":\"{s}\"}}", .{ output_key, owner_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "resolver")) {
         const resolver_hex = try name.resolver.toHex(allocator);
         defer allocator.free(resolver_hex);
         if (!name.resolver.isZero()) {
-            try writer.print("\"resolver\":{{\"address\":\"{s}\"}}", .{resolver_hex});
+            try writer.print("\"{s}\":{{\"address\":\"{s}\"}}", .{ output_key, resolver_hex });
         } else {
-            try writer.writeAll("\"resolver\":null");
+            try writer.print("\"{s}\":null", .{output_key});
         }
         return true;
     } else if (std.mem.eql(u8, field_name, "labelName")) {
         const escaped = try escapeJsonString(allocator, name.label);
         defer allocator.free(escaped);
-        try writer.print("\"labelName\":\"{s}\"", .{escaped});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         return true;
     } else if (std.mem.eql(u8, field_name, "labelhash")) {
         const hash_hex = try name.label_hash.toHex(allocator);
         defer allocator.free(hash_hex);
-        try writer.print("\"labelhash\":\"{s}\"", .{hash_hex});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, hash_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "expiryDate")) {
-        try writer.print("\"expiryDate\":{d}", .{name.expiry});
+        try writer.print("\"{s}\":{d}", .{ output_key, name.expiry });
         return true;
     }
     return false;
 }
 
 /// Event field handler
-fn handleEventField(ctx: *anyopaque, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn handleEventField(ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
     const event: *const models.Event = @ptrCast(@alignCast(ctx));
 
     if (std.mem.eql(u8, field_name, "id")) {
         const tx_hash = try event.tx_hash.toHex(allocator);
         defer allocator.free(tx_hash);
-        try writer.print("\"id\":\"{s}-{d}\"", .{ tx_hash, event.log_index });
+        try writer.print("\"{s}\":\"{s}-{d}\"", .{ output_key, tx_hash, event.log_index });
         return true;
     } else if (std.mem.eql(u8, field_name, "type")) {
-        try writer.print("\"type\":\"{s}\"", .{event.event_type.toString()});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, event.event_type.toString() });
         return true;
     } else if (std.mem.eql(u8, field_name, "blockNumber")) {
-        try writer.print("\"blockNumber\":{d}", .{event.block_number});
+        try writer.print("\"{s}\":{d}", .{ output_key, event.block_number });
         return true;
     } else if (std.mem.eql(u8, field_name, "transactionHash")) {
         const tx_hash = try event.tx_hash.toHex(allocator);
         defer allocator.free(tx_hash);
-        try writer.print("\"transactionHash\":\"{s}\"", .{tx_hash});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, tx_hash });
         return true;
     } else if (std.mem.eql(u8, field_name, "timestamp")) {
-        try writer.print("\"timestamp\":{d}", .{event.timestamp});
+        try writer.print("\"{s}\":{d}", .{ output_key, event.timestamp });
         return true;
     } else if (std.mem.eql(u8, field_name, "name")) {
         if (event.name) |n| {
             const escaped = try escapeJsonString(allocator, n);
             defer allocator.free(escaped);
-            try writer.print("\"name\":\"{s}\"", .{escaped});
+            try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         } else {
-            try writer.writeAll("\"name\":null");
+            try writer.print("\"{s}\":null", .{output_key});
         }
         return true;
     } else if (std.mem.eql(u8, field_name, "namehash")) {
         if (event.namehash) |nh| {
             const hash_hex = try nh.toHex(allocator);
             defer allocator.free(hash_hex);
-            try writer.print("\"namehash\":\"{s}\"", .{hash_hex});
+            try writer.print("\"{s}\":\"{s}\"", .{ output_key, hash_hex });
         } else {
-            try writer.writeAll("\"namehash\":null");
+            try writer.print("\"{s}\":null", .{output_key});
         }
         return true;
     } else if (std.mem.eql(u8, field_name, "contractAddress")) {
         const addr_hex = try event.contract_address.toHex(allocator);
         defer allocator.free(addr_hex);
-        try writer.print("\"contractAddress\":\"{s}\"", .{addr_hex});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, addr_hex });
         return true;
     }
     return false;
 }
 
 /// Registration field handler
-fn handleRegistrationField(ctx: *anyopaque, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn handleRegistrationField(ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
     const event: *const models.Event = @ptrCast(@alignCast(ctx));
 
     if (std.mem.eql(u8, field_name, "name") or std.mem.eql(u8, field_name, "id")) {
         if (event.name) |n| {
             const escaped = try escapeJsonString(allocator, n);
             defer allocator.free(escaped);
-            try writer.print("\"{s}\":\"{s}\"", .{ field_name, escaped });
+            try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         } else {
-            try writer.print("\"{s}\":null", .{field_name});
+            try writer.print("\"{s}\":null", .{output_key});
         }
         return true;
     } else if (std.mem.eql(u8, field_name, "block") or std.mem.eql(u8, field_name, "blockNumber")) {
-        try writer.print("\"block\":{d}", .{event.block_number});
+        try writer.print("\"{s}\":{d}", .{ output_key, event.block_number });
         return true;
     } else if (std.mem.eql(u8, field_name, "timestamp")) {
-        try writer.print("\"timestamp\":{d}", .{event.timestamp});
+        try writer.print("\"{s}\":{d}", .{ output_key, event.timestamp });
         return true;
     }
     return false;
 }
 
 /// EAC Role Assignment field handler
-fn handleEACRoleField(ctx: *anyopaque, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn handleEACRoleField(ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
     const role: *const models.EACRoleAssignment = @ptrCast(@alignCast(ctx));
 
     if (std.mem.eql(u8, field_name, "id")) {
-        try writer.print("\"id\":\"{d}\"", .{role.id});
+        try writer.print("\"{s}\":\"{d}\"", .{ output_key, role.id });
         return true;
     } else if (std.mem.eql(u8, field_name, "resource")) {
         const escaped = try escapeJsonString(allocator, role.resource);
         defer allocator.free(escaped);
-        try writer.print("\"resource\":\"{s}\"", .{escaped});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         return true;
     } else if (std.mem.eql(u8, field_name, "account")) {
         const account_hex = try role.account.toHex(allocator);
         defer allocator.free(account_hex);
-        try writer.print("\"account\":\"{s}\"", .{account_hex});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, account_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "roleBitmap")) {
         const escaped = try escapeJsonString(allocator, role.role_bitmap);
         defer allocator.free(escaped);
-        try writer.print("\"roleBitmap\":\"{s}\"", .{escaped});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         return true;
     } else if (std.mem.eql(u8, field_name, "blockNumber")) {
-        try writer.print("\"blockNumber\":{d}", .{role.block_number});
+        try writer.print("\"{s}\":{d}", .{ output_key, role.block_number });
         return true;
     } else if (std.mem.eql(u8, field_name, "transactionHash")) {
         const tx_hex = try role.tx_hash.toHex(allocator);
         defer allocator.free(tx_hex);
-        try writer.print("\"transactionHash\":\"{s}\"", .{tx_hex});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, tx_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "timestamp")) {
-        try writer.print("\"timestamp\":{d}", .{role.timestamp});
+        try writer.print("\"{s}\":{d}", .{ output_key, role.timestamp });
         return true;
     }
     return false;
 }
 
 /// Resolver field handler
-fn handleResolverField(ctx: *anyopaque, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn handleResolverField(ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
     const resolver: *const models.Resolver = @ptrCast(@alignCast(ctx));
 
     if (std.mem.eql(u8, field_name, "address")) {
         const addr_hex = try resolver.address.toHex(allocator);
         defer allocator.free(addr_hex);
-        try writer.print("\"address\":\"{s}\"", .{addr_hex});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, addr_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "name")) {
         const escaped = try escapeJsonString(allocator, resolver.name);
         defer allocator.free(escaped);
-        try writer.print("\"name\":\"{s}\"", .{escaped});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         return true;
     } else if (std.mem.eql(u8, field_name, "namehash")) {
         const hash_hex = try resolver.namehash.toHex(allocator);
         defer allocator.free(hash_hex);
-        try writer.print("\"namehash\":\"{s}\"", .{hash_hex});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, hash_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "setBlock")) {
-        try writer.print("\"setBlock\":{d}", .{resolver.set_block});
+        try writer.print("\"{s}\":{d}", .{ output_key, resolver.set_block });
         return true;
     } else if (std.mem.eql(u8, field_name, "setAt")) {
-        try writer.print("\"setAt\":{d}", .{resolver.set_at});
+        try writer.print("\"{s}\":{d}", .{ output_key, resolver.set_at });
         return true;
     }
     return false;
 }
 
 /// Registry field handler
-fn handleRegistryField(ctx: *anyopaque, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn handleRegistryField(ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
     const registry: *const models.Registry = @ptrCast(@alignCast(ctx));
 
     if (std.mem.eql(u8, field_name, "address")) {
         const addr_hex = try registry.address.toHex(allocator);
         defer allocator.free(addr_hex);
-        try writer.print("\"address\":\"{s}\"", .{addr_hex});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, addr_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "name")) {
         const escaped = try escapeJsonString(allocator, registry.name);
         defer allocator.free(escaped);
-        try writer.print("\"name\":\"{s}\"", .{escaped});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         return true;
     } else if (std.mem.eql(u8, field_name, "namehash")) {
         const hash_hex = try registry.namehash.toHex(allocator);
         defer allocator.free(hash_hex);
-        try writer.print("\"namehash\":\"{s}\"", .{hash_hex});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, hash_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "parentRegistry")) {
         const parent_hex = try registry.parent_registry.toHex(allocator);
         defer allocator.free(parent_hex);
-        try writer.print("\"parentRegistry\":\"{s}\"", .{parent_hex});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, parent_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "createdBlock")) {
-        try writer.print("\"createdBlock\":{d}", .{registry.created_block});
+        try writer.print("\"{s}\":{d}", .{ output_key, registry.created_block });
         return true;
     } else if (std.mem.eql(u8, field_name, "createdAt")) {
-        try writer.print("\"createdAt\":{d}", .{registry.created_at});
+        try writer.print("\"{s}\":{d}", .{ output_key, registry.created_at });
         return true;
     }
     return false;
 }
 
 /// Resolver Metadata field handler
-fn handleResolverMetadataField(ctx: *anyopaque, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn handleResolverMetadataField(ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
     const metadata: *const models.ResolverMetadata = @ptrCast(@alignCast(ctx));
 
     if (std.mem.eql(u8, field_name, "id")) {
-        try writer.print("\"id\":\"{d}\"", .{metadata.id});
+        try writer.print("\"{s}\":\"{d}\"", .{ output_key, metadata.id });
         return true;
     } else if (std.mem.eql(u8, field_name, "resolver")) {
         const resolver_hex = try metadata.resolver.toHex(allocator);
         defer allocator.free(resolver_hex);
-        try writer.print("\"resolver\":\"{s}\"", .{resolver_hex});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, resolver_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "graphqlUrl")) {
         const escaped = try escapeJsonString(allocator, metadata.graphql_url);
         defer allocator.free(escaped);
-        try writer.print("\"graphqlUrl\":\"{s}\"", .{escaped});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         return true;
     } else if (std.mem.eql(u8, field_name, "blockNumber")) {
-        try writer.print("\"blockNumber\":{d}", .{metadata.block_number});
+        try writer.print("\"{s}\":{d}", .{ output_key, metadata.block_number });
         return true;
     } else if (std.mem.eql(u8, field_name, "transactionHash")) {
         const tx_hex = try metadata.tx_hash.toHex(allocator);
         defer allocator.free(tx_hex);
-        try writer.print("\"transactionHash\":\"{s}\"", .{tx_hex});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, tx_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "timestamp")) {
-        try writer.print("\"timestamp\":{d}", .{metadata.timestamp});
+        try writer.print("\"{s}\":{d}", .{ output_key, metadata.timestamp });
         return true;
     }
     return false;
 }
 
 /// Resolver Approval field handler
-fn handleResolverApprovalField(ctx: *anyopaque, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn handleResolverApprovalField(ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
     const approval: *const models.ResolverApproval = @ptrCast(@alignCast(ctx));
 
     if (std.mem.eql(u8, field_name, "id")) {
-        try writer.print("\"id\":\"{d}\"", .{approval.id});
+        try writer.print("\"{s}\":\"{d}\"", .{ output_key, approval.id });
         return true;
     } else if (std.mem.eql(u8, field_name, "resolver")) {
         const resolver_hex = try approval.resolver.toHex(allocator);
         defer allocator.free(resolver_hex);
-        try writer.print("\"resolver\":\"{s}\"", .{resolver_hex});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, resolver_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "namehash")) {
         const hash_hex = try approval.namehash.toHex(allocator);
         defer allocator.free(hash_hex);
-        try writer.print("\"namehash\":\"{s}\"", .{hash_hex});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, hash_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "context")) {
         if (approval.context) |ctx_str| {
             const escaped = try escapeJsonString(allocator, ctx_str);
             defer allocator.free(escaped);
-            try writer.print("\"context\":\"{s}\"", .{escaped});
+            try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         } else {
-            try writer.writeAll("\"context\":null");
+            try writer.print("\"{s}\":null", .{output_key});
         }
         return true;
     } else if (std.mem.eql(u8, field_name, "delegate")) {
         const delegate_hex = try approval.delegate.toHex(allocator);
         defer allocator.free(delegate_hex);
-        try writer.print("\"delegate\":\"{s}\"", .{delegate_hex});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, delegate_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "approved")) {
-        try writer.print("\"approved\":{s}", .{if (approval.approved) "true" else "false"});
+        try writer.print("\"{s}\":{s}", .{ output_key, if (approval.approved) "true" else "false" });
         return true;
     } else if (std.mem.eql(u8, field_name, "blockNumber")) {
-        try writer.print("\"blockNumber\":{d}", .{approval.block_number});
+        try writer.print("\"{s}\":{d}", .{ output_key, approval.block_number });
         return true;
     } else if (std.mem.eql(u8, field_name, "transactionHash")) {
         const tx_hex = try approval.tx_hash.toHex(allocator);
         defer allocator.free(tx_hex);
-        try writer.print("\"transactionHash\":\"{s}\"", .{tx_hex});
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, tx_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "logIndex")) {
-        try writer.print("\"logIndex\":{d}", .{approval.log_index});
+        try writer.print("\"{s}\":{d}", .{ output_key, approval.log_index });
         return true;
     } else if (std.mem.eql(u8, field_name, "timestamp")) {
-        try writer.print("\"timestamp\":{d}", .{approval.timestamp});
+        try writer.print("\"{s}\":{d}", .{ output_key, approval.timestamp });
         return true;
     }
     return false;

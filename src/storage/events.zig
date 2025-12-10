@@ -78,7 +78,18 @@ pub fn insertEvent(db: *Database, event: models.Event) !void {
     }
 }
 
+/// Order direction for event queries
+pub const OrderDir = enum {
+    asc,
+    desc,
+};
+
 pub fn getRecentEvents(db: *Database, chain: ?models.Chain, event_type: ?models.EventType, limit: u32) ![]models.Event {
+    return getRecentEventsWithOrder(db, chain, event_type, limit, .desc);
+}
+
+/// Get recent events with configurable order direction (for backward pagination support)
+pub fn getRecentEventsWithOrder(db: *Database, chain: ?models.Chain, event_type: ?models.EventType, limit: u32, order_dir: OrderDir) ![]models.Event {
     var sql_buf: [512]u8 = undefined;
     var sql_len: usize = 0;
 
@@ -113,7 +124,11 @@ pub fn getRecentEvents(db: *Database, chain: ?models.Chain, event_type: ?models.
         }
     }
 
-    const order_sql = " ORDER BY block_number DESC, log_index DESC LIMIT ";
+    // Use order direction for backward pagination support
+    const order_sql = if (order_dir == .desc)
+        " ORDER BY block_number DESC, log_index DESC LIMIT "
+    else
+        " ORDER BY block_number ASC, log_index ASC LIMIT ";
     @memcpy(sql_buf[sql_len..][0..order_sql.len], order_sql);
     sql_len += order_sql.len;
 

@@ -22,6 +22,9 @@ pub const TokenType = enum {
     comma, // ,
     dollar, // $ (for variables)
     exclamation, // ! (for required types)
+    spread, // ... (for fragment spreads)
+    at, // @ (for directives)
+    equals, // = (for default values)
 
     // Keywords
     query,
@@ -112,6 +115,27 @@ pub const Lexer = struct {
             '!' => {
                 self.pos += 1;
                 return Token{ .type = .exclamation, .value = "!", .start = start, .end = self.pos };
+            },
+            '.' => {
+                // Check for spread operator ...
+                if (self.pos + 2 < self.source.len and
+                    self.source[self.pos + 1] == '.' and
+                    self.source[self.pos + 2] == '.')
+                {
+                    self.pos += 3;
+                    return Token{ .type = .spread, .value = "...", .start = start, .end = self.pos };
+                }
+                // Single dot is invalid in GraphQL
+                self.pos += 1;
+                return Token{ .type = .invalid, .value = ".", .start = start, .end = self.pos };
+            },
+            '@' => {
+                self.pos += 1;
+                return Token{ .type = .at, .value = "@", .start = start, .end = self.pos };
+            },
+            '=' => {
+                self.pos += 1;
+                return Token{ .type = .equals, .value = "=", .start = start, .end = self.pos };
             },
             '"' => {
                 return self.readString();
@@ -276,11 +300,26 @@ pub const Argument = struct {
     }
 };
 
+/// GraphQL directive (e.g., @skip, @include)
+pub const Directive = struct {
+    name: []const u8, // Directive name (e.g., "skip", "include")
+    arguments: []Argument, // Directive arguments
+
+    pub fn deinit(self: *Directive, allocator: std.mem.Allocator) void {
+        for (self.arguments) |*arg| {
+            arg.deinit(allocator);
+        }
+        allocator.free(self.arguments);
+    }
+};
+
 pub const Field = struct {
     name: []const u8,
     alias: ?[]const u8,
     arguments: []Argument,
     selections: []Field,
+    fragment_spread: ?[]const u8, // If this is a fragment spread (...FragmentName), this is the fragment name
+    directives: []Directive, // Field directives (e.g., @skip, @include)
 
     pub fn deinit(self: *Field, allocator: std.mem.Allocator) void {
         for (self.arguments) |*arg| {
@@ -292,8 +331,58 @@ pub const Field = struct {
             field.deinit(allocator);
         }
         allocator.free(self.selections);
+
+        for (self.directives) |*dir| {
+            dir.deinit(allocator);
+        }
+        allocator.free(self.directives);
+    }
+
+    /// Check if this field is a fragment spread
+    pub fn isFragmentSpread(self: *const Field) bool {
+        return self.fragment_spread != null;
+    }
+
+    /// Check if this field should be skipped based on directives
+    pub fn shouldSkip(self: *const Field, variables: ?*const std.StringHashMap(std.json.Value)) bool {
+        for (self.directives) |*directive| {
+            if (std.mem.eql(u8, directive.name, "skip")) {
+                // @skip(if: condition)
+                for (directive.arguments) |*arg| {
+                    if (std.mem.eql(u8, arg.name, "if")) {
+                        return evaluateBoolCondition(arg.value, variables);
+                    }
+                }
+            } else if (std.mem.eql(u8, directive.name, "include")) {
+                // @include(if: condition) - include if true, skip if false
+                for (directive.arguments) |*arg| {
+                    if (std.mem.eql(u8, arg.name, "if")) {
+                        return !evaluateBoolCondition(arg.value, variables);
+                    }
+                }
+            }
+        }
+        return false;
     }
 };
+
+/// Evaluate a boolean condition from a Value
+fn evaluateBoolCondition(value: Value, variables: ?*const std.StringHashMap(std.json.Value)) bool {
+    switch (value) {
+        .boolean => |b| return b,
+        .variable => |var_name| {
+            if (variables) |vars| {
+                if (vars.get(var_name)) |json_val| {
+                    if (json_val == .bool) {
+                        return json_val.bool;
+                    }
+                }
+            }
+            return false; // Default to false if variable not found
+        },
+        else => return false,
+    }
+}
 
 pub const OperationType = enum {
     query,
@@ -302,14 +391,28 @@ pub const OperationType = enum {
 
 pub const VariableDefinition = struct {
     name: []const u8, // Variable name (without $)
-    type_name: []const u8, // Type (e.g., "String", "Int")
-    required: bool, // Whether the type ends with !
+    type_name: []const u8, // Base type name (e.g., "String", "Int")
+    is_list: bool, // Whether this is a list type [Type]
+    list_item_required: bool, // Whether list items are required (the inner !)
+    required: bool, // Whether the outer type is required (ends with !)
     default_value: ?Value, // Optional default value
 
     pub fn deinit(self: *VariableDefinition, allocator: std.mem.Allocator) void {
         if (self.default_value) |*val| {
             var mut_val = val.*;
             mut_val.deinit(allocator);
+        }
+    }
+
+    /// Get the full type string representation (e.g., "[String!]!")
+    pub fn typeString(self: *const VariableDefinition, allocator: std.mem.Allocator) ![]u8 {
+        if (self.is_list) {
+            const inner_bang = if (self.list_item_required) "!" else "";
+            const outer_bang = if (self.required) "!" else "";
+            return try std.fmt.allocPrint(allocator, "[{s}{s}]{s}", .{ self.type_name, inner_bang, outer_bang });
+        } else {
+            const bang = if (self.required) "!" else "";
+            return try std.fmt.allocPrint(allocator, "{s}{s}", .{ self.type_name, bang });
         }
     }
 };
@@ -333,14 +436,34 @@ pub const Operation = struct {
     }
 };
 
+/// Fragment definition
+pub const Fragment = struct {
+    name: []const u8, // Fragment name (e.g., "DomainFields")
+    type_condition: []const u8, // Type the fragment applies to (e.g., "Domain")
+    selections: []Field, // Fields in the fragment
+
+    pub fn deinit(self: *Fragment, allocator: std.mem.Allocator) void {
+        for (self.selections) |*field| {
+            field.deinit(allocator);
+        }
+        allocator.free(self.selections);
+    }
+};
+
 pub const Document = struct {
     operations: []Operation,
+    fragments: []Fragment, // Fragment definitions
 
     pub fn deinit(self: *Document, allocator: std.mem.Allocator) void {
         for (self.operations) |*op| {
             op.deinit(allocator);
         }
         allocator.free(self.operations);
+
+        for (self.fragments) |*frag| {
+            frag.deinit(allocator);
+        }
+        allocator.free(self.fragments);
     }
 };
 
@@ -366,20 +489,69 @@ pub const Parser = struct {
 
     pub fn parseDocument(self: *Parser) !Document {
         var operations: std.ArrayList(Operation) = .{};
+        var fragments: std.ArrayList(Fragment) = .{};
         errdefer {
             for (operations.items) |*op| {
                 op.deinit(self.allocator);
             }
             operations.deinit(self.allocator);
+            for (fragments.items) |*frag| {
+                frag.deinit(self.allocator);
+            }
+            fragments.deinit(self.allocator);
         }
 
         while (self.current_token.type != .eof) {
-            const op = try self.parseOperation();
-            try operations.append(self.allocator, op);
+            if (self.current_token.type == .fragment) {
+                // Parse fragment definition
+                const frag = try self.parseFragment();
+                try fragments.append(self.allocator, frag);
+            } else {
+                const op = try self.parseOperation();
+                try operations.append(self.allocator, op);
+            }
         }
 
         return Document{
             .operations = try operations.toOwnedSlice(self.allocator),
+            .fragments = try fragments.toOwnedSlice(self.allocator),
+        };
+    }
+
+    fn parseFragment(self: *Parser) !Fragment {
+        // Expect 'fragment' keyword
+        if (self.current_token.type != .fragment) {
+            return error.ExpectedFragmentKeyword;
+        }
+        self.advance();
+
+        // Expect fragment name
+        if (self.current_token.type != .name) {
+            return error.ExpectedFragmentName;
+        }
+        const frag_name = self.current_token.value;
+        self.advance();
+
+        // Expect 'on' keyword
+        if (self.current_token.type != .on) {
+            return error.ExpectedOnKeyword;
+        }
+        self.advance();
+
+        // Expect type condition (type name)
+        if (self.current_token.type != .name) {
+            return error.ExpectedTypeName;
+        }
+        const type_condition = self.current_token.value;
+        self.advance();
+
+        // Parse selection set
+        const selections = try self.parseSelectionSet();
+
+        return Fragment{
+            .name = frag_name,
+            .type_condition = type_condition,
+            .selections = selections,
         };
     }
 
@@ -459,26 +631,61 @@ pub const Parser = struct {
             }
             self.advance();
 
-            // Parse type (e.g., String, String!, [String]!)
-            if (self.current_token.type != .name) {
+            // Parse type (e.g., String, String!, [String], [String!], [String]!, [String!]!)
+            var is_list = false;
+            var list_item_required = false;
+            var required = false;
+            var type_name: []const u8 = undefined;
+
+            // Check for list type [
+            if (self.current_token.type == .left_bracket) {
+                is_list = true;
+                self.advance(); // Skip [
+
+                // Expect type name inside brackets
+                if (self.current_token.type != .name) {
+                    return error.ExpectedTypeName;
+                }
+                type_name = self.current_token.value;
+                self.advance();
+
+                // Check for inner ! (list item required)
+                if (self.current_token.type == .exclamation) {
+                    list_item_required = true;
+                    self.advance();
+                }
+
+                // Expect ]
+                if (self.current_token.type != .right_bracket) {
+                    return error.ExpectedRightBracket;
+                }
+                self.advance();
+            } else if (self.current_token.type == .name) {
+                // Simple type (not a list)
+                type_name = self.current_token.value;
+                self.advance();
+            } else {
                 return error.ExpectedTypeName;
             }
-            const type_name = self.current_token.value;
-            self.advance();
 
-            // Check for ! (required)
-            var required = false;
+            // Check for outer ! (type required)
             if (self.current_token.type == .exclamation) {
                 required = true;
                 self.advance();
             }
 
-            // TODO: Handle default values with = sign
-            const default_value: ?Value = null;
+            // Parse default value if present: = value
+            var default_value: ?Value = null;
+            if (self.current_token.type == .equals) {
+                self.advance(); // Skip =
+                default_value = try self.parseValue();
+            }
 
             try definitions.append(self.allocator, .{
                 .name = var_name,
                 .type_name = type_name,
+                .is_list = is_list,
+                .list_item_required = list_item_required,
                 .required = required,
                 .default_value = default_value,
             });
@@ -513,8 +720,14 @@ pub const Parser = struct {
         }
 
         while (self.current_token.type != .right_brace and self.current_token.type != .eof) {
-            const field = try self.parseField();
-            try fields.append(self.allocator, field);
+            if (self.current_token.type == .spread) {
+                // Parse fragment spread (...FragmentName) or inline fragment (... on Type { })
+                const field = try self.parseFragmentSpread();
+                try fields.append(self.allocator, field);
+            } else {
+                const field = try self.parseField();
+                try fields.append(self.allocator, field);
+            }
         }
 
         if (self.current_token.type != .right_brace) {
@@ -523,6 +736,61 @@ pub const Parser = struct {
         self.advance(); // Skip }
 
         return try fields.toOwnedSlice(self.allocator);
+    }
+
+    fn parseFragmentSpread(self: *Parser) !Field {
+        // Expect ...
+        if (self.current_token.type != .spread) {
+            return error.ExpectedSpread;
+        }
+        self.advance();
+
+        // Check for inline fragment (... on Type { ... })
+        if (self.current_token.type == .on) {
+            self.advance();
+            // Expect type name
+            if (self.current_token.type != .name) {
+                return error.ExpectedTypeName;
+            }
+            const type_name = self.current_token.value;
+            self.advance();
+
+            // Parse directives (e.g., @skip, @include)
+            const directives = try self.parseDirectives();
+
+            // Parse selection set
+            const selections = try self.parseSelectionSet();
+
+            // Return as an inline fragment (stored in a special field format)
+            return Field{
+                .name = type_name, // Store the type condition as the name
+                .alias = null,
+                .arguments = &.{},
+                .selections = selections,
+                .fragment_spread = null, // Not a named fragment spread
+                .directives = directives,
+            };
+        }
+
+        // Expect fragment name
+        if (self.current_token.type != .name) {
+            return error.ExpectedFragmentName;
+        }
+        const frag_name = self.current_token.value;
+        self.advance();
+
+        // Parse directives (e.g., @skip, @include)
+        const directives = try self.parseDirectives();
+
+        // Return a fragment spread marker
+        return Field{
+            .name = frag_name,
+            .alias = null,
+            .arguments = &.{},
+            .selections = &.{},
+            .fragment_spread = frag_name,
+            .directives = directives,
+        };
     }
 
     fn parseField(self: *Parser) !Field {
@@ -552,6 +820,9 @@ pub const Parser = struct {
             arguments = try self.parseArguments();
         }
 
+        // Parse directives (e.g., @skip, @include)
+        const directives = try self.parseDirectives();
+
         // Parse selections (nested fields)
         var selections: []Field = &.{};
         if (self.current_token.type == .left_brace) {
@@ -563,7 +834,45 @@ pub const Parser = struct {
             .alias = alias,
             .arguments = arguments,
             .selections = selections,
+            .fragment_spread = null,
+            .directives = directives,
         };
+    }
+
+    /// Parse directives like @skip(if: true) or @include(if: $showDetails)
+    fn parseDirectives(self: *Parser) ![]Directive {
+        var directives: std.ArrayList(Directive) = .{};
+        errdefer {
+            for (directives.items) |*dir| {
+                dir.deinit(self.allocator);
+            }
+            directives.deinit(self.allocator);
+        }
+
+        // Parse directives while we see @
+        while (self.current_token.type == .at) {
+            self.advance(); // Skip @
+
+            // Expect directive name
+            if (self.current_token.type != .name) {
+                return error.ExpectedDirectiveName;
+            }
+            const dir_name = self.current_token.value;
+            self.advance();
+
+            // Parse directive arguments if present
+            var dir_args: []Argument = &.{};
+            if (self.current_token.type == .left_paren) {
+                dir_args = try self.parseArguments();
+            }
+
+            try directives.append(self.allocator, Directive{
+                .name = dir_name,
+                .arguments = dir_args,
+            });
+        }
+
+        return try directives.toOwnedSlice(self.allocator);
     }
 
     fn parseArguments(self: *Parser) ![]Argument {
@@ -794,6 +1103,7 @@ pub const Executor = struct {
     resolvers: ResolverMap,
     context: ExecutionContext,
     variables: ?*VariableMap, // Current variable values during execution
+    fragments: []const Fragment, // Fragment definitions from the document
 
     pub fn init(allocator: std.mem.Allocator, context: ExecutionContext) Executor {
         return .{
@@ -801,6 +1111,7 @@ pub const Executor = struct {
             .resolvers = ResolverMap.init(allocator),
             .context = context,
             .variables = null,
+            .fragments = &.{},
         };
     }
 
@@ -810,6 +1121,16 @@ pub const Executor = struct {
 
     pub fn registerResolver(self: *Executor, field_name: []const u8, resolver: ResolverFn) !void {
         try self.resolvers.put(field_name, resolver);
+    }
+
+    /// Look up a fragment by name
+    fn getFragment(self: *Executor, name: []const u8) ?*const Fragment {
+        for (self.fragments) |*frag| {
+            if (std.mem.eql(u8, frag.name, name)) {
+                return frag;
+            }
+        }
+        return null;
     }
 
     /// Resolve a value, replacing variable references with actual values
@@ -867,6 +1188,10 @@ pub const Executor = struct {
     }
 
     pub fn executeDocument(self: *Executor, document: *const Document, variables_json: ?std.json.Value) ![]u8 {
+        // Store fragments for use during execution
+        self.fragments = document.fragments;
+        defer self.fragments = &.{};
+
         // Setup variables if provided
         var variables_map: VariableMap = VariableMap.init(self.allocator);
         defer variables_map.deinit();
@@ -876,6 +1201,19 @@ pub const Executor = struct {
                 var iter = vars_json.object.iterator();
                 while (iter.next()) |entry| {
                     try variables_map.put(entry.key_ptr.*, entry.value_ptr.*);
+                }
+            }
+        }
+
+        // Apply default values from variable definitions for any missing variables
+        for (document.operations) |*operation| {
+            for (operation.variables) |*var_def| {
+                // If variable wasn't provided and has a default value, use the default
+                if (!variables_map.contains(var_def.name)) {
+                    if (var_def.default_value) |default| {
+                        const json_val = valueToJson(default);
+                        try variables_map.put(var_def.name, json_val);
+                    }
                 }
             }
         }
@@ -901,13 +1239,70 @@ pub const Executor = struct {
         return try self.allocator.dupe(u8, response.items);
     }
 
+    /// Convert parser Value to std.json.Value (for default values)
+    fn valueToJson(value: Value) std.json.Value {
+        return switch (value) {
+            .int => |i| std.json.Value{ .integer = i },
+            .float => |f| std.json.Value{ .float = f },
+            .string => |s| std.json.Value{ .string = s },
+            .boolean => |b| std.json.Value{ .bool = b },
+            .null_value => std.json.Value.null,
+            .variable => |v| std.json.Value{ .string = v }, // Variables in defaults are stored as strings
+            .list => std.json.Value.null, // TODO: Handle list defaults if needed
+            .object => std.json.Value.null, // TODO: Handle object defaults if needed
+        };
+    }
+
+    /// Expand selections, replacing fragment spreads with actual fragment fields
+    /// Also filters out fields that should be skipped due to directives (@skip, @include)
+    pub fn expandSelections(self: *Executor, selections: []const Field) ![]Field {
+        var expanded: std.ArrayList(Field) = .{};
+        errdefer expanded.deinit(self.allocator);
+
+        for (selections) |*field| {
+            // Check directives (@skip, @include) - skip this field if directive says so
+            if (field.shouldSkip(self.variables)) {
+                continue;
+            }
+
+            if (field.fragment_spread) |frag_name| {
+                // This is a fragment spread - expand it
+                if (self.getFragment(frag_name)) |frag| {
+                    // Recursively expand the fragment's selections
+                    const frag_fields = try self.expandSelections(frag.selections);
+                    defer self.allocator.free(frag_fields);
+
+                    for (frag_fields) |frag_field| {
+                        try expanded.append(self.allocator, frag_field);
+                    }
+                } else {
+                    std.log.warn("Unknown fragment: {s}", .{frag_name});
+                }
+            } else if (field.selections.len > 0) {
+                // This field has nested selections - expand them recursively
+                var expanded_field = field.*;
+                expanded_field.selections = try self.expandSelections(field.selections);
+                try expanded.append(self.allocator, expanded_field);
+            } else {
+                // Regular field - just copy it
+                try expanded.append(self.allocator, field.*);
+            }
+        }
+
+        return try expanded.toOwnedSlice(self.allocator);
+    }
+
     fn executeOperation(self: *Executor, operation: *const Operation) ![]u8 {
         var response: std.ArrayList(u8) = .{};
         defer response.deinit(self.allocator);
 
-        // Execute all root fields
+        // Expand fragments and filter by directives (@skip, @include)
+        const expanded_fields = try self.expandSelections(operation.fields);
+        defer self.allocator.free(expanded_fields);
+
+        // Execute all root fields (with fragments expanded and directives applied)
         var first = true;
-        for (operation.fields) |*field| {
+        for (expanded_fields) |*field| {
             if (!first) try response.appendSlice(self.allocator, ",");
             first = false;
 
@@ -995,6 +1390,119 @@ pub fn getBoolArg(field: *const Field, name: []const u8, default: ?bool) ?bool {
         }
     }
     return default;
+}
+
+// ============================================================================
+// TYPE VALIDATION - GraphQL spec-compliant argument validation
+// ============================================================================
+
+/// Error types for argument validation
+pub const ValidationError = error{
+    MissingRequiredArgument,
+    InvalidArgumentType,
+    InvalidIntValue,
+    InvalidFloatValue,
+    InvalidBoolValue,
+    InvalidListValue,
+    NullNotAllowed,
+};
+
+/// Get a required string argument, returning an error if missing or wrong type
+pub fn getRequiredStringArg(field: *const Field, name: []const u8) ValidationError![]const u8 {
+    for (field.arguments) |*arg| {
+        if (std.mem.eql(u8, arg.name, name)) {
+            return switch (arg.value) {
+                .string => |val| val,
+                .null_value => ValidationError.NullNotAllowed,
+                else => ValidationError.InvalidArgumentType,
+            };
+        }
+    }
+    return ValidationError.MissingRequiredArgument;
+}
+
+/// Get a required int argument, returning an error if missing or wrong type
+pub fn getRequiredIntArg(field: *const Field, name: []const u8) ValidationError!i64 {
+    for (field.arguments) |*arg| {
+        if (std.mem.eql(u8, arg.name, name)) {
+            return switch (arg.value) {
+                .int => |val| val,
+                .null_value => ValidationError.NullNotAllowed,
+                else => ValidationError.InvalidArgumentType,
+            };
+        }
+    }
+    return ValidationError.MissingRequiredArgument;
+}
+
+/// Get a required bool argument, returning an error if missing or wrong type
+pub fn getRequiredBoolArg(field: *const Field, name: []const u8) ValidationError!bool {
+    for (field.arguments) |*arg| {
+        if (std.mem.eql(u8, arg.name, name)) {
+            return switch (arg.value) {
+                .boolean => |val| val,
+                .null_value => ValidationError.NullNotAllowed,
+                else => ValidationError.InvalidArgumentType,
+            };
+        }
+    }
+    return ValidationError.MissingRequiredArgument;
+}
+
+/// Validate that a value matches an expected GraphQL type
+pub fn validateValueType(value: Value, expected_type: []const u8, required: bool) ValidationError!void {
+    // Handle null values
+    if (value == .null_value) {
+        if (required) {
+            return ValidationError.NullNotAllowed;
+        }
+        return; // null is valid for nullable types
+    }
+
+    // Validate based on expected type
+    if (std.mem.eql(u8, expected_type, "String") or std.mem.eql(u8, expected_type, "ID")) {
+        if (value != .string) {
+            return ValidationError.InvalidArgumentType;
+        }
+    } else if (std.mem.eql(u8, expected_type, "Int")) {
+        if (value != .int) {
+            return ValidationError.InvalidArgumentType;
+        }
+    } else if (std.mem.eql(u8, expected_type, "Float")) {
+        if (value != .float and value != .int) {
+            // Int can be coerced to Float per GraphQL spec
+            return ValidationError.InvalidArgumentType;
+        }
+    } else if (std.mem.eql(u8, expected_type, "Boolean")) {
+        if (value != .boolean) {
+            return ValidationError.InvalidArgumentType;
+        }
+    }
+    // For custom types and enums, we don't do strict validation here
+}
+
+/// Check if an argument exists
+pub fn hasArg(field: *const Field, name: []const u8) bool {
+    for (field.arguments) |*arg| {
+        if (std.mem.eql(u8, arg.name, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Get the type of an argument value as a string
+pub fn getValueTypeName(value: Value) []const u8 {
+    return switch (value) {
+        .int => "Int",
+        .float => "Float",
+        .string => "String",
+        .boolean => "Boolean",
+        .null_value => "Null",
+        .list => "List",
+        .object => "Object",
+        .variable => "Variable",
+    };
 }
 
 // ============================================================================
