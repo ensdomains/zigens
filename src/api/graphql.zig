@@ -100,7 +100,7 @@ pub const GraphQLHandler = struct {
         var document = parser.parseQuery(self.allocator, query) catch |err| {
             std.log.err("Failed to parse GraphQL query: {}", .{err});
             self.metrics.recordError();
-            return try self.buildErrorResponse("Invalid GraphQL syntax");
+            return try self.buildErrorResponseWithCode("Invalid GraphQL syntax", ErrorCode.SYNTAX_ERROR);
         };
         defer document.deinit(self.allocator);
 
@@ -117,7 +117,7 @@ pub const GraphQLHandler = struct {
             defer self.allocator.free(error_msg);
             std.log.warn("Query complexity violation: {s}", .{error_msg});
             self.metrics.recordRejection(analysis.depth, analysis.cost);
-            return try self.buildErrorResponse(error_msg);
+            return try self.buildErrorResponseWithCode(error_msg, ErrorCode.COMPLEXITY_LIMIT_EXCEEDED);
         }
 
         std.log.debug("Query complexity: depth={d}, cost={d}", .{ analysis.depth, analysis.cost });
@@ -126,7 +126,7 @@ pub const GraphQLHandler = struct {
         const result = self.executor.executeDocument(&document, variables) catch |err| {
             std.log.err("Failed to execute GraphQL query: {}", .{err});
             self.metrics.recordError();
-            return try self.buildErrorResponse("Query execution failed");
+            return try self.buildErrorResponseWithCode("Query execution failed", ErrorCode.EXECUTION_ERROR);
         };
 
         // Record successful query with timing
@@ -1276,10 +1276,47 @@ pub const GraphQLHandler = struct {
         column: u32,
     };
 
+    /// Standard GraphQL error codes for ENS indexer
+    pub const ErrorCode = enum {
+        SYNTAX_ERROR,
+        VALIDATION_ERROR,
+        COMPLEXITY_LIMIT_EXCEEDED,
+        EXECUTION_ERROR,
+        INVALID_ARGUMENT,
+        NOT_FOUND,
+        INTERNAL_ERROR,
+
+        pub fn toString(self: ErrorCode) []const u8 {
+            return switch (self) {
+                .SYNTAX_ERROR => "SYNTAX_ERROR",
+                .VALIDATION_ERROR => "VALIDATION_ERROR",
+                .COMPLEXITY_LIMIT_EXCEEDED => "COMPLEXITY_LIMIT_EXCEEDED",
+                .EXECUTION_ERROR => "EXECUTION_ERROR",
+                .INVALID_ARGUMENT => "INVALID_ARGUMENT",
+                .NOT_FOUND => "NOT_FOUND",
+                .INTERNAL_ERROR => "INTERNAL_ERROR",
+            };
+        }
+    };
+
     /// Build a GraphQL spec-compliant error response
     /// Format: {"errors":[{"message":"...", "locations":[...], "path":[...], "extensions":{...}}], "data":null}
     fn buildErrorResponse(self: *GraphQLHandler, message: []const u8) ![]u8 {
         return self.buildErrorResponseFull(message, null, null, null);
+    }
+
+    /// Build a GraphQL error response with error code
+    fn buildErrorResponseWithCode(self: *GraphQLHandler, message: []const u8, code: ErrorCode) ![]u8 {
+        const extensions = try std.fmt.allocPrint(self.allocator, "{{\"code\":\"{s}\"}}", .{code.toString()});
+        defer self.allocator.free(extensions);
+        return self.buildErrorResponseFull(message, null, null, extensions);
+    }
+
+    /// Build a GraphQL error response with error code and path
+    fn buildErrorResponseWithCodeAndPath(self: *GraphQLHandler, message: []const u8, code: ErrorCode, path: []const []const u8) ![]u8 {
+        const extensions = try std.fmt.allocPrint(self.allocator, "{{\"code\":\"{s}\"}}", .{code.toString()});
+        defer self.allocator.free(extensions);
+        return self.buildErrorResponseFull(message, null, path, extensions);
     }
 
     /// Build a GraphQL error response with optional locations
@@ -2705,10 +2742,22 @@ fn resolveEvents(ctx: parser.ExecutionContext, field: *const parser.Field) !pars
     return parser.FieldResult{ .json = result_json };
 }
 
+/// Parse chain argument from GraphQL field, defaulting to L2
+fn parseChainArg(field: *const parser.Field) models.Chain {
+    const chain_str = parser.getStringArg(field, "chain", null) orelse "l2";
+    if (std.mem.eql(u8, chain_str, "l1")) {
+        return .l1;
+    }
+    return .l2; // Default to L2
+}
+
 /// Resolver for roles query
 fn resolveRoles(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
     const allocator = ctx.allocator;
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
+
+    // Get chain argument (default: l2)
+    const chain = parseChainArg(field);
 
     // Get optional arguments
     const resource_arg = parser.getStringArg(field, "resource", null);
@@ -2716,7 +2765,7 @@ fn resolveRoles(ctx: parser.ExecutionContext, field: *const parser.Field) !parse
 
     // Determine which database method to call based on arguments
     const roles = if (resource_arg) |resource|
-        try database.getRolesByResource(.l2, resource)
+        try database.getRolesByResource(chain, resource)
     else if (account_arg) |account_str|
         blk: {
             const account_addr = Address.fromHex(account_str) catch {
@@ -2724,7 +2773,7 @@ fn resolveRoles(ctx: parser.ExecutionContext, field: *const parser.Field) !parse
                 const json = try allocator.dupe(u8, "[]");
                 return parser.FieldResult{ .json = json };
             };
-            break :blk try database.getRolesByAccount(.l2, account_addr);
+            break :blk try database.getRolesByAccount(chain, account_addr);
         }
     else
         try allocator.alloc(models.EACRoleAssignment, 0); // No arguments, return empty
@@ -2761,6 +2810,9 @@ fn resolveResolvers(ctx: parser.ExecutionContext, field: *const parser.Field) !p
     const allocator = ctx.allocator;
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
 
+    // Get chain argument (default: l2)
+    const chain = parseChainArg(field);
+
     // Get required account argument
     const account_arg = parser.getStringArg(field, "account", null) orelse {
         const json = try allocator.dupe(u8, "[]");
@@ -2773,7 +2825,7 @@ fn resolveResolvers(ctx: parser.ExecutionContext, field: *const parser.Field) !p
         return parser.FieldResult{ .json = json };
     };
 
-    const resolvers = try database.getResolversByOwner(.l2, account_addr);
+    const resolvers = try database.getResolversByOwner(chain, account_addr);
     defer {
         for (resolvers) |*resolver| {
             resolver.deinit(allocator);
@@ -2806,6 +2858,9 @@ fn resolveRegistries(ctx: parser.ExecutionContext, field: *const parser.Field) !
     const allocator = ctx.allocator;
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
 
+    // Get chain argument (default: l2)
+    const chain = parseChainArg(field);
+
     // Get required owner argument
     const owner_arg = parser.getStringArg(field, "owner", null) orelse {
         const json = try allocator.dupe(u8, "[]");
@@ -2818,7 +2873,7 @@ fn resolveRegistries(ctx: parser.ExecutionContext, field: *const parser.Field) !
         return parser.FieldResult{ .json = json };
     };
 
-    const registries = try database.getRegistriesByOwner(.l2, owner_addr);
+    const registries = try database.getRegistriesByOwner(chain, owner_addr);
     defer {
         for (registries) |*registry| {
             registry.deinit(allocator);
@@ -2851,6 +2906,9 @@ fn resolveMetadata(ctx: parser.ExecutionContext, field: *const parser.Field) !pa
     const allocator = ctx.allocator;
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
 
+    // Get chain argument (default: l2)
+    const chain = parseChainArg(field);
+
     // Get required resolver argument
     const resolver_arg = parser.getStringArg(field, "resolver", null) orelse {
         const json = try allocator.dupe(u8, "null");
@@ -2863,7 +2921,7 @@ fn resolveMetadata(ctx: parser.ExecutionContext, field: *const parser.Field) !pa
         return parser.FieldResult{ .json = json };
     };
 
-    const metadata_opt = try database.getResolverMetadata(.l2, resolver_addr);
+    const metadata_opt = try database.getResolverMetadata(chain, resolver_addr);
     if (metadata_opt) |metadata| {
         var metadata_mut = metadata;
         defer metadata_mut.deinit(allocator);
@@ -2885,6 +2943,9 @@ fn resolveApprovals(ctx: parser.ExecutionContext, field: *const parser.Field) !p
     const allocator = ctx.allocator;
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
 
+    // Get chain argument (default: l2)
+    const chain = parseChainArg(field);
+
     // Get optional arguments
     const namehash_arg = parser.getStringArg(field, "namehash", null);
     const delegate_arg = parser.getStringArg(field, "delegate", null);
@@ -2897,7 +2958,7 @@ fn resolveApprovals(ctx: parser.ExecutionContext, field: *const parser.Field) !p
                 const json = try allocator.dupe(u8, "[]");
                 return parser.FieldResult{ .json = json };
             };
-            break :blk try database.getApprovalsForName(.l2, namehash_hash, null);
+            break :blk try database.getApprovalsForName(chain, namehash_hash, null);
         }
     else if (delegate_arg) |delegate_str|
         blk: {
@@ -2906,7 +2967,7 @@ fn resolveApprovals(ctx: parser.ExecutionContext, field: *const parser.Field) !p
                 const json = try allocator.dupe(u8, "[]");
                 return parser.FieldResult{ .json = json };
             };
-            break :blk try database.getApprovalsForDelegate(.l2, delegate_addr);
+            break :blk try database.getApprovalsForDelegate(chain, delegate_addr);
         }
     else
         try allocator.alloc(models.ResolverApproval, 0); // No arguments, return empty
@@ -3240,23 +3301,20 @@ fn buildDomainJson(
             const first_arg = parser.getIntArg(field, "first", 10) orelse 10;
             const skip_arg = parser.getIntArg(field, "skip", 0) orelse 0;
 
-            // Get all names and filter by parent_name
-            // TODO: This is inefficient - ideally we'd add a database method for this
-            const all_names = try ctx.database.getAllNames(null, @intCast(skip_arg), @intCast(first_arg * 10));
-            defer {
-                for (all_names) |*n| {
-                    n.deinit(ctx.allocator);
-                }
-                ctx.allocator.free(all_names);
-            }
-
             try writer.print("\"{s}\":[", .{output_key});
-            var count: usize = 0;
-            for (all_names) |*subdomain| {
-                if (count >= first_arg) break;
-                // Check if parent_name matches
-                if (subdomain.parent_name != null and domain.name != null and std.mem.eql(u8, subdomain.parent_name.?, domain.name.?)) {
-                    if (count > 0) try writer.writeAll(",");
+
+            // Use efficient database query for subdomains
+            if (domain.name) |parent_name| {
+                const subdomains = try ctx.database.getSubdomains(parent_name, @intCast(skip_arg), @intCast(first_arg));
+                defer {
+                    for (subdomains) |*n| {
+                        n.deinit(ctx.allocator);
+                    }
+                    ctx.allocator.free(subdomains);
+                }
+
+                for (subdomains, 0..) |*subdomain, i| {
+                    if (i > 0) try writer.writeAll(",");
                     const subdomain_json = try buildDomainJson(subdomain, field.selections, .{
                         .database = ctx.database,
                         .depth = ctx.depth + 1,
@@ -3264,9 +3322,9 @@ fn buildDomainJson(
                     });
                     defer ctx.allocator.free(subdomain_json);
                     try writer.writeAll(subdomain_json);
-                    count += 1;
                 }
             }
+
             try writer.writeAll("]");
             first = false;
         } else if (std.mem.eql(u8, field.name, "events")) {
@@ -3473,7 +3531,54 @@ fn buildRegistrationJson(
             try writer.print("\"{s}\":{d}", .{ output_key, event.timestamp });
             first = false;
         } else if (std.mem.eql(u8, field.name, "expiryDate")) {
-            try writer.print("\"{s}\":{d}", .{ output_key, event.timestamp + 31536000 }); // +1 year placeholder
+            // Parse duration from event.data JSON and calculate expiry = timestamp + duration
+            const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, event.data, .{}) catch {
+                // Fallback: try to get expiry from domain record
+                if (event.namehash) |nh| {
+                    const domain_opt = ctx.database.getNameByNamehash(nh) catch null;
+                    if (domain_opt) |domain| {
+                        var domain_mut = domain;
+                        defer domain_mut.deinit(ctx.allocator);
+                        if (domain_mut.expiry > 0) {
+                            try writer.print("\"{s}\":{d}", .{ output_key, domain_mut.expiry });
+                            first = false;
+                            continue;
+                        }
+                    }
+                }
+                try writer.print("\"{s}\":null", .{output_key});
+                first = false;
+                continue;
+            };
+            defer parsed.deinit();
+
+            // Try to get duration from event data
+            if (parsed.value.object.get("duration")) |duration_val| {
+                if (duration_val == .integer) {
+                    const duration: i64 = duration_val.integer;
+                    const expiry = event.timestamp + duration;
+                    try writer.print("\"{s}\":{d}", .{ output_key, expiry });
+                    first = false;
+                    continue;
+                }
+            }
+
+            // Fallback: try to get expiry from domain record in database
+            if (event.namehash) |nh| {
+                const domain_opt = ctx.database.getNameByNamehash(nh) catch null;
+                if (domain_opt) |domain| {
+                    var domain_mut = domain;
+                    defer domain_mut.deinit(ctx.allocator);
+                    if (domain_mut.expiry > 0) {
+                        try writer.print("\"{s}\":{d}", .{ output_key, domain_mut.expiry });
+                        first = false;
+                        continue;
+                    }
+                }
+            }
+
+            // No duration available
+            try writer.print("\"{s}\":null", .{output_key});
             first = false;
         } else if (std.mem.eql(u8, field.name, "registrant")) {
             // Parse event.data JSON to extract the owner (registrant) address
@@ -3932,158 +4037,7 @@ fn handleResolverApprovalField(ctx: *anyopaque, output_key: []const u8, field_na
     return false;
 }
 
-test "GraphQL handler init" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var database = try db.Database.init(allocator, ":memory:");
-    defer database.deinit();
-
-    const handler = GraphQLHandler.init(allocator, &database);
-    _ = handler;
-}
-
-test "GraphQL extract string param" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var database = try db.Database.init(allocator, ":memory:");
-    defer database.deinit();
-
-    var handler = GraphQLHandler.init(allocator, &database);
-
-    const query = "domain(id: \"alice.eth\")";
-    const result = try handler.extractStringParam(query, "id:");
-
-    try std.testing.expectEqualStrings("alice.eth", result);
-}
-
-test "GraphQL extract int param" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var database = try db.Database.init(allocator, ":memory:");
-    defer database.deinit();
-
-    var handler = GraphQLHandler.init(allocator, &database);
-
-    const query = "domains(first: 100, skip: 50)";
-    const first = try handler.extractIntParam(query, "first:");
-    const skip = try handler.extractIntParam(query, "skip:");
-
-    try std.testing.expectEqual(@as(i64, 100), first);
-    try std.testing.expectEqual(@as(i64, 50), skip);
-}
-
-test "GraphQL domains query with pagination" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var database = try db.Database.init(allocator, ":memory:");
-    defer database.deinit();
-
-    var handler = GraphQLHandler.init(allocator, &database);
-
-    // Insert test data
-    const test_name = models.Name{
-        .name = "test.eth",
-        .namehash = Hash.zero,
-        .label = "test",
-        .label_hash = Hash.zero,
-        .parent_name = "eth",
-        .parent_namehash = Hash.zero,
-        .owner = Address.zero,
-        .resolver = Address.zero,
-        .registry = Address.zero,
-        .chain = .l1,
-        .token_id = 123,
-        .canonical_id = 123,
-        .token_version = 0,
-        .expiry = 0,
-        .registry_locked = false,
-        .migrated = false,
-        .ejected = false,
-        .created_at = 0,
-        .created_block = 0,
-        .updated_at = 0,
-        .updated_block = 0,
-    };
-    try database.insertName(test_name);
-
-    const query = "domains(first: 10, skip: 0) { name owner { id } }";
-    const result = try handler.handleDomainsQuery(query);
-    defer allocator.free(result);
-
-    // Should return JSON array with requested fields
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"domains\":") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"owner\":") != null);
-}
-
-test "GraphQL domain query" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var database = try db.Database.init(allocator, ":memory:");
-    defer database.deinit();
-
-    var handler = GraphQLHandler.init(allocator, &database);
-
-    // Insert test data
-    const test_name = models.Name{
-        .name = "alice.eth",
-        .namehash = try @import("../types/hash.zig").namehash(allocator, "alice.eth"),
-        .label = "alice",
-        .label_hash = Hash.zero,
-        .parent_name = "eth",
-        .parent_namehash = Hash.zero,
-        .owner = Address.zero,
-        .resolver = Address.zero,
-        .registry = Address.zero,
-        .chain = .l1,
-        .token_id = 456,
-        .canonical_id = 456,
-        .token_version = 0,
-        .expiry = 0,
-        .registry_locked = false,
-        .migrated = false,
-        .ejected = false,
-        .created_at = 0,
-        .created_block = 0,
-        .updated_at = 0,
-        .updated_block = 0,
-    };
-    try database.insertName(test_name);
-
-    const query = "domain(id: \"alice.eth\")";
-    const result = try handler.handleDomainQuery(query);
-    defer allocator.free(result);
-
-    // Should return domain data
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"alice.eth\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"domain\":") != null);
-}
-
-test "GraphQL account query" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var database = try db.Database.init(allocator, ":memory:");
-    defer database.deinit();
-
-    var handler = GraphQLHandler.init(allocator, &database);
-
-    const query = "account(id: \"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045\")";
-    const result = try handler.handleAccountQuery(query);
-    defer allocator.free(result);
-
-    // Should return account data
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"account\":") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "0xd8da6bf26964af9d7eed9e03e53415d37aa96045") != null);
-}
+// Note: GraphQL integration tests have been moved to:
+// - src/api/graphql_test.zig (parser tests)
+// - src/api/graphql_features_test.zig (feature tests)
+// These test files use the proper parser-based executor via handleQuery()

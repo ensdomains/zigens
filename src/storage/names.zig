@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing = std.testing;
 const db_module = @import("database.zig");
 const Database = db_module.Database;
 const c = db_module.c;
@@ -860,6 +861,94 @@ pub fn hasDirectSubdomains(db: *Database, parent_name: []const u8) !bool {
     return step_result == c.SQLITE_ROW;
 }
 
+/// Get subdomains of a parent domain with pagination
+/// Returns names where parent_name = the given parent name
+pub fn getSubdomains(db: *Database, parent_name_arg: []const u8, skip: u32, limit: u32) ![]models.Name {
+    const sql = "SELECT name, namehash, label, label_hash, parent_name, owner, resolver, registry, chain, token_id, canonical_id, token_version, expiry, registry_locked, migrated, ejected, created_at, created_block, updated_at, updated_block FROM names WHERE parent_name = ? ORDER BY created_at DESC LIMIT ? OFFSET ?";
+
+    const sql_z = try db.allocator.dupeZ(u8, sql);
+    defer db.allocator.free(sql_z);
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    const prepare_result = c.sqlite3_prepare_v2(db.db, sql_z.ptr, -1, &stmt, null);
+    if (prepare_result != c.SQLITE_OK) {
+        std.log.err("Failed to prepare SQL statement: {s}", .{c.sqlite3_errmsg(db.db)});
+        return error.PrepareFailed;
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+
+    const parent_name_z = try db.allocator.dupeZ(u8, parent_name_arg);
+    defer db.allocator.free(parent_name_z);
+
+    _ = c.sqlite3_bind_text(stmt, 1, parent_name_z.ptr, @intCast(parent_name_z.len), null);
+    _ = c.sqlite3_bind_int(stmt, 2, @intCast(limit));
+    _ = c.sqlite3_bind_int(stmt, 3, @intCast(skip));
+
+    var names_list: std.ArrayList(models.Name) = .{};
+    errdefer {
+        for (names_list.items) |*n| {
+            n.deinit(db.allocator);
+        }
+        names_list.deinit(db.allocator);
+    }
+
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        const name_str = std.mem.span(c.sqlite3_column_text(stmt, 0));
+        const label_str = std.mem.span(c.sqlite3_column_text(stmt, 2));
+        const label_hash_str = std.mem.span(c.sqlite3_column_text(stmt, 3));
+        const parent_name_str = std.mem.span(c.sqlite3_column_text(stmt, 4));
+        const chain_str = std.mem.span(c.sqlite3_column_text(stmt, 8));
+        const registry_str = std.mem.span(c.sqlite3_column_text(stmt, 7));
+        const owner_str = std.mem.span(c.sqlite3_column_text(stmt, 5));
+        const resolver_str = std.mem.span(c.sqlite3_column_text(stmt, 6));
+        const token_id_str = std.mem.span(c.sqlite3_column_text(stmt, 9));
+        const canonical_id_str = std.mem.span(c.sqlite3_column_text(stmt, 10));
+        const namehash_str = std.mem.span(c.sqlite3_column_text(stmt, 1));
+
+        // Derive parent_namehash from parent_name
+        const parent_namehash = try @import("../types/hash.zig").namehash(db.allocator, parent_name_str);
+
+        const name = models.Name{
+            .name = try db.allocator.dupe(u8, name_str),
+            .label = try db.allocator.dupe(u8, label_str),
+            .label_hash = try Hash.fromHex(label_hash_str),
+            .parent_name = try db.allocator.dupe(u8, parent_name_str),
+            .parent_namehash = parent_namehash,
+            .chain = try models.Chain.fromString(chain_str),
+            .registry = try Address.fromHex(registry_str),
+            .owner = try Address.fromHex(owner_str),
+            .resolver = try Address.fromHex(resolver_str),
+            .token_id = blk: {
+                const hex_str = if (std.mem.startsWith(u8, token_id_str, "0x")) token_id_str[2..] else token_id_str;
+                break :blk try std.fmt.parseInt(u256, hex_str, 16);
+            },
+            .canonical_id = blk: {
+                const hex_str = if (std.mem.startsWith(u8, canonical_id_str, "0x")) canonical_id_str[2..] else canonical_id_str;
+                break :blk try std.fmt.parseInt(u256, hex_str, 16);
+            },
+            .token_version = @intCast(c.sqlite3_column_int64(stmt, 11)),
+            .namehash = try Hash.fromHex(namehash_str),
+            .expiry = c.sqlite3_column_int64(stmt, 12),
+            .registry_locked = c.sqlite3_column_int(stmt, 13) != 0,
+            .migrated = c.sqlite3_column_int(stmt, 14) != 0,
+            .ejected = c.sqlite3_column_int(stmt, 15) != 0,
+            .created_block = @intCast(c.sqlite3_column_int64(stmt, 17)),
+            .created_at = c.sqlite3_column_int64(stmt, 16),
+            .updated_block = @intCast(c.sqlite3_column_int64(stmt, 19)),
+            .updated_at = c.sqlite3_column_int64(stmt, 18),
+            .is_wrapped = false,
+            .wrapper_fuses = null,
+            .wrapper_expiry = null,
+            .is_v1_name = false,
+            .v1_label_hash = null,
+        };
+
+        try names_list.append(db.allocator, name);
+    }
+
+    return names_list.toOwnedSlice(db.allocator);
+}
+
 /// Get all registries owned by an account (i.e., registries for names owned by the account)
 pub fn getRegistriesByOwner(db: *Database, chain: models.Chain, owner: Address) ![]models.Registry {
     const sql =
@@ -1086,7 +1175,6 @@ pub fn updateNameCreationDateIfEarlier(db: *Database, namehash: Hash, block_numb
 // ============================================================================
 
 test "updateNameWrapperState - wrap a name" {
-    const testing = std.testing;
     const allocator = testing.allocator;
 
     var database = try Database.init(allocator, ":memory:");
@@ -1115,6 +1203,11 @@ test "updateNameWrapperState - wrap a name" {
         .created_at = 1000,
         .updated_block = 1,
         .updated_at = 1000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
     };
 
     try insertName(&database, test_name);
@@ -1125,16 +1218,15 @@ test "updateNameWrapperState - wrap a name" {
     try updateNameWrapperState(&database, Hash.zero, fuses, expiry);
 
     // Verify wrapper state was updated
-    const name = try getNameByNamehash(&database, Hash.zero);
-    try testing.expect(name != null);
-    defer if (name) |n| n.deinit(allocator);
+    var name_opt = try getNameByNamehash(&database, Hash.zero);
+    try testing.expect(name_opt != null);
+    defer if (name_opt) |*n| n.deinit(allocator);
 
     // Note: We can't easily verify is_wrapped, wrapper_fuses, wrapper_expiry
     // as they're not in the Name struct yet. This test verifies the function doesn't crash.
 }
 
 test "updateNameUnwrapperState - unwrap a name" {
-    const testing = std.testing;
     const allocator = testing.allocator;
 
     var database = try Database.init(allocator, ":memory:");
@@ -1163,6 +1255,11 @@ test "updateNameUnwrapperState - unwrap a name" {
         .created_at = 1000,
         .updated_block = 1,
         .updated_at = 1000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
     };
 
     try insertName(&database, test_name);
@@ -1172,13 +1269,12 @@ test "updateNameUnwrapperState - unwrap a name" {
     try updateNameUnwrapperState(&database, Hash.zero);
 
     // Verify function completed successfully
-    const name = try getNameByNamehash(&database, Hash.zero);
-    try testing.expect(name != null);
-    defer if (name) |n| n.deinit(allocator);
+    var name_opt = try getNameByNamehash(&database, Hash.zero);
+    try testing.expect(name_opt != null);
+    defer if (name_opt) |*n| n.deinit(allocator);
 }
 
 test "updateNameWrapperFuses - update fuses" {
-    const testing = std.testing;
     const allocator = testing.allocator;
 
     var database = try Database.init(allocator, ":memory:");
@@ -1207,6 +1303,11 @@ test "updateNameWrapperFuses - update fuses" {
         .created_at = 1000,
         .updated_block = 1,
         .updated_at = 1000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
     };
 
     try insertName(&database, test_name);
@@ -1217,13 +1318,12 @@ test "updateNameWrapperFuses - update fuses" {
     try updateNameWrapperFuses(&database, Hash.zero, new_fuses);
 
     // Verify function completed successfully
-    const name = try getNameByNamehash(&database, Hash.zero);
-    try testing.expect(name != null);
-    defer if (name) |n| n.deinit(allocator);
+    var name_opt = try getNameByNamehash(&database, Hash.zero);
+    try testing.expect(name_opt != null);
+    defer if (name_opt) |*n| n.deinit(allocator);
 }
 
 test "updateNameWrapperExpiry - update wrapper expiry" {
-    const testing = std.testing;
     const allocator = testing.allocator;
 
     var database = try Database.init(allocator, ":memory:");
@@ -1252,6 +1352,11 @@ test "updateNameWrapperExpiry - update wrapper expiry" {
         .created_at = 1000,
         .updated_block = 1,
         .updated_at = 1000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
     };
 
     try insertName(&database, test_name);
@@ -1262,7 +1367,271 @@ test "updateNameWrapperExpiry - update wrapper expiry" {
     try updateNameWrapperExpiry(&database, Hash.zero, new_expiry);
 
     // Verify function completed successfully
-    const name = try getNameByNamehash(&database, Hash.zero);
-    try testing.expect(name != null);
-    defer if (name) |n| n.deinit(allocator);
+    var name_opt = try getNameByNamehash(&database, Hash.zero);
+    try testing.expect(name_opt != null);
+    defer if (name_opt) |*n| n.deinit(allocator);
+}
+
+test "getSubdomains returns subdomains for parent name" {
+    const allocator = testing.allocator;
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const hash_mod = @import("../types/hash.zig");
+
+    // Create parent domain "eth"
+    const eth_name = models.Name{
+        .name = try allocator.dupe(u8, "eth"),
+        .label = try allocator.dupe(u8, "eth"),
+        .label_hash = Hash.zero,
+        .parent_name = try allocator.dupe(u8, ""),
+        .parent_namehash = Hash.zero,
+        .chain = .l1,
+        .registry = Address.zero,
+        .owner = Address.zero,
+        .resolver = Address.zero,
+        .token_id = 0,
+        .canonical_id = 0,
+        .token_version = 0,
+        .namehash = try hash_mod.namehash(allocator, "eth"),
+        .expiry = 0,
+        .registry_locked = false,
+        .migrated = false,
+        .ejected = false,
+        .created_block = 1,
+        .created_at = 1000,
+        .updated_block = 1,
+        .updated_at = 1000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    };
+    defer {
+        allocator.free(eth_name.name.?);
+        allocator.free(eth_name.label.?);
+        allocator.free(eth_name.parent_name.?);
+    }
+    try insertName(&database, eth_name);
+
+    // Create subdomains alice.eth and bob.eth
+    const alice_name = models.Name{
+        .name = try allocator.dupe(u8, "alice.eth"),
+        .label = try allocator.dupe(u8, "alice"),
+        .label_hash = Hash.zero,
+        .parent_name = try allocator.dupe(u8, "eth"),
+        .parent_namehash = try hash_mod.namehash(allocator, "eth"),
+        .chain = .l1,
+        .registry = Address.zero,
+        .owner = Address.zero,
+        .resolver = Address.zero,
+        .token_id = 1,
+        .canonical_id = 1,
+        .token_version = 0,
+        .namehash = try hash_mod.namehash(allocator, "alice.eth"),
+        .expiry = 0,
+        .registry_locked = false,
+        .migrated = false,
+        .ejected = false,
+        .created_block = 2,
+        .created_at = 2000,
+        .updated_block = 2,
+        .updated_at = 2000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    };
+    defer {
+        allocator.free(alice_name.name.?);
+        allocator.free(alice_name.label.?);
+        allocator.free(alice_name.parent_name.?);
+    }
+    try insertName(&database, alice_name);
+
+    const bob_name = models.Name{
+        .name = try allocator.dupe(u8, "bob.eth"),
+        .label = try allocator.dupe(u8, "bob"),
+        .label_hash = Hash.zero,
+        .parent_name = try allocator.dupe(u8, "eth"),
+        .parent_namehash = try hash_mod.namehash(allocator, "eth"),
+        .chain = .l1,
+        .registry = Address.zero,
+        .owner = Address.zero,
+        .resolver = Address.zero,
+        .token_id = 2,
+        .canonical_id = 2,
+        .token_version = 0,
+        .namehash = try hash_mod.namehash(allocator, "bob.eth"),
+        .expiry = 0,
+        .registry_locked = false,
+        .migrated = false,
+        .ejected = false,
+        .created_block = 3,
+        .created_at = 3000,
+        .updated_block = 3,
+        .updated_at = 3000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    };
+    defer {
+        allocator.free(bob_name.name.?);
+        allocator.free(bob_name.label.?);
+        allocator.free(bob_name.parent_name.?);
+    }
+    try insertName(&database, bob_name);
+
+    // Query subdomains of eth
+    const subdomains = try getSubdomains(&database, "eth", 0, 10);
+    defer {
+        for (subdomains) |*s| {
+            s.deinit(allocator);
+        }
+        allocator.free(subdomains);
+    }
+
+    // Should return both alice.eth and bob.eth
+    try testing.expectEqual(@as(usize, 2), subdomains.len);
+
+    // Verify subdomains are ordered by created_at DESC (bob first, then alice)
+    try testing.expectEqualStrings("bob.eth", subdomains[0].name.?);
+    try testing.expectEqualStrings("alice.eth", subdomains[1].name.?);
+}
+
+test "getSubdomains respects pagination limits" {
+    const allocator = testing.allocator;
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const hash_mod = @import("../types/hash.zig");
+
+    // Create parent domain "eth"
+    const eth_name = models.Name{
+        .name = try allocator.dupe(u8, "eth"),
+        .label = try allocator.dupe(u8, "eth"),
+        .label_hash = Hash.zero,
+        .parent_name = try allocator.dupe(u8, ""),
+        .parent_namehash = Hash.zero,
+        .chain = .l1,
+        .registry = Address.zero,
+        .owner = Address.zero,
+        .resolver = Address.zero,
+        .token_id = 0,
+        .canonical_id = 0,
+        .token_version = 0,
+        .namehash = try hash_mod.namehash(allocator, "eth"),
+        .expiry = 0,
+        .registry_locked = false,
+        .migrated = false,
+        .ejected = false,
+        .created_block = 1,
+        .created_at = 1000,
+        .updated_block = 1,
+        .updated_at = 1000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    };
+    defer {
+        allocator.free(eth_name.name.?);
+        allocator.free(eth_name.label.?);
+        allocator.free(eth_name.parent_name.?);
+    }
+    try insertName(&database, eth_name);
+
+    // Create 5 subdomains
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) {
+        var name_buf: [32]u8 = undefined;
+        const name_slice = try std.fmt.bufPrint(&name_buf, "sub{d}.eth", .{i});
+        var label_buf: [16]u8 = undefined;
+        const label_slice = try std.fmt.bufPrint(&label_buf, "sub{d}", .{i});
+
+        const sub_name = models.Name{
+            .name = try allocator.dupe(u8, name_slice),
+            .label = try allocator.dupe(u8, label_slice),
+            .label_hash = Hash.zero,
+            .parent_name = try allocator.dupe(u8, "eth"),
+            .parent_namehash = try hash_mod.namehash(allocator, "eth"),
+            .chain = .l1,
+            .registry = Address.zero,
+            .owner = Address.zero,
+            .resolver = Address.zero,
+            .token_id = i + 1,
+            .canonical_id = i + 1,
+            .token_version = 0,
+            .namehash = try hash_mod.namehash(allocator, name_slice),
+            .expiry = 0,
+            .registry_locked = false,
+            .migrated = false,
+            .ejected = false,
+            .created_block = i + 2,
+            .created_at = @as(i64, @intCast((i + 2) * 1000)),
+            .updated_block = i + 2,
+            .updated_at = @as(i64, @intCast((i + 2) * 1000)),
+            .is_wrapped = false,
+            .wrapper_fuses = null,
+            .wrapper_expiry = null,
+            .is_v1_name = false,
+            .v1_label_hash = null,
+        };
+        defer {
+            allocator.free(sub_name.name.?);
+            allocator.free(sub_name.label.?);
+            allocator.free(sub_name.parent_name.?);
+        }
+        try insertName(&database, sub_name);
+    }
+
+    // Query with limit of 2
+    const subdomains = try getSubdomains(&database, "eth", 0, 2);
+    defer {
+        for (subdomains) |*s| {
+            s.deinit(allocator);
+        }
+        allocator.free(subdomains);
+    }
+
+    // Should return only 2 subdomains
+    try testing.expectEqual(@as(usize, 2), subdomains.len);
+
+    // Query with skip
+    const subdomains_skip = try getSubdomains(&database, "eth", 2, 2);
+    defer {
+        for (subdomains_skip) |*s| {
+            s.deinit(allocator);
+        }
+        allocator.free(subdomains_skip);
+    }
+
+    // Should return 2 more subdomains
+    try testing.expectEqual(@as(usize, 2), subdomains_skip.len);
+}
+
+test "getSubdomains returns empty for no subdomains" {
+    const allocator = testing.allocator;
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    // Query subdomains of non-existent parent
+    const subdomains = try getSubdomains(&database, "nonexistent.eth", 0, 10);
+    defer {
+        for (subdomains) |*s| {
+            s.deinit(allocator);
+        }
+        allocator.free(subdomains);
+    }
+
+    // Should return empty slice
+    try testing.expectEqual(@as(usize, 0), subdomains.len);
 }
