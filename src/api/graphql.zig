@@ -2774,6 +2774,10 @@ fn resolveEvents(ctx: parser.ExecutionContext, field: *const parser.Field) !pars
                     if (filter_arg.value == .string) {
                         filter_opts.domain = filter_arg.value.string;
                     }
+                } else if (std.mem.eql(u8, filter_arg.name, "contractAddress")) {
+                    if (filter_arg.value == .string) {
+                        filter_opts.contract_address = filter_arg.value.string;
+                    }
                 } else if (std.mem.eql(u8, filter_arg.name, "namehash")) {
                     if (filter_arg.value == .string) {
                         filter_opts.namehash = filter_arg.value.string;

@@ -1855,6 +1855,16 @@
               }
             },
             {
+              "name": "contractAddress",
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              }
+            },
+            {
               "name": "namehash",
               "type": {
                 "kind": "SCALAR",

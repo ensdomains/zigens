@@ -342,6 +342,9 @@ input EventFilter {
   """Filter by domain name"""
   domain: String
 
+  """Filter by contract address"""
+  contractAddress: String!
+
   """Filter by namehash"""
   namehash: String
 
