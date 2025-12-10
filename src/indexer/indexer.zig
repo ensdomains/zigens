@@ -2918,7 +2918,8 @@ pub const Indexer = struct {
     fn handleAddressChanged(self: *Indexer, chain: models.Chain, resolver: Address, log: rpc.Log) !void {
         // topics[0] = event signature
         // topics[1] = indexed node (namehash)
-        const namehash = log.topics[1];
+        if (log.topics.len < 2) return error.InvalidTopicCount;
+        var namehash = log.topics[1];
 
         // Decode coin type and address from data
         const coin_type = try abi.ABI.decodeUint256(log.data, 0);
@@ -2932,6 +2933,17 @@ pub const Indexer = struct {
         address_hex[1] = 'x';
         for (address_bytes, 0..) |byte, i| {
             _ = try std.fmt.bufPrint(address_hex[2 + i * 2 .. 4 + i * 2], "{x:0>2}", .{byte});
+        }
+
+        // In ENSv2, each name has its own dedicated resolver. If the namehash is zero,
+        // look up the actual namehash from the resolver address.
+        if (namehash.isZero()) {
+            if (try self.database.getNamehashByResolver(resolver)) |actual_namehash| {
+                namehash = actual_namehash;
+            } else {
+                std.log.debug("AddressChanged: skipping event with zero namehash and unknown resolver", .{});
+                return;
+            }
         }
 
         const nh_hex_log = try namehash.toHex(self.allocator);
@@ -2988,7 +3000,8 @@ pub const Indexer = struct {
     fn handleContentHashChanged(self: *Indexer, chain: models.Chain, resolver: Address, log: rpc.Log) !void {
         // topics[0] = event signature
         // topics[1] = indexed node (namehash)
-        const namehash = log.topics[1];
+        if (log.topics.len < 2) return error.InvalidTopicCount;
+        var namehash = log.topics[1];
 
         // Decode content hash from data
         const content_hash_bytes = try abi.ABI.decodeBytes(self.allocator, log.data, 0);
@@ -3001,6 +3014,17 @@ pub const Indexer = struct {
         content_hash_hex[1] = 'x';
         for (content_hash_bytes, 0..) |byte, i| {
             _ = try std.fmt.bufPrint(content_hash_hex[2 + i * 2 .. 4 + i * 2], "{x:0>2}", .{byte});
+        }
+
+        // In ENSv2, each name has its own dedicated resolver. If the namehash is zero,
+        // look up the actual namehash from the resolver address.
+        if (namehash.isZero()) {
+            if (try self.database.getNamehashByResolver(resolver)) |actual_namehash| {
+                namehash = actual_namehash;
+            } else {
+                std.log.debug("ContentHashChanged: skipping event with zero namehash and unknown resolver", .{});
+                return;
+            }
         }
 
         const nh_hex_log = try namehash.toHex(self.allocator);
@@ -3055,7 +3079,8 @@ pub const Indexer = struct {
         // topics[0] = event signature
         // topics[1] = indexed node (namehash)
         // topics[2] = indexed key (hashed, not useful)
-        const namehash = log.topics[1];
+        if (log.topics.len < 2) return error.InvalidTopicCount;
+        var namehash = log.topics[1];
 
         // Decode key and value from data
         const key = try abi.ABI.decodeString(self.allocator, log.data, 0);
@@ -3073,6 +3098,23 @@ pub const Indexer = struct {
             std.log.warn("Invalid UTF-8 in text record value: {any}", .{err});
             return;
         };
+
+        // In ENSv2, each name has its own dedicated resolver (User Resolver pattern).
+        // The TextChanged event may emit with a zeroed namehash because the resolver
+        // itself is dedicated to one name. In this case, we look up the name's namehash
+        // from the resolver address.
+        if (namehash.isZero()) {
+            if (try self.database.getNamehashByResolver(resolver)) |actual_namehash| {
+                namehash = actual_namehash;
+                std.log.debug("TextChanged: resolved zero namehash to {s} via resolver lookup", .{
+                    (try actual_namehash.toHex(self.allocator)),
+                });
+            } else {
+                // Resolver not associated with any indexed name - skip this event
+                std.log.debug("TextChanged: skipping event with zero namehash and unknown resolver", .{});
+                return;
+            }
+        }
 
         const nh_hex_log = try namehash.toHex(self.allocator);
         defer self.allocator.free(nh_hex_log);

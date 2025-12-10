@@ -206,6 +206,22 @@ pub fn build(b: *std.Build) void {
     const filter_test_step = b.step("test-filters", "Run filter logic unit tests");
     filter_test_step.dependOn(&run_filter_tests.step);
 
+    // Event filtering tests
+    const events_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/events_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    events_tests.linkLibC();
+    events_tests.linkSystemLibrary("sqlite3");
+
+    const run_events_tests = b.addRunArtifact(events_tests);
+    const events_test_step = b.step("test-events", "Run event filtering tests");
+    events_test_step.dependOn(&run_events_tests.step);
+
     // Make the default test command run all tests
     test_step.dependOn(&run_filter_tests.step);
+    test_step.dependOn(&run_events_tests.step);
 }

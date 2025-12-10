@@ -294,6 +294,13 @@
                     "kind": "SCALAR",
                     "name": "Int"
                   }
+                },
+                {
+                  "name": "where",
+                  "type": {
+                    "kind": "INPUT_OBJECT",
+                    "name": "EventFilter"
+                  }
                 }
               ],
               "type": {
@@ -339,6 +346,13 @@
                   "type": {
                     "kind": "SCALAR",
                     "name": "String"
+                  }
+                },
+                {
+                  "name": "where",
+                  "type": {
+                    "kind": "INPUT_OBJECT",
+                    "name": "EventFilter"
                   }
                 }
               ],
@@ -930,6 +944,31 @@
                 "ofType": {
                   "kind": "SCALAR",
                   "name": "Boolean"
+                }
+              }
+            },
+            {
+              "name": "events",
+              "args": [
+                {
+                  "name": "first",
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Event"
+                    }
+                  }
                 }
               }
             }
@@ -1750,6 +1789,74 @@
             },
             {
               "name": "expiryDate_lte",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            }
+          ]
+        },
+        {
+          "kind": "INPUT_OBJECT",
+          "name": "EventFilter",
+          "inputFields": [
+            {
+              "name": "type",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "type_in",
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "SCALAR",
+                    "name": "String"
+                  }
+                }
+              }
+            },
+            {
+              "name": "domain",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "namehash",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "blockNumber_gt",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "blockNumber_lt",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "timestamp_gt",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "timestamp_lt",
               "type": {
                 "kind": "SCALAR",
                 "name": "Int"
