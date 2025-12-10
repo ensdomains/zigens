@@ -2614,10 +2614,67 @@ fn resolveEvents(ctx: parser.ExecutionContext, field: *const parser.Field) !pars
     const allocator = ctx.allocator;
 
     // Extract arguments
-    const first = parser.getIntArg(field, "first", 50) orelse 50;
+    const first = parser.getIntArg(field, "first", 100) orelse 100;
 
-    // Get events from database
-    const events = try database.getRecentEvents(null, null, @intCast(first));
+    // Parse EventFilter if provided
+    var filter_opts = db.EventFilterOptions{
+        .limit = @intCast(first),
+    };
+
+    // Temporary storage for event_types strings
+    var event_types_list: std.ArrayList([]const u8) = .{};
+    defer event_types_list.deinit(allocator);
+
+    // Parse 'where' argument
+    for (field.arguments) |arg| {
+        if (std.mem.eql(u8, arg.name, "where") and arg.value == .object) {
+            for (arg.value.object) |filter_arg| {
+                if (std.mem.eql(u8, filter_arg.name, "type")) {
+                    if (filter_arg.value == .string) {
+                        filter_opts.event_type = filter_arg.value.string;
+                    }
+                } else if (std.mem.eql(u8, filter_arg.name, "type_in")) {
+                    if (filter_arg.value == .list) {
+                        for (filter_arg.value.list) |item| {
+                            if (item == .string) {
+                                try event_types_list.append(allocator, item.string);
+                            }
+                        }
+                        if (event_types_list.items.len > 0) {
+                            filter_opts.event_types = event_types_list.items;
+                        }
+                    }
+                } else if (std.mem.eql(u8, filter_arg.name, "domain")) {
+                    if (filter_arg.value == .string) {
+                        filter_opts.domain = filter_arg.value.string;
+                    }
+                } else if (std.mem.eql(u8, filter_arg.name, "namehash")) {
+                    if (filter_arg.value == .string) {
+                        filter_opts.namehash = filter_arg.value.string;
+                    }
+                } else if (std.mem.eql(u8, filter_arg.name, "blockNumber_gt")) {
+                    if (filter_arg.value == .int) {
+                        filter_opts.block_number_gt = filter_arg.value.int;
+                    }
+                } else if (std.mem.eql(u8, filter_arg.name, "blockNumber_lt")) {
+                    if (filter_arg.value == .int) {
+                        filter_opts.block_number_lt = filter_arg.value.int;
+                    }
+                } else if (std.mem.eql(u8, filter_arg.name, "timestamp_gt")) {
+                    if (filter_arg.value == .int) {
+                        filter_opts.timestamp_gt = filter_arg.value.int;
+                    }
+                } else if (std.mem.eql(u8, filter_arg.name, "timestamp_lt")) {
+                    if (filter_arg.value == .int) {
+                        filter_opts.timestamp_lt = filter_arg.value.int;
+                    }
+                }
+            }
+        }
+    }
+
+    // Get events from database with filters
+    const events = try database.getEventsFiltered(filter_opts);
     defer {
         for (events) |*event| {
             event.deinit(allocator);
@@ -3063,6 +3120,29 @@ fn buildDomainJson(
             defer ctx.allocator.free(owner_json);
             try writer.writeAll(owner_json);
             first = false;
+        } else if (std.mem.eql(u8, field.name, "resolvedAddress")) {
+            // Nested Account object - the address this domain resolves to (ETH address, coin type 60)
+            try writer.print("\"{s}\":", .{output_key});
+            // Fetch the ETH address (coin type 60) from resolver
+            const resolved_addr_opt = try ctx.database.getResolverAddress(domain.namehash, 60);
+            if (resolved_addr_opt) |addr_str| {
+                defer ctx.allocator.free(addr_str);
+                // Parse the address and build Account JSON
+                if (Address.fromHex(addr_str)) |addr| {
+                    const account_json = try buildAccountJson(addr, field.selections, .{
+                        .database = ctx.database,
+                        .depth = ctx.depth + 1,
+                        .allocator = ctx.allocator,
+                    });
+                    defer ctx.allocator.free(account_json);
+                    try writer.writeAll(account_json);
+                } else |_| {
+                    try writer.writeAll("null");
+                }
+            } else {
+                try writer.writeAll("null");
+            }
+            first = false;
         } else if (std.mem.eql(u8, field.name, "resolver")) {
             // Nested Resolver object
             try writer.print("\"{s}\":", .{output_key});
@@ -3189,6 +3269,36 @@ fn buildDomainJson(
             }
             try writer.writeAll("]");
             first = false;
+        } else if (std.mem.eql(u8, field.name, "events")) {
+            // Query events for this domain
+            const first_arg = parser.getIntArg(field, "first", 100) orelse 100;
+
+            // Get namehash as hex for querying
+            const namehash_hex = try domain.namehash.toHex(ctx.allocator);
+            defer ctx.allocator.free(namehash_hex);
+
+            // Query events by namehash
+            const domain_events = try ctx.database.getEventsByNamehash(namehash_hex, @intCast(first_arg));
+            defer {
+                for (domain_events) |*e| {
+                    e.deinit(ctx.allocator);
+                }
+                ctx.allocator.free(domain_events);
+            }
+
+            try writer.print("\"{s}\":[", .{output_key});
+            for (domain_events, 0..) |*event, i| {
+                if (i > 0) try writer.writeAll(",");
+                const event_json = try buildEventJson(event, field.selections, .{
+                    .database = ctx.database,
+                    .depth = ctx.depth + 1,
+                    .allocator = ctx.allocator,
+                });
+                defer ctx.allocator.free(event_json);
+                try writer.writeAll(event_json);
+            }
+            try writer.writeAll("]");
+            first = false;
         }
     }
 
@@ -3258,8 +3368,8 @@ fn buildResolverJson(
             }
             first = false;
         } else if (std.mem.eql(u8, field.name, "texts")) {
-            // Fetch text record keys by resolver address (V2 names have different namehashes)
-            const text_keys = try ctx.database.getResolverTextKeysByResolver(resolver);
+            // Fetch text record keys by namehash (unique per domain)
+            const text_keys = try ctx.database.getResolverTextKeys(domain_namehash);
             defer {
                 for (text_keys) |key| {
                     ctx.allocator.free(key);
@@ -3288,8 +3398,8 @@ fn buildResolverJson(
             }
 
             if (key_arg) |key| {
-                // Use resolver address for lookup (V2 names have different namehashes)
-                const text_value = try ctx.database.getResolverTextByResolver(resolver, key);
+                // Use namehash for lookup (unique per domain)
+                const text_value = try ctx.database.getResolverText(domain_namehash, key);
                 defer if (text_value) |val| ctx.allocator.free(val);
 
                 if (text_value) |val| {
