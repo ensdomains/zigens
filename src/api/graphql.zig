@@ -79,13 +79,18 @@ pub const GraphQLHandler = struct {
     }
 
     /// Handle a GraphQL query with optional variables
-    pub fn handleQuery(self: *GraphQLHandler, query: []const u8, variables: ?std.json.Value) ![]u8 {
+    pub fn handleQuery(self: *GraphQLHandler, query: []const u8, variables: ?std.json.Value, operation_name: ?[]const u8) ![]u8 {
         // Start timing for metrics
         var timer = metrics_mod.QueryTimer.start();
 
         // Handle introspection queries for autocomplete/schema exploration
         if (std.mem.indexOf(u8, query, "__schema") != null or std.mem.indexOf(u8, query, "IntrospectionQuery") != null) {
             return try self.handleIntrospectionQuery();
+        }
+
+        // Handle __type introspection queries (but not __typename)
+        if (std.mem.indexOf(u8, query, "__type(") != null) {
+            return try self.handleTypeIntrospectionQuery(query);
         }
 
         // Create request-scoped DataLoader context for batching and caching
@@ -123,9 +128,14 @@ pub const GraphQLHandler = struct {
         std.log.debug("Query complexity: depth={d}, cost={d}", .{ analysis.depth, analysis.cost });
 
         // Execute the parsed query with variables (with DataLoaders available)
-        const result = self.executor.executeDocument(&document, variables) catch |err| {
+        const result = self.executor.executeDocument(&document, variables, operation_name) catch |err| {
             std.log.err("Failed to execute GraphQL query: {}", .{err});
             self.metrics.recordError();
+            if (err == error.OperationNotFound) {
+                return try self.buildErrorResponseWithCode("Operation not found", ErrorCode.VALIDATION_ERROR);
+            } else if (err == error.OperationNameRequired) {
+                return try self.buildErrorResponseWithCode("Must provide operation name when query contains multiple operations", ErrorCode.VALIDATION_ERROR);
+            }
             return try self.buildErrorResponseWithCode("Query execution failed", ErrorCode.EXECUTION_ERROR);
         };
 
@@ -723,6 +733,71 @@ pub const GraphQLHandler = struct {
         // Generated from schema.graphql at build time
         const introspection_response = @embedFile("introspection.json");
         return try self.allocator.dupe(u8, introspection_response);
+    }
+
+    fn handleTypeIntrospectionQuery(self: *GraphQLHandler, query: []const u8) ![]u8 {
+        // Extract type name from __type(name: "TypeName") query
+        // Look for pattern: __type(name: "..." or __type(name: '...'
+        const type_name = blk: {
+            // Find __type(name:
+            const start_marker = "__type(name:";
+            const start_pos = std.mem.indexOf(u8, query, start_marker) orelse
+                return try self.buildErrorResponseWithCode("Invalid __type query: missing name argument", ErrorCode.VALIDATION_ERROR);
+
+            const after_marker = query[start_pos + start_marker.len ..];
+
+            // Skip whitespace
+            var i: usize = 0;
+            while (i < after_marker.len and (after_marker[i] == ' ' or after_marker[i] == '\t')) : (i += 1) {}
+
+            if (i >= after_marker.len)
+                return try self.buildErrorResponseWithCode("Invalid __type query: missing name value", ErrorCode.VALIDATION_ERROR);
+
+            // Check for quote character
+            const quote_char = after_marker[i];
+            if (quote_char != '"' and quote_char != '\'')
+                return try self.buildErrorResponseWithCode("Invalid __type query: name must be a string", ErrorCode.VALIDATION_ERROR);
+
+            // Find closing quote
+            const name_start = i + 1;
+            const name_end = std.mem.indexOfScalarPos(u8, after_marker, name_start, quote_char) orelse
+                return try self.buildErrorResponseWithCode("Invalid __type query: unterminated string", ErrorCode.VALIDATION_ERROR);
+
+            break :blk after_marker[name_start..name_end];
+        };
+
+        // Load and parse introspection data
+        const introspection_json = @embedFile("introspection.json");
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, introspection_json, .{}) catch {
+            return try self.buildErrorResponseWithCode("Failed to parse introspection data", ErrorCode.INTERNAL_ERROR);
+        };
+        defer parsed.deinit();
+
+        // Find the requested type
+        const types = parsed.value.object.get("data").?.object.get("__schema").?.object.get("types").?.array;
+
+        var found_type: ?std.json.Value = null;
+        for (types.items) |type_val| {
+            const name = type_val.object.get("name").?.string;
+            if (std.mem.eql(u8, name, type_name)) {
+                found_type = type_val;
+                break;
+            }
+        }
+
+        if (found_type == null) {
+            // Type not found - return null per GraphQL spec
+            return try self.allocator.dupe(u8, "{\"data\":{\"__type\":null}}");
+        }
+
+        // Serialize the type object to JSON
+        const type_json = std.json.Stringify.valueAlloc(self.allocator, found_type.?, .{}) catch {
+            return try self.buildErrorResponseWithCode("Failed to serialize type data", ErrorCode.INTERNAL_ERROR);
+        };
+        defer self.allocator.free(type_json);
+
+        // Build response
+        return try std.fmt.allocPrint(self.allocator, "{{\"data\":{{\"__type\":{s}}}}}", .{type_json});
     }
 
     fn buildDomainResponse(self: *GraphQLHandler, domain: models.Name) ![]u8 {
@@ -3128,6 +3203,13 @@ fn buildAccountJson(
             }
             try writer.writeAll("]");
             first = false;
+        } else if (std.mem.eql(u8, field.name, "__typename")) {
+            try writer.print("\"{s}\":\"Account\"", .{output_key});
+            first = false;
+        } else {
+            // Unknown field - return null per GraphQL spec
+            try writer.print("\"{s}\":null", .{output_key});
+            first = false;
         }
     }
 
@@ -3371,6 +3453,13 @@ fn buildDomainJson(
             }
             try writer.writeAll("]");
             first = false;
+        } else if (std.mem.eql(u8, field.name, "__typename")) {
+            try writer.print("\"{s}\":\"Domain\"", .{output_key});
+            first = false;
+        } else {
+            // Unknown field - return null per GraphQL spec
+            try writer.print("\"{s}\":null", .{output_key});
+            first = false;
         }
     }
 
@@ -3484,6 +3573,13 @@ fn buildResolverJson(
             } else {
                 try writer.print("\"{s}\":null", .{output_key});
             }
+            first = false;
+        } else if (std.mem.eql(u8, field.name, "__typename")) {
+            try writer.print("\"{s}\":\"Resolver\"", .{output_key});
+            first = false;
+        } else {
+            // Unknown field - return null per GraphQL spec
+            try writer.print("\"{s}\":null", .{output_key});
             first = false;
         }
     }
@@ -3628,6 +3724,13 @@ fn buildRegistrationJson(
                 try writer.print("\"{s}\":null", .{output_key});
             }
             first = false;
+        } else if (std.mem.eql(u8, field.name, "__typename")) {
+            try writer.print("\"{s}\":\"Registration\"", .{output_key});
+            first = false;
+        } else {
+            // Unknown field - return null per GraphQL spec
+            try writer.print("\"{s}\":null", .{output_key});
+            first = false;
         }
     }
 
@@ -3729,8 +3832,11 @@ fn buildEventJson(
             // Handle GraphQL introspection field
             try writer.print("\"{s}\":\"Event\"", .{output_key});
             first = false;
+        } else {
+            // Unknown field - return null per GraphQL spec
+            try writer.print("\"{s}\":null", .{output_key});
+            first = false;
         }
-        // Unknown fields are silently ignored (GraphQL spec allows this)
     }
 
     try writer.writeAll("}");

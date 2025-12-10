@@ -423,13 +423,22 @@ pub const Server = struct {
         // Extract variables if present (optional)
         const variables_value = parsed.value.object.get("variables");
 
+        // Extract operationName if present (optional, used when query has multiple operations)
+        const operation_name: ?[]const u8 = if (parsed.value.object.get("operationName")) |op_val|
+            if (op_val == .string) op_val.string else null
+        else
+            null;
+
         std.log.info("GraphQL query: {s}", .{query});
         if (variables_value) |v| {
             std.log.info("Variables provided: {any}", .{v});
         }
+        if (operation_name) |name| {
+            std.log.info("Operation name: {s}", .{name});
+        }
 
-        // Handle the query with variables
-        const result = try self.graphql_handler.handleQuery(query, variables_value);
+        // Handle the query with variables and operation name
+        const result = try self.graphql_handler.handleQuery(query, variables_value, operation_name);
         defer self.allocator.free(result);
 
         try self.sendJsonResponse(stream, 200, result);
