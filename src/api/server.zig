@@ -172,6 +172,12 @@ pub const Server = struct {
 
         std.log.debug("API request: {s} {s}", .{ method, path });
 
+        // Handle CORS preflight requests for all endpoints
+        if (std.mem.eql(u8, method, "OPTIONS")) {
+            try self.sendCorsPreflightResponse(connection.stream);
+            return;
+        }
+
         // Route request
         if (std.mem.startsWith(u8, path, "/graphql")) {
             // Handle GraphQL queries (both GET and POST)
@@ -556,6 +562,18 @@ pub const Server = struct {
         defer self.allocator.free(response);
 
         try self.sendJsonResponse(stream, 400, response);
+    }
+
+    fn sendCorsPreflightResponse(_: *Server, stream: std.net.Stream) !void {
+        const response =
+            "HTTP/1.1 204 No Content\r\n" ++
+            "Access-Control-Allow-Origin: *\r\n" ++
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" ++
+            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
+            "Access-Control-Max-Age: 86400\r\n" ++
+            "\r\n";
+
+        _ = try stream.write(response);
     }
 
     // ========================================================================
