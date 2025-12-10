@@ -520,10 +520,7 @@ test "WebhookManager init" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try db.Database.init(allocator, ":memory:");
-    defer database.deinit();
-
-    const manager = try WebhookManager.init(allocator, &database, 3, 1000);
+    const manager = try WebhookManager.init(allocator, ":memory:", 3, 1000);
     defer manager.deinit();
 
     try std.testing.expect(manager.max_retries == 3);
@@ -534,10 +531,7 @@ test "WebhookManager register webhook" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try db.Database.init(allocator, ":memory:");
-    defer database.deinit();
-
-    const manager = try WebhookManager.init(allocator, &database, 3, 1000);
+    const manager = try WebhookManager.init(allocator, ":memory:", 3, 1000);
     defer manager.deinit();
 
     const event_types = [_]models.EventType{.name_registered};
@@ -551,10 +545,7 @@ test "WebhookManager unregister webhook" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try db.Database.init(allocator, ":memory:");
-    defer database.deinit();
-
-    const manager = try WebhookManager.init(allocator, &database, 3, 1000);
+    const manager = try WebhookManager.init(allocator, ":memory:", 3, 1000);
     defer manager.deinit();
 
     const event_types = [_]models.EventType{.name_registered};
@@ -569,10 +560,7 @@ test "WebhookManager list webhooks" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try db.Database.init(allocator, ":memory:");
-    defer database.deinit();
-
-    const manager = try WebhookManager.init(allocator, &database, 3, 1000);
+    const manager = try WebhookManager.init(allocator, ":memory:", 3, 1000);
     defer manager.deinit();
 
     const event_types = [_]models.EventType{.name_registered};

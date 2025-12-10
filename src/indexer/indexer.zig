@@ -2296,10 +2296,13 @@ pub const Indexer = struct {
         const escaped_label = try json_utils.escapeString(self.allocator, label_str);
         defer self.allocator.free(escaped_label);
 
-        const event_data = try std.fmt.allocPrint(self.allocator, "{{\"label\":\"{s}\",\"tokenId\":{d},\"owner\":\"{any}\",\"duration\":{d},\"paymentToken\":\"{s}\",\"referrer\":\"{s}\",\"basePrice\":{d},\"premium\":{d}}}", .{
+        const owner_hex = try owner.toHex(self.allocator);
+        defer self.allocator.free(owner_hex);
+
+        const event_data = try std.fmt.allocPrint(self.allocator, "{{\"label\":\"{s}\",\"tokenId\":{d},\"owner\":\"{s}\",\"duration\":{d},\"paymentToken\":\"{s}\",\"referrer\":\"{s}\",\"basePrice\":{d},\"premium\":{d}}}", .{
             escaped_label,
             token_id,
-            owner,
+            owner_hex,
             duration,
             payment_token_hex,
             referrer_hex,
