@@ -352,7 +352,7 @@ input EventFilter {
   domain: String
 
   """Filter by contract address"""
-  contractAddress: String!
+  contractAddress: String
 
   """Filter by namehash"""
   namehash: String
