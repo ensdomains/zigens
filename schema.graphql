@@ -242,6 +242,9 @@ type Registration {
 
   """Account that registered the domain"""
   registrant: Account!
+
+  """Chain where registration occurred (l1 or l2)"""
+  chain: String!
 }
 
 """An event emitted by ENS contracts"""
@@ -272,6 +275,9 @@ type Event {
 
   """Domain associated with this event (if applicable)"""
   domain: Domain
+
+  """Chain where event occurred (l1 or l2)"""
+  chain: String!
 }
 
 """Filter criteria for querying domains"""
@@ -329,6 +335,9 @@ input RegistrationFilter {
 
   """Filter by expiry date less than or equal"""
   expiryDate_lte: Int
+
+  """Filter by chain (l1 or l2)"""
+  chain: String
 }
 
 """Filter criteria for querying events"""

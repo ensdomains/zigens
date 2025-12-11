@@ -1513,108 +1513,11 @@ pub const GraphQLHandler = struct {
     }
 };
 
-/// GraphQL Schema for ENSv2 Indexer
-pub const Schema = struct {
-    pub const schema_definition =
-        \\type Query {
-        \\  domain(id: String!): Domain
-        \\  domains(first: Int = 100, skip: Int = 0, where: DomainFilter): [Domain!]!
-        \\  account(id: String!): Account
-        \\  registrations(first: Int = 100, skip: Int = 0, where: RegistrationFilter): [Registration!]!
-        \\  events(first: Int = 100, skip: Int = 0, where: EventFilter): [Event!]!
-        \\}
-        \\
-        \\type Domain {
-        \\  id: String!
-        \\  name: String
-        \\  labelName: String
-        \\  labelhash: String
-        \\  parent: Domain
-        \\  subdomains: [Domain!]!
-        \\  resolvedAddress: Account
-        \\  owner: Account!
-        \\  resolver: Resolver
-        \\  ttl: Int
-        \\  isMigrated: Boolean!
-        \\  createdAt: Int!
-        \\  registrant: Account
-        \\  registrationDate: Int
-        \\  expiryDate: Int
-        \\  tokenId: String
-        \\  canonicalId: String
-        \\  tokenVersion: Int
-        \\}
-        \\
-        \\type Account {
-        \\  id: String!
-        \\  domains: [Domain!]!
-        \\  registrations: [Registration!]!
-        \\}
-        \\
-        \\type Resolver {
-        \\  id: String!
-        \\  address: String!
-        \\  addr: String
-        \\  contentHash: String
-        \\  texts: [String!]
-        \\  text(key: String!): String
-        \\}
-        \\
-        \\type Registration {
-        \\  id: String!
-        \\  name: String!
-        \\  domain: Domain!
-        \\  registrationDate: Int!
-        \\  expiryDate: Int!
-        \\  registrant: Account!
-        \\  chain: String!
-        \\}
-        \\
-        \\type Event {
-        \\  id: String!
-        \\  type: String!
-        \\  blockNumber: Int!
-        \\  transactionHash: String!
-        \\  timestamp: Int!
-        \\  contractAddress: String!
-        \\  name: String
-        \\  namehash: String
-        \\  domain: Domain
-        \\  chain: String!
-        \\}
-        \\
-        \\input DomainFilter {
-        \\  name: String
-        \\  name_contains: String
-        \\  owner: String
-        \\  resolvedAddress: String
-        \\  hasSubdomains: Boolean
-        \\  subdomainCount_gt: Int
-        \\  subdomainCount_lt: Int
-        \\}
-        \\
-        \\input RegistrationFilter {
-        \\  registrant: String
-        \\  expiryDate_gt: Int
-        \\  expiryDate_lt: Int
-        \\  chain: String
-        \\}
-        \\
-        \\input EventFilter {
-        \\  type: String
-        \\  type_in: [String!]
-        \\  domain: String
-        \\  namehash: String
-        \\  blockNumber_gt: Int
-        \\  blockNumber_lt: Int
-        \\  timestamp_gt: Int
-        \\  timestamp_lt: Int
-        \\}
-    ;
-};
-
 // ============================================================================
 // RESOLVER FUNCTIONS
+// ============================================================================
+// Note: GraphQL schema is defined in schema.graphql at the project root.
+// Introspection is served from introspection.json (generated at build time).
 // ============================================================================
 
 /// Resolver for domains query

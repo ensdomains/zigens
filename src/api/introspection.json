@@ -1174,6 +1174,17 @@
                   "name": "Account"
                 }
               }
+            },
+            {
+              "name": "chain",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              }
             }
           ]
         },
@@ -1270,6 +1281,17 @@
               "type": {
                 "kind": "OBJECT",
                 "name": "Domain"
+              }
+            },
+            {
+              "name": "chain",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
               }
             }
           ]
@@ -1819,6 +1841,13 @@
               "type": {
                 "kind": "SCALAR",
                 "name": "Int"
+              }
+            },
+            {
+              "name": "chain",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
               }
             }
           ]
