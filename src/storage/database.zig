@@ -24,6 +24,7 @@ const webhooks = @import("webhooks.zig");
 const transactions = @import("transactions.zig");
 const roles = @import("roles.zig");
 const ensip16 = @import("ensip16.zig");
+const registrations = @import("registrations.zig");
 
 // SQLITE_TRANSIENT - For Zig 0.15.1, we can't use the C constant due to alignment issues
 // Instead, we use null which tells SQLite to make a copy of the string
@@ -392,4 +393,10 @@ pub const Database = struct {
     pub const isApprovedFor = ensip16.isApprovedFor;
     pub const getApprovalsForName = ensip16.getApprovalsForName;
     pub const getApprovalsForDelegate = ensip16.getApprovalsForDelegate;
+
+    // Registrations module
+    // These functions query registration events with proper contract filtering
+    // to avoid duplicates from non-authoritative contracts
+    pub const RegistrationFilterOptions = registrations.RegistrationFilterOptions;
+    pub const getRegistrations = registrations.getRegistrations;
 };

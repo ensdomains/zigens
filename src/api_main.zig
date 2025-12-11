@@ -41,7 +41,6 @@ pub fn main() !void {
     }
 
     std.log.info("ENSv2 API Server starting...", .{});
-    std.log.info("Network: {s}", .{cfg.network.toString()});
     std.log.info("Database: {s}", .{cfg.database_path});
     std.log.info("Port: {d}", .{cfg.api_port});
     std.log.info("GraphQL Max Depth: {d}", .{cfg.graphql_max_depth});
@@ -51,14 +50,14 @@ pub fn main() !void {
     var database = try db.Database.initWithoutSchema(allocator, cfg.database_path);
     defer database.deinit();
 
-    std.log.info("Database connected", .{});
-
     // Check database integrity
     const integrity_ok = try database.checkIntegrity();
     if (!integrity_ok) {
         std.log.err("Database integrity check failed!", .{});
         return error.DatabaseCorrupted;
     }
+
+    std.log.info("Database connected", .{});
 
     // Start API server with complexity limits and metrics from config
     // Only pass webhook_db_path if webhooks are enabled

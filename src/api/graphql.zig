@@ -2152,7 +2152,12 @@ fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const par
 
     // For backward pagination (last/before), reverse the query order
     const order_dir: db.EventOrderDir = if (params.direction == .backward) .asc else .desc;
-    const events = try database.getRecentEventsWithOrder(null, .name_registered, @intCast(fetch_limit), order_dir);
+
+    // Get registration events from database (filters by canonical registries internally)
+    const events = try database.getRegistrations(.{
+        .limit = @intCast(fetch_limit),
+        .order_dir = order_dir,
+    });
     defer {
         for (events) |*event| {
             event.deinit(allocator);
@@ -2508,6 +2513,7 @@ fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.Field
     var filter_expiry_gte: ?i64 = null;
     var filter_expiry_lt: ?i64 = null;
     var filter_expiry_lte: ?i64 = null;
+    var filter_chain: ?models.Chain = null;
 
     // Look for "where" argument
     for (field.arguments) |arg| {
@@ -2517,6 +2523,10 @@ fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.Field
                     if (std.mem.eql(u8, filter_arg.name, "registrant")) {
                         if (filter_arg.value == .string) {
                             filter_registrant = Address.fromHex(filter_arg.value.string) catch null;
+                        }
+                    } else if (std.mem.eql(u8, filter_arg.name, "chain")) {
+                        if (filter_arg.value == .string) {
+                            filter_chain = models.Chain.fromString(filter_arg.value.string) catch null;
                         }
                     } else if (std.mem.eql(u8, filter_arg.name, "expiryDate_gt")) {
                         if (filter_arg.value == .int) {
@@ -2570,14 +2580,20 @@ fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.Field
         }
     }
 
-    // Get registration events from database (fetch more for filtering)
+    // Get registration events from database
+    // The database handles contract filtering internally based on its network configuration
     const fetch_limit = if (filter_registrant != null or filter_registrant_in != null or
         filter_expiry_gt != null or filter_expiry_gte != null or
         filter_expiry_lt != null or filter_expiry_lte != null)
         @min(first * 10, 1000)
     else
         first;
-    const events = try database.getRecentEvents(null, .name_registered, @intCast(fetch_limit));
+
+    const events = try database.getRegistrations(.{
+        .chain = filter_chain,
+        .limit = @intCast(fetch_limit),
+        .order_dir = .desc,
+    });
     defer {
         for (events) |*event| {
             event.deinit(allocator);
@@ -3727,6 +3743,9 @@ fn buildRegistrationJson(
             } else {
                 try writer.print("\"{s}\":null", .{output_key});
             }
+            first = false;
+        } else if (std.mem.eql(u8, field.name, "chain")) {
+            try writer.print("\"{s}\":\"{s}\"", .{ output_key, event.chain.toString() });
             first = false;
         } else if (std.mem.eql(u8, field.name, "__typename")) {
             try writer.print("\"{s}\":\"Registration\"", .{output_key});
