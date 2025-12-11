@@ -211,8 +211,10 @@ pub fn getRecentEventsWithOrder(db: *Database, chain: ?models.Chain, event_type:
 pub const EventFilterOptions = struct {
     event_type: ?[]const u8 = null,
     event_types: ?[]const []const u8 = null,
+    chain: ?models.Chain = null, // Filter by chain (l1 or l2)
     domain: ?[]const u8 = null,
     contract_address: ?[]const u8 = null,
+    contract_addresses: ?[]const []const u8 = null, // Multiple addresses (OR condition)
     namehash: ?[]const u8 = null,
     block_number_gt: ?i64 = null,
     block_number_lt: ?i64 = null,
@@ -235,6 +237,9 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     defer conditions.deinit(db.allocator);
 
     // Build WHERE conditions
+    if (filter.chain != null) {
+        try conditions.append(db.allocator, "chain = ?");
+    }
     if (filter.event_type != null) {
         try conditions.append(db.allocator, "event_type = ?");
     }
@@ -262,6 +267,25 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     }
     if (filter.contract_address != null) {
         try conditions.append(db.allocator, "contract_address = ?");
+    }
+    if (filter.contract_addresses != null and filter.contract_addresses.?.len > 0) {
+        // Build IN clause placeholder for multiple contract addresses
+        var in_clause_buf: [512]u8 = undefined;
+        var in_len: usize = 0;
+        const prefix = "contract_address IN (";
+        @memcpy(in_clause_buf[in_len..][0..prefix.len], prefix);
+        in_len += prefix.len;
+        for (filter.contract_addresses.?, 0..) |_, i| {
+            if (i > 0) {
+                in_clause_buf[in_len] = ',';
+                in_len += 1;
+            }
+            in_clause_buf[in_len] = '?';
+            in_len += 1;
+        }
+        in_clause_buf[in_len] = ')';
+        in_len += 1;
+        try conditions.append(db.allocator, try db.allocator.dupe(u8, in_clause_buf[0..in_len]));
     }
     if (filter.namehash != null) {
         try conditions.append(db.allocator, "namehash = ?");
@@ -321,6 +345,11 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
 
     // Bind parameters in the order they were added to conditions
     var param_idx: c_int = 1;
+    if (filter.chain) |ch| {
+        const chain_str = ch.toString();
+        _ = c.sqlite3_bind_text(stmt, param_idx, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
+        param_idx += 1;
+    }
     if (filter.event_type) |et| {
         _ = c.sqlite3_bind_text(stmt, param_idx, et.ptr, @intCast(et.len), SQLITE_TRANSIENT());
         param_idx += 1;
@@ -338,6 +367,12 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     if (filter.contract_address) |ca| {
         _ = c.sqlite3_bind_text(stmt, param_idx, ca.ptr, @intCast(ca.len), SQLITE_TRANSIENT());
         param_idx += 1;
+    }
+    if (filter.contract_addresses) |addrs| {
+        for (addrs) |addr| {
+            _ = c.sqlite3_bind_text(stmt, param_idx, addr.ptr, @intCast(addr.len), SQLITE_TRANSIENT());
+            param_idx += 1;
+        }
     }
     if (filter.namehash) |nh| {
         _ = c.sqlite3_bind_text(stmt, param_idx, nh.ptr, @intCast(nh.len), SQLITE_TRANSIENT());

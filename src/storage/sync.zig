@@ -217,9 +217,11 @@ pub fn pruneOldBlockHashes(db: *Database, chain: models.Chain, current_block: u6
     }
 }
 
-/// Verify database integrity
+/// Verify database integrity (uses quick_check for performance on large databases)
 pub fn checkIntegrity(db: *Database) !bool {
-    const sql = "PRAGMA integrity_check";
+    // quick_check is much faster than integrity_check on large databases
+    // It skips verifying that index content matches table content
+    const sql = "PRAGMA quick_check";
     var stmt: ?*c.sqlite3_stmt = null;
     defer {
         if (stmt) |s| _ = c.sqlite3_finalize(s);
