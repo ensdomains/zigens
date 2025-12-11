@@ -1567,6 +1567,7 @@ pub const Schema = struct {
         \\  registrationDate: Int!
         \\  expiryDate: Int!
         \\  registrant: Account!
+        \\  chain: String!
         \\}
         \\
         \\type Event {
@@ -1579,6 +1580,7 @@ pub const Schema = struct {
         \\  name: String
         \\  namehash: String
         \\  domain: Domain
+        \\  chain: String!
         \\}
         \\
         \\input DomainFilter {
@@ -1595,6 +1597,7 @@ pub const Schema = struct {
         \\  registrant: String
         \\  expiryDate_gt: Int
         \\  expiryDate_lt: Int
+        \\  chain: String
         \\}
         \\
         \\input EventFilter {
@@ -3851,6 +3854,9 @@ fn buildEventJson(
                 try writer.print("\"{s}\":null", .{output_key});
                 first = false;
             }
+        } else if (std.mem.eql(u8, field.name, "chain")) {
+            try writer.print("\"{s}\":\"{s}\"", .{ output_key, event.chain.toString() });
+            first = false;
         } else if (std.mem.eql(u8, field.name, "__typename")) {
             // Handle GraphQL introspection field
             try writer.print("\"{s}\":\"Event\"", .{output_key});
