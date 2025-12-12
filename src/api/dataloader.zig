@@ -884,7 +884,9 @@ pub fn batchLoadTextRecords(
         var text_query: std.ArrayList(u8) = .{};
         defer text_query.deinit(allocator);
 
-        try text_query.appendSlice(allocator, "SELECT resolver, key, value FROM resolver_texts WHERE resolver IN (");
+        // Use GROUP BY to deduplicate keys when multiple namehashes share the same resolver
+        // We only need unique keys per resolver for the texts field, taking MAX(value) for deterministic results
+        try text_query.appendSlice(allocator, "SELECT resolver, key, MAX(value) as value FROM resolver_texts WHERE resolver IN (");
         var first = true;
         var resolver_it = unique_resolvers.keyIterator();
         while (resolver_it.next()) |_| {
@@ -892,7 +894,9 @@ pub fn batchLoadTextRecords(
             try text_query.appendSlice(allocator, "?");
             first = false;
         }
-        try text_query.appendSlice(allocator, ") ORDER BY resolver, key");
+        // GROUP BY to deduplicate keys when multiple namehashes share the same resolver
+        // MAX(value) gets a deterministic value when there are duplicates
+        try text_query.appendSlice(allocator, ") GROUP BY resolver, key ORDER BY resolver, key");
 
         const text_query_z = try allocator.dupeZ(u8, text_query.items);
         defer allocator.free(text_query_z);
