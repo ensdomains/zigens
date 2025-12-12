@@ -2824,7 +2824,7 @@ pub const Indexer = struct {
         std.log.info("Indexing resolver events for {d} unique resolvers from blocks {d}-{d}", .{ resolvers.len, from_block, to_block });
 
         // Alchemy batch limit: 1000 requests/batch (we use 100 resolvers * 7 events = 700 for safety)
-        const RESOLVERS_PER_BATCH = 100;
+        const RESOLVERS_PER_BATCH = 20; // Reduced from 100 to prevent SystemResources error (20 * 7 = 140 requests)
         const REQUESTS_PER_RESOLVER = RESOLVER_EVENTS.len; // 7 event types
 
         // Process resolvers in chunks
