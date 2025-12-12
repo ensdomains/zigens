@@ -237,8 +237,25 @@ pub fn build(b: *std.Build) void {
     // Also add to the main graphql test step
     graphql_test_step.dependOn(&run_apollo_tests.step);
 
+    // GraphQL variables tests (parsing and resolution)
+    const variables_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/api/variables_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_variables_tests = b.addRunArtifact(variables_tests);
+    const variables_test_step = b.step("test-variables", "Run GraphQL variables tests");
+    variables_test_step.dependOn(&run_variables_tests.step);
+
+    // Also add to the main graphql test step
+    graphql_test_step.dependOn(&run_variables_tests.step);
+
     // Make the default test command run all tests
     test_step.dependOn(&run_filter_tests.step);
     test_step.dependOn(&run_events_tests.step);
     test_step.dependOn(&run_apollo_tests.step);
+    test_step.dependOn(&run_variables_tests.step);
 }

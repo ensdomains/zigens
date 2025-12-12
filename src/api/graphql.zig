@@ -1625,9 +1625,49 @@ fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) !par
     }
 
     // Get names from database
-    // Optimization: if owner filter is set and it's the main filter, push it to DB
+    // Optimization 1: if exact name filter is set, use direct lookup by namehash
+    // This is O(1) lookup instead of scanning/filtering
+    if (filter_name) |exact_name| {
+        // Compute namehash for exact lookup
+        const nh = try namehash(allocator, exact_name);
+
+        // Direct lookup by namehash
+        var found_name = try database.getNameByNamehash(nh);
+        if (found_name) |*name| {
+            defer name.deinit(allocator);
+
+            // Apply any additional filters (owner, etc.)
+            var matches = true;
+            if (filter_owner) |owner| {
+                if (!name.owner.eql(owner)) matches = false;
+            }
+
+            if (matches) {
+                // Build JSON result for single domain, wrapped in array
+                const name_json = try buildDomainJson(name, field.selections, .{
+                    .database = database,
+                    .depth = 0,
+                    .allocator = allocator,
+                    .loaders = ctx.loaders,
+                });
+                defer allocator.free(name_json);
+
+                // Wrap in array: [{...}]
+                var result = try allocator.alloc(u8, name_json.len + 2);
+                result[0] = '[';
+                @memcpy(result[1..][0..name_json.len], name_json);
+                result[name_json.len + 1] = ']';
+                return .{ .json = result };
+            }
+        }
+
+        // No match found - return empty array
+        return .{ .json = try allocator.dupe(u8, "[]") };
+    }
+
+    // Optimization 2: if owner filter is set and it's the main filter, push it to DB
     // This uses the idx_names_owner index instead of scanning all rows
-    const has_other_filters = filter_name != null or filter_name_contains != null or
+    const has_other_filters = filter_name_contains != null or
         filter_name_contains_nocase != null or filter_name_starts_with != null or
         filter_name_ends_with != null or filter_owner_in != null or
         filter_resolved_address != null or filter_has_subdomains != null or

@@ -361,6 +361,7 @@ pub const Indexer = struct {
         .{ .event_hash = abi.EventSignatures.token_regenerated_hash, .handler = handleTokenRegenerated, .name = "TokenRegenerated" },
         // NEW: TokenRegenerated V2 with 3 params (oldTokenId, newTokenId, flags) - current Sepolia deployment
         .{ .event_hash = abi.EventSignatures.token_regenerated_v2_hash, .handler = handleTokenRegenerated, .name = "TokenRegeneratedV2" },
+        .{ .event_hash = abi.EventSignatures.eac_roles_changed_hash, .handler = handleEACRolesChanged, .name = "EACRolesChanged" },
     };
 
     const ETH_REGISTRAR_EVENTS = [_]RegistryEventConfig{
@@ -377,6 +378,7 @@ pub const Indexer = struct {
         .{ .event_hash = abi.EventSignatures.token_regenerated_hash, .handler = handleTokenRegenerated, .name = "TokenRegenerated" },
         .{ .event_hash = abi.EventSignatures.resolver_update_hash, .handler = handleResolverUpdate, .name = "ResolverUpdate" },
         .{ .event_hash = abi.EventSignatures.transfer_single_hash, .handler = handleTransfer, .name = "TransferSingle" },
+        .{ .event_hash = abi.EventSignatures.eac_roles_changed_hash, .handler = handleEACRolesChanged, .name = "EACRolesChanged" },
     };
 
     // Resolver events have different handler signature (include resolver address)
@@ -1840,7 +1842,7 @@ pub const Indexer = struct {
             .token_id = @intCast(token_id),
             .canonical_id = canonical_id,
             .token_version = token_version,
-            .expiry = @intCast(expiration),
+            .expiry = @truncate(expiration),
             .registry_locked = false,
             .migrated = false,
             .ejected = false,
@@ -2234,7 +2236,7 @@ pub const Indexer = struct {
         const label_hash = try @import("../types/hash.zig").keccak256(self.allocator, label_str);
 
         // Calculate expiry from duration
-        const expiry = std.time.timestamp() + @as(i64, @intCast(duration));
+        const expiry: u64 = @intCast(std.time.timestamp() + @as(i64, @intCast(duration)));
 
         // Extract canonical_id and version from token_id
         const token_id_utils = @import("../types/token_id.zig");
@@ -2258,7 +2260,7 @@ pub const Indexer = struct {
             .parent_name = parent_name_dup,
             .parent_namehash = try @import("../types/hash.zig").namehash(self.allocator, "eth"),
             .chain = chain,
-            .registry = subregistry,
+            .registry = self.getEthRegistry(chain),
             .owner = owner,
             .resolver = resolver,
             .token_id = @intCast(token_id),
@@ -2285,6 +2287,23 @@ pub const Indexer = struct {
             if (name.parent_name) |p| self.allocator.free(p);
             return err;
         };
+
+        // If subregistry was deployed at registration, store it in the registries table
+        if (!subregistry.isZero()) {
+            const registry_entry = models.Registry{
+                .address = subregistry,
+                .chain = chain,
+                .name = full_name,
+                .namehash = namehash,
+                .parent_registry = self.getEthRegistry(chain),
+                .created_block = log.block_number,
+                .created_at = self.getBlockTimestamp(chain, log.block_number),
+            };
+            self.database.insertRegistry(registry_entry) catch |err| {
+                std.log.warn("Failed to insert subregistry for {s}: {any}", .{ full_name, err });
+            };
+            std.log.info("  → Registered subregistry {any} for {s}", .{ subregistry, full_name });
+        }
 
         // Store event with payment details
         const payment_token_hex = try payment_token.toHex(self.allocator);
@@ -2693,6 +2712,115 @@ pub const Indexer = struct {
         // Store approval in database
         try self.database.insertApproval(chain, token_id, owner, approved, log.block_number, log.transaction_hash);
         std.log.debug("Stored approval in database for tokenId={d}", .{token_id});
+    }
+
+    // ========================================================================
+    // Enhanced Access Control (EAC) Event Handler
+    // ========================================================================
+
+    /// Handle EACRolesChanged event from registry contracts
+    /// EACRolesChanged(uint256 indexed resource, address indexed account, uint256 oldRoleBitmap, uint256 newRoleBitmap)
+    fn handleEACRolesChanged(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+        // Event: EACRolesChanged(uint256 indexed resource, address indexed account, uint256 oldRoleBitmap, uint256 newRoleBitmap)
+        // topics[0] = event signature
+        // topics[1] = resource (tokenId/namehash as uint256) - indexed
+        // topics[2] = account - indexed
+        // data = oldRoleBitmap (uint256) + newRoleBitmap (uint256)
+        if (log.topics.len < 3) return error.InvalidTopicCount;
+
+        // Decode indexed parameters from topics
+        const resource_uint = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
+        const account = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
+
+        // Decode non-indexed parameters from data
+        const old_role_bitmap = try abi.ABI.decodeUint256(log.data, 0);
+        const new_role_bitmap = try abi.ABI.decodeUint256(log.data, 32);
+
+        // Convert resource uint256 to hex string (this is the namehash/tokenId)
+        var resource_bytes: [32]u8 = undefined;
+        std.mem.writeInt(u256, &resource_bytes, resource_uint, .big);
+        const resource_hex_chars = std.fmt.bytesToHex(resource_bytes, .lower);
+        const resource_hex = try std.fmt.allocPrint(self.allocator, "0x{s}", .{resource_hex_chars});
+        defer self.allocator.free(resource_hex);
+
+        // Convert role bitmaps to hex strings
+        var old_bitmap_bytes: [32]u8 = undefined;
+        std.mem.writeInt(u256, &old_bitmap_bytes, old_role_bitmap, .big);
+        const old_bitmap_hex_chars = std.fmt.bytesToHex(old_bitmap_bytes, .lower);
+        const old_bitmap_hex = try std.fmt.allocPrint(self.allocator, "0x{s}", .{old_bitmap_hex_chars});
+        defer self.allocator.free(old_bitmap_hex);
+
+        var new_bitmap_bytes: [32]u8 = undefined;
+        std.mem.writeInt(u256, &new_bitmap_bytes, new_role_bitmap, .big);
+        const new_bitmap_hex_chars = std.fmt.bytesToHex(new_bitmap_bytes, .lower);
+        const new_bitmap_hex = try std.fmt.allocPrint(self.allocator, "0x{s}", .{new_bitmap_hex_chars});
+        defer self.allocator.free(new_bitmap_hex);
+
+        const account_hex = try account.toHex(self.allocator);
+        defer self.allocator.free(account_hex);
+
+        std.log.debug("EACRolesChanged: resource={s}, account={s}, oldBitmap={s}, newBitmap={s}", .{
+            resource_hex,
+            account_hex,
+            old_bitmap_hex,
+            new_bitmap_hex,
+        });
+
+        // Store or delete role in database
+        // If newRoleBitmap is 0, all roles were revoked - delete the entry
+        // Otherwise, upsert with the new bitmap
+        if (new_role_bitmap == 0) {
+            try self.database.deleteEACRole(chain, resource_hex, account);
+            std.log.debug("  → Deleted EAC role (all roles revoked)", .{});
+        } else {
+            try self.database.upsertEACRole(
+                chain,
+                resource_hex,
+                account,
+                new_bitmap_hex,
+                log.block_number,
+                log.transaction_hash,
+                log.log_index,
+            );
+            std.log.debug("  → Stored EAC role assignment", .{});
+        }
+
+        // Store event for audit trail
+        const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resource\":\"{s}\",\"account\":\"{s}\",\"oldRoleBitmap\":\"{s}\",\"newRoleBitmap\":\"{s}\"}}", .{
+            resource_hex,
+            account_hex,
+            old_bitmap_hex,
+            new_bitmap_hex,
+        });
+
+        // Try to look up name for this resource (tokenId)
+        const maybe_name = try self.database.getNameByTokenId(resource_uint);
+        var name_str_opt: ?[]const u8 = null;
+        var namehash_opt: ?Hash = null;
+
+        if (maybe_name) |name| {
+            name_str_opt = if (name.name) |n| try self.allocator.dupe(u8, n) else null;
+            namehash_opt = name.namehash;
+            var name_copy = name;
+            name_copy.deinit(self.allocator);
+        }
+
+        defer if (name_str_opt) |n| self.allocator.free(n);
+
+        const event = models.Event{
+            .event_type = .eac_roles_changed,
+            .chain = chain,
+            .block_number = log.block_number,
+            .tx_hash = log.transaction_hash,
+            .log_index = log.log_index,
+            .contract_address = log.address,
+            .name = if (name_str_opt) |n| try self.allocator.dupe(u8, n) else null,
+            .namehash = namehash_opt,
+            .data = event_data,
+            .timestamp = std.time.timestamp(),
+        };
+
+        try self.insertEventAndNotify(event);
     }
 
     // ========================================================================
