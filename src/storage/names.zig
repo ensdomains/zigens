@@ -134,7 +134,7 @@ pub fn insertName(db: *Database, name: models.Name) !void {
     _ = c.sqlite3_bind_text(stmt, 11, token_id_hex.ptr, @intCast(token_id_hex.len), SQLITE_TRANSIENT());
     _ = c.sqlite3_bind_text(stmt, 12, canonical_id_hex.ptr, @intCast(canonical_id_hex.len), SQLITE_TRANSIENT());
     _ = c.sqlite3_bind_int64(stmt, 13, @intCast(name.token_version));
-    _ = c.sqlite3_bind_int64(stmt, 14, name.expiry);
+    _ = c.sqlite3_bind_int64(stmt, 14, @bitCast(name.expiry));
     _ = c.sqlite3_bind_int(stmt, 15, if (name.registry_locked) 1 else 0);
     _ = c.sqlite3_bind_int(stmt, 16, if (name.migrated) 1 else 0);
     _ = c.sqlite3_bind_int(stmt, 17, if (name.ejected) 1 else 0);
@@ -225,7 +225,7 @@ pub fn getNameByNamehash(db: *Database, namehash: Hash) !?models.Name {
             },
             .token_version = @intCast(c.sqlite3_column_int64(stmt, 11)),
             // Column 12 is namehash (skipped - using input param)
-            .expiry = c.sqlite3_column_int64(stmt, 13),
+            .expiry = @bitCast(c.sqlite3_column_int64(stmt, 13)),
             .registry_locked = c.sqlite3_column_int(stmt, 14) != 0,
             .migrated = c.sqlite3_column_int(stmt, 15) != 0,
             .ejected = c.sqlite3_column_int(stmt, 16) != 0,
@@ -471,7 +471,7 @@ pub fn getNameByTokenId(db: *Database, token_id: u256) !?models.Name {
             },
             .token_version = token_version,
             .namehash = try Hash.fromHex(namehash_str),
-            .expiry = @intCast(expiry),
+            .expiry = @bitCast(expiry),
             .registry_locked = registry_locked,
             .migrated = migrated,
             .ejected = ejected,
@@ -659,7 +659,7 @@ pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Nam
             },
             .token_version = @intCast(c.sqlite3_column_int64(stmt, 11)),
             .namehash = try Hash.fromHex(namehash_str),
-            .expiry = c.sqlite3_column_int64(stmt, 13),
+            .expiry = @bitCast(c.sqlite3_column_int64(stmt, 13)),
             .registry_locked = c.sqlite3_column_int(stmt, 14) != 0,
             .migrated = c.sqlite3_column_int(stmt, 15) != 0,
             .ejected = c.sqlite3_column_int(stmt, 16) != 0,
@@ -791,7 +791,7 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
             },
             .token_version = @intCast(c.sqlite3_column_int64(stmt, 11)),
             .namehash = try Hash.fromHex(namehash_str),
-            .expiry = c.sqlite3_column_int64(stmt, 12),
+            .expiry = @bitCast(c.sqlite3_column_int64(stmt, 12)),
             .registry_locked = c.sqlite3_column_int(stmt, 13) != 0,
             .migrated = c.sqlite3_column_int(stmt, 14) != 0,
             .ejected = c.sqlite3_column_int(stmt, 15) != 0,
@@ -933,7 +933,7 @@ pub fn getSubdomains(db: *Database, parent_name_arg: []const u8, skip: u32, limi
             },
             .token_version = @intCast(c.sqlite3_column_int64(stmt, 11)),
             .namehash = try Hash.fromHex(namehash_str),
-            .expiry = c.sqlite3_column_int64(stmt, 12),
+            .expiry = @bitCast(c.sqlite3_column_int64(stmt, 12)),
             .registry_locked = c.sqlite3_column_int(stmt, 13) != 0,
             .migrated = c.sqlite3_column_int(stmt, 14) != 0,
             .ejected = c.sqlite3_column_int(stmt, 15) != 0,

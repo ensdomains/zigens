@@ -74,7 +74,7 @@ pub const Name = struct {
     /// Increments when a name is regenerated
     token_version: u32,
     /// Expiration timestamp (0 if no expiration)
-    expiry: i64,
+    expiry: u64,
     /// Whether the registry is locked
     registry_locked: bool,
     /// Whether this is a migrated name from ENSv1
@@ -114,7 +114,7 @@ pub const Name = struct {
 
     pub fn isExpired(self: Name) bool {
         if (self.expiry == 0) return false;
-        const now = std.time.timestamp();
+        const now: u64 = @intCast(std.time.timestamp());
         return now >= self.expiry;
     }
 };
@@ -177,6 +177,9 @@ pub const EventType = enum {
     name_changed,
     interface_changed,
 
+    // EAC (Enhanced Access Control) events
+    eac_roles_changed,
+
     pub fn toString(self: EventType) []const u8 {
         return switch (self) {
             .new_subname => "NewSubname",
@@ -201,6 +204,7 @@ pub const EventType = enum {
             .pubkey_changed => "PubkeyChanged",
             .name_changed => "NameChanged",
             .interface_changed => "InterfaceChanged",
+            .eac_roles_changed => "EACRolesChanged",
         };
     }
 
@@ -227,6 +231,7 @@ pub const EventType = enum {
         if (std.mem.eql(u8, s, "PubkeyChanged")) return .pubkey_changed;
         if (std.mem.eql(u8, s, "NameChanged")) return .name_changed;
         if (std.mem.eql(u8, s, "InterfaceChanged")) return .interface_changed;
+        if (std.mem.eql(u8, s, "EACRolesChanged")) return .eac_roles_changed;
         return null;
     }
 };
