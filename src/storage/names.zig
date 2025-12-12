@@ -726,8 +726,13 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
     defer _ = c.sqlite3_finalize(stmt);
 
     var param_index: c_int = 1;
+    var owner_hex: ?[]u8 = null;
+    defer if (owner_hex) |h| db.allocator.free(h);
+
     if (owner) |o| {
-        if (c.sqlite3_bind_blob(stmt, param_index, &o.bytes, o.bytes.len, SQLITE_TRANSIENT()) != c.SQLITE_OK) {
+        // Owner is stored as TEXT hex string in the database
+        owner_hex = try o.toHex(db.allocator);
+        if (c.sqlite3_bind_text(stmt, param_index, owner_hex.?.ptr, @intCast(owner_hex.?.len), SQLITE_TRANSIENT()) != c.SQLITE_OK) {
             return error.DatabaseError;
         }
         param_index += 1;

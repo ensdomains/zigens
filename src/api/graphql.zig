@@ -19,6 +19,7 @@ const NestedContext = struct {
     database: *db.Database,
     depth: u32,
     allocator: std.mem.Allocator,
+    loaders: ?*anyopaque, // LoaderContext pointer for batching
 };
 
 /// Helper to escape JSON strings using std.json (RFC 8259 compliant)
@@ -1623,15 +1624,25 @@ fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) !par
         }
     }
 
-    // Get names from database (fetch more than needed for filtering)
-    const fetch_limit = if (filter_name != null or filter_name_contains != null or filter_name_contains_nocase != null or
-        filter_name_starts_with != null or filter_name_ends_with != null or filter_owner != null or
-        filter_owner_in != null or filter_resolved_address != null or
-        filter_has_subdomains != null or filter_subdomain_count_gt != null or filter_subdomain_count_lt != null)
-        @min(first * 10, 1000) // Fetch more if we need to filter
+    // Get names from database
+    // Optimization: if owner filter is set and it's the main filter, push it to DB
+    // This uses the idx_names_owner index instead of scanning all rows
+    const has_other_filters = filter_name != null or filter_name_contains != null or
+        filter_name_contains_nocase != null or filter_name_starts_with != null or
+        filter_name_ends_with != null or filter_owner_in != null or
+        filter_resolved_address != null or filter_has_subdomains != null or
+        filter_subdomain_count_gt != null or filter_subdomain_count_lt != null;
+
+    const db_owner_filter = if (filter_owner != null and !has_other_filters)
+        filter_owner
+    else
+        null;
+
+    const fetch_limit = if (has_other_filters or (filter_owner != null and has_other_filters))
+        @min(first * 10, 1000) // Fetch more if we need additional in-memory filtering
     else
         first;
-    const names = try database.getAllNames(null, @intCast(skip), @intCast(fetch_limit));
+    const names = try database.getAllNames(db_owner_filter, @intCast(skip), @intCast(fetch_limit));
     defer {
         for (names) |*name| {
             name.deinit(allocator);
@@ -1812,8 +1823,14 @@ fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) !par
                 if (std.mem.eql(u8, sort_ctx_param.field, "name")) {
                     const cmp = std.mem.order(u8, a.name orelse "[unknown]", b.name orelse "[unknown]");
                     return if (sort_ctx_param.asc) cmp == .lt else cmp == .gt;
-                } else if (std.mem.eql(u8, sort_ctx_param.field, "createdAt")) {
+                } else if (std.mem.eql(u8, sort_ctx_param.field, "createdAt") or
+                    std.mem.eql(u8, sort_ctx_param.field, "registrationDate"))
+                {
+                    // registrationDate is an alias for createdAt
                     return if (sort_ctx_param.asc) a.created_at < b.created_at else a.created_at > b.created_at;
+                } else if (std.mem.eql(u8, sort_ctx_param.field, "expiryDate")) {
+                    // Sort by expiry timestamp
+                    return if (sort_ctx_param.asc) a.expiry < b.expiry else a.expiry > b.expiry;
                 } else if (std.mem.eql(u8, sort_ctx_param.field, "id")) {
                     const cmp = std.mem.order(u8, &a.namehash.bytes, &b.namehash.bytes);
                     return if (sort_ctx_param.asc) cmp == .lt else cmp == .gt;
@@ -1830,6 +1847,70 @@ fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) !par
 
     try json.appendSlice(allocator, "[");
     const items_to_return = @min(first, filtered_names.items.len);
+
+    // Pre-load resolver data for all domains to enable batching (solves N+1 query problem)
+    // Check if resolver fields that need data loading are requested
+    if (ctx.loaders != null and items_to_return > 0) {
+        const dataloader_mod = @import("dataloader.zig");
+        var needs_resolver_addr = false;
+        var needs_content_hash = false;
+        var needs_text_records = false;
+        var needs_resolved_address = false;
+
+        // Check field selections for resolver sub-fields
+        for (field.selections) |sel| {
+            if (std.mem.eql(u8, sel.name, "resolver")) {
+                for (sel.selections) |resolver_sel| {
+                    if (std.mem.eql(u8, resolver_sel.name, "addr")) {
+                        needs_resolver_addr = true;
+                    } else if (std.mem.eql(u8, resolver_sel.name, "contentHash")) {
+                        needs_content_hash = true;
+                    } else if (std.mem.eql(u8, resolver_sel.name, "texts") or
+                        std.mem.eql(u8, resolver_sel.name, "text"))
+                    {
+                        needs_text_records = true;
+                    }
+                }
+            } else if (std.mem.eql(u8, sel.name, "resolvedAddress")) {
+                needs_resolved_address = true;
+            }
+        }
+
+        // Collect namehashes for items that will be returned
+        if (needs_resolver_addr or needs_content_hash or needs_text_records or needs_resolved_address) {
+            const loader_ctx: *dataloader_mod.LoaderContext = @ptrCast(@alignCast(ctx.loaders.?));
+            const return_items = filtered_names.items[0..@as(usize, @intCast(items_to_return))];
+
+            var namehashes = try allocator.alloc([32]u8, return_items.len);
+            defer allocator.free(namehashes);
+
+            for (return_items, 0..) |name, idx| {
+                namehashes[idx] = name.namehash.bytes;
+            }
+
+            // Pre-load resolver addresses (for addr field and resolvedAddress)
+            if (needs_resolver_addr or needs_resolved_address) {
+                const loader = try loader_ctx.getResolverAddressLoader();
+                const preloaded = try loader.loadMany(namehashes);
+                allocator.free(preloaded);
+            }
+
+            // Pre-load content hashes
+            if (needs_content_hash) {
+                const loader = try loader_ctx.getContentHashLoader();
+                const preloaded = try loader.loadMany(namehashes);
+                allocator.free(preloaded);
+            }
+
+            // Pre-load text records
+            if (needs_text_records) {
+                const loader = try loader_ctx.getTextRecordsLoader();
+                const preloaded = try loader.loadMany(namehashes);
+                allocator.free(preloaded);
+            }
+        }
+    }
+
     for (filtered_names.items[0..@as(usize, @intCast(items_to_return))], 0..) |name, i| {
         if (i > 0) try json.appendSlice(allocator, ",");
 
@@ -1837,6 +1918,7 @@ fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) !par
             .database = database,
             .depth = 0,
             .allocator = allocator,
+            .loaders = ctx.loaders,
         });
         defer allocator.free(name_json);
         try json.appendSlice(allocator, name_json);
@@ -1943,6 +2025,7 @@ fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parser.Fi
                 .database = database,
                 .depth = 0,
                 .allocator = allocator,
+                .loaders = ctx.loaders,
             },
             .hex_id = hex_id,
         };
@@ -2116,6 +2199,7 @@ fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const par
                 .database = database,
                 .depth = 0,
                 .allocator = allocator,
+                .loaders = ctx.loaders,
             },
             .id = id,
         };
@@ -2283,6 +2367,7 @@ fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser.Fie
                 .database = database,
                 .depth = 0,
                 .allocator = allocator,
+                .loaders = ctx.loaders,
             },
             .id = id,
         };
@@ -2384,6 +2469,7 @@ fn resolveDomain(ctx: parser.ExecutionContext, field: *const parser.Field) !pars
         .database = database,
         .depth = 0,
         .allocator = allocator,
+        .loaders = ctx.loaders,
     });
     return parser.FieldResult{ .json = name_json };
 }
@@ -2646,6 +2732,7 @@ fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.Field
             .database = database,
             .depth = 0,
             .allocator = allocator,
+            .loaders = ctx.loaders,
         });
         defer allocator.free(reg_json);
         try json.appendSlice(allocator, reg_json);
@@ -2747,6 +2834,7 @@ fn resolveEvents(ctx: parser.ExecutionContext, field: *const parser.Field) !pars
             .database = database,
             .depth = 0,
             .allocator = allocator,
+            .loaders = ctx.loaders,
         });
         defer allocator.free(event_json);
         try json.appendSlice(allocator, event_json);
@@ -3074,6 +3162,7 @@ fn buildAccountJson(
                     .database = ctx.database,
                     .depth = ctx.depth + 1,
                     .allocator = ctx.allocator,
+                    .loaders = ctx.loaders,
                 });
                 defer ctx.allocator.free(domain_json);
                 try writer.writeAll(domain_json);
@@ -3120,6 +3209,7 @@ fn buildAccountJson(
                             .database = ctx.database,
                             .depth = ctx.depth + 1,
                             .allocator = ctx.allocator,
+                            .loaders = ctx.loaders,
                         });
                         defer ctx.allocator.free(reg_json);
                         try writer.writeAll(reg_json);
@@ -3199,23 +3289,40 @@ fn buildDomainJson(
                 .database = ctx.database,
                 .depth = ctx.depth + 1,
                 .allocator = ctx.allocator,
+                .loaders = ctx.loaders,
             });
             defer ctx.allocator.free(owner_json);
             try writer.writeAll(owner_json);
             first = false;
         } else if (std.mem.eql(u8, field.name, "resolvedAddress")) {
             // Nested Account object - the address this domain resolves to (ETH address, coin type 60)
+            // Use DataLoader if available
+            const dataloader_mod = @import("dataloader.zig");
             try writer.print("\"{s}\":", .{output_key});
-            // Fetch the ETH address (coin type 60) from resolver
-            const resolved_addr_opt = try ctx.database.getResolverAddress(domain.namehash, 60);
+
+            var resolved_addr_opt: ?[]const u8 = null;
+            var owns_addr = false;
+
+            if (ctx.loaders) |loaders_ptr| {
+                const loader_ctx: *dataloader_mod.LoaderContext = @ptrCast(@alignCast(loaders_ptr));
+                const loader = try loader_ctx.getResolverAddressLoader();
+                resolved_addr_opt = try loader.load(domain.namehash.bytes);
+                // DataLoader owns the memory, don't free it
+            } else {
+                // Fallback to direct database query
+                resolved_addr_opt = try ctx.database.getResolverAddress(domain.namehash, 60);
+                owns_addr = true;
+            }
+            defer if (owns_addr) if (resolved_addr_opt) |a| ctx.allocator.free(a);
+
             if (resolved_addr_opt) |addr_str| {
-                defer ctx.allocator.free(addr_str);
                 // Parse the address and build Account JSON
                 if (Address.fromHex(addr_str)) |addr| {
                     const account_json = try buildAccountJson(addr, field.selections, .{
                         .database = ctx.database,
                         .depth = ctx.depth + 1,
                         .allocator = ctx.allocator,
+                        .loaders = ctx.loaders,
                     });
                     defer ctx.allocator.free(account_json);
                     try writer.writeAll(account_json);
@@ -3234,6 +3341,7 @@ fn buildDomainJson(
                     .database = ctx.database,
                     .depth = ctx.depth + 1,
                     .allocator = ctx.allocator,
+                    .loaders = ctx.loaders,
                 });
                 defer ctx.allocator.free(resolver_json);
                 try writer.writeAll(resolver_json);
@@ -3308,6 +3416,7 @@ fn buildDomainJson(
                         .database = ctx.database,
                         .depth = ctx.depth + 1,
                         .allocator = ctx.allocator,
+                        .loaders = ctx.loaders,
                     });
                     defer ctx.allocator.free(parent_json);
                     try writer.writeAll(parent_json);
@@ -3341,6 +3450,7 @@ fn buildDomainJson(
                         .database = ctx.database,
                         .depth = ctx.depth + 1,
                         .allocator = ctx.allocator,
+                        .loaders = ctx.loaders,
                     });
                     defer ctx.allocator.free(subdomain_json);
                     try writer.writeAll(subdomain_json);
@@ -3373,6 +3483,7 @@ fn buildDomainJson(
                     .database = ctx.database,
                     .depth = ctx.depth + 1,
                     .allocator = ctx.allocator,
+                    .loaders = ctx.loaders,
                 });
                 defer ctx.allocator.free(event_json);
                 try writer.writeAll(event_json);
@@ -3431,10 +3542,24 @@ fn buildResolverJson(
             try writer.print("\"{s}\":\"{s}\"", .{ output_key, addr_hex });
             first = false;
         } else if (std.mem.eql(u8, field.name, "addr")) {
-            // Fetch ETH address (coin type 60)
-            const addr_opt = try ctx.database.getResolverAddress(domain_namehash, 60);
+            // Fetch ETH address (coin type 60) - use DataLoader if available
+            const dataloader_mod = @import("dataloader.zig");
+            var addr_opt: ?[]const u8 = null;
+            var owns_addr = false;
+
+            if (ctx.loaders) |loaders_ptr| {
+                const loader_ctx: *dataloader_mod.LoaderContext = @ptrCast(@alignCast(loaders_ptr));
+                const loader = try loader_ctx.getResolverAddressLoader();
+                addr_opt = try loader.load(domain_namehash.bytes);
+                // DataLoader owns the memory, don't free it
+            } else {
+                // Fallback to direct database query
+                addr_opt = try ctx.database.getResolverAddress(domain_namehash, 60);
+                owns_addr = true;
+            }
+            defer if (owns_addr) if (addr_opt) |a| ctx.allocator.free(a);
+
             if (addr_opt) |addr| {
-                defer ctx.allocator.free(addr);
                 const escaped = try escapeJsonString(ctx.allocator, addr);
                 defer ctx.allocator.free(escaped);
                 try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
@@ -3443,10 +3568,24 @@ fn buildResolverJson(
             }
             first = false;
         } else if (std.mem.eql(u8, field.name, "contentHash")) {
-            // Fetch content hash
-            const hash_opt = try ctx.database.getResolverContentHash(domain_namehash);
+            // Fetch content hash - use DataLoader if available
+            const dataloader_mod = @import("dataloader.zig");
+            var hash_opt: ?[]const u8 = null;
+            var owns_hash = false;
+
+            if (ctx.loaders) |loaders_ptr| {
+                const loader_ctx: *dataloader_mod.LoaderContext = @ptrCast(@alignCast(loaders_ptr));
+                const loader = try loader_ctx.getContentHashLoader();
+                hash_opt = try loader.load(domain_namehash.bytes);
+                // DataLoader owns the memory, don't free it
+            } else {
+                // Fallback to direct database query
+                hash_opt = try ctx.database.getResolverContentHash(domain_namehash);
+                owns_hash = true;
+            }
+            defer if (owns_hash) if (hash_opt) |h| ctx.allocator.free(h);
+
             if (hash_opt) |hash| {
-                defer ctx.allocator.free(hash);
                 const escaped = try escapeJsonString(ctx.allocator, hash);
                 defer ctx.allocator.free(escaped);
                 try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
@@ -3455,26 +3594,45 @@ fn buildResolverJson(
             }
             first = false;
         } else if (std.mem.eql(u8, field.name, "texts")) {
-            // Fetch text record keys by namehash (unique per domain)
-            const text_keys = try ctx.database.getResolverTextKeys(domain_namehash);
-            defer {
-                for (text_keys) |key| {
-                    ctx.allocator.free(key);
+            // Fetch text record keys by namehash - use DataLoader if available
+            const dataloader_mod = @import("dataloader.zig");
+
+            if (ctx.loaders) |loaders_ptr| {
+                const loader_ctx: *dataloader_mod.LoaderContext = @ptrCast(@alignCast(loaders_ptr));
+                const loader = try loader_ctx.getTextRecordsLoader();
+                const text_records = try loader.load(domain_namehash.bytes);
+                // DataLoader owns the memory, don't free it
+
+                try writer.print("\"{s}\":[", .{output_key});
+                for (text_records.records, 0..) |record, i| {
+                    if (i > 0) try writer.writeAll(",");
+                    const escaped = try escapeJsonString(ctx.allocator, record.key);
+                    defer ctx.allocator.free(escaped);
+                    try writer.print("\"{s}\"", .{escaped});
                 }
-                ctx.allocator.free(text_keys);
+                try writer.writeAll("]");
+            } else {
+                // Fallback to direct database query
+                const text_keys = try ctx.database.getResolverTextKeys(domain_namehash);
+                defer {
+                    for (text_keys) |key| {
+                        ctx.allocator.free(key);
+                    }
+                    ctx.allocator.free(text_keys);
+                }
+                try writer.print("\"{s}\":[", .{output_key});
+                for (text_keys, 0..) |key, i| {
+                    if (i > 0) try writer.writeAll(",");
+                    const escaped = try escapeJsonString(ctx.allocator, key);
+                    defer ctx.allocator.free(escaped);
+                    try writer.print("\"{s}\"", .{escaped});
+                }
+                try writer.writeAll("]");
             }
-            try writer.print("\"{s}\":[", .{output_key});
-            for (text_keys, 0..) |key, i| {
-                if (i > 0) try writer.writeAll(",");
-                const escaped = try escapeJsonString(ctx.allocator, key);
-                defer ctx.allocator.free(escaped);
-                try writer.print("\"{s}\"", .{escaped});
-            }
-            try writer.writeAll("]");
             first = false;
         } else if (std.mem.eql(u8, field.name, "text")) {
-            // Get text record value for specific key
-            // Extract "key" argument
+            // Get text record value for specific key - use DataLoader if available
+            const dataloader_mod = @import("dataloader.zig");
             var key_arg: ?[]const u8 = null;
             for (field.arguments) |arg| {
                 if (std.mem.eql(u8, arg.name, "key")) {
@@ -3485,9 +3643,27 @@ fn buildResolverJson(
             }
 
             if (key_arg) |key| {
-                // Use namehash for lookup (unique per domain)
-                const text_value = try ctx.database.getResolverText(domain_namehash, key);
-                defer if (text_value) |val| ctx.allocator.free(val);
+                var text_value: ?[]const u8 = null;
+
+                if (ctx.loaders) |loaders_ptr| {
+                    const loader_ctx: *dataloader_mod.LoaderContext = @ptrCast(@alignCast(loaders_ptr));
+                    const loader = try loader_ctx.getTextRecordsLoader();
+                    const text_records = try loader.load(domain_namehash.bytes);
+                    // DataLoader owns the memory, don't free it
+
+                    // Find the value for the requested key
+                    for (text_records.records) |record| {
+                        if (std.mem.eql(u8, record.key, key)) {
+                            text_value = record.value;
+                            break;
+                        }
+                    }
+                } else {
+                    // Fallback to direct database query
+                    text_value = try ctx.database.getResolverText(domain_namehash, key);
+                    // Note: In fallback case we need to free, but DataLoader case doesn't
+                    defer if (ctx.loaders == null) if (text_value) |val| ctx.allocator.free(val);
+                }
 
                 if (text_value) |val| {
                     const escaped = try escapeJsonString(ctx.allocator, val);
@@ -3557,6 +3733,7 @@ fn buildRegistrationJson(
                         .database = ctx.database,
                         .depth = ctx.depth + 1,
                         .allocator = ctx.allocator,
+                        .loaders = ctx.loaders,
                     });
                     defer ctx.allocator.free(domain_json);
                     try writer.writeAll(domain_json);
@@ -3643,6 +3820,7 @@ fn buildRegistrationJson(
                     .database = ctx.database,
                     .depth = ctx.depth + 1,
                     .allocator = ctx.allocator,
+                    .loaders = ctx.loaders,
                 });
                 defer ctx.allocator.free(registrant_json);
                 try writer.writeAll(registrant_json);
@@ -3745,6 +3923,7 @@ fn buildEventJson(
                         .database = ctx.database,
                         .depth = ctx.depth + 1,
                         .allocator = ctx.allocator,
+                        .loaders = ctx.loaders,
                     });
                     defer ctx.allocator.free(domain_json);
                     try writer.writeAll(domain_json);

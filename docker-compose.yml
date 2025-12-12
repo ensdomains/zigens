@@ -15,6 +15,11 @@ services:
     container_name: ensv2-indexer-l2
     restart: unless-stopped
     command: ["/app/ensv2-indexer-l2"]
+    # Increase file descriptor limits to prevent SystemResources errors
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     volumes:
       - ens-data:/app/data
     environment:
@@ -57,6 +62,11 @@ services:
     container_name: ensv2-api
     restart: unless-stopped
     command: ["/app/api-entrypoint.sh"]
+    # Increase file descriptor limits for handling many concurrent connections
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     # Expose port for Coolify/Traefik to route traffic
     ports:
       - "5655:5655"

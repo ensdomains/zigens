@@ -2,6 +2,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const api = @import("api/server.zig");
 const db = @import("storage/database.zig");
+const ens_normalize = @import("ens_normalize");
 
 pub fn main() !void {
     // Configure SQLite for thread safety BEFORE any other operations
@@ -58,6 +59,13 @@ pub fn main() !void {
     }
 
     std.log.info("Database connected", .{});
+
+    // Eagerly initialize ENS normalizer to avoid cold-start latency on first query
+    // The library uses a lazy singleton that takes ~4 minutes to initialize on first call.
+    // By calling it during startup, we ensure GraphQL queries are fast from the start.
+    std.log.info("Initializing ENS name normalizer (this may take a few minutes)...", .{});
+    _ = ens_normalize.shared();
+    std.log.info("ENS normalizer initialized", .{});
 
     // Start API server with complexity limits and metrics from config
     // Only pass webhook_db_path if webhooks are enabled
