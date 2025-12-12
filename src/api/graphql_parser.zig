@@ -1133,7 +1133,7 @@ pub const Executor = struct {
         return null;
     }
 
-    /// Resolve a value, replacing variable references with actual values
+    /// Resolve a value, replacing variable references with actual values (recursively)
     fn resolveValue(self: *Executor, value: *const Value) !Value {
         return switch (value.*) {
             .variable => |var_name| {
@@ -1144,11 +1144,51 @@ pub const Executor = struct {
                         return try self.jsonToValue(json_val);
                     }
                 }
-                // Variable not found - return error
-                std.log.err("Variable ${s} not provided", .{var_name});
+                // Variable not found - return error (caller handles logging)
                 return error.UndefinedVariable;
             },
-            else => value.*, // Return value as-is
+            .object => |args| {
+                // Recursively resolve variables in object fields
+                var resolved_args = try self.allocator.alloc(Argument, args.len);
+                errdefer self.allocator.free(resolved_args);
+
+                var resolved_count: usize = 0;
+                errdefer {
+                    // Clean up any values that were allocated before the error
+                    for (resolved_args[0..resolved_count]) |arg| {
+                        self.freeResolvedValue(arg.value);
+                    }
+                }
+
+                for (args, 0..) |arg, i| {
+                    resolved_args[i] = Argument{
+                        .name = arg.name,
+                        .value = try self.resolveValue(&arg.value),
+                    };
+                    resolved_count += 1;
+                }
+                return Value{ .object = resolved_args };
+            },
+            .list => |items| {
+                // Recursively resolve variables in list items
+                var resolved_items = try self.allocator.alloc(Value, items.len);
+                errdefer self.allocator.free(resolved_items);
+
+                var resolved_count: usize = 0;
+                errdefer {
+                    // Clean up any values that were allocated before the error
+                    for (resolved_items[0..resolved_count]) |item| {
+                        self.freeResolvedValue(item);
+                    }
+                }
+
+                for (items, 0..) |item, i| {
+                    resolved_items[i] = try self.resolveValue(&item);
+                    resolved_count += 1;
+                }
+                return Value{ .list = resolved_items };
+            },
+            else => value.*, // Return value as-is (int, float, string, boolean, null)
         };
     }
 
@@ -1371,15 +1411,45 @@ pub const Executor = struct {
     }
 
     /// Resolve all arguments in a field, replacing variable references with actual values
-    fn resolveFieldArguments(self: *Executor, field: *const Field) ![]Argument {
+    pub fn resolveFieldArguments(self: *Executor, field: *const Field) ![]Argument {
         var resolved_args = try self.allocator.alloc(Argument, field.arguments.len);
+        errdefer self.allocator.free(resolved_args);
+
+        var resolved_count: usize = 0;
+        errdefer {
+            // Clean up any values that were allocated before the error
+            for (resolved_args[0..resolved_count]) |arg| {
+                self.freeResolvedValue(arg.value);
+            }
+        }
+
         for (field.arguments, 0..) |arg, i| {
             resolved_args[i] = Argument{
                 .name = arg.name,
                 .value = try self.resolveValue(&arg.value),
             };
+            resolved_count += 1;
         }
         return resolved_args;
+    }
+
+    /// Free a resolved value that was allocated during resolution
+    fn freeResolvedValue(self: *Executor, value: Value) void {
+        switch (value) {
+            .object => |args| {
+                for (args) |arg| {
+                    self.freeResolvedValue(arg.value);
+                }
+                self.allocator.free(args);
+            },
+            .list => |items| {
+                for (items) |item| {
+                    self.freeResolvedValue(item);
+                }
+                self.allocator.free(items);
+            },
+            else => {},
+        }
     }
 
     fn executeField(self: *Executor, field: *const Field) ![]u8 {

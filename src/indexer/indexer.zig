@@ -2260,7 +2260,7 @@ pub const Indexer = struct {
             .parent_name = parent_name_dup,
             .parent_namehash = try @import("../types/hash.zig").namehash(self.allocator, "eth"),
             .chain = chain,
-            .registry = subregistry,
+            .registry = self.getEthRegistry(chain),
             .owner = owner,
             .resolver = resolver,
             .token_id = @intCast(token_id),
@@ -2287,6 +2287,23 @@ pub const Indexer = struct {
             if (name.parent_name) |p| self.allocator.free(p);
             return err;
         };
+
+        // If subregistry was deployed at registration, store it in the registries table
+        if (!subregistry.isZero()) {
+            const registry_entry = models.Registry{
+                .address = subregistry,
+                .chain = chain,
+                .name = full_name,
+                .namehash = namehash,
+                .parent_registry = self.getEthRegistry(chain),
+                .created_block = log.block_number,
+                .created_at = self.getBlockTimestamp(chain, log.block_number),
+            };
+            self.database.insertRegistry(registry_entry) catch |err| {
+                std.log.warn("Failed to insert subregistry for {s}: {any}", .{ full_name, err });
+            };
+            std.log.info("  → Registered subregistry {any} for {s}", .{ subregistry, full_name });
+        }
 
         // Store event with payment details
         const payment_token_hex = try payment_token.toHex(self.allocator);
