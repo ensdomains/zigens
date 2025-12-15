@@ -2516,6 +2516,7 @@ fn resolveDomain(ctx: parser.ExecutionContext, field: *const parser.Field) !pars
 
 /// Resolver for account query
 fn resolveAccount(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
+    const database: *db.Database = @ptrCast(@alignCast(ctx.database));
     const allocator = ctx.allocator;
 
     // Extract id argument
@@ -2524,8 +2525,19 @@ fn resolveAccount(ctx: parser.ExecutionContext, field: *const parser.Field) !par
         return parser.FieldResult{ .json = null_json };
     };
 
-    // Build account object (simplified - just return the address for now)
-    const account_json = try std.fmt.allocPrint(allocator, "{{\"id\":\"{s}\"}}", .{id});
+    // Parse the address
+    const address = Address.fromHex(id) catch {
+        const null_json = try allocator.dupe(u8, "null");
+        return parser.FieldResult{ .json = null_json };
+    };
+
+    // Build account object with all requested fields (domains, registrations, etc.)
+    const account_json = try buildAccountJson(address, field.selections, .{
+        .database = database,
+        .depth = 1,
+        .allocator = allocator,
+        .loaders = ctx.loaders,
+    });
     return parser.FieldResult{ .json = account_json };
 }
 
