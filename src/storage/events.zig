@@ -220,6 +220,7 @@ pub const EventFilterOptions = struct {
     block_number_lt: ?i64 = null,
     timestamp_gt: ?i64 = null,
     timestamp_lt: ?i64 = null,
+    data_json_owner: ?[]const u8 = null, // Filter by owner field in JSON data
     limit: u32 = 100,
     order_dir: OrderDir = .desc,
 };
@@ -301,6 +302,10 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     }
     if (filter.timestamp_lt != null) {
         try conditions.append(db.allocator, "timestamp < ?");
+    }
+    if (filter.data_json_owner != null) {
+        // Use SQLite json_extract to filter by owner field in JSON data (case-insensitive)
+        try conditions.append(db.allocator, "LOWER(json_extract(data, '$.owner')) = LOWER(?)");
     }
 
     // Add WHERE clause if there are conditions
@@ -392,6 +397,10 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     }
     if (filter.timestamp_lt) |ts| {
         _ = c.sqlite3_bind_int64(stmt, param_idx, ts);
+        param_idx += 1;
+    }
+    if (filter.data_json_owner) |owner| {
+        _ = c.sqlite3_bind_text(stmt, param_idx, owner.ptr, @intCast(owner.len), SQLITE_TRANSIENT());
         param_idx += 1;
     }
 

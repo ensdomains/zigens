@@ -3223,11 +3223,18 @@ fn buildAccountJson(
             first = false;
         } else if (std.mem.eql(u8, field.name, "registrations")) {
             // Nested query: fetch registrations by this account
-            // Get name_registered events and filter by owner address
+            // Use database query with JSON filter to find NameRegistered events by owner
             const first_arg = parser.getIntArg(field, "first", 10) orelse 10;
 
-            // Query more events than needed since we'll filter them
-            const all_events = try ctx.database.getRecentEvents(null, .name_registered, @intCast(first_arg * 10));
+            const account_hex = try address.toHex(ctx.allocator);
+            defer ctx.allocator.free(account_hex);
+
+            // Query events filtered by event_type and JSON owner field
+            const all_events = try ctx.database.getEventsFiltered(.{
+                .event_type = "NameRegistered",
+                .data_json_owner = account_hex,
+                .limit = @intCast(first_arg),
+            });
             defer {
                 for (all_events) |*e| {
                     e.deinit(ctx.allocator);
@@ -3235,39 +3242,18 @@ fn buildAccountJson(
                 ctx.allocator.free(all_events);
             }
 
-            const account_hex = try address.toHex(ctx.allocator);
-            defer ctx.allocator.free(account_hex);
-
             try writer.print("\"{s}\":[", .{output_key});
-            var count: usize = 0;
-            for (all_events) |*event| {
-                if (count >= first_arg) break;
+            for (all_events, 0..) |*event, i| {
+                if (i > 0) try writer.writeAll(",");
 
-                // Parse event data to extract owner
-                const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, event.data, .{}) catch continue;
-                defer parsed.deinit();
-
-                const owner_str = if (parsed.value.object.get("owner")) |owner_val|
-                    if (owner_val == .string) owner_val.string else null
-                else
-                    null;
-
-                // Filter: only include if owner matches account address
-                if (owner_str) |owner| {
-                    if (std.ascii.eqlIgnoreCase(owner, account_hex)) {
-                        if (count > 0) try writer.writeAll(",");
-
-                        const reg_json = try buildRegistrationJson(event, field.selections, .{
-                            .database = ctx.database,
-                            .depth = ctx.depth + 1,
-                            .allocator = ctx.allocator,
-                            .loaders = ctx.loaders,
-                        });
-                        defer ctx.allocator.free(reg_json);
-                        try writer.writeAll(reg_json);
-                        count += 1;
-                    }
-                }
+                const reg_json = try buildRegistrationJson(event, field.selections, .{
+                    .database = ctx.database,
+                    .depth = ctx.depth + 1,
+                    .allocator = ctx.allocator,
+                    .loaders = ctx.loaders,
+                });
+                defer ctx.allocator.free(reg_json);
+                try writer.writeAll(reg_json);
             }
             try writer.writeAll("]");
             first = false;
