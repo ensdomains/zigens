@@ -136,6 +136,8 @@ pub const GraphQLHandler = struct {
                 return try self.buildErrorResponseWithCode("Operation not found", ErrorCode.VALIDATION_ERROR);
             } else if (err == error.OperationNameRequired) {
                 return try self.buildErrorResponseWithCode("Must provide operation name when query contains multiple operations", ErrorCode.VALIDATION_ERROR);
+            } else if (err == error.InvalidContractAddress) {
+                return try self.buildErrorResponseWithCode("Invalid contractAddress: must be a valid Ethereum address (40 hex characters with 0x prefix)", ErrorCode.INVALID_ARGUMENT);
             }
             return try self.buildErrorResponseWithCode("Query execution failed", ErrorCode.EXECUTION_ERROR);
         };
@@ -2812,6 +2814,10 @@ fn resolveEvents(ctx: parser.ExecutionContext, field: *const parser.Field) !pars
     var event_types_list: std.ArrayList([]const u8) = .{};
     defer event_types_list.deinit(allocator);
 
+    // Temporary storage for normalized contract address (to handle checksummed addresses)
+    var normalized_contract_address: ?[]u8 = null;
+    defer if (normalized_contract_address) |addr| allocator.free(addr);
+
     // Parse 'where' argument
     for (field.arguments) |arg| {
         if (std.mem.eql(u8, arg.name, "where") and arg.value == .object) {
@@ -2837,7 +2843,13 @@ fn resolveEvents(ctx: parser.ExecutionContext, field: *const parser.Field) !pars
                     }
                 } else if (std.mem.eql(u8, filter_arg.name, "contractAddress")) {
                     if (filter_arg.value == .string) {
-                        filter_opts.contract_address = filter_arg.value.string;
+                        // Parse and normalize address using Address.fromHex (validates format, normalizes to lowercase)
+                        const addr = Address.fromHex(filter_arg.value.string) catch {
+                            // Invalid address format - return error to user
+                            return error.InvalidContractAddress;
+                        };
+                        normalized_contract_address = try addr.toHex(allocator);
+                        filter_opts.contract_address = normalized_contract_address;
                     }
                 } else if (std.mem.eql(u8, filter_arg.name, "namehash")) {
                     if (filter_arg.value == .string) {
