@@ -3580,19 +3580,36 @@ fn buildResolverJson(
             try writer.print("\"{s}\":\"{s}\"", .{ output_key, addr_hex });
             first = false;
         } else if (std.mem.eql(u8, field.name, "addr")) {
-            // Fetch ETH address (coin type 60) - use DataLoader if available
+            // Fetch address for specified coin type (default: 60 for ETH)
+            // Supports: addr or addr(coinType: 60)
             const dataloader_mod = @import("dataloader.zig");
             var addr_opt: ?[]const u8 = null;
             var owns_addr = false;
 
-            if (ctx.loaders) |loaders_ptr| {
-                const loader_ctx: *dataloader_mod.LoaderContext = @ptrCast(@alignCast(loaders_ptr));
-                const loader = try loader_ctx.getResolverAddressLoader();
-                addr_opt = try loader.load(domain_namehash.bytes);
-                // DataLoader owns the memory, don't free it
+            // Parse coinType argument (default to 60 for ETH)
+            var coin_type: u64 = 60;
+            for (field.arguments) |arg| {
+                if (std.mem.eql(u8, arg.name, "coinType")) {
+                    if (arg.value == .int) {
+                        coin_type = @intCast(arg.value.int);
+                    }
+                }
+            }
+
+            // Only use DataLoader for default ETH (coinType 60)
+            if (coin_type == 60) {
+                if (ctx.loaders) |loaders_ptr| {
+                    const loader_ctx: *dataloader_mod.LoaderContext = @ptrCast(@alignCast(loaders_ptr));
+                    const loader = try loader_ctx.getResolverAddressLoader();
+                    addr_opt = try loader.load(domain_namehash.bytes);
+                    // DataLoader owns the memory, don't free it
+                } else {
+                    addr_opt = try ctx.database.getResolverAddress(domain_namehash, 60);
+                    owns_addr = true;
+                }
             } else {
-                // Fallback to direct database query
-                addr_opt = try ctx.database.getResolverAddress(domain_namehash, 60);
+                // For non-ETH coin types, query database directly
+                addr_opt = try ctx.database.getResolverAddress(domain_namehash, coin_type);
                 owns_addr = true;
             }
             defer if (owns_addr) if (addr_opt) |a| ctx.allocator.free(a);
@@ -3604,6 +3621,53 @@ fn buildResolverJson(
             } else {
                 try writer.print("\"{s}\":null", .{output_key});
             }
+            first = false;
+        } else if (std.mem.eql(u8, field.name, "addresses")) {
+            // Fetch all addresses for all coin types
+            // Returns array with requested subfields (coinType and/or address)
+            const resolvers_mod = @import("../storage/resolvers.zig");
+            const all_addresses = try resolvers_mod.getResolverAllAddresses(ctx.database, domain_namehash);
+            defer {
+                for (all_addresses) |*addr| {
+                    addr.deinit(ctx.allocator);
+                }
+                ctx.allocator.free(all_addresses);
+            }
+
+            // Check which subfields are requested
+            var want_coin_type = false;
+            var want_address = false;
+            for (field.selections) |subfield| {
+                if (std.mem.eql(u8, subfield.name, "coinType")) {
+                    want_coin_type = true;
+                } else if (std.mem.eql(u8, subfield.name, "address")) {
+                    want_address = true;
+                }
+            }
+            // Default to both if no selections (shouldn't happen in valid GraphQL)
+            if (!want_coin_type and !want_address) {
+                want_coin_type = true;
+                want_address = true;
+            }
+
+            try writer.print("\"{s}\":[", .{output_key});
+            for (all_addresses, 0..) |coin_addr, i| {
+                if (i > 0) try writer.writeAll(",");
+                try writer.writeAll("{");
+                var first_subfield = true;
+                if (want_coin_type) {
+                    try writer.print("\"coinType\":{d}", .{coin_addr.coin_type});
+                    first_subfield = false;
+                }
+                if (want_address) {
+                    const escaped = try escapeJsonString(ctx.allocator, coin_addr.address);
+                    defer ctx.allocator.free(escaped);
+                    if (!first_subfield) try writer.writeAll(",");
+                    try writer.print("\"address\":\"{s}\"", .{escaped});
+                }
+                try writer.writeAll("}");
+            }
+            try writer.writeAll("]");
             first = false;
         } else if (std.mem.eql(u8, field.name, "contentHash")) {
             // Fetch content hash - use DataLoader if available
