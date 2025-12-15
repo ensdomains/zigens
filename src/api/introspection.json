@@ -956,6 +956,13 @@
                     "kind": "SCALAR",
                     "name": "Int"
                   }
+                },
+                {
+                  "name": "where",
+                  "type": {
+                    "kind": "INPUT_OBJECT",
+                    "name": "EventFilter"
+                  }
                 }
               ],
               "type": {
@@ -1028,6 +1035,35 @@
         },
         {
           "kind": "OBJECT",
+          "name": "CoinAddress",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "coinType",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              }
+            },
+            {
+              "name": "address",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
           "name": "Resolver",
           "interfaces": [],
           "fields": [
@@ -1055,10 +1091,32 @@
             },
             {
               "name": "addr",
-              "args": [],
+              "args": [
+                {
+                  "name": "coinType",
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                }
+              ],
               "type": {
                 "kind": "SCALAR",
                 "name": "String"
+              }
+            },
+            {
+              "name": "addresses",
+              "args": [],
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "OBJECT",
+                    "name": "CoinAddress"
+                  }
+                }
               }
             },
             {

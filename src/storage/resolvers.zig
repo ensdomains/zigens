@@ -210,6 +210,63 @@ pub fn getResolverAddress(db: *Database, namehash: Hash, coin_type: u64) !?[]u8 
     return null;
 }
 
+/// Get all addresses for a namehash (all coin types)
+/// Returns array of (coin_type, address) pairs
+pub const CoinAddress = struct {
+    coin_type: u64,
+    address: []u8,
+
+    pub fn deinit(self: *CoinAddress, allocator: std.mem.Allocator) void {
+        allocator.free(self.address);
+    }
+};
+
+pub fn getResolverAllAddresses(db: *Database, namehash: Hash) ![]CoinAddress {
+    const sql =
+        \\SELECT coin_type, address FROM resolver_addresses
+        \\WHERE namehash = ?
+        \\ORDER BY coin_type
+    ;
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    defer {
+        if (stmt) |s| _ = c.sqlite3_finalize(s);
+    }
+
+    if (c.sqlite3_prepare_v2(db.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+        return error.PrepareFailed;
+    }
+
+    const namehash_str = try namehash.toHex(db.allocator);
+    defer db.allocator.free(namehash_str);
+
+    _ = c.sqlite3_bind_text(stmt, 1, namehash_str.ptr, @intCast(namehash_str.len), SQLITE_TRANSIENT());
+
+    var addresses: std.ArrayList(CoinAddress) = .{};
+    errdefer {
+        for (addresses.items) |*addr| {
+            addr.deinit(db.allocator);
+        }
+        addresses.deinit(db.allocator);
+    }
+
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        const coin_type: u64 = @intCast(c.sqlite3_column_int64(stmt, 0));
+        const addr_text = c.sqlite3_column_text(stmt, 1);
+        if (addr_text != null) {
+            const addr_len = c.sqlite3_column_bytes(stmt, 1);
+            const addr_slice = addr_text[0..@intCast(addr_len)];
+            const coin_addr = CoinAddress{
+                .coin_type = coin_type,
+                .address = try db.allocator.dupe(u8, addr_slice),
+            };
+            try addresses.append(db.allocator, coin_addr);
+        }
+    }
+
+    return addresses.toOwnedSlice(db.allocator);
+}
+
 /// Get the latest content hash for a namehash
 pub fn getResolverContentHash(db: *Database, namehash: Hash) !?[]u8 {
     const sql =

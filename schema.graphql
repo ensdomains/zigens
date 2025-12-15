@@ -187,7 +187,7 @@ type Domain {
   isNormalized: Boolean!
 
   """Events associated with this domain"""
-  events(first: Int = 100): [Event!]!
+  events(first: Int = 100, where: EventFilter): [Event!]!
 }
 
 """An Ethereum account (address)"""
@@ -202,6 +202,15 @@ type Account {
   registrations: [Registration!]!
 }
 
+"""A coin address record with coin type (SLIP-44)"""
+type CoinAddress {
+  """SLIP-44 coin type (e.g., 60 for ETH, 0 for BTC, 501 for SOL)"""
+  coinType: Int!
+
+  """Address value for this coin type"""
+  address: String!
+}
+
 """A resolver contract for an ENS domain"""
 type Resolver {
   """Resolver contract address"""
@@ -210,8 +219,11 @@ type Resolver {
   """Resolver contract address (same as id)"""
   address: String!
 
-  """Address record (forward resolution)"""
-  addr: String
+  """Address record for a specific coin type (default: 60 for ETH)"""
+  addr(coinType: Int = 60): String
+
+  """All set addresses across all coin types"""
+  addresses: [CoinAddress!]
 
   """Content hash (IPFS, Arweave, etc.)"""
   contentHash: String
