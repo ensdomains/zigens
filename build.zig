@@ -253,9 +253,33 @@ pub fn build(b: *std.Build) void {
     // Also add to the main graphql test step
     graphql_test_step.dependOn(&run_variables_tests.step);
 
+    // Address validation tests (for contractAddress filter in events query)
+    const address_validation_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/api/address_validation_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "address", .module = b.createModule(.{
+                    .root_source_file = b.path("src/types/address.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }) },
+            },
+        }),
+    });
+
+    const run_address_validation_tests = b.addRunArtifact(address_validation_tests);
+    const address_validation_test_step = b.step("test-address", "Run address validation tests");
+    address_validation_test_step.dependOn(&run_address_validation_tests.step);
+
+    // Also add to the main filter test step
+    filter_test_step.dependOn(&run_address_validation_tests.step);
+
     // Make the default test command run all tests
     test_step.dependOn(&run_filter_tests.step);
     test_step.dependOn(&run_events_tests.step);
     test_step.dependOn(&run_apollo_tests.step);
     test_step.dependOn(&run_variables_tests.step);
+    test_step.dependOn(&run_address_validation_tests.step);
 }
