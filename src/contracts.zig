@@ -80,7 +80,7 @@ fn sepoliaAddresses() ContractAddresses {
 
         // L2 Sepolia Contracts (from DEPLOYMENTS.v2.md)
         .l2_eth_registry = Address.fromHex("0xf332544e6234f1ca149907d0d4658afd5feb6831") catch unreachable,
-        .l2_eth_registrar = Address.fromHex("0x3334f0ebcbc4b5b7067f3aff25c6da8973690d54") catch unreachable, // FastTestETHRegistrar
+        .l2_eth_registrar = Address.fromHex("0xe37a1366c827d18dc0ad57f3767de4b3025ceac2") catch unreachable, // ETHRegistrar
         .l2_registry_datastore = Address.fromHex("0xe82b3bef599d45806fcce747df176808ff6244cf") catch unreachable,
 
         // Bridge Contracts (from DEPLOYMENTS.v2.md)

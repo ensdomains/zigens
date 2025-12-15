@@ -76,11 +76,11 @@ l2
 │  0 │ BridgeController        │ 0xbb84d5d658bbdb48bf99689f3a14f780ab2f9220 │
 │  1 │ DedicatedResolver       │ 0xa20b41dc7336c4d974e3c9a6ea01b77647559c46 │
 │  2 │ ETHRegistry             │ 0xf332544e6234f1ca149907d0d4658afd5feb6831 │
-│  3 │ FastTestETHRegistrar    │ 0x3334f0ebcbc4b5b7067f3aff25c6da8973690d54 │
+│  3 │ ETHRegistrar            │ 0xe37a1366c827d18dc0ad57f3767de4b3025ceac2 │
 │  4 │ HCAFactory              │ 0x6a20c7f050f31f4b4cb1eaf060849629be10e6a1 │
 │  5 │ MockBridge              │ 0xbcacc7702593e79e23f697505465b8fb344a9961 │
-│  6 │ MockDAI                 │ 0x8817e87e865b75db8b6a7e0d882b6dcba88d913e │
-│  7 │ MockUSDC                │ 0xeb704373997b676d111e4767e281b9fb3852ecef │
+│  6 │ MockDAI                 │ 0xd030a2465ee661338de1f02d05042bbf20d5d127 │
+│  7 │ MockUSDC                │ 0x2c3d8dfac22def2947e94432bcd6bb51e1ac55e6 │
 │  8 │ RegistryDatastore       │ 0xe82b3bef599d45806fcce747df176808ff6244cf │
 │  9 │ SimpleRegistryMetadata  │ 0x30eb652ab8498ee8b90e4a0553b31ed7d1c924cd │
 │ 10 │ StandardRentPriceOracle │ 0x8067e4771d9599ba5f33fcab8d05ee18ac505b23 │
