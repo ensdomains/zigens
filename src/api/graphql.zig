@@ -14,6 +14,14 @@ const ens_normalize = @import("ens_normalize");
 /// Maximum query depth to prevent DoS attacks
 const MAX_QUERY_DEPTH: u32 = 10;
 
+/// Max uint64 value representing "no expiry" for subnames
+const NO_EXPIRY: u64 = std.math.maxInt(u64);
+
+/// Check if expiry value represents a valid expiry date (not 0 or max uint64)
+fn hasValidExpiry(expiry: u64) bool {
+    return expiry > 0 and expiry < NO_EXPIRY;
+}
+
 /// Context for nested field resolution
 const NestedContext = struct {
     database: *db.Database,
@@ -880,7 +888,7 @@ pub const GraphQLHandler = struct {
         try writer.print("\"createdAt\":{d},", .{domain.created_at});
         try writer.print("\"registrant\":{{\"id\":\"{s}\"}},", .{owner_hex});
         try writer.print("\"registrationDate\":{d},", .{domain.created_at});
-        if (domain.expiry > 0) {
+        if (hasValidExpiry(domain.expiry)) {
             try writer.print("\"expiryDate\":{d},", .{domain.expiry});
         } else {
             try writer.writeAll("\"expiryDate\":null,");
@@ -1280,7 +1288,7 @@ pub const GraphQLHandler = struct {
 
             if (requested_fields.contains("expiryDate")) {
                 if (!first) try writer.writeAll(",");
-                if (item.expiry > 0) {
+                if (hasValidExpiry(item.expiry)) {
                     try writer.print("\"expiryDate\":{d}", .{item.expiry});
                 } else {
                     try writer.writeAll("\"expiryDate\":null");
@@ -3330,7 +3338,11 @@ fn buildDomainJson(
             try writer.print("\"{s}\":\"{s}\"", .{ output_key, hash_hex });
             first = false;
         } else if (std.mem.eql(u8, field.name, "expiryDate")) {
-            try writer.print("\"{s}\":{d}", .{ output_key, domain.expiry });
+            if (hasValidExpiry(domain.expiry)) {
+                try writer.print("\"{s}\":{d}", .{ output_key, domain.expiry });
+            } else {
+                try writer.print("\"{s}\":null", .{output_key});
+            }
             first = false;
         } else if (std.mem.eql(u8, field.name, "owner")) {
             // Nested Account object
@@ -3866,7 +3878,7 @@ fn buildRegistrationJson(
                     if (domain_opt) |domain| {
                         var domain_mut = domain;
                         defer domain_mut.deinit(ctx.allocator);
-                        if (domain_mut.expiry > 0) {
+                        if (hasValidExpiry(domain_mut.expiry)) {
                             try writer.print("\"{s}\":{d}", .{ output_key, domain_mut.expiry });
                             first = false;
                             continue;
@@ -3896,7 +3908,7 @@ fn buildRegistrationJson(
                 if (domain_opt) |domain| {
                     var domain_mut = domain;
                     defer domain_mut.deinit(ctx.allocator);
-                    if (domain_mut.expiry > 0) {
+                    if (hasValidExpiry(domain_mut.expiry)) {
                         try writer.print("\"{s}\":{d}", .{ output_key, domain_mut.expiry });
                         first = false;
                         continue;
@@ -4147,7 +4159,11 @@ fn handleNameField(ctx: *anyopaque, output_key: []const u8, field_name: []const 
         try writer.print("\"{s}\":\"{s}\"", .{ output_key, hash_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "expiryDate")) {
-        try writer.print("\"{s}\":{d}", .{ output_key, name.expiry });
+        if (hasValidExpiry(name.expiry)) {
+            try writer.print("\"{s}\":{d}", .{ output_key, name.expiry });
+        } else {
+            try writer.print("\"{s}\":null", .{output_key});
+        }
         return true;
     }
     return false;
