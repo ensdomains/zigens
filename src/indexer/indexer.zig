@@ -1808,39 +1808,45 @@ pub const Indexer = struct {
             label_str, token_id, expiration, registered_by
         });
 
-        // Look up the registry by address to get the parent name
-        // This allows us to properly index 3LDs (subnames like 1.sugh102.eth)
-        const registry_hex = try log.address.toHex(self.allocator);
-        defer self.allocator.free(registry_hex);
+        // Determine parent name based on registry address
+        // If from main .eth registry, parent is "eth". Otherwise look up subregistry parent.
+        const eth_registry = self.getEthRegistry(chain);
+        const is_main_registry = log.address.eql(eth_registry);
 
-        const registry_query = "SELECT name, namehash FROM registries WHERE address = ? AND chain = ?";
-        const registry_query_z = try self.allocator.dupeZ(u8, registry_query);
-        defer self.allocator.free(registry_query_z);
-
-        var reg_stmt: ?*c.sqlite3_stmt = null;
-        _ = c.sqlite3_prepare_v2(self.database.db, registry_query_z.ptr, -1, &reg_stmt, null);
-        defer _ = c.sqlite3_finalize(reg_stmt);
-
-        const chain_str = chain.toString();
-        _ = c.sqlite3_bind_text(reg_stmt, 1, registry_hex.ptr, @intCast(registry_hex.len), SQLITE_TRANSIENT());
-        _ = c.sqlite3_bind_text(reg_stmt, 2, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
-
-        var parent_name: []const u8 = "eth"; // Default to eth if not found (main registry)
+        var parent_name: []const u8 = "eth";
         var parent_name_allocated = false;
         var parent_namehash: Hash = try @import("../types/hash.zig").namehash(self.allocator, "eth");
 
-        if (c.sqlite3_step(reg_stmt) == c.SQLITE_ROW) {
-            const name_ptr = c.sqlite3_column_text(reg_stmt, 0);
-            if (name_ptr != null) {
-                const name_span = std.mem.span(name_ptr);
-                parent_name = try self.allocator.dupe(u8, name_span);
-                parent_name_allocated = true;
-            }
+        if (!is_main_registry) {
+            // This is a subregistry - look up the parent name from registries table
+            const registry_hex = try log.address.toHex(self.allocator);
+            defer self.allocator.free(registry_hex);
 
-            const namehash_ptr = c.sqlite3_column_text(reg_stmt, 1);
-            if (namehash_ptr != null) {
-                const namehash_hex = std.mem.span(namehash_ptr);
-                parent_namehash = try Hash.fromHex(namehash_hex);
+            const registry_query = "SELECT name, namehash FROM registries WHERE address = ? AND chain = ?";
+            const registry_query_z = try self.allocator.dupeZ(u8, registry_query);
+            defer self.allocator.free(registry_query_z);
+
+            var reg_stmt: ?*c.sqlite3_stmt = null;
+            _ = c.sqlite3_prepare_v2(self.database.db, registry_query_z.ptr, -1, &reg_stmt, null);
+            defer _ = c.sqlite3_finalize(reg_stmt);
+
+            const chain_str = chain.toString();
+            _ = c.sqlite3_bind_text(reg_stmt, 1, registry_hex.ptr, @intCast(registry_hex.len), SQLITE_TRANSIENT());
+            _ = c.sqlite3_bind_text(reg_stmt, 2, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
+
+            if (c.sqlite3_step(reg_stmt) == c.SQLITE_ROW) {
+                const name_ptr = c.sqlite3_column_text(reg_stmt, 0);
+                if (name_ptr != null) {
+                    const name_span = std.mem.span(name_ptr);
+                    parent_name = try self.allocator.dupe(u8, name_span);
+                    parent_name_allocated = true;
+                }
+
+                const namehash_ptr = c.sqlite3_column_text(reg_stmt, 1);
+                if (namehash_ptr != null) {
+                    const namehash_hex = std.mem.span(namehash_ptr);
+                    parent_namehash = try Hash.fromHex(namehash_hex);
+                }
             }
         }
         defer if (parent_name_allocated) self.allocator.free(parent_name);
