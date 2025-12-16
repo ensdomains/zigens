@@ -315,6 +315,7 @@ pub const Database = struct {
     pub const updateNameSubregistry = names.updateNameSubregistry;
     pub const updateNameResolver = names.updateNameResolver;
     pub const getNameByTokenId = names.getNameByTokenId;
+    pub const getNameByCanonicalId = names.getNameByCanonicalId;
     pub const updateNameExpiryByTokenId = names.updateNameExpiryByTokenId;
     pub const deleteNameByTokenId = names.deleteNameByTokenId;
     pub const updateNameTokenId = names.updateNameTokenId;

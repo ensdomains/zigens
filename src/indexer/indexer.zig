@@ -1612,16 +1612,17 @@ pub const Indexer = struct {
 
     fn handleSubregistryUpdate(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
         // Event: SubregistryUpdate(uint256 indexed id, address subregistry)
+        // Note: The 'id' in SubregistryUpdate is the canonical_id (version=0), not the full token_id
         if (log.topics.len < 2) return error.InvalidTopicCount;
 
         // topics[0] = event signature
-        // topics[1] = indexed id (token ID)
-        const token_id = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
+        // topics[1] = indexed id (canonical ID - note: this is NOT the full token_id)
+        const canonical_id = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
 
         // data = subregistry address
         const subregistry_addr = try abi.ABI.decodeAddress(log.data, 0);
 
-        std.log.debug("SubregistryUpdate: tokenId={d}, subregistry={any}, contract={any}", .{ token_id, subregistry_addr, log.address });
+        std.log.debug("SubregistryUpdate: canonicalId={d}, subregistry={any}, contract={any}", .{ canonical_id, subregistry_addr, log.address });
 
         // Skip if subregistry is zero address (unsetting subregistry)
         if (subregistry_addr.isZero()) {
@@ -1629,13 +1630,13 @@ pub const Indexer = struct {
             return;
         }
 
-        // Try to look up the name by token ID (now supports full u256 range)
-        const maybe_name = try self.database.getNameByTokenId(token_id);
+        // Look up the name by canonical ID (not token_id, since events use canonical_id)
+        const maybe_name = try self.database.getNameByCanonicalId(canonical_id);
         const name_str = if (maybe_name) |n| blk: {
             var name_copy = n;
             defer name_copy.deinit(self.allocator);
             break :blk try self.allocator.dupe(u8, name_copy.name orelse "[unknown]");
-        } else try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{token_id});
+        } else try std.fmt.allocPrint(self.allocator, "canonicalId:{d}", .{canonical_id});
         defer self.allocator.free(name_str);
 
         const namehash = if (maybe_name) |n| n.namehash else Hash.zero;
@@ -1670,9 +1671,9 @@ pub const Indexer = struct {
         const escaped_name = try json_utils.escapeString(self.allocator, name_str);
         defer self.allocator.free(escaped_name);
 
-        const event_data = try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\",\"tokenId\":{d},\"subregistry\":\"{s}\",\"registry\":\"{s}\"}}", .{
+        const event_data = try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\",\"canonicalId\":{d},\"subregistry\":\"{s}\",\"registry\":\"{s}\"}}", .{
             escaped_name,
-            token_id,
+            canonical_id,
             subreg_hex,
             contract_hex,
         });
@@ -1697,23 +1698,24 @@ pub const Indexer = struct {
 
     fn handleResolverUpdate(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
         // Event: ResolverUpdate(uint256 indexed id, address resolver)
+        // Note: The 'id' in ResolverUpdate is the canonical_id (version=0), not the full token_id
         if (log.topics.len < 2) return error.InvalidTopicCount;
 
         // topics[0] = event signature
-        // topics[1] = indexed id (token ID)
-        const token_id = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
+        // topics[1] = indexed id (canonical ID - note: this is NOT the full token_id)
+        const canonical_id = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
 
         // data = resolver address
         const resolver_addr = try abi.ABI.decodeAddress(log.data, 0);
 
-        std.log.debug("ResolverUpdate: tokenId={d}, resolver={any}, contract={any}", .{ token_id, resolver_addr, log.address });
+        std.log.debug("ResolverUpdate: canonicalId={d}, resolver={any}, contract={any}", .{ canonical_id, resolver_addr, log.address });
 
-        // Look up the name by token ID to get the actual namehash
-        const maybe_name = try self.database.getNameByTokenId(token_id);
+        // Look up the name by canonical ID (not token_id, since events use canonical_id)
+        const maybe_name = try self.database.getNameByCanonicalId(canonical_id);
 
         // Skip if name doesn't exist yet (might be out of order event processing)
         if (maybe_name == null) {
-            std.log.warn("  → Skipping ResolverUpdate for unknown tokenId={d}", .{token_id});
+            std.log.warn("  → Skipping ResolverUpdate for unknown canonicalId={d}", .{canonical_id});
             return;
         }
 
@@ -1746,9 +1748,9 @@ pub const Indexer = struct {
         const escaped_name = try json_utils.escapeString(self.allocator, name_str);
         defer self.allocator.free(escaped_name);
 
-        const event_data = try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\",\"tokenId\":{d},\"resolver\":\"{s}\",\"registry\":\"{s}\"}}", .{
+        const event_data = try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\",\"canonicalId\":{d},\"resolver\":\"{s}\",\"registry\":\"{s}\"}}", .{
             escaped_name,
-            token_id,
+            canonical_id,
             resolver_hex,
             contract_hex,
         });
@@ -1806,8 +1808,45 @@ pub const Indexer = struct {
             label_str, token_id, expiration, registered_by
         });
 
-        // Compute namehash from label.eth
-        const full_name = try std.fmt.allocPrint(self.allocator, "{s}.eth", .{label_str});
+        // Look up the registry by address to get the parent name
+        // This allows us to properly index 3LDs (subnames like 1.sugh102.eth)
+        const registry_hex = try log.address.toHex(self.allocator);
+        defer self.allocator.free(registry_hex);
+
+        const registry_query = "SELECT name, namehash FROM registries WHERE address = ? AND chain = ?";
+        const registry_query_z = try self.allocator.dupeZ(u8, registry_query);
+        defer self.allocator.free(registry_query_z);
+
+        var reg_stmt: ?*c.sqlite3_stmt = null;
+        _ = c.sqlite3_prepare_v2(self.database.db, registry_query_z.ptr, -1, &reg_stmt, null);
+        defer _ = c.sqlite3_finalize(reg_stmt);
+
+        const chain_str = chain.toString();
+        _ = c.sqlite3_bind_text(reg_stmt, 1, registry_hex.ptr, @intCast(registry_hex.len), SQLITE_TRANSIENT());
+        _ = c.sqlite3_bind_text(reg_stmt, 2, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
+
+        var parent_name: []const u8 = "eth"; // Default to eth if not found (main registry)
+        var parent_name_allocated = false;
+        var parent_namehash: Hash = try @import("../types/hash.zig").namehash(self.allocator, "eth");
+
+        if (c.sqlite3_step(reg_stmt) == c.SQLITE_ROW) {
+            const name_ptr = c.sqlite3_column_text(reg_stmt, 0);
+            if (name_ptr != null) {
+                const name_span = std.mem.span(name_ptr);
+                parent_name = try self.allocator.dupe(u8, name_span);
+                parent_name_allocated = true;
+            }
+
+            const namehash_ptr = c.sqlite3_column_text(reg_stmt, 1);
+            if (namehash_ptr != null) {
+                const namehash_hex = std.mem.span(namehash_ptr);
+                parent_namehash = try Hash.fromHex(namehash_hex);
+            }
+        }
+        defer if (parent_name_allocated) self.allocator.free(parent_name);
+
+        // Compute full name: label.parent_name
+        const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
         defer self.allocator.free(full_name);
         const namehash = try @import("../types/hash.zig").namehash(self.allocator, full_name);
 
@@ -1819,13 +1858,13 @@ pub const Indexer = struct {
         const canonical_id = token_id_utils.getCanonicalId(token_id);
         const token_version = token_id_utils.getTokenVersion(token_id);
 
-        const name_str_dup = try std.fmt.allocPrint(self.allocator, "{s}.eth", .{label_str});
+        const name_str_dup = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
         errdefer self.allocator.free(name_str_dup);
 
         const label_dup = try self.allocator.dupe(u8, label_str);
         errdefer self.allocator.free(label_dup);
 
-        const parent_name_dup = try self.allocator.dupe(u8, "eth");
+        const parent_name_dup = try self.allocator.dupe(u8, parent_name);
         errdefer self.allocator.free(parent_name_dup);
 
         const name = models.Name{
@@ -1834,9 +1873,9 @@ pub const Indexer = struct {
             .label = label_dup,
             .label_hash = label_hash,
             .parent_name = parent_name_dup,
-            .parent_namehash = try @import("../types/hash.zig").namehash(self.allocator, "eth"),
+            .parent_namehash = parent_namehash,
             .chain = chain,
-            .registry = self.getEthRegistry(chain),
+            .registry = log.address, // Use the actual registry that emitted the event
             .owner = registered_by,
             .resolver = Address.zero,
             .token_id = @intCast(token_id),
@@ -1882,7 +1921,7 @@ pub const Indexer = struct {
             expiration,
         });
 
-        const event_name = try std.fmt.allocPrint(self.allocator, "{s}.eth", .{label_str});
+        const event_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
 
         const event = models.Event{
             .event_type = .name_registered,

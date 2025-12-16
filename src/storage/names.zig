@@ -490,6 +490,98 @@ pub fn getNameByTokenId(db: *Database, token_id: u256) !?models.Name {
     return null;
 }
 
+/// Get name by canonical ID (for ResolverUpdate/SubregistryUpdate events that use canonical ID)
+/// In ENS V2, some events emit canonical_id (version=0) instead of full token_id (version>=1)
+pub fn getNameByCanonicalId(db: *Database, canonical_id: u256) !?models.Name {
+    const sql = "SELECT name, label, label_hash, parent_name, parent_namehash, chain, registry, owner, resolver, token_id, canonical_id, token_version, namehash, expiry, registry_locked, migrated, ejected, created_block, created_at, updated_block, updated_at, is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash FROM names WHERE canonical_id = ? LIMIT 1";
+
+    const sql_z = try db.allocator.dupeZ(u8, sql);
+    defer db.allocator.free(sql_z);
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    const prepare_result = c.sqlite3_prepare_v2(db.db, sql_z.ptr, -1, &stmt, null);
+    if (prepare_result != c.SQLITE_OK) {
+        std.log.err("Failed to prepare SQL statement: {s}", .{c.sqlite3_errmsg(db.db)});
+        return error.PrepareFailed;
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+
+    // Format canonical_id as hex string to match how it's stored in the database
+    const canonical_id_hex = try std.fmt.allocPrint(db.allocator, "0x{x:0>64}", .{canonical_id});
+    defer db.allocator.free(canonical_id_hex);
+
+    _ = c.sqlite3_bind_text(stmt, 1, canonical_id_hex.ptr, @intCast(canonical_id_hex.len), SQLITE_TRANSIENT());
+
+    if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        const name_str = std.mem.span(c.sqlite3_column_text(stmt, 0));
+        const label_str = std.mem.span(c.sqlite3_column_text(stmt, 1));
+        const label_hash_str = std.mem.span(c.sqlite3_column_text(stmt, 2));
+        const parent_name_str = std.mem.span(c.sqlite3_column_text(stmt, 3));
+        const parent_hash_str = std.mem.span(c.sqlite3_column_text(stmt, 4));
+        const chain_str = std.mem.span(c.sqlite3_column_text(stmt, 5));
+        const registry_str = std.mem.span(c.sqlite3_column_text(stmt, 6));
+        const owner_str = std.mem.span(c.sqlite3_column_text(stmt, 7));
+        const resolver_str = std.mem.span(c.sqlite3_column_text(stmt, 8));
+        const token_id_str = std.mem.span(c.sqlite3_column_text(stmt, 9));
+        const canonical_id_str = std.mem.span(c.sqlite3_column_text(stmt, 10));
+        const token_version = @as(u32, @intCast(c.sqlite3_column_int64(stmt, 11)));
+        const namehash_str = std.mem.span(c.sqlite3_column_text(stmt, 12));
+        const expiry = c.sqlite3_column_int64(stmt, 13);
+        const registry_locked = c.sqlite3_column_int(stmt, 14) != 0;
+        const migrated = c.sqlite3_column_int(stmt, 15) != 0;
+        const ejected = c.sqlite3_column_int(stmt, 16) != 0;
+        const created_block = c.sqlite3_column_int64(stmt, 17);
+        const created_at = c.sqlite3_column_int64(stmt, 18);
+        const updated_block = c.sqlite3_column_int64(stmt, 19);
+        const updated_at = c.sqlite3_column_int64(stmt, 20);
+        const is_wrapped = c.sqlite3_column_int(stmt, 21) != 0;
+        const wrapper_fuses_ptr = c.sqlite3_column_text(stmt, 22);
+        const wrapper_fuses = if (wrapper_fuses_ptr != null) try db.allocator.dupe(u8, std.mem.span(wrapper_fuses_ptr)) else null;
+        const wrapper_expiry_raw = c.sqlite3_column_int64(stmt, 23);
+        const wrapper_expiry = if (c.sqlite3_column_type(stmt, 23) != c.SQLITE_NULL) wrapper_expiry_raw else null;
+        const is_v1_name = c.sqlite3_column_int(stmt, 24) != 0;
+        const v1_label_hash_ptr = c.sqlite3_column_text(stmt, 25);
+        const v1_label_hash = if (v1_label_hash_ptr != null) try db.allocator.dupe(u8, std.mem.span(v1_label_hash_ptr)) else null;
+
+        return models.Name{
+            .name = try db.allocator.dupe(u8, name_str),
+            .label = try db.allocator.dupe(u8, label_str),
+            .label_hash = try Hash.fromHex(label_hash_str),
+            .parent_name = try db.allocator.dupe(u8, parent_name_str),
+            .parent_namehash = try Hash.fromHex(parent_hash_str),
+            .chain = try models.Chain.fromString(chain_str),
+            .registry = try Address.fromHex(registry_str),
+            .owner = try Address.fromHex(owner_str),
+            .resolver = try Address.fromHex(resolver_str),
+            .token_id = blk: {
+                const hex_str = if (std.mem.startsWith(u8, token_id_str, "0x")) token_id_str[2..] else token_id_str;
+                break :blk try std.fmt.parseInt(u256, hex_str, 16);
+            },
+            .canonical_id = blk: {
+                const hex_str = if (std.mem.startsWith(u8, canonical_id_str, "0x")) canonical_id_str[2..] else canonical_id_str;
+                break :blk try std.fmt.parseInt(u256, hex_str, 16);
+            },
+            .token_version = token_version,
+            .namehash = try Hash.fromHex(namehash_str),
+            .expiry = @bitCast(expiry),
+            .registry_locked = registry_locked,
+            .migrated = migrated,
+            .ejected = ejected,
+            .created_block = @intCast(created_block),
+            .created_at = created_at,
+            .updated_block = @intCast(updated_block),
+            .updated_at = updated_at,
+            .is_wrapped = is_wrapped,
+            .wrapper_fuses = wrapper_fuses,
+            .wrapper_expiry = wrapper_expiry,
+            .is_v1_name = is_v1_name,
+            .v1_label_hash = v1_label_hash,
+        };
+    }
+
+    return null;
+}
+
 /// Update name expiry by token ID (for V2 renewals)
 pub fn updateNameExpiryByTokenId(db: *Database, token_id: i64, expiry: i64) !void {
     const sql = "UPDATE names SET expiry = ?, updated_at = ?, updated_block = updated_block + 1 WHERE token_id = ?";
