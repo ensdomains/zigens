@@ -1675,20 +1675,19 @@ fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) !par
         return .{ .json = try allocator.dupe(u8, "[]") };
     }
 
-    // Optimization 2: if owner filter is set and it's the main filter, push it to DB
+    // Optimization 2: if owner filter is set, always push it to DB
     // This uses the idx_names_owner index instead of scanning all rows
+    // Other filters (name_contains_nocase, etc.) are applied in-memory after DB fetch
     const has_other_filters = filter_name_contains != null or
         filter_name_contains_nocase != null or filter_name_starts_with != null or
         filter_name_ends_with != null or filter_owner_in != null or
         filter_resolved_address != null or filter_has_subdomains != null or
         filter_subdomain_count_gt != null or filter_subdomain_count_lt != null;
 
-    const db_owner_filter = if (filter_owner != null and !has_other_filters)
-        filter_owner
-    else
-        null;
+    // Always pass owner filter to DB if present - it uses an index and narrows results
+    const db_owner_filter = filter_owner;
 
-    const fetch_limit = if (has_other_filters or (filter_owner != null and has_other_filters))
+    const fetch_limit = if (has_other_filters)
         @min(first * 10, 1000) // Fetch more if we need additional in-memory filtering
     else
         first;
