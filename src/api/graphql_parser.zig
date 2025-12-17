@@ -1104,6 +1104,7 @@ pub const Executor = struct {
     context: ExecutionContext,
     variables: ?*VariableMap, // Current variable values during execution
     fragments: []const Fragment, // Fragment definitions from the document
+    variable_definitions: []const VariableDefinition, // Variable definitions from the current operation
 
     pub fn init(allocator: std.mem.Allocator, context: ExecutionContext) Executor {
         return .{
@@ -1112,6 +1113,7 @@ pub const Executor = struct {
             .context = context,
             .variables = null,
             .fragments = &.{},
+            .variable_definitions = &.{},
         };
     }
 
@@ -1133,6 +1135,16 @@ pub const Executor = struct {
         return null;
     }
 
+    /// Look up a variable definition by name to check if it's nullable
+    fn getVariableDefinition(self: *Executor, var_name: []const u8) ?*const VariableDefinition {
+        for (self.variable_definitions) |*def| {
+            if (std.mem.eql(u8, def.name, var_name)) {
+                return def;
+            }
+        }
+        return null;
+    }
+
     /// Resolve a value, replacing variable references with actual values (recursively)
     fn resolveValue(self: *Executor, value: *const Value) !Value {
         return switch (value.*) {
@@ -1144,7 +1156,18 @@ pub const Executor = struct {
                         return try self.jsonToValue(json_val);
                     }
                 }
-                // Variable not found - return error (caller handles logging)
+                // Variable not provided - check if it's nullable or has a default
+                if (self.getVariableDefinition(var_name)) |var_def| {
+                    // If variable has a default value, use it
+                    if (var_def.default_value) |default_val| {
+                        return default_val;
+                    }
+                    // If variable is not required (nullable), return null
+                    if (!var_def.required) {
+                        return Value.null_value;
+                    }
+                }
+                // Variable is required but not provided - return error
                 return error.UndefinedVariable;
             },
             .object => |args| {
@@ -1308,6 +1331,8 @@ pub const Executor = struct {
         // Execute selected operations
         for (operations_to_execute, 0..) |operation, i| {
             if (i > 0) try response.appendSlice(self.allocator, ",");
+            // Set variable definitions for this operation so resolveValue can check nullability
+            self.variable_definitions = operation.variables;
             const result = try self.executeOperation(operation);
             defer self.allocator.free(result);
             try response.appendSlice(self.allocator, result);

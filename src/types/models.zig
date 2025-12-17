@@ -63,6 +63,9 @@ pub const Name = struct {
     registry: Address,
     /// Current owner address
     owner: Address,
+    /// Original registrant address (from NameRegistered event)
+    /// This does not change on transfers, unlike owner
+    registrant: Address,
     /// Resolver address
     resolver: Address,
     /// Token ID in the registry's ERC1155
