@@ -320,6 +320,7 @@ pub const Database = struct {
     pub const deleteNameByTokenId = names.deleteNameByTokenId;
     pub const updateNameTokenId = names.updateNameTokenId;
     pub const getNamesByOwner = names.getNamesByOwner;
+    pub const getNamesByRegistrant = names.getNamesByRegistrant;
     pub const getAllNames = names.getAllNames;
     pub const getAllNamesWithOrder = names.getAllNamesWithOrder;
     pub const OrderDir = names.OrderDir;

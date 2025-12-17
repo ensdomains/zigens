@@ -1001,6 +1001,99 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
     return names.toOwnedSlice(db.allocator);
 }
 
+/// Get names where the given address is the registrant (for account.registrations query)
+pub fn getNamesByRegistrant(db: *Database, registrant: Address, skip: u32, limit: u32) ![]models.Name {
+    const sql = "SELECT name, namehash, label, label_hash, parent_name, owner, resolver, registry, chain, token_id, canonical_id, token_version, expiry, registry_locked, migrated, ejected, created_at, created_block, updated_at, updated_block, registrant FROM names WHERE registrant = ? ORDER BY created_at DESC LIMIT ? OFFSET ?";
+
+    const sql_z = try db.allocator.dupeZ(u8, sql);
+    defer db.allocator.free(sql_z);
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db.db, sql_z.ptr, @intCast(sql_z.len + 1), &stmt, null) != c.SQLITE_OK) {
+        std.log.err("Failed to prepare statement: {s}", .{c.sqlite3_errmsg(db.db)});
+        return error.DatabaseError;
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+
+    const registrant_hex = try registrant.toHex(db.allocator);
+    defer db.allocator.free(registrant_hex);
+
+    if (c.sqlite3_bind_text(stmt, 1, registrant_hex.ptr, @intCast(registrant_hex.len), SQLITE_TRANSIENT()) != c.SQLITE_OK) {
+        return error.DatabaseError;
+    }
+    if (c.sqlite3_bind_int(stmt, 2, @intCast(limit)) != c.SQLITE_OK) {
+        return error.DatabaseError;
+    }
+    if (c.sqlite3_bind_int(stmt, 3, @intCast(skip)) != c.SQLITE_OK) {
+        return error.DatabaseError;
+    }
+
+    var names_list: std.ArrayList(models.Name) = .{};
+    errdefer {
+        for (names_list.items) |*name| {
+            name.deinit(db.allocator);
+        }
+        names_list.deinit(db.allocator);
+    }
+
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        const name_str = std.mem.span(c.sqlite3_column_text(stmt, 0));
+        const label_str = std.mem.span(c.sqlite3_column_text(stmt, 2));
+        const label_hash_str = std.mem.span(c.sqlite3_column_text(stmt, 3));
+        const parent_name_str = std.mem.span(c.sqlite3_column_text(stmt, 4));
+        const chain_str = std.mem.span(c.sqlite3_column_text(stmt, 8));
+        const registry_str = std.mem.span(c.sqlite3_column_text(stmt, 7));
+        const owner_str = std.mem.span(c.sqlite3_column_text(stmt, 5));
+        const resolver_str = std.mem.span(c.sqlite3_column_text(stmt, 6));
+        const token_id_str = std.mem.span(c.sqlite3_column_text(stmt, 9));
+        const canonical_id_str = std.mem.span(c.sqlite3_column_text(stmt, 10));
+        const namehash_str = std.mem.span(c.sqlite3_column_text(stmt, 1));
+        const registrant_str = std.mem.span(c.sqlite3_column_text(stmt, 20));
+
+        const parent_namehash = try @import("../types/hash.zig").namehash(db.allocator, parent_name_str);
+
+        const name = models.Name{
+            .name = try db.allocator.dupe(u8, name_str),
+            .label = try db.allocator.dupe(u8, label_str),
+            .label_hash = try Hash.fromHex(label_hash_str),
+            .parent_name = try db.allocator.dupe(u8, parent_name_str),
+            .parent_namehash = parent_namehash,
+            .chain = try models.Chain.fromString(chain_str),
+            .registry = try Address.fromHex(registry_str),
+            .owner = try Address.fromHex(owner_str),
+            .registrant = try Address.fromHex(registrant_str),
+            .resolver = try Address.fromHex(resolver_str),
+            .token_id = blk: {
+                const hex_str = if (std.mem.startsWith(u8, token_id_str, "0x")) token_id_str[2..] else token_id_str;
+                break :blk try std.fmt.parseInt(u256, hex_str, 16);
+            },
+            .canonical_id = blk: {
+                const hex_str = if (std.mem.startsWith(u8, canonical_id_str, "0x")) canonical_id_str[2..] else canonical_id_str;
+                break :blk try std.fmt.parseInt(u256, hex_str, 16);
+            },
+            .token_version = @intCast(c.sqlite3_column_int64(stmt, 11)),
+            .namehash = try Hash.fromHex(namehash_str),
+            .expiry = @bitCast(c.sqlite3_column_int64(stmt, 12)),
+            .registry_locked = c.sqlite3_column_int(stmt, 13) != 0,
+            .migrated = c.sqlite3_column_int(stmt, 14) != 0,
+            .ejected = c.sqlite3_column_int(stmt, 15) != 0,
+            .created_block = @intCast(c.sqlite3_column_int64(stmt, 17)),
+            .created_at = c.sqlite3_column_int64(stmt, 16),
+            .updated_block = @intCast(c.sqlite3_column_int64(stmt, 19)),
+            .updated_at = c.sqlite3_column_int64(stmt, 18),
+            .is_wrapped = false,
+            .wrapper_fuses = null,
+            .wrapper_expiry = null,
+            .is_v1_name = false,
+            .v1_label_hash = null,
+        };
+
+        try names_list.append(db.allocator, name);
+    }
+
+    return names_list.toOwnedSlice(db.allocator);
+}
+
 /// Count direct subdomains for a given parent name (one level down only)
 /// For example, if parent_name is "eth", this counts "vitalik.eth", "nick.eth", etc.
 /// but NOT "sub.vitalik.eth" (which would be a subdomain of "vitalik.eth")

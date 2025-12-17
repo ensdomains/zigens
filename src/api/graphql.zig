@@ -3241,38 +3241,31 @@ fn buildAccountJson(
             try writer.writeAll("]");
             first = false;
         } else if (std.mem.eql(u8, field.name, "registrations")) {
-            // Nested query: fetch registrations by this account
-            // Use database query with JSON filter to find NameRegistered events by owner
+            // Nested query: fetch domains where this account is the registrant
             const first_arg = parser.getIntArg(field, "first", 10) orelse 10;
+            const skip_arg = parser.getIntArg(field, "skip", 0) orelse 0;
 
-            const account_hex = try address.toHex(ctx.allocator);
-            defer ctx.allocator.free(account_hex);
-
-            // Query events filtered by event_type and JSON owner field
-            const all_events = try ctx.database.getEventsFiltered(.{
-                .event_type = "NameRegistered",
-                .data_json_owner = account_hex,
-                .limit = @intCast(first_arg),
-            });
+            // Query names table by registrant field
+            const names = try ctx.database.getNamesByRegistrant(address, @intCast(skip_arg), @intCast(first_arg));
             defer {
-                for (all_events) |*e| {
-                    e.deinit(ctx.allocator);
+                for (names) |*name| {
+                    name.deinit(ctx.allocator);
                 }
-                ctx.allocator.free(all_events);
+                ctx.allocator.free(names);
             }
 
             try writer.print("\"{s}\":[", .{output_key});
-            for (all_events, 0..) |*event, i| {
+            for (names, 0..) |*name, i| {
                 if (i > 0) try writer.writeAll(",");
 
-                const reg_json = try buildRegistrationJson(event, field.selections, .{
+                const domain_json = try buildDomainJson(name, field.selections, .{
                     .database = ctx.database,
                     .depth = ctx.depth + 1,
                     .allocator = ctx.allocator,
                     .loaders = ctx.loaders,
                 });
-                defer ctx.allocator.free(reg_json);
-                try writer.writeAll(reg_json);
+                defer ctx.allocator.free(domain_json);
+                try writer.writeAll(domain_json);
             }
             try writer.writeAll("]");
             first = false;
