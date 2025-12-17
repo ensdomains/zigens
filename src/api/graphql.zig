@@ -3556,6 +3556,19 @@ fn buildDomainJson(
             }
             try writer.writeAll("]");
             first = false;
+        } else if (std.mem.eql(u8, field.name, "domain")) {
+            // Registration.domain field - returns the Domain (which is the same object)
+            // This allows queries like: registrations { domain { id events { ... } } }
+            try writer.print("\"{s}\":", .{output_key});
+            const nested_domain_json = try buildDomainJson(domain, field.selections, .{
+                .database = ctx.database,
+                .depth = ctx.depth + 1,
+                .allocator = ctx.allocator,
+                .loaders = ctx.loaders,
+            });
+            defer ctx.allocator.free(nested_domain_json);
+            try writer.writeAll(nested_domain_json);
+            first = false;
         } else if (std.mem.eql(u8, field.name, "__typename")) {
             try writer.print("\"{s}\":\"Domain\"", .{output_key});
             first = false;
