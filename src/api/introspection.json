@@ -1016,7 +1016,22 @@
             },
             {
               "name": "registrations",
-              "args": [],
+              "args": [
+                {
+                  "name": "first",
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "skip",
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                }
+              ],
               "type": {
                 "kind": "NON_NULL",
                 "ofType": {
