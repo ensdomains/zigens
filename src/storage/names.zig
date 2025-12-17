@@ -60,14 +60,89 @@ pub fn insertRegistry(db: *Database, registry: models.Registry) !void {
     }
 }
 
+/// Update a registry that was created with a canonicalId placeholder name to use the actual name
+/// Also updates any names that used this placeholder as their parent_name
+pub fn updateRegistryPlaceholderName(db: *Database, placeholder_name: []const u8, actual_name: []const u8, namehash: Hash) !u32 {
+    // First update the registry
+    const registry_sql =
+        \\UPDATE registries SET name = ?, namehash = ? WHERE name = ?
+    ;
+
+    const registry_sql_z = try db.allocator.dupeZ(u8, registry_sql);
+    defer db.allocator.free(registry_sql_z);
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    const prepare_result = c.sqlite3_prepare_v2(db.db, registry_sql_z.ptr, -1, &stmt, null);
+    if (prepare_result != c.SQLITE_OK) {
+        std.log.err("Failed to prepare registry update SQL: {s}", .{c.sqlite3_errmsg(db.db)});
+        return error.PrepareFailed;
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+
+    const namehash_hex = try namehash.toHex(db.allocator);
+    defer db.allocator.free(namehash_hex);
+
+    _ = c.sqlite3_bind_text(stmt, 1, actual_name.ptr, @intCast(actual_name.len), SQLITE_TRANSIENT());
+    _ = c.sqlite3_bind_text(stmt, 2, namehash_hex.ptr, @intCast(namehash_hex.len), SQLITE_TRANSIENT());
+    _ = c.sqlite3_bind_text(stmt, 3, placeholder_name.ptr, @intCast(placeholder_name.len), SQLITE_TRANSIENT());
+
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
+        std.log.err("Failed to update registry placeholder: {s}", .{c.sqlite3_errmsg(db.db)});
+        return error.UpdateFailed;
+    }
+
+    const registry_changes: u32 = @intCast(c.sqlite3_changes(db.db));
+
+    // Now update any names that used this placeholder as parent_name
+    // Also need to update the full name of those subnames
+    const names_sql =
+        \\UPDATE names
+        \\SET parent_name = ?,
+        \\    parent_namehash = ?,
+        \\    name = label || '.' || ?
+        \\WHERE parent_name = ?
+    ;
+
+    const names_sql_z = try db.allocator.dupeZ(u8, names_sql);
+    defer db.allocator.free(names_sql_z);
+
+    var names_stmt: ?*c.sqlite3_stmt = null;
+    const names_prepare = c.sqlite3_prepare_v2(db.db, names_sql_z.ptr, -1, &names_stmt, null);
+    if (names_prepare != c.SQLITE_OK) {
+        std.log.err("Failed to prepare names update SQL: {s}", .{c.sqlite3_errmsg(db.db)});
+        return error.PrepareFailed;
+    }
+    defer _ = c.sqlite3_finalize(names_stmt);
+
+    _ = c.sqlite3_bind_text(names_stmt, 1, actual_name.ptr, @intCast(actual_name.len), SQLITE_TRANSIENT());
+    _ = c.sqlite3_bind_text(names_stmt, 2, namehash_hex.ptr, @intCast(namehash_hex.len), SQLITE_TRANSIENT());
+    _ = c.sqlite3_bind_text(names_stmt, 3, actual_name.ptr, @intCast(actual_name.len), SQLITE_TRANSIENT());
+    _ = c.sqlite3_bind_text(names_stmt, 4, placeholder_name.ptr, @intCast(placeholder_name.len), SQLITE_TRANSIENT());
+
+    if (c.sqlite3_step(names_stmt) != c.SQLITE_DONE) {
+        std.log.err("Failed to update names with placeholder parent: {s}", .{c.sqlite3_errmsg(db.db)});
+        return error.UpdateFailed;
+    }
+
+    const names_changes: u32 = @intCast(c.sqlite3_changes(db.db));
+
+    if (registry_changes > 0 or names_changes > 0) {
+        std.log.info("Updated placeholder '{s}' -> '{s}': {d} registries, {d} names", .{
+            placeholder_name, actual_name, registry_changes, names_changes
+        });
+    }
+
+    return registry_changes + names_changes;
+}
+
 pub fn insertName(db: *Database, name: models.Name) !void {
     const sql =
         \\INSERT OR REPLACE INTO names
         \\(namehash, name, label, label_hash, parent_name, parent_namehash, chain,
-        \\ registry, owner, resolver, token_id, canonical_id, token_version, expiry,
+        \\ registry, owner, registrant, resolver, token_id, canonical_id, token_version, expiry,
         \\ registry_locked, migrated, ejected, created_block, created_at, updated_block, updated_at,
         \\ is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ;
 
     const sql_z = try db.allocator.dupeZ(u8, sql);
@@ -95,6 +170,9 @@ pub fn insertName(db: *Database, name: models.Name) !void {
 
     const owner_hex = try name.owner.toHex(db.allocator);
     defer db.allocator.free(owner_hex);
+
+    const registrant_hex = try name.registrant.toHex(db.allocator);
+    defer db.allocator.free(registrant_hex);
 
     const resolver_hex = try name.resolver.toHex(db.allocator);
     defer db.allocator.free(resolver_hex);
@@ -130,34 +208,35 @@ pub fn insertName(db: *Database, name: models.Name) !void {
     _ = c.sqlite3_bind_text(stmt, 7, chain_str.ptr, @intCast(chain_str.len), c.SQLITE_STATIC);
     _ = c.sqlite3_bind_text(stmt, 8, registry_hex.ptr, @intCast(registry_hex.len), SQLITE_TRANSIENT());
     _ = c.sqlite3_bind_text(stmt, 9, owner_hex.ptr, @intCast(owner_hex.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 10, resolver_hex.ptr, @intCast(resolver_hex.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 11, token_id_hex.ptr, @intCast(token_id_hex.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 12, canonical_id_hex.ptr, @intCast(canonical_id_hex.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 13, @intCast(name.token_version));
-    _ = c.sqlite3_bind_int64(stmt, 14, @bitCast(name.expiry));
-    _ = c.sqlite3_bind_int(stmt, 15, if (name.registry_locked) 1 else 0);
-    _ = c.sqlite3_bind_int(stmt, 16, if (name.migrated) 1 else 0);
-    _ = c.sqlite3_bind_int(stmt, 17, if (name.ejected) 1 else 0);
-    _ = c.sqlite3_bind_int64(stmt, 18, @intCast(name.created_block));
-    _ = c.sqlite3_bind_int64(stmt, 19, name.created_at);
-    _ = c.sqlite3_bind_int64(stmt, 20, @intCast(name.updated_block));
-    _ = c.sqlite3_bind_int64(stmt, 21, name.updated_at);
-    _ = c.sqlite3_bind_int(stmt, 22, if (name.is_wrapped) 1 else 0);
+    _ = c.sqlite3_bind_text(stmt, 10, registrant_hex.ptr, @intCast(registrant_hex.len), SQLITE_TRANSIENT());
+    _ = c.sqlite3_bind_text(stmt, 11, resolver_hex.ptr, @intCast(resolver_hex.len), SQLITE_TRANSIENT());
+    _ = c.sqlite3_bind_text(stmt, 12, token_id_hex.ptr, @intCast(token_id_hex.len), SQLITE_TRANSIENT());
+    _ = c.sqlite3_bind_text(stmt, 13, canonical_id_hex.ptr, @intCast(canonical_id_hex.len), SQLITE_TRANSIENT());
+    _ = c.sqlite3_bind_int64(stmt, 14, @intCast(name.token_version));
+    _ = c.sqlite3_bind_int64(stmt, 15, @bitCast(name.expiry));
+    _ = c.sqlite3_bind_int(stmt, 16, if (name.registry_locked) 1 else 0);
+    _ = c.sqlite3_bind_int(stmt, 17, if (name.migrated) 1 else 0);
+    _ = c.sqlite3_bind_int(stmt, 18, if (name.ejected) 1 else 0);
+    _ = c.sqlite3_bind_int64(stmt, 19, @intCast(name.created_block));
+    _ = c.sqlite3_bind_int64(stmt, 20, name.created_at);
+    _ = c.sqlite3_bind_int64(stmt, 21, @intCast(name.updated_block));
+    _ = c.sqlite3_bind_int64(stmt, 22, name.updated_at);
+    _ = c.sqlite3_bind_int(stmt, 23, if (name.is_wrapped) 1 else 0);
     if (name.wrapper_fuses) |fuses| {
-        _ = c.sqlite3_bind_text(stmt, 23, fuses.ptr, @intCast(fuses.len), SQLITE_TRANSIENT());
-    } else {
-        _ = c.sqlite3_bind_null(stmt, 23);
-    }
-    if (name.wrapper_expiry) |expiry| {
-        _ = c.sqlite3_bind_int64(stmt, 24, expiry);
+        _ = c.sqlite3_bind_text(stmt, 24, fuses.ptr, @intCast(fuses.len), SQLITE_TRANSIENT());
     } else {
         _ = c.sqlite3_bind_null(stmt, 24);
     }
-    _ = c.sqlite3_bind_int(stmt, 25, if (name.is_v1_name) 1 else 0);
-    if (name.v1_label_hash) |hash| {
-        _ = c.sqlite3_bind_text(stmt, 26, hash.ptr, @intCast(hash.len), SQLITE_TRANSIENT());
+    if (name.wrapper_expiry) |expiry| {
+        _ = c.sqlite3_bind_int64(stmt, 25, expiry);
     } else {
-        _ = c.sqlite3_bind_null(stmt, 26);
+        _ = c.sqlite3_bind_null(stmt, 25);
+    }
+    _ = c.sqlite3_bind_int(stmt, 26, if (name.is_v1_name) 1 else 0);
+    if (name.v1_label_hash) |hash| {
+        _ = c.sqlite3_bind_text(stmt, 27, hash.ptr, @intCast(hash.len), SQLITE_TRANSIENT());
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 27);
     }
 
     if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
@@ -169,7 +248,7 @@ pub fn insertName(db: *Database, name: models.Name) !void {
 pub fn getNameByNamehash(db: *Database, namehash: Hash) !?models.Name {
     const sql =
         \\SELECT name, label, label_hash, parent_name, parent_namehash, chain, registry,
-        \\       owner, resolver, token_id, canonical_id, token_version, namehash, expiry, registry_locked,
+        \\       owner, registrant, resolver, token_id, canonical_id, token_version, namehash, expiry, registry_locked,
         \\       migrated, ejected, created_block, created_at, updated_block, updated_at,
         \\       is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash
         \\FROM names WHERE namehash = ?
@@ -200,9 +279,16 @@ pub fn getNameByNamehash(db: *Database, namehash: Hash) !?models.Name {
         const chain_str = std.mem.span(c.sqlite3_column_text(stmt, 5));
         const registry_str = std.mem.span(c.sqlite3_column_text(stmt, 6));
         const owner_str = std.mem.span(c.sqlite3_column_text(stmt, 7));
-        const resolver_str = std.mem.span(c.sqlite3_column_text(stmt, 8));
-        const token_id_str = std.mem.span(c.sqlite3_column_text(stmt, 9));
-        const canonical_id_str = std.mem.span(c.sqlite3_column_text(stmt, 10));
+        const registrant_str = std.mem.span(c.sqlite3_column_text(stmt, 8));
+        const resolver_str = std.mem.span(c.sqlite3_column_text(stmt, 9));
+        const token_id_str = std.mem.span(c.sqlite3_column_text(stmt, 10));
+        const canonical_id_str = std.mem.span(c.sqlite3_column_text(stmt, 11));
+
+        // Parse registrant - use owner as fallback for old records where registrant is null
+        const registrant = if (registrant_str.len > 0)
+            try Address.fromHex(registrant_str)
+        else
+            try Address.fromHex(owner_str);
 
         return models.Name{
             .name = try db.allocator.dupe(u8, name_str),
@@ -214,6 +300,7 @@ pub fn getNameByNamehash(db: *Database, namehash: Hash) !?models.Name {
             .chain = try models.Chain.fromString(chain_str),
             .registry = try Address.fromHex(registry_str),
             .owner = try Address.fromHex(owner_str),
+            .registrant = registrant,
             .resolver = try Address.fromHex(resolver_str),
             .token_id = blk: {
                 const hex_str = if (std.mem.startsWith(u8, token_id_str, "0x")) token_id_str[2..] else token_id_str;
@@ -223,16 +310,16 @@ pub fn getNameByNamehash(db: *Database, namehash: Hash) !?models.Name {
                 const hex_str = if (std.mem.startsWith(u8, canonical_id_str, "0x")) canonical_id_str[2..] else canonical_id_str;
                 break :blk try std.fmt.parseInt(u256, hex_str, 16);
             },
-            .token_version = @intCast(c.sqlite3_column_int64(stmt, 11)),
-            // Column 12 is namehash (skipped - using input param)
-            .expiry = @bitCast(c.sqlite3_column_int64(stmt, 13)),
-            .registry_locked = c.sqlite3_column_int(stmt, 14) != 0,
-            .migrated = c.sqlite3_column_int(stmt, 15) != 0,
-            .ejected = c.sqlite3_column_int(stmt, 16) != 0,
-            .created_block = @intCast(c.sqlite3_column_int64(stmt, 17)),
-            .created_at = c.sqlite3_column_int64(stmt, 18),
-            .updated_block = @intCast(c.sqlite3_column_int64(stmt, 19)),
-            .updated_at = c.sqlite3_column_int64(stmt, 20),
+            .token_version = @intCast(c.sqlite3_column_int64(stmt, 12)),
+            // Column 13 is namehash (skipped - using input param)
+            .expiry = @bitCast(c.sqlite3_column_int64(stmt, 14)),
+            .registry_locked = c.sqlite3_column_int(stmt, 15) != 0,
+            .migrated = c.sqlite3_column_int(stmt, 16) != 0,
+            .ejected = c.sqlite3_column_int(stmt, 17) != 0,
+            .created_block = @intCast(c.sqlite3_column_int64(stmt, 18)),
+            .created_at = c.sqlite3_column_int64(stmt, 19),
+            .updated_block = @intCast(c.sqlite3_column_int64(stmt, 20)),
+            .updated_at = c.sqlite3_column_int64(stmt, 21),
             .is_wrapped = false,
             .wrapper_fuses = null,
             .wrapper_expiry = null,
@@ -401,7 +488,7 @@ pub fn updateNameResolver(db: *Database, namehash: Hash, resolver: Address) !voi
 
 /// Get name by token ID
 pub fn getNameByTokenId(db: *Database, token_id: u256) !?models.Name {
-    const sql = "SELECT name, label, label_hash, parent_name, parent_namehash, chain, registry, owner, resolver, token_id, canonical_id, token_version, namehash, expiry, registry_locked, migrated, ejected, created_block, created_at, updated_block, updated_at FROM names WHERE token_id = ? LIMIT 1";
+    const sql = "SELECT name, label, label_hash, parent_name, parent_namehash, chain, registry, owner, registrant, resolver, token_id, canonical_id, token_version, namehash, expiry, registry_locked, migrated, ejected, created_block, created_at, updated_block, updated_at FROM names WHERE token_id = ? LIMIT 1";
 
     const sql_z = try db.allocator.dupeZ(u8, sql);
     defer db.allocator.free(sql_z);
@@ -429,26 +516,28 @@ pub fn getNameByTokenId(db: *Database, token_id: u256) !?models.Name {
         const chain_str = std.mem.span(c.sqlite3_column_text(stmt, 5));
         const registry_str = std.mem.span(c.sqlite3_column_text(stmt, 6));
         const owner_str = std.mem.span(c.sqlite3_column_text(stmt, 7));
-        const resolver_str = std.mem.span(c.sqlite3_column_text(stmt, 8));
-        const token_id_str = std.mem.span(c.sqlite3_column_text(stmt, 9));
-        const canonical_id_str = std.mem.span(c.sqlite3_column_text(stmt, 10));
-        const token_version = @as(u32, @intCast(c.sqlite3_column_int64(stmt, 11)));
-        const namehash_str = std.mem.span(c.sqlite3_column_text(stmt, 12));
-        const expiry = c.sqlite3_column_int64(stmt, 13);
-        const registry_locked = c.sqlite3_column_int(stmt, 14) != 0;
-        const migrated = c.sqlite3_column_int(stmt, 15) != 0;
-        const ejected = c.sqlite3_column_int(stmt, 16) != 0;
-        const created_block = c.sqlite3_column_int64(stmt, 17);
-        const created_at = c.sqlite3_column_int64(stmt, 18);
-        const updated_block = c.sqlite3_column_int64(stmt, 19);
-        const updated_at = c.sqlite3_column_int64(stmt, 20);
-        const is_wrapped = c.sqlite3_column_int(stmt, 21) != 0;
-        const wrapper_fuses_ptr = c.sqlite3_column_text(stmt, 22);
+        const registrant_ptr = c.sqlite3_column_text(stmt, 8);
+        const registrant_str = if (registrant_ptr != null) std.mem.span(registrant_ptr) else owner_str;
+        const resolver_str = std.mem.span(c.sqlite3_column_text(stmt, 9));
+        const token_id_str = std.mem.span(c.sqlite3_column_text(stmt, 10));
+        const canonical_id_str = std.mem.span(c.sqlite3_column_text(stmt, 11));
+        const token_version = @as(u32, @intCast(c.sqlite3_column_int64(stmt, 12)));
+        const namehash_str = std.mem.span(c.sqlite3_column_text(stmt, 13));
+        const expiry = c.sqlite3_column_int64(stmt, 14);
+        const registry_locked = c.sqlite3_column_int(stmt, 15) != 0;
+        const migrated = c.sqlite3_column_int(stmt, 16) != 0;
+        const ejected = c.sqlite3_column_int(stmt, 17) != 0;
+        const created_block = c.sqlite3_column_int64(stmt, 18);
+        const created_at = c.sqlite3_column_int64(stmt, 19);
+        const updated_block = c.sqlite3_column_int64(stmt, 20);
+        const updated_at = c.sqlite3_column_int64(stmt, 21);
+        const is_wrapped = c.sqlite3_column_int(stmt, 22) != 0;
+        const wrapper_fuses_ptr = c.sqlite3_column_text(stmt, 23);
         const wrapper_fuses = if (wrapper_fuses_ptr != null) try db.allocator.dupe(u8, std.mem.span(wrapper_fuses_ptr)) else null;
-        const wrapper_expiry_raw = c.sqlite3_column_int64(stmt, 23);
-        const wrapper_expiry = if (c.sqlite3_column_type(stmt, 23) != c.SQLITE_NULL) wrapper_expiry_raw else null;
-        const is_v1_name = c.sqlite3_column_int(stmt, 24) != 0;
-        const v1_label_hash_ptr = c.sqlite3_column_text(stmt, 25);
+        const wrapper_expiry_raw = c.sqlite3_column_int64(stmt, 24);
+        const wrapper_expiry = if (c.sqlite3_column_type(stmt, 24) != c.SQLITE_NULL) wrapper_expiry_raw else null;
+        const is_v1_name = c.sqlite3_column_int(stmt, 25) != 0;
+        const v1_label_hash_ptr = c.sqlite3_column_text(stmt, 26);
         const v1_label_hash = if (v1_label_hash_ptr != null) try db.allocator.dupe(u8, std.mem.span(v1_label_hash_ptr)) else null;
 
         return models.Name{
@@ -460,6 +549,7 @@ pub fn getNameByTokenId(db: *Database, token_id: u256) !?models.Name {
             .chain = try models.Chain.fromString(chain_str),
             .registry = try Address.fromHex(registry_str),
             .owner = try Address.fromHex(owner_str),
+            .registrant = try Address.fromHex(registrant_str),
             .resolver = try Address.fromHex(resolver_str),
             .token_id = blk: {
                 const hex_str = if (std.mem.startsWith(u8, token_id_str, "0x")) token_id_str[2..] else token_id_str;
@@ -493,7 +583,7 @@ pub fn getNameByTokenId(db: *Database, token_id: u256) !?models.Name {
 /// Get name by canonical ID (for ResolverUpdate/SubregistryUpdate events that use canonical ID)
 /// In ENS V2, some events emit canonical_id (version=0) instead of full token_id (version>=1)
 pub fn getNameByCanonicalId(db: *Database, canonical_id: u256) !?models.Name {
-    const sql = "SELECT name, label, label_hash, parent_name, parent_namehash, chain, registry, owner, resolver, token_id, canonical_id, token_version, namehash, expiry, registry_locked, migrated, ejected, created_block, created_at, updated_block, updated_at, is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash FROM names WHERE canonical_id = ? LIMIT 1";
+    const sql = "SELECT name, label, label_hash, parent_name, parent_namehash, chain, registry, owner, registrant, resolver, token_id, canonical_id, token_version, namehash, expiry, registry_locked, migrated, ejected, created_block, created_at, updated_block, updated_at, is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash FROM names WHERE canonical_id = ? LIMIT 1";
 
     const sql_z = try db.allocator.dupeZ(u8, sql);
     defer db.allocator.free(sql_z);
@@ -521,26 +611,28 @@ pub fn getNameByCanonicalId(db: *Database, canonical_id: u256) !?models.Name {
         const chain_str = std.mem.span(c.sqlite3_column_text(stmt, 5));
         const registry_str = std.mem.span(c.sqlite3_column_text(stmt, 6));
         const owner_str = std.mem.span(c.sqlite3_column_text(stmt, 7));
-        const resolver_str = std.mem.span(c.sqlite3_column_text(stmt, 8));
-        const token_id_str = std.mem.span(c.sqlite3_column_text(stmt, 9));
-        const canonical_id_str = std.mem.span(c.sqlite3_column_text(stmt, 10));
-        const token_version = @as(u32, @intCast(c.sqlite3_column_int64(stmt, 11)));
-        const namehash_str = std.mem.span(c.sqlite3_column_text(stmt, 12));
-        const expiry = c.sqlite3_column_int64(stmt, 13);
-        const registry_locked = c.sqlite3_column_int(stmt, 14) != 0;
-        const migrated = c.sqlite3_column_int(stmt, 15) != 0;
-        const ejected = c.sqlite3_column_int(stmt, 16) != 0;
-        const created_block = c.sqlite3_column_int64(stmt, 17);
-        const created_at = c.sqlite3_column_int64(stmt, 18);
-        const updated_block = c.sqlite3_column_int64(stmt, 19);
-        const updated_at = c.sqlite3_column_int64(stmt, 20);
-        const is_wrapped = c.sqlite3_column_int(stmt, 21) != 0;
-        const wrapper_fuses_ptr = c.sqlite3_column_text(stmt, 22);
+        const registrant_ptr = c.sqlite3_column_text(stmt, 8);
+        const registrant_str = if (registrant_ptr != null) std.mem.span(registrant_ptr) else owner_str;
+        const resolver_str = std.mem.span(c.sqlite3_column_text(stmt, 9));
+        const token_id_str = std.mem.span(c.sqlite3_column_text(stmt, 10));
+        const canonical_id_str = std.mem.span(c.sqlite3_column_text(stmt, 11));
+        const token_version = @as(u32, @intCast(c.sqlite3_column_int64(stmt, 12)));
+        const namehash_str = std.mem.span(c.sqlite3_column_text(stmt, 13));
+        const expiry = c.sqlite3_column_int64(stmt, 14);
+        const registry_locked = c.sqlite3_column_int(stmt, 15) != 0;
+        const migrated = c.sqlite3_column_int(stmt, 16) != 0;
+        const ejected = c.sqlite3_column_int(stmt, 17) != 0;
+        const created_block = c.sqlite3_column_int64(stmt, 18);
+        const created_at = c.sqlite3_column_int64(stmt, 19);
+        const updated_block = c.sqlite3_column_int64(stmt, 20);
+        const updated_at = c.sqlite3_column_int64(stmt, 21);
+        const is_wrapped = c.sqlite3_column_int(stmt, 22) != 0;
+        const wrapper_fuses_ptr = c.sqlite3_column_text(stmt, 23);
         const wrapper_fuses = if (wrapper_fuses_ptr != null) try db.allocator.dupe(u8, std.mem.span(wrapper_fuses_ptr)) else null;
-        const wrapper_expiry_raw = c.sqlite3_column_int64(stmt, 23);
-        const wrapper_expiry = if (c.sqlite3_column_type(stmt, 23) != c.SQLITE_NULL) wrapper_expiry_raw else null;
-        const is_v1_name = c.sqlite3_column_int(stmt, 24) != 0;
-        const v1_label_hash_ptr = c.sqlite3_column_text(stmt, 25);
+        const wrapper_expiry_raw = c.sqlite3_column_int64(stmt, 24);
+        const wrapper_expiry = if (c.sqlite3_column_type(stmt, 24) != c.SQLITE_NULL) wrapper_expiry_raw else null;
+        const is_v1_name = c.sqlite3_column_int(stmt, 25) != 0;
+        const v1_label_hash_ptr = c.sqlite3_column_text(stmt, 26);
         const v1_label_hash = if (v1_label_hash_ptr != null) try db.allocator.dupe(u8, std.mem.span(v1_label_hash_ptr)) else null;
 
         return models.Name{
@@ -552,6 +644,7 @@ pub fn getNameByCanonicalId(db: *Database, canonical_id: u256) !?models.Name {
             .chain = try models.Chain.fromString(chain_str),
             .registry = try Address.fromHex(registry_str),
             .owner = try Address.fromHex(owner_str),
+            .registrant = try Address.fromHex(registrant_str),
             .resolver = try Address.fromHex(resolver_str),
             .token_id = blk: {
                 const hex_str = if (std.mem.startsWith(u8, token_id_str, "0x")) token_id_str[2..] else token_id_str;
@@ -688,9 +781,9 @@ pub fn updateNameTokenId(db: *Database, old_token_id: u256, new_token_id: u256) 
 /// Get all names owned by an address
 pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Name {
     const sql = if (limit) |l|
-        try std.fmt.allocPrint(db.allocator, "SELECT name, label, label_hash, parent_name, parent_namehash, chain, registry, owner, resolver, token_id, canonical_id, token_version, namehash, expiry, registry_locked, migrated, ejected, created_block, created_at, updated_block, updated_at FROM names WHERE owner = ? LIMIT {d}", .{l})
+        try std.fmt.allocPrint(db.allocator, "SELECT name, label, label_hash, parent_name, parent_namehash, chain, registry, owner, registrant, resolver, token_id, canonical_id, token_version, namehash, expiry, registry_locked, migrated, ejected, created_block, created_at, updated_block, updated_at FROM names WHERE owner = ? LIMIT {d}", .{l})
     else
-        try std.fmt.allocPrint(db.allocator, "SELECT name, label, label_hash, parent_name, parent_namehash, chain, registry, owner, resolver, token_id, canonical_id, token_version, namehash, expiry, registry_locked, migrated, ejected, created_block, created_at, updated_block, updated_at FROM names WHERE owner = ?", .{});
+        try std.fmt.allocPrint(db.allocator, "SELECT name, label, label_hash, parent_name, parent_namehash, chain, registry, owner, registrant, resolver, token_id, canonical_id, token_version, namehash, expiry, registry_locked, migrated, ejected, created_block, created_at, updated_block, updated_at FROM names WHERE owner = ?", .{});
     defer db.allocator.free(sql);
 
     const sql_z = try db.allocator.dupeZ(u8, sql);
@@ -726,10 +819,12 @@ pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Nam
         const chain_str = std.mem.span(c.sqlite3_column_text(stmt, 5));
         const registry_str = std.mem.span(c.sqlite3_column_text(stmt, 6));
         const owner_str = std.mem.span(c.sqlite3_column_text(stmt, 7));
-        const resolver_str = std.mem.span(c.sqlite3_column_text(stmt, 8));
-        const token_id_str = std.mem.span(c.sqlite3_column_text(stmt, 9));
-        const canonical_id_str = std.mem.span(c.sqlite3_column_text(stmt, 10));
-        const namehash_str = std.mem.span(c.sqlite3_column_text(stmt, 12));
+        const registrant_ptr = c.sqlite3_column_text(stmt, 8);
+        const registrant_str = if (registrant_ptr != null) std.mem.span(registrant_ptr) else owner_str;
+        const resolver_str = std.mem.span(c.sqlite3_column_text(stmt, 9));
+        const token_id_str = std.mem.span(c.sqlite3_column_text(stmt, 10));
+        const canonical_id_str = std.mem.span(c.sqlite3_column_text(stmt, 11));
+        const namehash_str = std.mem.span(c.sqlite3_column_text(stmt, 13));
 
         const name = models.Name{
             .name = try db.allocator.dupe(u8, name_str),
@@ -740,6 +835,7 @@ pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Nam
             .chain = try models.Chain.fromString(chain_str),
             .registry = try Address.fromHex(registry_str),
             .owner = try Address.fromHex(owner_str),
+            .registrant = try Address.fromHex(registrant_str),
             .resolver = try Address.fromHex(resolver_str),
             .token_id = blk: {
                 const hex_str = if (std.mem.startsWith(u8, token_id_str, "0x")) token_id_str[2..] else token_id_str;
@@ -749,16 +845,16 @@ pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Nam
                 const hex_str = if (std.mem.startsWith(u8, canonical_id_str, "0x")) canonical_id_str[2..] else canonical_id_str;
                 break :blk try std.fmt.parseInt(u256, hex_str, 16);
             },
-            .token_version = @intCast(c.sqlite3_column_int64(stmt, 11)),
+            .token_version = @intCast(c.sqlite3_column_int64(stmt, 12)),
             .namehash = try Hash.fromHex(namehash_str),
-            .expiry = @bitCast(c.sqlite3_column_int64(stmt, 13)),
-            .registry_locked = c.sqlite3_column_int(stmt, 14) != 0,
-            .migrated = c.sqlite3_column_int(stmt, 15) != 0,
-            .ejected = c.sqlite3_column_int(stmt, 16) != 0,
-            .created_block = @intCast(c.sqlite3_column_int64(stmt, 17)),
-            .created_at = c.sqlite3_column_int64(stmt, 18),
-            .updated_block = @intCast(c.sqlite3_column_int64(stmt, 19)),
-            .updated_at = c.sqlite3_column_int64(stmt, 20),
+            .expiry = @bitCast(c.sqlite3_column_int64(stmt, 14)),
+            .registry_locked = c.sqlite3_column_int(stmt, 15) != 0,
+            .migrated = c.sqlite3_column_int(stmt, 16) != 0,
+            .ejected = c.sqlite3_column_int(stmt, 17) != 0,
+            .created_block = @intCast(c.sqlite3_column_int64(stmt, 18)),
+            .created_at = c.sqlite3_column_int64(stmt, 19),
+            .updated_block = @intCast(c.sqlite3_column_int64(stmt, 20)),
+            .updated_at = c.sqlite3_column_int64(stmt, 21),
             .is_wrapped = false,
             .wrapper_fuses = null,
             .wrapper_expiry = null,
@@ -872,6 +968,7 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
             .chain = try models.Chain.fromString(chain_str),
             .registry = try Address.fromHex(registry_str),
             .owner = try Address.fromHex(owner_str),
+            .registrant = try Address.fromHex(owner_str), // Fallback to owner for this query
             .resolver = try Address.fromHex(resolver_str),
             .token_id = blk: {
                 const hex_str = if (std.mem.startsWith(u8, token_id_str, "0x")) token_id_str[2..] else token_id_str;
@@ -1014,6 +1111,7 @@ pub fn getSubdomains(db: *Database, parent_name_arg: []const u8, skip: u32, limi
             .chain = try models.Chain.fromString(chain_str),
             .registry = try Address.fromHex(registry_str),
             .owner = try Address.fromHex(owner_str),
+            .registrant = try Address.fromHex(owner_str), // Fallback to owner for this query
             .resolver = try Address.fromHex(resolver_str),
             .token_id = blk: {
                 const hex_str = if (std.mem.startsWith(u8, token_id_str, "0x")) token_id_str[2..] else token_id_str;
@@ -1287,6 +1385,7 @@ test "updateNameWrapperState - wrap a name" {
         .chain = .l1,
         .registry = Address.zero,
         .owner = Address.zero,
+        .registrant = Address.zero,
         .resolver = Address.zero,
         .token_id = 0,
         .canonical_id = 0,
@@ -1339,6 +1438,7 @@ test "updateNameUnwrapperState - unwrap a name" {
         .chain = .l1,
         .registry = Address.zero,
         .owner = Address.zero,
+        .registrant = Address.zero,
         .resolver = Address.zero,
         .token_id = 0,
         .canonical_id = 0,
@@ -1387,6 +1487,7 @@ test "updateNameWrapperFuses - update fuses" {
         .chain = .l1,
         .registry = Address.zero,
         .owner = Address.zero,
+        .registrant = Address.zero,
         .resolver = Address.zero,
         .token_id = 0,
         .canonical_id = 0,
@@ -1436,6 +1537,7 @@ test "updateNameWrapperExpiry - update wrapper expiry" {
         .chain = .l1,
         .registry = Address.zero,
         .owner = Address.zero,
+        .registrant = Address.zero,
         .resolver = Address.zero,
         .token_id = 0,
         .canonical_id = 0,
@@ -1487,6 +1589,7 @@ test "getSubdomains returns subdomains for parent name" {
         .chain = .l1,
         .registry = Address.zero,
         .owner = Address.zero,
+        .registrant = Address.zero,
         .resolver = Address.zero,
         .token_id = 0,
         .canonical_id = 0,
@@ -1523,6 +1626,7 @@ test "getSubdomains returns subdomains for parent name" {
         .chain = .l1,
         .registry = Address.zero,
         .owner = Address.zero,
+        .registrant = Address.zero,
         .resolver = Address.zero,
         .token_id = 1,
         .canonical_id = 1,
@@ -1558,6 +1662,7 @@ test "getSubdomains returns subdomains for parent name" {
         .chain = .l1,
         .registry = Address.zero,
         .owner = Address.zero,
+        .registrant = Address.zero,
         .resolver = Address.zero,
         .token_id = 2,
         .canonical_id = 2,
@@ -1619,6 +1724,7 @@ test "getSubdomains respects pagination limits" {
         .chain = .l1,
         .registry = Address.zero,
         .owner = Address.zero,
+        .registrant = Address.zero,
         .resolver = Address.zero,
         .token_id = 0,
         .canonical_id = 0,
@@ -1662,6 +1768,7 @@ test "getSubdomains respects pagination limits" {
             .chain = .l1,
             .registry = Address.zero,
             .owner = Address.zero,
+            .registrant = Address.zero,
             .resolver = Address.zero,
             .token_id = i + 1,
             .canonical_id = i + 1,
@@ -1731,4 +1838,131 @@ test "getSubdomains returns empty for no subdomains" {
 
     // Should return empty slice
     try testing.expectEqual(@as(usize, 0), subdomains.len);
+}
+
+test "updateRegistryPlaceholderName - updates registry and child names" {
+    const allocator = testing.allocator;
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const hash_mod = @import("../types/hash.zig");
+
+    // Create a registry with a placeholder name (simulating SubregistryUpdate before NameRegistered)
+    const placeholder_name = "canonicalId:12345";
+    const placeholder_registry = models.Registry{
+        .address = Address.zero,
+        .chain = .l2,
+        .name = placeholder_name,
+        .namehash = Hash.zero, // Placeholder has wrong namehash initially
+        .parent_registry = Address.zero,
+        .created_block = 1,
+        .created_at = 1000,
+    };
+    try insertRegistry(&database, placeholder_registry);
+
+    // Use a unique namehash for the child name so we can query it
+    const child_namehash = try hash_mod.namehash(allocator, "sub.sg113.eth");
+
+    // Create a child name that has this placeholder as parent_name
+    const child_name = models.Name{
+        .name = try allocator.dupe(u8, "sub.canonicalId:12345"),
+        .label = try allocator.dupe(u8, "sub"),
+        .label_hash = Hash.zero,
+        .parent_name = try allocator.dupe(u8, placeholder_name),
+        .parent_namehash = Hash.zero,
+        .chain = .l2,
+        .registry = Address.zero,
+        .owner = Address.zero,
+        .registrant = Address.zero,
+        .resolver = Address.zero,
+        .token_id = 1,
+        .canonical_id = 1,
+        .token_version = 0,
+        .namehash = child_namehash, // Use the actual namehash so we can query it
+        .expiry = 0,
+        .registry_locked = false,
+        .migrated = false,
+        .ejected = false,
+        .created_block = 2,
+        .created_at = 2000,
+        .updated_block = 2,
+        .updated_at = 2000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    };
+    defer {
+        allocator.free(child_name.name.?);
+        allocator.free(child_name.label.?);
+        allocator.free(child_name.parent_name.?);
+    }
+    try insertName(&database, child_name);
+
+    // Now update the placeholder to the actual name
+    const actual_name = "sg113.eth";
+    const actual_namehash = try hash_mod.namehash(allocator, actual_name);
+    const changes = try updateRegistryPlaceholderName(&database, placeholder_name, actual_name, actual_namehash);
+
+    // Should have updated 1 registry + 1 name = 2 changes
+    try testing.expectEqual(@as(u32, 2), changes);
+
+    // Verify the child name was updated by querying it using the namehash
+    var updated_name_opt = try getNameByNamehash(&database, child_namehash);
+    defer {
+        if (updated_name_opt) |*n| {
+            n.deinit(allocator);
+        }
+    }
+
+    try testing.expect(updated_name_opt != null);
+    try testing.expectEqualStrings("sub.sg113.eth", updated_name_opt.?.name.?);
+    try testing.expectEqualStrings("sg113.eth", updated_name_opt.?.parent_name.?);
+}
+
+test "updateRegistryPlaceholderName - returns 0 when placeholder not found" {
+    const allocator = testing.allocator;
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const hash_mod = @import("../types/hash.zig");
+
+    // Try to update a placeholder that doesn't exist
+    const actual_namehash = try hash_mod.namehash(allocator, "sg113.eth");
+    const changes = try updateRegistryPlaceholderName(&database, "canonicalId:99999", "sg113.eth", actual_namehash);
+
+    // Should have updated 0 records
+    try testing.expectEqual(@as(u32, 0), changes);
+}
+
+test "updateRegistryPlaceholderName - updates registry only when no child names" {
+    const allocator = testing.allocator;
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const hash_mod = @import("../types/hash.zig");
+
+    // Create a registry with a placeholder name but no child names
+    const placeholder_name = "canonicalId:54321";
+    const placeholder_registry = models.Registry{
+        .address = Address.zero,
+        .chain = .l2,
+        .name = placeholder_name,
+        .namehash = Hash.zero,
+        .parent_registry = Address.zero,
+        .created_block = 1,
+        .created_at = 1000,
+    };
+    try insertRegistry(&database, placeholder_registry);
+
+    // Update the placeholder
+    const actual_namehash = try hash_mod.namehash(allocator, "alice.eth");
+    const changes = try updateRegistryPlaceholderName(&database, placeholder_name, "alice.eth", actual_namehash);
+
+    // Should have updated 1 registry only
+    try testing.expectEqual(@as(u32, 1), changes);
 }

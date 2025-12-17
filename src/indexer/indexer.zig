@@ -1617,12 +1617,16 @@ pub const Indexer = struct {
 
         // topics[0] = event signature
         // topics[1] = indexed id (canonical ID - note: this is NOT the full token_id)
-        const canonical_id = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
+        // SubregistryUpdate event uses tokenId in topics[1], which may include version bits
+        const token_id = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
+        // Extract canonical_id (upper bits without version) for consistent lookups
+        const token_id_utils = @import("../types/token_id.zig");
+        const canonical_id = token_id_utils.getCanonicalId(token_id);
 
         // data = subregistry address
         const subregistry_addr = try abi.ABI.decodeAddress(log.data, 0);
 
-        std.log.debug("SubregistryUpdate: canonicalId={d}, subregistry={any}, contract={any}", .{ canonical_id, subregistry_addr, log.address });
+        std.log.debug("SubregistryUpdate: tokenId={d}, canonicalId={d}, subregistry={any}, contract={any}", .{ token_id, canonical_id, subregistry_addr, log.address });
 
         // Skip if subregistry is zero address (unsetting subregistry)
         if (subregistry_addr.isZero()) {
@@ -1630,7 +1634,7 @@ pub const Indexer = struct {
             return;
         }
 
-        // Look up the name by canonical ID (not token_id, since events use canonical_id)
+        // Look up the name by canonical ID (token_id with version bits cleared)
         const maybe_name = try self.database.getNameByCanonicalId(canonical_id);
         const name_str = if (maybe_name) |n| blk: {
             var name_copy = n;
@@ -1883,6 +1887,7 @@ pub const Indexer = struct {
             .chain = chain,
             .registry = log.address, // Use the actual registry that emitted the event
             .owner = registered_by,
+            .registrant = registered_by, // Original registrant from NameRegistered event
             .resolver = Address.zero,
             .token_id = @intCast(token_id),
             .canonical_id = canonical_id,
@@ -1907,6 +1912,15 @@ pub const Indexer = struct {
             if (name.label) |l| self.allocator.free(l);
             if (name.parent_name) |p| self.allocator.free(p);
             return err;
+        };
+
+        // After inserting name, check if there are placeholder registries that need updating
+        // This happens when SubregistryUpdate was processed before NameRegistered in the same block
+        // The SubregistryUpdate creates a registry with name "canonicalId:{d}" as a placeholder
+        const placeholder_pattern = try std.fmt.allocPrint(self.allocator, "canonicalId:{d}", .{canonical_id});
+        defer self.allocator.free(placeholder_pattern);
+        _ = self.database.updateRegistryPlaceholderName(placeholder_pattern, full_name, namehash) catch |err| {
+            std.log.warn("Failed to update placeholder registry: {}", .{err});
         };
 
         // Store event
@@ -2054,6 +2068,7 @@ pub const Indexer = struct {
             .chain = chain,
             .registry = log.address,
             .owner = Address.zero, // Will be updated by Transfer event
+            .registrant = Address.zero, // Subnames don't have a registrant in the same sense
             .resolver = Address.zero,
             .token_id = @intCast(token_id),
             .canonical_id = canonical_id,
@@ -2307,6 +2322,7 @@ pub const Indexer = struct {
             .chain = chain,
             .registry = self.getEthRegistry(chain),
             .owner = owner,
+            .registrant = owner, // Original registrant from ETH Registrar
             .resolver = resolver,
             .token_id = @intCast(token_id),
             .canonical_id = canonical_id,
@@ -4319,6 +4335,7 @@ pub const Indexer = struct {
                 .chain = chain,
                 .registry = self.config.l1_contracts.ens_registry, // ENS Registry, not Base Registrar!
                 .owner = owner,
+                .registrant = owner, // Original registrant from V1 NameRegistered
                 .resolver = Address.zero, // Will be updated when resolver is set
                 .token_id = token_id,
                 .canonical_id = token_id, // V1 doesn't use versioning
@@ -5216,6 +5233,7 @@ pub const Indexer = struct {
                 .parent_namehash = parent_namehash,
                 .registry = registry,
                 .owner = owner,
+                .registrant = owner, // Original registrant from backfilled data
                 .resolver = Address.zero,
                 .token_id = token_id,
                 .canonical_id = canonical_id,

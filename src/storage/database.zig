@@ -327,6 +327,7 @@ pub const Database = struct {
     pub const countDirectSubdomains = names.countDirectSubdomains;
     pub const hasDirectSubdomains = names.hasDirectSubdomains;
     pub const getSubdomains = names.getSubdomains;
+    pub const updateRegistryPlaceholderName = names.updateRegistryPlaceholderName;
 
     // Resolver module (11 functions)
     pub const storeResolverAddress = resolvers.storeResolverAddress;

@@ -3356,6 +3356,18 @@ fn buildDomainJson(
             defer ctx.allocator.free(owner_json);
             try writer.writeAll(owner_json);
             first = false;
+        } else if (std.mem.eql(u8, field.name, "registrant")) {
+            // Nested Account object - the original registrant (from NameRegistered event)
+            try writer.print("\"{s}\":", .{output_key});
+            const registrant_json = try buildAccountJson(domain.registrant, field.selections, .{
+                .database = ctx.database,
+                .depth = ctx.depth + 1,
+                .allocator = ctx.allocator,
+                .loaders = ctx.loaders,
+            });
+            defer ctx.allocator.free(registrant_json);
+            try writer.writeAll(registrant_json);
+            first = false;
         } else if (std.mem.eql(u8, field.name, "resolvedAddress")) {
             // Nested Account object - the address this domain resolves to (ETH address, coin type 60)
             // Use DataLoader if available
