@@ -404,6 +404,9 @@ type EACRoleAssignment {
 
   """Timestamp when assigned"""
   timestamp: Int!
+
+  """Domain name this role applies to (null for global roles)"""
+  name: String
 }
 
 """Resolver information"""

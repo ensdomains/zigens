@@ -67,10 +67,11 @@ pub fn upsertEACRole(db: *Database, chain: models.Chain, resource: []const u8, a
 /// Get all role assignments for a resource
 pub fn getRolesByResource(db: *Database, chain: models.Chain, resource: []const u8) ![]models.EACRoleAssignment {
     const sql =
-        \\SELECT id, chain, resource, account, role_bitmap, block_number, transaction_hash, log_index, timestamp
-        \\FROM eac_roles
-        \\WHERE chain = ? AND resource = ?
-        \\ORDER BY timestamp DESC
+        \\SELECT r.id, r.chain, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp, n.name
+        \\FROM eac_roles r
+        \\LEFT JOIN names n ON r.resource = n.canonical_id
+        \\WHERE r.chain = ? AND r.resource = ?
+        \\ORDER BY r.timestamp DESC
     ;
 
     const sql_z = try db.allocator.dupeZ(u8, sql);
@@ -103,6 +104,13 @@ pub fn getRolesByResource(db: *Database, chain: models.Chain, resource: []const 
         const role_bitmap_col = std.mem.span(c.sqlite3_column_text(stmt, 4));
         const tx_hash_col = std.mem.span(c.sqlite3_column_text(stmt, 6));
 
+        // Get domain name from JOIN (column 9), may be null
+        const name_ptr = c.sqlite3_column_text(stmt, 9);
+        const name: ?[]const u8 = if (name_ptr != null)
+            try db.allocator.dupe(u8, std.mem.span(name_ptr))
+        else
+            null;
+
         const role = models.EACRoleAssignment{
             .id = @intCast(c.sqlite3_column_int64(stmt, 0)),
             .chain = try models.Chain.fromString(chain_col),
@@ -113,6 +121,7 @@ pub fn getRolesByResource(db: *Database, chain: models.Chain, resource: []const 
             .tx_hash = try Hash.fromHex(tx_hash_col),
             .log_index = @intCast(c.sqlite3_column_int(stmt, 7)),
             .timestamp = c.sqlite3_column_int64(stmt, 8),
+            .name = name,
         };
 
         try roles.append(db.allocator, role);
@@ -124,10 +133,11 @@ pub fn getRolesByResource(db: *Database, chain: models.Chain, resource: []const 
 /// Get all role assignments for an account
 pub fn getRolesByAccount(db: *Database, chain: models.Chain, account: Address) ![]models.EACRoleAssignment {
     const sql =
-        \\SELECT id, chain, resource, account, role_bitmap, block_number, transaction_hash, log_index, timestamp
-        \\FROM eac_roles
-        \\WHERE chain = ? AND account = ?
-        \\ORDER BY timestamp DESC
+        \\SELECT r.id, r.chain, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp, n.name
+        \\FROM eac_roles r
+        \\LEFT JOIN names n ON r.resource = n.canonical_id
+        \\WHERE r.chain = ? AND r.account = ?
+        \\ORDER BY r.timestamp DESC
     ;
 
     const sql_z = try db.allocator.dupeZ(u8, sql);
@@ -163,6 +173,13 @@ pub fn getRolesByAccount(db: *Database, chain: models.Chain, account: Address) !
         const role_bitmap_col = std.mem.span(c.sqlite3_column_text(stmt, 4));
         const tx_hash_col = std.mem.span(c.sqlite3_column_text(stmt, 6));
 
+        // Get domain name from JOIN (column 9), may be null
+        const name_ptr = c.sqlite3_column_text(stmt, 9);
+        const name: ?[]const u8 = if (name_ptr != null)
+            try db.allocator.dupe(u8, std.mem.span(name_ptr))
+        else
+            null;
+
         const role = models.EACRoleAssignment{
             .id = @intCast(c.sqlite3_column_int64(stmt, 0)),
             .chain = try models.Chain.fromString(chain_col),
@@ -173,6 +190,7 @@ pub fn getRolesByAccount(db: *Database, chain: models.Chain, account: Address) !
             .tx_hash = try Hash.fromHex(tx_hash_col),
             .log_index = @intCast(c.sqlite3_column_int(stmt, 7)),
             .timestamp = c.sqlite3_column_int64(stmt, 8),
+            .name = name,
         };
 
         try roles.append(db.allocator, role);

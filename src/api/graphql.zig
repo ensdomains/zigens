@@ -3526,15 +3526,75 @@ fn buildDomainJson(
             try writer.writeAll("]");
             first = false;
         } else if (std.mem.eql(u8, field.name, "events")) {
-            // Query events for this domain
+            // Query events for this domain with optional filter support
             const first_arg = parser.getIntArg(field, "first", 100) orelse 100;
 
             // Get namehash as hex for querying
             const namehash_hex = try domain.namehash.toHex(ctx.allocator);
             defer ctx.allocator.free(namehash_hex);
 
-            // Query events by namehash
-            const domain_events = try ctx.database.getEventsByNamehash(namehash_hex, @intCast(first_arg));
+            // Build filter options with namehash pre-set
+            var filter_opts = db.EventFilterOptions{
+                .namehash = namehash_hex,
+                .limit = @intCast(first_arg),
+            };
+
+            // Temporary storage for event_types strings
+            var event_types_list: std.ArrayList([]const u8) = .{};
+            defer event_types_list.deinit(ctx.allocator);
+
+            // Temporary storage for normalized contract address
+            var normalized_contract_address: ?[]u8 = null;
+            defer if (normalized_contract_address) |addr| ctx.allocator.free(addr);
+
+            // Parse 'where' argument for nested events
+            for (field.arguments) |arg| {
+                if (std.mem.eql(u8, arg.name, "where") and arg.value == .object) {
+                    for (arg.value.object) |filter_arg| {
+                        if (std.mem.eql(u8, filter_arg.name, "type")) {
+                            if (filter_arg.value == .string) {
+                                filter_opts.event_type = filter_arg.value.string;
+                            }
+                        } else if (std.mem.eql(u8, filter_arg.name, "type_in")) {
+                            if (filter_arg.value == .list) {
+                                for (filter_arg.value.list) |item| {
+                                    if (item == .string) {
+                                        try event_types_list.append(ctx.allocator, item.string);
+                                    }
+                                }
+                                if (event_types_list.items.len > 0) {
+                                    filter_opts.event_types = event_types_list.items;
+                                }
+                            }
+                        } else if (std.mem.eql(u8, filter_arg.name, "contractAddress")) {
+                            if (filter_arg.value == .string) {
+                                const addr = Address.fromHex(filter_arg.value.string) catch continue;
+                                normalized_contract_address = try addr.toHex(ctx.allocator);
+                                filter_opts.contract_address = normalized_contract_address;
+                            }
+                        } else if (std.mem.eql(u8, filter_arg.name, "blockNumber_gt")) {
+                            if (filter_arg.value == .int) {
+                                filter_opts.block_number_gt = filter_arg.value.int;
+                            }
+                        } else if (std.mem.eql(u8, filter_arg.name, "blockNumber_lt")) {
+                            if (filter_arg.value == .int) {
+                                filter_opts.block_number_lt = filter_arg.value.int;
+                            }
+                        } else if (std.mem.eql(u8, filter_arg.name, "timestamp_gt")) {
+                            if (filter_arg.value == .int) {
+                                filter_opts.timestamp_gt = filter_arg.value.int;
+                            }
+                        } else if (std.mem.eql(u8, filter_arg.name, "timestamp_lt")) {
+                            if (filter_arg.value == .int) {
+                                filter_opts.timestamp_lt = filter_arg.value.int;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Query events with filters
+            const domain_events = try ctx.database.getEventsFiltered(filter_opts);
             defer {
                 for (domain_events) |*e| {
                     e.deinit(ctx.allocator);
@@ -4291,6 +4351,15 @@ fn handleEACRoleField(ctx: *anyopaque, output_key: []const u8, field_name: []con
         return true;
     } else if (std.mem.eql(u8, field_name, "timestamp")) {
         try writer.print("\"{s}\":{d}", .{ output_key, role.timestamp });
+        return true;
+    } else if (std.mem.eql(u8, field_name, "name")) {
+        if (role.name) |name| {
+            const escaped = try escapeJsonString(allocator, name);
+            defer allocator.free(escaped);
+            try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
+        } else {
+            try writer.print("\"{s}\":null", .{output_key});
+        }
         return true;
     }
     return false;

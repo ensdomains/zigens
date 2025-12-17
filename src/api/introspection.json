@@ -1450,6 +1450,14 @@
                   "name": "Int"
                 }
               }
+            },
+            {
+              "name": "name",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
             }
           ]
         },

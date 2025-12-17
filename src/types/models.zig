@@ -420,10 +420,13 @@ pub const EACRoleAssignment = struct {
     log_index: u32,
     /// Timestamp
     timestamp: i64,
+    /// Domain name (resolved from resource/canonical_id, null for global roles)
+    name: ?[]const u8 = null,
 
     pub fn deinit(self: *EACRoleAssignment, allocator: std.mem.Allocator) void {
         allocator.free(self.resource);
         allocator.free(self.role_bitmap);
+        if (self.name) |n| allocator.free(n);
     }
 };
 
