@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
-const parser = @import("graphql_parser.zig");
+const graphql = @import("graphql");
+const parser = graphql.parser;
 
 // Unit tests for GraphQL parser with advanced filters and sorting
 

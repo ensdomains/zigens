@@ -1,7 +1,8 @@
 const std = @import("std");
 const testing = std.testing;
-const parser = @import("graphql_parser.zig");
-const pagination = @import("pagination.zig");
+const graphql = @import("graphql");
+const parser = graphql.parser;
+const pagination = graphql.pagination;
 
 // ============================================================================
 // GRAPHQL FEATURES TESTS (FULL COVERAGE)

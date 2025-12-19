@@ -3,10 +3,11 @@ const db = @import("../storage/database.zig");
 const models = @import("../types/models.zig");
 const Hash = @import("../types/hash.zig").Hash;
 const Address = @import("../types/address.zig").Address;
-const graphql = @import("graphql.zig");
+const graphql = @import("handler.zig");
 const json_utils = @import("../utils/json.zig");
 const url_utils = @import("../utils/url.zig");
 const validation = @import("../utils/validation.zig");
+const RateLimiter = @import("../rate_limiter.zig").RateLimiter;
 
 /// Simple JSON API Server for ENSv2 Indexer
 /// Provides REST endpoints and GraphQL for querying indexed data
@@ -17,8 +18,9 @@ pub const Server = struct {
     port: u16,
     server: ?std.net.Server,
     graphql_handler: graphql.GraphQLHandler,
+    rate_limiter: RateLimiter,
 
-    pub fn init(allocator: std.mem.Allocator, database: *db.Database, webhook_db_path: ?[]const u8, port: u16, complexity_max_depth: u32, complexity_max_cost: u32, metrics_enabled: bool) !Server {
+    pub fn init(allocator: std.mem.Allocator, database: *db.Database, webhook_db_path: ?[]const u8, port: u16, complexity_max_depth: u32, complexity_max_cost: u32, metrics_enabled: bool, rate_limit_per_second: u32) !Server {
         // Only open webhook database if path is provided (webhooks enabled)
         var webhook_db: ?*db.Database = null;
         if (webhook_db_path) |path| {
@@ -27,6 +29,10 @@ pub const Server = struct {
             webhook_db.?.* = webhook_db_value;
         }
 
+        // Initialize rate limiter with configurable requests per second
+        // Default burst capacity is 2x the per-second rate
+        const rate_limit = if (rate_limit_per_second > 0) rate_limit_per_second else 100;
+
         return .{
             .allocator = allocator,
             .database = database,
@@ -34,6 +40,7 @@ pub const Server = struct {
             .port = port,
             .server = null,
             .graphql_handler = try graphql.GraphQLHandler.init(allocator, database, complexity_max_depth, complexity_max_cost, metrics_enabled),
+            .rate_limiter = RateLimiter.init(rate_limit * 2, rate_limit),
         };
     }
 
@@ -66,6 +73,12 @@ pub const Server = struct {
     }
 
     fn handleConnection(self: *Server, connection: std.net.Server.Connection) !void {
+        // Check rate limit before processing request
+        if (!self.rate_limiter.tryAcquire()) {
+            try self.sendRateLimited(connection.stream);
+            return;
+        }
+
         // Read headers first (up to 4KB for headers)
         var header_buffer: [4096]u8 = undefined;
         var total_header_bytes: usize = 0;
@@ -571,6 +584,13 @@ pub const Server = struct {
         defer self.allocator.free(response);
 
         try self.sendJsonResponse(stream, 400, response);
+    }
+
+    fn sendRateLimited(self: *Server, stream: std.net.Stream) !void {
+        const response =
+            \\{"error":"Too many requests. Please try again later."}
+        ;
+        try self.sendJsonResponse(stream, 429, response);
     }
 
     fn sendCorsPreflightResponse(_: *Server, stream: std.net.Stream) !void {
@@ -1699,7 +1719,7 @@ test "Server init" {
     var database = try db.Database.init(allocator, ":memory:");
     defer database.deinit();
 
-    var server = try Server.init(allocator, &database, 8080, 10, 1000, false);
+    var server = try Server.init(allocator, &database, null, 8080, 10, 1000, false, 100);
     defer server.deinit();
 
     try std.testing.expect(server.port == 8080);

@@ -61,16 +61,14 @@ pub fn main() !void {
     std.log.info("Database connected", .{});
 
     // Eagerly initialize ENS normalizer to avoid cold-start latency on first query
-    // The library uses a lazy singleton that takes ~4 minutes to initialize on first call.
-    // By calling it during startup, we ensure GraphQL queries are fast from the start.
-    std.log.info("Initializing ENS name normalizer (this may take a few minutes)...", .{});
+    std.log.info("Initializing ENS name normalizer...", .{});
     _ = ens_normalize.shared();
     std.log.info("ENS normalizer initialized", .{});
 
     // Start API server with complexity limits and metrics from config
     // Only pass webhook_db_path if webhooks are enabled
     const webhook_path: ?[]const u8 = if (cfg.webhooks_enabled) cfg.webhook_db_path else null;
-    var server = try api.Server.init(allocator, &database, webhook_path, cfg.api_port, cfg.graphql_max_depth, cfg.graphql_max_cost, cfg.metrics_enabled);
+    var server = try api.Server.init(allocator, &database, webhook_path, cfg.api_port, cfg.graphql_max_depth, cfg.graphql_max_cost, cfg.metrics_enabled, cfg.rate_limit_per_second);
     defer server.deinit();
 
     std.log.info("Ready to serve requests", .{});
