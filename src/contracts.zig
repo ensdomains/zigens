@@ -50,6 +50,11 @@ pub const ContractAddresses = struct {
     v1_deployment_block: u64,
     l1_deployment_block: u64,
     l2_deployment_block: u64,
+
+    // Historical block markers (mainnet only, 0 for testnets)
+    temp_registrar_start_block: u64, // Temporary Registrar deployment (May 2017)
+    v1_migration_block: u64, // V1 Permanent Registrar deployment (May 2019)
+    name_wrapper_deployment_block: u64, // Name Wrapper deployment (September 2022)
 };
 
 pub fn getContractAddresses(network: Network) !ContractAddresses {
@@ -92,6 +97,11 @@ fn sepoliaAddresses() ContractAddresses {
         .v1_deployment_block = 4700000, // Approximate ENS V1 deployment on Sepolia
         .l1_deployment_block = 6500000, // Approximate ENS V2 L1 deployment
         .l2_deployment_block = 9374806, // Verified: L2 ETH Registry deployment on Sepolia
+
+        // Historical markers (not applicable for testnets)
+        .temp_registrar_start_block = 0,
+        .v1_migration_block = 0,
+        .name_wrapper_deployment_block = 0,
     };
 }
 
@@ -131,6 +141,11 @@ fn mainnetAddresses() ContractAddresses {
         .v1_deployment_block = 9380410, // V1 Permanent Registrar deployment (migration from temporary)
         .l1_deployment_block = 0, // V2 not deployed yet
         .l2_deployment_block = 0, // Not applicable for L1
+
+        // Historical block markers (mainnet specific)
+        .temp_registrar_start_block = 3327417, // Temporary Registrar deployment (May 2017)
+        .v1_migration_block = 9380410, // V1 Permanent Registrar deployment (May 2019)
+        .name_wrapper_deployment_block = 15628465, // Name Wrapper deployment (September 2022)
     };
 }
 

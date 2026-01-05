@@ -12,9 +12,11 @@ pub const IndexerStatus = struct {
 
     pub fn getProgress(self: IndexerStatus) f64 {
         if (self.target_block <= self.start_block) return 100.0;
+        if (self.current_block >= self.target_block) return 100.0;
         const total = self.target_block - self.start_block;
         const done = self.current_block - self.start_block;
-        return (@as(f64, @floatFromInt(done)) / @as(f64, @floatFromInt(total))) * 100.0;
+        const progress = (@as(f64, @floatFromInt(done)) / @as(f64, @floatFromInt(total))) * 100.0;
+        return @min(progress, 100.0);
     }
 
     pub fn getETA(self: IndexerStatus) ?i64 {
@@ -210,15 +212,27 @@ fn generateHTML(allocator: std.mem.Allocator, status: *IndexerStatus) ![]const u
         \\    .block-label {{ font-size: 12px; color: #6b7280; margin-bottom: 4px; }}
         \\    .block-value {{ font-size: 18px; font-weight: 600; color: #fff; }}
         \\    .eta-badge {{ display: inline-block; background: #1e3a8a; color: #93c5fd; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: 500; }}
+        \\    .synced-badge {{ display: inline-block; background: #065f46; color: #6ee7b7; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: 500; }}
+        \\    .hidden {{ display: none; }}
         \\  </style>
         \\  <script>
         \\    setInterval(async () => {{
         \\      const res = await fetch('/status/api');
         \\      const data = await res.json();
-        \\      document.getElementById('progress').style.width = data.progress.toFixed(1) + '%';
-        \\      document.getElementById('progress-text').textContent = data.progress.toFixed(1);
+        \\      document.getElementById('progress').style.width = Math.min(data.progress, 100).toFixed(1) + '%';
+        \\      document.getElementById('progress-text').textContent = Math.min(data.progress, 100).toFixed(1);
         \\      document.getElementById('current-block').textContent = data.current_block.toLocaleString();
-        \\      document.getElementById('eta').textContent = data.eta;
+        \\      document.getElementById('target-block').textContent = data.target_block.toLocaleString();
+        \\      const etaRow = document.getElementById('eta-row');
+        \\      const syncedRow = document.getElementById('synced-row');
+        \\      if (data.indexing_complete || data.progress >= 100) {{
+        \\        etaRow.classList.add('hidden');
+        \\        syncedRow.classList.remove('hidden');
+        \\      }} else {{
+        \\        etaRow.classList.remove('hidden');
+        \\        syncedRow.classList.add('hidden');
+        \\        document.getElementById('eta').textContent = data.eta;
+        \\      }}
         \\    }}, 1000);
         \\  </script>
         \\</head>
@@ -265,12 +279,16 @@ fn generateHTML(allocator: std.mem.Allocator, status: *IndexerStatus) ![]const u
         \\          </div>
         \\          <div class="block-stat">
         \\            <div class="block-label">Target</div>
-        \\            <div class="block-value">{d}</div>
+        \\            <div class="block-value" id="target-block">{d}</div>
         \\          </div>
         \\        </div>
-        \\        <div class="progress-info" style="margin-top: 16px;">
+        \\        <div class="progress-info {s}" id="eta-row" style="margin-top: 16px;">
         \\          <div class="progress-label">ETA</div>
         \\          <div class="eta-badge" id="eta">{s}</div>
+        \\        </div>
+        \\        <div class="progress-info {s}" id="synced-row" style="margin-top: 16px;">
+        \\          <div class="progress-label">Status</div>
+        \\          <div class="synced-badge">Synced</div>
         \\        </div>
         \\      </div>
         \\    </div>
@@ -286,7 +304,9 @@ fn generateHTML(allocator: std.mem.Allocator, status: *IndexerStatus) ![]const u
         status.start_block,
         status.current_block,
         status.target_block,
+        if (status.indexing_complete or progress >= 100.0) "hidden" else "",
         eta_str,
+        if (status.indexing_complete or progress >= 100.0) "" else "hidden",
     });
 
     return html;
