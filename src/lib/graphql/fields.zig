@@ -101,7 +101,8 @@ pub const FieldDef = struct {
     }
 };
 
-/// Escape a string for JSON output
+/// Escape a string for JSON output (RFC 8259 compliant)
+/// Properly escapes ALL control characters (0x00-0x1F, 0x7F), quotes, backslashes
 pub fn escapeJsonString(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     var result: std.ArrayList(u8) = .{};
     errdefer result.deinit(allocator);
@@ -113,11 +114,11 @@ pub fn escapeJsonString(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
             '\n' => try result.appendSlice(allocator, "\\n"),
             '\r' => try result.appendSlice(allocator, "\\r"),
             '\t' => try result.appendSlice(allocator, "\\t"),
-            0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => {
-                // Other control characters (excluding \n=0x0A, \r=0x0D, \t=0x09)
-                var buf: [6]u8 = undefined;
-                const len = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{char}) catch unreachable;
-                try result.appendSlice(allocator, len);
+            '\x08' => try result.appendSlice(allocator, "\\b"), // backspace
+            '\x0C' => try result.appendSlice(allocator, "\\f"), // form feed
+            // All other control characters (0x00-0x1F except the ones above, plus 0x7F) must be escaped as \uXXXX
+            0x00...0x07, 0x0B, 0x0E...0x1F, 0x7F => {
+                try result.writer(allocator).print("\\u{x:0>4}", .{char});
             },
             else => try result.append(allocator, char),
         }

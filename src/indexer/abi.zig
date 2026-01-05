@@ -1,6 +1,7 @@
 const std = @import("std");
 const Hash = @import("../types/hash.zig").Hash;
 const keccak = @import("../utils/keccak.zig");
+const constants = @import("../constants.zig");
 
 /// Compute event signature hash at compile time
 inline fn eventHash(comptime sig: []const u8) Hash {
@@ -305,8 +306,8 @@ pub const ABI = struct {
     /// Maximum allowed string length (1 MB) to prevent DoS attacks
     pub const MAX_STRING_LENGTH: usize = 1024 * 1024;
 
-    /// Maximum allowed array length (10,000 elements) to prevent DoS attacks
-    pub const MAX_ARRAY_LENGTH: usize = 10000;
+    /// Maximum allowed array length to prevent DoS attacks
+    pub const MAX_ARRAY_LENGTH: usize = constants.Validation.max_abi_array_length;
 
     /// Maximum allowed bytes length (1 MB) to prevent DoS attacks
     pub const MAX_BYTES_LENGTH: usize = 1024 * 1024;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const constants = @import("../constants.zig");
 const db_module = @import("database.zig");
 const Database = db_module.Database;
 const models = @import("../types/models.zig");
@@ -65,7 +66,7 @@ fn getCanonicalRegistryAddresses(allocator: std.mem.Allocator) ![][]const u8 {
 
 pub const RegistrationFilterOptions = struct {
     chain: ?models.Chain = null, // Filter by chain (l1 or l2)
-    limit: u32 = 100,
+    limit: u32 = constants.Pagination.default_limit,
     order_dir: events.OrderDir = .desc,
 };
 
@@ -87,7 +88,7 @@ pub fn getRegistrations(database: *Database, filter: RegistrationFilterOptions) 
 
     // Build event filter options
     const event_filter = events.EventFilterOptions{
-        .event_type = "NameRegistered",
+        .event_type = models.EventType.name_registered.toString(),
         .chain = filter.chain,
         .contract_addresses = if (canonical_addresses.len > 0) canonical_addresses else null,
         .limit = filter.limit,

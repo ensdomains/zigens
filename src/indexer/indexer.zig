@@ -1,5 +1,6 @@
 const std = @import("std");
 const config = @import("../config.zig");
+const constants = @import("../constants.zig");
 const db = @import("../storage/database.zig");
 const c = db.c;
 const rpc = @import("../rpc/client.zig");
@@ -85,7 +86,7 @@ pub const Indexer = struct {
                 .target_block = target_block,
                 .start_block = cfg.start_block,
                 .start_time = std.time.timestamp(),
-                .graphql_enabled = false, // GraphQL not implemented yet
+                .graphql_enabled = cfg.api_enabled,
                 .api_enabled = cfg.api_enabled,
                 .webhooks_enabled = cfg.webhooks_enabled,
                 .indexing_complete = false,
@@ -168,7 +169,7 @@ pub const Indexer = struct {
                 .target_block = target_block,
                 .start_block = deployment_block,
                 .start_time = std.time.timestamp(),
-                .graphql_enabled = false, // GraphQL not implemented yet
+                .graphql_enabled = cfg.api_enabled,
                 .api_enabled = cfg.api_enabled,
                 .webhooks_enabled = cfg.webhooks_enabled,
                 .indexing_complete = false,
@@ -463,7 +464,7 @@ pub const Indexer = struct {
         contract_name: []const u8,
     ) !void {
         // Predictive adaptive chunk sizing
-        const MIN_CHUNK_SIZE: u64 = 100;   // Minimum chunk size for efficiency
+        const MIN_CHUNK_SIZE: u64 = constants.RpcBatching.min_chunk_size;
         const MAX_CHUNK_SIZE: u64 = self.config.batch_size; // Use configured batch size as maximum
         const TARGET_EVENTS_PER_CHUNK: usize = 25000; // Target ~25000 events per chunk
 
@@ -607,7 +608,7 @@ pub const Indexer = struct {
                 chunk_start = chunk_end + 1;
                 // Rate limit: wait between batches to avoid hitting RPC provider limits
                 if (chunk_start <= to_block) {
-                    std.Thread.sleep(200 * std.time.ns_per_ms); // 200ms delay between batches
+                    std.Thread.sleep(constants.Timing.rpc_retry_delay_ms * std.time.ns_per_ms); // 200ms delay between batches
                 }
                 break :retry_loop; // Success - move to next chunk
             }
@@ -624,7 +625,7 @@ pub const Indexer = struct {
         try self.indexTempRegistrarEvents(chain, client, from_block, to_block);
 
         // Predictive adaptive chunk sizing
-        const MIN_CHUNK_SIZE: u64 = 100;   // Minimum chunk size for efficiency
+        const MIN_CHUNK_SIZE: u64 = constants.RpcBatching.min_chunk_size;
         const MAX_CHUNK_SIZE: u64 = self.config.batch_size; // Use configured batch size as maximum
         const TARGET_EVENTS_PER_CHUNK: usize = 25000; // Target ~25000 events per chunk
 
@@ -632,8 +633,8 @@ pub const Indexer = struct {
         var events_per_block: f64 = 5.0;   // Initial estimate: 5 events/block average
         var chunk_start = from_block;
 
-        // Name Wrapper deployment block (September 2022)
-        const NAME_WRAPPER_DEPLOYMENT_BLOCK = 15628465;
+        // Name Wrapper deployment block (from contract config)
+        const NAME_WRAPPER_DEPLOYMENT_BLOCK = self.config.l1_contracts.name_wrapper_deployment_block;
 
         while (chunk_start <= to_block) {
             // Flag to indicate if we need to reprocess this chunk due to new controllers
@@ -931,7 +932,7 @@ pub const Indexer = struct {
                 chunk_start = chunk_end + 1;
                 // Rate limit: wait between batches to avoid hitting RPC provider limits
                 if (chunk_start <= to_block) {
-                    std.Thread.sleep(200 * std.time.ns_per_ms); // 200ms delay between batches
+                    std.Thread.sleep(constants.Timing.rpc_retry_delay_ms * std.time.ns_per_ms); // 200ms delay between batches
                 }
             }
             break :retry_loop; // Success - move to next chunk (or reprocess current chunk)
@@ -1040,7 +1041,7 @@ pub const Indexer = struct {
                     else => {
                         // Other errors (database, parsing, etc) - log and wait briefly
                         std.log.err("{s} indexing error: {}", .{ chain.toString(), err });
-                        std.Thread.sleep(5000 * std.time.ns_per_ms); // Wait 5s for non-network errors
+                        std.Thread.sleep(constants.Timing.error_recovery_delay_ms * std.time.ns_per_ms); // Wait 5s for non-network errors
                     },
                 }
             }
@@ -1106,8 +1107,22 @@ pub const Indexer = struct {
         const current_block = try client.getBlockNumber();
         const target_block = if (self.end_block) |eb| @min(eb, current_block) else current_block;
 
+        // Update status target_block to reflect latest chain block
+        if (self.indexer_status) |status| {
+            status.target_block = target_block;
+        }
+
         if (last_synced >= target_block) {
+            // Mark as complete when caught up
+            if (self.indexer_status) |status| {
+                status.indexing_complete = true;
+            }
             return; // Nothing new to index
+        }
+
+        // Mark as in-progress when there are blocks to index
+        if (self.indexer_status) |status| {
+            status.indexing_complete = false;
         }
 
         const total_blocks = target_block - last_synced;
@@ -1170,7 +1185,7 @@ pub const Indexer = struct {
                 self.clearBlockTimestampCache();
 
                 // Force a brief pause to allow memory to be reclaimed
-                std.Thread.sleep(100 * std.time.ns_per_ms);
+                std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
             }
 
             from_block = to_block + 1;
@@ -1185,16 +1200,15 @@ pub const Indexer = struct {
         // 2. Then modify names (SubregistryUpdate, ResolverUpdate, Transfer)
         // 3. Then process data dependent on names existing (resolver records)
 
-        // Block range constants with 10-block safety buffers
-        const TEMP_REGISTRAR_START: u64 = 3327417; // Temporary Registrar deployment (May 2017)
-        const V1_MIGRATION_BLOCK: u64 = 9380410; // V1 Permanent Registrar deployment (May 2019)
-        _ = V1_MIGRATION_BLOCK; // Not currently used but kept for reference
+        // Block range constants from contract config (chain-specific)
+        const l1_contracts = self.config.l1_contracts;
+        const temp_registrar_start = l1_contracts.temp_registrar_start_block;
 
         // === V1 EVENTS (ENS V1 - Mainnet L1 only) ===
         // Only index V1 events if the block range overlaps with V1 deployment period
         // Skip if entire range is before temp registrar start OR if V2 is deployed and range is entirely after V2
-        const v2_deployment = if (chain == .l1) self.config.l1_contracts.l1_deployment_block else self.config.l2_contracts.l2_deployment_block;
-        const should_index_v1 = (to_block >= TEMP_REGISTRAR_START) and
+        const v2_deployment = if (chain == .l1) l1_contracts.l1_deployment_block else self.config.l2_contracts.l2_deployment_block;
+        const should_index_v1 = (temp_registrar_start > 0) and (to_block >= temp_registrar_start) and
                                (v2_deployment == 0 or from_block < v2_deployment + 10);
 
         if (should_index_v1) {
@@ -1210,35 +1224,35 @@ pub const Indexer = struct {
         if (should_index_v2) {
             // Index ETH Registry events (batched RPC requests)
             try self.indexEthRegistryEvents(chain, client, from_block, to_block);
-            std.Thread.sleep(100 * std.time.ns_per_ms); // Rate limit between RPC batches
+            std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms); // Rate limit between RPC batches
 
             // Index ETH Registrar events (batched RPC requests)
             try self.indexETHRegistrarEvents(chain, client, from_block, to_block);
-            std.Thread.sleep(100 * std.time.ns_per_ms); // Rate limit between RPC batches
+            std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms); // Rate limit between RPC batches
 
             // Get events from RegistryDatastore (SubregistryUpdate, ResolverUpdate)
             // Process BEFORE subregistries so new registries are discovered first
             try self.indexDatastoreEvents(chain, client, from_block, to_block);
-            std.Thread.sleep(100 * std.time.ns_per_ms); // Rate limit between RPC batches
+            std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms); // Rate limit between RPC batches
 
             // Get events from all subregistries (for subdomain indexing - NewSubname)
             // Process AFTER SubregistryUpdate so we know which registries to query
             try self.indexSubregistryEvents(chain, client, from_block, to_block);
-            std.Thread.sleep(100 * std.time.ns_per_ms); // Rate limit between RPC batches
+            std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms); // Rate limit between RPC batches
 
             // Get Transfer events (ERC1155)
             try self.indexTransferEvents(chain, client, from_block, to_block);
-            std.Thread.sleep(100 * std.time.ns_per_ms); // Rate limit between RPC batches
+            std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms); // Rate limit between RPC batches
 
             // Get resolver data events (AddressChanged, ContentHashChanged, TextChanged)
             // Process AFTER names and resolvers are set
             try self.indexResolverEvents(chain, client, from_block, to_block);
-            std.Thread.sleep(100 * std.time.ns_per_ms); // Rate limit between RPC batches
+            std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms); // Rate limit between RPC batches
 
             // Get migration events
             if (chain == .l1) {
                 try self.indexMigrationEvents(client, from_block, to_block);
-                std.Thread.sleep(100 * std.time.ns_per_ms); // Rate limit between RPC batches
+                std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms); // Rate limit between RPC batches
             }
 
             // Get ejection events
@@ -1416,55 +1430,86 @@ pub const Indexer = struct {
             to_block,
         });
 
-        // For each subregistry, index the same events we index from the main registry
-        for (subregistries) |subreg_hex| {
-            const subreg = try Address.fromHex(subreg_hex);
-            std.log.info("  Indexing subregistry: {s}", .{subreg_hex});
+        // RPC provider address limit per eth_getLogs call (conservative estimate)
+        const SUBREGISTRIES_PER_CALL = constants.RpcBatching.addresses_per_call;
 
-            // Build batch request for all subregistry events
-            var batch_requests: [SUBREGISTRY_EVENTS.len]rpc.Client.BatchGetLogsRequest = undefined;
-            inline for (SUBREGISTRY_EVENTS, 0..) |event_cfg, i| {
-                const topics = [_]?Hash{event_cfg.event_hash};
-                batch_requests[i] = .{
-                    .from_block = from_block,
-                    .to_block = to_block,
-                    .address = subreg,
-                    .topics = &topics,
-                };
-            }
-
-            // Fetch all event logs in a single batch request
-            const batch_results = try client.getLogsBatch(&batch_requests);
-            defer {
-                for (batch_results) |logs| {
-                    for (logs) |*log| {
-                        log.deinit(self.allocator);
-                    }
-                    self.allocator.free(logs);
-                }
-                self.allocator.free(batch_results);
-            }
-
-            // Process each event type's logs
-            inline for (SUBREGISTRY_EVENTS, 0..) |event_cfg, i| {
-                const logs = batch_results[i];
-                std.log.info("    Found {d} {s} event{s}", .{
-                    logs.len,
-                    event_cfg.name,
-                    if (logs.len == 1) "" else "s",
-                });
-
-                for (logs) |log| {
-                    try event_cfg.handler(self, chain, log);
-                }
-            }
-
-            // Update the subregistry's last_indexed_block in the cache
-            try self.database.registerSubregistry(chain, subreg_hex, to_block);
-
-            // Rate limit: wait between subregistry batches to avoid hitting RPC provider limits
-            std.Thread.sleep(300 * std.time.ns_per_ms); // 300ms delay between subregistry batches
+        // Build event topic array for OR matching (all 8 subregistry event types)
+        var event_topics: [SUBREGISTRY_EVENTS.len]Hash = undefined;
+        inline for (SUBREGISTRY_EVENTS, 0..) |event_cfg, i| {
+            event_topics[i] = event_cfg.event_hash;
         }
+
+        // Process subregistries in chunks based on address limit
+        var chunk_start: usize = 0;
+        var chunk_num: usize = 1;
+        const total_chunks = (subregistries.len + SUBREGISTRIES_PER_CALL - 1) / SUBREGISTRIES_PER_CALL;
+
+        while (chunk_start < subregistries.len) {
+            const chunk_end = @min(chunk_start + SUBREGISTRIES_PER_CALL, subregistries.len);
+            const chunk_size = chunk_end - chunk_start;
+
+            std.log.info("Processing subregistry batch {d}/{d} ({d} subregistries, 1 RPC call)...", .{
+                chunk_num,
+                total_chunks,
+                chunk_size,
+            });
+
+            // Convert subregistry hex strings to Address objects for this chunk
+            var subreg_addrs = try self.allocator.alloc(Address, chunk_size);
+            defer self.allocator.free(subreg_addrs);
+
+            for (subregistries[chunk_start..chunk_end], 0..) |subreg_hex, i| {
+                subreg_addrs[i] = try Address.fromHex(subreg_hex);
+            }
+
+            // Single RPC call for all subregistries in this chunk and all event types
+            const logs = try client.getLogsMultiAddress(.{
+                .from_block = from_block,
+                .to_block = to_block,
+                .addresses = subreg_addrs,
+                .topic0_or = &event_topics,
+            });
+            defer {
+                for (logs) |*log| {
+                    log.deinit(self.allocator);
+                }
+                self.allocator.free(logs);
+            }
+
+            std.log.info("  Fetched {d} total events from {d} subregistries", .{ logs.len, chunk_size });
+
+            // Process logs by matching topic[0] to event handler
+            for (logs) |log| {
+                if (log.topics.len == 0) continue;
+
+                const event_sig = log.topics[0];
+
+                // Find matching handler by comparing event signature
+                inline for (SUBREGISTRY_EVENTS) |event_cfg| {
+                    if (event_sig.eql(event_cfg.event_hash)) {
+                        try event_cfg.handler(self, chain, log);
+                        break;
+                    }
+                }
+            }
+
+            // Update last_indexed_block for all subregistries in this chunk
+            for (subregistries[chunk_start..chunk_end]) |subreg_hex| {
+                try self.database.registerSubregistry(chain, subreg_hex, to_block);
+            }
+
+            std.log.info("Batch {d} complete: processed {d} subregistries", .{ chunk_num, chunk_size });
+
+            chunk_start = chunk_end;
+            chunk_num += 1;
+
+            // Rate limit: wait between batches to avoid hitting RPC provider limits
+            if (chunk_start < subregistries.len) {
+                std.Thread.sleep(300 * std.time.ns_per_ms); // 300ms delay between batches
+            }
+        }
+
+        std.log.info("Subregistry indexing complete: {d} subregistries processed", .{subregistries.len});
     }
 
     fn indexTransferEvents(self: *Indexer, chain: models.Chain, client: *rpc.Client, from_block: u64, to_block: u64) !void {
@@ -2925,12 +2970,13 @@ pub const Indexer = struct {
     fn indexTempRegistrarEvents(self: *Indexer, chain: models.Chain, client: *rpc.Client, from_block: u64, to_block: u64) !void {
         if (chain != .l1) return; // Temporary Registrar only exists on mainnet L1
 
-        // V1 Permanent Registrar migration at block 9380410 (May 2019)
-        const V1_MIGRATION_BLOCK = 9380410;
-        if (from_block >= V1_MIGRATION_BLOCK) return; // No temp registrar events after migration
+        // V1 Permanent Registrar migration block (from contract config)
+        const v1_migration_block = self.config.l1_contracts.v1_migration_block;
+        if (v1_migration_block == 0) return; // Testnets don't have temp registrar
+        if (from_block >= v1_migration_block) return; // No temp registrar events after migration
 
         // Adjust to_block to not exceed migration block
-        const adjusted_to_block = if (to_block >= V1_MIGRATION_BLOCK) V1_MIGRATION_BLOCK - 1 else to_block;
+        const adjusted_to_block = if (to_block >= v1_migration_block) v1_migration_block - 1 else to_block;
 
         try self.indexV1EventsChunked(
             chain,
@@ -2976,11 +3022,12 @@ pub const Indexer = struct {
     fn indexV1NameWrapperEvents(self: *Indexer, chain: models.Chain, client: *rpc.Client, from_block: u64, to_block: u64) !void {
         if (chain != .l1) return; // V1 events only exist on mainnet L1
 
-        // Name Wrapper deployed at block 15628465 (September 2022)
-        const NAME_WRAPPER_DEPLOYMENT_BLOCK = 15628465;
-        if (to_block < NAME_WRAPPER_DEPLOYMENT_BLOCK) return;
+        // Name Wrapper deployment block (from contract config)
+        const name_wrapper_deployment = self.config.l1_contracts.name_wrapper_deployment_block;
+        if (name_wrapper_deployment == 0) return; // Testnets may not have Name Wrapper at same block
+        if (to_block < name_wrapper_deployment) return;
 
-        const adjusted_from_block = if (from_block < NAME_WRAPPER_DEPLOYMENT_BLOCK) NAME_WRAPPER_DEPLOYMENT_BLOCK else from_block;
+        const adjusted_from_block = if (from_block < name_wrapper_deployment) name_wrapper_deployment else from_block;
 
         try self.indexV1EventsChunked(
             chain,
@@ -3025,7 +3072,7 @@ pub const Indexer = struct {
 
     /// Index resolver data events (AddressChanged, ContentHashChanged, TextChanged)
     /// Queries all known resolver contracts for events in the block range
-    /// Uses chunked batching to query multiple resolvers simultaneously for massive performance gains
+    /// Uses multi-address queries to fetch all events in minimal RPC calls
     fn indexResolverEvents(self: *Indexer, chain: models.Chain, client: *rpc.Client, from_block: u64, to_block: u64) !void {
         // Get resolvers to index (uses cache table for performance)
         const resolvers = try self.database.getResolversToIndex(chain, from_block, to_block);
@@ -3043,87 +3090,72 @@ pub const Indexer = struct {
 
         std.log.info("Indexing resolver events for {d} unique resolvers from blocks {d}-{d}", .{ resolvers.len, from_block, to_block });
 
-        // Alchemy batch limit: 1000 requests/batch (we use 100 resolvers * 7 events = 700 for safety)
-        const RESOLVERS_PER_BATCH = 20; // Reduced from 100 to prevent SystemResources error (20 * 7 = 140 requests)
-        const REQUESTS_PER_RESOLVER = RESOLVER_EVENTS.len; // 7 event types
+        // RPC provider address limit per eth_getLogs call (conservative estimate)
+        const RESOLVERS_PER_CALL = constants.RpcBatching.addresses_per_call;
 
-        // Process resolvers in chunks
+        // Build event topic array for OR matching (all 7 resolver event types)
+        var event_topics: [RESOLVER_EVENTS.len]Hash = undefined;
+        inline for (RESOLVER_EVENTS, 0..) |event_cfg, i| {
+            event_topics[i] = event_cfg.event_hash;
+        }
+
+        // Process resolvers in chunks based on address limit
         var chunk_start: usize = 0;
         var chunk_num: usize = 1;
-        while (chunk_start < resolvers.len) {
-            const chunk_end = @min(chunk_start + RESOLVERS_PER_BATCH, resolvers.len);
-            const chunk_size = chunk_end - chunk_start;
-            const total_requests = chunk_size * REQUESTS_PER_RESOLVER;
+        const total_chunks = (resolvers.len + RESOLVERS_PER_CALL - 1) / RESOLVERS_PER_CALL;
 
-            std.log.info("Processing resolver batch {d}/{d} ({d} resolvers, {d} RPC requests)...", .{
+        while (chunk_start < resolvers.len) {
+            const chunk_end = @min(chunk_start + RESOLVERS_PER_CALL, resolvers.len);
+            const chunk_size = chunk_end - chunk_start;
+
+            std.log.info("Processing resolver batch {d}/{d} ({d} resolvers, 1 RPC call)...", .{
                 chunk_num,
-                (resolvers.len + RESOLVERS_PER_BATCH - 1) / RESOLVERS_PER_BATCH,
+                total_chunks,
                 chunk_size,
-                total_requests,
             });
 
-            // Build batch request for all resolvers in this chunk and all their events
-            var batch_requests = try self.allocator.alloc(rpc.Client.BatchGetLogsRequest, total_requests);
-            defer self.allocator.free(batch_requests);
+            // Convert resolver hex strings to Address objects for this chunk
+            var resolver_addrs = try self.allocator.alloc(Address, chunk_size);
+            defer self.allocator.free(resolver_addrs);
 
-            var request_idx: usize = 0;
-            for (resolvers[chunk_start..chunk_end]) |resolver_str| {
-                const resolver = try Address.fromHex(resolver_str);
-
-                // Add all event types for this resolver
-                inline for (RESOLVER_EVENTS) |event_cfg| {
-                    const topics = [_]?Hash{event_cfg.event_hash};
-                    batch_requests[request_idx] = .{
-                        .from_block = from_block,
-                        .to_block = to_block,
-                        .address = resolver,
-                        .topics = &topics,
-                    };
-                    request_idx += 1;
-                }
+            for (resolvers[chunk_start..chunk_end], 0..) |resolver_str, i| {
+                resolver_addrs[i] = try Address.fromHex(resolver_str);
             }
 
-            // Fetch all events for all resolvers in this chunk in ONE RPC call
-            const batch_results = try client.getLogsBatch(batch_requests);
+            // Single RPC call for all resolvers in this chunk and all event types
+            const logs = try client.getLogsMultiAddress(.{
+                .from_block = from_block,
+                .to_block = to_block,
+                .addresses = resolver_addrs,
+                .topic0_or = &event_topics,
+            });
             defer {
-                for (batch_results) |logs| {
-                    for (logs) |*log| {
-                        log.deinit(self.allocator);
-                    }
-                    self.allocator.free(logs);
+                for (logs) |*log| {
+                    log.deinit(self.allocator);
                 }
-                self.allocator.free(batch_results);
+                self.allocator.free(logs);
             }
 
-            // Process results for each resolver in the chunk
-            var result_idx: usize = 0;
-            for (resolvers[chunk_start..chunk_end]) |resolver_str| {
-                const resolver = try Address.fromHex(resolver_str);
-                var total_events_for_resolver: usize = 0;
+            std.log.info("  Fetched {d} total events from {d} resolvers", .{ logs.len, chunk_size });
 
-                // Process each event type for this resolver
+            // Process logs by matching topic[0] to event handler
+            for (logs) |log| {
+                if (log.topics.len == 0) continue;
+
+                const event_sig = log.topics[0];
+                const resolver = log.address;
+
+                // Find matching handler by comparing event signature
                 inline for (RESOLVER_EVENTS) |event_cfg| {
-                    const logs = batch_results[result_idx];
-                    total_events_for_resolver += logs.len;
-
-                    if (logs.len > 0) {
-                        std.log.info("  {s}: {d} {s} event{s}", .{
-                            resolver_str,
-                            logs.len,
-                            event_cfg.name,
-                            if (logs.len == 1) "" else "s",
-                        });
-                    }
-
-                    // Handle each event
-                    for (logs) |log| {
+                    if (event_sig.eql(event_cfg.event_hash)) {
                         try event_cfg.handler(self, chain, resolver, log);
+                        break;
                     }
-
-                    result_idx += 1;
                 }
+            }
 
-                // Update last_indexed_block for this resolver
+            // Update last_indexed_block for all resolvers in this chunk
+            for (resolvers[chunk_start..chunk_end]) |resolver_str| {
                 try self.database.registerResolver(chain, resolver_str, to_block);
             }
 
@@ -3134,7 +3166,7 @@ pub const Indexer = struct {
 
             // Rate limit: wait between batches to avoid hitting RPC provider limits
             if (chunk_start < resolvers.len) {
-                std.Thread.sleep(500 * std.time.ns_per_ms); // 500ms delay between batches
+                std.Thread.sleep(300 * std.time.ns_per_ms); // 300ms delay between batches
             }
         }
 
@@ -3778,8 +3810,8 @@ pub const Indexer = struct {
         });
 
         // V1 migration block - before this, we're in the temporary registrar period
-        const V1_MIGRATION_BLOCK = 9380410;
-        const is_pre_migration = log.block_number < V1_MIGRATION_BLOCK;
+        const v1_migration_block = self.config.l1_contracts.v1_migration_block;
+        const is_pre_migration = v1_migration_block > 0 and log.block_number < v1_migration_block;
 
         if (is_pre_migration) {
             // Store for later backfill when v1_labels table is populated
@@ -3824,8 +3856,7 @@ pub const Indexer = struct {
         // Post-migration: Check if this is a .eth 2LD registration
         // .eth 2LDs are already handled by BaseRegistrar NameRegistered events
         // Only record true subdomains (non-.eth parent) for backfill
-        const ETH_NAMEHASH = "0x93cdeb708b7545dc668eb9280176169d1c33cfd8ed6f04690a0bcc88a93fc4ae";
-        if (std.mem.eql(u8, parent_hex, ETH_NAMEHASH)) {
+        if (parent_node.eql(constants.WellKnown.eth_namehash)) {
             // This is a .eth 2LD registration (e.g., example.eth)
             // Skip - already handled by BaseRegistrar NameRegistered
             std.log.debug("V1 NewOwner for .eth 2LD (skipping - handled by BaseRegistrar): labelhash={s}", .{labelhash_hex});
@@ -4620,7 +4651,7 @@ pub const Indexer = struct {
             namehash,
             log.block_number,
             tx_hash_hex,
-            "NameRegistered",
+            models.EventType.name_registered.toString(),
         );
 
         // Store event
@@ -4696,7 +4727,7 @@ pub const Indexer = struct {
             namehash,
             log.block_number,
             tx_hash_hex,
-            "NameRenewed",
+            models.EventType.name_renewed.toString(),
         );
 
         // Store event

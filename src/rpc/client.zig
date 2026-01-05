@@ -287,6 +287,49 @@ pub const Client = struct {
         return parsed;
     }
 
+    /// Make a single RPC call with pre-built JSON params
+    fn makeRpcCallWithParams(self: *Client, method: []const u8, params: std.json.Value) !std.json.Parsed(std.json.Value) {
+        const request_id = self.nextRequestId();
+
+        // Use arena allocator for request/response buffers
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        // Build JSON-RPC request
+        var request_buf: std.ArrayList(u8) = .{};
+        const writer = request_buf.writer(arena_allocator);
+        try writer.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":", .{ request_id, method });
+
+        // Write params as JSON
+        try writeJsonValue(writer, params);
+
+        try writer.writeAll("}");
+
+        // Execute curl with retry logic
+        const response_body = try self.executeCurlWithRetry(arena_allocator, request_buf.items);
+
+        // Parse JSON response with main allocator (result will outlive this function)
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response_body, .{}) catch |err| {
+            const preview_len = @min(response_body.len, 500);
+            std.log.err("Failed to parse RPC response as JSON ({s}): {s}", .{ method, response_body[0..preview_len] });
+            return err;
+        };
+        errdefer parsed.deinit();
+
+        const response = parsed.value.object;
+
+        // Check for errors
+        if (response.get("error")) |err| {
+            const error_obj = err.object;
+            const error_message = error_obj.get("message").?.string;
+            std.log.err("RPC error: {s}", .{error_message});
+            return error.RpcError;
+        }
+
+        return parsed;
+    }
+
     /// Batch request descriptor
     pub const BatchRequest = struct {
         method: []const u8,
@@ -587,6 +630,110 @@ pub const Client = struct {
         }
 
         return results;
+    }
+
+    /// Descriptor for a multi-address getLogs request with OR topic support
+    /// This allows querying multiple contracts and multiple event types in a single RPC call
+    pub const MultiAddressLogsRequest = struct {
+        from_block: u64,
+        to_block: u64,
+        /// Multiple addresses to query (all contracts in one call)
+        addresses: []const Address,
+        /// First topic position supports OR matching (array of event signatures)
+        /// e.g., [AddressChanged, TextChanged, ContentHashChanged] matches ANY of these
+        topic0_or: []const Hash,
+    };
+
+    /// Fetch logs from multiple addresses with OR topic matching in a single RPC call
+    /// This is much more efficient than querying each address/topic separately
+    /// Returns all matching logs - caller must filter by address/topic if needed
+    /// Caller must free returned logs and their contents
+    pub fn getLogsMultiAddress(self: *Client, request: MultiAddressLogsRequest) ![]Log {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+
+        // Build filter object
+        const from_hex = try std.fmt.allocPrint(arena_alloc, "0x{x}", .{request.from_block});
+        const to_hex = try std.fmt.allocPrint(arena_alloc, "0x{x}", .{request.to_block});
+
+        var filter = std.json.ObjectMap.init(arena_alloc);
+        try filter.put("fromBlock", .{ .string = from_hex });
+        try filter.put("toBlock", .{ .string = to_hex });
+
+        // Add addresses array
+        if (request.addresses.len > 0) {
+            var addr_array = std.json.Array.init(arena_alloc);
+            for (request.addresses) |addr| {
+                const addr_hex = try addr.toHex(arena_alloc);
+                try addr_array.append(.{ .string = addr_hex });
+            }
+            try filter.put("address", .{ .array = addr_array });
+        }
+
+        // Add topics with OR support for topic[0]
+        if (request.topic0_or.len > 0) {
+            var topics_array = std.json.Array.init(arena_alloc);
+
+            // topic[0] is an array for OR matching
+            var topic0_array = std.json.Array.init(arena_alloc);
+            for (request.topic0_or) |topic| {
+                const topic_hex = try topic.toHex(arena_alloc);
+                try topic0_array.append(.{ .string = topic_hex });
+            }
+            try topics_array.append(.{ .array = topic0_array });
+
+            try filter.put("topics", .{ .array = topics_array });
+        }
+
+        // Build params array
+        var params_array = std.json.Array.init(arena_alloc);
+        try params_array.append(.{ .object = filter });
+
+        // Make RPC call
+        const parsed = try self.makeRpcCallWithParams("eth_getLogs", .{ .array = params_array });
+        defer parsed.deinit();
+
+        const result = parsed.value.object.get("result").?;
+        const logs_array = result.array;
+
+        // Allocate result logs
+        var logs = try self.allocator.alloc(Log, logs_array.items.len);
+        errdefer {
+            for (logs) |*log| {
+                log.deinit(self.allocator);
+            }
+            self.allocator.free(logs);
+        }
+
+        // Parse each log
+        for (logs_array.items, 0..) |log_value, i| {
+            const log_obj = log_value.object;
+
+            // Parse topics
+            const topics_json = log_obj.get("topics").?.array;
+            var log_topics = try self.allocator.alloc(Hash, topics_json.items.len);
+            for (topics_json.items, 0..) |topic_val, k| {
+                log_topics[k] = try Hash.fromHex(topic_val.string);
+            }
+
+            // Parse data
+            const data_hex = log_obj.get("data").?.string;
+            const data_bytes = try self.hexToBytes(data_hex);
+
+            logs[i] = Log{
+                .address = try Address.fromHex(log_obj.get("address").?.string),
+                .topics = log_topics,
+                .data = data_bytes,
+                .block_number = try std.fmt.parseInt(u64, log_obj.get("blockNumber").?.string[2..], 16),
+                .transaction_hash = try Hash.fromHex(log_obj.get("transactionHash").?.string),
+                .transaction_index = @intCast(try std.fmt.parseInt(u64, log_obj.get("transactionIndex").?.string[2..], 16)),
+                .log_index = @intCast(try std.fmt.parseInt(u64, log_obj.get("logIndex").?.string[2..], 16)),
+                .removed = if (log_obj.get("removed")) |r| r.bool else false,
+            };
+        }
+
+        return logs;
     }
 
     /// Fetch a single transaction by hash

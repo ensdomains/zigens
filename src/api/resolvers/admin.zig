@@ -16,8 +16,8 @@ const escapeJsonString = common.escapeJsonString;
 
 /// Parse chain argument from field (defaults to l2)
 fn parseChainArg(field: *const parser.Field) models.Chain {
-    const chain_str = parser.getStringArg(field, "chain", null) orelse "l2";
-    if (std.mem.eql(u8, chain_str, "l1")) {
+    const chain_str = parser.getStringArg(field, "chain", null) orelse models.Chain.l2.toString();
+    if (std.mem.eql(u8, chain_str, models.Chain.l1.toString())) {
         return .l1;
     }
     return .l2; // Default to L2

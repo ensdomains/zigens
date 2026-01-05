@@ -60,7 +60,7 @@ fn parseNameRow(q: *Query, allocator: std.mem.Allocator) !models.Name {
     const label_hash_str = q.getTextSlice(2) orelse "";
     const parent_name_str = q.getTextSlice(3) orelse "";
     const parent_hash_str = q.getTextSlice(4) orelse "";
-    const chain_str = q.getTextSlice(5) orelse "l2";
+    const chain_str = q.getTextSlice(5) orelse models.Chain.l2.toString();
     const registry_str = q.getTextSlice(6) orelse "";
     const owner_str = q.getTextSlice(7) orelse "";
     const registrant_str = q.getTextSlice(8);
@@ -118,7 +118,7 @@ fn parseNameRowShort(q: *Query, allocator: std.mem.Allocator) !models.Name {
     const label_hash_str = q.getTextSlice(2) orelse "";
     const parent_name_str = q.getTextSlice(3) orelse "";
     const parent_hash_str = q.getTextSlice(4) orelse "";
-    const chain_str = q.getTextSlice(5) orelse "l2";
+    const chain_str = q.getTextSlice(5) orelse models.Chain.l2.toString();
     const registry_str = q.getTextSlice(6) orelse "";
     const owner_str = q.getTextSlice(7) orelse "";
     const registrant_str = q.getTextSlice(8);
@@ -664,7 +664,7 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
         const owner_str = q.getTextSlice(5) orelse "";
         const resolver_str = q.getTextSlice(6) orelse "";
         const registry_str = q.getTextSlice(7) orelse "";
-        const chain_str = q.getTextSlice(8) orelse "l2";
+        const chain_str = q.getTextSlice(8) orelse models.Chain.l2.toString();
         const token_id_str = q.getTextSlice(9) orelse "0x0";
         const canonical_id_str = q.getTextSlice(10) orelse "0x0";
 

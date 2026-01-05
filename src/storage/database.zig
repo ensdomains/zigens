@@ -2,6 +2,7 @@ const std = @import("std");
 pub const c = @cImport({
     @cInclude("sqlite3.h");
 });
+const constants = @import("../constants.zig");
 const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
@@ -120,10 +121,10 @@ pub const Database = struct {
         // Enable WAL mode for better concurrency (allows concurrent reads during writes)
         try database.exec("PRAGMA journal_mode=WAL;");
 
-        // Performance and reliability PRAGMAs
-        try database.exec("PRAGMA busy_timeout = 5000;");        // Wait up to 5s if database is locked
+        // Performance and reliability PRAGMAs (values from constants.zig)
+        try database.exec(std.fmt.comptimePrint("PRAGMA busy_timeout = {d};", .{constants.SQLite.busy_timeout_ms}));
         try database.exec("PRAGMA synchronous = NORMAL;");       // Faster writes (safe with WAL)
-        try database.exec("PRAGMA cache_size = -64000;");        // Use 64MB cache (negative = KB)
+        try database.exec(std.fmt.comptimePrint("PRAGMA cache_size = {d};", .{constants.SQLite.cache_size_kb}));
         try database.exec("PRAGMA foreign_keys = ON;");          // Enable foreign key constraints
         try database.exec("PRAGMA temp_store = memory;");        // Use RAM for temp tables
 
@@ -157,10 +158,10 @@ pub const Database = struct {
         // Enable WAL mode for better concurrency
         try database.exec("PRAGMA journal_mode=WAL;");
 
-        // Performance and reliability PRAGMAs
-        try database.exec("PRAGMA busy_timeout = 5000;");
+        // Performance and reliability PRAGMAs (values from constants.zig)
+        try database.exec(std.fmt.comptimePrint("PRAGMA busy_timeout = {d};", .{constants.SQLite.busy_timeout_ms}));
         try database.exec("PRAGMA synchronous = NORMAL;");
-        try database.exec("PRAGMA cache_size = -64000;");
+        try database.exec(std.fmt.comptimePrint("PRAGMA cache_size = {d};", .{constants.SQLite.cache_size_kb}));
         try database.exec("PRAGMA foreign_keys = ON;");
         try database.exec("PRAGMA temp_store = memory;");
 

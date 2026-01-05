@@ -1,4 +1,5 @@
 const std = @import("std");
+const constants = @import("../constants.zig");
 const db_module = @import("database.zig");
 const Database = db_module.Database;
 const Query = db_module.Query;
@@ -14,8 +15,8 @@ const Hash = @import("../types/hash.zig").Hash;
 /// Column order: event_type(0), chain(1), block_number(2), tx_hash(3), log_index(4),
 ///               contract_address(5), name(6), namehash(7), data(8), timestamp(9)
 fn parseEventRow(q: *Query, allocator: std.mem.Allocator) !models.Event {
-    const event_type_str = q.getTextSlice(0) orelse "Transfer";
-    const chain_str = q.getTextSlice(1) orelse "l2";
+    const event_type_str = q.getTextSlice(0) orelse models.EventType.transfer.toString();
+    const chain_str = q.getTextSlice(1) orelse models.Chain.l2.toString();
     const tx_hash_str = q.getTextSlice(3) orelse return error.MissingTxHash;
     const contract_addr_str = q.getTextSlice(5) orelse return error.MissingContractAddress;
     const data_str = q.getTextSlice(8) orelse "{}";
@@ -174,7 +175,7 @@ pub const EventFilterOptions = struct {
     timestamp_gt: ?i64 = null,
     timestamp_lt: ?i64 = null,
     data_json_owner: ?[]const u8 = null,
-    limit: u32 = 100,
+    limit: u32 = constants.Pagination.default_limit,
     order_dir: OrderDir = .desc,
 };
 
