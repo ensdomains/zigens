@@ -10,6 +10,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Create GraphQL library module for use by test files
+    const graphql_lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/lib/graphql/graphql.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Combined indexer executable (both L1 and L2 in one process)
     const indexer_exe = b.addExecutable(.{
         .name = "ensv2-indexer",
@@ -163,9 +170,12 @@ pub fn build(b: *std.Build) void {
     // GraphQL parser tests
     const graphql_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/api/graphql_test.zig"),
+            .root_source_file = b.path("tests/graphql/graphql_test.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "graphql", .module = graphql_lib_mod },
+            },
         }),
     });
     graphql_tests.linkLibC();
@@ -178,9 +188,12 @@ pub fn build(b: *std.Build) void {
     // GraphQL feature tests (full coverage)
     const graphql_features_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/api/graphql_features_test.zig"),
+            .root_source_file = b.path("tests/graphql/graphql_features_test.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "graphql", .module = graphql_lib_mod },
+            },
         }),
     });
     graphql_features_tests.linkLibC();
@@ -224,9 +237,12 @@ pub fn build(b: *std.Build) void {
     // Apollo Client compatibility tests
     const apollo_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/api/apollo_compatibility_test.zig"),
+            .root_source_file = b.path("tests/graphql/apollo_compatibility_test.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "graphql", .module = graphql_lib_mod },
+            },
         }),
     });
 
@@ -240,9 +256,12 @@ pub fn build(b: *std.Build) void {
     // GraphQL variables tests (parsing and resolution)
     const variables_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/api/variables_test.zig"),
+            .root_source_file = b.path("tests/graphql/variables_test.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "graphql", .module = graphql_lib_mod },
+            },
         }),
     });
 
@@ -276,10 +295,105 @@ pub fn build(b: *std.Build) void {
     // Also add to the main filter test step
     filter_test_step.dependOn(&run_address_validation_tests.step);
 
+    // Create shared lib module for test imports (single module to avoid conflicts)
+    const lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const helpers_mod = b.createModule(.{
+        .root_source_file = b.path("tests/helpers.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "lib", .module = lib_mod },
+        },
+    });
+
+    // Storage tests - names
+    const storage_names_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/storage/names_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "helpers", .module = helpers_mod },
+                .{ .name = "lib", .module = lib_mod },
+            },
+        }),
+    });
+    storage_names_tests.linkLibC();
+    storage_names_tests.linkSystemLibrary("sqlite3");
+
+    const run_storage_names_tests = b.addRunArtifact(storage_names_tests);
+
+    // Storage tests - resolvers
+    const storage_resolvers_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/storage/resolvers_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "helpers", .module = helpers_mod },
+                .{ .name = "lib", .module = lib_mod },
+            },
+        }),
+    });
+    storage_resolvers_tests.linkLibC();
+    storage_resolvers_tests.linkSystemLibrary("sqlite3");
+
+    const run_storage_resolvers_tests = b.addRunArtifact(storage_resolvers_tests);
+
+    // Storage tests - roles
+    const storage_roles_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/storage/roles_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "helpers", .module = helpers_mod },
+                .{ .name = "lib", .module = lib_mod },
+            },
+        }),
+    });
+    storage_roles_tests.linkLibC();
+    storage_roles_tests.linkSystemLibrary("sqlite3");
+
+    const run_storage_roles_tests = b.addRunArtifact(storage_roles_tests);
+
+    // Storage tests - webhooks
+    const storage_webhooks_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/storage/webhooks_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "helpers", .module = helpers_mod },
+                .{ .name = "lib", .module = lib_mod },
+            },
+        }),
+    });
+    storage_webhooks_tests.linkLibC();
+    storage_webhooks_tests.linkSystemLibrary("sqlite3");
+
+    const run_storage_webhooks_tests = b.addRunArtifact(storage_webhooks_tests);
+
+    // Storage test step
+    const storage_test_step = b.step("test-storage", "Run storage module tests");
+    storage_test_step.dependOn(&run_storage_names_tests.step);
+    storage_test_step.dependOn(&run_storage_resolvers_tests.step);
+    storage_test_step.dependOn(&run_storage_roles_tests.step);
+    storage_test_step.dependOn(&run_storage_webhooks_tests.step);
+
     // Make the default test command run all tests
     test_step.dependOn(&run_filter_tests.step);
     test_step.dependOn(&run_events_tests.step);
     test_step.dependOn(&run_apollo_tests.step);
     test_step.dependOn(&run_variables_tests.step);
     test_step.dependOn(&run_address_validation_tests.step);
+    test_step.dependOn(&run_storage_names_tests.step);
+    test_step.dependOn(&run_storage_resolvers_tests.step);
+    test_step.dependOn(&run_storage_roles_tests.step);
+    test_step.dependOn(&run_storage_webhooks_tests.step);
 }

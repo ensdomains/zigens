@@ -605,6 +605,10 @@ pub const Indexer = struct {
                 }
 
                 chunk_start = chunk_end + 1;
+                // Rate limit: wait between batches to avoid hitting RPC provider limits
+                if (chunk_start <= to_block) {
+                    std.Thread.sleep(200 * std.time.ns_per_ms); // 200ms delay between batches
+                }
                 break :retry_loop; // Success - move to next chunk
             }
         }
@@ -925,6 +929,10 @@ pub const Indexer = struct {
             // Only advance to next chunk if we're not reprocessing for new controllers
             if (!needs_controller_reprocess) {
                 chunk_start = chunk_end + 1;
+                // Rate limit: wait between batches to avoid hitting RPC provider limits
+                if (chunk_start <= to_block) {
+                    std.Thread.sleep(200 * std.time.ns_per_ms); // 200ms delay between batches
+                }
             }
             break :retry_loop; // Success - move to next chunk (or reprocess current chunk)
             }
@@ -1114,6 +1122,9 @@ pub const Indexer = struct {
             const to_block = @min(from_block + batch_size - 1, target_block);
             const batch_blocks = to_block - from_block + 1;
 
+            // Rate limit RPC calls to avoid hitting provider limits
+            self.rate_limiter.acquire();
+
             // Use transaction for batch atomicity
             try self.database.beginTransaction();
             errdefer self.database.rollbackTransaction();
@@ -1154,6 +1165,9 @@ pub const Indexer = struct {
 
                 // Prune old block hashes (keep last 1000 blocks)
                 try self.database.pruneOldBlockHashes(chain, to_block);
+
+                // Clear block timestamp cache to prevent memory growth
+                self.clearBlockTimestampCache();
 
                 // Force a brief pause to allow memory to be reclaimed
                 std.Thread.sleep(100 * std.time.ns_per_ms);
@@ -1196,28 +1210,35 @@ pub const Indexer = struct {
         if (should_index_v2) {
             // Index ETH Registry events (batched RPC requests)
             try self.indexEthRegistryEvents(chain, client, from_block, to_block);
+            std.Thread.sleep(100 * std.time.ns_per_ms); // Rate limit between RPC batches
 
             // Index ETH Registrar events (batched RPC requests)
             try self.indexETHRegistrarEvents(chain, client, from_block, to_block);
+            std.Thread.sleep(100 * std.time.ns_per_ms); // Rate limit between RPC batches
 
             // Get events from RegistryDatastore (SubregistryUpdate, ResolverUpdate)
             // Process BEFORE subregistries so new registries are discovered first
             try self.indexDatastoreEvents(chain, client, from_block, to_block);
+            std.Thread.sleep(100 * std.time.ns_per_ms); // Rate limit between RPC batches
 
             // Get events from all subregistries (for subdomain indexing - NewSubname)
             // Process AFTER SubregistryUpdate so we know which registries to query
             try self.indexSubregistryEvents(chain, client, from_block, to_block);
+            std.Thread.sleep(100 * std.time.ns_per_ms); // Rate limit between RPC batches
 
             // Get Transfer events (ERC1155)
             try self.indexTransferEvents(chain, client, from_block, to_block);
+            std.Thread.sleep(100 * std.time.ns_per_ms); // Rate limit between RPC batches
 
             // Get resolver data events (AddressChanged, ContentHashChanged, TextChanged)
             // Process AFTER names and resolvers are set
             try self.indexResolverEvents(chain, client, from_block, to_block);
+            std.Thread.sleep(100 * std.time.ns_per_ms); // Rate limit between RPC batches
 
             // Get migration events
             if (chain == .l1) {
                 try self.indexMigrationEvents(client, from_block, to_block);
+                std.Thread.sleep(100 * std.time.ns_per_ms); // Rate limit between RPC batches
             }
 
             // Get ejection events
@@ -1229,63 +1250,53 @@ pub const Indexer = struct {
         // SubregistryUpdate/Updated and ResolverUpdate/Updated events are emitted from the Registry contract
         const registry_addr = self.getEthRegistry(chain);
 
-        // Fetch all event types - need to handle both old and new event signatures
+        // Fetch all event types in a single batch - need to handle both old and new event signatures
         // OLD: SubregistryUpdate, ResolverUpdate (pre-deployment)
         // NEW: SubregistryUpdated, ResolverUpdated (current deployment on Sepolia)
 
-        // SubregistryUpdate events (OLD signature)
-        const topics = [_]?Hash{abi.EventSignatures.subregistry_update_hash};
-        const logs = try client.getLogs(from_block, to_block, registry_addr, &topics);
+        // Topics for each event type
+        const topics_subreg_old = [_]?Hash{abi.EventSignatures.subregistry_update_hash};
+        const topics_subreg_new = [_]?Hash{abi.EventSignatures.subregistry_updated_hash};
+        const topics_resolver_old = [_]?Hash{abi.EventSignatures.resolver_update_hash};
+        const topics_resolver_new = [_]?Hash{abi.EventSignatures.resolver_updated_hash};
+
+        // Build batch request for all datastore events (4 calls → 1 batch)
+        const batch_requests = [_]rpc.Client.BatchGetLogsRequest{
+            .{ .from_block = from_block, .to_block = to_block, .address = registry_addr, .topics = &topics_subreg_old },
+            .{ .from_block = from_block, .to_block = to_block, .address = registry_addr, .topics = &topics_subreg_new },
+            .{ .from_block = from_block, .to_block = to_block, .address = registry_addr, .topics = &topics_resolver_old },
+            .{ .from_block = from_block, .to_block = to_block, .address = registry_addr, .topics = &topics_resolver_new },
+        };
+
+        // Fetch all event logs in a single batch request
+        const batch_results = try client.getLogsBatch(&batch_requests);
         defer {
-            for (logs) |*log| {
-                log.deinit(self.allocator);
+            for (batch_results) |logs| {
+                for (logs) |*log| {
+                    log.deinit(self.allocator);
+                }
+                self.allocator.free(logs);
             }
-            self.allocator.free(logs);
+            self.allocator.free(batch_results);
         }
 
-        for (logs) |log| {
+        // Process SubregistryUpdate events (OLD signature)
+        for (batch_results[0]) |log| {
             try self.handleSubregistryUpdate(chain, log);
         }
 
-        // SubregistryUpdated events (NEW signature - current Sepolia deployment)
-        const topics_new = [_]?Hash{abi.EventSignatures.subregistry_updated_hash};
-        const logs_new = try client.getLogs(from_block, to_block, registry_addr, &topics_new);
-        defer {
-            for (logs_new) |*log| {
-                log.deinit(self.allocator);
-            }
-            self.allocator.free(logs_new);
-        }
-
-        for (logs_new) |log| {
+        // Process SubregistryUpdated events (NEW signature)
+        for (batch_results[1]) |log| {
             try self.handleSubregistryUpdate(chain, log);
         }
 
-        // ResolverUpdate events (OLD signature)
-        const topics2 = [_]?Hash{abi.EventSignatures.resolver_update_hash};
-        const logs2 = try client.getLogs(from_block, to_block, registry_addr, &topics2);
-        defer {
-            for (logs2) |*log| {
-                log.deinit(self.allocator);
-            }
-            self.allocator.free(logs2);
-        }
-
-        for (logs2) |log| {
+        // Process ResolverUpdate events (OLD signature)
+        for (batch_results[2]) |log| {
             try self.handleResolverUpdate(chain, log);
         }
 
-        // ResolverUpdated events (NEW signature - current Sepolia deployment)
-        const topics2_new = [_]?Hash{abi.EventSignatures.resolver_updated_hash};
-        const logs2_new = try client.getLogs(from_block, to_block, registry_addr, &topics2_new);
-        defer {
-            for (logs2_new) |*log| {
-                log.deinit(self.allocator);
-            }
-            self.allocator.free(logs2_new);
-        }
-
-        for (logs2_new) |log| {
+        // Process ResolverUpdated events (NEW signature)
+        for (batch_results[3]) |log| {
             try self.handleResolverUpdate(chain, log);
         }
     }
@@ -1450,6 +1461,9 @@ pub const Indexer = struct {
 
             // Update the subregistry's last_indexed_block in the cache
             try self.database.registerSubregistry(chain, subreg_hex, to_block);
+
+            // Rate limit: wait between subregistry batches to avoid hitting RPC provider limits
+            std.Thread.sleep(300 * std.time.ns_per_ms); // 300ms delay between subregistry batches
         }
     }
 
@@ -1457,52 +1471,43 @@ pub const Indexer = struct {
         // We need to track transfers from all registries, but for now we'll focus on the .eth registry
         const eth_registry = self.getEthRegistry(chain);
 
-        // TransferSingle events
-        {
-            const topics = [_]?Hash{abi.EventSignatures.transfer_single_hash};
-            const logs = try client.getLogs(from_block, to_block, eth_registry, &topics);
-            defer {
+        // Topics for each event type
+        const topics_transfer_single = [_]?Hash{abi.EventSignatures.transfer_single_hash};
+        const topics_transfer_batch = [_]?Hash{abi.EventSignatures.transfer_batch_hash};
+        const topics_approval = [_]?Hash{abi.EventSignatures.approval_hash};
+
+        // Build batch request for all transfer events (3 calls → 1 batch)
+        const batch_requests = [_]rpc.Client.BatchGetLogsRequest{
+            .{ .from_block = from_block, .to_block = to_block, .address = eth_registry, .topics = &topics_transfer_single },
+            .{ .from_block = from_block, .to_block = to_block, .address = eth_registry, .topics = &topics_transfer_batch },
+            .{ .from_block = from_block, .to_block = to_block, .address = eth_registry, .topics = &topics_approval },
+        };
+
+        // Fetch all event logs in a single batch request
+        const batch_results = try client.getLogsBatch(&batch_requests);
+        defer {
+            for (batch_results) |logs| {
                 for (logs) |*log| {
                     log.deinit(self.allocator);
                 }
                 self.allocator.free(logs);
             }
-
-            for (logs) |log| {
-                try self.handleTransfer(chain, log);
-            }
+            self.allocator.free(batch_results);
         }
 
-        // TransferBatch events
-        {
-            const topics = [_]?Hash{abi.EventSignatures.transfer_batch_hash};
-            const logs = try client.getLogs(from_block, to_block, eth_registry, &topics);
-            defer {
-                for (logs) |*log| {
-                    log.deinit(self.allocator);
-                }
-                self.allocator.free(logs);
-            }
-
-            for (logs) |log| {
-                try self.handleTransferBatch(chain, log);
-            }
+        // Process TransferSingle events
+        for (batch_results[0]) |log| {
+            try self.handleTransfer(chain, log);
         }
 
-        // Approval events
-        {
-            const topics = [_]?Hash{abi.EventSignatures.approval_hash};
-            const logs = try client.getLogs(from_block, to_block, eth_registry, &topics);
-            defer {
-                for (logs) |*log| {
-                    log.deinit(self.allocator);
-                }
-                self.allocator.free(logs);
-            }
+        // Process TransferBatch events
+        for (batch_results[1]) |log| {
+            try self.handleTransferBatch(chain, log);
+        }
 
-            for (logs) |log| {
-                try self.handleApproval(chain, log);
-            }
+        // Process Approval events
+        for (batch_results[2]) |log| {
+            try self.handleApproval(chain, log);
         }
     }
 
@@ -1515,79 +1520,104 @@ pub const Indexer = struct {
     fn indexEjectionEvents(self: *Indexer, chain: models.Chain, client: *rpc.Client, from_block: u64, to_block: u64) !void {
         // Get the appropriate bridge controller contract address
         const bridge_addr = self.getBridgeController(chain);
-
-        // Skip if bridge contract is not configured (zero address)
-        if (bridge_addr.isZero()) {
-            return;
-        }
-
-        // NameEjectedToL1 events
-        {
-            const topics = [_]?Hash{abi.EventSignatures.name_ejected_to_l1_hash};
-            const logs = try client.getLogs(from_block, to_block, bridge_addr, &topics);
-            defer {
-                for (logs) |*log| {
-                    log.deinit(self.allocator);
-                }
-                self.allocator.free(logs);
-            }
-
-            std.log.info("Found {d} NameEjectedToL1 event{s} from {s}", .{
-                logs.len,
-                if (logs.len == 1) "" else "s",
-                chain.toString(),
-            });
-
-            for (logs) |log| {
-                try self.handleNameEjectedToL1(chain, log);
-            }
-        }
-
-        // NameEjectedToL2 events
-        {
-            const topics = [_]?Hash{abi.EventSignatures.name_ejected_to_l2_hash};
-            const logs = try client.getLogs(from_block, to_block, bridge_addr, &topics);
-            defer {
-                for (logs) |*log| {
-                    log.deinit(self.allocator);
-                }
-                self.allocator.free(logs);
-            }
-
-            std.log.info("Found {d} NameEjectedToL2 event{s} from {s}", .{
-                logs.len,
-                if (logs.len == 1) "" else "s",
-                chain.toString(),
-            });
-
-            for (logs) |log| {
-                try self.handleNameEjectedToL2(chain, log);
-            }
-        }
-
-        // RenewalSynchronized events (only on L1)
-        if (chain == .l1) {
-            const topics = [_]?Hash{abi.EventSignatures.renewal_synchronized_hash};
-            const logs = try client.getLogs(from_block, to_block, bridge_addr, &topics);
-            defer {
-                for (logs) |*log| {
-                    log.deinit(self.allocator);
-                }
-                self.allocator.free(logs);
-            }
-
-            std.log.info("Found {d} RenewalSynchronized event{s}", .{
-                logs.len,
-                if (logs.len == 1) "" else "s",
-            });
-
-            for (logs) |log| {
-                try self.handleRenewalSynchronized(chain, log);
-            }
-        }
-
-        // TokenObserverSet events (from registry contracts)
         const registry_addr = self.getEthRegistry(chain);
+
+        // Skip bridge events if bridge contract is not configured (zero address)
+        if (!bridge_addr.isZero()) {
+            // Topics for bridge events
+            const topics_ejected_l1 = [_]?Hash{abi.EventSignatures.name_ejected_to_l1_hash};
+            const topics_ejected_l2 = [_]?Hash{abi.EventSignatures.name_ejected_to_l2_hash};
+            const topics_renewal_sync = [_]?Hash{abi.EventSignatures.renewal_synchronized_hash};
+
+            // Build batch request for bridge events (2-3 calls → 1 batch depending on chain)
+            if (chain == .l1) {
+                // L1: Include RenewalSynchronized
+                const batch_requests = [_]rpc.Client.BatchGetLogsRequest{
+                    .{ .from_block = from_block, .to_block = to_block, .address = bridge_addr, .topics = &topics_ejected_l1 },
+                    .{ .from_block = from_block, .to_block = to_block, .address = bridge_addr, .topics = &topics_ejected_l2 },
+                    .{ .from_block = from_block, .to_block = to_block, .address = bridge_addr, .topics = &topics_renewal_sync },
+                };
+
+                const batch_results = try client.getLogsBatch(&batch_requests);
+                defer {
+                    for (batch_results) |logs| {
+                        for (logs) |*log| {
+                            log.deinit(self.allocator);
+                        }
+                        self.allocator.free(logs);
+                    }
+                    self.allocator.free(batch_results);
+                }
+
+                // Process NameEjectedToL1 events
+                std.log.info("Found {d} NameEjectedToL1 event{s} from {s}", .{
+                    batch_results[0].len,
+                    if (batch_results[0].len == 1) "" else "s",
+                    chain.toString(),
+                });
+                for (batch_results[0]) |log| {
+                    try self.handleNameEjectedToL1(chain, log);
+                }
+
+                // Process NameEjectedToL2 events
+                std.log.info("Found {d} NameEjectedToL2 event{s} from {s}", .{
+                    batch_results[1].len,
+                    if (batch_results[1].len == 1) "" else "s",
+                    chain.toString(),
+                });
+                for (batch_results[1]) |log| {
+                    try self.handleNameEjectedToL2(chain, log);
+                }
+
+                // Process RenewalSynchronized events
+                std.log.info("Found {d} RenewalSynchronized event{s}", .{
+                    batch_results[2].len,
+                    if (batch_results[2].len == 1) "" else "s",
+                });
+                for (batch_results[2]) |log| {
+                    try self.handleRenewalSynchronized(chain, log);
+                }
+            } else {
+                // L2: No RenewalSynchronized
+                const batch_requests = [_]rpc.Client.BatchGetLogsRequest{
+                    .{ .from_block = from_block, .to_block = to_block, .address = bridge_addr, .topics = &topics_ejected_l1 },
+                    .{ .from_block = from_block, .to_block = to_block, .address = bridge_addr, .topics = &topics_ejected_l2 },
+                };
+
+                const batch_results = try client.getLogsBatch(&batch_requests);
+                defer {
+                    for (batch_results) |logs| {
+                        for (logs) |*log| {
+                            log.deinit(self.allocator);
+                        }
+                        self.allocator.free(logs);
+                    }
+                    self.allocator.free(batch_results);
+                }
+
+                // Process NameEjectedToL1 events
+                std.log.info("Found {d} NameEjectedToL1 event{s} from {s}", .{
+                    batch_results[0].len,
+                    if (batch_results[0].len == 1) "" else "s",
+                    chain.toString(),
+                });
+                for (batch_results[0]) |log| {
+                    try self.handleNameEjectedToL1(chain, log);
+                }
+
+                // Process NameEjectedToL2 events
+                std.log.info("Found {d} NameEjectedToL2 event{s} from {s}", .{
+                    batch_results[1].len,
+                    if (batch_results[1].len == 1) "" else "s",
+                    chain.toString(),
+                });
+                for (batch_results[1]) |log| {
+                    try self.handleNameEjectedToL2(chain, log);
+                }
+            }
+        }
+
+        // TokenObserverSet events (from registry contract - separate batch)
         {
             const topics = [_]?Hash{abi.EventSignatures.token_observer_set_hash};
             const logs = try client.getLogs(from_block, to_block, registry_addr, &topics);
@@ -1694,7 +1724,7 @@ pub const Indexer = struct {
             .name = event_name,
             .namehash = namehash,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -1771,7 +1801,7 @@ pub const Indexer = struct {
             .name = event_name,
             .namehash = namehash,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -1953,7 +1983,7 @@ pub const Indexer = struct {
             .name = event_name,
             .namehash = namehash,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -2123,7 +2153,7 @@ pub const Indexer = struct {
             .name = event_name,
             .namehash = namehash,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -2180,7 +2210,7 @@ pub const Indexer = struct {
             .name = event_name,
             .namehash = namehash,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -2249,7 +2279,7 @@ pub const Indexer = struct {
             .name = event_name,
             .namehash = namehash_opt,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -2295,8 +2325,9 @@ pub const Indexer = struct {
         const namehash = try @import("../types/hash.zig").namehash(self.allocator, full_name);
         const label_hash = try @import("../types/hash.zig").keccak256(self.allocator, label_str);
 
-        // Calculate expiry from duration
-        const expiry: u64 = @intCast(std.time.timestamp() + @as(i64, @intCast(duration)));
+        // Calculate expiry from registration block timestamp + duration
+        const block_timestamp = self.getBlockTimestamp(chain, log.block_number);
+        const expiry: u64 = @intCast(block_timestamp + @as(i64, @intCast(duration)));
 
         // Extract canonical_id and version from token_id
         const token_id_utils = @import("../types/token_id.zig");
@@ -2402,7 +2433,7 @@ pub const Indexer = struct {
             .name = event_name,
             .namehash = namehash,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -2480,7 +2511,7 @@ pub const Indexer = struct {
             .name = event_name,
             .namehash = namehash,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -2511,7 +2542,7 @@ pub const Indexer = struct {
             .name = null,
             .namehash = null,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -2566,7 +2597,7 @@ pub const Indexer = struct {
             .name = event_name,
             .namehash = namehash,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -2631,7 +2662,7 @@ pub const Indexer = struct {
             .name = event_name,
             .namehash = namehash,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -2683,7 +2714,7 @@ pub const Indexer = struct {
             .name = null,
             .namehash = null,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -2765,7 +2796,7 @@ pub const Indexer = struct {
             .name = event_name,
             .namehash = namehash,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -2878,7 +2909,7 @@ pub const Indexer = struct {
             .name = if (name_str_opt) |n| try self.allocator.dupe(u8, n) else null,
             .namehash = namehash_opt,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -3100,6 +3131,11 @@ pub const Indexer = struct {
 
             chunk_start = chunk_end;
             chunk_num += 1;
+
+            // Rate limit: wait between batches to avoid hitting RPC provider limits
+            if (chunk_start < resolvers.len) {
+                std.Thread.sleep(500 * std.time.ns_per_ms); // 500ms delay between batches
+            }
         }
 
         std.log.info("Resolver indexing complete: {d} resolvers processed", .{resolvers.len});
@@ -3181,7 +3217,7 @@ pub const Indexer = struct {
             .name = null,
             .namehash = namehash,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -3259,7 +3295,7 @@ pub const Indexer = struct {
             .name = null,
             .namehash = namehash,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -3357,7 +3393,7 @@ pub const Indexer = struct {
             .name = null,
             .namehash = namehash,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -3401,7 +3437,7 @@ pub const Indexer = struct {
             .name = null,
             .namehash = namehash,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -3459,7 +3495,7 @@ pub const Indexer = struct {
             .name = null,
             .namehash = namehash,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -3515,7 +3551,7 @@ pub const Indexer = struct {
             .name = null,
             .namehash = namehash,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -3577,7 +3613,7 @@ pub const Indexer = struct {
             .name = null,
             .namehash = namehash,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -3840,7 +3876,7 @@ pub const Indexer = struct {
             .name = null,
             .namehash = subdomain_namehash, // Use subdomain namehash
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -3882,7 +3918,7 @@ pub const Indexer = struct {
             .name = null,
             .namehash = node,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -3933,7 +3969,7 @@ pub const Indexer = struct {
             .name = null,
             .namehash = node,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -3974,7 +4010,7 @@ pub const Indexer = struct {
             .name = null,
             .namehash = node,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -4037,7 +4073,7 @@ pub const Indexer = struct {
             .name = null,
             .namehash = node,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -4086,7 +4122,7 @@ pub const Indexer = struct {
             .name = null,
             .namehash = node,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -4133,7 +4169,7 @@ pub const Indexer = struct {
             .name = null,
             .namehash = node,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -4180,7 +4216,7 @@ pub const Indexer = struct {
             .name = null,
             .namehash = node,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -4257,7 +4293,7 @@ pub const Indexer = struct {
             .name = null,
             .namehash = null,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -4375,7 +4411,7 @@ pub const Indexer = struct {
                 .name = full_name,
                 .namehash = namehash,
                 .data = event_data,
-                .timestamp = std.time.timestamp(),
+                .timestamp = self.getBlockTimestamp(chain, log.block_number),
             };
 
             try self.insertEventAndNotify(event);
@@ -4400,7 +4436,7 @@ pub const Indexer = struct {
                 .name = null,
                 .namehash = null,
                 .data = event_data,
-                .timestamp = std.time.timestamp(),
+                .timestamp = self.getBlockTimestamp(chain, log.block_number),
             };
 
             try self.insertEventAndNotify(event);
@@ -4468,7 +4504,7 @@ pub const Indexer = struct {
             .name = null,
             .namehash = null,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -4604,7 +4640,7 @@ pub const Indexer = struct {
             .name = name,
             .namehash = namehash,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -4680,7 +4716,7 @@ pub const Indexer = struct {
             .name = name,
             .namehash = namehash,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);
@@ -4720,7 +4756,7 @@ pub const Indexer = struct {
             .name = null,
             .namehash = node,
             .data = event_data,
-            .timestamp = std.time.timestamp(),
+            .timestamp = self.getBlockTimestamp(chain, log.block_number),
         };
 
         try self.insertEventAndNotify(event);

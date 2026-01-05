@@ -1,5 +1,5 @@
 const std = @import("std");
-const parser = @import("graphql_parser.zig");
+const parser = @import("parser.zig");
 
 /// Query complexity limits configuration
 pub const ComplexityLimits = struct {

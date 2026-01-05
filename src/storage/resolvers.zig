@@ -1,19 +1,13 @@
 const std = @import("std");
 const db_module = @import("database.zig");
 const Database = db_module.Database;
-const c = db_module.c;
+const Query = db_module.Query;
 const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
 
-// SQLITE_TRANSIENT - For Zig 0.15.1, we can't use the C constant due to alignment issues
-// Instead, we use null which tells SQLite to make a copy of the string
-inline fn SQLITE_TRANSIENT() c.sqlite3_destructor_type {
-    return null;
-}
-
 // ============================================================================
-// RESOLVER OPERATIONS (8 functions)
+// RESOLVER OPERATIONS
 // ============================================================================
 
 pub fn storeResolverAddress(
@@ -33,43 +27,19 @@ pub fn storeResolverAddress(
         \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
     ;
 
-    const sql_z = try db.allocator.dupeZ(u8, sql);
-    defer db.allocator.free(sql_z);
+    var q = try Query.init(db, sql);
+    defer q.deinit();
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    defer {
-        if (stmt) |s| _ = c.sqlite3_finalize(s);
-    }
+    try q.bindHash(namehash);
+    try q.bindAddress(resolver);
+    try q.bindInt64(@intCast(coin_type));
+    try q.bindText(address);
+    try q.bindTextStatic(chain.toString());
+    try q.bindInt64(@intCast(block_number));
+    try q.bindHash(tx_hash);
+    try q.bindInt64(timestamp);
 
-    if (c.sqlite3_prepare_v2(db.db, sql_z.ptr, -1, &stmt, null) != c.SQLITE_OK) {
-        std.log.err("Failed to prepare resolver address SQL: {s}", .{c.sqlite3_errmsg(db.db)});
-        std.log.err("SQL was: {s}", .{sql});
-        return error.PrepareFailed;
-    }
-
-    const namehash_str = try namehash.toHex(db.allocator);
-    defer db.allocator.free(namehash_str);
-
-    const resolver_str = try resolver.toHex(db.allocator);
-    defer db.allocator.free(resolver_str);
-
-    const chain_str = chain.toString();
-
-    const tx_hash_str = try tx_hash.toHex(db.allocator);
-    defer db.allocator.free(tx_hash_str);
-
-    _ = c.sqlite3_bind_text(stmt, 1, namehash_str.ptr, @intCast(namehash_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 2, resolver_str.ptr, @intCast(resolver_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 3, @intCast(coin_type));
-    _ = c.sqlite3_bind_text(stmt, 4, address.ptr, @intCast(address.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 5, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 6, @intCast(block_number));
-    _ = c.sqlite3_bind_text(stmt, 7, tx_hash_str.ptr, @intCast(tx_hash_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 8, timestamp);
-
-    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
-        return error.StoreFailed;
-    }
+    try q.exec();
 }
 
 /// Store resolver content hash (from ContentHashChanged event)
@@ -89,37 +59,18 @@ pub fn storeResolverContentHash(
         \\VALUES (?, ?, ?, ?, ?, ?, ?)
     ;
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    defer {
-        if (stmt) |s| _ = c.sqlite3_finalize(s);
-    }
+    var q = try Query.init(db, sql);
+    defer q.deinit();
 
-    if (c.sqlite3_prepare_v2(db.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
-        return error.PrepareFailed;
-    }
+    try q.bindHash(namehash);
+    try q.bindAddress(resolver);
+    try q.bindText(content_hash);
+    try q.bindTextStatic(chain.toString());
+    try q.bindInt64(@intCast(block_number));
+    try q.bindHash(tx_hash);
+    try q.bindInt64(timestamp);
 
-    const namehash_str = try namehash.toHex(db.allocator);
-    defer db.allocator.free(namehash_str);
-
-    const resolver_str = try resolver.toHex(db.allocator);
-    defer db.allocator.free(resolver_str);
-
-    const chain_str = chain.toString();
-
-    const tx_hash_str = try tx_hash.toHex(db.allocator);
-    defer db.allocator.free(tx_hash_str);
-
-    _ = c.sqlite3_bind_text(stmt, 1, namehash_str.ptr, @intCast(namehash_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 2, resolver_str.ptr, @intCast(resolver_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 3, content_hash.ptr, @intCast(content_hash.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 4, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 5, @intCast(block_number));
-    _ = c.sqlite3_bind_text(stmt, 6, tx_hash_str.ptr, @intCast(tx_hash_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 7, timestamp);
-
-    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
-        return error.StoreFailed;
-    }
+    try q.exec();
 }
 
 /// Store resolver text record (from TextChanged event)
@@ -140,38 +91,19 @@ pub fn storeResolverText(
         \\VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ;
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    defer {
-        if (stmt) |s| _ = c.sqlite3_finalize(s);
-    }
+    var q = try Query.init(db, sql);
+    defer q.deinit();
 
-    if (c.sqlite3_prepare_v2(db.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
-        return error.PrepareFailed;
-    }
+    try q.bindHash(namehash);
+    try q.bindAddress(resolver);
+    try q.bindText(key);
+    try q.bindText(value);
+    try q.bindTextStatic(chain.toString());
+    try q.bindInt64(@intCast(block_number));
+    try q.bindHash(tx_hash);
+    try q.bindInt64(timestamp);
 
-    const namehash_str = try namehash.toHex(db.allocator);
-    defer db.allocator.free(namehash_str);
-
-    const resolver_str = try resolver.toHex(db.allocator);
-    defer db.allocator.free(resolver_str);
-
-    const chain_str = chain.toString();
-
-    const tx_hash_str = try tx_hash.toHex(db.allocator);
-    defer db.allocator.free(tx_hash_str);
-
-    _ = c.sqlite3_bind_text(stmt, 1, namehash_str.ptr, @intCast(namehash_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 2, resolver_str.ptr, @intCast(resolver_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 3, key.ptr, @intCast(key.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 4, value.ptr, @intCast(value.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 5, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 6, @intCast(block_number));
-    _ = c.sqlite3_bind_text(stmt, 7, tx_hash_str.ptr, @intCast(tx_hash_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 8, timestamp);
-
-    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
-        return error.StoreFailed;
-    }
+    try q.exec();
 }
 
 /// Get the latest address record for a namehash (coin type 60 = ETH)
@@ -183,30 +115,15 @@ pub fn getResolverAddress(db: *Database, namehash: Hash, coin_type: u64) !?[]u8 
         \\LIMIT 1
     ;
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    defer {
-        if (stmt) |s| _ = c.sqlite3_finalize(s);
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+
+    try q.bindHash(namehash);
+    try q.bindInt64(@intCast(coin_type));
+
+    if (try q.step()) {
+        return try q.getText(0);
     }
-
-    if (c.sqlite3_prepare_v2(db.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
-        return error.PrepareFailed;
-    }
-
-    const namehash_str = try namehash.toHex(db.allocator);
-    defer db.allocator.free(namehash_str);
-
-    _ = c.sqlite3_bind_text(stmt, 1, namehash_str.ptr, @intCast(namehash_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 2, @intCast(coin_type));
-
-    if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const addr_text = c.sqlite3_column_text(stmt, 0);
-        if (addr_text != null) {
-            const addr_len = c.sqlite3_column_bytes(stmt, 0);
-            const addr_slice = addr_text[0..@intCast(addr_len)];
-            return try db.allocator.dupe(u8, addr_slice);
-        }
-    }
-
     return null;
 }
 
@@ -228,19 +145,10 @@ pub fn getResolverAllAddresses(db: *Database, namehash: Hash) ![]CoinAddress {
         \\ORDER BY coin_type
     ;
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    defer {
-        if (stmt) |s| _ = c.sqlite3_finalize(s);
-    }
+    var q = try Query.init(db, sql);
+    defer q.deinit();
 
-    if (c.sqlite3_prepare_v2(db.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
-        return error.PrepareFailed;
-    }
-
-    const namehash_str = try namehash.toHex(db.allocator);
-    defer db.allocator.free(namehash_str);
-
-    _ = c.sqlite3_bind_text(stmt, 1, namehash_str.ptr, @intCast(namehash_str.len), SQLITE_TRANSIENT());
+    try q.bindHash(namehash);
 
     var addresses: std.ArrayList(CoinAddress) = .{};
     errdefer {
@@ -250,15 +158,12 @@ pub fn getResolverAllAddresses(db: *Database, namehash: Hash) ![]CoinAddress {
         addresses.deinit(db.allocator);
     }
 
-    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const coin_type: u64 = @intCast(c.sqlite3_column_int64(stmt, 0));
-        const addr_text = c.sqlite3_column_text(stmt, 1);
-        if (addr_text != null) {
-            const addr_len = c.sqlite3_column_bytes(stmt, 1);
-            const addr_slice = addr_text[0..@intCast(addr_len)];
+    while (try q.step()) {
+        const coin_type: u64 = @intCast(q.getInt64(0));
+        if (try q.getText(1)) |addr| {
             const coin_addr = CoinAddress{
                 .coin_type = coin_type,
-                .address = try db.allocator.dupe(u8, addr_slice),
+                .address = addr,
             };
             try addresses.append(db.allocator, coin_addr);
         }
@@ -276,29 +181,14 @@ pub fn getResolverContentHash(db: *Database, namehash: Hash) !?[]u8 {
         \\LIMIT 1
     ;
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    defer {
-        if (stmt) |s| _ = c.sqlite3_finalize(s);
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+
+    try q.bindHash(namehash);
+
+    if (try q.step()) {
+        return try q.getText(0);
     }
-
-    if (c.sqlite3_prepare_v2(db.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
-        return error.PrepareFailed;
-    }
-
-    const namehash_str = try namehash.toHex(db.allocator);
-    defer db.allocator.free(namehash_str);
-
-    _ = c.sqlite3_bind_text(stmt, 1, namehash_str.ptr, @intCast(namehash_str.len), SQLITE_TRANSIENT());
-
-    if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const hash_text = c.sqlite3_column_text(stmt, 0);
-        if (hash_text != null) {
-            const hash_len = c.sqlite3_column_bytes(stmt, 0);
-            const hash_slice = hash_text[0..@intCast(hash_len)];
-            return try db.allocator.dupe(u8, hash_slice);
-        }
-    }
-
     return null;
 }
 
@@ -310,19 +200,10 @@ pub fn getResolverTextKeys(db: *Database, namehash: Hash) ![][]u8 {
         \\ORDER BY key
     ;
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    defer {
-        if (stmt) |s| _ = c.sqlite3_finalize(s);
-    }
+    var q = try Query.init(db, sql);
+    defer q.deinit();
 
-    if (c.sqlite3_prepare_v2(db.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
-        return error.PrepareFailed;
-    }
-
-    const namehash_str = try namehash.toHex(db.allocator);
-    defer db.allocator.free(namehash_str);
-
-    _ = c.sqlite3_bind_text(stmt, 1, namehash_str.ptr, @intCast(namehash_str.len), SQLITE_TRANSIENT());
+    try q.bindHash(namehash);
 
     var keys: std.ArrayList([]u8) = .{};
     errdefer {
@@ -332,13 +213,9 @@ pub fn getResolverTextKeys(db: *Database, namehash: Hash) ![][]u8 {
         keys.deinit(db.allocator);
     }
 
-    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const key_text = c.sqlite3_column_text(stmt, 0);
-        if (key_text != null) {
-            const key_len = c.sqlite3_column_bytes(stmt, 0);
-            const key_slice = key_text[0..@intCast(key_len)];
-            const key_copy = try db.allocator.dupe(u8, key_slice);
-            try keys.append(db.allocator, key_copy);
+    while (try q.step()) {
+        if (try q.getText(0)) |key| {
+            try keys.append(db.allocator, key);
         }
     }
 
@@ -354,30 +231,15 @@ pub fn getResolverText(db: *Database, namehash: Hash, key: []const u8) !?[]u8 {
         \\LIMIT 1
     ;
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    defer {
-        if (stmt) |s| _ = c.sqlite3_finalize(s);
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+
+    try q.bindHash(namehash);
+    try q.bindText(key);
+
+    if (try q.step()) {
+        return try q.getText(0);
     }
-
-    if (c.sqlite3_prepare_v2(db.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
-        return error.PrepareFailed;
-    }
-
-    const namehash_str = try namehash.toHex(db.allocator);
-    defer db.allocator.free(namehash_str);
-
-    _ = c.sqlite3_bind_text(stmt, 1, namehash_str.ptr, @intCast(namehash_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 2, key.ptr, @intCast(key.len), SQLITE_TRANSIENT());
-
-    if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const value_text = c.sqlite3_column_text(stmt, 0);
-        if (value_text != null) {
-            const value_len = c.sqlite3_column_bytes(stmt, 0);
-            const value_slice = value_text[0..@intCast(value_len)];
-            return try db.allocator.dupe(u8, value_slice);
-        }
-    }
-
     return null;
 }
 
@@ -391,19 +253,10 @@ pub fn getResolverTextKeysByResolver(db: *Database, resolver: Address) ![][]u8 {
         \\ORDER BY key
     ;
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    defer {
-        if (stmt) |s| _ = c.sqlite3_finalize(s);
-    }
+    var q = try Query.init(db, sql);
+    defer q.deinit();
 
-    if (c.sqlite3_prepare_v2(db.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
-        return error.PrepareFailed;
-    }
-
-    const resolver_str = try resolver.toHex(db.allocator);
-    defer db.allocator.free(resolver_str);
-
-    _ = c.sqlite3_bind_text(stmt, 1, resolver_str.ptr, @intCast(resolver_str.len), SQLITE_TRANSIENT());
+    try q.bindAddress(resolver);
 
     var keys: std.ArrayList([]u8) = .{};
     errdefer {
@@ -413,13 +266,9 @@ pub fn getResolverTextKeysByResolver(db: *Database, resolver: Address) ![][]u8 {
         keys.deinit(db.allocator);
     }
 
-    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const key_text = c.sqlite3_column_text(stmt, 0);
-        if (key_text != null) {
-            const key_len = c.sqlite3_column_bytes(stmt, 0);
-            const key_slice = key_text[0..@intCast(key_len)];
-            const key_copy = try db.allocator.dupe(u8, key_slice);
-            try keys.append(db.allocator, key_copy);
+    while (try q.step()) {
+        if (try q.getText(0)) |key| {
+            try keys.append(db.allocator, key);
         }
     }
 
@@ -435,30 +284,15 @@ pub fn getResolverTextByResolver(db: *Database, resolver: Address, key: []const 
         \\LIMIT 1
     ;
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    defer {
-        if (stmt) |s| _ = c.sqlite3_finalize(s);
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+
+    try q.bindAddress(resolver);
+    try q.bindText(key);
+
+    if (try q.step()) {
+        return try q.getText(0);
     }
-
-    if (c.sqlite3_prepare_v2(db.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
-        return error.PrepareFailed;
-    }
-
-    const resolver_str = try resolver.toHex(db.allocator);
-    defer db.allocator.free(resolver_str);
-
-    _ = c.sqlite3_bind_text(stmt, 1, resolver_str.ptr, @intCast(resolver_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 2, key.ptr, @intCast(key.len), SQLITE_TRANSIENT());
-
-    if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const value_text = c.sqlite3_column_text(stmt, 0);
-        if (value_text != null) {
-            const value_len = c.sqlite3_column_bytes(stmt, 0);
-            const value_slice = value_text[0..@intCast(value_len)];
-            return try db.allocator.dupe(u8, value_slice);
-        }
-    }
-
     return null;
 }
 
@@ -477,30 +311,23 @@ pub fn getResolversToIndex(db: *Database, chain: models.Chain, from_block: u64, 
         \\  AND kr.address IS NULL
     ;
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    defer {
-        if (stmt) |s| _ = c.sqlite3_finalize(s);
-    }
-
-    if (c.sqlite3_prepare_v2(db.db, discover_sql, -1, &stmt, null) != c.SQLITE_OK) {
-        return error.PrepareFailed;
-    }
-
     const chain_str = chain.toString();
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 2, @intCast(from_block));
-    _ = c.sqlite3_bind_int64(stmt, 3, @intCast(to_block));
 
-    // Register newly discovered resolvers
-    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const addr_text = c.sqlite3_column_text(stmt, 0);
-        if (addr_text != null) {
-            const addr_len = c.sqlite3_column_bytes(stmt, 0);
-            const addr_slice = addr_text[0..@intCast(addr_len)];
-            try db.registerResolver(chain, addr_slice, from_block);
+    {
+        var q = try Query.init(db, discover_sql);
+        defer q.deinit();
+
+        try q.bindTextStatic(chain_str);
+        try q.bindInt64(@intCast(from_block));
+        try q.bindInt64(@intCast(to_block));
+
+        // Register newly discovered resolvers
+        while (try q.step()) {
+            if (q.getTextSlice(0)) |addr_slice| {
+                try db.registerResolver(chain, addr_slice, from_block);
+            }
         }
     }
-    _ = c.sqlite3_finalize(stmt);
 
     // Now get ALL known resolvers from cache (very fast)
     const get_sql =
@@ -509,11 +336,10 @@ pub fn getResolversToIndex(db: *Database, chain: models.Chain, from_block: u64, 
         \\ORDER BY address
     ;
 
-    if (c.sqlite3_prepare_v2(db.db, get_sql, -1, &stmt, null) != c.SQLITE_OK) {
-        return error.PrepareFailed;
-    }
+    var q2 = try Query.init(db, get_sql);
+    defer q2.deinit();
 
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
+    try q2.bindTextStatic(chain_str);
 
     var resolvers: std.ArrayList([]u8) = .{};
     errdefer {
@@ -523,13 +349,9 @@ pub fn getResolversToIndex(db: *Database, chain: models.Chain, from_block: u64, 
         resolvers.deinit(db.allocator);
     }
 
-    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const addr_text = c.sqlite3_column_text(stmt, 0);
-        if (addr_text != null) {
-            const addr_len = c.sqlite3_column_bytes(stmt, 0);
-            const addr_slice = addr_text[0..@intCast(addr_len)];
-            const addr_copy = try db.allocator.dupe(u8, addr_slice);
-            try resolvers.append(db.allocator, addr_copy);
+    while (try q2.step()) {
+        if (try q2.getText(0)) |addr| {
+            try resolvers.append(db.allocator, addr);
         }
     }
 
@@ -545,23 +367,11 @@ pub fn getResolversByOwner(db: *Database, chain: models.Chain, owner: Address) !
         \\ORDER BY n.created_at DESC
     ;
 
-    const sql_z = try db.allocator.dupeZ(u8, sql);
-    defer db.allocator.free(sql_z);
+    var q = try Query.init(db, sql);
+    defer q.deinit();
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    const prepare_result = c.sqlite3_prepare_v2(db.db, sql_z.ptr, -1, &stmt, null);
-    if (prepare_result != c.SQLITE_OK) {
-        std.log.err("Failed to prepare SQL statement: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.PrepareFailed;
-    }
-    defer _ = c.sqlite3_finalize(stmt);
-
-    const chain_str = chain.toString();
-    const owner_hex = try owner.toHex(db.allocator);
-    defer db.allocator.free(owner_hex);
-
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 2, owner_hex.ptr, @intCast(owner_hex.len), SQLITE_TRANSIENT());
+    try q.bindTextStatic(chain.toString());
+    try q.bindAddress(owner);
 
     var result: std.ArrayList(models.Resolver) = .{};
     errdefer {
@@ -571,18 +381,18 @@ pub fn getResolversByOwner(db: *Database, chain: models.Chain, owner: Address) !
         result.deinit(db.allocator);
     }
 
-    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const resolver_hex = std.mem.span(c.sqlite3_column_text(stmt, 0));
-        const name_str = std.mem.span(c.sqlite3_column_text(stmt, 1));
-        const namehash_hex = std.mem.span(c.sqlite3_column_text(stmt, 2));
+    while (try q.step()) {
+        const resolver_addr = try q.getAddress(0) orelse continue;
+        const name_str = q.getTextSlice(1) orelse continue;
+        const namehash_val = try q.getHash(2) orelse continue;
 
         const resolver = models.Resolver{
             .chain = chain,
-            .address = try Address.fromHex(resolver_hex),
+            .address = resolver_addr,
             .name = try db.allocator.dupe(u8, name_str),
-            .namehash = try Hash.fromHex(namehash_hex),
-            .set_block = @intCast(c.sqlite3_column_int64(stmt, 3)),
-            .set_at = c.sqlite3_column_int64(stmt, 4),
+            .namehash = namehash_val,
+            .set_block = @intCast(q.getInt64(3)),
+            .set_at = q.getInt64(4),
         };
 
         try result.append(db.allocator, resolver);

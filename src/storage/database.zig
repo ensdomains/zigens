@@ -26,6 +26,10 @@ const roles = @import("roles.zig");
 const ensip16 = @import("ensip16.zig");
 const registrations = @import("registrations.zig");
 
+// Query abstraction module
+pub const query = @import("query.zig");
+pub const Query = query.Query;
+
 // SQLITE_TRANSIENT - For Zig 0.15.1, we can't use the C constant due to alignment issues
 // Instead, we use null which tells SQLite to make a copy of the string
 // This is functionally equivalent to SQLITE_TRANSIENT for our use case

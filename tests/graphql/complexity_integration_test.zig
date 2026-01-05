@@ -1,7 +1,8 @@
 const std = @import("std");
 const testing = std.testing;
-const parser = @import("graphql_parser.zig");
-const complexity = @import("query_complexity.zig");
+const graphql = @import("graphql");
+const parser = graphql.parser;
+const complexity = graphql.complexity;
 
 // ============================================================================
 // INTEGRATION TESTS - Query Complexity with Real Queries

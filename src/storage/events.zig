@@ -1,19 +1,55 @@
 const std = @import("std");
 const db_module = @import("database.zig");
 const Database = db_module.Database;
-const c = db_module.c;
+const Query = db_module.Query;
 const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
 
-// SQLITE_TRANSIENT - For Zig 0.15.1, we can't use the C constant due to alignment issues
-// Instead, we use null which tells SQLite to make a copy of the string
-inline fn SQLITE_TRANSIENT() c.sqlite3_destructor_type {
-    return null;
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+/// Parse a single event row from query results
+/// Column order: event_type(0), chain(1), block_number(2), tx_hash(3), log_index(4),
+///               contract_address(5), name(6), namehash(7), data(8), timestamp(9)
+fn parseEventRow(q: *Query, allocator: std.mem.Allocator) !models.Event {
+    const event_type_str = q.getTextSlice(0) orelse "Transfer";
+    const chain_str = q.getTextSlice(1) orelse "l2";
+    const tx_hash_str = q.getTextSlice(3) orelse return error.MissingTxHash;
+    const contract_addr_str = q.getTextSlice(5) orelse return error.MissingContractAddress;
+    const data_str = q.getTextSlice(8) orelse "{}";
+
+    const name_val = if (q.getTextSlice(6)) |n| try allocator.dupe(u8, n) else null;
+    errdefer if (name_val) |n| allocator.free(n);
+
+    const namehash_val = if (q.getTextSlice(7)) |hash_str| blk: {
+        if (hash_str.len == 66 and hash_str[0] == '0' and hash_str[1] == 'x') {
+            break :blk Hash.fromHex(hash_str) catch null;
+        } else {
+            break :blk null;
+        }
+    } else null;
+
+    const data_copy = try allocator.dupe(u8, data_str);
+    errdefer allocator.free(data_copy);
+
+    return models.Event{
+        .event_type = models.EventType.fromString(event_type_str) orelse .transfer,
+        .chain = try models.Chain.fromString(chain_str),
+        .block_number = @intCast(q.getInt64(2)),
+        .tx_hash = try Hash.fromHex(tx_hash_str),
+        .log_index = @intCast(q.getInt(4)),
+        .contract_address = try Address.fromHex(contract_addr_str),
+        .name = name_val,
+        .namehash = namehash_val,
+        .data = data_copy,
+        .timestamp = q.getInt64(9),
+    };
 }
 
 // ============================================================================
-// EVENT OPERATIONS (3 functions)
+// EVENT OPERATIONS
 // ============================================================================
 
 pub fn insertEvent(db: *Database, event: models.Event) !void {
@@ -24,58 +60,24 @@ pub fn insertEvent(db: *Database, event: models.Event) !void {
         \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ;
 
-    const sql_z = try db.allocator.dupeZ(u8, sql);
-    defer db.allocator.free(sql_z);
+    var q = try Query.init(db, sql);
+    defer q.deinit();
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    const prepare_result = c.sqlite3_prepare_v2(db.db, sql_z.ptr, -1, &stmt, null);
-    if (prepare_result != c.SQLITE_OK) {
-        std.log.err("Failed to prepare insert event statement: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.PrepareFailed;
-    }
-    defer _ = c.sqlite3_finalize(stmt);
-
+    // Bind event type and chain as static text
     const event_type_str = event.event_type.toString();
     const chain_str = event.chain.toString();
+    try q.bindTextStatic(event_type_str);
+    try q.bindTextStatic(chain_str);
+    try q.bindInt64(@intCast(event.block_number));
+    try q.bindHash(event.tx_hash);
+    try q.bindInt(@intCast(event.log_index));
+    try q.bindAddress(event.contract_address);
+    try q.bindOptionalText(event.name);
+    try q.bindOptionalHash(event.namehash);
+    try q.bindText(event.data);
+    try q.bindInt64(event.timestamp);
 
-    const tx_hash_hex = try event.tx_hash.toHex(db.allocator);
-    const contract_hex = try event.contract_address.toHex(db.allocator);
-    const nh_hex = if (event.namehash) |nh| try nh.toHex(db.allocator) else null;
-
-    // Defer all allocations until AFTER sqlite3_step() completes
-    // Even though SQLITE_TRANSIENT() tells SQLite to copy, the copy happens during step()
-    defer {
-        db.allocator.free(tx_hash_hex);
-        db.allocator.free(contract_hex);
-        if (nh_hex) |h| db.allocator.free(h);
-    }
-
-    _ = c.sqlite3_bind_text(stmt, 1, event_type_str.ptr, @intCast(event_type_str.len), c.SQLITE_STATIC);
-    _ = c.sqlite3_bind_text(stmt, 2, chain_str.ptr, @intCast(chain_str.len), c.SQLITE_STATIC);
-    _ = c.sqlite3_bind_int64(stmt, 3, @intCast(event.block_number));
-    _ = c.sqlite3_bind_text(stmt, 4, tx_hash_hex.ptr, @intCast(tx_hash_hex.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int(stmt, 5, @intCast(event.log_index));
-    _ = c.sqlite3_bind_text(stmt, 6, contract_hex.ptr, @intCast(contract_hex.len), SQLITE_TRANSIENT());
-
-    if (event.name) |name| {
-        _ = c.sqlite3_bind_text(stmt, 7, name.ptr, @intCast(name.len), SQLITE_TRANSIENT());
-    } else {
-        _ = c.sqlite3_bind_null(stmt, 7);
-    }
-
-    if (nh_hex) |h| {
-        _ = c.sqlite3_bind_text(stmt, 8, h.ptr, @intCast(h.len), SQLITE_TRANSIENT());
-    } else {
-        _ = c.sqlite3_bind_null(stmt, 8);
-    }
-
-    _ = c.sqlite3_bind_text(stmt, 9, event.data.ptr, @intCast(event.data.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 10, event.timestamp);
-
-    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
-        std.log.err("Failed to insert event: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.InsertFailed;
-    }
+    try q.exec();
 }
 
 /// Order direction for event queries
@@ -97,7 +99,6 @@ pub fn getRecentEventsWithOrder(db: *Database, chain: ?models.Chain, event_type:
     @memcpy(sql_buf[sql_len..][0..base_sql.len], base_sql);
     sql_len += base_sql.len;
 
-    var param_count: u8 = 0;
     if (chain != null or event_type != null) {
         const where_sql = " WHERE ";
         @memcpy(sql_buf[sql_len..][0..where_sql.len], where_sql);
@@ -107,7 +108,6 @@ pub fn getRecentEventsWithOrder(db: *Database, chain: ?models.Chain, event_type:
             const chain_filter = "chain = ?";
             @memcpy(sql_buf[sql_len..][0..chain_filter.len], chain_filter);
             sql_len += chain_filter.len;
-            param_count += 1;
 
             if (event_type != null) {
                 const and_sql = " AND ";
@@ -120,11 +120,9 @@ pub fn getRecentEventsWithOrder(db: *Database, chain: ?models.Chain, event_type:
             const type_filter = "event_type = ?";
             @memcpy(sql_buf[sql_len..][0..type_filter.len], type_filter);
             sql_len += type_filter.len;
-            param_count += 1;
         }
     }
 
-    // Use order direction for backward pagination support
     const order_sql = if (order_dir == .desc)
         " ORDER BY block_number DESC, log_index DESC LIMIT "
     else
@@ -135,28 +133,15 @@ pub fn getRecentEventsWithOrder(db: *Database, chain: ?models.Chain, event_type:
     const limit_str = try std.fmt.bufPrint(sql_buf[sql_len..], "{d}", .{limit});
     sql_len += limit_str.len;
 
-    const sql = sql_buf[0..sql_len];
-    const sql_z = try db.allocator.dupeZ(u8, sql);
-    defer db.allocator.free(sql_z);
-
-    var stmt: ?*c.sqlite3_stmt = null;
-    const prepare_result = c.sqlite3_prepare_v2(db.db, sql_z.ptr, -1, &stmt, null);
-    if (prepare_result != c.SQLITE_OK) {
-        std.log.err("Failed to prepare get events statement: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.PrepareFailed;
-    }
-    defer _ = c.sqlite3_finalize(stmt);
+    var q = try Query.init(db, sql_buf[0..sql_len]);
+    defer q.deinit();
 
     // Bind parameters
-    var param_idx: c_int = 1;
     if (chain) |ch| {
-        const chain_str = ch.toString();
-        _ = c.sqlite3_bind_text(stmt, param_idx, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
-        param_idx += 1;
+        try q.bindTextStatic(ch.toString());
     }
     if (event_type) |et| {
-        const type_str = et.toString();
-        _ = c.sqlite3_bind_text(stmt, param_idx, type_str.ptr, @intCast(type_str.len), SQLITE_TRANSIENT());
+        try q.bindTextStatic(et.toString());
     }
 
     var events: std.ArrayList(models.Event) = .{};
@@ -167,40 +152,8 @@ pub fn getRecentEventsWithOrder(db: *Database, chain: ?models.Chain, event_type:
         events.deinit(db.allocator);
     }
 
-    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const event_type_str = std.mem.span(c.sqlite3_column_text(stmt, 0));
-        const chain_str = std.mem.span(c.sqlite3_column_text(stmt, 1));
-        const tx_hash_str = std.mem.span(c.sqlite3_column_text(stmt, 3));
-        const contract_addr_str = std.mem.span(c.sqlite3_column_text(stmt, 5));
-        const data_str = std.mem.span(c.sqlite3_column_text(stmt, 8));
-
-        const name_col = c.sqlite3_column_text(stmt, 6);
-        const name_val = if (name_col != null) try db.allocator.dupe(u8, std.mem.span(name_col)) else null;
-
-        const namehash_col = c.sqlite3_column_text(stmt, 7);
-        const namehash_val = if (namehash_col != null) blk: {
-            const hash_str = std.mem.span(namehash_col);
-            // Check if it's valid hex (should start with 0x and be 66 chars)
-            if (hash_str.len == 66 and hash_str[0] == '0' and hash_str[1] == 'x') {
-                break :blk Hash.fromHex(hash_str) catch null;
-            } else {
-                break :blk null;
-            }
-        } else null;
-
-        const event = models.Event{
-            .event_type = models.EventType.fromString(event_type_str) orelse .transfer,
-            .chain = try models.Chain.fromString(chain_str),
-            .block_number = @intCast(c.sqlite3_column_int64(stmt, 2)),
-            .tx_hash = try Hash.fromHex(tx_hash_str),
-            .log_index = @intCast(c.sqlite3_column_int(stmt, 4)),
-            .contract_address = try Address.fromHex(contract_addr_str),
-            .name = name_val,
-            .namehash = namehash_val,
-            .data = try db.allocator.dupe(u8, data_str),
-            .timestamp = c.sqlite3_column_int64(stmt, 9),
-        };
-
+    while (try q.step()) {
+        const event = try parseEventRow(&q, db.allocator);
         try events.append(db.allocator, event);
     }
 
@@ -211,16 +164,16 @@ pub fn getRecentEventsWithOrder(db: *Database, chain: ?models.Chain, event_type:
 pub const EventFilterOptions = struct {
     event_type: ?[]const u8 = null,
     event_types: ?[]const []const u8 = null,
-    chain: ?models.Chain = null, // Filter by chain (l1 or l2)
+    chain: ?models.Chain = null,
     domain: ?[]const u8 = null,
     contract_address: ?[]const u8 = null,
-    contract_addresses: ?[]const []const u8 = null, // Multiple addresses (OR condition)
+    contract_addresses: ?[]const []const u8 = null,
     namehash: ?[]const u8 = null,
     block_number_gt: ?i64 = null,
     block_number_lt: ?i64 = null,
     timestamp_gt: ?i64 = null,
     timestamp_lt: ?i64 = null,
-    data_json_owner: ?[]const u8 = null, // Filter by owner field in JSON data
+    data_json_owner: ?[]const u8 = null,
     limit: u32 = 100,
     order_dir: OrderDir = .desc,
 };
@@ -237,6 +190,15 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     var conditions: std.ArrayList([]const u8) = .{};
     defer conditions.deinit(db.allocator);
 
+    // Track allocated IN clause strings for cleanup
+    var allocated_clauses: std.ArrayList([]const u8) = .{};
+    defer {
+        for (allocated_clauses.items) |clause| {
+            db.allocator.free(clause);
+        }
+        allocated_clauses.deinit(db.allocator);
+    }
+
     // Build WHERE conditions
     if (filter.chain != null) {
         try conditions.append(db.allocator, "chain = ?");
@@ -245,7 +207,6 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
         try conditions.append(db.allocator, "event_type = ?");
     }
     if (filter.event_types != null and filter.event_types.?.len > 0) {
-        // Build IN clause placeholder
         var in_clause_buf: [256]u8 = undefined;
         var in_len: usize = 0;
         const prefix = "event_type IN (";
@@ -261,7 +222,9 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
         }
         in_clause_buf[in_len] = ')';
         in_len += 1;
-        try conditions.append(db.allocator, try db.allocator.dupe(u8, in_clause_buf[0..in_len]));
+        const clause = try db.allocator.dupe(u8, in_clause_buf[0..in_len]);
+        try allocated_clauses.append(db.allocator, clause);
+        try conditions.append(db.allocator, clause);
     }
     if (filter.domain != null) {
         try conditions.append(db.allocator, "name = ?");
@@ -270,7 +233,6 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
         try conditions.append(db.allocator, "contract_address = ?");
     }
     if (filter.contract_addresses != null and filter.contract_addresses.?.len > 0) {
-        // Build IN clause placeholder for multiple contract addresses
         var in_clause_buf: [512]u8 = undefined;
         var in_len: usize = 0;
         const prefix = "contract_address IN (";
@@ -286,7 +248,9 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
         }
         in_clause_buf[in_len] = ')';
         in_len += 1;
-        try conditions.append(db.allocator, try db.allocator.dupe(u8, in_clause_buf[0..in_len]));
+        const clause = try db.allocator.dupe(u8, in_clause_buf[0..in_len]);
+        try allocated_clauses.append(db.allocator, clause);
+        try conditions.append(db.allocator, clause);
     }
     if (filter.namehash != null) {
         try conditions.append(db.allocator, "namehash = ?");
@@ -304,7 +268,6 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
         try conditions.append(db.allocator, "timestamp < ?");
     }
     if (filter.data_json_owner != null) {
-        // Use SQLite json_extract to filter by owner field in JSON data (case-insensitive)
         try conditions.append(db.allocator, "LOWER(json_extract(data, '$.owner')) = LOWER(?)");
     }
 
@@ -336,72 +299,49 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     const limit_str = try std.fmt.bufPrint(sql_buf[sql_len..], "{d}", .{filter.limit});
     sql_len += limit_str.len;
 
-    const sql = sql_buf[0..sql_len];
-    const sql_z = try db.allocator.dupeZ(u8, sql);
-    defer db.allocator.free(sql_z);
-
-    var stmt: ?*c.sqlite3_stmt = null;
-    const prepare_result = c.sqlite3_prepare_v2(db.db, sql_z.ptr, -1, &stmt, null);
-    if (prepare_result != c.SQLITE_OK) {
-        std.log.err("Failed to prepare get events filtered statement: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.PrepareFailed;
-    }
-    defer _ = c.sqlite3_finalize(stmt);
+    var q = try Query.init(db, sql_buf[0..sql_len]);
+    defer q.deinit();
 
     // Bind parameters in the order they were added to conditions
-    var param_idx: c_int = 1;
     if (filter.chain) |ch| {
-        const chain_str = ch.toString();
-        _ = c.sqlite3_bind_text(stmt, param_idx, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
-        param_idx += 1;
+        try q.bindTextStatic(ch.toString());
     }
     if (filter.event_type) |et| {
-        _ = c.sqlite3_bind_text(stmt, param_idx, et.ptr, @intCast(et.len), SQLITE_TRANSIENT());
-        param_idx += 1;
+        try q.bindText(et);
     }
     if (filter.event_types) |types| {
         for (types) |t| {
-            _ = c.sqlite3_bind_text(stmt, param_idx, t.ptr, @intCast(t.len), SQLITE_TRANSIENT());
-            param_idx += 1;
+            try q.bindText(t);
         }
     }
     if (filter.domain) |d| {
-        _ = c.sqlite3_bind_text(stmt, param_idx, d.ptr, @intCast(d.len), SQLITE_TRANSIENT());
-        param_idx += 1;
+        try q.bindText(d);
     }
     if (filter.contract_address) |ca| {
-        _ = c.sqlite3_bind_text(stmt, param_idx, ca.ptr, @intCast(ca.len), SQLITE_TRANSIENT());
-        param_idx += 1;
+        try q.bindText(ca);
     }
     if (filter.contract_addresses) |addrs| {
         for (addrs) |addr| {
-            _ = c.sqlite3_bind_text(stmt, param_idx, addr.ptr, @intCast(addr.len), SQLITE_TRANSIENT());
-            param_idx += 1;
+            try q.bindText(addr);
         }
     }
     if (filter.namehash) |nh| {
-        _ = c.sqlite3_bind_text(stmt, param_idx, nh.ptr, @intCast(nh.len), SQLITE_TRANSIENT());
-        param_idx += 1;
+        try q.bindText(nh);
     }
     if (filter.block_number_gt) |bn| {
-        _ = c.sqlite3_bind_int64(stmt, param_idx, bn);
-        param_idx += 1;
+        try q.bindInt64(bn);
     }
     if (filter.block_number_lt) |bn| {
-        _ = c.sqlite3_bind_int64(stmt, param_idx, bn);
-        param_idx += 1;
+        try q.bindInt64(bn);
     }
     if (filter.timestamp_gt) |ts| {
-        _ = c.sqlite3_bind_int64(stmt, param_idx, ts);
-        param_idx += 1;
+        try q.bindInt64(ts);
     }
     if (filter.timestamp_lt) |ts| {
-        _ = c.sqlite3_bind_int64(stmt, param_idx, ts);
-        param_idx += 1;
+        try q.bindInt64(ts);
     }
     if (filter.data_json_owner) |owner| {
-        _ = c.sqlite3_bind_text(stmt, param_idx, owner.ptr, @intCast(owner.len), SQLITE_TRANSIENT());
-        param_idx += 1;
+        try q.bindText(owner);
     }
 
     var events: std.ArrayList(models.Event) = .{};
@@ -412,47 +352,9 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
         events.deinit(db.allocator);
     }
 
-    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const event_type_str = std.mem.span(c.sqlite3_column_text(stmt, 0));
-        const chain_str = std.mem.span(c.sqlite3_column_text(stmt, 1));
-        const tx_hash_str = std.mem.span(c.sqlite3_column_text(stmt, 3));
-        const contract_addr_str = std.mem.span(c.sqlite3_column_text(stmt, 5));
-        const data_str = std.mem.span(c.sqlite3_column_text(stmt, 8));
-
-        const name_col = c.sqlite3_column_text(stmt, 6);
-        const name_val = if (name_col != null) try db.allocator.dupe(u8, std.mem.span(name_col)) else null;
-
-        const namehash_col = c.sqlite3_column_text(stmt, 7);
-        const namehash_val = if (namehash_col != null) blk: {
-            const hash_str = std.mem.span(namehash_col);
-            if (hash_str.len == 66 and hash_str[0] == '0' and hash_str[1] == 'x') {
-                break :blk Hash.fromHex(hash_str) catch null;
-            } else {
-                break :blk null;
-            }
-        } else null;
-
-        const event = models.Event{
-            .event_type = models.EventType.fromString(event_type_str) orelse .transfer,
-            .chain = try models.Chain.fromString(chain_str),
-            .block_number = @intCast(c.sqlite3_column_int64(stmt, 2)),
-            .tx_hash = try Hash.fromHex(tx_hash_str),
-            .log_index = @intCast(c.sqlite3_column_int(stmt, 4)),
-            .contract_address = try Address.fromHex(contract_addr_str),
-            .name = name_val,
-            .namehash = namehash_val,
-            .data = try db.allocator.dupe(u8, data_str),
-            .timestamp = c.sqlite3_column_int64(stmt, 9),
-        };
-
+    while (try q.step()) {
+        const event = try parseEventRow(&q, db.allocator);
         try events.append(db.allocator, event);
-    }
-
-    // Free allocated IN clause strings
-    for (conditions.items) |cond| {
-        if (std.mem.startsWith(u8, cond, "event_type IN")) {
-            db.allocator.free(cond);
-        }
     }
 
     return events.toOwnedSlice(db.allocator);
@@ -482,40 +384,21 @@ pub fn insertApproval(db: *Database, chain: models.Chain, token_id: u256, owner:
         \\VALUES (?, ?, ?, ?, ?, ?, ?)
     ;
 
-    const sql_z = try db.allocator.dupeZ(u8, sql);
-    defer db.allocator.free(sql_z);
+    var q = try Query.init(db, sql);
+    defer q.deinit();
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    const prepare_result = c.sqlite3_prepare_v2(db.db, sql_z.ptr, -1, &stmt, null);
-    if (prepare_result != c.SQLITE_OK) {
-        std.log.err("Failed to prepare insert approval statement: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.PrepareFailed;
-    }
-    defer _ = c.sqlite3_finalize(stmt);
-
-    const chain_str = chain.toString();
     const token_id_str = try std.fmt.allocPrint(db.allocator, "{d}", .{token_id});
     defer db.allocator.free(token_id_str);
-    const owner_hex = try owner.toHex(db.allocator);
-    defer db.allocator.free(owner_hex);
-    const approved_hex = try approved.toHex(db.allocator);
-    defer db.allocator.free(approved_hex);
-    const tx_hash_hex = try tx_hash.toHex(db.allocator);
-    defer db.allocator.free(tx_hash_hex);
-    const timestamp = std.time.timestamp();
 
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 2, token_id_str.ptr, @intCast(token_id_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 3, owner_hex.ptr, @intCast(owner_hex.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 4, approved_hex.ptr, @intCast(approved_hex.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 5, @intCast(block_number));
-    _ = c.sqlite3_bind_text(stmt, 6, tx_hash_hex.ptr, @intCast(tx_hash_hex.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 7, timestamp);
+    try q.bindTextStatic(chain.toString());
+    try q.bindText(token_id_str);
+    try q.bindAddress(owner);
+    try q.bindAddress(approved);
+    try q.bindInt64(@intCast(block_number));
+    try q.bindHash(tx_hash);
+    try q.bindInt64(std.time.timestamp());
 
-    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
-        std.log.err("Failed to insert approval: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.InsertFailed;
-    }
+    try q.exec();
 }
 
 // ============================================================================
@@ -533,11 +416,8 @@ fn createTestEvent(
     block_number: u64,
     timestamp: i64,
 ) !models.Event {
-    // Generate unique tx_hash based on counter to avoid UNIQUE constraint violations
-    // Events table has UNIQUE(chain, tx_hash, log_index) constraint
     test_event_counter += 1;
 
-    // Create a unique tx_hash by embedding the counter in the hash
     var tx_hash_bytes: [32]u8 = undefined;
     @memset(&tx_hash_bytes, 0);
     std.mem.writeInt(u32, tx_hash_bytes[0..4], test_event_counter, .big);
@@ -562,7 +442,6 @@ test "EventFilterOptions - filter by event type" {
     var database = try Database.init(allocator, ":memory:");
     defer database.deinit();
 
-    // Insert test events
     var event1 = try createTestEvent(allocator, .transfer, "test.eth", "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef", 100, 1000);
     defer event1.deinit(allocator);
     try insertEvent(&database, event1);
@@ -575,7 +454,6 @@ test "EventFilterOptions - filter by event type" {
     defer event3.deinit(allocator);
     try insertEvent(&database, event3);
 
-    // Test filter by event type
     const transfer_events = try getEventsFiltered(&database, .{
         .event_type = "Transfer",
         .limit = 100,
@@ -680,7 +558,6 @@ test "EventFilterOptions - filter by block number range" {
     defer event4.deinit(allocator);
     try insertEvent(&database, event4);
 
-    // Test block range filter (150 < block < 350)
     const range_events = try getEventsFiltered(&database, .{
         .block_number_gt = 150,
         .block_number_lt = 350,
@@ -716,7 +593,6 @@ test "EventFilterOptions - filter by timestamp range" {
     defer event3.deinit(allocator);
     try insertEvent(&database, event3);
 
-    // Test timestamp range filter (1500 < timestamp < 2500)
     const range_events = try getEventsFiltered(&database, .{
         .timestamp_gt = 1500,
         .timestamp_lt = 2500,
@@ -755,7 +631,6 @@ test "EventFilterOptions - combined filters" {
     defer event4.deinit(allocator);
     try insertEvent(&database, event4);
 
-    // Test combined filter: Transfer events for combo.eth between blocks 50-180
     const combo_events = try getEventsFiltered(&database, .{
         .event_type = "Transfer",
         .domain = "combo.eth",
@@ -795,7 +670,6 @@ test "EventFilterOptions - multiple event types (type_in)" {
     defer event4.deinit(allocator);
     try insertEvent(&database, event4);
 
-    // Test filter with multiple types
     const types = [_][]const u8{ "Transfer", "NameRegistered" };
     const multi_type_events = try getEventsFiltered(&database, .{
         .event_types = &types,
@@ -878,7 +752,6 @@ test "EventFilterOptions - limit parameter" {
     var database = try Database.init(allocator, ":memory:");
     defer database.deinit();
 
-    // Insert many events
     var i: u64 = 0;
     while (i < 20) : (i += 1) {
         var event = try createTestEvent(allocator, .transfer, "test.eth", null, 100 + i, @intCast(1000 + i));
@@ -886,7 +759,6 @@ test "EventFilterOptions - limit parameter" {
         try insertEvent(&database, event);
     }
 
-    // Test with limit
     const limited_events = try getEventsFiltered(&database, .{
         .limit = 5,
     });
@@ -916,7 +788,6 @@ test "EventFilterOptions - ordering (desc by default)" {
     defer event3.deinit(allocator);
     try insertEvent(&database, event3);
 
-    // Test default ordering (desc)
     const desc_events = try getEventsFiltered(&database, .{
         .limit = 100,
         .order_dir = .desc,
@@ -931,7 +802,6 @@ test "EventFilterOptions - ordering (desc by default)" {
     try std.testing.expectEqual(@as(u64, 200), desc_events[1].block_number);
     try std.testing.expectEqual(@as(u64, 100), desc_events[2].block_number);
 
-    // Test ascending ordering
     const asc_events = try getEventsFiltered(&database, .{
         .limit = 100,
         .order_dir = .asc,
@@ -957,7 +827,6 @@ test "EventFilterOptions - empty result" {
     defer event.deinit(allocator);
     try insertEvent(&database, event);
 
-    // Query for non-existent domain
     const no_events = try getEventsFiltered(&database, .{
         .domain = "nonexistent.eth",
         .limit = 100,
@@ -973,7 +842,6 @@ test "EventFilterOptions - all V2 event types" {
     var database = try Database.init(allocator, ":memory:");
     defer database.deinit();
 
-    // Insert one of each event type to verify they can all be stored and queried
     const event_types = [_]models.EventType{
         .new_subname,
         .subregistry_update,
@@ -1005,7 +873,6 @@ test "EventFilterOptions - all V2 event types" {
         try insertEvent(&database, event);
     }
 
-    // Query all events
     const all_events = try getEventsFiltered(&database, .{
         .limit = 100,
     });
@@ -1016,7 +883,6 @@ test "EventFilterOptions - all V2 event types" {
 
     try std.testing.expectEqual(event_types.len, all_events.len);
 
-    // Verify each type can be filtered
     for (event_types) |et| {
         const type_events = try getEventsFiltered(&database, .{
             .event_type = et.toString(),

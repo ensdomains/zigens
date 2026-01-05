@@ -78,9 +78,9 @@ pub const Config = struct {
                 }
             },
             .poll_interval = env_mod.getEnvInt(&env_map, u64, "POLL_INTERVAL", 12),
-            .batch_size = env_mod.getEnvInt(&env_map, u64, "BATCH_SIZE", 1000),
-            .max_blocks_per_request = env_mod.getEnvInt(&env_map, u64, "MAX_BLOCKS_PER_REQUEST", 1000),
-            .rate_limit_per_second = env_mod.getEnvInt(&env_map, u32, "RATE_LIMIT_PER_SECOND", 10),
+            .batch_size = env_mod.getEnvInt(&env_map, u64, "BATCH_SIZE", 2000),
+            .max_blocks_per_request = env_mod.getEnvInt(&env_map, u64, "MAX_BLOCKS_PER_REQUEST", 2000),
+            .rate_limit_per_second = env_mod.getEnvInt(&env_map, u32, "RATE_LIMIT_PER_SECOND", 15),
             .api_port = env_mod.getEnvInt(&env_map, u16, "API_PORT", 8080),
             .api_enabled = env_mod.getEnvBool(&env_map, "API_ENABLED", true),
             .status_port = blk: {

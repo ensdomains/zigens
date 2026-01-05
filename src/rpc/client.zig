@@ -165,6 +165,65 @@ pub const Client = struct {
         return self.request_id.fetchAdd(1, .monotonic);
     }
 
+    /// Execute curl with retry logic and exponential backoff
+    /// Returns stdout on success, error on failure after all retries exhausted
+    fn executeCurlWithRetry(self: *Client, arena_allocator: std.mem.Allocator, request_body: []const u8) ![]const u8 {
+        const max_retries: u32 = 3;
+        var attempt: u32 = 0;
+        var last_error: ?anyerror = null;
+
+        while (attempt < max_retries) : (attempt += 1) {
+            // Exponential backoff: 0ms, 1000ms, 2000ms, 4000ms
+            if (attempt > 0) {
+                const delay_ms: u64 = @as(u64, 1000) * (@as(u64, 1) << @intCast(attempt - 1));
+                std.log.warn("RPC request failed, retrying in {d}ms (attempt {d}/{d})", .{ delay_ms, attempt + 1, max_retries });
+                std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+            }
+
+            const curl_result = std.process.Child.run(.{
+                .allocator = arena_allocator,
+                .argv = &.{
+                    "curl",
+                    "-s", // Silent mode
+                    "--connect-timeout",
+                    "30", // 30 second connection timeout
+                    "--max-time",
+                    "120", // 120 second total timeout
+                    "-X",
+                    "POST",
+                    "-H",
+                    "Content-Type: application/json",
+                    "-d",
+                    request_body,
+                    self.rpc_url,
+                },
+                .max_output_bytes = 10 * 1024 * 1024, // 10MB max response
+            }) catch |err| {
+                last_error = err;
+                std.log.warn("curl spawn error: {}", .{err});
+                continue;
+            };
+
+            if (curl_result.term != .Exited or curl_result.term.Exited != 0) {
+                last_error = error.HttpError;
+                std.log.warn("curl process failed with exit: {}", .{curl_result.term});
+                continue;
+            }
+
+            // Check for empty response (network issues sometimes return empty)
+            if (curl_result.stdout.len == 0) {
+                last_error = error.HttpError;
+                std.log.warn("curl returned empty response", .{});
+                continue;
+            }
+
+            return curl_result.stdout;
+        }
+
+        std.log.err("RPC request failed after {d} retries", .{max_retries});
+        return last_error orelse error.HttpError;
+    }
+
     fn makeRpcCall(self: *Client, method: []const u8, params: anytype) !std.json.Parsed(std.json.Value) {
         const request_id = self.nextRequestId();
 
@@ -203,32 +262,16 @@ pub const Client = struct {
 
         try writer.writeAll("}");
 
-        // WORKAROUND: Zig 0.15.1 TLS has cipher suite compatibility issues with many RPC providers.
-        // Use curl which has mature TLS support until Zig's TLS implementation improves.
-        // See: https://github.com/ziglang/zig/issues/17213
-        const curl_result = try std.process.Child.run(.{
-            .allocator = arena_allocator,
-            .argv = &.{
-                "curl",
-                "-s",             // Silent mode
-                "-X",
-                "POST",
-                "-H",
-                "Content-Type: application/json",
-                "-d",
-                request_buf.items,
-                self.rpc_url,
-            },
-            .max_output_bytes = 10 * 1024 * 1024, // 10MB max response
-        });
-
-        if (curl_result.term != .Exited or curl_result.term.Exited != 0) {
-            std.log.err("curl process failed: {}", .{curl_result.term});
-            return error.HttpError;
-        }
+        // Execute curl with retry logic
+        const response_body = try self.executeCurlWithRetry(arena_allocator, request_buf.items);
 
         // Parse JSON response with main allocator (result will outlive this function)
-        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, curl_result.stdout, .{});
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response_body, .{}) catch |err| {
+            // Log the first 500 chars of response to help debug non-JSON responses (rate limiting, HTML errors, etc.)
+            const preview_len = @min(response_body.len, 500);
+            std.log.err("Failed to parse RPC response as JSON ({s}): {s}", .{ method, response_body[0..preview_len] });
+            return err;
+        };
         errdefer parsed.deinit();
 
         const response = parsed.value.object;
@@ -274,30 +317,16 @@ pub const Client = struct {
 
         try writer.writeAll("]");
 
-        // Use curl for the HTTP request (same as makeRpcCall)
-        const curl_result = try std.process.Child.run(.{
-            .allocator = arena_allocator,
-            .argv = &.{
-                "curl",
-                "-s",
-                "-X",
-                "POST",
-                "-H",
-                "Content-Type: application/json",
-                "-d",
-                request_buf.items,
-                self.rpc_url,
-            },
-            .max_output_bytes = 10 * 1024 * 1024, // 10MB max response
-        });
-
-        if (curl_result.term != .Exited or curl_result.term.Exited != 0) {
-            std.log.err("curl process failed: {}", .{curl_result.term});
-            return error.HttpError;
-        }
+        // Execute curl with retry logic
+        const response_body = try self.executeCurlWithRetry(arena_allocator, request_buf.items);
 
         // Parse JSON response with main allocator (result will outlive this function)
-        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, curl_result.stdout, .{});
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response_body, .{}) catch |err| {
+            // Log the first 500 chars of response to help debug non-JSON responses (rate limiting, HTML errors, etc.)
+            const preview_len = @min(response_body.len, 500);
+            std.log.err("Failed to parse batch RPC response as JSON: {s}", .{response_body[0..preview_len]});
+            return err;
+        };
         errdefer parsed.deinit();
 
         // Batch responses are returned as an array

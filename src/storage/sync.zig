@@ -1,42 +1,26 @@
 const std = @import("std");
 const db_module = @import("database.zig");
 const Database = db_module.Database;
-const c = db_module.c;
+const Query = db_module.Query;
 const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
 
-// SQLITE_TRANSIENT - For Zig 0.15.1, we can't use the C constant due to alignment issues
-// Instead, we use null which tells SQLite to make a copy of the string
-inline fn SQLITE_TRANSIENT() c.sqlite3_destructor_type {
-    return null;
-}
-
 // ============================================================================
-// SYNC/MIGRATION OPERATIONS (14 functions)
+// SYNC/MIGRATION OPERATIONS
 // ============================================================================
 
 pub fn getSyncState(db: *Database, chain: models.Chain) !?u64 {
     const sql = "SELECT last_synced_block FROM sync_state WHERE chain = ?";
 
-    const sql_z = try db.allocator.dupeZ(u8, sql);
-    defer db.allocator.free(sql_z);
+    var q = try Query.init(db, sql);
+    defer q.deinit();
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    const prepare_result = c.sqlite3_prepare_v2(db.db, sql_z.ptr, -1, &stmt, null);
-    if (prepare_result != c.SQLITE_OK) {
-        std.log.err("Failed to prepare SQL statement: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.PrepareFailed;
+    try q.bindTextStatic(chain.toString());
+
+    if (try q.step()) {
+        return @intCast(q.getInt64(0));
     }
-    defer _ = c.sqlite3_finalize(stmt);
-
-    const chain_str = chain.toString();
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), c.SQLITE_STATIC);
-
-    if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        return @intCast(c.sqlite3_column_int64(stmt, 0));
-    }
-
     return null;
 }
 
@@ -46,28 +30,14 @@ pub fn setSyncState(db: *Database, chain: models.Chain, block: u64) !void {
         \\VALUES (?, ?, ?)
     ;
 
-    const sql_z = try db.allocator.dupeZ(u8, sql);
-    defer db.allocator.free(sql_z);
+    var q = try Query.init(db, sql);
+    defer q.deinit();
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    const prepare_result = c.sqlite3_prepare_v2(db.db, sql_z.ptr, -1, &stmt, null);
-    if (prepare_result != c.SQLITE_OK) {
-        std.log.err("Failed to prepare SQL statement: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.PrepareFailed;
-    }
-    defer _ = c.sqlite3_finalize(stmt);
+    try q.bindTextStatic(chain.toString());
+    try q.bindInt64(@intCast(block));
+    try q.bindInt64(std.time.timestamp());
 
-    const chain_str = chain.toString();
-    const now = std.time.timestamp();
-
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), c.SQLITE_STATIC);
-    _ = c.sqlite3_bind_int64(stmt, 2, @intCast(block));
-    _ = c.sqlite3_bind_int64(stmt, 3, now);
-
-    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
-        std.log.err("Failed to set sync state: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.UpdateFailed;
-    }
+    try q.exec();
 }
 
 pub fn storeBlockHash(db: *Database, chain: models.Chain, block_number: u64, block_hash: Hash, parent_hash: Hash) !void {
@@ -77,70 +47,31 @@ pub fn storeBlockHash(db: *Database, chain: models.Chain, block_number: u64, blo
         \\VALUES (?, ?, ?, ?, ?)
     ;
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    defer {
-        if (stmt) |s| _ = c.sqlite3_finalize(s);
-    }
+    var q = try Query.init(db, sql);
+    defer q.deinit();
 
-    if (c.sqlite3_prepare_v2(db.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
-        std.log.err("Failed to prepare statement: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.PrepareFailed;
-    }
+    try q.bindTextStatic(chain.toString());
+    try q.bindInt64(@intCast(block_number));
+    try q.bindHash(block_hash);
+    try q.bindHash(parent_hash);
+    try q.bindInt64(std.time.timestamp());
 
-    const chain_str = chain.toString();
-    // Format hashes manually
-    var block_hash_hex: [66]u8 = undefined;
-    block_hash_hex[0] = '0';
-    block_hash_hex[1] = 'x';
-    for (block_hash.bytes, 0..) |byte, i| {
-        _ = std.fmt.bufPrint(block_hash_hex[2 + i * 2 ..][0..2], "{x:0>2}", .{byte}) catch unreachable;
-    }
-
-    var parent_hash_hex: [66]u8 = undefined;
-    parent_hash_hex[0] = '0';
-    parent_hash_hex[1] = 'x';
-    for (parent_hash.bytes, 0..) |byte, i| {
-        _ = std.fmt.bufPrint(parent_hash_hex[2 + i * 2 ..][0..2], "{x:0>2}", .{byte}) catch unreachable;
-    }
-
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 2, @intCast(block_number));
-    _ = c.sqlite3_bind_text(stmt, 3, block_hash_hex[0..66].ptr, 66, SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 4, parent_hash_hex[0..66].ptr, 66, SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 5, std.time.timestamp());
-
-    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
-        std.log.err("Failed to store block hash: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.InsertFailed;
-    }
+    try q.exec();
 }
 
 /// Get stored block hash for reorg detection
 pub fn getBlockHash(db: *Database, chain: models.Chain, block_number: u64) !?Hash {
     const sql = "SELECT block_hash FROM block_hashes WHERE chain = ? AND block_number = ?";
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    defer {
-        if (stmt) |s| _ = c.sqlite3_finalize(s);
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+
+    try q.bindTextStatic(chain.toString());
+    try q.bindInt64(@intCast(block_number));
+
+    if (try q.step()) {
+        return try q.getHash(0);
     }
-
-    if (c.sqlite3_prepare_v2(db.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
-        return error.PrepareFailed;
-    }
-
-    const chain_str = chain.toString();
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 2, @intCast(block_number));
-
-    if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const hash_text = c.sqlite3_column_text(stmt, 0);
-        const hash_len = c.sqlite3_column_bytes(stmt, 0);
-        if (hash_text != null and hash_len > 0) {
-            const hash_slice = hash_text[0..@intCast(hash_len)];
-            return try Hash.fromHex(hash_slice);
-        }
-    }
-
     return null;
 }
 
@@ -149,39 +80,25 @@ pub fn rollbackToBlock(db: *Database, chain: models.Chain, block_number: u64) !v
     const chain_str = chain.toString();
 
     // Delete events
-    const delete_events = "DELETE FROM events WHERE chain = ? AND block_number > ?";
-    var stmt: ?*c.sqlite3_stmt = null;
-    defer {
-        if (stmt) |s| _ = c.sqlite3_finalize(s);
+    {
+        const delete_events = "DELETE FROM events WHERE chain = ? AND block_number > ?";
+        var q = try Query.init(db, delete_events);
+        defer q.deinit();
+
+        try q.bindTextStatic(chain_str);
+        try q.bindInt64(@intCast(block_number));
+        try q.exec();
     }
-
-    if (c.sqlite3_prepare_v2(db.db, delete_events, -1, &stmt, null) != c.SQLITE_OK) {
-        return error.PrepareFailed;
-    }
-
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 2, @intCast(block_number));
-
-    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
-        std.log.err("Failed to delete events during rollback: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.RollbackFailed;
-    }
-
-    _ = c.sqlite3_finalize(stmt);
-    stmt = null;
 
     // Delete block hashes
-    const delete_blocks = "DELETE FROM block_hashes WHERE chain = ? AND block_number > ?";
-    if (c.sqlite3_prepare_v2(db.db, delete_blocks, -1, &stmt, null) != c.SQLITE_OK) {
-        return error.PrepareFailed;
-    }
+    {
+        const delete_blocks = "DELETE FROM block_hashes WHERE chain = ? AND block_number > ?";
+        var q = try Query.init(db, delete_blocks);
+        defer q.deinit();
 
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 2, @intCast(block_number));
-
-    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
-        std.log.err("Failed to delete block hashes during rollback: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.RollbackFailed;
+        try q.bindTextStatic(chain_str);
+        try q.bindInt64(@intCast(block_number));
+        try q.exec();
     }
 
     // Update sync state
@@ -198,44 +115,23 @@ pub fn pruneOldBlockHashes(db: *Database, chain: models.Chain, current_block: u6
     const cutoff_block = current_block - keep_blocks;
     const sql = "DELETE FROM block_hashes WHERE chain = ? AND block_number < ?";
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    defer {
-        if (stmt) |s| _ = c.sqlite3_finalize(s);
-    }
+    var q = try Query.init(db, sql);
+    defer q.deinit();
 
-    if (c.sqlite3_prepare_v2(db.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
-        return error.PrepareFailed;
-    }
-
-    const chain_str = chain.toString();
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 2, @intCast(cutoff_block));
-
-    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
-        std.log.err("Failed to prune old block hashes: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.PruneFailed;
-    }
+    try q.bindTextStatic(chain.toString());
+    try q.bindInt64(@intCast(cutoff_block));
+    try q.exec();
 }
 
 /// Verify database integrity (uses quick_check for performance on large databases)
 pub fn checkIntegrity(db: *Database) !bool {
-    // quick_check is much faster than integrity_check on large databases
-    // It skips verifying that index content matches table content
     const sql = "PRAGMA quick_check";
-    var stmt: ?*c.sqlite3_stmt = null;
-    defer {
-        if (stmt) |s| _ = c.sqlite3_finalize(s);
-    }
 
-    if (c.sqlite3_prepare_v2(db.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
-        return error.PrepareFailed;
-    }
+    var q = try Query.init(db, sql);
+    defer q.deinit();
 
-    if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const result = c.sqlite3_column_text(stmt, 0);
-        if (result != null) {
-            const result_len = c.sqlite3_column_bytes(stmt, 0);
-            const result_slice = result[0..@intCast(result_len)];
+    if (try q.step()) {
+        if (q.getTextSlice(0)) |result_slice| {
             const is_ok = std.mem.eql(u8, result_slice, "ok");
             if (!is_ok) {
                 std.log.err("Database integrity check failed: {s}", .{result_slice});
@@ -243,7 +139,6 @@ pub fn checkIntegrity(db: *Database) !bool {
             return is_ok;
         }
     }
-
     return false;
 }
 
@@ -256,24 +151,15 @@ pub fn registerSubregistry(db: *Database, chain: models.Chain, address: []const 
         \\  last_indexed_block = MAX(last_indexed_block, excluded.last_indexed_block)
     ;
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    defer {
-        if (stmt) |s| _ = c.sqlite3_finalize(s);
-    }
+    var q = try Query.init(db, sql);
+    defer q.deinit();
 
-    if (c.sqlite3_prepare_v2(db.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
-        return error.PrepareFailed;
-    }
+    try q.bindTextStatic(chain.toString());
+    try q.bindText(address);
+    try q.bindInt64(@intCast(block_number));
+    try q.bindInt64(@intCast(block_number));
 
-    const chain_str = chain.toString();
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 2, address.ptr, @intCast(address.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 3, @intCast(block_number));
-    _ = c.sqlite3_bind_int64(stmt, 4, @intCast(block_number));
-
-    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
-        return error.ExecuteFailed;
-    }
+    try q.exec();
 }
 
 /// Register or update a known resolver
@@ -285,29 +171,22 @@ pub fn registerResolver(db: *Database, chain: models.Chain, address: []const u8,
         \\  last_indexed_block = MAX(last_indexed_block, excluded.last_indexed_block)
     ;
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    defer {
-        if (stmt) |s| _ = c.sqlite3_finalize(s);
-    }
+    var q = try Query.init(db, sql);
+    defer q.deinit();
 
-    if (c.sqlite3_prepare_v2(db.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
-        return error.PrepareFailed;
-    }
+    try q.bindTextStatic(chain.toString());
+    try q.bindText(address);
+    try q.bindInt64(@intCast(block_number));
+    try q.bindInt64(@intCast(block_number));
 
-    const chain_str = chain.toString();
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 2, address.ptr, @intCast(address.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 3, @intCast(block_number));
-    _ = c.sqlite3_bind_int64(stmt, 4, @intCast(block_number));
-
-    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
-        return error.ExecuteFailed;
-    }
+    try q.exec();
 }
 
 /// Get subregistries to index for a block range
 /// Uses cache table for O(1) lookup, falls back to full scan on first run
 pub fn getSubregistriesToIndex(db: *Database, chain: models.Chain, main_registry: []const u8, from_block: u64, to_block: u64) ![][]u8 {
+    const chain_str = chain.toString();
+
     // First, discover any NEW subregistries from registries table (only those registered in this block range)
     const discover_sql =
         \\SELECT DISTINCT r.address
@@ -321,31 +200,22 @@ pub fn getSubregistriesToIndex(db: *Database, chain: models.Chain, main_registry
         \\  AND ks.address IS NULL
     ;
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    defer {
-        if (stmt) |s| _ = c.sqlite3_finalize(s);
-    }
+    {
+        var q = try Query.init(db, discover_sql);
+        defer q.deinit();
 
-    if (c.sqlite3_prepare_v2(db.db, discover_sql, -1, &stmt, null) != c.SQLITE_OK) {
-        return error.PrepareFailed;
-    }
+        try q.bindTextStatic(chain_str);
+        try q.bindText(main_registry);
+        try q.bindInt64(@intCast(from_block));
+        try q.bindInt64(@intCast(to_block));
 
-    const chain_str = chain.toString();
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 2, main_registry.ptr, @intCast(main_registry.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 3, @intCast(from_block));
-    _ = c.sqlite3_bind_int64(stmt, 4, @intCast(to_block));
-
-    // Register newly discovered subregistries
-    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const addr_text = c.sqlite3_column_text(stmt, 0);
-        if (addr_text != null) {
-            const addr_len = c.sqlite3_column_bytes(stmt, 0);
-            const addr_slice = addr_text[0..@intCast(addr_len)];
-            try db.registerSubregistry(chain, addr_slice, from_block);
+        // Register newly discovered subregistries
+        while (try q.step()) {
+            if (q.getTextSlice(0)) |addr_slice| {
+                try db.registerSubregistry(chain, addr_slice, from_block);
+            }
         }
     }
-    _ = c.sqlite3_finalize(stmt);
 
     // Now get ALL known subregistries from cache (very fast)
     const get_sql =
@@ -354,11 +224,10 @@ pub fn getSubregistriesToIndex(db: *Database, chain: models.Chain, main_registry
         \\ORDER BY address
     ;
 
-    if (c.sqlite3_prepare_v2(db.db, get_sql, -1, &stmt, null) != c.SQLITE_OK) {
-        return error.PrepareFailed;
-    }
+    var q2 = try Query.init(db, get_sql);
+    defer q2.deinit();
 
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
+    try q2.bindTextStatic(chain_str);
 
     var subregistries: std.ArrayList([]u8) = .{};
     errdefer {
@@ -368,13 +237,9 @@ pub fn getSubregistriesToIndex(db: *Database, chain: models.Chain, main_registry
         subregistries.deinit(db.allocator);
     }
 
-    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const addr_text = c.sqlite3_column_text(stmt, 0);
-        if (addr_text != null) {
-            const addr_len = c.sqlite3_column_bytes(stmt, 0);
-            const addr_slice = addr_text[0..@intCast(addr_len)];
-            const addr_copy = try db.allocator.dupe(u8, addr_slice);
-            try subregistries.append(db.allocator, addr_copy);
+    while (try q2.step()) {
+        if (try q2.getText(0)) |addr| {
+            try subregistries.append(db.allocator, addr);
         }
     }
 
@@ -389,38 +254,22 @@ pub fn insertMigration(db: *Database, chain: models.Chain, token_id: u256, direc
         \\VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ;
 
-    const sql_z = try db.allocator.dupeZ(u8, sql);
-    defer db.allocator.free(sql_z);
+    var q = try Query.init(db, sql);
+    defer q.deinit();
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    const prepare_result = c.sqlite3_prepare_v2(db.db, sql_z.ptr, -1, &stmt, null);
-    if (prepare_result != c.SQLITE_OK) {
-        std.log.err("Failed to prepare SQL statement: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.PrepareFailed;
-    }
-    defer _ = c.sqlite3_finalize(stmt);
-
-    const chain_str = chain.toString();
     const token_id_str = try std.fmt.allocPrint(db.allocator, "{d}", .{token_id});
     defer db.allocator.free(token_id_str);
-    const direction_str = direction.toString();
-    const tx_hash_hex = try tx_hash.toHex(db.allocator);
-    defer db.allocator.free(tx_hash_hex);
-    const timestamp = std.time.timestamp();
 
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 2, token_id_str.ptr, @intCast(token_id_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 3, direction_str.ptr, @intCast(direction_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 4, dns_encoded_name.ptr, @intCast(dns_encoded_name.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 5, @intCast(block_number));
-    _ = c.sqlite3_bind_text(stmt, 6, tx_hash_hex.ptr, @intCast(tx_hash_hex.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int(stmt, 7, @intCast(log_index));
-    _ = c.sqlite3_bind_int64(stmt, 8, timestamp);
+    try q.bindTextStatic(chain.toString());
+    try q.bindText(token_id_str);
+    try q.bindTextStatic(direction.toString());
+    try q.bindText(dns_encoded_name);
+    try q.bindInt64(@intCast(block_number));
+    try q.bindHash(tx_hash);
+    try q.bindInt(@intCast(log_index));
+    try q.bindInt64(std.time.timestamp());
 
-    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
-        std.log.err("Failed to insert migration: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.InsertFailed;
-    }
+    try q.exec();
 }
 
 /// Insert a renewal sync event
@@ -431,36 +280,21 @@ pub fn insertRenewalSync(db: *Database, chain: models.Chain, token_id: u256, new
         \\VALUES (?, ?, ?, ?, ?, ?, ?)
     ;
 
-    const sql_z = try db.allocator.dupeZ(u8, sql);
-    defer db.allocator.free(sql_z);
+    var q = try Query.init(db, sql);
+    defer q.deinit();
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    const prepare_result = c.sqlite3_prepare_v2(db.db, sql_z.ptr, -1, &stmt, null);
-    if (prepare_result != c.SQLITE_OK) {
-        std.log.err("Failed to prepare SQL statement: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.PrepareFailed;
-    }
-    defer _ = c.sqlite3_finalize(stmt);
-
-    const chain_str = chain.toString();
     const token_id_str = try std.fmt.allocPrint(db.allocator, "{d}", .{token_id});
     defer db.allocator.free(token_id_str);
-    const tx_hash_hex = try tx_hash.toHex(db.allocator);
-    defer db.allocator.free(tx_hash_hex);
-    const timestamp = std.time.timestamp();
 
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 2, token_id_str.ptr, @intCast(token_id_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 3, @intCast(new_expiry));
-    _ = c.sqlite3_bind_int64(stmt, 4, @intCast(block_number));
-    _ = c.sqlite3_bind_text(stmt, 5, tx_hash_hex.ptr, @intCast(tx_hash_hex.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int(stmt, 6, @intCast(log_index));
-    _ = c.sqlite3_bind_int64(stmt, 7, timestamp);
+    try q.bindTextStatic(chain.toString());
+    try q.bindText(token_id_str);
+    try q.bindInt64(@intCast(new_expiry));
+    try q.bindInt64(@intCast(block_number));
+    try q.bindHash(tx_hash);
+    try q.bindInt(@intCast(log_index));
+    try q.bindInt64(std.time.timestamp());
 
-    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
-        std.log.err("Failed to insert renewal sync: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.InsertFailed;
-    }
+    try q.exec();
 }
 
 /// Insert a token observer event
@@ -471,38 +305,21 @@ pub fn insertTokenObserver(db: *Database, chain: models.Chain, token_id: u256, o
         \\VALUES (?, ?, ?, ?, ?, ?, ?)
     ;
 
-    const sql_z = try db.allocator.dupeZ(u8, sql);
-    defer db.allocator.free(sql_z);
+    var q = try Query.init(db, sql);
+    defer q.deinit();
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    const prepare_result = c.sqlite3_prepare_v2(db.db, sql_z.ptr, -1, &stmt, null);
-    if (prepare_result != c.SQLITE_OK) {
-        std.log.err("Failed to prepare SQL statement: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.PrepareFailed;
-    }
-    defer _ = c.sqlite3_finalize(stmt);
-
-    const chain_str = chain.toString();
     const token_id_str = try std.fmt.allocPrint(db.allocator, "{d}", .{token_id});
     defer db.allocator.free(token_id_str);
-    const observer_hex = try observer.toHex(db.allocator);
-    defer db.allocator.free(observer_hex);
-    const tx_hash_hex = try tx_hash.toHex(db.allocator);
-    defer db.allocator.free(tx_hash_hex);
-    const timestamp = std.time.timestamp();
 
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 2, token_id_str.ptr, @intCast(token_id_str.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 3, observer_hex.ptr, @intCast(observer_hex.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 4, @intCast(block_number));
-    _ = c.sqlite3_bind_text(stmt, 5, tx_hash_hex.ptr, @intCast(tx_hash_hex.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int(stmt, 6, @intCast(log_index));
-    _ = c.sqlite3_bind_int64(stmt, 7, timestamp);
+    try q.bindTextStatic(chain.toString());
+    try q.bindText(token_id_str);
+    try q.bindAddress(observer);
+    try q.bindInt64(@intCast(block_number));
+    try q.bindHash(tx_hash);
+    try q.bindInt(@intCast(log_index));
+    try q.bindInt64(std.time.timestamp());
 
-    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
-        std.log.err("Failed to insert token observer: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.InsertFailed;
-    }
+    try q.exec();
 }
 
 /// Delete all data after a specific block (for clean re-indexing)
@@ -538,24 +355,13 @@ pub fn deleteDataAfterBlock(db: *Database, block_number: u64) !void {
         );
         defer db.allocator.free(sql);
 
-        const sql_z = try db.allocator.dupeZ(u8, sql);
-        defer db.allocator.free(sql_z);
+        var q = try Query.init(db, sql);
+        defer q.deinit();
 
-        var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db.db, sql_z.ptr, -1, &stmt, null) != c.SQLITE_OK) {
-            std.log.err("Failed to prepare delete for {s}: {s}", .{ table.name, c.sqlite3_errmsg(db.db) });
-            return error.PrepareFailed;
-        }
-        defer _ = c.sqlite3_finalize(stmt);
+        try q.bindInt64(@intCast(block_number));
+        try q.exec();
 
-        _ = c.sqlite3_bind_int64(stmt, 1, @intCast(block_number));
-
-        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
-            std.log.err("Failed to delete from {s}: {s}", .{ table.name, c.sqlite3_errmsg(db.db) });
-            return error.DeleteFailed;
-        }
-
-        const deleted = c.sqlite3_changes(db.db);
+        const deleted = q.changes();
         if (deleted > 0) {
             std.log.info("  Deleted {d} rows from {s}", .{ deleted, table.name });
         }
