@@ -403,6 +403,47 @@ pub fn insertApproval(db: *Database, chain: models.Chain, token_id: u256, owner:
 }
 
 // ============================================================================
+// AGGREGATION OPERATIONS
+// ============================================================================
+
+/// Get total count of all events in the database
+pub fn getTotalEventCount(db: *Database) !usize {
+    var q = try Query.init(db, "SELECT COUNT(*) FROM events");
+    defer q.deinit();
+
+    if (try q.step()) {
+        return @intCast(q.getInt64(0));
+    }
+    return 0;
+}
+
+/// Count events for a specific domain (by namehash)
+pub fn countEventsByNamehash(db: *Database, namehash: Hash) !usize {
+    var q = try Query.init(db, "SELECT COUNT(*) FROM events WHERE namehash = ?");
+    defer q.deinit();
+
+    try q.bindHash(namehash);
+
+    if (try q.step()) {
+        return @intCast(q.getInt64(0));
+    }
+    return 0;
+}
+
+/// Count events for a specific domain (by name)
+pub fn countEventsByDomain(db: *Database, domain_name: []const u8) !usize {
+    var q = try Query.init(db, "SELECT COUNT(*) FROM events WHERE name = ?");
+    defer q.deinit();
+
+    try q.bindText(domain_name);
+
+    if (try q.step()) {
+        return @intCast(q.getInt64(0));
+    }
+    return 0;
+}
+
+// ============================================================================
 // TESTS
 // ============================================================================
 

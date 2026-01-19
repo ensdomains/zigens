@@ -334,6 +334,7 @@ pub const Database = struct {
     pub const hasDirectSubdomains = names.hasDirectSubdomains;
     pub const getSubdomains = names.getSubdomains;
     pub const updateRegistryPlaceholderName = names.updateRegistryPlaceholderName;
+    pub const getTotalNameCount = names.getTotalNameCount;
 
     // Resolver module (11 functions)
     pub const storeResolverAddress = resolvers.storeResolverAddress;
@@ -374,6 +375,9 @@ pub const Database = struct {
     pub const getEventsByNamehash = events.getEventsByNamehash;
     pub const getEventsByDomain = events.getEventsByDomain;
     pub const insertApproval = events.insertApproval;
+    pub const getTotalEventCount = events.getTotalEventCount;
+    pub const countEventsByNamehash = events.countEventsByNamehash;
+    pub const countEventsByDomain = events.countEventsByDomain;
 
     // Webhooks module (3 functions)
     pub const insertWebhook = webhooks.insertWebhook;
@@ -407,4 +411,5 @@ pub const Database = struct {
     // to avoid duplicates from non-authoritative contracts
     pub const RegistrationFilterOptions = registrations.RegistrationFilterOptions;
     pub const getRegistrations = registrations.getRegistrations;
+    pub const getTotalRegistrationCount = registrations.getTotalRegistrationCount;
 };

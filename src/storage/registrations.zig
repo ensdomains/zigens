@@ -99,6 +99,62 @@ pub fn getRegistrations(database: *Database, filter: RegistrationFilterOptions) 
 }
 
 // ============================================================================
+// AGGREGATION OPERATIONS
+// ============================================================================
+
+/// Get total count of registrations (NameRegistered events from canonical registries)
+pub fn getTotalRegistrationCount(database: *Database) !usize {
+    const allocator = database.allocator;
+    const canonical_addresses = try getCanonicalRegistryAddresses(allocator);
+    defer {
+        for (canonical_addresses) |addr| {
+            allocator.free(addr);
+        }
+        allocator.free(canonical_addresses);
+    }
+
+    // Build SQL with IN clause for canonical addresses
+    var sql_buf: [512]u8 = undefined;
+    var sql_len: usize = 0;
+
+    const base = "SELECT COUNT(*) FROM events WHERE event_type = ?";
+    @memcpy(sql_buf[sql_len..][0..base.len], base);
+    sql_len += base.len;
+
+    if (canonical_addresses.len > 0) {
+        const and_in = " AND contract_address IN (";
+        @memcpy(sql_buf[sql_len..][0..and_in.len], and_in);
+        sql_len += and_in.len;
+
+        for (canonical_addresses, 0..) |_, i| {
+            if (i > 0) {
+                sql_buf[sql_len] = ',';
+                sql_len += 1;
+            }
+            sql_buf[sql_len] = '?';
+            sql_len += 1;
+        }
+
+        sql_buf[sql_len] = ')';
+        sql_len += 1;
+    }
+
+    var q = try db_module.Query.init(database, sql_buf[0..sql_len]);
+    defer q.deinit();
+
+    try q.bindTextStatic(models.EventType.name_registered.toString());
+
+    for (canonical_addresses) |addr| {
+        try q.bindText(addr);
+    }
+
+    if (try q.step()) {
+        return @intCast(q.getInt64(0));
+    }
+    return 0;
+}
+
+// ============================================================================
 // TESTS
 // ============================================================================
 
