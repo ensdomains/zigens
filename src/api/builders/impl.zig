@@ -832,6 +832,195 @@ fn domainIsNormalizedHandler(ctx: *anyopaque, field: *const parser.Field, nested
     return try nested_ctx.allocator.dupe(u8, "false");
 }
 
+/// Domain nested field handler: subdomainsCount (aggregation)
+fn domainSubdomainsCountHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    _ = field;
+    const domain: *const models.Name = @ptrCast(@alignCast(ctx));
+    const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+
+    if (domain.name) |parent_name| {
+        const count = try database.countDirectSubdomains(parent_name);
+        return try std.fmt.allocPrint(nested_ctx.allocator, "{d}", .{count});
+    }
+    return try nested_ctx.allocator.dupe(u8, "0");
+}
+
+/// Domain nested field handler: eventsCount (aggregation)
+fn domainEventsCountHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    _ = field;
+    const domain: *const models.Name = @ptrCast(@alignCast(ctx));
+    const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+
+    const count = try database.countEventsByNamehash(domain.namehash);
+    return try std.fmt.allocPrint(nested_ctx.allocator, "{d}", .{count});
+}
+
+/// Domain nested field handler: subdomainConnection (Relay-style connection)
+fn domainSubdomainConnectionHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    const domain: *const models.Name = @ptrCast(@alignCast(ctx));
+    const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+    const allocator = nested_ctx.allocator;
+
+    const first_arg = parser.getIntArg(field, "first", 10) orelse 10;
+    const limit: u32 = @intCast(@min(first_arg, 100));
+
+    var json: std.ArrayList(u8) = .{};
+    errdefer json.deinit(allocator);
+
+    if (domain.name) |parent_name| {
+        // Get total count
+        const total_count = try database.countDirectSubdomains(parent_name);
+
+        // Fetch one extra to determine hasNextPage
+        const subdomains = try database.getSubdomains(parent_name, 0, limit + 1);
+        defer {
+            for (subdomains) |*n| n.deinit(allocator);
+            allocator.free(subdomains);
+        }
+
+        const has_next = subdomains.len > limit;
+        const actual_count = @min(subdomains.len, limit);
+
+        // Extract node selections
+        var node_selections: []const parser.Field = &[_]parser.Field{};
+        for (field.selections) |*sel| {
+            if (std.mem.eql(u8, sel.name, "edges")) {
+                for (sel.selections) |*edge_sel| {
+                    if (std.mem.eql(u8, edge_sel.name, "node")) {
+                        node_selections = edge_sel.selections;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+
+        // Build connection JSON
+        try json.appendSlice(allocator, "{\"totalCount\":");
+        const count_str = try std.fmt.allocPrint(allocator, "{d}", .{total_count});
+        defer allocator.free(count_str);
+        try json.appendSlice(allocator, count_str);
+
+        try json.appendSlice(allocator, ",\"pageInfo\":{\"hasNextPage\":");
+        try json.appendSlice(allocator, if (has_next) "true" else "false");
+        try json.appendSlice(allocator, ",\"hasPreviousPage\":false}");
+
+        try json.appendSlice(allocator, ",\"edges\":[");
+        for (subdomains[0..actual_count], 0..) |*subdomain, i| {
+            if (i > 0) try json.appendSlice(allocator, ",");
+
+            // Build cursor from namehash
+            const cursor_hex = try subdomain.namehash.toHex(allocator);
+            defer allocator.free(cursor_hex);
+
+            try json.appendSlice(allocator, "{\"cursor\":\"");
+            try json.appendSlice(allocator, cursor_hex);
+            try json.appendSlice(allocator, "\",\"node\":");
+
+            const subdomain_json = try buildDomainJson(subdomain, node_selections, .{
+                .database = database,
+                .depth = nested_ctx.depth + 1,
+                .allocator = allocator,
+                .loaders = nested_ctx.loaders,
+            });
+            defer allocator.free(subdomain_json);
+            try json.appendSlice(allocator, subdomain_json);
+            try json.appendSlice(allocator, "}");
+        }
+        try json.appendSlice(allocator, "]}");
+    } else {
+        try json.appendSlice(allocator, "{\"totalCount\":0,\"pageInfo\":{\"hasNextPage\":false,\"hasPreviousPage\":false},\"edges\":[]}");
+    }
+
+    return try allocator.dupe(u8, json.items);
+}
+
+/// Domain nested field handler: eventsConnection (Relay-style connection)
+fn domainEventsConnectionHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    const domain: *const models.Name = @ptrCast(@alignCast(ctx));
+    const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+    const allocator = nested_ctx.allocator;
+
+    const first_arg = parser.getIntArg(field, "first", 10) orelse 10;
+    const limit: u32 = @intCast(@min(first_arg, 100));
+
+    // Get total count
+    const total_count = try database.countEventsByNamehash(domain.namehash);
+
+    // Fetch events
+    const namehash_hex = try domain.namehash.toHex(allocator);
+    defer allocator.free(namehash_hex);
+
+    const filter_opts = db.EventFilterOptions{
+        .namehash = namehash_hex,
+        .limit = limit + 1,
+    };
+
+    const events = try database.getEventsFiltered(filter_opts);
+    defer {
+        for (events) |*e| e.deinit(allocator);
+        allocator.free(events);
+    }
+
+    const has_next = events.len > limit;
+    const actual_count = @min(events.len, limit);
+
+    // Extract node selections
+    var node_selections: []const parser.Field = &[_]parser.Field{};
+    for (field.selections) |*sel| {
+        if (std.mem.eql(u8, sel.name, "edges")) {
+            for (sel.selections) |*edge_sel| {
+                if (std.mem.eql(u8, edge_sel.name, "node")) {
+                    node_selections = edge_sel.selections;
+                    break;
+                }
+            }
+            break;
+        }
+    }
+
+    var json: std.ArrayList(u8) = .{};
+    errdefer json.deinit(allocator);
+
+    // Build connection JSON
+    try json.appendSlice(allocator, "{\"totalCount\":");
+    const count_str = try std.fmt.allocPrint(allocator, "{d}", .{total_count});
+    defer allocator.free(count_str);
+    try json.appendSlice(allocator, count_str);
+
+    try json.appendSlice(allocator, ",\"pageInfo\":{\"hasNextPage\":");
+    try json.appendSlice(allocator, if (has_next) "true" else "false");
+    try json.appendSlice(allocator, ",\"hasPreviousPage\":false}");
+
+    try json.appendSlice(allocator, ",\"edges\":[");
+    for (events[0..actual_count], 0..) |*event, i| {
+        if (i > 0) try json.appendSlice(allocator, ",");
+
+        // Build cursor from tx_hash-log_index
+        const tx_hash_hex = try event.tx_hash.toHex(allocator);
+        defer allocator.free(tx_hash_hex);
+        const cursor = try std.fmt.allocPrint(allocator, "{s}-{d}", .{ tx_hash_hex, event.log_index });
+        defer allocator.free(cursor);
+
+        try json.appendSlice(allocator, "{\"cursor\":\"");
+        try json.appendSlice(allocator, cursor);
+        try json.appendSlice(allocator, "\",\"node\":");
+
+        const event_json = try buildEventJson(event, node_selections, .{
+            .database = database,
+            .depth = nested_ctx.depth + 1,
+            .allocator = allocator,
+            .loaders = nested_ctx.loaders,
+        });
+        defer allocator.free(event_json);
+        try json.appendSlice(allocator, event_json);
+        try json.appendSlice(allocator, "}");
+    }
+    try json.appendSlice(allocator, "]}");
+
+    return try allocator.dupe(u8, json.items);
+}
+
 /// Domain entity configuration
 const DomainBuildEntityConfig = json_builder.EntityConfig{
     .type_name = "Domain",
@@ -843,7 +1032,11 @@ const DomainBuildEntityConfig = json_builder.EntityConfig{
         .{ .name = "resolver", .handler = domainResolverHandler },
         .{ .name = "parent", .handler = domainParentHandler },
         .{ .name = "subdomains", .handler = domainSubdomainsHandler },
+        .{ .name = "subdomainsCount", .handler = domainSubdomainsCountHandler },
+        .{ .name = "subdomainConnection", .handler = domainSubdomainConnectionHandler },
         .{ .name = "events", .handler = domainEventsHandler },
+        .{ .name = "eventsCount", .handler = domainEventsCountHandler },
+        .{ .name = "eventsConnection", .handler = domainEventsConnectionHandler },
         .{ .name = "domain", .handler = domainDomainHandler },
         .{ .name = "expiryDate", .handler = domainExpiryDateHandler },
         .{ .name = "normalizedName", .handler = domainNormalizedNameHandler },

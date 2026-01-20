@@ -109,6 +109,9 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
         };
     }
 
+    // Get total count for aggregation
+    const total_count = try database.getTotalEventCount();
+
     // Build connection
     const connection = try pagination.buildConnectionString(
         EventWithSelections,
@@ -116,7 +119,7 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
         wrapper_items,
         params,
         getId,
-        null,
+        total_count,
     );
     defer connection.deinit(allocator);
 

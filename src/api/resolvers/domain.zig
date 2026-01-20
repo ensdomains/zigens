@@ -562,6 +562,9 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         };
     }
 
+    // Get total count for aggregation
+    const total_count = try database.getTotalNameCount();
+
     // Build connection
     const connection = try pagination.buildConnectionString(
         NameWithSelections,
@@ -569,7 +572,7 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         wrapper_items,
         params,
         getId,
-        null, // total_count - can be added later
+        total_count,
     );
     defer connection.deinit(allocator);
 

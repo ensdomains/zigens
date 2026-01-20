@@ -706,6 +706,21 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
 }
 
 // ============================================================================
+// AGGREGATION OPERATIONS
+// ============================================================================
+
+/// Get total count of all names in the database
+pub fn getTotalNameCount(db: *Database) !usize {
+    var q = try Query.init(db, "SELECT COUNT(*) FROM names");
+    defer q.deinit();
+
+    if (try q.step()) {
+        return @intCast(q.getInt64(0));
+    }
+    return 0;
+}
+
+// ============================================================================
 // SUBDOMAIN OPERATIONS
 // ============================================================================
 

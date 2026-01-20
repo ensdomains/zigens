@@ -115,6 +115,9 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
         };
     }
 
+    // Get total count for aggregation
+    const total_count = try database.getTotalRegistrationCount();
+
     // Build connection
     const connection = try pagination.buildConnectionString(
         RegistrationWithSelections,
@@ -122,7 +125,7 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
         wrapper_items,
         params,
         getId,
-        null,
+        total_count,
     );
     defer connection.deinit(allocator);
 
