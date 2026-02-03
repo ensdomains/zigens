@@ -21,6 +21,8 @@ pub const Config = struct {
     webhooks_enabled: bool,
     webhook_max_retries: u32,
     webhook_db_path: []const u8,
+    webhook_admin_username: ?[]const u8,
+    webhook_admin_password: ?[]const u8,
     max_memory_mb: u64,
     checkpoint_interval: u64,
     graphql_max_depth: u32,
@@ -94,6 +96,22 @@ pub const Config = struct {
             .webhooks_enabled = env_mod.getEnvBool(&env_map, "WEBHOOKS_ENABLED", false),
             .webhook_max_retries = env_mod.getEnvInt(&env_map, u32, "WEBHOOK_MAX_RETRIES", 3),
             .webhook_db_path = try allocator.dupe(u8, env_mod.getEnv(&env_map, "WEBHOOK_DB_PATH", "./data/webhooks.db")),
+            .webhook_admin_username = blk: {
+                const user = env_mod.getEnv(&env_map, "WEBHOOK_ADMIN_USERNAME", "");
+                if (user.len == 0) {
+                    break :blk null;
+                } else {
+                    break :blk try allocator.dupe(u8, user);
+                }
+            },
+            .webhook_admin_password = blk: {
+                const pwd = env_mod.getEnv(&env_map, "WEBHOOK_ADMIN_PASSWORD", "");
+                if (pwd.len == 0) {
+                    break :blk null;
+                } else {
+                    break :blk try allocator.dupe(u8, pwd);
+                }
+            },
             .max_memory_mb = env_mod.getEnvInt(&env_map, u64, "MAX_MEMORY_MB", 512),
             .checkpoint_interval = env_mod.getEnvInt(&env_map, u64, "CHECKPOINT_INTERVAL", 100),
             .graphql_max_depth = env_mod.getEnvInt(&env_map, u32, "GRAPHQL_MAX_DEPTH", 10),
@@ -107,6 +125,12 @@ pub const Config = struct {
         self.allocator.free(self.l2_rpc_url);
         self.allocator.free(self.database_path);
         self.allocator.free(self.webhook_db_path);
+        if (self.webhook_admin_username) |user| {
+            self.allocator.free(user);
+        }
+        if (self.webhook_admin_password) |pwd| {
+            self.allocator.free(pwd);
+        }
     }
 };
 

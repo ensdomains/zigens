@@ -18,6 +18,7 @@ pub const WebhookManager = struct {
     should_stop: std.atomic.Value(bool),
     rate_limit_ms: u64,  // Milliseconds between requests to same endpoint
     db_mutex: std.Thread.Mutex,  // Protects database access from worker threads
+    last_cleanup_at: std.atomic.Value(i64),  // Timestamp of last queue cleanup
 
     pub fn init(allocator: std.mem.Allocator, webhook_db_path: []const u8, max_retries: u32, rate_limit_ms: u64) !*WebhookManager {
         const manager = try allocator.create(WebhookManager);
@@ -43,6 +44,7 @@ pub const WebhookManager = struct {
             .should_stop = std.atomic.Value(bool).init(false),
             .rate_limit_ms = rate_limit_ms,
             .db_mutex = std.Thread.Mutex{},
+            .last_cleanup_at = std.atomic.Value(i64).init(0),  // Will run cleanup on first check
         };
         return manager;
     }
@@ -138,11 +140,40 @@ pub const WebhookManager = struct {
                 std.log.err("Worker error processing queue: {}", .{err});
             };
 
+            // Run daily cleanup if 24 hours have passed
+            self.runDailyCleanupIfNeeded();
+
             // Sleep briefly to avoid busy-waiting
             std.Thread.sleep(100 * std.time.ns_per_ms);
         }
 
         std.log.debug("Webhook worker stopped", .{});
+    }
+
+    /// Run queue cleanup once per day (24 hours)
+    fn runDailyCleanupIfNeeded(self: *WebhookManager) void {
+        const now = std.time.timestamp();
+        const last_cleanup = self.last_cleanup_at.load(.acquire);
+        const one_day_seconds: i64 = 86400;
+
+        // Check if 24 hours have passed since last cleanup
+        if (now - last_cleanup >= one_day_seconds) {
+            // Try to claim the cleanup (avoid multiple workers running it)
+            if (self.last_cleanup_at.cmpxchgStrong(last_cleanup, now, .acq_rel, .acquire) == null) {
+                // Successfully claimed - run cleanup
+                const stats = self.cleanupQueueDefault() catch |err| {
+                    std.log.err("Daily queue cleanup failed: {}", .{err});
+                    return;
+                };
+
+                if (stats.delivered_removed > 0 or stats.failed_removed > 0) {
+                    std.log.info("Daily cleanup: removed {d} delivered, {d} failed webhook entries", .{
+                        stats.delivered_removed,
+                        stats.failed_removed,
+                    });
+                }
+            }
+        }
     }
 
     /// Notify webhooks about an event (async - adds to persistent queue)
@@ -205,16 +236,38 @@ pub const WebhookManager = struct {
         defer self.allocator.free(data_escaped);
 
         const writer = payload.writer(self.allocator);
-        try writer.print("{{\"event_type\":\"{s}\",\"chain\":\"{s}\",\"block_number\":{d},\"tx_hash\":\"{s}\",\"contract_address\":\"{s}\",\"data\":\"{s}\",\"timestamp\":{d}}}",
+
+        // Build base payload with required fields
+        try writer.print("{{\"event_type\":\"{s}\",\"chain\":\"{s}\",\"block_number\":{d},\"tx_hash\":\"{s}\",\"log_index\":{d},\"contract_address\":\"{s}\"",
             .{
                 event.event_type.toString(),
                 event.chain.toString(),
                 event.block_number,
                 tx_hex,
+                event.log_index,
                 contract_hex,
-                data_escaped,
-                event.timestamp,
             });
+
+        // Add optional name field
+        if (event.name) |name| {
+            const name_escaped = try json_utils.escapeString(self.allocator, name);
+            defer self.allocator.free(name_escaped);
+            try writer.print(",\"name\":\"{s}\"", .{name_escaped});
+        } else {
+            try writer.writeAll(",\"name\":null");
+        }
+
+        // Add optional namehash field
+        if (event.namehash) |nh| {
+            const nh_hex = try nh.toHex(self.allocator);
+            defer self.allocator.free(nh_hex);
+            try writer.print(",\"namehash\":\"{s}\"", .{nh_hex});
+        } else {
+            try writer.writeAll(",\"namehash\":null");
+        }
+
+        // Add data and timestamp
+        try writer.print(",\"data\":\"{s}\",\"timestamp\":{d}}}", .{ data_escaped, event.timestamp });
 
         return payload.toOwnedSlice(self.allocator);
     }
@@ -298,7 +351,7 @@ pub const WebhookManager = struct {
                 \\WHERE status IN ('pending', 'processing')
                 \\  AND next_retry_at <= ?
                 \\ORDER BY webhook_url, created_at
-                \\LIMIT 50
+                \\LIMIT 200
             ;
 
             const sql_z = try self.allocator.dupeZ(u8, sql);
@@ -447,7 +500,11 @@ pub const WebhookManager = struct {
             .allocator = self.allocator,
             .argv = &.{
                 "curl",
-                "-s",             // Silent mode
+                "-s",                  // Silent mode
+                "--connect-timeout",
+                "5",                   // 5 second connection timeout
+                "--max-time",
+                "30",                  // 30 second total timeout
                 "-X",
                 "POST",
                 "-H",
@@ -457,9 +514,9 @@ pub const WebhookManager = struct {
                 "-d",
                 payload,
                 "-w",
-                "%{http_code}",   // Write HTTP status code to stdout
+                "%{http_code}",        // Write HTTP status code to stdout
                 "-o",
-                "/dev/null",      // Don't output response body
+                "/dev/null",           // Don't output response body
                 url,
             },
             .max_output_bytes = 1024,
@@ -512,6 +569,141 @@ pub const WebhookManager = struct {
     /// List all webhooks
     pub fn listWebhooks(self: *WebhookManager) ![]models.Webhook {
         return try self.database.getWebhooks();
+    }
+
+    // =========================================================================
+    // QUEUE CLEANUP
+    // =========================================================================
+    //
+    // The webhook_queue table accumulates entries over time:
+    // - 'pending' and 'processing' entries are still active and needed
+    // - 'delivered' entries have completed successfully - no longer needed
+    // - 'failed' entries gave up after max retries - no longer needed
+    //
+    // Without cleanup, the table grows indefinitely:
+    // - Each entry stores full JSON payload (~500-2000 bytes)
+    // - 10,000 events/day × 3 webhooks = 30,000 rows/day
+    // - This impacts disk space, query performance, and backup times
+    //
+    // Cleanup policy:
+    // - Delivered: remove after 1 day (just for recent debugging)
+    // - Failed: remove after 7 days (allows investigation window)
+    // =========================================================================
+
+    /// Queue cleanup statistics
+    pub const CleanupStats = struct {
+        delivered_removed: u32,
+        failed_removed: u32,
+    };
+
+    /// Clean up old webhook queue entries that are no longer needed.
+    /// - Delivered webhooks older than `delivered_retention_days` are removed
+    /// - Failed webhooks older than `failed_retention_days` are removed
+    /// Returns the number of entries removed.
+    pub fn cleanupQueue(self: *WebhookManager, delivered_retention_days: u32, failed_retention_days: u32) !CleanupStats {
+        self.db_mutex.lock();
+        defer self.db_mutex.unlock();
+
+        var stats = CleanupStats{ .delivered_removed = 0, .failed_removed = 0 };
+        const now = std.time.timestamp();
+
+        // Clean up delivered webhooks
+        {
+            const cutoff = now - (@as(i64, delivered_retention_days) * 86400);
+            const sql = "DELETE FROM webhook_queue WHERE status = 'delivered' AND created_at < ?";
+            const sql_z = try self.allocator.dupeZ(u8, sql);
+            defer self.allocator.free(sql_z);
+
+            var stmt: ?*db.c.sqlite3_stmt = null;
+            if (db.c.sqlite3_prepare_v2(self.database.db, sql_z.ptr, -1, &stmt, null) != db.c.SQLITE_OK) {
+                return error.PrepareFailed;
+            }
+            defer _ = db.c.sqlite3_finalize(stmt);
+
+            _ = db.c.sqlite3_bind_int64(stmt, 1, cutoff);
+
+            if (db.c.sqlite3_step(stmt) == db.c.SQLITE_DONE) {
+                stats.delivered_removed = @intCast(db.c.sqlite3_changes(self.database.db));
+            }
+        }
+
+        // Clean up failed webhooks
+        {
+            const cutoff = now - (@as(i64, failed_retention_days) * 86400);
+            const sql = "DELETE FROM webhook_queue WHERE status = 'failed' AND created_at < ?";
+            const sql_z = try self.allocator.dupeZ(u8, sql);
+            defer self.allocator.free(sql_z);
+
+            var stmt: ?*db.c.sqlite3_stmt = null;
+            if (db.c.sqlite3_prepare_v2(self.database.db, sql_z.ptr, -1, &stmt, null) != db.c.SQLITE_OK) {
+                return error.PrepareFailed;
+            }
+            defer _ = db.c.sqlite3_finalize(stmt);
+
+            _ = db.c.sqlite3_bind_int64(stmt, 1, cutoff);
+
+            if (db.c.sqlite3_step(stmt) == db.c.SQLITE_DONE) {
+                stats.failed_removed = @intCast(db.c.sqlite3_changes(self.database.db));
+            }
+        }
+
+        if (stats.delivered_removed > 0 or stats.failed_removed > 0) {
+            std.log.info("Webhook queue cleanup: removed {d} delivered, {d} failed entries", .{
+                stats.delivered_removed,
+                stats.failed_removed,
+            });
+        }
+
+        return stats;
+    }
+
+    /// Clean up queue with default retention policy (1 day delivered, 7 days failed)
+    pub fn cleanupQueueDefault(self: *WebhookManager) !CleanupStats {
+        return self.cleanupQueue(1, 7);
+    }
+
+    /// Get queue statistics for monitoring
+    pub const QueueStats = struct {
+        pending: u32,
+        processing: u32,
+        delivered: u32,
+        failed: u32,
+    };
+
+    pub fn getQueueStats(self: *WebhookManager) !QueueStats {
+        self.db_mutex.lock();
+        defer self.db_mutex.unlock();
+
+        var stats = QueueStats{ .pending = 0, .processing = 0, .delivered = 0, .failed = 0 };
+
+        const sql =
+            \\SELECT status, COUNT(*) FROM webhook_queue GROUP BY status
+        ;
+        const sql_z = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(sql_z);
+
+        var stmt: ?*db.c.sqlite3_stmt = null;
+        if (db.c.sqlite3_prepare_v2(self.database.db, sql_z.ptr, -1, &stmt, null) != db.c.SQLITE_OK) {
+            return error.PrepareFailed;
+        }
+        defer _ = db.c.sqlite3_finalize(stmt);
+
+        while (db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW) {
+            const status = std.mem.span(db.c.sqlite3_column_text(stmt, 0));
+            const count: u32 = @intCast(db.c.sqlite3_column_int(stmt, 1));
+
+            if (std.mem.eql(u8, status, "pending")) {
+                stats.pending = count;
+            } else if (std.mem.eql(u8, status, "processing")) {
+                stats.processing = count;
+            } else if (std.mem.eql(u8, status, "delivered")) {
+                stats.delivered = count;
+            } else if (std.mem.eql(u8, status, "failed")) {
+                stats.failed = count;
+            }
+        }
+
+        return stats;
     }
 };
 

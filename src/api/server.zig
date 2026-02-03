@@ -19,8 +19,10 @@ pub const Server = struct {
     server: ?std.net.Server,
     graphql_handler: graphql.GraphQLHandler,
     rate_limiter: RateLimiter,
+    webhook_admin_username: ?[]const u8,  // Optional - if set with password, requires Basic Auth
+    webhook_admin_password: ?[]const u8,  // Optional - if set, requires Basic Auth for webhook endpoints
 
-    pub fn init(allocator: std.mem.Allocator, database: *db.Database, webhook_db_path: ?[]const u8, port: u16, complexity_max_depth: u32, complexity_max_cost: u32, metrics_enabled: bool, rate_limit_per_second: u32) !Server {
+    pub fn init(allocator: std.mem.Allocator, database: *db.Database, webhook_db_path: ?[]const u8, port: u16, complexity_max_depth: u32, complexity_max_cost: u32, metrics_enabled: bool, rate_limit_per_second: u32, webhook_admin_username: ?[]const u8, webhook_admin_password: ?[]const u8) !Server {
         // Only open webhook database if path is provided (webhooks enabled)
         var webhook_db: ?*db.Database = null;
         if (webhook_db_path) |path| {
@@ -41,6 +43,8 @@ pub const Server = struct {
             .server = null,
             .graphql_handler = try graphql.GraphQLHandler.init(allocator, database, complexity_max_depth, complexity_max_cost, metrics_enabled),
             .rate_limiter = RateLimiter.init(rate_limit * 2, rate_limit),
+            .webhook_admin_username = webhook_admin_username,
+            .webhook_admin_password = webhook_admin_password,
         };
     }
 
@@ -202,10 +206,18 @@ pub const Server = struct {
                 try self.sendBadRequest(connection.stream, "Only GET and POST supported for GraphQL");
             }
         } else if (std.mem.startsWith(u8, path, "/webhooks") and !std.mem.startsWith(u8, path, "/api/webhooks")) {
-            // Webhook management UI
+            // Webhook management UI - requires auth if password is set
+            if (!self.checkWebhookAuth(request)) {
+                try self.sendUnauthorized(connection.stream);
+                return;
+            }
             try self.handleWebhookUI(connection.stream);
         } else if (std.mem.startsWith(u8, path, "/api/webhooks")) {
-            // Webhook API endpoints
+            // Webhook API endpoints - requires auth if password is set
+            if (!self.checkWebhookAuth(request)) {
+                try self.sendUnauthorized(connection.stream);
+                return;
+            }
             try self.handleWebhooksAPI(connection.stream, method, path, request);
         } else if (std.mem.startsWith(u8, path, "/api/name/")) {
             try self.handleNameQuery(connection.stream, path);
@@ -605,6 +617,57 @@ pub const Server = struct {
         _ = try stream.write(response);
     }
 
+    fn sendUnauthorized(_: *Server, stream: std.net.Stream) !void {
+        const response =
+            "HTTP/1.1 401 Unauthorized\r\n" ++
+            "Content-Type: application/json\r\n" ++
+            "WWW-Authenticate: Basic realm=\"Webhook Admin\"\r\n" ++
+            "Access-Control-Allow-Origin: *\r\n" ++
+            "Content-Length: 36\r\n" ++
+            "\r\n" ++
+            "{\"error\":\"Authentication required\"}";
+
+        _ = try stream.write(response);
+    }
+
+    /// Check Basic Auth credentials from request headers
+    /// Returns true if auth is valid or not required, false if auth failed
+    fn checkWebhookAuth(self: *Server, request: []const u8) bool {
+        // If no password is set, allow all requests (auth disabled)
+        const required_password = self.webhook_admin_password orelse return true;
+        const required_username = self.webhook_admin_username orelse return true;
+
+        // Find Authorization header
+        var lines = std.mem.splitSequence(u8, request, "\r\n");
+        while (lines.next()) |line| {
+            if (std.ascii.startsWithIgnoreCase(line, "authorization:")) {
+                const header_value = std.mem.trim(u8, line["authorization:".len..], " ");
+
+                // Check for Basic auth
+                if (std.ascii.startsWithIgnoreCase(header_value, "basic ")) {
+                    const encoded = std.mem.trim(u8, header_value["basic ".len..], " ");
+
+                    // Decode base64
+                    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return false;
+                    if (decoded_len > 256) return false;
+
+                    var decoded_buf: [256]u8 = undefined;
+                    std.base64.standard.Decoder.decode(&decoded_buf, encoded) catch return false;
+                    const decoded = decoded_buf[0..decoded_len];
+
+                    // Format is "username:password"
+                    if (std.mem.indexOf(u8, decoded, ":")) |colon_pos| {
+                        const username = decoded[0..colon_pos];
+                        const password = decoded[colon_pos + 1 ..];
+                        return std.mem.eql(u8, username, required_username) and std.mem.eql(u8, password, required_password);
+                    }
+                }
+                return false;
+            }
+        }
+        return false;
+    }
+
     // ========================================================================
     // WEBHOOK MANAGEMENT ENDPOINTS
     // ========================================================================
@@ -899,31 +962,41 @@ pub const Server = struct {
             \\  <style>
             \\    * { box-sizing: border-box; }
             \\    body {
-            \\      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+            \\      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             \\      max-width: 1400px;
             \\      margin: 0 auto;
-            \\      padding: 20px;
-            \\      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            \\      padding: 40px 20px;
+            \\      background: #f8f9fa;
             \\      min-height: 100vh;
+            \\      color: #1a1a1a;
             \\    }
             \\    h1 {
-            \\      color: white;
-            \\      text-align: center;
-            \\      font-size: 2.5rem;
-            \\      margin-bottom: 30px;
-            \\      text-shadow: 0 2px 4px rgba(0,0,0,0.2);
+            \\      color: #1a1a1a;
+            \\      text-align: left;
+            \\      font-size: 1.75rem;
+            \\      font-weight: 600;
+            \\      margin-bottom: 32px;
+            \\      letter-spacing: -0.5px;
+            \\    }
+            \\    h2 {
+            \\      font-size: 1rem;
+            \\      font-weight: 600;
+            \\      color: #1a1a1a;
+            \\      margin-bottom: 20px;
+            \\      text-transform: uppercase;
+            \\      letter-spacing: 0.5px;
             \\    }
             \\    .container {
-            \\      background: white;
-            \\      padding: 30px;
-            \\      border-radius: 12px;
-            \\      box-shadow: 0 8px 32px rgba(0,0,0,0.1);
-            \\      margin-bottom: 20px;
+            \\      background: #fff;
+            \\      padding: 28px;
+            \\      border-radius: 8px;
+            \\      border: 1px solid #e5e5e5;
+            \\      margin-bottom: 24px;
             \\    }
             \\    .form-grid {
             \\      display: grid;
-            \\      grid-template-columns: 1fr 400px;
-            \\      gap: 30px;
+            \\      grid-template-columns: 1fr 340px;
+            \\      gap: 32px;
             \\    }
             \\    @media (max-width: 900px) {
             \\      .form-grid { grid-template-columns: 1fr; }
@@ -931,31 +1004,35 @@ pub const Server = struct {
             \\    .event-categories {
             \\      display: grid;
             \\      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-            \\      gap: 15px;
-            \\      margin-top: 10px;
+            \\      gap: 16px;
+            \\      margin-top: 12px;
             \\    }
             \\    .event-category {
-            \\      border: 1px solid #e0e0e0;
-            \\      border-radius: 8px;
-            \\      padding: 15px;
+            \\      border: 1px solid #e5e5e5;
+            \\      border-radius: 6px;
+            \\      padding: 16px;
             \\      background: #fafafa;
             \\    }
             \\    .category-title {
-            \\      font-weight: 700;
-            \\      color: #667eea;
+            \\      font-weight: 600;
+            \\      color: #666;
             \\      margin-bottom: 12px;
-            \\      font-size: 13px;
+            \\      font-size: 11px;
             \\      text-transform: uppercase;
-            \\      letter-spacing: 0.5px;
+            \\      letter-spacing: 0.8px;
             \\      display: flex;
             \\      justify-content: space-between;
             \\      align-items: center;
             \\    }
             \\    .select-all {
-            \\      font-size: 11px;
-            \\      color: #667eea;
+            \\      font-size: 10px;
+            \\      color: #888;
             \\      cursor: pointer;
-            \\      text-decoration: underline;
+            \\      text-decoration: none;
+            \\      font-weight: 500;
+            \\    }
+            \\    .select-all:hover {
+            \\      color: #1a1a1a;
             \\    }
             \\    .checkbox-item {
             \\      display: flex;
@@ -964,150 +1041,169 @@ pub const Server = struct {
             \\      cursor: pointer;
             \\    }
             \\    .checkbox-item input[type="checkbox"] {
-            \\      width: 18px;
-            \\      height: 18px;
-            \\      margin-right: 8px;
+            \\      width: 16px;
+            \\      height: 16px;
+            \\      margin-right: 10px;
             \\      cursor: pointer;
-            \\      accent-color: #667eea;
+            \\      accent-color: #1a1a1a;
             \\    }
             \\    .checkbox-item label {
             \\      cursor: pointer;
             \\      font-size: 13px;
-            \\      color: #333;
+            \\      color: #444;
             \\      user-select: none;
             \\    }
             \\    .summary-panel {
             \\      position: sticky;
             \\      top: 20px;
-            \\      border: 2px solid #667eea;
-            \\      border-radius: 8px;
+            \\      border: 1px solid #e5e5e5;
+            \\      border-radius: 6px;
             \\      padding: 20px;
-            \\      background: linear-gradient(135deg, #667eea10 0%, #764ba210 100%);
+            \\      background: #fafafa;
             \\      max-height: 600px;
             \\      overflow-y: auto;
             \\    }
             \\    .summary-title {
-            \\      font-weight: 700;
-            \\      font-size: 16px;
-            \\      color: #667eea;
-            \\      margin-bottom: 15px;
+            \\      font-weight: 600;
+            \\      font-size: 11px;
+            \\      color: #666;
+            \\      margin-bottom: 16px;
             \\      display: flex;
             \\      align-items: center;
-            \\      gap: 8px;
+            \\      gap: 10px;
+            \\      text-transform: uppercase;
+            \\      letter-spacing: 0.8px;
             \\    }
             \\    .summary-count {
-            \\      background: #667eea;
-            \\      color: white;
-            \\      padding: 2px 10px;
-            \\      border-radius: 12px;
-            \\      font-size: 13px;
+            \\      background: #1a1a1a;
+            \\      color: #fff;
+            \\      padding: 2px 8px;
+            \\      border-radius: 10px;
+            \\      font-size: 11px;
             \\    }
             \\    .summary-empty {
-            \\      color: #999;
-            \\      font-style: italic;
+            \\      color: #888;
+            \\      font-size: 13px;
             \\      text-align: center;
-            \\      padding: 20px;
+            \\      padding: 20px 0;
             \\    }
             \\    .summary-events {
             \\      display: flex;
             \\      flex-wrap: wrap;
-            \\      gap: 8px;
+            \\      gap: 6px;
             \\    }
             \\    .summary-event-tag {
-            \\      background: white;
-            \\      border: 1px solid #667eea;
-            \\      color: #667eea;
-            \\      padding: 6px 12px;
-            \\      border-radius: 6px;
-            \\      font-size: 12px;
+            \\      background: #fff;
+            \\      border: 1px solid #ddd;
+            \\      color: #444;
+            \\      padding: 5px 10px;
+            \\      border-radius: 4px;
+            \\      font-size: 11px;
             \\      font-weight: 500;
             \\    }
             \\    .summary-event-tag.all {
-            \\      background: #667eea;
-            \\      color: white;
-            \\      font-weight: 700;
+            \\      background: #1a1a1a;
+            \\      border-color: #1a1a1a;
+            \\      color: #fff;
+            \\      font-weight: 600;
             \\    }
             \\    table {
             \\      width: 100%;
-            \\      border-collapse: separate;
-            \\      border-spacing: 0;
-            \\      margin-top: 20px;
-            \\      border-radius: 8px;
-            \\      overflow: hidden;
+            \\      border-collapse: collapse;
+            \\      margin-top: 16px;
+            \\      font-size: 13px;
             \\    }
             \\    th, td {
             \\      text-align: left;
-            \\      padding: 14px;
-            \\      border-bottom: 1px solid #f0f0f0;
+            \\      padding: 12px 16px;
+            \\      border-bottom: 1px solid #eee;
             \\    }
             \\    th {
-            \\      background: linear-gradient(135deg, #667eea, #764ba2);
-            \\      color: white;
+            \\      background: #fafafa;
+            \\      color: #666;
             \\      font-weight: 600;
-            \\      font-size: 13px;
+            \\      font-size: 11px;
             \\      text-transform: uppercase;
             \\      letter-spacing: 0.5px;
+            \\      border-bottom: 1px solid #e5e5e5;
             \\    }
             \\    tr:hover td {
-            \\      background: #f8f9ff;
+            \\      background: #fafafa;
             \\    }
             \\    button {
-            \\      padding: 10px 20px;
-            \\      border: none;
-            \\      border-radius: 6px;
+            \\      padding: 8px 16px;
+            \\      border: 1px solid #ddd;
+            \\      border-radius: 4px;
             \\      cursor: pointer;
-            \\      font-size: 14px;
-            \\      font-weight: 600;
-            \\      margin-right: 8px;
-            \\      transition: all 0.2s;
+            \\      font-size: 13px;
+            \\      font-weight: 500;
+            \\      margin-right: 6px;
+            \\      transition: all 0.15s ease;
+            \\      background: #fff;
+            \\      color: #444;
+            \\    }
+            \\    button:hover {
+            \\      border-color: #999;
+            \\      background: #fafafa;
             \\    }
             \\    .btn-primary {
-            \\      background: linear-gradient(135deg, #667eea, #764ba2);
-            \\      color: white;
+            \\      background: #1a1a1a;
+            \\      border-color: #1a1a1a;
+            \\      color: #fff;
             \\    }
             \\    .btn-primary:hover {
-            \\      transform: translateY(-1px);
-            \\      box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+            \\      background: #333;
+            \\      border-color: #333;
             \\    }
             \\    .btn-danger {
-            \\      background: #dc3545;
-            \\      color: white;
+            \\      background: #fff;
+            \\      border-color: #ccc;
+            \\      color: #666;
             \\    }
             \\    .btn-danger:hover {
-            \\      background: #c82333;
-            \\    }
-            \\    .btn-success {
-            \\      background: #28a745;
-            \\      color: white;
-            \\    }
-            \\    .btn-success:hover {
-            \\      background: #218838;
-            \\    }
-            \\    .btn-warning {
-            \\      background: #ffc107;
+            \\      background: #f5f5f5;
+            \\      border-color: #999;
             \\      color: #333;
             \\    }
+            \\    .btn-success {
+            \\      background: #1a1a1a;
+            \\      border-color: #1a1a1a;
+            \\      color: #fff;
+            \\    }
+            \\    .btn-success:hover {
+            \\      background: #333;
+            \\      border-color: #333;
+            \\    }
+            \\    .btn-warning {
+            \\      background: #fff;
+            \\      border-color: #ccc;
+            \\      color: #666;
+            \\    }
             \\    .btn-warning:hover {
-            \\      background: #e0a800;
+            \\      background: #f5f5f5;
+            \\      border-color: #999;
             \\    }
             \\    .btn-edit {
-            \\      background: #17a2b8;
-            \\      color: white;
+            \\      background: #fff;
+            \\      border-color: #ccc;
+            \\      color: #666;
             \\    }
             \\    .btn-edit:hover {
-            \\      background: #138496;
+            \\      background: #f5f5f5;
+            \\      border-color: #999;
             \\    }
             \\    input[type="text"], input[type="url"] {
-            \\      padding: 12px;
-            \\      border: 2px solid #e0e0e0;
-            \\      border-radius: 6px;
+            \\      padding: 10px 12px;
+            \\      border: 1px solid #ddd;
+            \\      border-radius: 4px;
             \\      font-size: 14px;
             \\      width: 100%;
-            \\      transition: border-color 0.2s;
+            \\      transition: border-color 0.15s ease;
+            \\      background: #fff;
             \\    }
             \\    input[type="text"]:focus, input[type="url"]:focus {
             \\      outline: none;
-            \\      border-color: #667eea;
+            \\      border-color: #999;
             \\    }
             \\    .form-group {
             \\      margin-bottom: 20px;
@@ -1115,43 +1211,63 @@ pub const Server = struct {
             \\    .form-group label {
             \\      display: block;
             \\      margin-bottom: 8px;
-            \\      font-weight: 600;
-            \\      color: #333;
-            \\      font-size: 14px;
+            \\      font-weight: 500;
+            \\      color: #444;
+            \\      font-size: 13px;
             \\    }
             \\    .status-active {
-            \\      color: #28a745;
+            \\      color: #1a1a1a;
             \\      font-weight: 600;
             \\    }
+            \\    .status-active::before {
+            \\      content: "";
+            \\      display: inline-block;
+            \\      width: 6px;
+            \\      height: 6px;
+            \\      background: #1a1a1a;
+            \\      border-radius: 50%;
+            \\      margin-right: 6px;
+            \\    }
             \\    .status-inactive {
-            \\      color: #dc3545;
-            \\      font-weight: 600;
+            \\      color: #888;
+            \\      font-weight: 500;
+            \\    }
+            \\    .status-inactive::before {
+            \\      content: "";
+            \\      display: inline-block;
+            \\      width: 6px;
+            \\      height: 6px;
+            \\      background: #ccc;
+            \\      border-radius: 50%;
+            \\      margin-right: 6px;
             \\    }
             \\    .event-tag {
             \\      display: inline-block;
-            \\      background: #e9ecef;
-            \\      padding: 4px 10px;
-            \\      border-radius: 4px;
+            \\      background: #f0f0f0;
+            \\      padding: 3px 8px;
+            \\      border-radius: 3px;
             \\      margin: 2px;
             \\      font-size: 11px;
+            \\      color: #555;
             \\    }
             \\    #message {
-            \\      padding: 16px;
-            \\      border-radius: 8px;
+            \\      padding: 14px 16px;
+            \\      border-radius: 4px;
             \\      margin-bottom: 20px;
             \\      display: none;
             \\      font-weight: 500;
+            \\      font-size: 13px;
             \\    }
             \\    #message.success {
-            \\      background: #d4edda;
-            \\      color: #155724;
-            \\      border: 1px solid #c3e6cb;
+            \\      background: #f8f9fa;
+            \\      color: #1a1a1a;
+            \\      border: 1px solid #ddd;
             \\      display: block;
             \\    }
             \\    #message.error {
-            \\      background: #f8d7da;
-            \\      color: #721c24;
-            \\      border: 1px solid #f5c6cb;
+            \\      background: #fafafa;
+            \\      color: #666;
+            \\      border: 1px solid #ddd;
             \\      display: block;
             \\    }
             \\    .modal {
@@ -1162,45 +1278,46 @@ pub const Server = struct {
             \\      top: 0;
             \\      width: 100%;
             \\      height: 100%;
-            \\      background: rgba(0,0,0,0.5);
-            \\      backdrop-filter: blur(4px);
+            \\      background: rgba(0,0,0,0.4);
+            \\      backdrop-filter: blur(2px);
             \\    }
             \\    .modal-content {
-            \\      background: white;
-            \\      margin: 50px auto;
-            \\      padding: 30px;
-            \\      border-radius: 12px;
+            \\      background: #fff;
+            \\      margin: 60px auto;
+            \\      padding: 28px;
+            \\      border-radius: 8px;
             \\      max-width: 900px;
             \\      max-height: 85vh;
             \\      overflow-y: auto;
-            \\      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            \\      box-shadow: 0 4px 24px rgba(0,0,0,0.15);
             \\    }
             \\    .modal-header {
             \\      display: flex;
             \\      justify-content: space-between;
             \\      align-items: center;
-            \\      margin-bottom: 20px;
-            \\      padding-bottom: 15px;
-            \\      border-bottom: 2px solid #667eea;
+            \\      margin-bottom: 24px;
+            \\      padding-bottom: 16px;
+            \\      border-bottom: 1px solid #e5e5e5;
             \\    }
             \\    .modal-header h2 {
             \\      margin: 0;
-            \\      color: #667eea;
+            \\      color: #1a1a1a;
+            \\      font-size: 1.1rem;
             \\    }
             \\    .close {
-            \\      font-size: 32px;
+            \\      font-size: 24px;
             \\      font-weight: 300;
             \\      color: #999;
             \\      cursor: pointer;
             \\      line-height: 1;
             \\    }
             \\    .close:hover {
-            \\      color: #333;
+            \\      color: #1a1a1a;
             \\    }
             \\  </style>
             \\</head>
             \\<body>
-            \\  <h1>📡 ENSv2 Webhook Management</h1>
+            \\  <h1>Webhook Management</h1>
             \\
             \\  <div id="message"></div>
             \\
@@ -1220,7 +1337,7 @@ pub const Server = struct {
             \\              <div class="event-category">
             \\                <div class="category-title">
             \\                  Registry
-            \\                  <span class="select-all" onclick="selectCategory('registry')">Select All</span>
+            \\                  <span class="select-all" data-category="registry" onclick="toggleCategory('registry')">Select All</span>
             \\                </div>
             \\                <div class="checkbox-item">
             \\                  <input type="checkbox" id="new_subname" value="new_subname" class="event-checkbox registry-event">
@@ -1243,7 +1360,7 @@ pub const Server = struct {
             \\              <div class="event-category">
             \\                <div class="category-title">
             \\                  Registration
-            \\                  <span class="select-all" onclick="selectCategory('registration')">Select All</span>
+            \\                  <span class="select-all" data-category="registration" onclick="toggleCategory('registration')">Select All</span>
             \\                </div>
             \\                <div class="checkbox-item">
             \\                  <input type="checkbox" id="name_registered" value="name_registered" class="event-checkbox registration-event">
@@ -1266,7 +1383,7 @@ pub const Server = struct {
             \\              <div class="event-category">
             \\                <div class="category-title">
             \\                  Token & Other
-            \\                  <span class="select-all" onclick="selectCategory('token')">Select All</span>
+            \\                  <span class="select-all" data-category="token" onclick="toggleCategory('token')">Select All</span>
             \\                </div>
             \\                <div class="checkbox-item">
             \\                  <input type="checkbox" id="token_regenerated" value="token_regenerated" class="event-checkbox token-event">
@@ -1289,7 +1406,7 @@ pub const Server = struct {
             \\              <div class="event-category">
             \\                <div class="category-title">
             \\                  Migration
-            \\                  <span class="select-all" onclick="selectCategory('migration')">Select All</span>
+            \\                  <span class="select-all" data-category="migration" onclick="toggleCategory('migration')">Select All</span>
             \\                </div>
             \\                <div class="checkbox-item">
             \\                  <input type="checkbox" id="name_migrated" value="name_migrated" class="event-checkbox migration-event">
@@ -1308,7 +1425,7 @@ pub const Server = struct {
             \\              <div class="event-category">
             \\                <div class="category-title">
             \\                  Resolver Records
-            \\                  <span class="select-all" onclick="selectCategory('resolver')">Select All</span>
+            \\                  <span class="select-all" data-category="resolver" onclick="toggleCategory('resolver')">Select All</span>
             \\                </div>
             \\                <div class="checkbox-item">
             \\                  <input type="checkbox" id="text_changed" value="text_changed" class="event-checkbox resolver-event">
@@ -1341,7 +1458,7 @@ pub const Server = struct {
             \\              </div>
             \\            </div>
             \\          </div>
-            \\          <button type="submit" class="btn-success">✓ Create Webhook</button>
+            \\          <button type="submit" class="btn-success">Create Webhook</button>
             \\        </div>
             \\
             \\        <div class="summary-panel">
@@ -1394,7 +1511,7 @@ pub const Server = struct {
             \\              <label>Select Event Types:</label>
             \\              <div class="event-categories" id="editEventCategories"></div>
             \\            </div>
-            \\            <button type="submit" class="btn-primary">💾 Save Changes</button>
+            \\            <button type="submit" class="btn-primary">Save Changes</button>
             \\            <button type="button" class="btn-danger" onclick="closeEditModal()">Cancel</button>
             \\          </div>
             \\          <div class="summary-panel">
@@ -1467,7 +1584,7 @@ pub const Server = struct {
             \\
             \\      if (count === 0) {
             \\        contentEl.className = 'summary-empty';
-            \\        contentEl.innerHTML = 'No events selected. Webhook will receive <span class="summary-event-tag all">ALL EVENTS</span>';
+            \\        contentEl.innerHTML = '<div style="margin-bottom: 12px;">No events selected.</div><div>Webhook will receive <span class="summary-event-tag all">ALL EVENTS</span></div>';
             \\      } else {
             \\        contentEl.className = 'summary-events';
             \\        contentEl.innerHTML = selected.map(v =>
@@ -1476,21 +1593,44 @@ pub const Server = struct {
             \\      }
             \\    }
             \\
-            \\    function selectCategory(category) {
+            \\    function toggleCategory(category, container = document) {
             \\      const events = EVENT_CATEGORIES[category];
-            \\      events.forEach(event => {
-            \\        const cb = document.getElementById(event);
-            \\        if (cb) cb.checked = true;
-            \\      });
-            \\      updateSummary(false);
+            \\      const checkboxes = events.map(e => container.querySelector(`#${e}`) || container.querySelector(`[value="${e}"]`)).filter(Boolean);
+            \\      const allChecked = checkboxes.every(cb => cb.checked);
+            \\      checkboxes.forEach(cb => cb.checked = !allChecked);
+            \\      updateCategoryToggleText(category, container);
+            \\      updateSummary(container !== document);
+            \\    }
+            \\
+            \\    function updateCategoryToggleText(category, container = document) {
+            \\      const events = EVENT_CATEGORIES[category];
+            \\      const checkboxes = events.map(e => container.querySelector(`#${e}`) || container.querySelector(`[value="${e}"]`)).filter(Boolean);
+            \\      const allChecked = checkboxes.every(cb => cb.checked);
+            \\      const toggleEl = container.querySelector(`[data-category="${category}"]`);
+            \\      if (toggleEl) {
+            \\        toggleEl.textContent = allChecked ? 'Deselect All' : 'Select All';
+            \\      }
+            \\    }
+            \\
+            \\    function updateAllCategoryToggles(container = document) {
+            \\      Object.keys(EVENT_CATEGORIES).forEach(cat => updateCategoryToggleText(cat, container));
+            \\    }
+            \\
+            \\    // Legacy function name for backwards compatibility
+            \\    function selectCategory(category) {
+            \\      toggleCategory(category, document);
             \\    }
             \\
             \\    // Set up event listeners for create form checkboxes
             \\    document.addEventListener('DOMContentLoaded', () => {
             \\      document.querySelectorAll('.event-checkbox').forEach(cb => {
-            \\        cb.addEventListener('change', () => updateSummary(false));
+            \\        cb.addEventListener('change', () => {
+            \\          updateSummary(false);
+            \\          updateAllCategoryToggles(document);
+            \\        });
             \\      });
             \\      updateSummary(false);
+            \\      updateAllCategoryToggles(document);
             \\    });
             \\
             \\    async function loadWebhooks() {
@@ -1542,7 +1682,7 @@ pub const Server = struct {
             \\        <div class="event-category">
             \\          <div class="category-title">
             \\            ${category.charAt(0).toUpperCase() + category.slice(1)}
-            \\            <span class="select-all" onclick="selectEditCategory('${category}')">Select All</span>
+            \\            <span class="select-all" data-category="${category}" onclick="toggleEditCategory('${category}')">Select All</span>
             \\          </div>
             \\          ${events.map(event => `
             \\            <div class="checkbox-item">
@@ -1555,20 +1695,40 @@ pub const Server = struct {
             \\
             \\      // Add event listeners
             \\      container.querySelectorAll('.event-checkbox').forEach(cb => {
-            \\        cb.addEventListener('change', () => updateSummary(true));
+            \\        cb.addEventListener('change', () => {
+            \\          updateSummary(true);
+            \\          updateAllEditCategoryToggles();
+            \\        });
             \\      });
             \\
             \\      updateSummary(true);
+            \\      updateAllEditCategoryToggles();
             \\      document.getElementById('editModal').style.display = 'block';
             \\    }
             \\
-            \\    function selectEditCategory(category) {
+            \\    function toggleEditCategory(category) {
+            \\      const container = document.getElementById('editEventCategories');
             \\      const events = EVENT_CATEGORIES[category];
-            \\      events.forEach(event => {
-            \\        const cb = document.getElementById('edit_' + event);
-            \\        if (cb) cb.checked = true;
-            \\      });
+            \\      const checkboxes = events.map(e => document.getElementById('edit_' + e)).filter(Boolean);
+            \\      const allChecked = checkboxes.every(cb => cb.checked);
+            \\      checkboxes.forEach(cb => cb.checked = !allChecked);
+            \\      updateEditCategoryToggleText(category);
             \\      updateSummary(true);
+            \\    }
+            \\
+            \\    function updateEditCategoryToggleText(category) {
+            \\      const events = EVENT_CATEGORIES[category];
+            \\      const checkboxes = events.map(e => document.getElementById('edit_' + e)).filter(Boolean);
+            \\      const allChecked = checkboxes.every(cb => cb.checked);
+            \\      const container = document.getElementById('editEventCategories');
+            \\      const toggleEl = container.querySelector(`[data-category="${category}"]`);
+            \\      if (toggleEl) {
+            \\        toggleEl.textContent = allChecked ? 'Deselect All' : 'Select All';
+            \\      }
+            \\    }
+            \\
+            \\    function updateAllEditCategoryToggles() {
+            \\      Object.keys(EVENT_CATEGORIES).forEach(cat => updateEditCategoryToggleText(cat));
             \\    }
             \\
             \\    function closeEditModal() {
@@ -1719,7 +1879,7 @@ test "Server init" {
     var database = try db.Database.init(allocator, ":memory:");
     defer database.deinit();
 
-    var server = try Server.init(allocator, &database, null, 8080, 10, 1000, false, 100);
+    var server = try Server.init(allocator, &database, null, 8080, 10, 1000, false, 100, null, null);
     defer server.deinit();
 
     try std.testing.expect(server.port == 8080);

@@ -55,10 +55,10 @@ pub const Indexer = struct {
 
         var webhook_manager: ?*webhooks.WebhookManager = null;
         if (cfg.webhooks_enabled) {
-            webhook_manager = try webhooks.WebhookManager.init(allocator, cfg.webhook_db_path, cfg.webhook_max_retries, 1000); // 1000ms rate limit per endpoint
+            webhook_manager = try webhooks.WebhookManager.init(allocator, cfg.webhook_db_path, cfg.webhook_max_retries, 100); // 100ms rate limit per endpoint (10 req/sec)
             // Workers disabled during indexing to avoid SQLite contention
             // Webhooks are queued and can be processed separately
-            // try webhook_manager.?.startWorkers(1);
+            // try webhook_manager.?.startWorkers(8);
         }
 
         // Optionally create status tracking and server if configured
@@ -137,10 +137,10 @@ pub const Indexer = struct {
 
         var webhook_manager: ?*webhooks.WebhookManager = null;
         if (cfg.webhooks_enabled) {
-            webhook_manager = try webhooks.WebhookManager.init(allocator, cfg.webhook_db_path, cfg.webhook_max_retries, 1000); // 1000ms rate limit per endpoint
+            webhook_manager = try webhooks.WebhookManager.init(allocator, cfg.webhook_db_path, cfg.webhook_max_retries, 100); // 100ms rate limit per endpoint (10 req/sec)
             // Workers disabled during indexing to avoid SQLite contention
             // Webhooks are queued and can be processed separately
-            // try webhook_manager.?.startWorkers(1);
+            // try webhook_manager.?.startWorkers(8);
         }
 
         // Optionally create status tracking and server if configured
@@ -980,8 +980,8 @@ pub const Indexer = struct {
             if (!self.initial_sync_complete.load(.acquire)) {
                 self.initial_sync_complete.store(true, .release);
                 if (self.webhook_manager) |wm| {
-                    std.log.info("Initial sync complete - starting webhook workers", .{});
-                    try wm.startWorkers(1);
+                    std.log.info("Initial sync complete - starting 8 webhook workers", .{});
+                    try wm.startWorkers(8);
                 }
             }
 
