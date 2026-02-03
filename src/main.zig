@@ -53,7 +53,7 @@ pub fn main() !void {
     // Start API server if enabled
     if (cfg.api_enabled) {
         const webhook_path: ?[]const u8 = if (cfg.webhooks_enabled) cfg.webhook_db_path else null;
-        var server = try api.Server.init(allocator, &database, webhook_path, cfg.api_port, cfg.graphql_max_depth, cfg.graphql_max_cost, cfg.metrics_enabled, cfg.rate_limit_per_second);
+        var server = try api.Server.init(allocator, &database, webhook_path, cfg.api_port, cfg.graphql_max_depth, cfg.graphql_max_cost, cfg.metrics_enabled, cfg.rate_limit_per_second, cfg.webhook_admin_username, cfg.webhook_admin_password);
         defer server.deinit();
 
         std.log.info("API server starting on port {d}", .{cfg.api_port});
