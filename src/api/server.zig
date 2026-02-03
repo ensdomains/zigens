@@ -206,14 +206,24 @@ pub const Server = struct {
                 try self.sendBadRequest(connection.stream, "Only GET and POST supported for GraphQL");
             }
         } else if (std.mem.startsWith(u8, path, "/webhooks") and !std.mem.startsWith(u8, path, "/api/webhooks")) {
-            // Webhook management UI - requires auth if password is set
+            // Webhook management UI - only available if webhooks are enabled
+            if (self.webhook_database == null) {
+                try self.sendNotFound(connection.stream);
+                return;
+            }
+            // Requires auth if password is set
             if (!self.checkWebhookAuth(request)) {
                 try self.sendUnauthorized(connection.stream);
                 return;
             }
             try self.handleWebhookUI(connection.stream);
         } else if (std.mem.startsWith(u8, path, "/api/webhooks")) {
-            // Webhook API endpoints - requires auth if password is set
+            // Webhook API endpoints - only available if webhooks are enabled
+            if (self.webhook_database == null) {
+                try self.sendNotFound(connection.stream);
+                return;
+            }
+            // Requires auth if password is set
             if (!self.checkWebhookAuth(request)) {
                 try self.sendUnauthorized(connection.stream);
                 return;
