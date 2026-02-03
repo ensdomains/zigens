@@ -628,16 +628,16 @@ pub const Server = struct {
     }
 
     fn sendUnauthorized(_: *Server, stream: std.net.Stream) !void {
-        const response =
-            "HTTP/1.1 401 Unauthorized\r\n" ++
+        const body = "{\"error\":\"Authentication required\"}";
+        const header = "HTTP/1.1 401 Unauthorized\r\n" ++
             "Content-Type: application/json\r\n" ++
             "WWW-Authenticate: Basic realm=\"Webhook Admin\"\r\n" ++
             "Access-Control-Allow-Origin: *\r\n" ++
-            "Content-Length: 36\r\n" ++
-            "\r\n" ++
-            "{\"error\":\"Authentication required\"}";
+            "Content-Length: " ++ std.fmt.comptimePrint("{d}", .{body.len}) ++ "\r\n" ++
+            "\r\n";
 
-        _ = try stream.write(response);
+        _ = try stream.write(header);
+        _ = try stream.write(body);
     }
 
     /// Check Basic Auth credentials from request headers
