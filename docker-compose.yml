@@ -39,7 +39,7 @@ services:
       - STATUS_PORT=3001
       # Webhooks (optional)
       - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
-      - WEBHOOK_DB_PATH=/app/data/webhooks.db
+      - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
       - WEBHOOK_MAX_RETRIES=${WEBHOOK_MAX_RETRIES:-3}
     healthcheck:
       test: ["CMD", "/app/healthcheck.sh"]
@@ -73,6 +73,7 @@ services:
       - "5655:5655"
     volumes:
       - ens-data:/app/data:ro  # Read-only access to database
+      - webhook-data:/app/webhooks  # Writable volume for webhook database
     environment:
       # Database (same as indexer)
       - DATABASE_PATH=/app/data/ens_v2.db
@@ -85,7 +86,7 @@ services:
       - GRAPHQL_MAX_COST=1000
       # Webhooks
       - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
-      - WEBHOOK_DB_PATH=/app/data/webhooks.db
+      - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
       - WEBHOOK_ADMIN_USERNAME=${WEBHOOK_ADMIN_USERNAME:-}
       - WEBHOOK_ADMIN_PASSWORD=${WEBHOOK_ADMIN_PASSWORD:-}
       # Metrics (optional)
@@ -114,4 +115,6 @@ networks:
 
 volumes:
   ens-data:
+    driver: local
+  webhook-data:
     driver: local
