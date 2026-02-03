@@ -22,6 +22,7 @@ services:
         hard: 65536
     volumes:
       - ens-data:/app/data
+      - webhook-data:/app/webhooks  # Shared webhook database
     environment:
       # Database
       - DATABASE_PATH=/app/data/ens_v2.db
