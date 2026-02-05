@@ -2284,6 +2284,12 @@ pub const Indexer = struct {
             name_str_opt = try self.allocator.dupe(u8, name.name orelse "[unknown]");
             namehash_opt = name.namehash;
 
+            // Only update owner if the Transfer came from the name's own registry
+            // This prevents tokenId collisions between registries from causing incorrect updates
+            // (e.g., a User Registry might use the same tokenId as the main .eth registry)
+            const is_from_names_registry = log.address.eql(name.registry);
+            const name_registry = name.registry; // Copy before deinit for logging
+
             // Clean up the name struct
             var name_copy = name;
             name_copy.deinit(self.allocator);
