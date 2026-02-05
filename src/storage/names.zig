@@ -229,11 +229,17 @@ pub fn updateRegistryPlaceholderName(db: *Database, placeholder_name: []const u8
 pub fn getRegistriesByOwner(db: *Database, chain: models.Chain, owner: Address) ![]models.Registry {
     // Join registries with names on namehash to find registries where the NAME is owned by the specified owner
     // This returns registries for names that the owner controls (not registries that the owner's names use as subregistries)
+    // Only returns the LATEST (most recent) registry per name to avoid duplicates when subregistry is updated
     var q = try Query.init(db,
         \\SELECT r.address, r.chain, r.name, r.namehash, r.parent_registry, r.created_block, r.created_at
         \\FROM registries r
         \\JOIN names n ON r.namehash = n.namehash AND r.chain = n.chain
         \\WHERE r.chain = ? AND n.owner = ?
+        \\AND r.created_block = (
+        \\    SELECT MAX(r2.created_block)
+        \\    FROM registries r2
+        \\    WHERE r2.namehash = r.namehash AND r2.chain = r.chain
+        \\)
     );
     defer q.deinit();
 
