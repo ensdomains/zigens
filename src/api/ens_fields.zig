@@ -314,6 +314,11 @@ fn getEventChain(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
     return FieldValue{ .string = event.chain.toString() };
 }
 
+fn getEventData(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
+    const event = getEventCtx(ctx);
+    return FieldValue{ .optional_string = event.data };
+}
+
 /// Event field definitions table
 pub const EventFields = [_]FieldDef{
     FieldDef.custom("id", writeEventId),
@@ -325,6 +330,7 @@ pub const EventFields = [_]FieldDef{
     FieldDef.optionalHash("namehash", getEventNamehash),
     FieldDef.address("contractAddress", getEventContractAddress),
     FieldDef.string("chain", getEventChain),
+    FieldDef.optionalString("data", getEventData),
 };
 
 /// Custom writer for event ID (composite field)

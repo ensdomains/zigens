@@ -29,6 +29,9 @@ type Query {
   """Get EAC role assignments"""
   roles(resource: String, account: String): [EACRoleAssignment!]!
 
+  """Get EAC role assignments with cursor-based pagination (recommended)"""
+  roleConnection(first: Int, after: String, last: Int, before: String, resource: String, account: String): EACRoleAssignmentConnection!
+
   """Get dedicated resolvers for an account"""
   resolvers(account: String!): [ResolverInfo!]!
 
@@ -122,6 +125,27 @@ type EventConnection {
 
   """A list of edges"""
   edges: [EventEdge!]!
+
+  """Total count of items (may be expensive to compute)"""
+  totalCount: Int
+}
+
+"""An edge in an EACRoleAssignment connection"""
+type EACRoleAssignmentEdge {
+  """A cursor for use in pagination"""
+  cursor: String!
+
+  """The item at the end of the edge"""
+  node: EACRoleAssignment!
+}
+
+"""A connection to a list of EACRoleAssignments"""
+type EACRoleAssignmentConnection {
+  """Information to aid in pagination"""
+  pageInfo: PageInfo!
+
+  """A list of edges"""
+  edges: [EACRoleAssignmentEdge!]!
 
   """Total count of items (may be expensive to compute)"""
   totalCount: Int
@@ -290,6 +314,9 @@ type Event {
 
   """Chain where event occurred (l1 or l2)"""
   chain: String!
+
+  """Event-specific data as JSON (e.g., key/value for TextChanged, address for AddressChanged)"""
+  data: String
 }
 
 """Filter criteria for querying domains"""

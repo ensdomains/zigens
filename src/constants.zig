@@ -43,7 +43,7 @@ pub const Pagination = struct {
 /// RPC batching limits for multi-address queries
 pub const RpcBatching = struct {
     /// Number of contract addresses per eth_getLogs call
-    pub const addresses_per_call: u32 = 50;
+    pub const addresses_per_call: u32 = 60;
 
     /// Minimum block chunk size for adaptive chunking
     pub const min_chunk_size: u64 = 100;

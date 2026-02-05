@@ -1,5 +1,6 @@
 /// Admin-related GraphQL resolvers
 /// - resolveRoles: List EAC role assignments
+/// - resolveRolesConnection: Cursor-based pagination for role assignments
 /// - resolveResolvers: List resolvers
 /// - resolveRegistries: List registries
 /// - resolveMetadata: List resolver metadata
@@ -11,6 +12,7 @@ const models = common.models;
 const Address = common.Address;
 const Hash = common.Hash;
 const parser = common.parser;
+const pagination = common.pagination;
 const builders = common.builders;
 const escapeJsonString = common.escapeJsonString;
 
@@ -73,6 +75,154 @@ pub fn resolveRoles(ctx: parser.ExecutionContext, field: *const parser.Field) !p
     }
 
     try json.appendSlice(allocator, "]");
+    return parser.FieldResult{ .json = try allocator.dupe(u8, json.items) };
+}
+
+/// Resolver for roleConnection query (cursor-based pagination)
+pub fn resolveRolesConnection(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
+    const allocator = ctx.allocator;
+    const database: *db.Database = @ptrCast(@alignCast(ctx.database));
+
+    // Get chain argument (default: l2)
+    const chain = parseChainArg(field);
+
+    // Parse pagination arguments
+    const first = parser.getIntArg(field, "first", null);
+    const after = parser.getStringArg(field, "after", null);
+    const last = parser.getIntArg(field, "last", null);
+    const before = parser.getStringArg(field, "before", null);
+
+    const params = try pagination.PaginationParams.parse(
+        first,
+        after,
+        last,
+        before,
+        100, // default limit
+        1000, // max limit
+    );
+
+    // Get optional filter arguments
+    const resource_arg = parser.getStringArg(field, "resource", null);
+    const account_arg = parser.getStringArg(field, "account", null);
+
+    // Parse account address if provided
+    var account_addr: ?Address = null;
+    if (account_arg) |account_str| {
+        account_addr = Address.fromHex(account_str) catch null;
+    }
+
+    // Decode cursor if present
+    var cursor_id: ?i64 = null;
+    if (params.cursor) |cursor| {
+        cursor_id = pagination.CursorCodec.decodeInt(allocator, cursor) catch null;
+    }
+
+    // Extract node selections from query
+    var node_selections: []const parser.Field = &[_]parser.Field{};
+    for (field.selections) |*sel| {
+        if (std.mem.eql(u8, sel.name, "edges")) {
+            for (sel.selections) |*edge_sel| {
+                if (std.mem.eql(u8, edge_sel.name, "node")) {
+                    node_selections = edge_sel.selections;
+                    break;
+                }
+            }
+            break;
+        }
+    }
+
+    // Fetch one extra item to determine hasNextPage/hasPreviousPage
+    const fetch_limit: u32 = @intCast(params.limit + 1);
+
+    const roles = try database.getRolesWithPagination(chain, .{
+        .resource = resource_arg,
+        .account = account_addr,
+        .limit = fetch_limit,
+        .cursor_id = cursor_id,
+        .direction = if (params.direction == .backward) .backward else .forward,
+    });
+    defer {
+        for (roles) |*role| {
+            @constCast(role).deinit(allocator);
+        }
+        allocator.free(roles);
+    }
+
+    // Determine actual items to return
+    const actual_items = @min(roles.len, params.limit);
+    const has_more = roles.len > params.limit;
+
+    // For backward pagination, reverse the results to maintain proper edge order
+    if (params.direction == .backward and actual_items > 1) {
+        std.mem.reverse(models.EACRoleAssignment, @constCast(roles[0..actual_items]));
+    }
+
+    const items_slice = roles[0..actual_items];
+
+    // Get total count for aggregation
+    const total_count = try database.getTotalRoleCount(chain, resource_arg, account_addr);
+
+    // Build JSON
+    var json: std.ArrayList(u8) = .{};
+    defer json.deinit(allocator);
+
+    try json.appendSlice(allocator, "{\"pageInfo\":{");
+    try json.appendSlice(allocator, "\"hasNextPage\":");
+    try json.appendSlice(allocator, if (params.direction == .forward and has_more) "true" else "false");
+    try json.appendSlice(allocator, ",\"hasPreviousPage\":");
+    try json.appendSlice(allocator, if (params.direction == .backward and has_more) "true" else if (params.cursor != null) "true" else "false");
+
+    if (items_slice.len > 0) {
+        const start_cursor = try pagination.CursorCodec.encodeInt(allocator, @intCast(items_slice[0].id));
+        defer allocator.free(start_cursor);
+        try json.appendSlice(allocator, ",\"startCursor\":\"");
+        try json.appendSlice(allocator, start_cursor);
+        try json.appendSlice(allocator, "\"");
+
+        const end_cursor = try pagination.CursorCodec.encodeInt(allocator, @intCast(items_slice[items_slice.len - 1].id));
+        defer allocator.free(end_cursor);
+        try json.appendSlice(allocator, ",\"endCursor\":\"");
+        try json.appendSlice(allocator, end_cursor);
+        try json.appendSlice(allocator, "\"");
+    } else {
+        try json.appendSlice(allocator, ",\"startCursor\":null");
+        try json.appendSlice(allocator, ",\"endCursor\":null");
+    }
+
+    try json.appendSlice(allocator, "},\"edges\":[");
+
+    // Build edges
+    for (items_slice, 0..) |*role, i| {
+        if (i > 0) try json.appendSlice(allocator, ",");
+
+        const cursor = try pagination.CursorCodec.encodeInt(allocator, @intCast(role.id));
+        defer allocator.free(cursor);
+
+        try json.appendSlice(allocator, "{\"cursor\":\"");
+        try json.appendSlice(allocator, cursor);
+        try json.appendSlice(allocator, "\",\"node\":");
+
+        // Build role JSON using the existing field handler
+        const handler = FieldHandler{
+            .handleFn = handleEACRoleField,
+            .context = @constCast(@ptrCast(role)),
+        };
+        const role_json = try buildJsonWithFields(allocator, node_selections, handler);
+        defer allocator.free(role_json);
+        try json.appendSlice(allocator, role_json);
+
+        try json.appendSlice(allocator, "}");
+    }
+
+    try json.appendSlice(allocator, "]");
+
+    try json.appendSlice(allocator, ",\"totalCount\":");
+    const count_str = try std.fmt.allocPrint(allocator, "{d}", .{total_count});
+    defer allocator.free(count_str);
+    try json.appendSlice(allocator, count_str);
+
+    try json.appendSlice(allocator, "}");
+
     return parser.FieldResult{ .json = try allocator.dupe(u8, json.items) };
 }
 

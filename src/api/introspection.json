@@ -397,6 +397,60 @@
               }
             },
             {
+              "name": "roleConnection",
+              "args": [
+                {
+                  "name": "first",
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "after",
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "String"
+                  }
+                },
+                {
+                  "name": "last",
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "before",
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "String"
+                  }
+                },
+                {
+                  "name": "resource",
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "String"
+                  }
+                },
+                {
+                  "name": "account",
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "String"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "OBJECT",
+                  "name": "EACRoleAssignmentConnection"
+                }
+              }
+            },
+            {
               "name": "resolvers",
               "args": [
                 {
@@ -751,6 +805,78 @@
                     "ofType": {
                       "kind": "OBJECT",
                       "name": "EventEdge"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "name": "totalCount",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "EACRoleAssignmentEdge",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "cursor",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              }
+            },
+            {
+              "name": "node",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "OBJECT",
+                  "name": "EACRoleAssignment"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "EACRoleAssignmentConnection",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "pageInfo",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "OBJECT",
+                  "name": "PageInfo"
+                }
+              }
+            },
+            {
+              "name": "edges",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "EACRoleAssignmentEdge"
                     }
                   }
                 }
@@ -1365,6 +1491,14 @@
                   "kind": "SCALAR",
                   "name": "String"
                 }
+              }
+            },
+            {
+              "name": "data",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
               }
             }
           ]

@@ -263,6 +263,24 @@ pub const Indexer = struct {
         self.block_timestamp_cache.clearRetainingCapacity();
     }
 
+    /// Look up domain name from namehash (returns null if not found)
+    fn getNameFromNamehash(self: *Indexer, namehash: Hash) ?[]const u8 {
+        const name_record = self.database.getNameByNamehash(namehash) catch return null;
+        if (name_record) |record| {
+            // The name field is optional - if not set, return null
+            if (record.name) |name| {
+                // Duplicate the name so the record can be cleaned up
+                const name_copy = self.allocator.dupe(u8, name) catch return null;
+                var mutable_record = record;
+                mutable_record.deinit(self.allocator);
+                return name_copy;
+            }
+            var mutable_record = record;
+            mutable_record.deinit(self.allocator);
+        }
+        return null;
+    }
+
     // Helper methods to eliminate chain-specific conditionals
     inline fn getEthRegistry(self: *Indexer, chain: models.Chain) Address {
         return if (chain == .l1) self.config.l1_contracts.eth_registry else self.config.l2_contracts.l2_eth_registry;
@@ -2284,12 +2302,21 @@ pub const Indexer = struct {
             name_str_opt = try self.allocator.dupe(u8, name.name orelse "[unknown]");
             namehash_opt = name.namehash;
 
+            // Only update owner if the Transfer came from the name's own registry
+            // This prevents tokenId collisions between registries from causing incorrect updates
+            // (e.g., a User Registry might use the same tokenId as the main .eth registry)
+            const is_from_names_registry = log.address.eql(name.registry);
+            const name_registry = name.registry; // Copy before deinit for logging
+
             // Clean up the name struct
             var name_copy = name;
             name_copy.deinit(self.allocator);
 
-            // Update owner
-            try self.database.updateNameOwner(namehash_opt.?, to);
+            if (is_from_names_registry) {
+                try self.database.updateNameOwner(namehash_opt.?, to);
+            } else {
+                std.log.debug("  → Skipping owner update: Transfer from {any} but name's registry is {any}", .{ log.address, name_registry });
+            }
         } else {
             std.log.debug("  → Skipping Transfer for unknown tokenId={d}", .{id});
         }
@@ -3239,6 +3266,9 @@ pub const Indexer = struct {
             address_hex,
         });
 
+        // Look up domain name from namehash
+        const domain_name = self.getNameFromNamehash(namehash);
+
         const event = models.Event{
             .event_type = .address_changed,
             .chain = chain,
@@ -3246,7 +3276,7 @@ pub const Indexer = struct {
             .tx_hash = log.transaction_hash,
             .log_index = log.log_index,
             .contract_address = log.address,
-            .name = null,
+            .name = domain_name,
             .namehash = namehash,
             .data = event_data,
             .timestamp = self.getBlockTimestamp(chain, log.block_number),
@@ -3317,6 +3347,9 @@ pub const Indexer = struct {
             content_hash_hex,
         });
 
+        // Look up domain name from namehash
+        const domain_name = self.getNameFromNamehash(namehash);
+
         const event = models.Event{
             .event_type = .contenthash_changed,
             .chain = chain,
@@ -3324,7 +3357,7 @@ pub const Indexer = struct {
             .tx_hash = log.transaction_hash,
             .log_index = log.log_index,
             .contract_address = log.address,
-            .name = null,
+            .name = domain_name,
             .namehash = namehash,
             .data = event_data,
             .timestamp = self.getBlockTimestamp(chain, log.block_number),
@@ -3415,6 +3448,9 @@ pub const Indexer = struct {
             escaped_value,
         });
 
+        // Look up domain name from namehash
+        const domain_name = self.getNameFromNamehash(namehash);
+
         const event = models.Event{
             .event_type = .text_changed,
             .chain = chain,
@@ -3422,7 +3458,7 @@ pub const Indexer = struct {
             .tx_hash = log.transaction_hash,
             .log_index = log.log_index,
             .contract_address = log.address,
-            .name = null,
+            .name = domain_name,
             .namehash = namehash,
             .data = event_data,
             .timestamp = self.getBlockTimestamp(chain, log.block_number),
@@ -3459,6 +3495,10 @@ pub const Indexer = struct {
             content_type,
         });
 
+        // Look up domain name from namehash
+        const domain_name = self.getNameFromNamehash(namehash);
+        // Note: domain_name ownership is transferred to Event and freed by insertEventAndNotify
+
         const event = models.Event{
             .event_type = .abi_changed,
             .chain = chain,
@@ -3466,7 +3506,7 @@ pub const Indexer = struct {
             .tx_hash = log.transaction_hash,
             .log_index = log.log_index,
             .contract_address = log.address,
-            .name = null,
+            .name = domain_name,
             .namehash = namehash,
             .data = event_data,
             .timestamp = self.getBlockTimestamp(chain, log.block_number),
@@ -3517,6 +3557,10 @@ pub const Indexer = struct {
             y_hex,
         });
 
+        // Look up domain name from namehash
+        const domain_name = self.getNameFromNamehash(namehash);
+        // Note: domain_name ownership is transferred to Event and freed by insertEventAndNotify
+
         const event = models.Event{
             .event_type = .pubkey_changed,
             .chain = chain,
@@ -3524,7 +3568,7 @@ pub const Indexer = struct {
             .tx_hash = log.transaction_hash,
             .log_index = log.log_index,
             .contract_address = log.address,
-            .name = null,
+            .name = domain_name,
             .namehash = namehash,
             .data = event_data,
             .timestamp = self.getBlockTimestamp(chain, log.block_number),
@@ -3573,6 +3617,10 @@ pub const Indexer = struct {
             escaped_name,
         });
 
+        // Look up domain name from namehash
+        const domain_name = self.getNameFromNamehash(namehash);
+        // Note: domain_name ownership is transferred to Event and freed by insertEventAndNotify
+
         const event = models.Event{
             .event_type = .name_changed,
             .chain = chain,
@@ -3580,7 +3628,7 @@ pub const Indexer = struct {
             .tx_hash = log.transaction_hash,
             .log_index = log.log_index,
             .contract_address = log.address,
-            .name = null,
+            .name = domain_name,
             .namehash = namehash,
             .data = event_data,
             .timestamp = self.getBlockTimestamp(chain, log.block_number),
@@ -3635,6 +3683,10 @@ pub const Indexer = struct {
             implementer_hex,
         });
 
+        // Look up domain name from namehash
+        const domain_name = self.getNameFromNamehash(namehash);
+        // Note: domain_name ownership is transferred to Event and freed by insertEventAndNotify
+
         const event = models.Event{
             .event_type = .interface_changed,
             .chain = chain,
@@ -3642,7 +3694,7 @@ pub const Indexer = struct {
             .tx_hash = log.transaction_hash,
             .log_index = log.log_index,
             .contract_address = log.address,
-            .name = null,
+            .name = domain_name,
             .namehash = namehash,
             .data = event_data,
             .timestamp = self.getBlockTimestamp(chain, log.block_number),
