@@ -391,11 +391,14 @@ pub const Database = struct {
     pub const commitTransaction = transactions.commitTransaction;
     pub const rollbackTransaction = transactions.rollbackTransaction;
 
-    // Roles module (4 functions)
+    // Roles module (7 functions)
     pub const upsertEACRole = roles.upsertEACRole;
     pub const getRolesByResource = roles.getRolesByResource;
     pub const getRolesByAccount = roles.getRolesByAccount;
     pub const deleteEACRole = roles.deleteEACRole;
+    pub const RolePaginationOptions = roles.RolePaginationOptions;
+    pub const getRolesWithPagination = roles.getRolesWithPagination;
+    pub const getTotalRoleCount = roles.getTotalRoleCount;
 
     // ENSIP-16 module (7 functions)
     pub const upsertResolverMetadata = ensip16.upsertResolverMetadata;

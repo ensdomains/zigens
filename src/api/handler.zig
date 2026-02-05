@@ -59,6 +59,7 @@ pub const GraphQLHandler = struct {
         try executor.registerResolver("events", resolvers.resolveEvents);
         try executor.registerResolver("eventConnection", resolvers.resolveEventConnection);
         try executor.registerResolver("roles", resolvers.resolveRoles);
+        try executor.registerResolver("roleConnection", resolvers.resolveRolesConnection);
         try executor.registerResolver("resolvers", resolvers.resolveResolvers);
         try executor.registerResolver("registries", resolvers.resolveRegistries);
         try executor.registerResolver("metadata", resolvers.resolveMetadata);
@@ -435,8 +436,8 @@ pub const GraphQLHandler = struct {
 
             const item = try std.fmt.allocPrint(
                 self.allocator,
-                "{{\"id\":\"{s}-{d}\",\"type\":\"{s}\",\"blockNumber\":{d},\"transactionHash\":\"{s}\",\"timestamp\":{d},\"name\":{s},\"namehash\":{s},\"contractAddress\":\"{s}\"}}",
-                .{ tx_hash, event.log_index, event.event_type.toString(), event.block_number, tx_hash, event.timestamp, name_str, namehash_str, contract_addr },
+                "{{\"id\":\"{s}-{d}\",\"type\":\"{s}\",\"blockNumber\":{d},\"transactionHash\":\"{s}\",\"timestamp\":{d},\"name\":{s},\"namehash\":{s},\"contractAddress\":\"{s}\",\"chain\":\"{s}\",\"data\":{s}}}",
+                .{ tx_hash, event.log_index, event.event_type.toString(), event.block_number, tx_hash, event.timestamp, name_str, namehash_str, contract_addr, chain_str, data_str },
             );
             defer self.allocator.free(item);
             try response.appendSlice(self.allocator, item);
@@ -1090,10 +1091,8 @@ pub const GraphQLHandler = struct {
         var text_records_map: ?std.AutoHashMap([32]u8, @import("loaders.zig").TextRecords) = null;
         defer {
             if (text_records_map) |*map| {
-                var it = map.valueIterator();
-                while (it.next()) |val_ptr| {
-                    val_ptr.*.deinit();
-                }
+                // Note: TextRecords are owned by the DataLoader cache and will be freed
+                // when LoaderContext.deinit() runs. Don't free them here to avoid double-free.
                 map.deinit();
             }
         }
