@@ -1073,12 +1073,8 @@ pub const GraphQLHandler = struct {
         var content_hash_map: ?std.AutoHashMap([32]u8, ?[]const u8) = null;
         defer {
             if (content_hash_map) |*map| {
-                var it = map.valueIterator();
-                while (it.next()) |val_ptr| {
-                    if (val_ptr.*) |val| {
-                        self.allocator.free(val);
-                    }
-                }
+                // Note: Values are owned by the DataLoader cache and will be freed
+                // when LoaderContext.deinit() runs. Don't free them here to avoid double-free.
                 map.deinit();
             }
         }
