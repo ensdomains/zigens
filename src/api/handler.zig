@@ -425,6 +425,14 @@ pub const GraphQLHandler = struct {
             } else try self.allocator.dupe(u8, "null");
             defer self.allocator.free(namehash_str);
 
+            const data_str = if (event.data) |d|
+                try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{d})
+            else
+                try self.allocator.dupe(u8, "null");
+            defer self.allocator.free(data_str);
+
+            const chain_str = event.chain.toString();
+
             const item = try std.fmt.allocPrint(
                 self.allocator,
                 "{{\"id\":\"{s}-{d}\",\"type\":\"{s}\",\"blockNumber\":{d},\"transactionHash\":\"{s}\",\"timestamp\":{d},\"name\":{s},\"namehash\":{s},\"contractAddress\":\"{s}\"}}",
