@@ -212,6 +212,12 @@ type Domain {
 
   """Events associated with this domain"""
   events(first: Int = 100, where: EventFilter): [Event!]!
+
+  """Count of direct subdomains (one level only)"""
+  subdomainsCount: Int!
+
+  """Count of events associated with this domain"""
+  eventsCount: Int!
 }
 
 """An Ethereum account (address)"""

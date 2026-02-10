@@ -11,7 +11,7 @@ const Hash = @import("types/hash.zig").Hash;
 /// Timing constants for delays, retries, and intervals
 pub const Timing = struct {
     /// Delay between RPC batch calls to avoid rate limiting (milliseconds)
-    pub const rpc_batch_delay_ms: u64 = 100;
+    pub const rpc_batch_delay_ms: u64 = 50;
 
     /// Delay before retrying a failed RPC call (milliseconds)
     pub const rpc_retry_delay_ms: u64 = 200;

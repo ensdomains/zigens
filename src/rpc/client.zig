@@ -97,6 +97,8 @@ pub const Log = struct {
     transaction_index: u32,
     log_index: u32,
     removed: bool,
+    /// Block timestamp - optional, some RPC providers include it in eth_getLogs response
+    block_timestamp: ?u64,
 
     pub fn deinit(self: *Log, allocator: std.mem.Allocator) void {
         allocator.free(self.topics);
@@ -199,6 +201,12 @@ pub const Client = struct {
                 },
                 .max_output_bytes = 10 * 1024 * 1024, // 10MB max response
             }) catch |err| {
+                // StdoutStreamTooLong means response is too big - retrying won't help
+                // Return immediately so caller can reduce query size
+                if (err == error.StdoutStreamTooLong) {
+                    std.log.debug("Response too large for buffer, returning immediately", .{});
+                    return err;
+                }
                 last_error = err;
                 std.log.warn("curl spawn error: {}", .{err});
                 continue;
@@ -500,6 +508,7 @@ pub const Client = struct {
                 .transaction_index = @intCast(try std.fmt.parseInt(u64, log_obj.get("transactionIndex").?.string[2..], 16)),
                 .log_index = @intCast(try std.fmt.parseInt(u64, log_obj.get("logIndex").?.string[2..], 16)),
                 .removed = if (log_obj.get("removed")) |r| r.bool else false,
+                .block_timestamp = if (log_obj.get("blockTimestamp")) |ts| std.fmt.parseInt(u64, ts.string[2..], 16) catch null else null,
             };
         }
 
@@ -623,6 +632,7 @@ pub const Client = struct {
                     .transaction_index = @intCast(try std.fmt.parseInt(u64, log_obj.get("transactionIndex").?.string[2..], 16)),
                     .log_index = @intCast(try std.fmt.parseInt(u64, log_obj.get("logIndex").?.string[2..], 16)),
                     .removed = if (log_obj.get("removed")) |r| r.bool else false,
+                    .block_timestamp = if (log_obj.get("blockTimestamp")) |ts| std.fmt.parseInt(u64, ts.string[2..], 16) catch null else null,
                 };
             }
 
@@ -730,6 +740,7 @@ pub const Client = struct {
                 .transaction_index = @intCast(try std.fmt.parseInt(u64, log_obj.get("transactionIndex").?.string[2..], 16)),
                 .log_index = @intCast(try std.fmt.parseInt(u64, log_obj.get("logIndex").?.string[2..], 16)),
                 .removed = if (log_obj.get("removed")) |r| r.bool else false,
+                .block_timestamp = if (log_obj.get("blockTimestamp")) |ts| std.fmt.parseInt(u64, ts.string[2..], 16) catch null else null,
             };
         }
 

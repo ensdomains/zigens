@@ -142,6 +142,19 @@ pub fn checkIntegrity(db: *Database) !bool {
     return false;
 }
 
+/// Check if a subregistry is already known
+pub fn isSubregistryKnown(db: *Database, chain: models.Chain, address: []const u8) !bool {
+    const sql = "SELECT 1 FROM known_subregistries WHERE chain = ? AND address = ? LIMIT 1";
+
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+
+    try q.bindTextStatic(chain.toString());
+    try q.bindText(address);
+
+    return try q.step();
+}
+
 /// Register or update a known subregistry
 pub fn registerSubregistry(db: *Database, chain: models.Chain, address: []const u8, block_number: u64) !void {
     const sql =
@@ -370,4 +383,129 @@ pub fn deleteDataAfterBlock(db: *Database, block_number: u64) !void {
     // Commit transaction
     try db.exec("COMMIT");
     std.log.info("Data cleanup complete", .{});
+}
+
+// ============================================================================
+// ORPHANED REGISTRATIONS
+// ============================================================================
+
+/// Orphaned registration data - NameRegistered events skipped due to no parent
+pub const OrphanedRegistration = struct {
+    chain: models.Chain,
+    subregistry_address: []const u8,
+    token_id: u256,
+    label: []const u8,
+    expiry: u64,
+    owner: Address,
+    block_number: u64,
+    tx_hash: Hash,
+    log_index: u32,
+
+    pub fn deinit(self: *OrphanedRegistration, allocator: std.mem.Allocator) void {
+        allocator.free(self.subregistry_address);
+        allocator.free(self.label);
+    }
+};
+
+/// Store an orphaned NameRegistered event for later processing
+pub fn insertOrphanedRegistration(
+    db: *Database,
+    chain: models.Chain,
+    subregistry_address: []const u8,
+    token_id: u256,
+    label: []const u8,
+    expiry: u64,
+    owner: Address,
+    block_number: u64,
+    tx_hash: Hash,
+    log_index: u32,
+) !void {
+    const sql =
+        \\INSERT OR IGNORE INTO orphaned_registrations
+        \\(chain, subregistry_address, token_id, label, expiry, owner, block_number, tx_hash, log_index, created_at)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ;
+
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+
+    const token_id_str = try std.fmt.allocPrint(db.allocator, "0x{x:0>64}", .{token_id});
+    defer db.allocator.free(token_id_str);
+
+    try q.bindTextStatic(chain.toString());
+    try q.bindText(subregistry_address);
+    try q.bindText(token_id_str);
+    try q.bindText(label);
+    try q.bindInt64(@intCast(expiry));
+    try q.bindAddress(owner);
+    try q.bindInt64(@intCast(block_number));
+    try q.bindHash(tx_hash);
+    try q.bindInt(@intCast(log_index));
+    try q.bindInt64(std.time.timestamp());
+
+    try q.exec();
+}
+
+/// Get orphaned registrations for a subregistry address
+pub fn getOrphanedRegistrations(db: *Database, chain: models.Chain, subregistry_address: []const u8) ![]OrphanedRegistration {
+    const sql =
+        \\SELECT chain, subregistry_address, token_id, label, expiry, owner, block_number, tx_hash, log_index
+        \\FROM orphaned_registrations
+        \\WHERE chain = ? AND subregistry_address = ?
+        \\ORDER BY block_number ASC
+    ;
+
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+
+    try q.bindTextStatic(chain.toString());
+    try q.bindText(subregistry_address);
+
+    var results: std.ArrayList(OrphanedRegistration) = .{};
+    errdefer {
+        for (results.items) |*item| {
+            item.deinit(db.allocator);
+        }
+        results.deinit(db.allocator);
+    }
+
+    while (try q.step()) {
+        const chain_str = q.getTextSlice(0) orelse continue;
+        const addr_str = q.getTextSlice(1) orelse continue;
+        const token_id_str = q.getTextSlice(2) orelse continue;
+        const label_str = q.getTextSlice(3) orelse continue;
+        const owner_str = q.getTextSlice(5) orelse continue;
+        const tx_hash_str = q.getTextSlice(7) orelse continue;
+
+        // Parse token_id from hex
+        const token_id_clean = if (std.mem.startsWith(u8, token_id_str, "0x")) token_id_str[2..] else token_id_str;
+        const token_id = std.fmt.parseInt(u256, token_id_clean, 16) catch continue;
+
+        try results.append(db.allocator, .{
+            .chain = models.Chain.fromString(chain_str) catch continue,
+            .subregistry_address = try db.allocator.dupe(u8, addr_str),
+            .token_id = token_id,
+            .label = try db.allocator.dupe(u8, label_str),
+            .expiry = @intCast(q.getInt64(4)),
+            .owner = Address.fromHex(owner_str) catch continue,
+            .block_number = @intCast(q.getInt64(6)),
+            .tx_hash = Hash.fromHex(tx_hash_str) catch continue,
+            .log_index = @intCast(q.getInt(8)),
+        });
+    }
+
+    return results.toOwnedSlice(db.allocator);
+}
+
+/// Delete orphaned registrations after they've been processed
+pub fn deleteOrphanedRegistrations(db: *Database, chain: models.Chain, subregistry_address: []const u8) !void {
+    const sql = "DELETE FROM orphaned_registrations WHERE chain = ? AND subregistry_address = ?";
+
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+
+    try q.bindTextStatic(chain.toString());
+    try q.bindText(subregistry_address);
+
+    try q.exec();
 }

@@ -185,12 +185,8 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
     var resolver_addresses: ?std.AutoHashMap([32]u8, ?[]const u8) = null;
     defer {
         if (resolver_addresses) |*addrs| {
-            var it = addrs.iterator();
-            while (it.next()) |entry| {
-                if (entry.value_ptr.*) |addr| {
-                    allocator.free(addr);
-                }
-            }
+            // Note: Values are owned by the DataLoader cache and will be freed
+            // when LoaderContext.deinit() runs. Don't free them here to avoid double-free.
             addrs.deinit();
         }
     }
@@ -224,6 +220,36 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
     // First pass: collect filtered names
     var filtered_names: std.ArrayList(*models.Name) = .{};
     defer filtered_names.deinit(allocator);
+
+    // Pre-compute lowercase filter once (avoid re-allocating per name)
+    const lower_filter_precomputed: ?[]u8 = if (filter_name_contains_nocase) |f|
+        try std.ascii.allocLowerString(allocator, f)
+    else
+        null;
+    defer if (lower_filter_precomputed) |lf| allocator.free(lf);
+
+    // Pre-batch subdomain counts if any subdomain filter is active (avoid N+1 queries)
+    var subdomain_counts: ?std.StringHashMap(u32) = null;
+    if (filter_has_subdomains != null or filter_subdomain_count_gt != null or filter_subdomain_count_lt != null) {
+        // Collect all parent names for batch query
+        var parent_names: std.ArrayList([]const u8) = .{};
+        defer parent_names.deinit(allocator);
+        for (names) |*name| {
+            if (name.name) |n| {
+                try parent_names.append(allocator, n);
+            }
+        }
+        if (parent_names.items.len > 0) {
+            subdomain_counts = try database.batchCountDirectSubdomains(allocator, parent_names.items);
+        }
+    }
+    defer if (subdomain_counts) |*sc| {
+        var it = sc.keyIterator();
+        while (it.next()) |key| {
+            allocator.free(key.*);
+        }
+        sc.deinit();
+    };
 
     for (names) |*name| {
         // Apply filters
@@ -274,13 +300,11 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
             }
         }
 
-        if (matches and filter_name_contains_nocase != null) {
-            // Case-insensitive contains
+        if (matches and lower_filter_precomputed != null) {
+            // Case-insensitive contains (filter already lowercased once before loop)
             const lower_name = try std.ascii.allocLowerString(allocator, name.name orelse "[unknown]");
             defer allocator.free(lower_name);
-            const lower_filter = try std.ascii.allocLowerString(allocator, filter_name_contains_nocase.?);
-            defer allocator.free(lower_filter);
-            if (std.mem.indexOf(u8, lower_name, lower_filter) == null) matches = false;
+            if (std.mem.indexOf(u8, lower_name, lower_filter_precomputed.?) == null) matches = false;
         }
 
         if (matches and filter_name_starts_with != null) {
@@ -303,9 +327,11 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
         }
 
         // Filter by hasSubdomains - only counts direct children (one level down)
+        // Uses pre-batched counts to avoid N+1 queries
         if (matches and filter_has_subdomains != null) {
             if (name.name) |domain_name| {
-                const has_subs = try database.hasDirectSubdomains(domain_name);
+                const count = if (subdomain_counts) |sc| sc.get(domain_name) orelse 0 else 0;
+                const has_subs = count > 0;
                 if (filter_has_subdomains.? != has_subs) matches = false;
             } else {
                 // Domain without a name can't have subdomains checked
@@ -314,9 +340,10 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
         }
 
         // Filter by subdomainCount_gt - only counts direct children (one level down)
+        // Uses pre-batched counts to avoid N+1 queries
         if (matches and filter_subdomain_count_gt != null) {
             if (name.name) |domain_name| {
-                const subdomain_count = try database.countDirectSubdomains(domain_name);
+                const subdomain_count = if (subdomain_counts) |sc| sc.get(domain_name) orelse 0 else 0;
                 if (subdomain_count <= @as(u32, @intCast(filter_subdomain_count_gt.?))) matches = false;
             } else {
                 // Domain without a name has 0 subdomains
@@ -325,9 +352,10 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
         }
 
         // Filter by subdomainCount_lt - only counts direct children (one level down)
+        // Uses pre-batched counts to avoid N+1 queries
         if (matches and filter_subdomain_count_lt != null) {
             if (name.name) |domain_name| {
-                const subdomain_count = try database.countDirectSubdomains(domain_name);
+                const subdomain_count = if (subdomain_counts) |sc| sc.get(domain_name) orelse 0 else 0;
                 if (subdomain_count >= @as(u32, @intCast(filter_subdomain_count_lt.?))) matches = false;
             } else {
                 // Domain without a name has 0 subdomains - always passes lt filter unless lt=0
