@@ -182,6 +182,7 @@ pub const Client = struct {
                 std.Thread.sleep(delay_ms * std.time.ns_per_ms);
             }
 
+            const curl_start = std.time.milliTimestamp();
             const curl_result = std.process.Child.run(.{
                 .allocator = arena_allocator,
                 .argv = &.{
@@ -199,7 +200,7 @@ pub const Client = struct {
                     request_body,
                     self.rpc_url,
                 },
-                .max_output_bytes = 10 * 1024 * 1024, // 10MB max response
+                .max_output_bytes = 50 * 1024 * 1024, // 50MB max response (handles spam bursts)
             }) catch |err| {
                 // StdoutStreamTooLong means response is too big - retrying won't help
                 // Return immediately so caller can reduce query size
@@ -223,6 +224,11 @@ pub const Client = struct {
                 last_error = error.HttpError;
                 std.log.warn("curl returned empty response", .{});
                 continue;
+            }
+
+            const curl_elapsed = std.time.milliTimestamp() - curl_start;
+            if (curl_elapsed > 500) {
+                std.log.debug("RPC curl took {d}ms, response {d} bytes", .{ curl_elapsed, curl_result.stdout.len });
             }
 
             return curl_result.stdout;
@@ -701,8 +707,10 @@ pub const Client = struct {
         try params_array.append(.{ .object = filter });
 
         // Make RPC call
+        const rpc_start = std.time.milliTimestamp();
         const parsed = try self.makeRpcCallWithParams("eth_getLogs", .{ .array = params_array });
         defer parsed.deinit();
+        const rpc_elapsed = std.time.milliTimestamp() - rpc_start;
 
         const result = parsed.value.object.get("result").?;
         const logs_array = result.array;
@@ -717,6 +725,7 @@ pub const Client = struct {
         }
 
         // Parse each log
+        const parse_start = std.time.milliTimestamp();
         for (logs_array.items, 0..) |log_value, i| {
             const log_obj = log_value.object;
 
@@ -743,8 +752,153 @@ pub const Client = struct {
                 .block_timestamp = if (log_obj.get("blockTimestamp")) |ts| std.fmt.parseInt(u64, ts.string[2..], 16) catch null else null,
             };
         }
+        const parse_elapsed = std.time.milliTimestamp() - parse_start;
+
+        if (logs.len > 1000) {
+            std.log.debug("getLogsMultiAddress: {d} logs, rpc={d}ms, parse={d}ms", .{ logs.len, rpc_elapsed, parse_elapsed });
+        }
 
         return logs;
+    }
+
+    /// Batch version of getLogsMultiAddress - fetches multiple block ranges in a single HTTP request
+    /// Returns array of log arrays in the same order as requests
+    /// Caller must free each log array and its contents
+    pub fn getLogsMultiAddressBatch(self: *Client, requests: []const MultiAddressLogsRequest) ![][]Log {
+        if (requests.len == 0) {
+            return try self.allocator.alloc([]Log, 0);
+        }
+
+        // Use arena allocator for building batch request params
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+
+        // Build batch requests
+        var batch_requests = try arena_alloc.alloc(BatchRequest, requests.len);
+
+        for (requests, 0..) |req, i| {
+            // Build filter object
+            const from_hex = try std.fmt.allocPrint(arena_alloc, "0x{x}", .{req.from_block});
+            const to_hex = try std.fmt.allocPrint(arena_alloc, "0x{x}", .{req.to_block});
+
+            var filter = std.json.ObjectMap.init(arena_alloc);
+            try filter.put("fromBlock", .{ .string = from_hex });
+            try filter.put("toBlock", .{ .string = to_hex });
+
+            // Add addresses array
+            if (req.addresses.len > 0) {
+                var addr_array = std.json.Array.init(arena_alloc);
+                for (req.addresses) |addr| {
+                    const addr_hex = try addr.toHex(arena_alloc);
+                    try addr_array.append(.{ .string = addr_hex });
+                }
+                try filter.put("address", .{ .array = addr_array });
+            }
+
+            // Add topics with OR support for topic[0]
+            if (req.topic0_or.len > 0) {
+                var topics_array = std.json.Array.init(arena_alloc);
+
+                // topic[0] is an array for OR matching
+                var topic0_array = std.json.Array.init(arena_alloc);
+                for (req.topic0_or) |topic| {
+                    const topic_hex = try topic.toHex(arena_alloc);
+                    try topic0_array.append(.{ .string = topic_hex });
+                }
+                try topics_array.append(.{ .array = topic0_array });
+
+                try filter.put("topics", .{ .array = topics_array });
+            }
+
+            // Create batch request with filter as param array
+            var params_array = std.json.Array.init(arena_alloc);
+            try params_array.append(.{ .object = filter });
+
+            batch_requests[i] = .{
+                .method = "eth_getLogs",
+                .params = .{ .array = params_array },
+            };
+        }
+
+        // Make batch RPC call with timing
+        const rpc_start = std.time.milliTimestamp();
+        const parsed = try self.makeBatchRpcCall(batch_requests);
+        defer parsed.deinit();
+        const rpc_elapsed = std.time.milliTimestamp() - rpc_start;
+
+        const responses = parsed.value.array;
+
+        // Allocate array for results
+        var results = try self.allocator.alloc([]Log, requests.len);
+        errdefer {
+            for (results, 0..) |logs, i| {
+                if (i > 0) {
+                    for (logs) |*log| {
+                        log.deinit(self.allocator);
+                    }
+                    self.allocator.free(logs);
+                }
+            }
+            self.allocator.free(results);
+        }
+
+        // Parse each response
+        const parse_start = std.time.milliTimestamp();
+        var total_logs: usize = 0;
+        for (responses.items, 0..) |response_value, i| {
+            const response = response_value.object;
+            const result = response.get("result").?;
+            const logs_array = result.array;
+
+            var logs = try self.allocator.alloc(Log, logs_array.items.len);
+            errdefer {
+                for (logs, 0..) |*log, j| {
+                    if (j > 0) log.deinit(self.allocator);
+                }
+                self.allocator.free(logs);
+            }
+
+            for (logs_array.items, 0..) |log_value, j| {
+                const log_obj = log_value.object;
+
+                // Parse topics
+                const topics_json = log_obj.get("topics").?.array;
+                var log_topics = try self.allocator.alloc(Hash, topics_json.items.len);
+                for (topics_json.items, 0..) |topic_val, k| {
+                    log_topics[k] = try Hash.fromHex(topic_val.string);
+                }
+
+                // Parse data
+                const data_hex = log_obj.get("data").?.string;
+                const data_bytes = try self.hexToBytes(data_hex);
+
+                logs[j] = Log{
+                    .address = try Address.fromHex(log_obj.get("address").?.string),
+                    .topics = log_topics,
+                    .data = data_bytes,
+                    .block_number = try std.fmt.parseInt(u64, log_obj.get("blockNumber").?.string[2..], 16),
+                    .transaction_hash = try Hash.fromHex(log_obj.get("transactionHash").?.string),
+                    .transaction_index = @intCast(try std.fmt.parseInt(u64, log_obj.get("transactionIndex").?.string[2..], 16)),
+                    .log_index = @intCast(try std.fmt.parseInt(u64, log_obj.get("logIndex").?.string[2..], 16)),
+                    .removed = if (log_obj.get("removed")) |r| r.bool else false,
+                    .block_timestamp = if (log_obj.get("blockTimestamp")) |ts| std.fmt.parseInt(u64, ts.string[2..], 16) catch null else null,
+                };
+            }
+
+            results[i] = logs;
+            total_logs += logs.len;
+        }
+        const parse_elapsed = std.time.milliTimestamp() - parse_start;
+
+        std.log.debug("getLogsMultiAddressBatch: {d} requests, {d} total logs, rpc={d}ms, parse={d}ms", .{
+            requests.len,
+            total_logs,
+            rpc_elapsed,
+            parse_elapsed,
+        });
+
+        return results;
     }
 
     /// Fetch a single transaction by hash

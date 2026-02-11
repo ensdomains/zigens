@@ -1611,12 +1611,11 @@ pub const Indexer = struct {
         // STEP 2: Topic-only query for TransferSingle - O(1) per subregistry
         // Filter by: 1) Token ID entropy (ENS uses hash-like IDs)
         //            2) Known subregistries HashSet
-        // Uses adaptive chunking: starts small (TransferSingle is VERY common),
-        // shrinks on failure, grows on success up to max
+        // Uses JSON-RPC batching: batch multiple chunk queries into single HTTP request
         // ========================================================================
-        const MAX_CHUNK_SIZE: u64 = 2000; // TransferSingle is very common, stay conservative
-        const MIN_CHUNK_SIZE: u64 = 50; // Minimum before giving up
-        std.log.info("  Step 2: Topic-only query for TransferSingle (adaptive chunking, max {d} blocks)", .{MAX_CHUNK_SIZE});
+        const CHUNK_SIZE: u64 = 2000; // TransferSingle is very common, stay conservative
+        const BATCH_SIZE: usize = 10; // Number of chunks per HTTP request
+        std.log.info("  Step 2: Topic-only query for TransferSingle (batched, {d} chunks x {d} blocks per request)", .{ BATCH_SIZE, CHUNK_SIZE });
 
         const transfer_topics = [_]Hash{SUBREGISTRY_TRANSFER_EVENT.event_hash};
         var transfer_processed: usize = 0;
@@ -1624,92 +1623,141 @@ pub const Indexer = struct {
         var transfer_filtered_unknown: usize = 0;
         var transfer_total_fetched: usize = 0;
 
-        var current_chunk_size: u64 = MAX_CHUNK_SIZE;
-        var chunk_from = from_block;
+        // Calculate total chunks needed
+        const total_blocks = to_block - from_block + 1;
+        const total_chunks = (total_blocks + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
-        while (chunk_from <= to_block) {
-            var retry_chunk_size = current_chunk_size;
+        var chunks_processed: usize = 0;
+        var batch_start_chunk: usize = 0;
 
-            // Retry loop with adaptive chunk size
-            const transfer_logs = while (retry_chunk_size >= MIN_CHUNK_SIZE) {
-                const chunk_to = @min(chunk_from + retry_chunk_size - 1, to_block);
+        while (batch_start_chunk < total_chunks) {
+            // Build batch of chunk requests
+            const batch_end_chunk = @min(batch_start_chunk + BATCH_SIZE, total_chunks);
+            const batch_count = batch_end_chunk - batch_start_chunk;
 
-                const logs = client.getLogsMultiAddress(.{
-                    .from_block = chunk_from,
-                    .to_block = chunk_to,
+            var batch_requests = try self.allocator.alloc(rpc.Client.MultiAddressLogsRequest, batch_count);
+            defer self.allocator.free(batch_requests);
+
+            for (0..batch_count) |i| {
+                const chunk_idx = batch_start_chunk + i;
+                const chunk_from_block = from_block + chunk_idx * CHUNK_SIZE;
+                const chunk_to_block = @min(chunk_from_block + CHUNK_SIZE - 1, to_block);
+
+                batch_requests[i] = .{
+                    .from_block = chunk_from_block,
+                    .to_block = chunk_to_block,
                     .addresses = &[_]Address{}, // Empty = no address filter (topic-only)
                     .topic0_or = &transfer_topics,
-                }) catch |err| {
-                    // Halve chunk size and retry
-                    const new_size = retry_chunk_size / 2;
-                    std.log.info("    Chunk {d}-{d} too large ({any}), reducing to {d} blocks", .{ chunk_from, chunk_to, err, new_size });
-                    retry_chunk_size = new_size;
-                    std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
-                    continue;
                 };
+            }
 
-                // Success - update current chunk size for next iteration
-                current_chunk_size = retry_chunk_size;
-                break logs;
-            } else {
-                // All retries failed - skip this range and try to continue
-                std.log.warn("    TransferSingle failed at block {d} even with min chunk, skipping ahead", .{chunk_from});
-                chunk_from += MIN_CHUNK_SIZE;
-                current_chunk_size = MIN_CHUNK_SIZE * 2; // Start small for next range
+            // Make batched RPC call
+            const batch_results = client.getLogsMultiAddressBatch(batch_requests) catch |err| {
+                // If batch fails, fall back to individual requests
+                std.log.warn("    Batch request failed ({any}), falling back to individual requests", .{err});
+
+                for (batch_requests) |req| {
+                    const logs = client.getLogsMultiAddress(req) catch |e| {
+                        std.log.warn("    Individual request {d}-{d} also failed: {any}", .{ req.from_block, req.to_block, e });
+                        continue;
+                    };
+                    defer {
+                        for (logs) |*log| {
+                            log.deinit(self.allocator);
+                        }
+                        self.allocator.free(logs);
+                    }
+
+                    // Process logs from this chunk
+                    transfer_total_fetched += logs.len;
+                    for (logs) |log| {
+                        if (log.data.len >= 32) {
+                            const token_id = abi.ABI.decodeUint256(log.data, 0) catch continue;
+                            if (token_id < (1 << 64)) {
+                                transfer_filtered_small_id += 1;
+                                continue;
+                            }
+                        }
+                        if (!known_subreg_set.contains(log.address.bytes)) {
+                            transfer_filtered_unknown += 1;
+                            continue;
+                        }
+                        SUBREGISTRY_TRANSFER_EVENT.handler(self, chain, log) catch |handler_err| {
+                            std.log.warn("    Failed to process transfer: {}", .{handler_err});
+                        };
+                        transfer_processed += 1;
+                    }
+                    chunks_processed += 1;
+                }
+                batch_start_chunk = batch_end_chunk;
                 continue;
             };
-
             defer {
-                for (transfer_logs) |*log| {
-                    log.deinit(self.allocator);
+                for (batch_results) |logs| {
+                    for (logs) |*log| {
+                        log.deinit(self.allocator);
+                    }
+                    self.allocator.free(logs);
                 }
-                self.allocator.free(transfer_logs);
+                self.allocator.free(batch_results);
             }
 
-            transfer_total_fetched += transfer_logs.len;
+            // Process results from batch
+            const filter_start = std.time.milliTimestamp();
+            var batch_filtered_small: usize = 0;
+            var batch_filtered_unknown: usize = 0;
+            var batch_processed: usize = 0;
+            var batch_fetched: usize = 0;
 
-            for (transfer_logs) |log| {
-                // Quick filter 1: Check token ID entropy
-                // ENS token IDs are namehashes (keccak256) - large 256-bit numbers
-                // Most ERC1155s use sequential IDs (1, 2, 3...) which are small
-                if (log.data.len >= 32) {
-                    const token_id = abi.ABI.decodeUint256(log.data, 0) catch continue;
-                    // Namehashes are uniformly distributed ~2^256, sequential IDs are tiny
-                    // Using 2^64 as threshold filters out ~80% of non-ENS transfers
-                    if (token_id < (1 << 64)) {
-                        transfer_filtered_small_id += 1;
+            for (batch_results) |logs| {
+                batch_fetched += logs.len;
+
+                for (logs) |log| {
+                    // Quick filter 1: Check token ID entropy
+                    if (log.data.len >= 32) {
+                        const token_id = abi.ABI.decodeUint256(log.data, 0) catch continue;
+                        if (token_id < (1 << 64)) {
+                            transfer_filtered_small_id += 1;
+                            batch_filtered_small += 1;
+                            continue;
+                        }
+                    }
+
+                    // Quick filter 2: Check if from known subregistry
+                    if (!known_subreg_set.contains(log.address.bytes)) {
+                        transfer_filtered_unknown += 1;
+                        batch_filtered_unknown += 1;
                         continue;
                     }
-                }
 
-                // Quick filter 2: Check if from known subregistry
-                if (!known_subreg_set.contains(log.address.bytes)) {
-                    transfer_filtered_unknown += 1;
-                    continue;
-                }
-
-                // Process the transfer event
-                SUBREGISTRY_TRANSFER_EVENT.handler(self, chain, log) catch |err| {
-                    std.log.warn("    Failed to process transfer: {}", .{err});
-                };
-                transfer_processed += 1;
-            }
-
-            // Move to next chunk
-            chunk_from += current_chunk_size;
-
-            // Gradually increase chunk size back toward max after success (conservative: +25%)
-            if (current_chunk_size < MAX_CHUNK_SIZE) {
-                const increase = @max(current_chunk_size / 4, 100); // At least 100 blocks
-                const new_size = @min(current_chunk_size + increase, MAX_CHUNK_SIZE);
-                if (new_size > current_chunk_size) {
-                    std.log.debug("    Increasing chunk size: {d} -> {d}", .{ current_chunk_size, new_size });
-                    current_chunk_size = new_size;
+                    // Process the transfer event
+                    SUBREGISTRY_TRANSFER_EVENT.handler(self, chain, log) catch |err| {
+                        std.log.warn("    Failed to process transfer: {}", .{err});
+                    };
+                    transfer_processed += 1;
+                    batch_processed += 1;
                 }
             }
+            const filter_elapsed = std.time.milliTimestamp() - filter_start;
 
-            // Rate limit between chunks
-            if (chunk_from <= to_block) {
+            transfer_total_fetched += batch_fetched;
+            chunks_processed += batch_count;
+
+            if (batch_fetched > 1000) {
+                std.log.debug("    Batch {d} chunks: {d} logs, filter={d}ms (small={d}, unknown={d}, processed={d})", .{
+                    batch_count,
+                    batch_fetched,
+                    filter_elapsed,
+                    batch_filtered_small,
+                    batch_filtered_unknown,
+                    batch_processed,
+                });
+            }
+
+            batch_start_chunk = batch_end_chunk;
+
+            // Rate limit between batches
+            if (batch_start_chunk < total_chunks) {
                 std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
             }
         }
