@@ -17,6 +17,7 @@ const resolvers = @import("resolvers.zig");
 
 // Re-export types for use by other modules
 pub const OrderDir = names.OrderDir;
+pub const NameFilters = names.NameFilters;
 const sync = @import("sync.zig");
 const events = @import("events.zig");
 pub const EventOrderDir = events.OrderDir;
@@ -327,7 +328,9 @@ pub const Database = struct {
     pub const getNamesByRegistrant = names.getNamesByRegistrant;
     pub const getAllNames = names.getAllNames;
     pub const getAllNamesWithOrder = names.getAllNamesWithOrder;
+    pub const getFilteredNames = names.getFilteredNames;
     pub const OrderDir = names.OrderDir;
+    pub const NameFilters = names.NameFilters;
     pub const getRegistriesByOwner = names.getRegistriesByOwner;
     pub const countDirectSubdomains = names.countDirectSubdomains;
     pub const hasDirectSubdomains = names.hasDirectSubdomains;

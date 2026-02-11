@@ -34,6 +34,10 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
     var filter_has_subdomains: ?bool = null;
     var filter_subdomain_count_gt: ?i64 = null;
     var filter_subdomain_count_lt: ?i64 = null;
+    var filter_expiry_gt: ?i64 = null;
+    var filter_expiry_gte: ?i64 = null;
+    var filter_expiry_lt: ?i64 = null;
+    var filter_expiry_lte: ?i64 = null;
 
     // Look for "where" argument
     for (field.arguments) |arg| {
@@ -92,6 +96,22 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
                     } else if (std.mem.eql(u8, filter_arg.name, "subdomainCount_lt")) {
                         if (filter_arg.value == .int) {
                             filter_subdomain_count_lt = filter_arg.value.int;
+                        }
+                    } else if (std.mem.eql(u8, filter_arg.name, "expiry_gt")) {
+                        if (filter_arg.value == .int) {
+                            filter_expiry_gt = filter_arg.value.int;
+                        }
+                    } else if (std.mem.eql(u8, filter_arg.name, "expiry_gte")) {
+                        if (filter_arg.value == .int) {
+                            filter_expiry_gte = filter_arg.value.int;
+                        }
+                    } else if (std.mem.eql(u8, filter_arg.name, "expiry_lt")) {
+                        if (filter_arg.value == .int) {
+                            filter_expiry_lt = filter_arg.value.int;
+                        }
+                    } else if (std.mem.eql(u8, filter_arg.name, "expiry_lte")) {
+                        if (filter_arg.value == .int) {
+                            filter_expiry_lte = filter_arg.value.int;
                         }
                     }
                 }
@@ -157,23 +177,39 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
         return .{ .json = try allocator.dupe(u8, "[]") };
     }
 
-    // Optimization 2: if owner filter is set, always push it to DB
-    // This uses the idx_names_owner index instead of scanning all rows
-    // Other filters (name_contains_nocase, etc.) are applied in-memory after DB fetch
-    const has_other_filters = filter_name_contains != null or
+    // Check if any filters are set
+    const has_filters = filter_name != null or filter_name_contains != null or
         filter_name_contains_nocase != null or filter_name_starts_with != null or
-        filter_name_ends_with != null or filter_owner_in != null or
+        filter_name_ends_with != null or filter_owner != null or filter_owner_in != null or
         filter_resolved_address != null or filter_has_subdomains != null or
-        filter_subdomain_count_gt != null or filter_subdomain_count_lt != null;
+        filter_subdomain_count_gt != null or filter_subdomain_count_lt != null or
+        filter_expiry_gt != null or filter_expiry_gte != null or
+        filter_expiry_lt != null or filter_expiry_lte != null;
 
-    // Always pass owner filter to DB if present - it uses an index and narrows results
-    const db_owner_filter = filter_owner;
+    // All filters pushed to DB - no need to over-fetch
+    const fetch_limit: u32 = @intCast(first);
 
-    const fetch_limit = if (has_other_filters)
-        @min(first * 10, 1000) // Fetch more if we need additional in-memory filtering
+    // Use filtered query with all filters pushed to DB
+    const names = if (has_filters)
+        try database.getFilteredNames(.{
+            .owner = filter_owner,
+            .owner_in = filter_owner_in,
+            .name = filter_name,
+            .name_contains = filter_name_contains,
+            .name_contains_nocase = filter_name_contains_nocase,
+            .name_starts_with = filter_name_starts_with,
+            .name_ends_with = filter_name_ends_with,
+            .expiry_gt = filter_expiry_gt,
+            .expiry_gte = filter_expiry_gte,
+            .expiry_lt = filter_expiry_lt,
+            .expiry_lte = filter_expiry_lte,
+            .resolved_address = filter_resolved_address,
+            .has_subdomains = filter_has_subdomains,
+            .subdomain_count_gt = filter_subdomain_count_gt,
+            .subdomain_count_lt = filter_subdomain_count_lt,
+        }, @intCast(skip), fetch_limit, .desc)
     else
-        first;
-    const names = try database.getAllNames(db_owner_filter, @intCast(skip), @intCast(fetch_limit));
+        try database.getAllNames(null, @intCast(skip), fetch_limit);
     defer {
         for (names) |*name| {
             name.deinit(allocator);
@@ -181,191 +217,12 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
         allocator.free(names);
     }
 
-    // Batch-load resolver addresses if needed for filtering (eliminates N+1 query)
-    var resolver_addresses: ?std.AutoHashMap([32]u8, ?[]const u8) = null;
-    defer {
-        if (resolver_addresses) |*addrs| {
-            // Note: Values are owned by the DataLoader cache and will be freed
-            // when LoaderContext.deinit() runs. Don't free them here to avoid double-free.
-            addrs.deinit();
-        }
-    }
-
-    if (filter_resolved_address != null) {
-        // Use DataLoader to batch-load all resolver addresses in one query
-        const dataloader_mod = loaders;
-        if (ctx.loaders) |loaders_ptr| {
-            const loader_ctx: *dataloader_mod.LoaderContext = @ptrCast(@alignCast(loaders_ptr));
-            const loader = try loader_ctx.getResolverAddressLoader();
-
-            // Collect all namehashes
-            var namehashes = try allocator.alloc([32]u8, names.len);
-            defer allocator.free(namehashes);
-            for (names, 0..) |name, i| {
-                namehashes[i] = name.namehash.bytes;
-            }
-
-            // Batch load all addresses in one query!
-            const addresses = try loader.loadMany(namehashes);
-            defer allocator.free(addresses);
-
-            // Build lookup map
-            resolver_addresses = std.AutoHashMap([32]u8, ?[]const u8).init(allocator);
-            for (namehashes, addresses) |hash, addr| {
-                try resolver_addresses.?.put(hash, addr);
-            }
-        }
-    }
-
-    // First pass: collect filtered names
+    // All filtering is now done at DB level
+    // Collect pointers for sorting
     var filtered_names: std.ArrayList(*models.Name) = .{};
     defer filtered_names.deinit(allocator);
-
-    // Pre-compute lowercase filter once (avoid re-allocating per name)
-    const lower_filter_precomputed: ?[]u8 = if (filter_name_contains_nocase) |f|
-        try std.ascii.allocLowerString(allocator, f)
-    else
-        null;
-    defer if (lower_filter_precomputed) |lf| allocator.free(lf);
-
-    // Pre-batch subdomain counts if any subdomain filter is active (avoid N+1 queries)
-    var subdomain_counts: ?std.StringHashMap(u32) = null;
-    if (filter_has_subdomains != null or filter_subdomain_count_gt != null or filter_subdomain_count_lt != null) {
-        // Collect all parent names for batch query
-        var parent_names: std.ArrayList([]const u8) = .{};
-        defer parent_names.deinit(allocator);
-        for (names) |*name| {
-            if (name.name) |n| {
-                try parent_names.append(allocator, n);
-            }
-        }
-        if (parent_names.items.len > 0) {
-            subdomain_counts = try database.batchCountDirectSubdomains(allocator, parent_names.items);
-        }
-    }
-    defer if (subdomain_counts) |*sc| {
-        var it = sc.keyIterator();
-        while (it.next()) |key| {
-            allocator.free(key.*);
-        }
-        sc.deinit();
-    };
-
     for (names) |*name| {
-        // Apply filters
-        var matches = true;
-
-        if (filter_name) |fname| {
-            if (!std.mem.eql(u8, name.name orelse "[unknown]", fname)) matches = false;
-        }
-
-        if (matches and filter_name_contains != null) {
-            if (std.mem.indexOf(u8, name.name orelse "[unknown]", filter_name_contains.?) == null) matches = false;
-        }
-
-        if (matches and filter_owner != null) {
-            if (!name.owner.eql(filter_owner.?)) matches = false;
-        }
-
-        if (matches and filter_resolved_address != null) {
-            // Use pre-loaded resolver addresses (no database query in loop!)
-            if (resolver_addresses) |*addrs| {
-                const addr_opt = addrs.get(name.namehash.bytes);
-                if (addr_opt) |addr| {
-                    if (addr) |addr_str| {
-                        const resolved_addr = Address.fromHex(addr_str) catch {
-                            matches = false;
-                            continue;
-                        };
-                        if (!resolved_addr.eql(filter_resolved_address.?)) matches = false;
-                    } else {
-                        matches = false;
-                    }
-                } else {
-                    matches = false;
-                }
-            } else {
-                // Fallback to direct database query if loaders not available
-                const addr_opt = try database.getResolverAddress(name.namehash, 60);
-                if (addr_opt) |addr| {
-                    defer allocator.free(addr);
-                    const resolved_addr = Address.fromHex(addr) catch {
-                        matches = false;
-                        continue;
-                    };
-                    if (!resolved_addr.eql(filter_resolved_address.?)) matches = false;
-                } else {
-                    matches = false;
-                }
-            }
-        }
-
-        if (matches and lower_filter_precomputed != null) {
-            // Case-insensitive contains (filter already lowercased once before loop)
-            const lower_name = try std.ascii.allocLowerString(allocator, name.name orelse "[unknown]");
-            defer allocator.free(lower_name);
-            if (std.mem.indexOf(u8, lower_name, lower_filter_precomputed.?) == null) matches = false;
-        }
-
-        if (matches and filter_name_starts_with != null) {
-            if (!std.mem.startsWith(u8, name.name orelse "[unknown]", filter_name_starts_with.?)) matches = false;
-        }
-
-        if (matches and filter_name_ends_with != null) {
-            if (!std.mem.endsWith(u8, name.name orelse "[unknown]", filter_name_ends_with.?)) matches = false;
-        }
-
-        if (matches and filter_owner_in != null) {
-            var found = false;
-            for (filter_owner_in.?) |addr| {
-                if (name.owner.eql(addr)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) matches = false;
-        }
-
-        // Filter by hasSubdomains - only counts direct children (one level down)
-        // Uses pre-batched counts to avoid N+1 queries
-        if (matches and filter_has_subdomains != null) {
-            if (name.name) |domain_name| {
-                const count = if (subdomain_counts) |sc| sc.get(domain_name) orelse 0 else 0;
-                const has_subs = count > 0;
-                if (filter_has_subdomains.? != has_subs) matches = false;
-            } else {
-                // Domain without a name can't have subdomains checked
-                if (filter_has_subdomains.?) matches = false;
-            }
-        }
-
-        // Filter by subdomainCount_gt - only counts direct children (one level down)
-        // Uses pre-batched counts to avoid N+1 queries
-        if (matches and filter_subdomain_count_gt != null) {
-            if (name.name) |domain_name| {
-                const subdomain_count = if (subdomain_counts) |sc| sc.get(domain_name) orelse 0 else 0;
-                if (subdomain_count <= @as(u32, @intCast(filter_subdomain_count_gt.?))) matches = false;
-            } else {
-                // Domain without a name has 0 subdomains
-                matches = false;
-            }
-        }
-
-        // Filter by subdomainCount_lt - only counts direct children (one level down)
-        // Uses pre-batched counts to avoid N+1 queries
-        if (matches and filter_subdomain_count_lt != null) {
-            if (name.name) |domain_name| {
-                const subdomain_count = if (subdomain_counts) |sc| sc.get(domain_name) orelse 0 else 0;
-                if (subdomain_count >= @as(u32, @intCast(filter_subdomain_count_lt.?))) matches = false;
-            } else {
-                // Domain without a name has 0 subdomains - always passes lt filter unless lt=0
-                if (filter_subdomain_count_lt.? <= 0) matches = false;
-            }
-        }
-
-        if (matches) {
-            try filtered_names.append(allocator, name);
-        }
+        try filtered_names.append(allocator, name);
     }
 
     // Sort filtered names if orderBy is specified
