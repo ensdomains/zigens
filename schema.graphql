@@ -212,6 +212,12 @@ type Domain {
 
   """Events associated with this domain"""
   events(first: Int = 100, where: EventFilter): [Event!]!
+
+  """Count of direct subdomains (one level only)"""
+  subdomainsCount: Int!
+
+  """Count of events associated with this domain"""
+  eventsCount: Int!
 }
 
 """An Ethereum account (address)"""
@@ -353,6 +359,18 @@ input DomainFilter {
 
   """Filter by direct subdomain count less than (one level only)"""
   subdomainCount_lt: Int
+
+  """Filter by expiry date greater than (Unix timestamp)"""
+  expiry_gt: Int
+
+  """Filter by expiry date greater than or equal (Unix timestamp)"""
+  expiry_gte: Int
+
+  """Filter by expiry date less than (Unix timestamp)"""
+  expiry_lt: Int
+
+  """Filter by expiry date less than or equal (Unix timestamp)"""
+  expiry_lte: Int
 }
 
 """Filter criteria for querying registrations"""

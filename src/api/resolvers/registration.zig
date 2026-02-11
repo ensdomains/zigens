@@ -274,17 +274,20 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
 
     // Get registration events from database
     // The database handles contract filtering internally based on its network configuration
-    const fetch_limit = if (filter_registrant != null or filter_registrant_in != null or
-        filter_expiry_gt != null or filter_expiry_gte != null or
-        filter_expiry_lt != null or filter_expiry_lte != null)
-        @min(first * 10, 1000)
+    // Expiry filters are pushed to DB query, only registrant filters need in-memory filtering
+    const fetch_limit: u32 = if (filter_registrant != null or filter_registrant_in != null)
+        @intCast(@min(first * 10, 1000))
     else
-        first;
+        @intCast(first);
 
     const events = try database.getRegistrations(.{
         .chain = filter_chain,
-        .limit = @intCast(fetch_limit),
+        .limit = fetch_limit,
         .order_dir = .desc,
+        .expiry_gt = filter_expiry_gt,
+        .expiry_gte = filter_expiry_gte,
+        .expiry_lt = filter_expiry_lt,
+        .expiry_lte = filter_expiry_lte,
     });
     defer {
         for (events) |*event| {
@@ -359,10 +362,10 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
             }
 
             // Get expiry for filter checks and sorting
-            // Calculate expiry from timestamp + duration
-            if (parsed.value.object.get("duration")) |duration_val| {
-                if (duration_val == .integer) {
-                    event_expiry = event.timestamp + duration_val.integer;
+            // Use expiration field directly (absolute timestamp)
+            if (parsed.value.object.get("expiration")) |expiration_val| {
+                if (expiration_val == .integer) {
+                    event_expiry = expiration_val.integer;
                 }
             }
         }

@@ -68,6 +68,10 @@ pub const RegistrationFilterOptions = struct {
     chain: ?models.Chain = null, // Filter by chain (l1 or l2)
     limit: u32 = constants.Pagination.default_limit,
     order_dir: events.OrderDir = .desc,
+    expiry_gt: ?i64 = null,
+    expiry_gte: ?i64 = null,
+    expiry_lt: ?i64 = null,
+    expiry_lte: ?i64 = null,
 };
 
 /// Get registration events filtered by canonical registry contracts.
@@ -93,6 +97,10 @@ pub fn getRegistrations(database: *Database, filter: RegistrationFilterOptions) 
         .contract_addresses = if (canonical_addresses.len > 0) canonical_addresses else null,
         .limit = filter.limit,
         .order_dir = filter.order_dir,
+        .expiry_gt = filter.expiry_gt,
+        .expiry_gte = filter.expiry_gte,
+        .expiry_lt = filter.expiry_lt,
+        .expiry_lte = filter.expiry_lte,
     };
 
     return events.getEventsFiltered(database, event_filter);

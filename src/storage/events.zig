@@ -175,6 +175,11 @@ pub const EventFilterOptions = struct {
     timestamp_gt: ?i64 = null,
     timestamp_lt: ?i64 = null,
     data_json_owner: ?[]const u8 = null,
+    // Expiry filters - uses json_extract(data, '$.expiration')
+    expiry_gt: ?i64 = null,
+    expiry_gte: ?i64 = null,
+    expiry_lt: ?i64 = null,
+    expiry_lte: ?i64 = null,
     limit: u32 = constants.Pagination.default_limit,
     order_dir: OrderDir = .desc,
 };
@@ -271,6 +276,18 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     if (filter.data_json_owner != null) {
         try conditions.append(db.allocator, "LOWER(json_extract(data, '$.owner')) = LOWER(?)");
     }
+    if (filter.expiry_gt != null) {
+        try conditions.append(db.allocator, "json_extract(data, '$.expiration') > ?");
+    }
+    if (filter.expiry_gte != null) {
+        try conditions.append(db.allocator, "json_extract(data, '$.expiration') >= ?");
+    }
+    if (filter.expiry_lt != null) {
+        try conditions.append(db.allocator, "json_extract(data, '$.expiration') < ?");
+    }
+    if (filter.expiry_lte != null) {
+        try conditions.append(db.allocator, "json_extract(data, '$.expiration') <= ?");
+    }
 
     // Add WHERE clause if there are conditions
     if (conditions.items.len > 0) {
@@ -343,6 +360,18 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     }
     if (filter.data_json_owner) |owner| {
         try q.bindText(owner);
+    }
+    if (filter.expiry_gt) |exp| {
+        try q.bindInt64(exp);
+    }
+    if (filter.expiry_gte) |exp| {
+        try q.bindInt64(exp);
+    }
+    if (filter.expiry_lt) |exp| {
+        try q.bindInt64(exp);
+    }
+    if (filter.expiry_lte) |exp| {
+        try q.bindInt64(exp);
     }
 
     var events: std.ArrayList(models.Event) = .{};

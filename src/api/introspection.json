@@ -1104,6 +1104,28 @@
                   }
                 }
               }
+            },
+            {
+              "name": "subdomainsCount",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              }
+            },
+            {
+              "name": "eventsCount",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              }
             }
           ]
         },
@@ -1999,6 +2021,34 @@
             },
             {
               "name": "subdomainCount_lt",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "expiry_gt",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "expiry_gte",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "expiry_lt",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "expiry_lte",
               "type": {
                 "kind": "SCALAR",
                 "name": "Int"

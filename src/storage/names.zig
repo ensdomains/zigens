@@ -168,8 +168,11 @@ fn parseNameRowShort(q: *Query, allocator: std.mem.Allocator) !models.Name {
 // ============================================================================
 
 pub fn insertRegistry(db: *Database, registry: models.Registry) !void {
+    // Use INSERT OR IGNORE to keep the FIRST SubregistryUpdate (when subregistry was established)
+    // not later ones. This ensures created_block reflects when the parent->subregistry mapping
+    // was first created, which is needed for correct temporal parent lookups.
     var q = try Query.init(db,
-        \\INSERT OR REPLACE INTO registries
+        \\INSERT OR IGNORE INTO registries
         \\(address, chain, name, namehash, parent_registry, created_block, created_at)
         \\VALUES (?, ?, ?, ?, ?, ?, ?)
     );
@@ -343,17 +346,6 @@ pub fn updateNameOwner(db: *Database, namehash: Hash, new_owner: Address) !void 
     defer q.deinit();
 
     try q.bindAddress(new_owner);
-    try q.bindInt64(std.time.timestamp());
-    try q.bindHash(namehash);
-    try q.exec();
-}
-
-/// Update name subregistry
-pub fn updateNameSubregistry(db: *Database, namehash: Hash, subregistry: Address) !void {
-    var q = try Query.init(db, "UPDATE names SET registry = ?, updated_at = ? WHERE namehash = ?");
-    defer q.deinit();
-
-    try q.bindAddress(subregistry);
     try q.bindInt64(std.time.timestamp());
     try q.bindHash(namehash);
     try q.exec();
@@ -616,8 +608,258 @@ pub const OrderDir = enum {
     desc,
 };
 
+/// Parse name rows from a query result
+fn parseNameRows(q: *Query, allocator: std.mem.Allocator) ![]models.Name {
+    var names: std.ArrayList(models.Name) = .{};
+    errdefer {
+        for (names.items) |*name| {
+            name.deinit(allocator);
+        }
+        names.deinit(allocator);
+    }
+
+    while (try q.step()) {
+        // Column order: name(0), namehash(1), label(2), label_hash(3), parent_name(4), parent_namehash(5),
+        //               owner(6), resolver(7), registry(8), chain(9), token_id(10),
+        //               canonical_id(11), token_version(12), expiry(13), registry_locked(14),
+        //               migrated(15), ejected(16), created_at(17), created_block(18),
+        //               updated_at(19), updated_block(20)
+        const name_str = q.getTextSlice(0) orelse "";
+        const namehash_str = q.getTextSlice(1) orelse "";
+        const label_str = q.getTextSlice(2) orelse "";
+        const label_hash_str = q.getTextSlice(3) orelse "";
+        const parent_name_str = q.getTextSlice(4) orelse "";
+        const parent_namehash_str = q.getTextSlice(5) orelse "";
+        const owner_str = q.getTextSlice(6) orelse "";
+        const resolver_str = q.getTextSlice(7) orelse "";
+        const registry_str = q.getTextSlice(8) orelse "";
+        const chain_str = q.getTextSlice(9) orelse models.Chain.l2.toString();
+        const token_id_str = q.getTextSlice(10) orelse "0x0";
+        const canonical_id_str = q.getTextSlice(11) orelse "0x0";
+
+        try names.append(allocator, .{
+            .name = try allocator.dupe(u8, name_str),
+            .namehash = try Hash.fromHex(namehash_str),
+            .label = try allocator.dupe(u8, label_str),
+            .label_hash = try Hash.fromHex(label_hash_str),
+            .parent_name = try allocator.dupe(u8, parent_name_str),
+            .parent_namehash = try Hash.fromHex(parent_namehash_str),
+            .owner = try Address.fromHex(owner_str),
+            .registrant = try Address.fromHex(owner_str), // Fallback
+            .resolver = try Address.fromHex(resolver_str),
+            .registry = try Address.fromHex(registry_str),
+            .chain = try models.Chain.fromString(chain_str),
+            .token_id = try parseU256Hex(token_id_str),
+            .canonical_id = try parseU256Hex(canonical_id_str),
+            .token_version = @intCast(q.getInt64(12)),
+            .expiry = @bitCast(q.getInt64(13)),
+            .registry_locked = q.getBool(14),
+            .migrated = q.getBool(15),
+            .ejected = q.getBool(16),
+            .created_at = q.getInt64(17),
+            .created_block = @intCast(q.getInt64(18)),
+            .updated_at = q.getInt64(19),
+            .updated_block = @intCast(q.getInt64(20)),
+            .is_wrapped = false,
+            .wrapper_fuses = null,
+            .wrapper_expiry = null,
+            .is_v1_name = false,
+            .v1_label_hash = null,
+        });
+    }
+
+    return names.toOwnedSlice(allocator);
+}
+
 pub fn getAllNames(db: *Database, owner: ?Address, skip: u32, limit: u32) ![]models.Name {
     return getAllNamesWithOrder(db, owner, skip, limit, .desc);
+}
+
+/// Filter options for querying names
+pub const NameFilters = struct {
+    // Owner filters
+    owner: ?Address = null,
+    owner_in: ?[]const Address = null,
+    // Name filters
+    name: ?[]const u8 = null,
+    name_contains: ?[]const u8 = null,
+    name_contains_nocase: ?[]const u8 = null,
+    name_starts_with: ?[]const u8 = null,
+    name_ends_with: ?[]const u8 = null,
+    // Expiry filters
+    expiry_gt: ?i64 = null,
+    expiry_gte: ?i64 = null,
+    expiry_lt: ?i64 = null,
+    expiry_lte: ?i64 = null,
+    // Resolved address filter (requires resolver lookup)
+    resolved_address: ?Address = null,
+    // Subdomain filters (requires subquery)
+    has_subdomains: ?bool = null,
+    subdomain_count_gt: ?i64 = null,
+    subdomain_count_lt: ?i64 = null,
+};
+
+/// Get names with filters pushed down to DB query
+pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u32, order_dir: OrderDir) ![]models.Name {
+    const order_str = if (order_dir == .desc) "DESC" else "ASC";
+
+    // Build WHERE clause dynamically using ArrayList for conditions
+    var conditions: std.ArrayList([]const u8) = .{};
+    defer conditions.deinit(db.allocator);
+
+    // Track allocations for cleanup
+    var allocated_strings: std.ArrayList([]const u8) = .{};
+    defer {
+        for (allocated_strings.items) |s| db.allocator.free(s);
+        allocated_strings.deinit(db.allocator);
+    }
+
+    // Owner filters
+    if (filters.owner != null) {
+        try conditions.append(db.allocator, "owner = ?");
+    }
+    if (filters.owner_in) |owners| {
+        if (owners.len > 0) {
+            // Build IN clause: owner IN (?, ?, ...)
+            var in_parts: std.ArrayList(u8) = .{};
+            defer in_parts.deinit(db.allocator);
+            try in_parts.appendSlice(db.allocator, "owner IN (");
+            for (owners, 0..) |_, i| {
+                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
+                try in_parts.appendSlice(db.allocator, "?");
+            }
+            try in_parts.appendSlice(db.allocator, ")");
+            const clause = try db.allocator.dupe(u8, in_parts.items);
+            try allocated_strings.append(db.allocator, clause);
+            try conditions.append(db.allocator, clause);
+        }
+    }
+
+    // Name filters
+    if (filters.name != null) {
+        try conditions.append(db.allocator, "name = ?");
+    }
+    if (filters.name_contains != null) {
+        try conditions.append(db.allocator, "name LIKE '%' || ? || '%'");
+    }
+    if (filters.name_contains_nocase != null) {
+        try conditions.append(db.allocator, "LOWER(name) LIKE '%' || LOWER(?) || '%'");
+    }
+    if (filters.name_starts_with != null) {
+        try conditions.append(db.allocator, "name LIKE ? || '%'");
+    }
+    if (filters.name_ends_with != null) {
+        try conditions.append(db.allocator, "name LIKE '%' || ?");
+    }
+
+    // Expiry filters
+    if (filters.expiry_gt != null) {
+        try conditions.append(db.allocator, "expiry > ?");
+    }
+    if (filters.expiry_gte != null) {
+        try conditions.append(db.allocator, "expiry >= ?");
+    }
+    if (filters.expiry_lt != null) {
+        try conditions.append(db.allocator, "expiry < ?");
+    }
+    if (filters.expiry_lte != null) {
+        try conditions.append(db.allocator, "expiry <= ?");
+    }
+
+    // Resolved address filter (join with resolver_addresses table)
+    if (filters.resolved_address != null) {
+        try conditions.append(db.allocator, "namehash IN (SELECT namehash FROM resolver_addresses WHERE address = ?)");
+    }
+
+    // Subdomain count filters (using subquery)
+    if (filters.has_subdomains) |has_subs| {
+        if (has_subs) {
+            try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) > 0");
+        } else {
+            try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) = 0");
+        }
+    }
+    if (filters.subdomain_count_gt != null) {
+        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) > ?");
+    }
+    if (filters.subdomain_count_lt != null) {
+        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) < ?");
+    }
+
+    // Build WHERE clause
+    var where_clause: std.ArrayList(u8) = .{};
+    defer where_clause.deinit(db.allocator);
+
+    if (conditions.items.len > 0) {
+        try where_clause.appendSlice(db.allocator, "WHERE ");
+        for (conditions.items, 0..) |cond, i| {
+            if (i > 0) try where_clause.appendSlice(db.allocator, " AND ");
+            try where_clause.appendSlice(db.allocator, cond);
+        }
+        try where_clause.appendSlice(db.allocator, " ");
+    }
+
+    const sql = try std.fmt.allocPrint(db.allocator,
+        \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, chain,
+        \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated, ejected,
+        \\       created_at, created_block, updated_at, updated_block
+        \\FROM names {s}ORDER BY created_at {s} LIMIT ? OFFSET ?
+    , .{ where_clause.items, order_str });
+    defer db.allocator.free(sql);
+
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+
+    // Bind parameters in the same order as conditions were added
+    if (filters.owner) |o| {
+        try q.bindAddress(o);
+    }
+    if (filters.owner_in) |owners| {
+        for (owners) |o| {
+            try q.bindAddress(o);
+        }
+    }
+    if (filters.name) |n| {
+        try q.bindText(n);
+    }
+    if (filters.name_contains) |n| {
+        try q.bindText(n);
+    }
+    if (filters.name_contains_nocase) |n| {
+        try q.bindText(n);
+    }
+    if (filters.name_starts_with) |n| {
+        try q.bindText(n);
+    }
+    if (filters.name_ends_with) |n| {
+        try q.bindText(n);
+    }
+    if (filters.expiry_gt) |v| {
+        try q.bindInt64(v);
+    }
+    if (filters.expiry_gte) |v| {
+        try q.bindInt64(v);
+    }
+    if (filters.expiry_lt) |v| {
+        try q.bindInt64(v);
+    }
+    if (filters.expiry_lte) |v| {
+        try q.bindInt64(v);
+    }
+    if (filters.resolved_address) |addr| {
+        try q.bindAddress(addr);
+    }
+    // has_subdomains doesn't need binding (no ?)
+    if (filters.subdomain_count_gt) |v| {
+        try q.bindInt64(v);
+    }
+    if (filters.subdomain_count_lt) |v| {
+        try q.bindInt64(v);
+    }
+    try q.bindInt(@intCast(limit));
+    try q.bindInt(@intCast(skip));
+
+    return parseNameRows(&q, db.allocator);
 }
 
 /// Get all names with configurable order direction
@@ -625,14 +867,14 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
     const order_str = if (order_dir == .desc) "DESC" else "ASC";
     const sql = if (owner != null)
         try std.fmt.allocPrint(db.allocator,
-            \\SELECT name, namehash, label, label_hash, parent_name, owner, resolver, registry, chain,
+            \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, chain,
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated, ejected,
             \\       created_at, created_block, updated_at, updated_block
             \\FROM names WHERE owner = ? ORDER BY created_at {s} LIMIT ? OFFSET ?
         , .{order_str})
     else
         try std.fmt.allocPrint(db.allocator,
-            \\SELECT name, namehash, label, label_hash, parent_name, owner, resolver, registry, chain,
+            \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, chain,
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated, ejected,
             \\       created_at, created_block, updated_at, updated_block
             \\FROM names ORDER BY created_at {s} LIMIT ? OFFSET ?
@@ -657,25 +899,23 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
     }
 
     while (try q.step()) {
-        // Column order: name(0), namehash(1), label(2), label_hash(3), parent_name(4),
-        //               owner(5), resolver(6), registry(7), chain(8), token_id(9),
-        //               canonical_id(10), token_version(11), expiry(12), registry_locked(13),
-        //               migrated(14), ejected(15), created_at(16), created_block(17),
-        //               updated_at(18), updated_block(19)
+        // Column order: name(0), namehash(1), label(2), label_hash(3), parent_name(4), parent_namehash(5),
+        //               owner(6), resolver(7), registry(8), chain(9), token_id(10),
+        //               canonical_id(11), token_version(12), expiry(13), registry_locked(14),
+        //               migrated(15), ejected(16), created_at(17), created_block(18),
+        //               updated_at(19), updated_block(20)
         const name_str = q.getTextSlice(0) orelse "";
         const namehash_str = q.getTextSlice(1) orelse "";
         const label_str = q.getTextSlice(2) orelse "";
         const label_hash_str = q.getTextSlice(3) orelse "";
         const parent_name_str = q.getTextSlice(4) orelse "";
-        const owner_str = q.getTextSlice(5) orelse "";
-        const resolver_str = q.getTextSlice(6) orelse "";
-        const registry_str = q.getTextSlice(7) orelse "";
-        const chain_str = q.getTextSlice(8) orelse models.Chain.l2.toString();
-        const token_id_str = q.getTextSlice(9) orelse "0x0";
-        const canonical_id_str = q.getTextSlice(10) orelse "0x0";
-
-        // Derive parent_namehash from parent_name
-        const parent_namehash = try @import("../types/hash.zig").namehash(db.allocator, parent_name_str);
+        const parent_namehash_str = q.getTextSlice(5) orelse "";
+        const owner_str = q.getTextSlice(6) orelse "";
+        const resolver_str = q.getTextSlice(7) orelse "";
+        const registry_str = q.getTextSlice(8) orelse "";
+        const chain_str = q.getTextSlice(9) orelse models.Chain.l2.toString();
+        const token_id_str = q.getTextSlice(10) orelse "0x0";
+        const canonical_id_str = q.getTextSlice(11) orelse "0x0";
 
         try names.append(db.allocator, .{
             .name = try db.allocator.dupe(u8, name_str),
@@ -683,7 +923,7 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
             .label = try db.allocator.dupe(u8, label_str),
             .label_hash = try Hash.fromHex(label_hash_str),
             .parent_name = try db.allocator.dupe(u8, parent_name_str),
-            .parent_namehash = parent_namehash,
+            .parent_namehash = try Hash.fromHex(parent_namehash_str),
             .owner = try Address.fromHex(owner_str),
             .registrant = try Address.fromHex(owner_str), // Fallback
             .resolver = try Address.fromHex(resolver_str),
@@ -691,15 +931,15 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
             .chain = try models.Chain.fromString(chain_str),
             .token_id = try parseU256Hex(token_id_str),
             .canonical_id = try parseU256Hex(canonical_id_str),
-            .token_version = @intCast(q.getInt64(11)),
-            .expiry = @bitCast(q.getInt64(12)),
-            .registry_locked = q.getBool(13),
-            .migrated = q.getBool(14),
-            .ejected = q.getBool(15),
-            .created_at = q.getInt64(16),
-            .created_block = @intCast(q.getInt64(17)),
-            .updated_at = q.getInt64(18),
-            .updated_block = @intCast(q.getInt64(19)),
+            .token_version = @intCast(q.getInt64(12)),
+            .expiry = @bitCast(q.getInt64(13)),
+            .registry_locked = q.getBool(14),
+            .migrated = q.getBool(15),
+            .ejected = q.getBool(16),
+            .created_at = q.getInt64(17),
+            .created_block = @intCast(q.getInt64(18)),
+            .updated_at = q.getInt64(19),
+            .updated_block = @intCast(q.getInt64(20)),
             .is_wrapped = false,
             .wrapper_fuses = null,
             .wrapper_expiry = null,
@@ -750,6 +990,63 @@ pub fn hasDirectSubdomains(db: *Database, parent_name: []const u8) !bool {
 
     try q.bindText(parent_name);
     return try q.step();
+}
+
+/// Batch count direct subdomains for multiple parent names in a single query
+/// Returns a hashmap mapping parent_name -> subdomain count
+pub fn batchCountDirectSubdomains(db: *Database, allocator: std.mem.Allocator, parent_names: []const []const u8) !std.StringHashMap(u32) {
+    var counts = std.StringHashMap(u32).init(allocator);
+    errdefer {
+        var it = counts.keyIterator();
+        while (it.next()) |key| {
+            allocator.free(key.*);
+        }
+        counts.deinit();
+    }
+
+    if (parent_names.len == 0) {
+        return counts;
+    }
+
+    // Build dynamic SQL: SELECT parent_name, COUNT(*) FROM names WHERE parent_name IN (?, ?, ...) GROUP BY parent_name
+    var sql_buf: std.ArrayList(u8) = .{};
+    defer sql_buf.deinit(allocator);
+
+    try sql_buf.appendSlice(allocator, "SELECT parent_name, COUNT(*) FROM names WHERE parent_name IN (");
+    for (parent_names, 0..) |_, i| {
+        if (i > 0) try sql_buf.appendSlice(allocator, ", ");
+        try sql_buf.appendSlice(allocator, "?");
+    }
+    try sql_buf.appendSlice(allocator, ") GROUP BY parent_name");
+
+    const sql_z = try allocator.dupeZ(u8, sql_buf.items);
+    defer allocator.free(sql_z);
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db.db, sql_z.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+        return counts; // Return empty map on error
+    }
+    defer _ = c.sqlite3_finalize(stmt);
+
+    // Bind all parent names
+    for (parent_names, 0..) |name, i| {
+        _ = c.sqlite3_bind_text(stmt, @intCast(i + 1), name.ptr, @intCast(name.len), null);
+    }
+
+    // Execute and collect results
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        const parent_text = c.sqlite3_column_text(stmt, 0);
+        const parent_len = c.sqlite3_column_bytes(stmt, 0);
+        const count = c.sqlite3_column_int(stmt, 1);
+
+        if (parent_text != null and parent_len > 0) {
+            const parent_slice = parent_text[0..@intCast(parent_len)];
+            const key = try allocator.dupe(u8, parent_slice);
+            try counts.put(key, @intCast(count));
+        }
+    }
+
+    return counts;
 }
 
 /// Get direct subdomains of a name with pagination
