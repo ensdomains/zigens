@@ -63,17 +63,33 @@ pub const Server = struct {
         const address = try std.net.Address.parseIp("0.0.0.0", self.port);
         var server = try address.listen(.{
             .reuse_address = true,
+            .kernel_backlog = 128, // Handle burst of connections
         });
         self.server = server;
 
         std.log.info("API server listening on port {d}", .{self.port});
 
         while (true) {
-            const connection = try server.accept();
-            defer connection.stream.close();
+            const connection = server.accept() catch |err| {
+                std.log.warn("Failed to accept connection: {}", .{err});
+                continue;
+            };
 
-            try self.handleConnection(connection);
+            // Spawn a thread to handle each connection concurrently
+            const thread = std.Thread.spawn(.{}, handleConnectionThread, .{ self, connection }) catch |err| {
+                std.log.warn("Failed to spawn handler thread: {}", .{err});
+                connection.stream.close();
+                continue;
+            };
+            thread.detach();
         }
+    }
+
+    fn handleConnectionThread(self: *Server, connection: std.net.Server.Connection) void {
+        defer connection.stream.close();
+        self.handleConnection(connection) catch |err| {
+            std.log.warn("Connection handler error: {}", .{err});
+        };
     }
 
     fn handleConnection(self: *Server, connection: std.net.Server.Connection) !void {
