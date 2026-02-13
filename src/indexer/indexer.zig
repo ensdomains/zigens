@@ -2365,7 +2365,7 @@ pub const Indexer = struct {
 
         // Validate label is valid UTF-8 and contains no control characters
         unicode.validateName(label_str) catch |err| {
-            std.log.warn("Invalid name label for tokenId={d}: {any}", .{ token_id, err });
+            std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
             return;
         };
 
@@ -2888,7 +2888,7 @@ pub const Indexer = struct {
 
         // Validate label is valid UTF-8 and contains no control characters
         unicode.validateName(label_str) catch |err| {
-            std.log.warn("Invalid name label for tokenId={d}: {any}", .{ token_id, err });
+            std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
             return;
         };
 
@@ -3038,7 +3038,7 @@ pub const Indexer = struct {
 
         // Validate label is valid UTF-8 and contains no control characters
         unicode.validateName(label_str) catch |err| {
-            std.log.warn("Invalid name label for tokenId={d}: {any}", .{ token_id, err });
+            std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
             return;
         };
 

@@ -13,7 +13,8 @@ pub fn main() !void {
         std.log.warn("Failed to configure SQLite thread safety: {d}", .{sqlite_result});
     }
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    // Use thread-safe allocator for concurrent request handling
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
