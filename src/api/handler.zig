@@ -100,8 +100,12 @@ pub const GraphQLHandler = struct {
         var loader_context = try dataloader_mod.LoaderContext.init(self.allocator, self.database);
         defer loader_context.deinit();
 
-        // Inject loaders into execution context for this request
-        self.executor.context.loaders = @ptrCast(loader_context);
+        // Create a per-request executor copy to avoid race conditions when
+        // multiple threads handle requests concurrently. The shared executor's
+        // resolvers map is read-only and safe to share; per-request state
+        // (fragments, variables, loaders) lives on this stack copy.
+        var request_executor = self.executor;
+        request_executor.context.loaders = @ptrCast(loader_context);
 
         // Parse the query using the new parser
         var document = parser.parseQuery(self.allocator, query) catch |err| {
@@ -129,8 +133,8 @@ pub const GraphQLHandler = struct {
 
         std.log.debug("Query complexity: depth={d}, cost={d}", .{ analysis.depth, analysis.cost });
 
-        // Execute the parsed query with variables (with DataLoaders available)
-        const result = self.executor.executeDocument(&document, variables, operation_name) catch |err| {
+        // Execute the parsed query with the per-request executor
+        const result = request_executor.executeDocument(&document, variables, operation_name) catch |err| {
             std.log.err("Failed to execute GraphQL query: {}", .{err});
             self.metrics.recordError();
             if (err == error.OperationNotFound) {

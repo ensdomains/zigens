@@ -22,12 +22,18 @@ pub const RateLimiter = struct {
     pub fn tryAcquire(self: *RateLimiter) bool {
         self.refill();
 
-        const current = self.tokens.load(.acquire);
-        if (current > 0) {
-            _ = self.tokens.fetchSub(1, .release);
-            return true;
+        // Use compare-and-swap loop to atomically decrement only if > 0.
+        // A simple load-then-fetchSub has a TOCTOU race: two threads can both
+        // read current=1, both subtract, wrapping u32 to max and disabling
+        // the rate limiter.
+        while (true) {
+            const current = self.tokens.load(.acquire);
+            if (current == 0) return false;
+            if (self.tokens.cmpxchgWeak(current, current - 1, .release, .monotonic) == null) {
+                return true;
+            }
+            // CAS failed (another thread changed tokens), retry
         }
-        return false;
     }
 
     /// Acquire a token, blocking if necessary

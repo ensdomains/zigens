@@ -107,22 +107,10 @@ pub const LoaderContext = struct {
             return loader;
         }
 
-        // Create a struct that holds the database reference for the batch function
-        const BatchContext = struct {
-            var database_ref: ?*db.Database = null;
-
-            fn batchLoad(allocator: std.mem.Allocator, namehashes: []const [32]u8) ![]?[]const u8 {
-                const database = database_ref orelse return error.NoDatabaseReference;
-                return batchLoadResolverAddresses(database, allocator, namehashes);
-            }
-        };
-
-        // Set the database reference
-        BatchContext.database_ref = self.database;
-
         self.resolver_address_loader = try DataLoader([32]u8, ?[]const u8).init(
             self.allocator,
-            &BatchContext.batchLoad,
+            &batchLoadResolverAddressesWrapper,
+            @ptrCast(self.database),
         );
 
         return self.resolver_address_loader.?;
@@ -134,20 +122,10 @@ pub const LoaderContext = struct {
             return loader;
         }
 
-        const BatchContext = struct {
-            var database_ref: ?*db.Database = null;
-
-            fn batchLoad(allocator: std.mem.Allocator, namehashes: []const [32]u8) ![]?[]const u8 {
-                const database = database_ref orelse return error.NoDatabaseReference;
-                return batchLoadContentHashes(database, allocator, namehashes);
-            }
-        };
-
-        BatchContext.database_ref = self.database;
-
         self.content_hash_loader = try DataLoader([32]u8, ?[]const u8).init(
             self.allocator,
-            &BatchContext.batchLoad,
+            &batchLoadContentHashesWrapper,
+            @ptrCast(self.database),
         );
 
         return self.content_hash_loader.?;
@@ -159,23 +137,10 @@ pub const LoaderContext = struct {
             return loader;
         }
 
-        const BatchContext = struct {
-            var database_ref: ?*db.Database = null;
-            var allocator_ref: ?std.mem.Allocator = null;
-
-            fn batchLoad(_: std.mem.Allocator, namehashes: []const [32]u8) ![]TextRecords {
-                const database = database_ref orelse return error.NoDatabaseReference;
-                const alloc = allocator_ref orelse return error.NoAllocatorReference;
-                return batchLoadTextRecords(database, alloc, namehashes);
-            }
-        };
-
-        BatchContext.database_ref = self.database;
-        BatchContext.allocator_ref = self.allocator;
-
         self.text_records_loader = try DataLoader([32]u8, TextRecords).init(
             self.allocator,
-            &BatchContext.batchLoad,
+            &batchLoadTextRecordsWrapper,
+            @ptrCast(self.database),
         );
 
         return self.text_records_loader.?;
@@ -187,23 +152,10 @@ pub const LoaderContext = struct {
             return loader;
         }
 
-        const BatchContext = struct {
-            var database_ref: ?*db.Database = null;
-            var allocator_ref: ?std.mem.Allocator = null;
-
-            fn batchLoad(_: std.mem.Allocator, addresses: []const []const u8) ![][]const u8 {
-                const database = database_ref orelse return error.NoDatabaseReference;
-                const alloc = allocator_ref orelse return error.NoAllocatorReference;
-                return batchLoadAccounts(database, alloc, addresses);
-            }
-        };
-
-        BatchContext.database_ref = self.database;
-        BatchContext.allocator_ref = self.allocator;
-
         self.account_loader = try DataLoader([]const u8, []const u8).init(
             self.allocator,
-            &BatchContext.batchLoad,
+            &batchLoadAccountsWrapper,
+            @ptrCast(self.database),
         );
 
         return self.account_loader.?;
@@ -226,6 +178,30 @@ pub const LoaderStats = struct {
     text_records: CacheStats,
     account: CacheStats,
 };
+
+// ============================================================================
+// Batch Loading Wrappers - Thread-safe wrappers that receive database via context
+// ============================================================================
+
+fn batchLoadResolverAddressesWrapper(context: ?*anyopaque, allocator: std.mem.Allocator, namehashes: []const [32]u8) ![]?[]const u8 {
+    const database: *db.Database = @ptrCast(@alignCast(context.?));
+    return batchLoadResolverAddresses(database, allocator, namehashes);
+}
+
+fn batchLoadContentHashesWrapper(context: ?*anyopaque, allocator: std.mem.Allocator, namehashes: []const [32]u8) ![]?[]const u8 {
+    const database: *db.Database = @ptrCast(@alignCast(context.?));
+    return batchLoadContentHashes(database, allocator, namehashes);
+}
+
+fn batchLoadTextRecordsWrapper(context: ?*anyopaque, allocator: std.mem.Allocator, namehashes: []const [32]u8) ![]TextRecords {
+    const database: *db.Database = @ptrCast(@alignCast(context.?));
+    return batchLoadTextRecords(database, allocator, namehashes);
+}
+
+fn batchLoadAccountsWrapper(context: ?*anyopaque, allocator: std.mem.Allocator, addresses: []const []const u8) ![][]const u8 {
+    const database: *db.Database = @ptrCast(@alignCast(context.?));
+    return batchLoadAccounts(database, allocator, addresses);
+}
 
 // ============================================================================
 // Batch Loading Functions - These execute the actual database queries
@@ -790,7 +766,7 @@ test "DataLoader: basic init and deinit" {
 
     // Simple batch function that echoes keys
     const batchFn = struct {
-        fn load(alloc: std.mem.Allocator, keys: []const u32) ![]u32 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, keys: []const u32) ![]u32 {
             const values = try alloc.alloc(u32, keys.len);
             for (keys, 0..) |key, i| {
                 values[i] = key * 2; // Double the key
@@ -799,7 +775,7 @@ test "DataLoader: basic init and deinit" {
         }
     }.load;
 
-    const loader = try DataLoader(u32, u32).init(allocator, batchFn);
+    const loader = try DataLoader(u32, u32).init(allocator, batchFn, null);
     defer loader.deinit();
 
     try std.testing.expect(loader.cache_hits == 0);
@@ -811,7 +787,7 @@ test "DataLoader: single load triggers batch" {
     const allocator = std.testing.allocator;
 
     const batchFn = struct {
-        fn load(alloc: std.mem.Allocator, keys: []const u32) ![]u32 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, keys: []const u32) ![]u32 {
             const values = try alloc.alloc(u32, keys.len);
             for (keys, 0..) |key, i| {
                 values[i] = key * 10;
@@ -820,7 +796,7 @@ test "DataLoader: single load triggers batch" {
         }
     }.load;
 
-    const loader = try DataLoader(u32, u32).init(allocator, batchFn);
+    const loader = try DataLoader(u32, u32).init(allocator, batchFn, null);
     defer loader.deinit();
 
     // First load - cache miss
@@ -842,7 +818,7 @@ test "DataLoader: loadMany batches multiple keys" {
     const allocator = std.testing.allocator;
 
     const batchFn = struct {
-        fn load(alloc: std.mem.Allocator, keys: []const u32) ![]u32 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, keys: []const u32) ![]u32 {
             const values = try alloc.alloc(u32, keys.len);
             for (keys, 0..) |key, i| {
                 values[i] = key + 100;
@@ -851,7 +827,7 @@ test "DataLoader: loadMany batches multiple keys" {
         }
     }.load;
 
-    const loader = try DataLoader(u32, u32).init(allocator, batchFn);
+    const loader = try DataLoader(u32, u32).init(allocator, batchFn, null);
     defer loader.deinit();
 
     const keys = [_]u32{ 1, 2, 3, 4, 5 };
@@ -872,7 +848,7 @@ test "DataLoader: cache hit rate calculation" {
     const allocator = std.testing.allocator;
 
     const batchFn = struct {
-        fn load(alloc: std.mem.Allocator, keys: []const u32) ![]u32 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, keys: []const u32) ![]u32 {
             const values = try alloc.alloc(u32, keys.len);
             for (keys, 0..) |key, i| {
                 values[i] = key;
@@ -881,7 +857,7 @@ test "DataLoader: cache hit rate calculation" {
         }
     }.load;
 
-    const loader = try DataLoader(u32, u32).init(allocator, batchFn);
+    const loader = try DataLoader(u32, u32).init(allocator, batchFn, null);
     defer loader.deinit();
 
     // Load 3 items
@@ -905,7 +881,7 @@ test "DataLoader: average batch size calculation" {
     const allocator = std.testing.allocator;
 
     const batchFn = struct {
-        fn load(alloc: std.mem.Allocator, keys: []const u32) ![]u32 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, keys: []const u32) ![]u32 {
             const values = try alloc.alloc(u32, keys.len);
             for (keys, 0..) |key, i| {
                 values[i] = key;
@@ -914,7 +890,7 @@ test "DataLoader: average batch size calculation" {
         }
     }.load;
 
-    const loader = try DataLoader(u32, u32).init(allocator, batchFn);
+    const loader = try DataLoader(u32, u32).init(allocator, batchFn, null);
     defer loader.deinit();
 
     // First batch: 3 items
@@ -942,7 +918,7 @@ test "DataLoader: empty batch returns immediately" {
     const batchFn = struct {
         var count_ptr: *usize = undefined;
 
-        fn load(alloc: std.mem.Allocator, keys: []const u32) ![]u32 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, keys: []const u32) ![]u32 {
             count_ptr.* += 1;
             const values = try alloc.alloc(u32, keys.len);
             for (keys, 0..) |key, i| {
@@ -954,7 +930,7 @@ test "DataLoader: empty batch returns immediately" {
 
     batchFn.count_ptr = &call_count;
 
-    const loader = try DataLoader(u32, u32).init(allocator, batchFn);
+    const loader = try DataLoader(u32, u32).init(allocator, batchFn, null);
     defer loader.deinit();
 
     // Load one item
@@ -970,7 +946,7 @@ test "DataLoader: duplicate keys in same batch" {
     const allocator = std.testing.allocator;
 
     const batchFn = struct {
-        fn load(alloc: std.mem.Allocator, keys: []const u32) ![]u32 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, keys: []const u32) ![]u32 {
             const values = try alloc.alloc(u32, keys.len);
             for (keys, 0..) |key, i| {
                 values[i] = key * 3;
@@ -979,7 +955,7 @@ test "DataLoader: duplicate keys in same batch" {
         }
     }.load;
 
-    const loader = try DataLoader(u32, u32).init(allocator, batchFn);
+    const loader = try DataLoader(u32, u32).init(allocator, batchFn, null);
     defer loader.deinit();
 
     // Load same key twice (should deduplicate in pending list)
@@ -1039,7 +1015,7 @@ test "DataLoader: clearCache resets entries but keeps stats" {
     const allocator = std.testing.allocator;
 
     const batchFn = struct {
-        fn load(alloc: std.mem.Allocator, keys: []const u32) ![]u32 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, keys: []const u32) ![]u32 {
             const values = try alloc.alloc(u32, keys.len);
             for (keys, 0..) |key, i| {
                 values[i] = key;
@@ -1048,7 +1024,7 @@ test "DataLoader: clearCache resets entries but keeps stats" {
         }
     }.load;
 
-    const loader = try DataLoader(u32, u32).init(allocator, batchFn);
+    const loader = try DataLoader(u32, u32).init(allocator, batchFn, null);
     defer loader.deinit();
 
     // Load some items
@@ -1077,7 +1053,7 @@ test "Content Hash Loader: basic batch loading" {
 
     // Mock batch function that returns content hashes
     const batchFn = struct {
-        fn load(alloc: std.mem.Allocator, keys: []const [32]u8) ![]?[]const u8 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, keys: []const [32]u8) ![]?[]const u8 {
             const values = try alloc.alloc(?[]const u8, keys.len);
             for (values, keys, 0..) |*value, key, i| {
                 // Return hash for first 2, null for rest
@@ -1092,7 +1068,7 @@ test "Content Hash Loader: basic batch loading" {
         }
     }.load;
 
-    const loader = try DataLoader([32]u8, ?[]const u8).init(allocator, batchFn);
+    const loader = try DataLoader([32]u8, ?[]const u8).init(allocator, batchFn, null);
     defer {
         // Clean up cached values
         var it = loader.cache.iterator();
@@ -1135,7 +1111,7 @@ test "Content Hash Loader: cache hits" {
     const allocator = std.testing.allocator;
 
     const batchFn = struct {
-        fn load(alloc: std.mem.Allocator, keys: []const [32]u8) ![]?[]const u8 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, keys: []const [32]u8) ![]?[]const u8 {
             const values = try alloc.alloc(?[]const u8, keys.len);
             for (values, keys) |*value, key| {
                 const hash = try std.fmt.allocPrint(alloc, "hash-{d}", .{key[0]});
@@ -1145,7 +1121,7 @@ test "Content Hash Loader: cache hits" {
         }
     }.load;
 
-    const loader = try DataLoader([32]u8, ?[]const u8).init(allocator, batchFn);
+    const loader = try DataLoader([32]u8, ?[]const u8).init(allocator, batchFn, null);
     defer {
         var it = loader.cache.iterator();
         while (it.next()) |entry| {
@@ -1178,7 +1154,7 @@ test "Text Records Loader: basic loading" {
     const allocator = std.testing.allocator;
 
     const batchFn = struct {
-        fn load(alloc: std.mem.Allocator, keys: []const [32]u8) ![]TextRecords {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, keys: []const [32]u8) ![]TextRecords {
             const values = try alloc.alloc(TextRecords, keys.len);
             for (values, keys, 0..) |*value, key, i| {
                 if (i == 0) {
@@ -1202,7 +1178,7 @@ test "Text Records Loader: basic loading" {
         }
     }.load;
 
-    const loader = try DataLoader([32]u8, TextRecords).init(allocator, batchFn);
+    const loader = try DataLoader([32]u8, TextRecords).init(allocator, batchFn, null);
     defer {
         var it = loader.cache.iterator();
         while (it.next()) |entry| {
@@ -1224,7 +1200,7 @@ test "Text Records Loader: loadMany with multiple namehashes" {
     const allocator = std.testing.allocator;
 
     const batchFn = struct {
-        fn load(alloc: std.mem.Allocator, keys: []const [32]u8) ![]TextRecords {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, keys: []const [32]u8) ![]TextRecords {
             const values = try alloc.alloc(TextRecords, keys.len);
             for (values, keys, 0..) |*value, key, i| {
                 // Each namehash gets i+1 records
@@ -1241,7 +1217,7 @@ test "Text Records Loader: loadMany with multiple namehashes" {
         }
     }.load;
 
-    const loader = try DataLoader([32]u8, TextRecords).init(allocator, batchFn);
+    const loader = try DataLoader([32]u8, TextRecords).init(allocator, batchFn, null);
     defer {
         var it = loader.cache.iterator();
         while (it.next()) |entry| {
@@ -1275,7 +1251,7 @@ test "Text Records Loader: empty results" {
     const allocator = std.testing.allocator;
 
     const batchFn = struct {
-        fn load(alloc: std.mem.Allocator, keys: []const [32]u8) ![]TextRecords {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, keys: []const [32]u8) ![]TextRecords {
             const values = try alloc.alloc(TextRecords, keys.len);
             for (values) |*value| {
                 // All namehashes have no records
@@ -1285,7 +1261,7 @@ test "Text Records Loader: empty results" {
         }
     }.load;
 
-    const loader = try DataLoader([32]u8, TextRecords).init(allocator, batchFn);
+    const loader = try DataLoader([32]u8, TextRecords).init(allocator, batchFn, null);
     defer {
         var it = loader.cache.iterator();
         while (it.next()) |entry| {
@@ -1341,7 +1317,7 @@ test "Account Loader: basic batch loading" {
 
     // Mock batch function that normalizes addresses
     const batchFn = struct {
-        fn load(alloc: std.mem.Allocator, addresses: []const []const u8) ![][]const u8 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, addresses: []const []const u8) ![][]const u8 {
             const values = try alloc.alloc([]const u8, addresses.len);
             for (values, addresses) |*value, address| {
                 // Normalize addresses by converting to lowercase
@@ -1355,7 +1331,7 @@ test "Account Loader: basic batch loading" {
         }
     }.load;
 
-    const loader = try DataLoader([]const u8, []const u8).init(allocator, batchFn);
+    const loader = try DataLoader([]const u8, []const u8).init(allocator, batchFn, null);
     defer {
         // Clean up cached values
         var it = loader.cache.iterator();
@@ -1389,7 +1365,7 @@ test "Account Loader: cache hits for same address" {
     const allocator = std.testing.allocator;
 
     const batchFn = struct {
-        fn load(alloc: std.mem.Allocator, addresses: []const []const u8) ![][]const u8 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, addresses: []const []const u8) ![][]const u8 {
             const values = try alloc.alloc([]const u8, addresses.len);
             for (values, addresses) |*value, address| {
                 value.* = try alloc.dupe(u8, address);
@@ -1398,7 +1374,7 @@ test "Account Loader: cache hits for same address" {
         }
     }.load;
 
-    const loader = try DataLoader([]const u8, []const u8).init(allocator, batchFn);
+    const loader = try DataLoader([]const u8, []const u8).init(allocator, batchFn, null);
     defer {
         var it = loader.cache.iterator();
         while (it.next()) |entry| {
@@ -1433,7 +1409,7 @@ test "Account Loader: loadMany with multiple addresses" {
     const allocator = std.testing.allocator;
 
     const batchFn = struct {
-        fn load(alloc: std.mem.Allocator, addresses: []const []const u8) ![][]const u8 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, addresses: []const []const u8) ![][]const u8 {
             const values = try alloc.alloc([]const u8, addresses.len);
             for (values, addresses) |*value, address| {
                 const result = try std.fmt.allocPrint(alloc, "normalized_{s}", .{address});
@@ -1443,7 +1419,7 @@ test "Account Loader: loadMany with multiple addresses" {
         }
     }.load;
 
-    const loader = try DataLoader([]const u8, []const u8).init(allocator, batchFn);
+    const loader = try DataLoader([]const u8, []const u8).init(allocator, batchFn, null);
     defer {
         var it = loader.cache.iterator();
         while (it.next()) |entry| {
@@ -1476,12 +1452,12 @@ test "Account Loader: empty batch returns immediately" {
     const allocator = std.testing.allocator;
 
     const batchFn = struct {
-        fn load(alloc: std.mem.Allocator, addresses: []const []const u8) ![][]const u8 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, addresses: []const []const u8) ![][]const u8 {
             return try alloc.alloc([]const u8, addresses.len);
         }
     }.load;
 
-    const loader = try DataLoader([]const u8, []const u8).init(allocator, batchFn);
+    const loader = try DataLoader([]const u8, []const u8).init(allocator, batchFn, null);
     defer loader.deinit();
 
     const addresses = [_][]const u8{};
@@ -1551,7 +1527,7 @@ test "N+1 Prevention: multiple domains sharing same resolver address" {
     const batchFn = struct {
         var counter: *usize = undefined;
 
-        fn load(alloc: std.mem.Allocator, keys: []const [32]u8) ![]?[]const u8 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, keys: []const [32]u8) ![]?[]const u8 {
             // Count how many times the batch function is called
             counter.* += 1;
 
@@ -1566,7 +1542,7 @@ test "N+1 Prevention: multiple domains sharing same resolver address" {
 
     batchFn.counter = &batch_count;
 
-    const loader = try DataLoader([32]u8, ?[]const u8).init(allocator, batchFn);
+    const loader = try DataLoader([32]u8, ?[]const u8).init(allocator, batchFn, null);
     defer {
         var it = loader.cache.iterator();
         while (it.next()) |entry| {
@@ -1616,7 +1592,7 @@ test "N+1 Prevention: loadMany batches all keys in single request" {
         var counter: *usize = undefined;
         var keys_count: *usize = undefined;
 
-        fn load(alloc: std.mem.Allocator, keys: []const [32]u8) ![]?[]const u8 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, keys: []const [32]u8) ![]?[]const u8 {
             counter.* += 1;
             keys_count.* = keys.len;
 
@@ -1631,7 +1607,7 @@ test "N+1 Prevention: loadMany batches all keys in single request" {
     batchFn.counter = &batch_count;
     batchFn.keys_count = &keys_per_batch;
 
-    const loader = try DataLoader([32]u8, ?[]const u8).init(allocator, batchFn);
+    const loader = try DataLoader([32]u8, ?[]const u8).init(allocator, batchFn, null);
     defer {
         var it = loader.cache.iterator();
         while (it.next()) |entry| {
@@ -1670,7 +1646,7 @@ test "Memory Safety: batch load returns ownership to caller" {
     const allocator = std.testing.allocator;
 
     const batchFn = struct {
-        fn load(alloc: std.mem.Allocator, keys: []const [32]u8) ![]?[]const u8 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, keys: []const [32]u8) ![]?[]const u8 {
             const values = try alloc.alloc(?[]const u8, keys.len);
             for (values, keys, 0..) |*value, key, i| {
                 // Allocate a unique string for each key
@@ -1686,7 +1662,7 @@ test "Memory Safety: batch load returns ownership to caller" {
         }
     }.load;
 
-    const loader = try DataLoader([32]u8, ?[]const u8).init(allocator, batchFn);
+    const loader = try DataLoader([32]u8, ?[]const u8).init(allocator, batchFn, null);
     defer {
         // This defer should properly free all cached values without double-free
         var it = loader.cache.iterator();
@@ -1744,7 +1720,7 @@ test "Memory Safety: duplicate keys in batch are deduplicated" {
         var counter: *usize = undefined;
         var unique_count: *usize = undefined;
 
-        fn load(alloc: std.mem.Allocator, keys: []const [32]u8) ![]?[]const u8 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, keys: []const [32]u8) ![]?[]const u8 {
             counter.* += 1;
             unique_count.* = keys.len;
 
@@ -1759,7 +1735,7 @@ test "Memory Safety: duplicate keys in batch are deduplicated" {
     batchFn.counter = &batch_count;
     batchFn.unique_count = &unique_keys_in_batch;
 
-    const loader = try DataLoader([32]u8, ?[]const u8).init(allocator, batchFn);
+    const loader = try DataLoader([32]u8, ?[]const u8).init(allocator, batchFn, null);
     defer {
         var it = loader.cache.iterator();
         while (it.next()) |entry| {
@@ -1803,7 +1779,7 @@ test "Complex Scenario: nested resolver fields use same DataLoader context" {
     const batchFn = struct {
         var counter: *usize = undefined;
 
-        fn load(alloc: std.mem.Allocator, keys: []const [32]u8) ![]?[]const u8 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, keys: []const [32]u8) ![]?[]const u8 {
             counter.* += 1;
 
             const values = try alloc.alloc(?[]const u8, keys.len);
@@ -1816,7 +1792,7 @@ test "Complex Scenario: nested resolver fields use same DataLoader context" {
 
     batchFn.counter = &batch_count;
 
-    const loader = try DataLoader([32]u8, ?[]const u8).init(allocator, batchFn);
+    const loader = try DataLoader([32]u8, ?[]const u8).init(allocator, batchFn, null);
     defer {
         var it = loader.cache.iterator();
         while (it.next()) |entry| {
@@ -1866,7 +1842,7 @@ test "Edge Case: empty batch returns empty results" {
     const batchFn = struct {
         var was_called: *bool = undefined;
 
-        fn load(alloc: std.mem.Allocator, keys: []const [32]u8) ![]?[]const u8 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, keys: []const [32]u8) ![]?[]const u8 {
             was_called.* = true;
             return try alloc.alloc(?[]const u8, keys.len);
         }
@@ -1874,7 +1850,7 @@ test "Edge Case: empty batch returns empty results" {
 
     batchFn.was_called = &batch_called;
 
-    const loader = try DataLoader([32]u8, ?[]const u8).init(allocator, batchFn);
+    const loader = try DataLoader([32]u8, ?[]const u8).init(allocator, batchFn, null);
     defer loader.deinit();
 
     // Load with empty array
@@ -1892,7 +1868,7 @@ test "Edge Case: all results are null" {
     const allocator = std.testing.allocator;
 
     const batchFn = struct {
-        fn load(alloc: std.mem.Allocator, keys: []const [32]u8) ![]?[]const u8 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, keys: []const [32]u8) ![]?[]const u8 {
             const values = try alloc.alloc(?[]const u8, keys.len);
             for (values) |*value| {
                 value.* = null; // All results are null
@@ -1901,7 +1877,7 @@ test "Edge Case: all results are null" {
         }
     }.load;
 
-    const loader = try DataLoader([32]u8, ?[]const u8).init(allocator, batchFn);
+    const loader = try DataLoader([32]u8, ?[]const u8).init(allocator, batchFn, null);
     defer loader.deinit();
 
     var hashes: [5][32]u8 = undefined;
@@ -1932,7 +1908,7 @@ test "Stress: large batch size" {
     const allocator = std.testing.allocator;
 
     const batchFn = struct {
-        fn load(alloc: std.mem.Allocator, keys: []const [32]u8) ![]?[]const u8 {
+        fn load(_: ?*anyopaque, alloc: std.mem.Allocator, keys: []const [32]u8) ![]?[]const u8 {
             const values = try alloc.alloc(?[]const u8, keys.len);
             for (values, keys, 0..) |*value, key, i| {
                 if (i % 3 == 0) {
@@ -1945,7 +1921,7 @@ test "Stress: large batch size" {
         }
     }.load;
 
-    const loader = try DataLoader([32]u8, ?[]const u8).init(allocator, batchFn);
+    const loader = try DataLoader([32]u8, ?[]const u8).init(allocator, batchFn, null);
     defer {
         var it = loader.cache.iterator();
         while (it.next()) |entry| {
