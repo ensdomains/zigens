@@ -13,9 +13,12 @@ pub fn DataLoader(comptime K: type, comptime V: type) type {
         /// Pending keys waiting to be batched
         pending: std.ArrayList(K),
 
-        /// Batch loading function - takes array of keys, returns array of values
+        /// Batch loading function - takes a context, allocator, and array of keys, returns array of values
         /// Values must be returned in the same order as keys
-        batch_load_fn: *const fn (allocator: std.mem.Allocator, keys: []const K) anyerror![]V,
+        batch_load_fn: *const fn (context: ?*anyopaque, allocator: std.mem.Allocator, keys: []const K) anyerror![]V,
+
+        /// Opaque context pointer passed to the batch load function (e.g. database reference)
+        context: ?*anyopaque,
 
         allocator: std.mem.Allocator,
 
@@ -27,13 +30,15 @@ pub fn DataLoader(comptime K: type, comptime V: type) type {
 
         pub fn init(
             allocator: std.mem.Allocator,
-            batch_load_fn: *const fn (allocator: std.mem.Allocator, keys: []const K) anyerror![]V,
+            batch_load_fn: *const fn (context: ?*anyopaque, allocator: std.mem.Allocator, keys: []const K) anyerror![]V,
+            context: ?*anyopaque,
         ) !*Self {
             const loader = try allocator.create(Self);
             loader.* = .{
                 .cache = std.AutoHashMap(K, V).init(allocator),
                 .pending = std.ArrayList(K){},
                 .batch_load_fn = batch_load_fn,
+                .context = context,
                 .allocator = allocator,
                 .cache_hits = 0,
                 .cache_misses = 0,
@@ -124,7 +129,7 @@ pub fn DataLoader(comptime K: type, comptime V: type) type {
             self.total_keys_loaded += batch_size;
 
             // Call user-provided batch function
-            const values = try self.batch_load_fn(self.allocator, self.pending.items);
+            const values = try self.batch_load_fn(self.context, self.allocator, self.pending.items);
             defer self.allocator.free(values);
 
             // Ensure batch function returned correct number of values
