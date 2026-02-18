@@ -2092,12 +2092,19 @@ pub const Indexer = struct {
 
         std.log.info("    Processing orphan: {s} (block {d})", .{ full_name, orphan.block_number });
 
-        // Create the name
+        // Create the name (insertName copies all text internally, so we free our allocations)
+        const name_dup = try self.allocator.dupe(u8, full_name);
+        defer self.allocator.free(name_dup);
+        const label_dup = try self.allocator.dupe(u8, orphan.label);
+        defer self.allocator.free(label_dup);
+        const parent_name_dup = try self.allocator.dupe(u8, parent_name);
+        defer self.allocator.free(parent_name_dup);
+
         const name = models.Name{
-            .name = try self.allocator.dupe(u8, full_name),
-            .label = try self.allocator.dupe(u8, orphan.label),
+            .name = name_dup,
+            .label = label_dup,
             .label_hash = label_hash,
-            .parent_name = try self.allocator.dupe(u8, parent_name),
+            .parent_name = parent_name_dup,
             .parent_namehash = parent_namehash,
             .chain = chain,
             .registry = subregistry_addr,
@@ -2468,13 +2475,13 @@ pub const Indexer = struct {
         const token_version = token_id_utils.getTokenVersion(token_id);
 
         const name_str_dup = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
-        errdefer self.allocator.free(name_str_dup);
+        defer self.allocator.free(name_str_dup);
 
         const label_dup = try self.allocator.dupe(u8, label_str);
-        errdefer self.allocator.free(label_dup);
+        defer self.allocator.free(label_dup);
 
         const parent_name_dup = try self.allocator.dupe(u8, parent_name);
-        errdefer self.allocator.free(parent_name_dup);
+        defer self.allocator.free(parent_name_dup);
 
         const name = models.Name{
             .name = name_str_dup,
@@ -2506,12 +2513,7 @@ pub const Indexer = struct {
             .v1_label_hash = null,
         };
 
-        self.database.insertName(name) catch |err| {
-            if (name.name) |n| self.allocator.free(n);
-            if (name.label) |l| self.allocator.free(l);
-            if (name.parent_name) |p| self.allocator.free(p);
-            return err;
-        };
+        try self.database.insertName(name);
 
         // After inserting name, check if there are placeholder registries that need updating
         // This happens when SubregistryUpdate was processed before NameRegistered in the same block
@@ -2657,13 +2659,13 @@ pub const Indexer = struct {
         // NewSubname doesn't include owner or expiration, so we need to get them from TransferSingle event
         // or query the datastore. For now, we'll use zero values and they'll be updated by Transfer events
         const name_str = try self.allocator.dupe(u8, full_name);
-        errdefer self.allocator.free(name_str);
+        defer self.allocator.free(name_str);
 
         const label_dup = try self.allocator.dupe(u8, label_str);
-        errdefer self.allocator.free(label_dup);
+        defer self.allocator.free(label_dup);
 
         const parent_name_dup = try self.allocator.dupe(u8, parent_name.?);
-        errdefer self.allocator.free(parent_name_dup);
+        defer self.allocator.free(parent_name_dup);
 
         const name = models.Name{
             .name = name_str,
@@ -2695,13 +2697,7 @@ pub const Indexer = struct {
             .v1_label_hash = null,
         };
 
-        self.database.insertName(name) catch |err| {
-            // Clean up name allocations on error
-            if (name.name) |n| self.allocator.free(n);
-            if (name.label) |l| self.allocator.free(l);
-            if (name.parent_name) |p| self.allocator.free(p);
-            return err;
-        };
+        try self.database.insertName(name);
 
         // Store event
         const nh_hex = try namehash.toHex(self.allocator);
@@ -2921,13 +2917,13 @@ pub const Indexer = struct {
         const token_version = token_id_utils.getTokenVersion(token_id);
 
         const name_str_dup = try std.fmt.allocPrint(self.allocator, "{s}.eth", .{label_str});
-        errdefer self.allocator.free(name_str_dup);
+        defer self.allocator.free(name_str_dup);
 
         const label_dup = try self.allocator.dupe(u8, label_str);
-        errdefer self.allocator.free(label_dup);
+        defer self.allocator.free(label_dup);
 
         const parent_name_dup = try self.allocator.dupe(u8, "eth");
-        errdefer self.allocator.free(parent_name_dup);
+        defer self.allocator.free(parent_name_dup);
 
         const name = models.Name{
             .name = name_str_dup,
@@ -2959,12 +2955,7 @@ pub const Indexer = struct {
             .v1_label_hash = null,
         };
 
-        self.database.insertName(name) catch |err| {
-            if (name.name) |n| self.allocator.free(n);
-            if (name.label) |l| self.allocator.free(l);
-            if (name.parent_name) |p| self.allocator.free(p);
-            return err;
-        };
+        try self.database.insertName(name);
 
         // If subregistry was deployed at registration, store it in the registries table
         if (!subregistry.isZero()) {
@@ -3891,8 +3882,10 @@ pub const Indexer = struct {
         if (namehash.isZero()) {
             if (try self.database.getNamehashByResolver(resolver)) |actual_namehash| {
                 namehash = actual_namehash;
+                const resolved_hex = try actual_namehash.toHex(self.allocator);
+                defer self.allocator.free(resolved_hex);
                 std.log.debug("TextChanged: resolved zero namehash to {s} via resolver lookup", .{
-                    (try actual_namehash.toHex(self.allocator)),
+                    resolved_hex,
                 });
             } else {
                 // Resolver not associated with any indexed name - skip this event
@@ -5867,7 +5860,10 @@ pub const Indexer = struct {
             // Check if name already exists (from V1 events processed during sync)
             const existing_name = names_storage.getNameByNamehash(self.database, namehash) catch null;
 
-            if (existing_name) |_| {
+            if (existing_name) |existing| {
+                // Free the existing name record (we only needed to check existence)
+                var existing_copy = existing;
+                existing_copy.deinit(self.allocator);
                 // Name exists from V1 events - only update creation date if ours is earlier
                 names_storage.updateNameCreationDateIfEarlier(
                     self.database,
