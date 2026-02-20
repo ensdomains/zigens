@@ -66,6 +66,8 @@ fn getCanonicalRegistryAddresses(allocator: std.mem.Allocator) ![][]const u8 {
 
 pub const RegistrationFilterOptions = struct {
     chain: ?models.Chain = null, // Filter by chain (l1 or l2)
+    registrant: ?[]const u8 = null, // Filter by registrant (owner in event data JSON)
+    registrant_in: ?[]const []const u8 = null, // Filter by registrant IN list
     limit: u32 = constants.Pagination.default_limit,
     order_dir: events.OrderDir = .desc,
     expiry_gt: ?i64 = null,
@@ -95,6 +97,8 @@ pub fn getRegistrations(database: *Database, filter: RegistrationFilterOptions) 
         .event_type = models.EventType.name_registered.toString(),
         .chain = filter.chain,
         .contract_addresses = if (canonical_addresses.len > 0) canonical_addresses else null,
+        .data_json_owner = filter.registrant,
+        .data_json_owners = filter.registrant_in,
         .limit = filter.limit,
         .order_dir = filter.order_dir,
         .expiry_gt = filter.expiry_gt,
@@ -110,8 +114,111 @@ pub fn getRegistrations(database: *Database, filter: RegistrationFilterOptions) 
 // AGGREGATION OPERATIONS
 // ============================================================================
 
-/// Get total count of registrations (NameRegistered events from canonical registries)
-pub fn getTotalRegistrationCount(database: *Database) !usize {
+/// Get count of registrations with optional filters.
+/// When registrant/registrant_in is set, queries the `names` table using the indexed
+/// `registrant` column for O(log N) performance instead of scanning events with json_extract.
+/// For unfiltered counts, queries the events table with event_type + contract_address filters.
+pub fn getRegistrationCount(database: *Database, filter: RegistrationFilterOptions) !usize {
+    if (filter.registrant != null or (filter.registrant_in != null and filter.registrant_in.?.len > 0)) {
+        return getRegistrationCountFromNames(database, filter);
+    }
+    return getRegistrationCountFromEvents(database, filter);
+}
+
+/// Count registrations using the names table (fast — uses idx_names_registrant index).
+/// Filters 2LDs by parent_name = 'eth' which matches what canonical registries handle.
+/// Addresses are stored lowercase via Address.toHex(.lower), so we LOWER() the input.
+fn getRegistrationCountFromNames(database: *Database, filter: RegistrationFilterOptions) !usize {
+    var sql_buf: [1024]u8 = undefined;
+    var sql_len: usize = 0;
+
+    const base = "SELECT COUNT(*) FROM names WHERE parent_name = 'eth'";
+    @memcpy(sql_buf[sql_len..][0..base.len], base);
+    sql_len += base.len;
+
+    if (filter.chain != null) {
+        const cond = " AND chain = ?";
+        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
+        sql_len += cond.len;
+    }
+    if (filter.registrant != null) {
+        const cond = " AND registrant = LOWER(?)";
+        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
+        sql_len += cond.len;
+    }
+    if (filter.registrant_in != null and filter.registrant_in.?.len > 0) {
+        const prefix = " AND registrant IN (";
+        @memcpy(sql_buf[sql_len..][0..prefix.len], prefix);
+        sql_len += prefix.len;
+        for (filter.registrant_in.?, 0..) |_, i| {
+            if (i > 0) {
+                sql_buf[sql_len] = ',';
+                sql_len += 1;
+            }
+            const placeholder = "LOWER(?)";
+            @memcpy(sql_buf[sql_len..][0..placeholder.len], placeholder);
+            sql_len += placeholder.len;
+        }
+        sql_buf[sql_len] = ')';
+        sql_len += 1;
+    }
+    if (filter.expiry_gt != null) {
+        const cond = " AND expiry > ?";
+        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
+        sql_len += cond.len;
+    }
+    if (filter.expiry_gte != null) {
+        const cond = " AND expiry >= ?";
+        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
+        sql_len += cond.len;
+    }
+    if (filter.expiry_lt != null) {
+        const cond = " AND expiry < ?";
+        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
+        sql_len += cond.len;
+    }
+    if (filter.expiry_lte != null) {
+        const cond = " AND expiry <= ?";
+        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
+        sql_len += cond.len;
+    }
+
+    var q = try db_module.Query.init(database, sql_buf[0..sql_len]);
+    defer q.deinit();
+
+    if (filter.chain) |ch| {
+        try q.bindTextStatic(ch.toString());
+    }
+    if (filter.registrant) |reg| {
+        try q.bindText(reg);
+    }
+    if (filter.registrant_in) |regs| {
+        for (regs) |reg| {
+            try q.bindText(reg);
+        }
+    }
+    if (filter.expiry_gt) |exp| {
+        try q.bindInt64(exp);
+    }
+    if (filter.expiry_gte) |exp| {
+        try q.bindInt64(exp);
+    }
+    if (filter.expiry_lt) |exp| {
+        try q.bindInt64(exp);
+    }
+    if (filter.expiry_lte) |exp| {
+        try q.bindInt64(exp);
+    }
+
+    if (try q.step()) {
+        return @intCast(q.getInt64(0));
+    }
+    return 0;
+}
+
+/// Count registrations using the events table (for unfiltered counts).
+/// Uses event_type index to find NameRegistered events, then checks contract_address.
+fn getRegistrationCountFromEvents(database: *Database, filter: RegistrationFilterOptions) !usize {
     const allocator = database.allocator;
     const canonical_addresses = try getCanonicalRegistryAddresses(allocator);
     defer {
@@ -121,8 +228,7 @@ pub fn getTotalRegistrationCount(database: *Database) !usize {
         allocator.free(canonical_addresses);
     }
 
-    // Build SQL with IN clause for canonical addresses
-    var sql_buf: [512]u8 = undefined;
+    var sql_buf: [1024]u8 = undefined;
     var sql_len: usize = 0;
 
     const base = "SELECT COUNT(*) FROM events WHERE event_type = ?";
@@ -147,19 +253,64 @@ pub fn getTotalRegistrationCount(database: *Database) !usize {
         sql_len += 1;
     }
 
+    if (filter.chain != null) {
+        const cond = " AND chain = ?";
+        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
+        sql_len += cond.len;
+    }
+    if (filter.expiry_gt != null) {
+        const cond = " AND json_extract(data, '$.expiration') > ?";
+        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
+        sql_len += cond.len;
+    }
+    if (filter.expiry_gte != null) {
+        const cond = " AND json_extract(data, '$.expiration') >= ?";
+        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
+        sql_len += cond.len;
+    }
+    if (filter.expiry_lt != null) {
+        const cond = " AND json_extract(data, '$.expiration') < ?";
+        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
+        sql_len += cond.len;
+    }
+    if (filter.expiry_lte != null) {
+        const cond = " AND json_extract(data, '$.expiration') <= ?";
+        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
+        sql_len += cond.len;
+    }
+
     var q = try db_module.Query.init(database, sql_buf[0..sql_len]);
     defer q.deinit();
 
     try q.bindTextStatic(models.EventType.name_registered.toString());
-
     for (canonical_addresses) |addr| {
         try q.bindText(addr);
+    }
+    if (filter.chain) |ch| {
+        try q.bindTextStatic(ch.toString());
+    }
+    if (filter.expiry_gt) |exp| {
+        try q.bindInt64(exp);
+    }
+    if (filter.expiry_gte) |exp| {
+        try q.bindInt64(exp);
+    }
+    if (filter.expiry_lt) |exp| {
+        try q.bindInt64(exp);
+    }
+    if (filter.expiry_lte) |exp| {
+        try q.bindInt64(exp);
     }
 
     if (try q.step()) {
         return @intCast(q.getInt64(0));
     }
     return 0;
+}
+
+/// Get total count of registrations (convenience wrapper with no filters)
+pub fn getTotalRegistrationCount(database: *Database) !usize {
+    return getRegistrationCount(database, .{});
 }
 
 // ============================================================================

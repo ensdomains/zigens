@@ -32,6 +32,73 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
         1000, // max limit
     );
 
+    // Parse where filters
+    var filter_registrant: ?[]const u8 = null;
+    var filter_registrant_in: ?[][]const u8 = null;
+    var filter_expiry_gt: ?i64 = null;
+    var filter_expiry_gte: ?i64 = null;
+    var filter_expiry_lt: ?i64 = null;
+    var filter_expiry_lte: ?i64 = null;
+    var filter_chain: ?models.Chain = null;
+
+    for (field.arguments) |arg| {
+        if (std.mem.eql(u8, arg.name, "where")) {
+            if (arg.value == .object) {
+                for (arg.value.object) |filter_arg| {
+                    if (std.mem.eql(u8, filter_arg.name, "registrant")) {
+                        if (filter_arg.value == .string) {
+                            filter_registrant = filter_arg.value.string;
+                        }
+                    } else if (std.mem.eql(u8, filter_arg.name, "chain")) {
+                        if (filter_arg.value == .string) {
+                            filter_chain = models.Chain.fromString(filter_arg.value.string) catch null;
+                        }
+                    } else if (std.mem.eql(u8, filter_arg.name, "expiryDate_gt")) {
+                        if (filter_arg.value == .int) {
+                            filter_expiry_gt = filter_arg.value.int;
+                        }
+                    } else if (std.mem.eql(u8, filter_arg.name, "expiryDate_lt")) {
+                        if (filter_arg.value == .int) {
+                            filter_expiry_lt = filter_arg.value.int;
+                        }
+                    } else if (std.mem.eql(u8, filter_arg.name, "expiryDate_gte")) {
+                        if (filter_arg.value == .int) {
+                            filter_expiry_gte = filter_arg.value.int;
+                        }
+                    } else if (std.mem.eql(u8, filter_arg.name, "expiryDate_lte")) {
+                        if (filter_arg.value == .int) {
+                            filter_expiry_lte = filter_arg.value.int;
+                        }
+                    } else if (std.mem.eql(u8, filter_arg.name, "registrant_in")) {
+                        if (filter_arg.value == .list) {
+                            var addresses: std.ArrayList([]const u8) = .{};
+                            defer addresses.deinit(allocator);
+                            for (filter_arg.value.list) |item| {
+                                if (item == .string) {
+                                    try addresses.append(allocator, item.string);
+                                }
+                            }
+                            filter_registrant_in = try addresses.toOwnedSlice(allocator);
+                        }
+                    }
+                }
+            }
+            break;
+        }
+    }
+    defer if (filter_registrant_in) |regs| allocator.free(regs);
+
+    // Build registration filter
+    const reg_filter = db.RegistrationFilterOptions{
+        .chain = filter_chain,
+        .registrant = filter_registrant,
+        .registrant_in = filter_registrant_in,
+        .expiry_gt = filter_expiry_gt,
+        .expiry_gte = filter_expiry_gte,
+        .expiry_lt = filter_expiry_lt,
+        .expiry_lte = filter_expiry_lte,
+    };
+
     // Extract node selections from query
     var node_selections: []const parser.Field = &[_]parser.Field{};
     for (field.selections) |*sel| {
@@ -52,11 +119,12 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
     // For backward pagination (last/before), reverse the query order
     const order_dir: db.EventOrderDir = if (params.direction == .backward) .asc else .desc;
 
-    // Get registration events from database (filters by canonical registries internally)
-    const events = try database.getRegistrations(.{
-        .limit = @intCast(fetch_limit),
-        .order_dir = order_dir,
-    });
+    // Get registration events from database with filters applied at DB level
+    var fetch_filter = reg_filter;
+    fetch_filter.limit = @intCast(fetch_limit);
+    fetch_filter.order_dir = order_dir;
+
+    const events = try database.getRegistrations(fetch_filter);
     defer {
         for (events) |*event| {
             event.deinit(allocator);
@@ -115,8 +183,18 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
         };
     }
 
-    // Get total count for aggregation
-    const total_count = try database.getTotalRegistrationCount();
+    // Only compute total count when requested in the GraphQL selection
+    var wants_total_count = false;
+    for (field.selections) |*sel| {
+        if (std.mem.eql(u8, sel.name, "totalCount")) {
+            wants_total_count = true;
+            break;
+        }
+    }
+    const total_count: ?usize = if (wants_total_count)
+        try database.getRegistrationCount(reg_filter)
+    else
+        null;
 
     // Build connection
     const connection = try pagination.buildConnectionString(
@@ -199,8 +277,8 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
     const skip = parser.getIntArg(field, "skip", 0) orelse 0;
 
     // Parse filter if provided
-    var filter_registrant: ?Address = null;
-    var filter_registrant_in: ?[]Address = null;
+    var filter_registrant: ?[]const u8 = null;
+    var filter_registrant_in: ?[][]const u8 = null;
     var filter_expiry_gt: ?i64 = null;
     var filter_expiry_gte: ?i64 = null;
     var filter_expiry_lt: ?i64 = null;
@@ -214,7 +292,7 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
                 for (arg.value.object) |filter_arg| {
                     if (std.mem.eql(u8, filter_arg.name, "registrant")) {
                         if (filter_arg.value == .string) {
-                            filter_registrant = Address.fromHex(filter_arg.value.string) catch null;
+                            filter_registrant = filter_arg.value.string;
                         }
                     } else if (std.mem.eql(u8, filter_arg.name, "chain")) {
                         if (filter_arg.value == .string) {
@@ -230,13 +308,11 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
                         }
                     } else if (std.mem.eql(u8, filter_arg.name, "registrant_in")) {
                         if (filter_arg.value == .list) {
-                            var addresses: std.ArrayList(Address) = .{};
+                            var addresses: std.ArrayList([]const u8) = .{};
                             defer addresses.deinit(allocator);
                             for (filter_arg.value.list) |item| {
                                 if (item == .string) {
-                                    if (Address.fromHex(item.string)) |addr| {
-                                        try addresses.append(allocator, addr);
-                                    } else |_| {}
+                                    try addresses.append(allocator, item.string);
                                 }
                             }
                             filter_registrant_in = try addresses.toOwnedSlice(allocator);
@@ -255,6 +331,7 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
             break;
         }
     }
+    defer if (filter_registrant_in) |regs| allocator.free(regs);
 
     // Parse orderBy and orderDirection
     var order_by: ?[]const u8 = null;
@@ -272,17 +349,13 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
         }
     }
 
-    // Get registration events from database
-    // The database handles contract filtering internally based on its network configuration
-    // Expiry filters are pushed to DB query, only registrant filters need in-memory filtering
-    const fetch_limit: u32 = if (filter_registrant != null or filter_registrant_in != null)
-        @intCast(@min(first * 10, 1000))
-    else
-        @intCast(first);
-
+    // All filters are pushed to the DB level
+    // Fetch enough items to cover skip + first for offset pagination
     const events = try database.getRegistrations(.{
         .chain = filter_chain,
-        .limit = fetch_limit,
+        .registrant = filter_registrant,
+        .registrant_in = filter_registrant_in,
+        .limit = @intCast(first + skip),
         .order_dir = .desc,
         .expiry_gt = filter_expiry_gt,
         .expiry_gte = filter_expiry_gte,
@@ -303,66 +376,19 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
         expiry: i64,
     };
 
-    // First pass: collect filtered events
+    // Collect events and parse expiry for sorting
     var filtered_events: std.ArrayList(FilteredEvent) = .{};
     defer filtered_events.deinit(allocator);
 
     for (events) |*event| {
         if (event.name == null) continue;
 
-        // Parse event data to check filters
-        var matches = true;
         var event_expiry: i64 = 0;
-        var owner_str: ?[]const u8 = null;
 
-        if (filter_registrant != null or filter_registrant_in != null or
-            filter_expiry_gt != null or filter_expiry_gte != null or
-            filter_expiry_lt != null or filter_expiry_lte != null or
-            order_by != null) {
+        if (order_by != null) {
             const parsed = std.json.parseFromSlice(std.json.Value, allocator, event.data, .{}) catch continue;
             defer parsed.deinit();
 
-            // Get owner for registrant filters
-            owner_str = if (parsed.value.object.get("owner")) |owner_val|
-                if (owner_val == .string) owner_val.string else null
-            else
-                null;
-
-            // Check registrant filter
-            if (filter_registrant) |reg_addr| {
-                if (owner_str) |owner| {
-                    const owner_addr = Address.fromHex(owner) catch {
-                        matches = false;
-                        continue;
-                    };
-                    if (!owner_addr.eql(reg_addr)) matches = false;
-                } else {
-                    matches = false;
-                }
-            }
-
-            // Check registrant_in filter
-            if (matches and filter_registrant_in != null) {
-                if (owner_str) |owner| {
-                    const owner_addr = Address.fromHex(owner) catch {
-                        matches = false;
-                        continue;
-                    };
-                    var found = false;
-                    for (filter_registrant_in.?) |addr| {
-                        if (owner_addr.eql(addr)) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) matches = false;
-                } else {
-                    matches = false;
-                }
-            }
-
-            // Get expiry for filter checks and sorting
-            // Use expiration field directly (absolute timestamp)
             if (parsed.value.object.get("expiration")) |expiration_val| {
                 if (expiration_val == .integer) {
                     event_expiry = expiration_val.integer;
@@ -370,49 +396,32 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
             }
         }
 
-        // Apply expiry filters
-        if (matches and filter_expiry_gt != null) {
-            if (event_expiry <= filter_expiry_gt.?) matches = false;
-        }
-        if (matches and filter_expiry_gte != null) {
-            if (event_expiry < filter_expiry_gte.?) matches = false;
-        }
-        if (matches and filter_expiry_lt != null) {
-            if (event_expiry >= filter_expiry_lt.?) matches = false;
-        }
-        if (matches and filter_expiry_lte != null) {
-            if (event_expiry > filter_expiry_lte.?) matches = false;
-        }
-
-        if (matches) {
-            try filtered_events.append(allocator, .{
-                .event = event,
-                .name = event.name.?,
-                .expiry = event_expiry,
-            });
-        }
+        try filtered_events.append(allocator, .{
+            .event = event,
+            .name = event.name.?,
+            .expiry = event_expiry,
+        });
     }
 
     // Sort filtered events if orderBy is specified
     if (order_by) |field_name| {
         const ascending = std.mem.eql(u8, order_direction, "asc");
         const SortContext = struct {
-            field: []const u8,
+            field_name: []const u8,
             asc: bool,
         };
-        const sort_ctx = SortContext{ .field = field_name, .asc = ascending };
+        const sort_ctx = SortContext{ .field_name = field_name, .asc = ascending };
 
         std.mem.sort(FilteredEvent, filtered_events.items, sort_ctx, struct {
             fn lessThan(sort_ctx_param: SortContext, a: FilteredEvent, b: FilteredEvent) bool {
-                if (std.mem.eql(u8, sort_ctx_param.field, "name")) {
+                if (std.mem.eql(u8, sort_ctx_param.field_name, "name")) {
                     const cmp = std.mem.order(u8, a.name, b.name);
                     return if (sort_ctx_param.asc) cmp == .lt else cmp == .gt;
-                } else if (std.mem.eql(u8, sort_ctx_param.field, "registrationDate")) {
+                } else if (std.mem.eql(u8, sort_ctx_param.field_name, "registrationDate")) {
                     return if (sort_ctx_param.asc) a.event.timestamp < b.event.timestamp else a.event.timestamp > b.event.timestamp;
-                } else if (std.mem.eql(u8, sort_ctx_param.field, "expiryDate")) {
+                } else if (std.mem.eql(u8, sort_ctx_param.field_name, "expiryDate")) {
                     return if (sort_ctx_param.asc) a.expiry < b.expiry else a.expiry > b.expiry;
-                } else if (std.mem.eql(u8, sort_ctx_param.field, "id")) {
-                    // For registrations, id is the name
+                } else if (std.mem.eql(u8, sort_ctx_param.field_name, "id")) {
                     const cmp = std.mem.order(u8, a.name, b.name);
                     return if (sort_ctx_param.asc) cmp == .lt else cmp == .gt;
                 }

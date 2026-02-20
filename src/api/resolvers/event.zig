@@ -31,6 +31,69 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
         1000, // max limit
     );
 
+    // Parse where filters
+    var filter_opts = db.EventFilterOptions{};
+
+    var event_types_list: std.ArrayList([]const u8) = .{};
+    defer event_types_list.deinit(allocator);
+
+    var normalized_contract_address: ?[]u8 = null;
+    defer if (normalized_contract_address) |addr| allocator.free(addr);
+
+    for (field.arguments) |arg| {
+        if (std.mem.eql(u8, arg.name, "where") and arg.value == .object) {
+            for (arg.value.object) |filter_arg| {
+                if (std.mem.eql(u8, filter_arg.name, "type")) {
+                    if (filter_arg.value == .string) {
+                        filter_opts.event_type = filter_arg.value.string;
+                    }
+                } else if (std.mem.eql(u8, filter_arg.name, "type_in")) {
+                    if (filter_arg.value == .list) {
+                        for (filter_arg.value.list) |item| {
+                            if (item == .string) {
+                                try event_types_list.append(allocator, item.string);
+                            }
+                        }
+                        if (event_types_list.items.len > 0) {
+                            filter_opts.event_types = event_types_list.items;
+                        }
+                    }
+                } else if (std.mem.eql(u8, filter_arg.name, "domain")) {
+                    if (filter_arg.value == .string) {
+                        filter_opts.domain = filter_arg.value.string;
+                    }
+                } else if (std.mem.eql(u8, filter_arg.name, "contractAddress")) {
+                    if (filter_arg.value == .string) {
+                        const addr = Address.fromHex(filter_arg.value.string) catch continue;
+                        normalized_contract_address = try addr.toHex(allocator);
+                        filter_opts.contract_address = normalized_contract_address;
+                    }
+                } else if (std.mem.eql(u8, filter_arg.name, "namehash")) {
+                    if (filter_arg.value == .string) {
+                        filter_opts.namehash = filter_arg.value.string;
+                    }
+                } else if (std.mem.eql(u8, filter_arg.name, "blockNumber_gt")) {
+                    if (filter_arg.value == .int) {
+                        filter_opts.block_number_gt = filter_arg.value.int;
+                    }
+                } else if (std.mem.eql(u8, filter_arg.name, "blockNumber_lt")) {
+                    if (filter_arg.value == .int) {
+                        filter_opts.block_number_lt = filter_arg.value.int;
+                    }
+                } else if (std.mem.eql(u8, filter_arg.name, "timestamp_gt")) {
+                    if (filter_arg.value == .int) {
+                        filter_opts.timestamp_gt = filter_arg.value.int;
+                    }
+                } else if (std.mem.eql(u8, filter_arg.name, "timestamp_lt")) {
+                    if (filter_arg.value == .int) {
+                        filter_opts.timestamp_lt = filter_arg.value.int;
+                    }
+                }
+            }
+            break;
+        }
+    }
+
     // Extract node selections from query
     var node_selections: []const parser.Field = &[_]parser.Field{};
     for (field.selections) |*sel| {
@@ -50,7 +113,13 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
 
     // For backward pagination (last/before), reverse the query order
     const order_dir: db.EventOrderDir = if (params.direction == .backward) .asc else .desc;
-    const events = try database.getRecentEventsWithOrder(null, null, @intCast(fetch_limit), order_dir);
+
+    // Apply filters and fetch
+    var fetch_filter = filter_opts;
+    fetch_filter.limit = @intCast(fetch_limit);
+    fetch_filter.order_dir = order_dir;
+
+    const events = try database.getEventsFiltered(fetch_filter);
     defer {
         for (events) |*event| {
             event.deinit(allocator);
@@ -109,8 +178,18 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
         };
     }
 
-    // Get total count for aggregation
-    const total_count = try database.getTotalEventCount();
+    // Only compute total count when requested in the GraphQL selection
+    var wants_total_count = false;
+    for (field.selections) |*sel| {
+        if (std.mem.eql(u8, sel.name, "totalCount")) {
+            wants_total_count = true;
+            break;
+        }
+    }
+    const total_count: ?usize = if (wants_total_count)
+        try database.getEventCount(filter_opts)
+    else
+        null;
 
     // Build connection
     const connection = try pagination.buildConnectionString(
