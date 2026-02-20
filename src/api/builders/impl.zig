@@ -868,8 +868,14 @@ fn domainSubdomainConnectionHandler(ctx: *anyopaque, field: *const parser.Field,
     errdefer json.deinit(allocator);
 
     if (domain.name) |parent_name| {
-        // Get total count
-        const total_count = try database.countDirectSubdomains(parent_name);
+        // Check if totalCount is requested
+        var wants_total_count = false;
+        for (field.selections) |*sel| {
+            if (std.mem.eql(u8, sel.name, "totalCount")) {
+                wants_total_count = true;
+                break;
+            }
+        }
 
         // Fetch one extra to determine hasNextPage
         const subdomains = try database.getSubdomains(parent_name, 0, limit + 1);
@@ -896,12 +902,20 @@ fn domainSubdomainConnectionHandler(ctx: *anyopaque, field: *const parser.Field,
         }
 
         // Build connection JSON
-        try json.appendSlice(allocator, "{\"totalCount\":");
-        const count_str = try std.fmt.allocPrint(allocator, "{d}", .{total_count});
-        defer allocator.free(count_str);
-        try json.appendSlice(allocator, count_str);
+        try json.appendSlice(allocator, "{");
+        var first_field = true;
 
-        try json.appendSlice(allocator, ",\"pageInfo\":{\"hasNextPage\":");
+        if (wants_total_count) {
+            const total_count = try database.countDirectSubdomains(parent_name);
+            const count_str = try std.fmt.allocPrint(allocator, "{d}", .{total_count});
+            defer allocator.free(count_str);
+            try json.appendSlice(allocator, "\"totalCount\":");
+            try json.appendSlice(allocator, count_str);
+            first_field = false;
+        }
+
+        if (!first_field) try json.appendSlice(allocator, ",");
+        try json.appendSlice(allocator, "\"pageInfo\":{\"hasNextPage\":");
         try json.appendSlice(allocator, if (has_next) "true" else "false");
         try json.appendSlice(allocator, ",\"hasPreviousPage\":false}");
 
@@ -929,7 +943,7 @@ fn domainSubdomainConnectionHandler(ctx: *anyopaque, field: *const parser.Field,
         }
         try json.appendSlice(allocator, "]}");
     } else {
-        try json.appendSlice(allocator, "{\"totalCount\":0,\"pageInfo\":{\"hasNextPage\":false,\"hasPreviousPage\":false},\"edges\":[]}");
+        try json.appendSlice(allocator, "{\"pageInfo\":{\"hasNextPage\":false,\"hasPreviousPage\":false},\"edges\":[]}");
     }
 
     return try allocator.dupe(u8, json.items);
@@ -944,8 +958,14 @@ fn domainEventsConnectionHandler(ctx: *anyopaque, field: *const parser.Field, ne
     const first_arg = parser.getIntArg(field, "first", 10) orelse 10;
     const limit: u32 = @intCast(@min(first_arg, 100));
 
-    // Get total count
-    const total_count = try database.countEventsByNamehash(domain.namehash);
+    // Check if totalCount is requested
+    var wants_total_count = false;
+    for (field.selections) |*sel| {
+        if (std.mem.eql(u8, sel.name, "totalCount")) {
+            wants_total_count = true;
+            break;
+        }
+    }
 
     // Fetch events
     const namehash_hex = try domain.namehash.toHex(allocator);
@@ -983,12 +1003,20 @@ fn domainEventsConnectionHandler(ctx: *anyopaque, field: *const parser.Field, ne
     errdefer json.deinit(allocator);
 
     // Build connection JSON
-    try json.appendSlice(allocator, "{\"totalCount\":");
-    const count_str = try std.fmt.allocPrint(allocator, "{d}", .{total_count});
-    defer allocator.free(count_str);
-    try json.appendSlice(allocator, count_str);
+    try json.appendSlice(allocator, "{");
+    var first_field = true;
 
-    try json.appendSlice(allocator, ",\"pageInfo\":{\"hasNextPage\":");
+    if (wants_total_count) {
+        const total_count = try database.countEventsByNamehash(domain.namehash);
+        const count_str = try std.fmt.allocPrint(allocator, "{d}", .{total_count});
+        defer allocator.free(count_str);
+        try json.appendSlice(allocator, "\"totalCount\":");
+        try json.appendSlice(allocator, count_str);
+        first_field = false;
+    }
+
+    if (!first_field) try json.appendSlice(allocator, ",");
+    try json.appendSlice(allocator, "\"pageInfo\":{\"hasNextPage\":");
     try json.appendSlice(allocator, if (has_next) "true" else "false");
     try json.appendSlice(allocator, ",\"hasPreviousPage\":false}");
 

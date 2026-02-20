@@ -159,8 +159,18 @@ pub fn resolveRolesConnection(ctx: parser.ExecutionContext, field: *const parser
 
     const items_slice = roles[0..actual_items];
 
-    // Get total count for aggregation
-    const total_count = try database.getTotalRoleCount(chain, resource_arg, account_addr);
+    // Only compute total count when requested in the GraphQL selection
+    var wants_total_count = false;
+    for (field.selections) |*sel| {
+        if (std.mem.eql(u8, sel.name, "totalCount")) {
+            wants_total_count = true;
+            break;
+        }
+    }
+    const total_count: ?usize = if (wants_total_count)
+        try database.getTotalRoleCount(chain, resource_arg, account_addr)
+    else
+        null;
 
     // Build JSON
     var json: std.ArrayList(u8) = .{};
@@ -216,10 +226,12 @@ pub fn resolveRolesConnection(ctx: parser.ExecutionContext, field: *const parser
 
     try json.appendSlice(allocator, "]");
 
-    try json.appendSlice(allocator, ",\"totalCount\":");
-    const count_str = try std.fmt.allocPrint(allocator, "{d}", .{total_count});
-    defer allocator.free(count_str);
-    try json.appendSlice(allocator, count_str);
+    if (total_count) |count| {
+        try json.appendSlice(allocator, ",\"totalCount\":");
+        const count_str = try std.fmt.allocPrint(allocator, "{d}", .{count});
+        defer allocator.free(count_str);
+        try json.appendSlice(allocator, count_str);
+    }
 
     try json.appendSlice(allocator, "}");
 

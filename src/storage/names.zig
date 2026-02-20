@@ -957,8 +957,149 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
 
 /// Get total count of all names in the database
 pub fn getTotalNameCount(db: *Database) !usize {
-    var q = try Query.init(db, "SELECT COUNT(*) FROM names");
+    return getFilteredNameCount(db, .{});
+}
+
+/// Get count of names with optional filters.
+/// Builds the same WHERE clause as getFilteredNames but uses SELECT COUNT(*).
+pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
+    var conditions: std.ArrayList([]const u8) = .{};
+    defer conditions.deinit(db.allocator);
+
+    var allocated_strings: std.ArrayList([]const u8) = .{};
+    defer {
+        for (allocated_strings.items) |s| db.allocator.free(s);
+        allocated_strings.deinit(db.allocator);
+    }
+
+    // Build WHERE conditions (same order as getFilteredNames)
+    if (filters.owner != null) {
+        try conditions.append(db.allocator, "owner = ?");
+    }
+    if (filters.owner_in) |owners| {
+        if (owners.len > 0) {
+            var in_parts: std.ArrayList(u8) = .{};
+            defer in_parts.deinit(db.allocator);
+            try in_parts.appendSlice(db.allocator, "owner IN (");
+            for (owners, 0..) |_, i| {
+                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
+                try in_parts.appendSlice(db.allocator, "?");
+            }
+            try in_parts.appendSlice(db.allocator, ")");
+            const clause = try db.allocator.dupe(u8, in_parts.items);
+            try allocated_strings.append(db.allocator, clause);
+            try conditions.append(db.allocator, clause);
+        }
+    }
+    if (filters.name != null) {
+        try conditions.append(db.allocator, "name = ?");
+    }
+    if (filters.name_contains != null) {
+        try conditions.append(db.allocator, "name LIKE '%' || ? || '%'");
+    }
+    if (filters.name_contains_nocase != null) {
+        try conditions.append(db.allocator, "LOWER(name) LIKE '%' || LOWER(?) || '%'");
+    }
+    if (filters.name_starts_with != null) {
+        try conditions.append(db.allocator, "name LIKE ? || '%'");
+    }
+    if (filters.name_ends_with != null) {
+        try conditions.append(db.allocator, "name LIKE '%' || ?");
+    }
+    if (filters.expiry_gt != null) {
+        try conditions.append(db.allocator, "expiry > ?");
+    }
+    if (filters.expiry_gte != null) {
+        try conditions.append(db.allocator, "expiry >= ?");
+    }
+    if (filters.expiry_lt != null) {
+        try conditions.append(db.allocator, "expiry < ?");
+    }
+    if (filters.expiry_lte != null) {
+        try conditions.append(db.allocator, "expiry <= ?");
+    }
+    if (filters.resolved_address != null) {
+        try conditions.append(db.allocator, "namehash IN (SELECT namehash FROM resolver_addresses WHERE address = ?)");
+    }
+    if (filters.has_subdomains) |has_subs| {
+        if (has_subs) {
+            try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) > 0");
+        } else {
+            try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) = 0");
+        }
+    }
+    if (filters.subdomain_count_gt != null) {
+        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) > ?");
+    }
+    if (filters.subdomain_count_lt != null) {
+        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) < ?");
+    }
+
+    // Build SQL
+    var where_clause: std.ArrayList(u8) = .{};
+    defer where_clause.deinit(db.allocator);
+
+    if (conditions.items.len > 0) {
+        try where_clause.appendSlice(db.allocator, "WHERE ");
+        for (conditions.items, 0..) |cond, i| {
+            if (i > 0) try where_clause.appendSlice(db.allocator, " AND ");
+            try where_clause.appendSlice(db.allocator, cond);
+        }
+        try where_clause.appendSlice(db.allocator, " ");
+    }
+
+    const sql = try std.fmt.allocPrint(db.allocator, "SELECT COUNT(*) FROM names {s}", .{where_clause.items});
+    defer db.allocator.free(sql);
+
+    var q = try Query.init(db, sql);
     defer q.deinit();
+
+    // Bind parameters (same order as getFilteredNames)
+    if (filters.owner) |o| {
+        try q.bindAddress(o);
+    }
+    if (filters.owner_in) |owners| {
+        for (owners) |o| {
+            try q.bindAddress(o);
+        }
+    }
+    if (filters.name) |n| {
+        try q.bindText(n);
+    }
+    if (filters.name_contains) |n| {
+        try q.bindText(n);
+    }
+    if (filters.name_contains_nocase) |n| {
+        try q.bindText(n);
+    }
+    if (filters.name_starts_with) |n| {
+        try q.bindText(n);
+    }
+    if (filters.name_ends_with) |n| {
+        try q.bindText(n);
+    }
+    if (filters.expiry_gt) |v| {
+        try q.bindInt64(v);
+    }
+    if (filters.expiry_gte) |v| {
+        try q.bindInt64(v);
+    }
+    if (filters.expiry_lt) |v| {
+        try q.bindInt64(v);
+    }
+    if (filters.expiry_lte) |v| {
+        try q.bindInt64(v);
+    }
+    if (filters.resolved_address) |addr| {
+        try q.bindAddress(addr);
+    }
+    // has_subdomains doesn't need binding (no ?)
+    if (filters.subdomain_count_gt) |v| {
+        try q.bindInt64(v);
+    }
+    if (filters.subdomain_count_lt) |v| {
+        try q.bindInt64(v);
+    }
 
     if (try q.step()) {
         return @intCast(q.getInt64(0));

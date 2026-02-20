@@ -175,6 +175,7 @@ pub const EventFilterOptions = struct {
     timestamp_gt: ?i64 = null,
     timestamp_lt: ?i64 = null,
     data_json_owner: ?[]const u8 = null,
+    data_json_owners: ?[]const []const u8 = null,
     // Expiry filters - uses json_extract(data, '$.expiration')
     expiry_gt: ?i64 = null,
     expiry_gte: ?i64 = null,
@@ -186,7 +187,7 @@ pub const EventFilterOptions = struct {
 
 /// Get events with flexible filtering
 pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Event {
-    var sql_buf: [1024]u8 = undefined;
+    var sql_buf: [2048]u8 = undefined;
     var sql_len: usize = 0;
 
     const base_sql = "SELECT event_type, chain, block_number, tx_hash, log_index, contract_address, name, namehash, data, timestamp FROM events";
@@ -276,6 +277,27 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     if (filter.data_json_owner != null) {
         try conditions.append(db.allocator, "LOWER(json_extract(data, '$.owner')) = LOWER(?)");
     }
+    if (filter.data_json_owners != null and filter.data_json_owners.?.len > 0) {
+        var in_clause_buf: [1024]u8 = undefined;
+        var in_len: usize = 0;
+        const prefix = "LOWER(json_extract(data, '$.owner')) IN (";
+        @memcpy(in_clause_buf[in_len..][0..prefix.len], prefix);
+        in_len += prefix.len;
+        for (filter.data_json_owners.?, 0..) |_, i| {
+            if (i > 0) {
+                in_clause_buf[in_len] = ',';
+                in_len += 1;
+            }
+            const placeholder = "LOWER(?)";
+            @memcpy(in_clause_buf[in_len..][0..placeholder.len], placeholder);
+            in_len += placeholder.len;
+        }
+        in_clause_buf[in_len] = ')';
+        in_len += 1;
+        const clause = try db.allocator.dupe(u8, in_clause_buf[0..in_len]);
+        try allocated_clauses.append(db.allocator, clause);
+        try conditions.append(db.allocator, clause);
+    }
     if (filter.expiry_gt != null) {
         try conditions.append(db.allocator, "json_extract(data, '$.expiration') > ?");
     }
@@ -361,6 +383,11 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     if (filter.data_json_owner) |owner| {
         try q.bindText(owner);
     }
+    if (filter.data_json_owners) |owners| {
+        for (owners) |owner| {
+            try q.bindText(owner);
+        }
+    }
     if (filter.expiry_gt) |exp| {
         try q.bindInt64(exp);
     }
@@ -437,8 +464,212 @@ pub fn insertApproval(db: *Database, chain: models.Chain, token_id: u256, owner:
 
 /// Get total count of all events in the database
 pub fn getTotalEventCount(db: *Database) !usize {
-    var q = try Query.init(db, "SELECT COUNT(*) FROM events");
+    return getEventCount(db, .{});
+}
+
+/// Get count of events with optional filters.
+/// Builds the same WHERE clause as getEventsFiltered but uses SELECT COUNT(*).
+pub fn getEventCount(db: *Database, filter: EventFilterOptions) !usize {
+    var sql_buf: [2048]u8 = undefined;
+    var sql_len: usize = 0;
+
+    const base_sql = "SELECT COUNT(*) FROM events";
+    @memcpy(sql_buf[sql_len..][0..base_sql.len], base_sql);
+    sql_len += base_sql.len;
+
+    var conditions: std.ArrayList([]const u8) = .{};
+    defer conditions.deinit(db.allocator);
+
+    var allocated_clauses: std.ArrayList([]const u8) = .{};
+    defer {
+        for (allocated_clauses.items) |clause| {
+            db.allocator.free(clause);
+        }
+        allocated_clauses.deinit(db.allocator);
+    }
+
+    // Build WHERE conditions (same order as getEventsFiltered)
+    if (filter.chain != null) {
+        try conditions.append(db.allocator, "chain = ?");
+    }
+    if (filter.event_type != null) {
+        try conditions.append(db.allocator, "event_type = ?");
+    }
+    if (filter.event_types != null and filter.event_types.?.len > 0) {
+        var in_clause_buf: [256]u8 = undefined;
+        var in_len: usize = 0;
+        const prefix = "event_type IN (";
+        @memcpy(in_clause_buf[in_len..][0..prefix.len], prefix);
+        in_len += prefix.len;
+        for (filter.event_types.?, 0..) |_, i| {
+            if (i > 0) {
+                in_clause_buf[in_len] = ',';
+                in_len += 1;
+            }
+            in_clause_buf[in_len] = '?';
+            in_len += 1;
+        }
+        in_clause_buf[in_len] = ')';
+        in_len += 1;
+        const clause = try db.allocator.dupe(u8, in_clause_buf[0..in_len]);
+        try allocated_clauses.append(db.allocator, clause);
+        try conditions.append(db.allocator, clause);
+    }
+    if (filter.domain != null) {
+        try conditions.append(db.allocator, "name = ?");
+    }
+    if (filter.contract_address != null) {
+        try conditions.append(db.allocator, "contract_address = ?");
+    }
+    if (filter.contract_addresses != null and filter.contract_addresses.?.len > 0) {
+        var in_clause_buf: [512]u8 = undefined;
+        var in_len: usize = 0;
+        const prefix = "contract_address IN (";
+        @memcpy(in_clause_buf[in_len..][0..prefix.len], prefix);
+        in_len += prefix.len;
+        for (filter.contract_addresses.?, 0..) |_, i| {
+            if (i > 0) {
+                in_clause_buf[in_len] = ',';
+                in_len += 1;
+            }
+            in_clause_buf[in_len] = '?';
+            in_len += 1;
+        }
+        in_clause_buf[in_len] = ')';
+        in_len += 1;
+        const clause = try db.allocator.dupe(u8, in_clause_buf[0..in_len]);
+        try allocated_clauses.append(db.allocator, clause);
+        try conditions.append(db.allocator, clause);
+    }
+    if (filter.namehash != null) {
+        try conditions.append(db.allocator, "namehash = ?");
+    }
+    if (filter.block_number_gt != null) {
+        try conditions.append(db.allocator, "block_number > ?");
+    }
+    if (filter.block_number_lt != null) {
+        try conditions.append(db.allocator, "block_number < ?");
+    }
+    if (filter.timestamp_gt != null) {
+        try conditions.append(db.allocator, "timestamp > ?");
+    }
+    if (filter.timestamp_lt != null) {
+        try conditions.append(db.allocator, "timestamp < ?");
+    }
+    if (filter.data_json_owner != null) {
+        try conditions.append(db.allocator, "LOWER(json_extract(data, '$.owner')) = LOWER(?)");
+    }
+    if (filter.data_json_owners != null and filter.data_json_owners.?.len > 0) {
+        var in_clause_buf: [1024]u8 = undefined;
+        var in_len: usize = 0;
+        const prefix = "LOWER(json_extract(data, '$.owner')) IN (";
+        @memcpy(in_clause_buf[in_len..][0..prefix.len], prefix);
+        in_len += prefix.len;
+        for (filter.data_json_owners.?, 0..) |_, i| {
+            if (i > 0) {
+                in_clause_buf[in_len] = ',';
+                in_len += 1;
+            }
+            const placeholder = "LOWER(?)";
+            @memcpy(in_clause_buf[in_len..][0..placeholder.len], placeholder);
+            in_len += placeholder.len;
+        }
+        in_clause_buf[in_len] = ')';
+        in_len += 1;
+        const clause = try db.allocator.dupe(u8, in_clause_buf[0..in_len]);
+        try allocated_clauses.append(db.allocator, clause);
+        try conditions.append(db.allocator, clause);
+    }
+    if (filter.expiry_gt != null) {
+        try conditions.append(db.allocator, "json_extract(data, '$.expiration') > ?");
+    }
+    if (filter.expiry_gte != null) {
+        try conditions.append(db.allocator, "json_extract(data, '$.expiration') >= ?");
+    }
+    if (filter.expiry_lt != null) {
+        try conditions.append(db.allocator, "json_extract(data, '$.expiration') < ?");
+    }
+    if (filter.expiry_lte != null) {
+        try conditions.append(db.allocator, "json_extract(data, '$.expiration') <= ?");
+    }
+
+    if (conditions.items.len > 0) {
+        const where_sql = " WHERE ";
+        @memcpy(sql_buf[sql_len..][0..where_sql.len], where_sql);
+        sql_len += where_sql.len;
+
+        for (conditions.items, 0..) |cond, i| {
+            if (i > 0) {
+                const and_sql = " AND ";
+                @memcpy(sql_buf[sql_len..][0..and_sql.len], and_sql);
+                sql_len += and_sql.len;
+            }
+            @memcpy(sql_buf[sql_len..][0..cond.len], cond);
+            sql_len += cond.len;
+        }
+    }
+
+    var q = try Query.init(db, sql_buf[0..sql_len]);
     defer q.deinit();
+
+    // Bind parameters (same order as getEventsFiltered)
+    if (filter.chain) |ch| {
+        try q.bindTextStatic(ch.toString());
+    }
+    if (filter.event_type) |et| {
+        try q.bindText(et);
+    }
+    if (filter.event_types) |types| {
+        for (types) |t| {
+            try q.bindText(t);
+        }
+    }
+    if (filter.domain) |d| {
+        try q.bindText(d);
+    }
+    if (filter.contract_address) |ca| {
+        try q.bindText(ca);
+    }
+    if (filter.contract_addresses) |addrs| {
+        for (addrs) |addr| {
+            try q.bindText(addr);
+        }
+    }
+    if (filter.namehash) |nh| {
+        try q.bindText(nh);
+    }
+    if (filter.block_number_gt) |bn| {
+        try q.bindInt64(bn);
+    }
+    if (filter.block_number_lt) |bn| {
+        try q.bindInt64(bn);
+    }
+    if (filter.timestamp_gt) |ts| {
+        try q.bindInt64(ts);
+    }
+    if (filter.timestamp_lt) |ts| {
+        try q.bindInt64(ts);
+    }
+    if (filter.data_json_owner) |owner| {
+        try q.bindText(owner);
+    }
+    if (filter.data_json_owners) |owners| {
+        for (owners) |owner| {
+            try q.bindText(owner);
+        }
+    }
+    if (filter.expiry_gt) |exp| {
+        try q.bindInt64(exp);
+    }
+    if (filter.expiry_gte) |exp| {
+        try q.bindInt64(exp);
+    }
+    if (filter.expiry_lt) |exp| {
+        try q.bindInt64(exp);
+    }
+    if (filter.expiry_lte) |exp| {
+        try q.bindInt64(exp);
+    }
 
     if (try q.step()) {
         return @intCast(q.getInt64(0));

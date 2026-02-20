@@ -27,6 +27,7 @@ const transactions = @import("transactions.zig");
 const roles = @import("roles.zig");
 const ensip16 = @import("ensip16.zig");
 const registrations = @import("registrations.zig");
+pub const RegistrationFilterOptions = registrations.RegistrationFilterOptions;
 
 // Query abstraction module
 pub const query = @import("query.zig");
@@ -338,6 +339,7 @@ pub const Database = struct {
     pub const getSubdomains = names.getSubdomains;
     pub const updateRegistryPlaceholderName = names.updateRegistryPlaceholderName;
     pub const getTotalNameCount = names.getTotalNameCount;
+    pub const getFilteredNameCount = names.getFilteredNameCount;
 
     // Resolver module (11 functions)
     pub const storeResolverAddress = resolvers.storeResolverAddress;
@@ -384,6 +386,7 @@ pub const Database = struct {
     pub const getEventsByDomain = events.getEventsByDomain;
     pub const insertApproval = events.insertApproval;
     pub const getTotalEventCount = events.getTotalEventCount;
+    pub const getEventCount = events.getEventCount;
     pub const countEventsByNamehash = events.countEventsByNamehash;
     pub const countEventsByDomain = events.countEventsByDomain;
 
@@ -422,5 +425,6 @@ pub const Database = struct {
     // to avoid duplicates from non-authoritative contracts
     pub const RegistrationFilterOptions = registrations.RegistrationFilterOptions;
     pub const getRegistrations = registrations.getRegistrations;
+    pub const getRegistrationCount = registrations.getRegistrationCount;
     pub const getTotalRegistrationCount = registrations.getTotalRegistrationCount;
 };
