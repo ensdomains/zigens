@@ -904,7 +904,7 @@ pub const GraphQLHandler = struct {
         try writer.print("\"isMigrated\":{},", .{domain.migrated});
         try writer.print("\"createdAt\":{d},", .{domain.created_at});
         try writer.print("\"registrant\":{{\"id\":\"{s}\"}},", .{owner_hex});
-        try writer.print("\"registrationDate\":{d},", .{domain.created_at});
+        try writer.print("\"registrationDate\":{d},", .{domain.registered_at});
         if (builders.hasValidExpiry(domain.expiry)) {
             try writer.print("\"expiryDate\":{d},", .{domain.expiry});
         } else {
@@ -1343,7 +1343,7 @@ pub const GraphQLHandler = struct {
 
             if (requested_fields.contains("registrationDate")) {
                 if (!first) try writer.writeAll(",");
-                try writer.print("\"registrationDate\":{d}", .{item.created_at});
+                try writer.print("\"registrationDate\":{d}", .{item.registered_at});
                 first = false;
             }
 

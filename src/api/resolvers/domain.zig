@@ -239,11 +239,10 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
                 if (std.mem.eql(u8, sort_ctx_param.field, "name")) {
                     const cmp = std.mem.order(u8, a.name orelse "[unknown]", b.name orelse "[unknown]");
                     return if (sort_ctx_param.asc) cmp == .lt else cmp == .gt;
-                } else if (std.mem.eql(u8, sort_ctx_param.field, "createdAt") or
-                    std.mem.eql(u8, sort_ctx_param.field, "registrationDate"))
-                {
-                    // registrationDate is an alias for createdAt
+                } else if (std.mem.eql(u8, sort_ctx_param.field, "createdAt")) {
                     return if (sort_ctx_param.asc) a.created_at < b.created_at else a.created_at > b.created_at;
+                } else if (std.mem.eql(u8, sort_ctx_param.field, "registrationDate")) {
+                    return if (sort_ctx_param.asc) a.registered_at < b.registered_at else a.registered_at > b.registered_at;
                 } else if (std.mem.eql(u8, sort_ctx_param.field, "expiryDate")) {
                     // Sort by expiry timestamp
                     return if (sort_ctx_param.asc) a.expiry < b.expiry else a.expiry > b.expiry;

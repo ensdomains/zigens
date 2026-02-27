@@ -88,6 +88,8 @@ pub const Name = struct {
     created_block: u64,
     /// Timestamp when created
     created_at: i64,
+    /// Timestamp of the current registration (updates on re-registration)
+    registered_at: i64,
     /// Block number of last update
     updated_block: u64,
     /// Timestamp of last update
