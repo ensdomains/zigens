@@ -14,6 +14,15 @@ const loaders = common.loaders;
 const namehash = common.namehash_fn;
 const NestedContext = common.NestedContext;
 
+fn mapDomainOrderBy(order_by: ?[]const u8) db.NameSortField {
+    const field_name = order_by orelse return .created_at;
+    if (std.mem.eql(u8, field_name, "name")) return .name;
+    if (std.mem.eql(u8, field_name, "createdAt")) return .created_at;
+    if (std.mem.eql(u8, field_name, "expiryDate")) return .expiry;
+    if (std.mem.eql(u8, field_name, "registrationDate")) return .registered_at;
+    return .created_at;
+}
+
 pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
     const allocator = ctx.allocator;
@@ -189,6 +198,10 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
     // All filters pushed to DB - no need to over-fetch
     const fetch_limit: u32 = @intCast(first);
 
+    // Map GraphQL orderBy to SQL sort field
+    const sort_field = mapDomainOrderBy(order_by);
+    const order_dir: db.OrderDir = if (std.mem.eql(u8, order_direction, "desc")) .desc else .asc;
+
     // Use filtered query with all filters pushed to DB
     const names = if (has_filters)
         try database.getFilteredNames(.{
@@ -207,9 +220,9 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
             .has_subdomains = filter_has_subdomains,
             .subdomain_count_gt = filter_subdomain_count_gt,
             .subdomain_count_lt = filter_subdomain_count_lt,
-        }, @intCast(skip), fetch_limit, .desc)
+        }, @intCast(skip), fetch_limit, order_dir, sort_field)
     else
-        try database.getAllNames(null, @intCast(skip), fetch_limit);
+        try database.getAllNamesWithOrder(null, @intCast(skip), fetch_limit, order_dir, sort_field);
     defer {
         for (names) |*name| {
             name.deinit(allocator);
@@ -217,51 +230,12 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
         allocator.free(names);
     }
 
-    // All filtering is now done at DB level
-    // Collect pointers for sorting
-    var filtered_names: std.ArrayList(*models.Name) = .{};
-    defer filtered_names.deinit(allocator);
-    for (names) |*name| {
-        try filtered_names.append(allocator, name);
-    }
-
-    // Sort filtered names if orderBy is specified
-    if (order_by) |field_name| {
-        const ascending = std.mem.eql(u8, order_direction, "asc");
-        const SortContext = struct {
-            field: []const u8,
-            asc: bool,
-        };
-        const sort_ctx = SortContext{ .field = field_name, .asc = ascending };
-
-        std.mem.sort(*models.Name, filtered_names.items, sort_ctx, struct {
-            fn lessThan(sort_ctx_param: SortContext, a: *models.Name, b: *models.Name) bool {
-                if (std.mem.eql(u8, sort_ctx_param.field, "name")) {
-                    const cmp = std.mem.order(u8, a.name orelse "[unknown]", b.name orelse "[unknown]");
-                    return if (sort_ctx_param.asc) cmp == .lt else cmp == .gt;
-                } else if (std.mem.eql(u8, sort_ctx_param.field, "createdAt")) {
-                    return if (sort_ctx_param.asc) a.created_at < b.created_at else a.created_at > b.created_at;
-                } else if (std.mem.eql(u8, sort_ctx_param.field, "registrationDate")) {
-                    return if (sort_ctx_param.asc) a.registered_at < b.registered_at else a.registered_at > b.registered_at;
-                } else if (std.mem.eql(u8, sort_ctx_param.field, "expiryDate")) {
-                    // Sort by expiry timestamp
-                    return if (sort_ctx_param.asc) a.expiry < b.expiry else a.expiry > b.expiry;
-                } else if (std.mem.eql(u8, sort_ctx_param.field, "id")) {
-                    const cmp = std.mem.order(u8, &a.namehash.bytes, &b.namehash.bytes);
-                    return if (sort_ctx_param.asc) cmp == .lt else cmp == .gt;
-                }
-                // Default: no sorting
-                return false;
-            }
-        }.lessThan);
-    }
-
-    // Build JSON from sorted/filtered names
+    // Build JSON from DB-sorted names
     var json: std.ArrayList(u8) = .{};
     defer json.deinit(allocator);
 
     try json.appendSlice(allocator, "[");
-    const items_to_return = @min(first, filtered_names.items.len);
+    const items_to_return = @min(first, names.len);
 
     // Pre-load resolver data for all domains to enable batching (solves N+1 query problem)
     // Check if resolver fields that need data loading are requested
@@ -294,12 +268,12 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
         // Collect namehashes for items that will be returned
         if (needs_resolver_addr or needs_content_hash or needs_text_records or needs_resolved_address) {
             const loader_ctx: *dataloader_mod.LoaderContext = @ptrCast(@alignCast(ctx.loaders.?));
-            const return_items = filtered_names.items[0..@as(usize, @intCast(items_to_return))];
+            const return_items = names[0..@as(usize, @intCast(items_to_return))];
 
             var namehashes = try allocator.alloc([32]u8, return_items.len);
             defer allocator.free(namehashes);
 
-            for (return_items, 0..) |name, idx| {
+            for (return_items, 0..) |*name, idx| {
                 namehashes[idx] = name.namehash.bytes;
             }
 
@@ -326,7 +300,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
         }
     }
 
-    for (filtered_names.items[0..@as(usize, @intCast(items_to_return))], 0..) |name, i| {
+    for (names[0..@as(usize, @intCast(items_to_return))], 0..) |*name, i| {
         if (i > 0) try json.appendSlice(allocator, ",");
 
         const name_json = try builders.buildDomainJson(name, field.selections, .{
@@ -500,15 +474,35 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         }
     }
 
+    // Parse orderBy and orderDirection for connection
+    var order_by: ?[]const u8 = null;
+    var order_direction: ?[]const u8 = null;
+    for (field.arguments) |arg| {
+        if (std.mem.eql(u8, arg.name, "orderBy")) {
+            if (arg.value == .string) order_by = arg.value.string;
+        } else if (std.mem.eql(u8, arg.name, "orderDirection")) {
+            if (arg.value == .string) order_direction = arg.value.string;
+        }
+    }
+    const sort_field = mapDomainOrderBy(order_by);
+
+    // Default order: desc (newest first) when no orderDirection specified, matching original behavior
+    const order_dir_str = order_direction orelse "desc";
+
     // Fetch one extra item to determine hasNextPage/hasPreviousPage
     const fetch_limit = params.limit + 1;
 
-    // For backward pagination (last/before), reverse the query order
-    const order_dir: db.OrderDir = if (params.direction == .backward) .asc else .desc;
-    const names = if (has_filters)
-        try database.getFilteredNames(name_filters, 0, @intCast(fetch_limit), order_dir)
+    // Combine pagination direction with user-requested order
+    const base_dir: db.OrderDir = if (std.mem.eql(u8, order_dir_str, "desc")) .desc else .asc;
+    const order_dir: db.OrderDir = if (params.direction == .backward)
+        (if (base_dir == .desc) .asc else .desc)
     else
-        try database.getAllNamesWithOrder(null, 0, @intCast(fetch_limit), order_dir);
+        base_dir;
+
+    const names = if (has_filters)
+        try database.getFilteredNames(name_filters, 0, @intCast(fetch_limit), order_dir, sort_field)
+    else
+        try database.getAllNamesWithOrder(null, 0, @intCast(fetch_limit), order_dir, sort_field);
     defer {
         for (names) |*name| {
             name.deinit(allocator);

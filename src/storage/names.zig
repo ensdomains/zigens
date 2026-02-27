@@ -636,6 +636,23 @@ pub const OrderDir = enum {
     desc,
 };
 
+/// Sort field for name queries
+pub const NameSortField = enum {
+    created_at,
+    name,
+    expiry,
+    registered_at,
+
+    pub fn toSql(self: NameSortField) []const u8 {
+        return switch (self) {
+            .created_at => "created_at",
+            .name => "name",
+            .expiry => "expiry",
+            .registered_at => "registered_at",
+        };
+    }
+};
+
 /// Parse name rows from a query result
 fn parseNameRows(q: *Query, allocator: std.mem.Allocator) ![]models.Name {
     var names: std.ArrayList(models.Name) = .{};
@@ -701,7 +718,7 @@ fn parseNameRows(q: *Query, allocator: std.mem.Allocator) ![]models.Name {
 }
 
 pub fn getAllNames(db: *Database, owner: ?Address, skip: u32, limit: u32) ![]models.Name {
-    return getAllNamesWithOrder(db, owner, skip, limit, .desc);
+    return getAllNamesWithOrder(db, owner, skip, limit, .desc, .created_at);
 }
 
 /// Filter options for querying names
@@ -729,7 +746,7 @@ pub const NameFilters = struct {
 };
 
 /// Get names with filters pushed down to DB query
-pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u32, order_dir: OrderDir) ![]models.Name {
+pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u32, order_dir: OrderDir, sort_field: NameSortField) ![]models.Name {
     const order_str = if (order_dir == .desc) "DESC" else "ASC";
 
     // Build WHERE clause dynamically using ArrayList for conditions
@@ -832,8 +849,8 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
         \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, chain,
         \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated, ejected,
         \\       created_at, registered_at, created_block, updated_at, updated_block
-        \\FROM names {s}ORDER BY created_at {s} LIMIT ? OFFSET ?
-    , .{ where_clause.items, order_str });
+        \\FROM names {s}ORDER BY {s} {s} LIMIT ? OFFSET ?
+    , .{ where_clause.items, sort_field.toSql(), order_str });
     defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
@@ -892,22 +909,22 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
 }
 
 /// Get all names with configurable order direction
-pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u32, order_dir: OrderDir) ![]models.Name {
+pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u32, order_dir: OrderDir, sort_field: NameSortField) ![]models.Name {
     const order_str = if (order_dir == .desc) "DESC" else "ASC";
     const sql = if (owner != null)
         try std.fmt.allocPrint(db.allocator,
             \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, chain,
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated, ejected,
             \\       created_at, registered_at, created_block, updated_at, updated_block
-            \\FROM names WHERE owner = ? ORDER BY created_at {s} LIMIT ? OFFSET ?
-        , .{order_str})
+            \\FROM names WHERE owner = ? ORDER BY {s} {s} LIMIT ? OFFSET ?
+        , .{ sort_field.toSql(), order_str })
     else
         try std.fmt.allocPrint(db.allocator,
             \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, chain,
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated, ejected,
             \\       created_at, registered_at, created_block, updated_at, updated_block
-            \\FROM names ORDER BY created_at {s} LIMIT ? OFFSET ?
-        , .{order_str});
+            \\FROM names ORDER BY {s} {s} LIMIT ? OFFSET ?
+        , .{ sort_field.toSql(), order_str });
     defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
