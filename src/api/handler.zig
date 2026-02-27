@@ -95,9 +95,17 @@ pub const GraphQLHandler = struct {
             return try self.handleTypeIntrospectionQuery(query);
         }
 
+        // Per-request arena allocator: all short-lived request allocations (parsing,
+        // execution, dataloaders, resolver intermediates) go here instead of the GPA.
+        // Backed by page_allocator so pages return directly to the OS when the
+        // request completes, eliminating GPA fragmentation from thread-per-connection.
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const request_alloc = arena.allocator();
+
         // Create request-scoped DataLoader context for batching and caching
         const dataloader_mod = @import("loaders.zig");
-        var loader_context = try dataloader_mod.LoaderContext.init(self.allocator, self.database);
+        var loader_context = try dataloader_mod.LoaderContext.init(request_alloc, self.database);
         defer loader_context.deinit();
 
         // Create a per-request executor copy to avoid race conditions when
@@ -105,25 +113,28 @@ pub const GraphQLHandler = struct {
         // resolvers map is read-only and safe to share; per-request state
         // (fragments, variables, loaders) lives on this stack copy.
         var request_executor = self.executor;
+        request_executor.allocator = request_alloc;
+        request_executor.context.allocator = request_alloc;
         request_executor.context.loaders = @ptrCast(loader_context);
 
-        // Parse the query using the new parser
-        var document = parser.parseQuery(self.allocator, query) catch |err| {
+        // Parse the query using the arena allocator
+        var document = parser.parseQuery(request_alloc, query) catch |err| {
             std.log.err("Failed to parse GraphQL query: {}", .{err});
             self.metrics.recordError();
             return try self.buildErrorResponseWithCode("Invalid GraphQL syntax", ErrorCode.SYNTAX_ERROR);
         };
-        defer document.deinit(self.allocator);
+        defer document.deinit(request_alloc);
 
         // Analyze query complexity to prevent DoS attacks
         const limits = complexity.ComplexityLimits{
             .max_depth = self.complexity_max_depth,
             .max_cost = self.complexity_max_cost,
         };
-        var analyzer = complexity.ComplexityAnalyzer.init(self.allocator, limits);
+        var analyzer = complexity.ComplexityAnalyzer.init(request_alloc, limits);
         const analysis = try analyzer.analyzeDocument(&document);
 
         if (!analysis.isValid()) {
+            // Error message allocated on GPA since it's returned to the caller
             const error_msg = try analysis.errorMessage(self.allocator);
             defer self.allocator.free(error_msg);
             std.log.warn("Query complexity violation: {s}", .{error_msg});
@@ -133,7 +144,7 @@ pub const GraphQLHandler = struct {
 
         std.log.debug("Query complexity: depth={d}, cost={d}", .{ analysis.depth, analysis.cost });
 
-        // Execute the parsed query with the per-request executor
+        // Execute the parsed query with the per-request executor (arena-backed)
         const result = request_executor.executeDocument(&document, variables, operation_name) catch |err| {
             std.log.err("Failed to execute GraphQL query: {}", .{err});
             self.metrics.recordError();
@@ -157,7 +168,8 @@ pub const GraphQLHandler = struct {
         const avg_batch = stats.resolver_address.avgBatchSize();
         std.log.debug("DataLoader stats - Resolver addresses: {d} cached, {d} hits, {d} misses, hit rate: {d:.2}%, {d} batches, avg batch size: {d:.2}", .{ stats.resolver_address.entries, stats.resolver_address.cache_hits, stats.resolver_address.cache_misses, hit_rate * 100, stats.resolver_address.batch_loads, avg_batch });
 
-        return result;
+        // Dupe result from arena to GPA for the caller (arena is freed on return)
+        return try self.allocator.dupe(u8, result);
     }
 
     fn handleMultiFieldQuery(self: *GraphQLHandler, query: []const u8) ![]u8 {

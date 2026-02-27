@@ -3462,8 +3462,9 @@ pub const Indexer = struct {
             new_bitmap_hex,
         });
 
-        // Try to look up name for this resource (tokenId)
-        const maybe_name = try self.database.getNameByTokenId(resource_uint);
+        // Try to look up name for this resource (canonical_id, not tokenId)
+        // EAC resource is the canonical_id (version=0), not the full token_id
+        const maybe_name = try self.database.getNameByCanonicalId(resource_uint);
         var name_str_opt: ?[]const u8 = null;
         var namehash_opt: ?Hash = null;
 

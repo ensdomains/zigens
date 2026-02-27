@@ -1493,7 +1493,12 @@ pub const Executor = struct {
 
         // Resolve arguments (replace variable references with actual values)
         const resolved_args = try self.resolveFieldArguments(field);
-        defer self.allocator.free(resolved_args);
+        defer {
+            for (resolved_args) |arg| {
+                self.freeResolvedValue(arg.value);
+            }
+            self.allocator.free(resolved_args);
+        }
 
         // Create a field with resolved arguments
         var resolved_field = field.*;
