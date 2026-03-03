@@ -434,6 +434,9 @@ pub const Indexer = struct {
         .{ .event_hash = abi.EventSignatures.pubkey_changed_hash, .handler = handlePubkeyChanged, .name = "PubkeyChanged" },
         .{ .event_hash = abi.EventSignatures.name_changed_hash, .handler = handleNameChanged, .name = "NameChanged" },
         .{ .event_hash = abi.EventSignatures.interface_changed_hash, .handler = handleInterfaceChanged, .name = "InterfaceChanged" },
+        .{ .event_hash = abi.EventSignatures.version_changed_hash, .handler = handleVersionChanged, .name = "VersionChanged" },
+        .{ .event_hash = abi.EventSignatures.alias_changed_hash, .handler = handleAliasChanged, .name = "AliasChanged" },
+        .{ .event_hash = abi.EventSignatures.eac_roles_changed_hash, .handler = handleResolverEACRolesChanged, .name = "EACRolesChanged" },
     };
 
     // ========================================================================
@@ -1165,13 +1168,15 @@ pub const Indexer = struct {
         const total_blocks = target_block - last_synced;
         std.log.info("Indexing {s} from block {d} to {d} ({d} blocks)", .{ chain.toString(), last_synced + 1, target_block, total_blocks });
 
-        // Index in batches with memory management
-        const batch_size = self.config.batch_size;
+        // Index in batches with adaptive batch sizing
+        // Starts at configured size, halves on RPC response size errors, grows back on success
+        var current_batch_size = self.config.batch_size;
+        const ABSOLUTE_MIN_BATCH: u64 = 100;
         var from_block = last_synced + 1;
         var blocks_indexed: u64 = 0;
 
         while (from_block <= target_block and !self.should_stop.load(.acquire)) {
-            const to_block = @min(from_block + batch_size - 1, target_block);
+            const to_block = @min(from_block + current_batch_size - 1, target_block);
             const batch_blocks = to_block - from_block + 1;
 
             // Rate limit RPC calls to avoid hitting provider limits
@@ -1179,12 +1184,28 @@ pub const Indexer = struct {
 
             // Use transaction for batch atomicity
             try self.database.beginTransaction();
-            errdefer self.database.rollbackTransaction();
 
-            try self.indexBlockRange(chain, client, from_block, to_block);
+            // Try indexing - on RPC response size errors, rollback, halve batch, retry
+            self.indexBlockRange(chain, client, from_block, to_block) catch |err| {
+                self.database.rollbackTransaction();
+
+                if ((err == error.RpcError or err == error.StdoutStreamTooLong) and current_batch_size > ABSOLUTE_MIN_BATCH) {
+                    current_batch_size = @max(ABSOLUTE_MIN_BATCH, current_batch_size / 2);
+                    std.log.warn("RPC response too large for blocks {d}-{d}! Reducing batch size to {d} blocks and retrying", .{ from_block, to_block, current_batch_size });
+                    continue; // Retry same from_block with smaller batch
+                }
+
+                return err;
+            };
 
             // Commit transaction FIRST, then update sync state
             try self.database.commitTransaction();
+
+            // After successful batch, gradually grow batch size back toward configured maximum
+            if (current_batch_size < self.config.batch_size) {
+                current_batch_size = @min(self.config.batch_size, current_batch_size + current_batch_size / 4);
+                std.log.info("Growing batch size to {d} blocks", .{current_batch_size});
+            }
 
             blocks_indexed += batch_blocks;
             const progress = (@as(f64, @floatFromInt(blocks_indexed)) / @as(f64, @floatFromInt(total_blocks))) * 100.0;
@@ -3454,6 +3475,7 @@ pub const Indexer = struct {
                 log.block_number,
                 log.transaction_hash,
                 log.log_index,
+                log.address,
             );
             std.log.debug("  → Stored EAC role assignment", .{});
         }
@@ -3979,6 +4001,19 @@ pub const Indexer = struct {
         const resolver_hex = try resolver.toHex(self.allocator);
         defer self.allocator.free(resolver_hex);
 
+        // Store ABI record in database
+        self.database.storeResolverABI(
+            namehash,
+            resolver,
+            @truncate(content_type),
+            chain,
+            log.block_number,
+            log.transaction_hash,
+            self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        ) catch |err| {
+            std.log.warn("Failed to store resolver ABI: {}", .{err});
+        };
+
         const event_data = try std.fmt.allocPrint(self.allocator, "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"contentType\":{d}}}", .{
             nh_hex,
             resolver_hex,
@@ -4039,6 +4074,20 @@ pub const Indexer = struct {
         defer self.allocator.free(x_hex);
         const y_hex = try y.toHex(self.allocator);
         defer self.allocator.free(y_hex);
+
+        // Store pubkey record in database
+        self.database.storeResolverPubkey(
+            namehash,
+            resolver,
+            x_hex,
+            y_hex,
+            chain,
+            log.block_number,
+            log.transaction_hash,
+            self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        ) catch |err| {
+            std.log.warn("Failed to store resolver pubkey: {}", .{err});
+        };
 
         const event_data = try std.fmt.allocPrint(self.allocator, "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"x\":\"{s}\",\"y\":\"{s}\"}}", .{
             nh_hex,
@@ -4101,6 +4150,19 @@ pub const Indexer = struct {
         const escaped_name = try json_utils.escapeString(self.allocator, name);
         defer self.allocator.free(escaped_name);
 
+        // Store name record in database (reverse resolution)
+        self.database.storeResolverName(
+            namehash,
+            resolver,
+            name,
+            chain,
+            log.block_number,
+            log.transaction_hash,
+            self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        ) catch |err| {
+            std.log.warn("Failed to store resolver name: {}", .{err});
+        };
+
         const event_data = try std.fmt.allocPrint(self.allocator, "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"name\":\"{s}\"}}", .{
             nh_hex,
             resolver_hex,
@@ -4135,8 +4197,8 @@ pub const Indexer = struct {
         // topics[2] = indexed interfaceID (bytes4 padded to bytes32)
         const namehash = log.topics[1];
 
-        // Interface ID is a bytes4, stored in the last 4 bytes of the topic
-        const interface_id_bytes = log.topics[2].bytes[28..32];
+        // Interface ID is a bytes4, left-aligned (right-padded) in the 32-byte topic
+        const interface_id_bytes = log.topics[2].bytes[0..4];
 
         // Decode implementer address from data
         const implementer = try abi.ABI.decodeAddress(log.data, 0);
@@ -4166,6 +4228,20 @@ pub const Indexer = struct {
         const implementer_hex = try implementer.toHex(self.allocator);
         defer self.allocator.free(implementer_hex);
 
+        // Store interface record in database
+        self.database.storeResolverInterface(
+            namehash,
+            resolver,
+            interface_id_hex,
+            implementer_hex,
+            chain,
+            log.block_number,
+            log.transaction_hash,
+            self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        ) catch |err| {
+            std.log.warn("Failed to store resolver interface: {}", .{err});
+        };
+
         const event_data = try std.fmt.allocPrint(self.allocator, "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"interfaceID\":\"{s}\",\"implementer\":\"{s}\"}}", .{
             nh_hex,
             resolver_hex,
@@ -4191,6 +4267,253 @@ pub const Indexer = struct {
         };
 
         try self.insertEventAndNotify(event);
+    }
+
+    /// Handle VersionChanged event (OwnedResolver)
+    /// VersionChanged(bytes32 indexed node, uint64 newVersion)
+    /// Clears all resolver records for the given namehash
+    fn handleVersionChanged(self: *Indexer, chain: models.Chain, resolver: Address, log: rpc.Log) !void {
+        // topics[0] = event signature
+        // topics[1] = indexed node (namehash)
+        // data = newVersion (uint64, padded to 32 bytes)
+        const namehash = log.topics[1];
+
+        // Decode newVersion from data (uint64 encoded as uint256)
+        var new_version: u64 = 0;
+        if (log.data.len >= 32) {
+            const version_u256 = abi.ABI.decodeUint256(log.data, 0) catch 0;
+            new_version = @truncate(version_u256);
+        }
+
+        const nh_hex_log = try namehash.toHex(self.allocator);
+        defer self.allocator.free(nh_hex_log);
+        std.log.debug("VersionChanged: namehash={s} newVersion={d}", .{
+            nh_hex_log,
+            new_version,
+        });
+
+        // Clear all resolver records for this namehash
+        self.database.deleteResolverAddresses(namehash) catch |err| {
+            std.log.warn("Failed to delete resolver addresses: {}", .{err});
+        };
+        self.database.deleteResolverContentHash(namehash) catch |err| {
+            std.log.warn("Failed to delete resolver contenthash: {}", .{err});
+        };
+        self.database.deleteResolverTexts(namehash) catch |err| {
+            std.log.warn("Failed to delete resolver texts: {}", .{err});
+        };
+        // Note: aliases are NOT versioned — they live in _storage().aliases, not _record(node).
+        // So VersionChanged does NOT clear aliases.
+        self.database.deleteResolverPubkeys(namehash) catch |err| {
+            std.log.warn("Failed to delete resolver pubkeys: {}", .{err});
+        };
+        self.database.deleteResolverAbis(namehash) catch |err| {
+            std.log.warn("Failed to delete resolver ABIs: {}", .{err});
+        };
+        self.database.deleteResolverNames(namehash) catch |err| {
+            std.log.warn("Failed to delete resolver names: {}", .{err});
+        };
+        self.database.deleteResolverInterfaces(namehash) catch |err| {
+            std.log.warn("Failed to delete resolver interfaces: {}", .{err});
+        };
+
+        // Store the new version
+        self.database.storeResolverVersion(
+            namehash,
+            resolver,
+            new_version,
+            chain,
+            log.block_number,
+            log.transaction_hash,
+            self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        ) catch |err| {
+            std.log.warn("Failed to store resolver version: {}", .{err});
+        };
+
+        // Store event and trigger webhooks
+        const nh_hex = try namehash.toHex(self.allocator);
+        defer self.allocator.free(nh_hex);
+        const resolver_hex = try resolver.toHex(self.allocator);
+        defer self.allocator.free(resolver_hex);
+
+        const event_data = try std.fmt.allocPrint(self.allocator, "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"newVersion\":{d}}}", .{
+            nh_hex,
+            resolver_hex,
+            new_version,
+        });
+
+        const domain_name = self.getNameFromNamehash(namehash);
+
+        const event = models.Event{
+            .event_type = .version_changed,
+            .chain = chain,
+            .block_number = log.block_number,
+            .tx_hash = log.transaction_hash,
+            .log_index = log.log_index,
+            .contract_address = log.address,
+            .name = domain_name,
+            .namehash = namehash,
+            .data = event_data,
+            .timestamp = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        };
+
+        try self.insertEventAndNotify(event);
+    }
+
+    /// Handle AliasChanged event (OwnedResolver)
+    /// AliasChanged(bytes indexed indexedFromName, bytes indexed indexedToName, bytes fromName, bytes toName)
+    fn handleAliasChanged(self: *Indexer, chain: models.Chain, resolver: Address, log: rpc.Log) !void {
+        // topics[0] = event signature
+        // topics[1] = keccak256(fromName) — indexed bytes are hashed, not directly useful
+        // topics[2] = keccak256(toName) — indexed bytes are hashed, not directly useful
+        // data = ABI-encoded (bytes fromName, bytes toName)
+
+        // Decode fromName (first dynamic bytes in data)
+        const from_dns_bytes = abi.ABI.decodeBytes(self.allocator, log.data, 0) catch |err| {
+            std.log.warn("AliasChanged: failed to decode fromName bytes: {}", .{err});
+            return;
+        };
+        defer self.allocator.free(from_dns_bytes);
+
+        // Decode toName (second dynamic bytes in data)
+        const to_dns_bytes = abi.ABI.decodeBytes(self.allocator, log.data, 32) catch |err| {
+            std.log.warn("AliasChanged: failed to decode toName bytes: {}", .{err});
+            return;
+        };
+        defer self.allocator.free(to_dns_bytes);
+
+        // Decode DNS wire format to human-readable names
+        const from_name = decodeDnsWireFormat(self.allocator, from_dns_bytes) catch |err| {
+            std.log.warn("AliasChanged: failed to decode fromName DNS wire format: {}", .{err});
+            return;
+        };
+        defer self.allocator.free(from_name);
+
+        const resolver_hex_log = try resolver.toHex(self.allocator);
+        defer self.allocator.free(resolver_hex_log);
+
+        // If toName is empty, the alias was removed
+        if (to_dns_bytes.len == 0 or (to_dns_bytes.len == 1 and to_dns_bytes[0] == 0)) {
+            std.log.debug("AliasChanged: resolver={s} removed alias for {s}", .{
+                resolver_hex_log,
+                from_name,
+            });
+
+            self.database.deleteResolverAlias(resolver, from_name) catch |err| {
+                std.log.warn("Failed to delete resolver alias: {}", .{err});
+            };
+        } else {
+            const to_name = decodeDnsWireFormat(self.allocator, to_dns_bytes) catch |err| {
+                std.log.warn("AliasChanged: failed to decode toName DNS wire format: {}", .{err});
+                return;
+            };
+            defer self.allocator.free(to_name);
+
+            std.log.debug("AliasChanged: resolver={s} alias {s} -> {s}", .{
+                resolver_hex_log,
+                from_name,
+                to_name,
+            });
+
+            // Store in database
+            self.database.storeResolverAlias(
+                resolver,
+                from_name,
+                to_name,
+                chain,
+                log.block_number,
+                log.transaction_hash,
+                self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+            ) catch |err| {
+                std.log.warn("Failed to store resolver alias: {}", .{err});
+            };
+        }
+
+        // Store event and trigger webhooks
+        const resolver_hex = try resolver.toHex(self.allocator);
+        defer self.allocator.free(resolver_hex);
+
+        const escaped_from = try json_utils.escapeString(self.allocator, from_name);
+        defer self.allocator.free(escaped_from);
+
+        // For event data, include raw toName even if empty
+        const to_name_for_event = decodeDnsWireFormat(self.allocator, to_dns_bytes) catch
+            try self.allocator.dupe(u8, "");
+        defer self.allocator.free(to_name_for_event);
+
+        const escaped_to = try json_utils.escapeString(self.allocator, to_name_for_event);
+        defer self.allocator.free(escaped_to);
+
+        const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"fromName\":\"{s}\",\"toName\":\"{s}\"}}", .{
+            resolver_hex,
+            escaped_from,
+            escaped_to,
+        });
+
+        const event = models.Event{
+            .event_type = .alias_changed,
+            .chain = chain,
+            .block_number = log.block_number,
+            .tx_hash = log.transaction_hash,
+            .log_index = log.log_index,
+            .contract_address = log.address,
+            .name = null,
+            .namehash = null,
+            .data = event_data,
+            .timestamp = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        };
+
+        try self.insertEventAndNotify(event);
+    }
+
+    /// Wrapper for EACRolesChanged from resolver contracts
+    /// Adapts ResolverEventConfig signature to call the existing RegistryEventConfig handler
+    fn handleResolverEACRolesChanged(self: *Indexer, chain: models.Chain, _resolver: Address, log: rpc.Log) !void {
+        _ = _resolver;
+        try handleEACRolesChanged(self, chain, log);
+    }
+
+    /// Decode DNS wire format to human-readable domain name
+    /// e.g., \x03eth\x00 → "eth", \x05alice\x03eth\x00 → "alice.eth"
+    fn decodeDnsWireFormat(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+        if (data.len == 0) return error.EmptyDnsData;
+
+        var parts: std.ArrayList([]const u8) = .{};
+        defer parts.deinit(allocator);
+
+        var pos: usize = 0;
+        while (pos < data.len) {
+            const label_len = data[pos];
+            if (label_len == 0) break; // Root label terminator
+
+            pos += 1;
+            if (pos + label_len > data.len) return error.InvalidDnsWireFormat;
+
+            try parts.append(allocator, data[pos .. pos + label_len]);
+            pos += label_len;
+        }
+
+        if (parts.items.len == 0) return error.EmptyDnsName;
+
+        // Calculate total length: sum of labels + dots between them
+        var total_len: usize = 0;
+        for (parts.items) |part| {
+            total_len += part.len;
+        }
+        total_len += parts.items.len - 1; // dots
+
+        var result = try allocator.alloc(u8, total_len);
+        var offset: usize = 0;
+        for (parts.items, 0..) |part, i| {
+            @memcpy(result[offset .. offset + part.len], part);
+            offset += part.len;
+            if (i < parts.items.len - 1) {
+                result[offset] = '.';
+                offset += 1;
+            }
+        }
+
+        return result;
     }
 
     /// Handle NameEjectedToL1 event

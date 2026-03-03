@@ -356,6 +356,36 @@ pub const Database = struct {
     pub const getResolverTextByResolver = resolvers.getResolverTextByResolver;
     pub const getResolversToIndex = resolvers.getResolversToIndex;
     pub const getResolversByOwner = resolvers.getResolversByOwner;
+    pub const deleteResolverAddresses = resolvers.deleteResolverAddresses;
+    pub const deleteResolverContentHash = resolvers.deleteResolverContentHash;
+    pub const deleteResolverTexts = resolvers.deleteResolverTexts;
+    pub const deleteResolverAlias = resolvers.deleteResolverAlias;
+    pub const deleteResolverPubkeys = resolvers.deleteResolverPubkeys;
+    pub const deleteResolverAbis = resolvers.deleteResolverAbis;
+    pub const deleteResolverNames = resolvers.deleteResolverNames;
+    pub const deleteResolverInterfaces = resolvers.deleteResolverInterfaces;
+    pub const storeResolverAlias = resolvers.storeResolverAlias;
+    pub const AliasRecord = resolvers.AliasRecord;
+    pub const getResolverAliases = resolvers.getResolverAliases;
+    pub const storeResolverPubkey = resolvers.storeResolverPubkey;
+    pub const storeResolverABI = resolvers.storeResolverABI;
+    pub const storeResolverName = resolvers.storeResolverName;
+    pub const storeResolverInterface = resolvers.storeResolverInterface;
+    pub const storeResolverVersion = resolvers.storeResolverVersion;
+    pub const PubkeyRecord = resolvers.PubkeyRecord;
+    pub const getResolverPubkey = resolvers.getResolverPubkey;
+    pub const getResolverAbiContentTypes = resolvers.getResolverAbiContentTypes;
+    pub const getResolverReverseName = resolvers.getResolverReverseName;
+    pub const InterfaceRecord = resolvers.InterfaceRecord;
+    pub const getResolverInterfaces = resolvers.getResolverInterfaces;
+    pub const getResolverVersion = resolvers.getResolverVersion;
+    pub const getResolverNodeCount = resolvers.getResolverNodeCount;
+    pub const getResolverAliasCount = resolvers.getResolverAliasCount;
+    pub const getResolverRoleHolderCount = resolvers.getResolverRoleHolderCount;
+    pub const getResolverRoles = resolvers.getResolverRoles;
+
+    // Names module - resolver query
+    pub const getNamesByResolver = names.getNamesByResolver;
 
     // Sync module (14 functions)
     pub const getSyncState = sync.getSyncState;

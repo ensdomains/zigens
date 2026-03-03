@@ -11,17 +11,18 @@ const Hash = @import("../types/hash.zig").Hash;
 // ============================================================================
 
 /// Insert or update EAC role assignment
-pub fn upsertEACRole(db: *Database, chain: models.Chain, resource: []const u8, account: Address, role_bitmap: []const u8, block_number: u64, tx_hash: Hash, log_index: u32) !void {
+pub fn upsertEACRole(db: *Database, chain: models.Chain, resource: []const u8, account: Address, role_bitmap: []const u8, block_number: u64, tx_hash: Hash, log_index: u32, contract_address: Address) !void {
     const sql =
         \\INSERT INTO eac_roles
-        \\(chain, resource, account, role_bitmap, block_number, transaction_hash, log_index, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        \\(chain, resource, account, role_bitmap, block_number, transaction_hash, log_index, timestamp, contract_address)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         \\ON CONFLICT(chain, resource, account) DO UPDATE SET
         \\  role_bitmap = excluded.role_bitmap,
         \\  block_number = excluded.block_number,
         \\  transaction_hash = excluded.transaction_hash,
         \\  log_index = excluded.log_index,
-        \\  timestamp = excluded.timestamp
+        \\  timestamp = excluded.timestamp,
+        \\  contract_address = excluded.contract_address
     ;
 
     var q = try Query.init(db, sql);
@@ -35,6 +36,7 @@ pub fn upsertEACRole(db: *Database, chain: models.Chain, resource: []const u8, a
     try q.bindHash(tx_hash);
     try q.bindInt(@intCast(log_index));
     try q.bindInt64(@intCast(std.time.timestamp()));
+    try q.bindAddress(contract_address);
 
     try q.exec();
 }
