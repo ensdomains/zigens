@@ -2302,19 +2302,22 @@ pub const Indexer = struct {
 
     fn handleResolverUpdate(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
         // Event: ResolverUpdate(uint256 indexed id, address resolver)
-        // Note: The 'id' in ResolverUpdate is the canonical_id (version=0), not the full token_id
+        // Note: The 'id' in ResolverUpdate is the current token_id (including version bits),
+        // NOT the canonical_id. We must strip version bits to look up the name.
         if (log.topics.len < 2) return error.InvalidTopicCount;
 
         // topics[0] = event signature
-        // topics[1] = indexed id (canonical ID - note: this is NOT the full token_id)
-        const canonical_id = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
+        // topics[1] = indexed id (this is the full token_id, including version bits)
+        const token_id = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
+        const token_id_utils_local = @import("../types/token_id.zig");
+        const canonical_id = token_id_utils_local.getCanonicalId(token_id);
 
         // data = resolver address
         const resolver_addr = try abi.ABI.decodeAddress(log.data, 0);
 
-        std.log.debug("ResolverUpdate: canonicalId={d}, resolver={any}, contract={any}", .{ canonical_id, resolver_addr, log.address });
+        std.log.debug("ResolverUpdate: tokenId={d}, canonicalId={d}, resolver={any}, contract={any}", .{ token_id, canonical_id, resolver_addr, log.address });
 
-        // Look up the name by canonical ID (not token_id, since events use canonical_id)
+        // Look up the name by canonical ID (strip version bits from token_id first)
         const maybe_name = try self.database.getNameByCanonicalId(canonical_id);
 
         // Skip if name doesn't exist yet (might be out of order event processing)
@@ -3985,8 +3988,19 @@ pub const Indexer = struct {
         // topics[0] = event signature
         // topics[1] = indexed node (namehash)
         // topics[2] = indexed contentType
-        const namehash = log.topics[1];
+        var namehash = log.topics[1];
         const content_type = try abi.ABI.decodeUint256(&log.topics[2].bytes, 0);
+
+        // In ENSv2, each name has its own dedicated resolver. If the namehash is zero,
+        // look up the actual namehash from the resolver address.
+        if (namehash.isZero()) {
+            if (try self.database.getNamehashByResolver(resolver)) |actual_namehash| {
+                namehash = actual_namehash;
+            } else {
+                std.log.debug("ABIChanged: skipping event with zero namehash and unknown resolver", .{});
+                return;
+            }
+        }
 
         const nh_hex_log = try namehash.toHex(self.allocator);
         defer self.allocator.free(nh_hex_log);
@@ -4045,7 +4059,18 @@ pub const Indexer = struct {
     fn handlePubkeyChanged(self: *Indexer, chain: models.Chain, resolver: Address, log: rpc.Log) !void {
         // topics[0] = event signature
         // topics[1] = indexed node (namehash)
-        const namehash = log.topics[1];
+        var namehash = log.topics[1];
+
+        // In ENSv2, each name has its own dedicated resolver. If the namehash is zero,
+        // look up the actual namehash from the resolver address.
+        if (namehash.isZero()) {
+            if (try self.database.getNamehashByResolver(resolver)) |actual_namehash| {
+                namehash = actual_namehash;
+            } else {
+                std.log.debug("PubkeyChanged: skipping event with zero namehash and unknown resolver", .{});
+                return;
+            }
+        }
 
         // Data contains x and y coordinates (each 32 bytes)
         if (log.data.len < 64) return error.InsufficientData;
@@ -4121,7 +4146,18 @@ pub const Indexer = struct {
     fn handleNameChanged(self: *Indexer, chain: models.Chain, resolver: Address, log: rpc.Log) !void {
         // topics[0] = event signature
         // topics[1] = indexed node (namehash)
-        const namehash = log.topics[1];
+        var namehash = log.topics[1];
+
+        // In ENSv2, each name has its own dedicated resolver. If the namehash is zero,
+        // look up the actual namehash from the resolver address.
+        if (namehash.isZero()) {
+            if (try self.database.getNamehashByResolver(resolver)) |actual_namehash| {
+                namehash = actual_namehash;
+            } else {
+                std.log.debug("NameChanged: skipping event with zero namehash and unknown resolver", .{});
+                return;
+            }
+        }
 
         // Decode name from data
         const name = try abi.ABI.decodeString(self.allocator, log.data, 0);
@@ -4195,7 +4231,18 @@ pub const Indexer = struct {
         // topics[0] = event signature
         // topics[1] = indexed node (namehash)
         // topics[2] = indexed interfaceID (bytes4 padded to bytes32)
-        const namehash = log.topics[1];
+        var namehash = log.topics[1];
+
+        // In ENSv2, each name has its own dedicated resolver. If the namehash is zero,
+        // look up the actual namehash from the resolver address.
+        if (namehash.isZero()) {
+            if (try self.database.getNamehashByResolver(resolver)) |actual_namehash| {
+                namehash = actual_namehash;
+            } else {
+                std.log.debug("InterfaceChanged: skipping event with zero namehash and unknown resolver", .{});
+                return;
+            }
+        }
 
         // Interface ID is a bytes4, left-aligned (right-padded) in the 32-byte topic
         const interface_id_bytes = log.topics[2].bytes[0..4];
@@ -4276,7 +4323,18 @@ pub const Indexer = struct {
         // topics[0] = event signature
         // topics[1] = indexed node (namehash)
         // data = newVersion (uint64, padded to 32 bytes)
-        const namehash = log.topics[1];
+        var namehash = log.topics[1];
+
+        // In ENSv2, each name has its own dedicated resolver. If the namehash is zero,
+        // look up the actual namehash from the resolver address.
+        if (namehash.isZero()) {
+            if (try self.database.getNamehashByResolver(resolver)) |actual_namehash| {
+                namehash = actual_namehash;
+            } else {
+                std.log.debug("VersionChanged: skipping event with zero namehash and unknown resolver", .{});
+                return;
+            }
+        }
 
         // Decode newVersion from data (uint64 encoded as uint256)
         var new_version: u64 = 0;
