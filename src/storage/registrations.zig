@@ -70,6 +70,7 @@ pub const RegistrationFilterOptions = struct {
     registrant_in: ?[]const []const u8 = null, // Filter by registrant IN list
     limit: u32 = constants.Pagination.default_limit,
     order_dir: events.OrderDir = .desc,
+    sort_field: events.EventSortField = .block_number,
     expiry_gt: ?i64 = null,
     expiry_gte: ?i64 = null,
     expiry_lt: ?i64 = null,
@@ -101,6 +102,7 @@ pub fn getRegistrations(database: *Database, filter: RegistrationFilterOptions) 
         .data_json_owners = filter.registrant_in,
         .limit = filter.limit,
         .order_dir = filter.order_dir,
+        .sort_field = filter.sort_field,
         .expiry_gt = filter.expiry_gt,
         .expiry_gte = filter.expiry_gte,
         .expiry_lt = filter.expiry_lt,

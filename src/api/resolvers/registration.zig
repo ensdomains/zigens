@@ -12,6 +12,15 @@ const builders = common.builders;
 const loaders = common.loaders;
 const NestedContext = common.NestedContext;
 
+fn mapRegistrationOrderBy(order_by: ?[]const u8) db.EventSortField {
+    const field_name = order_by orelse return .block_number;
+    if (std.mem.eql(u8, field_name, "registrationDate")) return .timestamp;
+    if (std.mem.eql(u8, field_name, "name")) return .name;
+    // expiryDate lives in JSON, can't sort in SQL — keep default
+    if (std.mem.eql(u8, field_name, "expiryDate")) return .block_number;
+    return .block_number;
+}
+
 /// Resolver for registrationConnection query (cursor-based pagination)
 pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
@@ -113,16 +122,36 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
         }
     }
 
+    // Parse orderBy and orderDirection for connection
+    var order_by: ?[]const u8 = null;
+    var order_direction: ?[]const u8 = null;
+    for (field.arguments) |arg| {
+        if (std.mem.eql(u8, arg.name, "orderBy")) {
+            if (arg.value == .string) order_by = arg.value.string;
+        } else if (std.mem.eql(u8, arg.name, "orderDirection")) {
+            if (arg.value == .string) order_direction = arg.value.string;
+        }
+    }
+    const sort_field = mapRegistrationOrderBy(order_by);
+
+    // Default order: desc (newest first) when no orderDirection specified, matching original behavior
+    const order_dir_str = order_direction orelse "desc";
+
     // Fetch one extra item to determine hasNextPage/hasPreviousPage
     const fetch_limit = params.limit + 1;
 
-    // For backward pagination (last/before), reverse the query order
-    const order_dir: db.EventOrderDir = if (params.direction == .backward) .asc else .desc;
+    // Combine pagination direction with user-requested order
+    const base_dir: db.EventOrderDir = if (std.mem.eql(u8, order_dir_str, "desc")) .desc else .asc;
+    const order_dir: db.EventOrderDir = if (params.direction == .backward)
+        (if (base_dir == .desc) .asc else .desc)
+    else
+        base_dir;
 
     // Get registration events from database with filters applied at DB level
     var fetch_filter = reg_filter;
     fetch_filter.limit = @intCast(fetch_limit);
     fetch_filter.order_dir = order_dir;
+    fetch_filter.sort_field = sort_field;
 
     const events = try database.getRegistrations(fetch_filter);
     defer {
@@ -349,43 +378,51 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
         }
     }
 
+    // Map GraphQL orderBy to SQL sort field
+    const sort_field = mapRegistrationOrderBy(order_by);
+    const order_dir: db.EventOrderDir = if (std.mem.eql(u8, order_direction, "desc")) .desc else .asc;
+
+    // For expiryDate sort, we need in-memory fallback since expiry is in JSON
+    const is_expiry_sort = if (order_by) |ob| std.mem.eql(u8, ob, "expiryDate") else false;
+
     // All filters are pushed to the DB level
-    // Fetch enough items to cover skip + first for offset pagination
-    const events = try database.getRegistrations(.{
+    // For expiryDate sort, fetch all matching events for in-memory sort
+    // For other sorts, fetch enough items to cover skip + first for offset pagination
+    const fetch_limit: u32 = if (is_expiry_sort) 10000 else @intCast(first + skip);
+
+    const events_result = try database.getRegistrations(.{
         .chain = filter_chain,
         .registrant = filter_registrant,
         .registrant_in = filter_registrant_in,
-        .limit = @intCast(first + skip),
-        .order_dir = .desc,
+        .limit = fetch_limit,
+        .order_dir = order_dir,
+        .sort_field = sort_field,
         .expiry_gt = filter_expiry_gt,
         .expiry_gte = filter_expiry_gte,
         .expiry_lt = filter_expiry_lt,
         .expiry_lte = filter_expiry_lte,
     });
     defer {
-        for (events) |*event| {
+        for (events_result) |*event| {
             event.deinit(allocator);
         }
-        allocator.free(events);
+        allocator.free(events_result);
     }
 
-    // Helper struct for sorting
-    const FilteredEvent = struct {
-        event: *models.Event,
-        name: []const u8,
-        expiry: i64,
-    };
+    // For expiryDate sort, apply in-memory sort since expiry is stored in JSON
+    if (is_expiry_sort) {
+        const FilteredEvent = struct {
+            event: *models.Event,
+            expiry: i64,
+        };
 
-    // Collect events and parse expiry for sorting
-    var filtered_events: std.ArrayList(FilteredEvent) = .{};
-    defer filtered_events.deinit(allocator);
+        var filtered_events: std.ArrayList(FilteredEvent) = .{};
+        defer filtered_events.deinit(allocator);
 
-    for (events) |*event| {
-        if (event.name == null) continue;
+        for (events_result) |*event| {
+            if (event.name == null) continue;
 
-        var event_expiry: i64 = 0;
-
-        if (order_by != null) {
+            var event_expiry: i64 = 0;
             const parsed = std.json.parseFromSlice(std.json.Value, allocator, event.data, .{}) catch continue;
             defer parsed.deinit();
 
@@ -394,53 +431,57 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
                     event_expiry = expiration_val.integer;
                 }
             }
+
+            try filtered_events.append(allocator, .{
+                .event = event,
+                .expiry = event_expiry,
+            });
         }
 
-        try filtered_events.append(allocator, .{
-            .event = event,
-            .name = event.name.?,
-            .expiry = event_expiry,
-        });
-    }
-
-    // Sort filtered events if orderBy is specified
-    if (order_by) |field_name| {
         const ascending = std.mem.eql(u8, order_direction, "asc");
-        const SortContext = struct {
-            field_name: []const u8,
-            asc: bool,
-        };
-        const sort_ctx = SortContext{ .field_name = field_name, .asc = ascending };
-
-        std.mem.sort(FilteredEvent, filtered_events.items, sort_ctx, struct {
-            fn lessThan(sort_ctx_param: SortContext, a: FilteredEvent, b: FilteredEvent) bool {
-                if (std.mem.eql(u8, sort_ctx_param.field_name, "name")) {
-                    const cmp = std.mem.order(u8, a.name, b.name);
-                    return if (sort_ctx_param.asc) cmp == .lt else cmp == .gt;
-                } else if (std.mem.eql(u8, sort_ctx_param.field_name, "registrationDate")) {
-                    return if (sort_ctx_param.asc) a.event.timestamp < b.event.timestamp else a.event.timestamp > b.event.timestamp;
-                } else if (std.mem.eql(u8, sort_ctx_param.field_name, "expiryDate")) {
-                    return if (sort_ctx_param.asc) a.expiry < b.expiry else a.expiry > b.expiry;
-                } else if (std.mem.eql(u8, sort_ctx_param.field_name, "id")) {
-                    const cmp = std.mem.order(u8, a.name, b.name);
-                    return if (sort_ctx_param.asc) cmp == .lt else cmp == .gt;
-                }
-                return false;
+        std.mem.sort(FilteredEvent, filtered_events.items, ascending, struct {
+            fn lessThan(asc: bool, a: FilteredEvent, b: FilteredEvent) bool {
+                return if (asc) a.expiry < b.expiry else a.expiry > b.expiry;
             }
         }.lessThan);
+
+        // Build JSON from sorted events, applying skip
+        var json: std.ArrayList(u8) = .{};
+        defer json.deinit(allocator);
+
+        try json.appendSlice(allocator, "[");
+        const start_idx: usize = @min(@as(usize, @intCast(skip)), filtered_events.items.len);
+        const end_idx: usize = @min(start_idx + @as(usize, @intCast(first)), filtered_events.items.len);
+        for (filtered_events.items[start_idx..end_idx], 0..) |filtered, i| {
+            if (i > 0) try json.appendSlice(allocator, ",");
+
+            const reg_json = try builders.buildRegistrationJson(filtered.event, field.selections, .{
+                .database = database,
+                .depth = 0,
+                .allocator = allocator,
+                .loaders = ctx.loaders,
+            });
+            defer allocator.free(reg_json);
+            try json.appendSlice(allocator, reg_json);
+        }
+        try json.appendSlice(allocator, "]");
+
+        const result_json = try allocator.dupe(u8, json.items);
+        return parser.FieldResult{ .json = result_json };
     }
 
-    // Build JSON from sorted/filtered events, applying skip
+    // For non-expiryDate sorts, data is already sorted by SQL
+    // Build JSON, applying skip
     var json: std.ArrayList(u8) = .{};
     defer json.deinit(allocator);
 
     try json.appendSlice(allocator, "[");
-    const start_idx = @min(skip, filtered_events.items.len);
-    const end_idx = @min(start_idx + first, filtered_events.items.len);
-    for (filtered_events.items[@as(usize, @intCast(start_idx))..@as(usize, @intCast(end_idx))], 0..) |filtered, i| {
+    const start_idx: usize = @min(@as(usize, @intCast(skip)), events_result.len);
+    const end_idx: usize = @min(start_idx + @as(usize, @intCast(first)), events_result.len);
+    for (events_result[start_idx..end_idx], 0..) |*event, i| {
         if (i > 0) try json.appendSlice(allocator, ",");
 
-        const reg_json = try builders.buildRegistrationJson(filtered.event, field.selections, .{
+        const reg_json = try builders.buildRegistrationJson(event, field.selections, .{
             .database = database,
             .depth = 0,
             .allocator = allocator,

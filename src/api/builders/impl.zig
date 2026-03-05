@@ -524,6 +524,174 @@ fn resolverTextHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: 
     return try nested_ctx.allocator.dupe(u8, "null");
 }
 
+/// Resolver nested field handler: pubkey
+fn resolverPubkeyHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    _ = field;
+    const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
+    const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+
+    var pubkey_opt = try database.getResolverPubkey(rctx.namehash);
+    if (pubkey_opt) |*pubkey| {
+        defer pubkey.deinit(nested_ctx.allocator);
+        const escaped_x = try escapeJsonString(nested_ctx.allocator, pubkey.x);
+        defer nested_ctx.allocator.free(escaped_x);
+        const escaped_y = try escapeJsonString(nested_ctx.allocator, pubkey.y);
+        defer nested_ctx.allocator.free(escaped_y);
+        return try std.fmt.allocPrint(nested_ctx.allocator, "{{\"x\":\"{s}\",\"y\":\"{s}\"}}", .{ escaped_x, escaped_y });
+    }
+    return try nested_ctx.allocator.dupe(u8, "null");
+}
+
+/// Resolver nested field handler: abis (content types)
+fn resolverAbisHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    _ = field;
+    const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
+    const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+
+    const content_types = try database.getResolverAbiContentTypes(rctx.namehash);
+    defer nested_ctx.allocator.free(content_types);
+
+    var json_buf: std.ArrayList(u8) = .{};
+    errdefer json_buf.deinit(nested_ctx.allocator);
+    const writer = json_buf.writer(nested_ctx.allocator);
+
+    try writer.writeAll("[");
+    for (content_types, 0..) |ct, i| {
+        if (i > 0) try writer.writeAll(",");
+        try writer.print("{d}", .{ct});
+    }
+    try writer.writeAll("]");
+
+    return try nested_ctx.allocator.dupe(u8, json_buf.items);
+}
+
+/// Resolver nested field handler: reverseName
+fn resolverReverseNameHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    _ = field;
+    const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
+    const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+
+    if (try database.getResolverReverseName(rctx.namehash)) |name_val| {
+        defer nested_ctx.allocator.free(name_val);
+        const escaped = try escapeJsonString(nested_ctx.allocator, name_val);
+        defer nested_ctx.allocator.free(escaped);
+        return try std.fmt.allocPrint(nested_ctx.allocator, "\"{s}\"", .{escaped});
+    }
+    return try nested_ctx.allocator.dupe(u8, "null");
+}
+
+/// Resolver nested field handler: interfaces
+fn resolverInterfacesHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
+    const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+
+    const ifaces = try database.getResolverInterfaces(rctx.namehash);
+    defer {
+        for (ifaces) |*iface| iface.deinit(nested_ctx.allocator);
+        nested_ctx.allocator.free(ifaces);
+    }
+
+    var want_interface_id = false;
+    var want_implementer = false;
+    for (field.selections) |subfield| {
+        if (std.mem.eql(u8, subfield.name, "interfaceId")) want_interface_id = true;
+        if (std.mem.eql(u8, subfield.name, "implementer")) want_implementer = true;
+    }
+    if (!want_interface_id and !want_implementer) {
+        want_interface_id = true;
+        want_implementer = true;
+    }
+
+    var json_buf: std.ArrayList(u8) = .{};
+    errdefer json_buf.deinit(nested_ctx.allocator);
+    const writer = json_buf.writer(nested_ctx.allocator);
+
+    try writer.writeAll("[");
+    for (ifaces, 0..) |iface, i| {
+        if (i > 0) try writer.writeAll(",");
+        try writer.writeAll("{");
+        var first_subfield = true;
+        if (want_interface_id) {
+            const escaped = try escapeJsonString(nested_ctx.allocator, iface.interface_id);
+            defer nested_ctx.allocator.free(escaped);
+            try writer.print("\"interfaceId\":\"{s}\"", .{escaped});
+            first_subfield = false;
+        }
+        if (want_implementer) {
+            const escaped = try escapeJsonString(nested_ctx.allocator, iface.implementer);
+            defer nested_ctx.allocator.free(escaped);
+            if (!first_subfield) try writer.writeAll(",");
+            try writer.print("\"implementer\":\"{s}\"", .{escaped});
+        }
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]");
+
+    return try nested_ctx.allocator.dupe(u8, json_buf.items);
+}
+
+/// Resolver nested field handler: aliases
+fn resolverAliasesHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
+    const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+
+    const alias_records = try database.getResolverAliases(rctx.resolver);
+    defer {
+        for (alias_records) |*r| r.deinit(nested_ctx.allocator);
+        nested_ctx.allocator.free(alias_records);
+    }
+
+    var want_from = false;
+    var want_to = false;
+    for (field.selections) |subfield| {
+        if (std.mem.eql(u8, subfield.name, "fromName")) want_from = true;
+        if (std.mem.eql(u8, subfield.name, "toName")) want_to = true;
+    }
+    if (!want_from and !want_to) {
+        want_from = true;
+        want_to = true;
+    }
+
+    var json_buf: std.ArrayList(u8) = .{};
+    errdefer json_buf.deinit(nested_ctx.allocator);
+    const writer = json_buf.writer(nested_ctx.allocator);
+
+    try writer.writeAll("[");
+    for (alias_records, 0..) |record, i| {
+        if (i > 0) try writer.writeAll(",");
+        try writer.writeAll("{");
+        var first_subfield = true;
+        if (want_from) {
+            const escaped = try escapeJsonString(nested_ctx.allocator, record.from_name);
+            defer nested_ctx.allocator.free(escaped);
+            try writer.print("\"fromName\":\"{s}\"", .{escaped});
+            first_subfield = false;
+        }
+        if (want_to) {
+            const escaped = try escapeJsonString(nested_ctx.allocator, record.to_name);
+            defer nested_ctx.allocator.free(escaped);
+            if (!first_subfield) try writer.writeAll(",");
+            try writer.print("\"toName\":\"{s}\"", .{escaped});
+        }
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]");
+
+    return try nested_ctx.allocator.dupe(u8, json_buf.items);
+}
+
+/// Resolver nested field handler: version
+fn resolverVersionHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    _ = field;
+    const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
+    const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+
+    if (try database.getResolverVersion(rctx.namehash)) |version| {
+        return try std.fmt.allocPrint(nested_ctx.allocator, "{d}", .{version});
+    }
+    return try nested_ctx.allocator.dupe(u8, "null");
+}
+
 /// Resolver entity configuration
 const ResolverBuildEntityConfig = json_builder.EntityConfig{
     .type_name = "Resolver",
@@ -534,6 +702,12 @@ const ResolverBuildEntityConfig = json_builder.EntityConfig{
         .{ .name = "contentHash", .handler = resolverContentHashHandler },
         .{ .name = "texts", .handler = resolverTextsHandler },
         .{ .name = "text", .handler = resolverTextHandler },
+        .{ .name = "pubkey", .handler = resolverPubkeyHandler },
+        .{ .name = "abis", .handler = resolverAbisHandler },
+        .{ .name = "reverseName", .handler = resolverReverseNameHandler },
+        .{ .name = "interfaces", .handler = resolverInterfacesHandler },
+        .{ .name = "aliases", .handler = resolverAliasesHandler },
+        .{ .name = "version", .handler = resolverVersionHandler },
     },
 };
 

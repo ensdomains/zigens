@@ -43,6 +43,9 @@ type Query {
 
   """Get ENSIP-16 resolver approvals/delegations"""
   approvals(namehash: String, delegate: String): [ResolverApproval!]!
+
+  """Get resolver information by contract address"""
+  resolver(id: String!): ResolverDetail
 }
 
 # ============================================================================
@@ -241,6 +244,33 @@ type CoinAddress {
   address: String!
 }
 
+"""A public key record (secp256k1 coordinates)"""
+type Pubkey {
+  """X coordinate (hex string)"""
+  x: String!
+
+  """Y coordinate (hex string)"""
+  y: String!
+}
+
+"""An interface implementation record"""
+type InterfaceRecord {
+  """Interface ID (EIP-165 selector, hex string)"""
+  interfaceId: String!
+
+  """Implementer contract address"""
+  implementer: String!
+}
+
+"""A resolver alias mapping (from OwnedResolver)"""
+type Alias {
+  """Source DNS name"""
+  fromName: String!
+
+  """Destination DNS name"""
+  toName: String!
+}
+
 """A resolver contract for an ENS domain"""
 type Resolver {
   """Resolver contract address"""
@@ -263,6 +293,24 @@ type Resolver {
 
   """Get a specific text record value by key"""
   text(key: String!): String
+
+  """Public key record (secp256k1 x/y coordinates)"""
+  pubkey: Pubkey
+
+  """ABI content types set on this resolver"""
+  abis: [Int!]
+
+  """Reverse name record (from NameChanged events)"""
+  reverseName: String
+
+  """Interface implementations set on this resolver"""
+  interfaces: [InterfaceRecord!]
+
+  """Aliases set on this resolver (from AliasChanged events)"""
+  aliases: [Alias!]
+
+  """Current version counter (from VersionChanged events)"""
+  version: Int
 }
 
 """A domain registration record"""
@@ -350,6 +398,9 @@ input DomainFilter {
 
   """Filter by resolved address"""
   resolvedAddress: String
+
+  """Filter by resolver contract address"""
+  resolver: String
 
   """Filter by whether domain has direct subdomains (one level only)"""
   hasSubdomains: Boolean
@@ -470,6 +521,36 @@ type ResolverInfo {
 
   """Timestamp when resolver was set"""
   setAt: Int!
+}
+
+"""Detailed resolver information with statistics"""
+type ResolverDetail {
+  """Resolver contract address"""
+  id: String!
+
+  """Resolver contract address"""
+  address: String!
+
+  """Number of domains using this resolver"""
+  nodeCount: Int!
+
+  """Number of aliases defined on this resolver"""
+  aliasCount: Int!
+
+  """Number of distinct role holders on this resolver"""
+  roleHolderCount: Int!
+
+  """Domains using this resolver (limited)"""
+  nodes(first: Int = 100): [Domain!]!
+
+  """Aliases defined on this resolver"""
+  aliases: [Alias!]!
+
+  """EAC role assignments on this resolver"""
+  roles: [EACRoleAssignment!]!
+
+  """Events emitted by this resolver contract"""
+  events(first: Int = 100): [Event!]!
 }
 
 """Registry information"""

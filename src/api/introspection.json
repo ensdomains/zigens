@@ -556,6 +556,25 @@
                   }
                 }
               }
+            },
+            {
+              "name": "resolver",
+              "args": [
+                {
+                  "name": "id",
+                  "type": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "SCALAR",
+                      "name": "String"
+                    }
+                  }
+                }
+              ],
+              "type": {
+                "kind": "OBJECT",
+                "name": "ResolverDetail"
+              }
             }
           ]
         },
@@ -1227,6 +1246,93 @@
         },
         {
           "kind": "OBJECT",
+          "name": "Pubkey",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "x",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              }
+            },
+            {
+              "name": "y",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "InterfaceRecord",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "interfaceId",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              }
+            },
+            {
+              "name": "implementer",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "Alias",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "fromName",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              }
+            },
+            {
+              "name": "toName",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
           "name": "Resolver",
           "interfaces": [],
           "fields": [
@@ -1321,6 +1427,72 @@
               "type": {
                 "kind": "SCALAR",
                 "name": "String"
+              }
+            },
+            {
+              "name": "pubkey",
+              "args": [],
+              "type": {
+                "kind": "OBJECT",
+                "name": "Pubkey"
+              }
+            },
+            {
+              "name": "abis",
+              "args": [],
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                }
+              }
+            },
+            {
+              "name": "reverseName",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "interfaces",
+              "args": [],
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "OBJECT",
+                    "name": "InterfaceRecord"
+                  }
+                }
+              }
+            },
+            {
+              "name": "aliases",
+              "args": [],
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "OBJECT",
+                    "name": "Alias"
+                  }
+                }
+              }
+            },
+            {
+              "name": "version",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
               }
             }
           ]
@@ -1681,6 +1853,152 @@
         },
         {
           "kind": "OBJECT",
+          "name": "ResolverDetail",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "id",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              }
+            },
+            {
+              "name": "address",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              }
+            },
+            {
+              "name": "nodeCount",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              }
+            },
+            {
+              "name": "aliasCount",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              }
+            },
+            {
+              "name": "roleHolderCount",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              }
+            },
+            {
+              "name": "nodes",
+              "args": [
+                {
+                  "name": "first",
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Domain"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "name": "aliases",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Alias"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "name": "roles",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "EACRoleAssignment"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "name": "events",
+              "args": [
+                {
+                  "name": "first",
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Event"
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
           "name": "RegistryInfo",
           "interfaces": [],
           "fields": [
@@ -2000,6 +2318,13 @@
             },
             {
               "name": "resolvedAddress",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "resolver",
               "type": {
                 "kind": "SCALAR",
                 "name": "String"

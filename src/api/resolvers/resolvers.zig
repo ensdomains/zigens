@@ -29,6 +29,7 @@ pub const resolveAccount = account.resolveAccount;
 pub const resolveRoles = admin.resolveRoles;
 pub const resolveRolesConnection = admin.resolveRolesConnection;
 pub const resolveResolvers = admin.resolveResolvers;
+pub const resolveResolver = admin.resolveResolver;
 pub const resolveRegistries = admin.resolveRegistries;
 pub const resolveMetadata = admin.resolveMetadata;
 pub const resolveApprovals = admin.resolveApprovals;

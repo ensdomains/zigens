@@ -61,6 +61,7 @@ pub const GraphQLHandler = struct {
         try executor.registerResolver("roles", resolvers.resolveRoles);
         try executor.registerResolver("roleConnection", resolvers.resolveRolesConnection);
         try executor.registerResolver("resolvers", resolvers.resolveResolvers);
+        try executor.registerResolver("resolver", resolvers.resolveResolver);
         try executor.registerResolver("registries", resolvers.resolveRegistries);
         try executor.registerResolver("metadata", resolvers.resolveMetadata);
         try executor.registerResolver("approvals", resolvers.resolveApprovals);

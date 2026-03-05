@@ -185,6 +185,10 @@ pub const EventType = enum {
     // EAC (Enhanced Access Control) events
     eac_roles_changed,
 
+    // OwnedResolver events
+    version_changed,
+    alias_changed,
+
     pub fn toString(self: EventType) []const u8 {
         return switch (self) {
             .new_subname => "NewSubname",
@@ -210,6 +214,8 @@ pub const EventType = enum {
             .name_changed => "NameChanged",
             .interface_changed => "InterfaceChanged",
             .eac_roles_changed => "EACRolesChanged",
+            .version_changed => "VersionChanged",
+            .alias_changed => "AliasChanged",
         };
     }
 
@@ -237,6 +243,8 @@ pub const EventType = enum {
         if (std.mem.eql(u8, s, "NameChanged")) return .name_changed;
         if (std.mem.eql(u8, s, "InterfaceChanged")) return .interface_changed;
         if (std.mem.eql(u8, s, "EACRolesChanged")) return .eac_roles_changed;
+        if (std.mem.eql(u8, s, "VersionChanged")) return .version_changed;
+        if (std.mem.eql(u8, s, "AliasChanged")) return .alias_changed;
         return null;
     }
 };

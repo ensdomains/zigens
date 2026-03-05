@@ -606,6 +606,29 @@ pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Nam
     return names.toOwnedSlice(db.allocator);
 }
 
+/// Get names by resolver address
+pub fn getNamesByResolver(db: *Database, resolver: Address, limit: u32) ![]models.Name {
+    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE resolver = ? ORDER BY created_at DESC LIMIT ?");
+    defer q.deinit();
+
+    try q.bindAddress(resolver);
+    try q.bindInt(@intCast(limit));
+
+    var names: std.ArrayList(models.Name) = .{};
+    errdefer {
+        for (names.items) |*name| {
+            name.deinit(db.allocator);
+        }
+        names.deinit(db.allocator);
+    }
+
+    while (try q.step()) {
+        try names.append(db.allocator, try parseNameRowShort(&q, db.allocator));
+    }
+
+    return names.toOwnedSlice(db.allocator);
+}
+
 /// Get names by registrant address
 pub fn getNamesByRegistrant(db: *Database, registrant: Address, skip: u32, limit: u32) ![]models.Name {
     var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE registrant = ? ORDER BY created_at DESC LIMIT ? OFFSET ?");
@@ -634,6 +657,23 @@ pub fn getNamesByRegistrant(db: *Database, registrant: Address, skip: u32, limit
 pub const OrderDir = enum {
     asc,
     desc,
+};
+
+/// Sort field for name queries
+pub const NameSortField = enum {
+    created_at,
+    name,
+    expiry,
+    registered_at,
+
+    pub fn toSql(self: NameSortField) []const u8 {
+        return switch (self) {
+            .created_at => "created_at",
+            .name => "name",
+            .expiry => "expiry",
+            .registered_at => "registered_at",
+        };
+    }
 };
 
 /// Parse name rows from a query result
@@ -701,7 +741,7 @@ fn parseNameRows(q: *Query, allocator: std.mem.Allocator) ![]models.Name {
 }
 
 pub fn getAllNames(db: *Database, owner: ?Address, skip: u32, limit: u32) ![]models.Name {
-    return getAllNamesWithOrder(db, owner, skip, limit, .desc);
+    return getAllNamesWithOrder(db, owner, skip, limit, .desc, .created_at);
 }
 
 /// Filter options for querying names
@@ -722,6 +762,8 @@ pub const NameFilters = struct {
     expiry_lte: ?i64 = null,
     // Resolved address filter (requires resolver lookup)
     resolved_address: ?Address = null,
+    // Resolver contract address filter
+    resolver: ?Address = null,
     // Subdomain filters (requires subquery)
     has_subdomains: ?bool = null,
     subdomain_count_gt: ?i64 = null,
@@ -729,7 +771,7 @@ pub const NameFilters = struct {
 };
 
 /// Get names with filters pushed down to DB query
-pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u32, order_dir: OrderDir) ![]models.Name {
+pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u32, order_dir: OrderDir, sort_field: NameSortField) ![]models.Name {
     const order_str = if (order_dir == .desc) "DESC" else "ASC";
 
     // Build WHERE clause dynamically using ArrayList for conditions
@@ -800,6 +842,11 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
         try conditions.append(db.allocator, "namehash IN (SELECT namehash FROM resolver_addresses WHERE address = ?)");
     }
 
+    // Resolver contract address filter
+    if (filters.resolver != null) {
+        try conditions.append(db.allocator, "resolver = ?");
+    }
+
     // Subdomain count filters (using subquery)
     if (filters.has_subdomains) |has_subs| {
         if (has_subs) {
@@ -832,8 +879,8 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
         \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, chain,
         \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated, ejected,
         \\       created_at, registered_at, created_block, updated_at, updated_block
-        \\FROM names {s}ORDER BY created_at {s} LIMIT ? OFFSET ?
-    , .{ where_clause.items, order_str });
+        \\FROM names {s}ORDER BY {s} {s} LIMIT ? OFFSET ?
+    , .{ where_clause.items, sort_field.toSql(), order_str });
     defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
@@ -878,6 +925,9 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
     if (filters.resolved_address) |addr| {
         try q.bindAddress(addr);
     }
+    if (filters.resolver) |addr| {
+        try q.bindAddress(addr);
+    }
     // has_subdomains doesn't need binding (no ?)
     if (filters.subdomain_count_gt) |v| {
         try q.bindInt64(v);
@@ -892,22 +942,22 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
 }
 
 /// Get all names with configurable order direction
-pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u32, order_dir: OrderDir) ![]models.Name {
+pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u32, order_dir: OrderDir, sort_field: NameSortField) ![]models.Name {
     const order_str = if (order_dir == .desc) "DESC" else "ASC";
     const sql = if (owner != null)
         try std.fmt.allocPrint(db.allocator,
             \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, chain,
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated, ejected,
             \\       created_at, registered_at, created_block, updated_at, updated_block
-            \\FROM names WHERE owner = ? ORDER BY created_at {s} LIMIT ? OFFSET ?
-        , .{order_str})
+            \\FROM names WHERE owner = ? ORDER BY {s} {s} LIMIT ? OFFSET ?
+        , .{ sort_field.toSql(), order_str })
     else
         try std.fmt.allocPrint(db.allocator,
             \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, chain,
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated, ejected,
             \\       created_at, registered_at, created_block, updated_at, updated_block
-            \\FROM names ORDER BY created_at {s} LIMIT ? OFFSET ?
-        , .{order_str});
+            \\FROM names ORDER BY {s} {s} LIMIT ? OFFSET ?
+        , .{ sort_field.toSql(), order_str });
     defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
@@ -1051,6 +1101,9 @@ pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
     if (filters.resolved_address != null) {
         try conditions.append(db.allocator, "namehash IN (SELECT namehash FROM resolver_addresses WHERE address = ?)");
     }
+    if (filters.resolver != null) {
+        try conditions.append(db.allocator, "resolver = ?");
+    }
     if (filters.has_subdomains) |has_subs| {
         if (has_subs) {
             try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) > 0");
@@ -1121,6 +1174,9 @@ pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
         try q.bindInt64(v);
     }
     if (filters.resolved_address) |addr| {
+        try q.bindAddress(addr);
+    }
+    if (filters.resolver) |addr| {
         try q.bindAddress(addr);
     }
     // has_subdomains doesn't need binding (no ?)
