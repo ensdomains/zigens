@@ -130,6 +130,7 @@ pub fn createTestName(
         .ejected = false,
         .created_block = 1000,
         .created_at = 1700000000,
+        .registered_at = 1700000000,
         .updated_block = 1000,
         .updated_at = 1700000000,
         .is_wrapped = false,

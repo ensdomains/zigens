@@ -136,6 +136,14 @@ pub const EventSignatures = struct {
     pub const interface_changed = "InterfaceChanged(bytes32,bytes4,address)";
     pub const interface_changed_hash: Hash = eventHash(interface_changed);
 
+    /// VersionChanged(bytes32 indexed node, uint64 newVersion)
+    pub const version_changed = "VersionChanged(bytes32,uint64)";
+    pub const version_changed_hash: Hash = eventHash(version_changed);
+
+    /// AliasChanged(bytes indexed indexedFromName, bytes indexed indexedToName, bytes fromName, bytes toName)
+    pub const alias_changed = "AliasChanged(bytes,bytes,bytes,bytes)";
+    pub const alias_changed_hash: Hash = eventHash(alias_changed);
+
     // ========================================================================
     // ENS Temporary Registrar events (Pre-V1 Migration, May 2017 - May 2019)
     // Address: 0x6090A6e47849629b7245Dfa1Ca21D94cd15878Ef

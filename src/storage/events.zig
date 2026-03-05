@@ -87,6 +87,21 @@ pub const OrderDir = enum {
     desc,
 };
 
+/// Sort field for event queries
+pub const EventSortField = enum {
+    block_number,
+    timestamp,
+    name,
+
+    pub fn toSql(self: EventSortField) []const u8 {
+        return switch (self) {
+            .block_number => "block_number",
+            .timestamp => "timestamp",
+            .name => "name",
+        };
+    }
+};
+
 pub fn getRecentEvents(db: *Database, chain: ?models.Chain, event_type: ?models.EventType, limit: u32) ![]models.Event {
     return getRecentEventsWithOrder(db, chain, event_type, limit, .desc);
 }
@@ -183,6 +198,7 @@ pub const EventFilterOptions = struct {
     expiry_lte: ?i64 = null,
     limit: u32 = constants.Pagination.default_limit,
     order_dir: OrderDir = .desc,
+    sort_field: EventSortField = .block_number,
 };
 
 /// Get events with flexible filtering
@@ -329,12 +345,28 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     }
 
     // Add ORDER BY
-    const order_sql = if (filter.order_dir == .desc)
-        " ORDER BY block_number DESC, log_index DESC LIMIT "
-    else
-        " ORDER BY block_number ASC, log_index ASC LIMIT ";
-    @memcpy(sql_buf[sql_len..][0..order_sql.len], order_sql);
-    sql_len += order_sql.len;
+    const order_by_prefix = " ORDER BY ";
+    @memcpy(sql_buf[sql_len..][0..order_by_prefix.len], order_by_prefix);
+    sql_len += order_by_prefix.len;
+
+    const sort_col = filter.sort_field.toSql();
+    @memcpy(sql_buf[sql_len..][0..sort_col.len], sort_col);
+    sql_len += sort_col.len;
+
+    const dir_str = if (filter.order_dir == .desc) " DESC" else " ASC";
+    @memcpy(sql_buf[sql_len..][0..dir_str.len], dir_str);
+    sql_len += dir_str.len;
+
+    // Add secondary sort for block_number to maintain stable ordering
+    if (filter.sort_field == .block_number) {
+        const secondary = if (filter.order_dir == .desc) ", log_index DESC" else ", log_index ASC";
+        @memcpy(sql_buf[sql_len..][0..secondary.len], secondary);
+        sql_len += secondary.len;
+    }
+
+    const limit_prefix = " LIMIT ";
+    @memcpy(sql_buf[sql_len..][0..limit_prefix.len], limit_prefix);
+    sql_len += limit_prefix.len;
 
     const limit_str = try std.fmt.bufPrint(sql_buf[sql_len..], "{d}", .{filter.limit});
     sql_len += limit_str.len;

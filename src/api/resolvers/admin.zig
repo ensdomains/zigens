@@ -432,6 +432,194 @@ pub fn resolveApprovals(ctx: parser.ExecutionContext, field: *const parser.Field
     return parser.FieldResult{ .json = try allocator.dupe(u8, json.items) };
 }
 
+/// Resolver for resolverDetail query - provides detailed resolver info with statistics
+pub fn resolveResolver(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
+    const allocator = ctx.allocator;
+    const database: *db.Database = @ptrCast(@alignCast(ctx.database));
+
+    // Get required id argument (resolver contract address)
+    const id_arg = parser.getStringArg(field, "id", null) orelse {
+        const json = try allocator.dupe(u8, "null");
+        return parser.FieldResult{ .json = json };
+    };
+
+    const resolver_addr = Address.fromHex(id_arg) catch {
+        const json = try allocator.dupe(u8, "null");
+        return parser.FieldResult{ .json = json };
+    };
+
+    // Build JSON based on requested fields
+    var json: std.ArrayList(u8) = .{};
+    defer json.deinit(allocator);
+    try json.appendSlice(allocator, "{");
+
+    var first = true;
+    for (field.selections) |*sel| {
+        const output_key = sel.alias orelse sel.name;
+
+        if (!first) try json.appendSlice(allocator, ",");
+
+        if (std.mem.eql(u8, sel.name, "id") or std.mem.eql(u8, sel.name, "address")) {
+            const addr_hex = try resolver_addr.toHex(allocator);
+            defer allocator.free(addr_hex);
+            try json.appendSlice(allocator, "\"");
+            try json.appendSlice(allocator, output_key);
+            try json.appendSlice(allocator, "\":\"");
+            try json.appendSlice(allocator, addr_hex);
+            try json.appendSlice(allocator, "\"");
+            first = false;
+        } else if (std.mem.eql(u8, sel.name, "nodeCount")) {
+            const count = try database.getResolverNodeCount(resolver_addr);
+            const count_str = try std.fmt.allocPrint(allocator, "\"{s}\":{d}", .{ output_key, count });
+            defer allocator.free(count_str);
+            try json.appendSlice(allocator, count_str);
+            first = false;
+        } else if (std.mem.eql(u8, sel.name, "aliasCount")) {
+            const count = try database.getResolverAliasCount(resolver_addr);
+            const count_str = try std.fmt.allocPrint(allocator, "\"{s}\":{d}", .{ output_key, count });
+            defer allocator.free(count_str);
+            try json.appendSlice(allocator, count_str);
+            first = false;
+        } else if (std.mem.eql(u8, sel.name, "roleHolderCount")) {
+            const count = try database.getResolverRoleHolderCount(resolver_addr);
+            const count_str = try std.fmt.allocPrint(allocator, "\"{s}\":{d}", .{ output_key, count });
+            defer allocator.free(count_str);
+            try json.appendSlice(allocator, count_str);
+            first = false;
+        } else if (std.mem.eql(u8, sel.name, "nodes")) {
+            const limit_arg = parser.getIntArg(sel, "first", null) orelse 100;
+            const limit: u32 = @intCast(@min(limit_arg, 1000));
+            const names = try database.getNamesByResolver(resolver_addr, limit);
+            defer {
+                for (names) |*name| @constCast(name).deinit(allocator);
+                allocator.free(names);
+            }
+
+            try json.appendSlice(allocator, "\"");
+            try json.appendSlice(allocator, output_key);
+            try json.appendSlice(allocator, "\":[");
+            for (names, 0..) |*name, i| {
+                if (i > 0) try json.appendSlice(allocator, ",");
+                const name_mut = @constCast(name);
+                const domain_json = try builders.buildDomainJson(name_mut, sel.selections, .{
+                    .database = database,
+                    .depth = 1,
+                    .allocator = allocator,
+                    .loaders = ctx.loaders,
+                });
+                defer allocator.free(domain_json);
+                try json.appendSlice(allocator, domain_json);
+            }
+            try json.appendSlice(allocator, "]");
+            first = false;
+        } else if (std.mem.eql(u8, sel.name, "aliases")) {
+            const alias_records = try database.getResolverAliases(resolver_addr);
+            defer {
+                for (alias_records) |*r| @constCast(r).deinit(allocator);
+                allocator.free(alias_records);
+            }
+
+            try json.appendSlice(allocator, "\"");
+            try json.appendSlice(allocator, output_key);
+            try json.appendSlice(allocator, "\":[");
+            for (alias_records, 0..) |record, i| {
+                if (i > 0) try json.appendSlice(allocator, ",");
+                try json.appendSlice(allocator, "{");
+                var first_sub = true;
+                for (sel.selections) |subfield| {
+                    if (std.mem.eql(u8, subfield.name, "fromName")) {
+                        if (!first_sub) try json.appendSlice(allocator, ",");
+                        const escaped = try escapeJsonString(allocator, record.from_name);
+                        defer allocator.free(escaped);
+                        const val = try std.fmt.allocPrint(allocator, "\"fromName\":\"{s}\"", .{escaped});
+                        defer allocator.free(val);
+                        try json.appendSlice(allocator, val);
+                        first_sub = false;
+                    } else if (std.mem.eql(u8, subfield.name, "toName")) {
+                        if (!first_sub) try json.appendSlice(allocator, ",");
+                        const escaped = try escapeJsonString(allocator, record.to_name);
+                        defer allocator.free(escaped);
+                        const val = try std.fmt.allocPrint(allocator, "\"toName\":\"{s}\"", .{escaped});
+                        defer allocator.free(val);
+                        try json.appendSlice(allocator, val);
+                        first_sub = false;
+                    }
+                }
+                // Default to all fields if none selected
+                if (first_sub) {
+                    const escaped_from = try escapeJsonString(allocator, record.from_name);
+                    defer allocator.free(escaped_from);
+                    const escaped_to = try escapeJsonString(allocator, record.to_name);
+                    defer allocator.free(escaped_to);
+                    const val = try std.fmt.allocPrint(allocator, "\"fromName\":\"{s}\",\"toName\":\"{s}\"", .{ escaped_from, escaped_to });
+                    defer allocator.free(val);
+                    try json.appendSlice(allocator, val);
+                }
+                try json.appendSlice(allocator, "}");
+            }
+            try json.appendSlice(allocator, "]");
+            first = false;
+        } else if (std.mem.eql(u8, sel.name, "roles")) {
+            const role_list = try database.getResolverRoles(resolver_addr);
+            defer {
+                for (role_list) |*role| @constCast(role).deinit(allocator);
+                allocator.free(role_list);
+            }
+
+            try json.appendSlice(allocator, "\"");
+            try json.appendSlice(allocator, output_key);
+            try json.appendSlice(allocator, "\":[");
+            for (role_list, 0..) |*role, i| {
+                if (i > 0) try json.appendSlice(allocator, ",");
+                const handler = FieldHandler{
+                    .handleFn = handleEACRoleField,
+                    .context = @constCast(@ptrCast(role)),
+                };
+                const role_json = try buildJsonWithFields(allocator, sel.selections, handler);
+                defer allocator.free(role_json);
+                try json.appendSlice(allocator, role_json);
+            }
+            try json.appendSlice(allocator, "]");
+            first = false;
+        } else if (std.mem.eql(u8, sel.name, "events")) {
+            const limit_arg = parser.getIntArg(sel, "first", null) orelse 100;
+            const limit: u32 = @intCast(@min(limit_arg, 1000));
+
+            const addr_hex = try resolver_addr.toHex(allocator);
+            defer allocator.free(addr_hex);
+
+            const events_list = try database.getEventsFiltered(.{
+                .contract_address = addr_hex,
+                .limit = limit,
+            });
+            defer {
+                for (events_list) |*evt| @constCast(evt).deinit(allocator);
+                allocator.free(events_list);
+            }
+
+            try json.appendSlice(allocator, "\"");
+            try json.appendSlice(allocator, output_key);
+            try json.appendSlice(allocator, "\":[");
+            for (events_list, 0..) |*evt, i| {
+                if (i > 0) try json.appendSlice(allocator, ",");
+                const evt_json = try builders.buildEventJson(evt, sel.selections, .{
+                    .database = database,
+                    .depth = 1,
+                    .allocator = allocator,
+                    .loaders = ctx.loaders,
+                });
+                defer allocator.free(evt_json);
+                try json.appendSlice(allocator, evt_json);
+            }
+            try json.appendSlice(allocator, "]");
+            first = false;
+        }
+    }
+
+    try json.appendSlice(allocator, "}");
+    return parser.FieldResult{ .json = try allocator.dupe(u8, json.items) };
+}
+
 // ============================================================================
 // Supporting Types and Functions for Resolvers
 // ============================================================================

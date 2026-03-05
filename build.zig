@@ -152,12 +152,22 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    // Create shared lib module for test imports (single module to avoid conflicts)
+    const lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Integration tests
     const integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/integration.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "lib", .module = lib_mod },
+            },
         }),
     });
     integration_tests.linkLibC();
@@ -294,13 +304,6 @@ pub fn build(b: *std.Build) void {
 
     // Also add to the main filter test step
     filter_test_step.dependOn(&run_address_validation_tests.step);
-
-    // Create shared lib module for test imports (single module to avoid conflicts)
-    const lib_mod = b.createModule(.{
-        .root_source_file = b.path("src/lib.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
 
     const helpers_mod = b.createModule(.{
         .root_source_file = b.path("tests/helpers.zig"),

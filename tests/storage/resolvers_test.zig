@@ -254,6 +254,27 @@ test "getResolverTextByResolver for V2 names" {
     try testing.expectEqualStrings("test@example.com", value.?);
 }
 
+test "getResolverTextKeysByResolver returns keys by resolver address" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "v2keys.eth");
+    const resolver = helpers.TEST_RESOLVER;
+    const tx_hash = helpers.randomHash();
+
+    try resolvers.storeResolverText(database, nh, resolver, "avatar", "img.png", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverText(database, nh, resolver, "url", "https://x.com", .l2, 1000, tx_hash, 1700000000);
+
+    const keys = try resolvers.getResolverTextKeysByResolver(database, resolver);
+    defer {
+        for (keys) |key| allocator.free(key);
+        allocator.free(keys);
+    }
+
+    try testing.expectEqual(@as(usize, 2), keys.len);
+}
+
 // ============================================================================
 // RESOLVER DISCOVERY
 // ============================================================================
@@ -311,4 +332,775 @@ test "getResolversByOwner returns empty for unknown owner" {
     defer allocator.free(resolver_list);
 
     try testing.expectEqual(@as(usize, 0), resolver_list.len);
+}
+
+// ============================================================================
+// ALIAS RECORDS
+// ============================================================================
+
+test "storeResolverAlias inserts alias record" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const resolver = helpers.TEST_RESOLVER;
+    const tx_hash = helpers.randomHash();
+
+    try resolvers.storeResolverAlias(
+        database,
+        resolver,
+        "sub.eth",
+        "target.eth",
+        .l2,
+        1000,
+        tx_hash,
+        1700000000,
+    );
+
+    const aliases = try resolvers.getResolverAliases(database, resolver);
+    defer {
+        for (aliases) |*a| a.deinit(allocator);
+        allocator.free(aliases);
+    }
+
+    try testing.expectEqual(@as(usize, 1), aliases.len);
+    try testing.expectEqualStrings("sub.eth", aliases[0].from_name);
+    try testing.expectEqualStrings("target.eth", aliases[0].to_name);
+}
+
+test "storeResolverAlias upserts existing alias" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const resolver = helpers.TEST_RESOLVER;
+    const tx_hash = helpers.randomHash();
+
+    // Insert initial alias
+    try resolvers.storeResolverAlias(database, resolver, "sub.eth", "old-target.eth", .l2, 1000, tx_hash, 1700000000);
+
+    // Update with new target
+    const tx_hash2 = helpers.randomHash();
+    try resolvers.storeResolverAlias(database, resolver, "sub.eth", "new-target.eth", .l2, 2000, tx_hash2, 1700001000);
+
+    const aliases = try resolvers.getResolverAliases(database, resolver);
+    defer {
+        for (aliases) |*a| a.deinit(allocator);
+        allocator.free(aliases);
+    }
+
+    try testing.expectEqual(@as(usize, 1), aliases.len);
+    try testing.expectEqualStrings("new-target.eth", aliases[0].to_name);
+}
+
+test "getResolverAliases returns multiple aliases" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const resolver = helpers.TEST_RESOLVER;
+    const tx_hash = helpers.randomHash();
+
+    try resolvers.storeResolverAlias(database, resolver, "a.eth", "target-a.eth", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverAlias(database, resolver, "b.eth", "target-b.eth", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverAlias(database, resolver, "c.eth", "target-c.eth", .l2, 1000, tx_hash, 1700000000);
+
+    const aliases = try resolvers.getResolverAliases(database, resolver);
+    defer {
+        for (aliases) |*a| a.deinit(allocator);
+        allocator.free(aliases);
+    }
+
+    try testing.expectEqual(@as(usize, 3), aliases.len);
+}
+
+test "getResolverAliases returns empty for unknown resolver" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const unknown = helpers.randomAddress();
+    const aliases = try resolvers.getResolverAliases(database, unknown);
+    defer allocator.free(aliases);
+
+    try testing.expectEqual(@as(usize, 0), aliases.len);
+}
+
+test "deleteResolverAlias removes specific alias" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const resolver = helpers.TEST_RESOLVER;
+    const tx_hash = helpers.randomHash();
+
+    try resolvers.storeResolverAlias(database, resolver, "keep.eth", "target1.eth", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverAlias(database, resolver, "remove.eth", "target2.eth", .l2, 1000, tx_hash, 1700000000);
+
+    // Delete one alias
+    try resolvers.deleteResolverAlias(database, resolver, "remove.eth");
+
+    const aliases = try resolvers.getResolverAliases(database, resolver);
+    defer {
+        for (aliases) |*a| a.deinit(allocator);
+        allocator.free(aliases);
+    }
+
+    try testing.expectEqual(@as(usize, 1), aliases.len);
+    try testing.expectEqualStrings("keep.eth", aliases[0].from_name);
+}
+
+// ============================================================================
+// PUBKEY RECORDS
+// ============================================================================
+
+test "storeResolverPubkey inserts pubkey record" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "pubkey.eth");
+    const resolver = helpers.TEST_RESOLVER;
+    const tx_hash = helpers.randomHash();
+
+    try resolvers.storeResolverPubkey(
+        database,
+        nh,
+        resolver,
+        "0xaabbccdd",
+        "0x11223344",
+        .l2,
+        1000,
+        tx_hash,
+        1700000000,
+    );
+
+    const result = try resolvers.getResolverPubkey(database, nh);
+    try testing.expect(result != null);
+    var pk = result.?;
+    defer pk.deinit(allocator);
+
+    try testing.expectEqualStrings("0xaabbccdd", pk.x);
+    try testing.expectEqualStrings("0x11223344", pk.y);
+}
+
+test "storeResolverPubkey upserts existing" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "pubkey-update.eth");
+    const resolver = helpers.TEST_RESOLVER;
+    const tx_hash = helpers.randomHash();
+
+    try resolvers.storeResolverPubkey(database, nh, resolver, "0x0001", "0x0002", .l2, 1000, tx_hash, 1700000000);
+    const tx_hash2 = helpers.randomHash();
+    try resolvers.storeResolverPubkey(database, nh, resolver, "0xnewx", "0xnewy", .l2, 2000, tx_hash2, 1700001000);
+
+    const result = try resolvers.getResolverPubkey(database, nh);
+    try testing.expect(result != null);
+    var pk = result.?;
+    defer pk.deinit(allocator);
+
+    try testing.expectEqualStrings("0xnewx", pk.x);
+    try testing.expectEqualStrings("0xnewy", pk.y);
+}
+
+test "getResolverPubkey returns null for unknown" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const unknown_nh = helpers.randomHash();
+    const result = try resolvers.getResolverPubkey(database, unknown_nh);
+    try testing.expect(result == null);
+}
+
+test "deleteResolverPubkeys clears pubkey" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "pubkey-del.eth");
+    const tx_hash = helpers.randomHash();
+
+    try resolvers.storeResolverPubkey(database, nh, helpers.TEST_RESOLVER, "0x01", "0x02", .l2, 1000, tx_hash, 1700000000);
+
+    // Verify exists
+    {
+        const result = try resolvers.getResolverPubkey(database, nh);
+        try testing.expect(result != null);
+        var pk = result.?;
+        pk.deinit(allocator);
+    }
+
+    // Delete
+    try resolvers.deleteResolverPubkeys(database, nh);
+
+    const result = try resolvers.getResolverPubkey(database, nh);
+    try testing.expect(result == null);
+}
+
+// ============================================================================
+// ABI RECORDS
+// ============================================================================
+
+test "storeResolverABI inserts ABI content type" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "abi.eth");
+    const resolver = helpers.TEST_RESOLVER;
+    const tx_hash = helpers.randomHash();
+
+    try resolvers.storeResolverABI(database, nh, resolver, 1, .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverABI(database, nh, resolver, 2, .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverABI(database, nh, resolver, 4, .l2, 1000, tx_hash, 1700000000);
+
+    const content_types = try resolvers.getResolverAbiContentTypes(database, nh);
+    defer allocator.free(content_types);
+
+    try testing.expectEqual(@as(usize, 3), content_types.len);
+    try testing.expectEqual(@as(u64, 1), content_types[0]);
+    try testing.expectEqual(@as(u64, 2), content_types[1]);
+    try testing.expectEqual(@as(u64, 4), content_types[2]);
+}
+
+test "getResolverAbiContentTypes returns empty for unknown" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const unknown_nh = helpers.randomHash();
+    const content_types = try resolvers.getResolverAbiContentTypes(database, unknown_nh);
+    defer allocator.free(content_types);
+
+    try testing.expectEqual(@as(usize, 0), content_types.len);
+}
+
+test "deleteResolverAbis clears all ABI records" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "abi-del.eth");
+    const tx_hash = helpers.randomHash();
+
+    try resolvers.storeResolverABI(database, nh, helpers.TEST_RESOLVER, 1, .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverABI(database, nh, helpers.TEST_RESOLVER, 2, .l2, 1000, tx_hash, 1700000000);
+
+    try resolvers.deleteResolverAbis(database, nh);
+
+    const content_types = try resolvers.getResolverAbiContentTypes(database, nh);
+    defer allocator.free(content_types);
+
+    try testing.expectEqual(@as(usize, 0), content_types.len);
+}
+
+// ============================================================================
+// NAME (REVERSE) RECORDS
+// ============================================================================
+
+test "storeResolverName inserts reverse name" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "reverse.eth");
+    const resolver = helpers.TEST_RESOLVER;
+    const tx_hash = helpers.randomHash();
+
+    try resolvers.storeResolverName(database, nh, resolver, "vitalik.eth", .l2, 1000, tx_hash, 1700000000);
+
+    const result = try resolvers.getResolverReverseName(database, nh);
+    try testing.expect(result != null);
+    defer allocator.free(result.?);
+
+    try testing.expectEqualStrings("vitalik.eth", result.?);
+}
+
+test "storeResolverName upserts existing" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "reverse-update.eth");
+    const tx_hash = helpers.randomHash();
+
+    try resolvers.storeResolverName(database, nh, helpers.TEST_RESOLVER, "old.eth", .l2, 1000, tx_hash, 1700000000);
+    const tx_hash2 = helpers.randomHash();
+    try resolvers.storeResolverName(database, nh, helpers.TEST_RESOLVER, "new.eth", .l2, 2000, tx_hash2, 1700001000);
+
+    const result = try resolvers.getResolverReverseName(database, nh);
+    try testing.expect(result != null);
+    defer allocator.free(result.?);
+
+    try testing.expectEqualStrings("new.eth", result.?);
+}
+
+test "getResolverReverseName returns null for unknown" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const unknown_nh = helpers.randomHash();
+    const result = try resolvers.getResolverReverseName(database, unknown_nh);
+    try testing.expect(result == null);
+}
+
+test "deleteResolverNames clears reverse name" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "reverse-del.eth");
+    const tx_hash = helpers.randomHash();
+
+    try resolvers.storeResolverName(database, nh, helpers.TEST_RESOLVER, "name.eth", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.deleteResolverNames(database, nh);
+
+    const result = try resolvers.getResolverReverseName(database, nh);
+    try testing.expect(result == null);
+}
+
+// ============================================================================
+// INTERFACE RECORDS
+// ============================================================================
+
+test "storeResolverInterface inserts interface record" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "iface.eth");
+    const resolver = helpers.TEST_RESOLVER;
+    const tx_hash = helpers.randomHash();
+
+    try resolvers.storeResolverInterface(
+        database,
+        nh,
+        resolver,
+        "0x01ffc9a7",
+        "0xaaaa",
+        .l2,
+        1000,
+        tx_hash,
+        1700000000,
+    );
+
+    const ifaces = try resolvers.getResolverInterfaces(database, nh);
+    defer {
+        for (ifaces) |*i| i.deinit(allocator);
+        allocator.free(ifaces);
+    }
+
+    try testing.expectEqual(@as(usize, 1), ifaces.len);
+    try testing.expectEqualStrings("0x01ffc9a7", ifaces[0].interface_id);
+    try testing.expectEqualStrings("0xaaaa", ifaces[0].implementer);
+}
+
+test "storeResolverInterface inserts multiple interfaces" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "multi-iface.eth");
+    const tx_hash = helpers.randomHash();
+
+    try resolvers.storeResolverInterface(database, nh, helpers.TEST_RESOLVER, "0x01ffc9a7", "0xaaaa", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverInterface(database, nh, helpers.TEST_RESOLVER, "0x3b3b57de", "0xbbbb", .l2, 1000, tx_hash, 1700000000);
+
+    const ifaces = try resolvers.getResolverInterfaces(database, nh);
+    defer {
+        for (ifaces) |*i| i.deinit(allocator);
+        allocator.free(ifaces);
+    }
+
+    try testing.expectEqual(@as(usize, 2), ifaces.len);
+}
+
+test "getResolverInterfaces returns empty for unknown" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const unknown_nh = helpers.randomHash();
+    const ifaces = try resolvers.getResolverInterfaces(database, unknown_nh);
+    defer allocator.free(ifaces);
+
+    try testing.expectEqual(@as(usize, 0), ifaces.len);
+}
+
+test "deleteResolverInterfaces clears all interfaces" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "iface-del.eth");
+    const tx_hash = helpers.randomHash();
+
+    try resolvers.storeResolverInterface(database, nh, helpers.TEST_RESOLVER, "0x01ffc9a7", "0xaaaa", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverInterface(database, nh, helpers.TEST_RESOLVER, "0x3b3b57de", "0xbbbb", .l2, 1000, tx_hash, 1700000000);
+
+    try resolvers.deleteResolverInterfaces(database, nh);
+
+    const ifaces = try resolvers.getResolverInterfaces(database, nh);
+    defer allocator.free(ifaces);
+
+    try testing.expectEqual(@as(usize, 0), ifaces.len);
+}
+
+// ============================================================================
+// VERSION RECORDS
+// ============================================================================
+
+test "storeResolverVersion inserts version" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "version.eth");
+    const tx_hash = helpers.randomHash();
+
+    try resolvers.storeResolverVersion(database, nh, helpers.TEST_RESOLVER, 1, .l2, 1000, tx_hash, 1700000000);
+
+    const result = try resolvers.getResolverVersion(database, nh);
+    try testing.expect(result != null);
+    try testing.expectEqual(@as(u64, 1), result.?);
+}
+
+test "storeResolverVersion upserts to higher version" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "version-up.eth");
+    const tx_hash = helpers.randomHash();
+
+    try resolvers.storeResolverVersion(database, nh, helpers.TEST_RESOLVER, 1, .l2, 1000, tx_hash, 1700000000);
+    const tx_hash2 = helpers.randomHash();
+    try resolvers.storeResolverVersion(database, nh, helpers.TEST_RESOLVER, 5, .l2, 2000, tx_hash2, 1700001000);
+
+    const result = try resolvers.getResolverVersion(database, nh);
+    try testing.expect(result != null);
+    try testing.expectEqual(@as(u64, 5), result.?);
+}
+
+test "getResolverVersion returns null for unknown" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const unknown_nh = helpers.randomHash();
+    const result = try resolvers.getResolverVersion(database, unknown_nh);
+    try testing.expect(result == null);
+}
+
+// ============================================================================
+// DELETE OPERATIONS (VersionChanged clearing)
+// ============================================================================
+
+test "deleteResolverAddresses clears all addresses for namehash" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "addr-del.eth");
+    const tx_hash = helpers.randomHash();
+
+    try resolvers.storeResolverAddress(database, nh, helpers.TEST_RESOLVER, 60, "0xeth", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverAddress(database, nh, helpers.TEST_RESOLVER, 0, "bc1q", .l2, 1000, tx_hash, 1700000000);
+
+    try resolvers.deleteResolverAddresses(database, nh);
+
+    const addresses = try resolvers.getResolverAllAddresses(database, nh);
+    defer allocator.free(addresses);
+
+    try testing.expectEqual(@as(usize, 0), addresses.len);
+}
+
+test "deleteResolverContentHash clears contenthash" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "ch-del.eth");
+    const tx_hash = helpers.randomHash();
+
+    try resolvers.storeResolverContentHash(database, nh, helpers.TEST_RESOLVER, "ipfs://Qm123", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.deleteResolverContentHash(database, nh);
+
+    const result = try resolvers.getResolverContentHash(database, nh);
+    try testing.expect(result == null);
+}
+
+test "deleteResolverTexts clears all text records" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "text-del.eth");
+    const tx_hash = helpers.randomHash();
+
+    try resolvers.storeResolverText(database, nh, helpers.TEST_RESOLVER, "avatar", "img.png", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverText(database, nh, helpers.TEST_RESOLVER, "url", "https://x.com", .l2, 1000, tx_hash, 1700000000);
+
+    try resolvers.deleteResolverTexts(database, nh);
+
+    const keys = try resolvers.getResolverTextKeys(database, nh);
+    defer allocator.free(keys);
+
+    try testing.expectEqual(@as(usize, 0), keys.len);
+}
+
+// ============================================================================
+// RESOLVER STATISTICS
+// ============================================================================
+
+test "getResolverNodeCount counts domains using resolver" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // Create names and set resolver
+    const nh1 = try helpers.createTestName(allocator, database, "stat1.eth", helpers.TEST_OWNER_1);
+    try database.updateNameResolver(nh1, helpers.TEST_RESOLVER);
+
+    const nh2 = try helpers.createTestName(allocator, database, "stat2.eth", helpers.TEST_OWNER_1);
+    try database.updateNameResolver(nh2, helpers.TEST_RESOLVER);
+
+    // Create a name with a different resolver
+    _ = try helpers.createTestName(allocator, database, "stat3.eth", helpers.TEST_OWNER_1);
+
+    const count = try resolvers.getResolverNodeCount(database, helpers.TEST_RESOLVER);
+    try testing.expectEqual(@as(usize, 2), count);
+}
+
+test "getResolverNodeCount returns 0 for unknown resolver" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const unknown = helpers.randomAddress();
+    const count = try resolvers.getResolverNodeCount(database, unknown);
+    try testing.expectEqual(@as(usize, 0), count);
+}
+
+test "getResolverAliasCount counts aliases for resolver" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const resolver = helpers.TEST_RESOLVER;
+    const tx_hash = helpers.randomHash();
+
+    try resolvers.storeResolverAlias(database, resolver, "a.eth", "b.eth", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverAlias(database, resolver, "c.eth", "d.eth", .l2, 1000, tx_hash, 1700000000);
+
+    const count = try resolvers.getResolverAliasCount(database, resolver);
+    try testing.expectEqual(@as(usize, 2), count);
+}
+
+test "getResolverAliasCount returns 0 for unknown resolver" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const unknown = helpers.randomAddress();
+    const count = try resolvers.getResolverAliasCount(database, unknown);
+    try testing.expectEqual(@as(usize, 0), count);
+}
+
+test "getResolverRoleHolderCount counts distinct accounts" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const roles = lib.storage.roles;
+    const tx_hash = helpers.randomHash();
+
+    // Two different accounts on the same resolver contract
+    try roles.upsertEACRole(database, .l2, "resource1", helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .l2, "resource2", helpers.TEST_OWNER_2, "0x02", 1000, tx_hash, 1, helpers.TEST_RESOLVER);
+    // Same account, different resource — should not add to distinct count
+    try roles.upsertEACRole(database, .l2, "resource3", helpers.TEST_OWNER_1, "0x04", 1000, tx_hash, 2, helpers.TEST_RESOLVER);
+
+    const count = try resolvers.getResolverRoleHolderCount(database, helpers.TEST_RESOLVER);
+    try testing.expectEqual(@as(usize, 2), count);
+}
+
+test "getResolverRoleHolderCount returns 0 for unknown resolver" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const unknown = helpers.randomAddress();
+    const count = try resolvers.getResolverRoleHolderCount(database, unknown);
+    try testing.expectEqual(@as(usize, 0), count);
+}
+
+test "getResolverRoles returns roles by contract address" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const roles = lib.storage.roles;
+    const tx_hash = helpers.randomHash();
+    const other_resolver = helpers.randomAddress();
+
+    // Roles on TEST_RESOLVER
+    try roles.upsertEACRole(database, .l2, "res1", helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .l2, "res2", helpers.TEST_OWNER_2, "0x02", 1000, tx_hash, 1, helpers.TEST_RESOLVER);
+    // Role on different resolver — should not be returned
+    try roles.upsertEACRole(database, .l2, "res3", helpers.TEST_OWNER_1, "0x04", 1000, tx_hash, 2, other_resolver);
+
+    const role_list = try resolvers.getResolverRoles(database, helpers.TEST_RESOLVER);
+    defer {
+        for (role_list) |*r| r.deinit(allocator);
+        allocator.free(role_list);
+    }
+
+    try testing.expectEqual(@as(usize, 2), role_list.len);
+}
+
+test "getResolverRoles returns empty for unknown resolver" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const unknown = helpers.randomAddress();
+    const role_list = try resolvers.getResolverRoles(database, unknown);
+    defer allocator.free(role_list);
+
+    try testing.expectEqual(@as(usize, 0), role_list.len);
+}
+
+// ============================================================================
+// GET NAMES BY RESOLVER
+// ============================================================================
+
+test "getNamesByResolver returns names using resolver" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const names = lib.storage.names;
+
+    // Create names and set resolver
+    const nh1 = try helpers.createTestName(allocator, database, "byres1.eth", helpers.TEST_OWNER_1);
+    try database.updateNameResolver(nh1, helpers.TEST_RESOLVER);
+
+    const nh2 = try helpers.createTestName(allocator, database, "byres2.eth", helpers.TEST_OWNER_1);
+    try database.updateNameResolver(nh2, helpers.TEST_RESOLVER);
+
+    // Name with different resolver — should not appear
+    _ = try helpers.createTestName(allocator, database, "byres3.eth", helpers.TEST_OWNER_1);
+
+    const name_list = try names.getNamesByResolver(database, helpers.TEST_RESOLVER, 100);
+    defer {
+        for (name_list) |*n| n.deinit(allocator);
+        allocator.free(name_list);
+    }
+
+    try testing.expectEqual(@as(usize, 2), name_list.len);
+}
+
+test "getNamesByResolver respects limit" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const names = lib.storage.names;
+
+    const nh1 = try helpers.createTestName(allocator, database, "lim1.eth", helpers.TEST_OWNER_1);
+    try database.updateNameResolver(nh1, helpers.TEST_RESOLVER);
+
+    const nh2 = try helpers.createTestName(allocator, database, "lim2.eth", helpers.TEST_OWNER_1);
+    try database.updateNameResolver(nh2, helpers.TEST_RESOLVER);
+
+    const nh3 = try helpers.createTestName(allocator, database, "lim3.eth", helpers.TEST_OWNER_1);
+    try database.updateNameResolver(nh3, helpers.TEST_RESOLVER);
+
+    const name_list = try names.getNamesByResolver(database, helpers.TEST_RESOLVER, 2);
+    defer {
+        for (name_list) |*n| n.deinit(allocator);
+        allocator.free(name_list);
+    }
+
+    try testing.expectEqual(@as(usize, 2), name_list.len);
+}
+
+test "getNamesByResolver returns empty for unknown resolver" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const names = lib.storage.names;
+    const unknown = helpers.randomAddress();
+
+    const name_list = try names.getNamesByResolver(database, unknown, 100);
+    defer allocator.free(name_list);
+
+    try testing.expectEqual(@as(usize, 0), name_list.len);
+}
+
+// ============================================================================
+// RESOLVER FILTER ON DOMAIN QUERIES
+// ============================================================================
+
+test "getFilteredNames with resolver filter" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const names = lib.storage.names;
+
+    // Create names, set resolver on some
+    const nh1 = try helpers.createTestName(allocator, database, "filt1.eth", helpers.TEST_OWNER_1);
+    try database.updateNameResolver(nh1, helpers.TEST_RESOLVER);
+
+    const nh2 = try helpers.createTestName(allocator, database, "filt2.eth", helpers.TEST_OWNER_1);
+    try database.updateNameResolver(nh2, helpers.TEST_RESOLVER);
+
+    // Name without resolver update (resolver = zero)
+    _ = try helpers.createTestName(allocator, database, "filt3.eth", helpers.TEST_OWNER_1);
+
+    const filtered = try names.getFilteredNames(
+        database,
+        .{ .resolver = helpers.TEST_RESOLVER },
+        0,
+        100,
+        .desc,
+        .created_at,
+    );
+    defer {
+        for (filtered) |*n| n.deinit(allocator);
+        allocator.free(filtered);
+    }
+
+    try testing.expectEqual(@as(usize, 2), filtered.len);
+}
+
+test "getFilteredNameCount with resolver filter" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const names = lib.storage.names;
+
+    const nh1 = try helpers.createTestName(allocator, database, "cnt1.eth", helpers.TEST_OWNER_1);
+    try database.updateNameResolver(nh1, helpers.TEST_RESOLVER);
+
+    const nh2 = try helpers.createTestName(allocator, database, "cnt2.eth", helpers.TEST_OWNER_1);
+    try database.updateNameResolver(nh2, helpers.TEST_RESOLVER);
+
+    _ = try helpers.createTestName(allocator, database, "cnt3.eth", helpers.TEST_OWNER_1);
+
+    const count = try names.getFilteredNameCount(
+        database,
+        .{ .resolver = helpers.TEST_RESOLVER },
+    );
+
+    try testing.expectEqual(@as(usize, 2), count);
 }
