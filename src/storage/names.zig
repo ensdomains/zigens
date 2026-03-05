@@ -416,6 +416,32 @@ pub fn deleteNameByTokenId(db: *Database, token_id: i64) !void {
     try q.exec();
 }
 
+/// Update name expiry by canonical ID (version-stable lookup for V2 renewals)
+pub fn updateNameExpiryByCanonicalId(db: *Database, canonical_id: u256, expiry: i64) !void {
+    var q = try Query.init(db, "UPDATE names SET expiry = ?, updated_at = ? WHERE canonical_id = ?");
+    defer q.deinit();
+
+    const canonical_id_hex = try formatU256Hex(db.allocator, canonical_id);
+    defer db.allocator.free(canonical_id_hex);
+
+    try q.bindInt64(expiry);
+    try q.bindInt64(std.time.timestamp());
+    try q.bindText(canonical_id_hex);
+    try q.exec();
+}
+
+/// Delete a name by canonical ID (version-stable lookup for burned names)
+pub fn deleteNameByCanonicalId(db: *Database, canonical_id: u256) !void {
+    var q = try Query.init(db, "DELETE FROM names WHERE canonical_id = ?");
+    defer q.deinit();
+
+    const canonical_id_hex = try formatU256Hex(db.allocator, canonical_id);
+    defer db.allocator.free(canonical_id_hex);
+
+    try q.bindText(canonical_id_hex);
+    try q.exec();
+}
+
 /// Update token_id for a name (for TokenRegenerated events)
 pub fn updateNameTokenId(db: *Database, old_token_id: u256, new_token_id: u256) !void {
     const token_id_utils = @import("../types/token_id.zig");

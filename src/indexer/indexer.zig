@@ -2767,28 +2767,27 @@ pub const Indexer = struct {
         // Topics[1] = indexed tokenId
         const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
         const token_id: u256 = token_id_raw;
+        const token_id_utils_renew = @import("../types/token_id.zig");
+        const canonical_id = token_id_utils_renew.getCanonicalId(token_id);
 
         // Data contains: uint64 newExpiration, address renewedBy (both padded to 32 bytes)
         const new_expiration = try abi.ABI.decodeUint256(log.data, 0);  // uint64 but padded
         const renewed_by = try abi.ABI.decodeAddress(log.data, 32);
 
-        std.log.debug("NameRenewed: tokenId={d}, newExpiration={d}, renewedBy={any}", .{
-            token_id, new_expiration, renewed_by
+        std.log.debug("NameRenewed: tokenId={d}, canonicalId={d}, newExpiration={d}, renewedBy={any}", .{
+            token_id, canonical_id, new_expiration, renewed_by
         });
 
-        // Look up the name by token_id to get the namehash
-        // For now, we'll update by token_id
-        try self.database.updateNameExpiryByTokenId(@intCast(token_id), @intCast(new_expiration));
+        // Update expiry using canonical_id (stable across token regenerations)
+        try self.database.updateNameExpiryByCanonicalId(canonical_id, @intCast(new_expiration));
 
-        // Store event - we need to look up the name/namehash for the event
-        // For simplicity, we'll just store the token_id
         const event_data = try std.fmt.allocPrint(self.allocator, "{{\"tokenId\":{d},\"newExpiration\":{d}}}", .{
             token_id,
             new_expiration,
         });
 
-        // Try to get the name from database
-        const maybe_name = try self.database.getNameByTokenId(token_id);
+        // Look up the name by canonical_id (stable across token regenerations)
+        const maybe_name = try self.database.getNameByCanonicalId(canonical_id);
         const name_str = if (maybe_name) |n| blk: {
             var name_copy = n;
             defer name_copy.deinit(self.allocator);
@@ -3050,6 +3049,8 @@ pub const Indexer = struct {
 
         const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
         const token_id: u256 = token_id_raw;
+        const token_id_utils_eth_renew = @import("../types/token_id.zig");
+        const canonical_id = token_id_utils_eth_renew.getCanonicalId(token_id);
 
         // Data: [offset_to_label, duration, newExpiry, paymentToken, referrer, base, label_length, label_data]
         const label_str = try abi.ABI.decodeString(self.allocator, log.data, 0);
@@ -3067,12 +3068,12 @@ pub const Indexer = struct {
         const referrer = try abi.ABI.decodeBytes32(log.data, 128);
         const base_price = try abi.ABI.decodeUint256(log.data, 160);
 
-        std.log.debug("ETHRegistrar.NameRenewed: {s} (tokenId={d}, duration={d}, newExpiry={d}, base={d})", .{
-            label_str, token_id, duration, new_expiry, base_price
+        std.log.debug("ETHRegistrar.NameRenewed: {s} (tokenId={d}, canonicalId={d}, duration={d}, newExpiry={d}, base={d})", .{
+            label_str, token_id, canonical_id, duration, new_expiry, base_price
         });
 
-        // Update name expiry
-        try self.database.updateNameExpiryByTokenId(@intCast(token_id), @intCast(new_expiry));
+        // Update expiry using canonical_id (stable across token regenerations)
+        try self.database.updateNameExpiryByCanonicalId(canonical_id, @intCast(new_expiry));
 
         // Store event with payment details
         const payment_token_hex = try payment_token.toHex(self.allocator);
@@ -3094,7 +3095,8 @@ pub const Indexer = struct {
             base_price,
         });
 
-        const maybe_name = try self.database.getNameByTokenId(token_id);
+        // Look up the name by canonical_id (stable across token regenerations)
+        const maybe_name = try self.database.getNameByCanonicalId(canonical_id);
         const name_str = if (maybe_name) |n| blk: {
             var name_copy = n;
             defer name_copy.deinit(self.allocator);
@@ -3159,14 +3161,16 @@ pub const Indexer = struct {
 
         const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
         const token_id: u256 = token_id_raw;
+        const token_id_utils_burn = @import("../types/token_id.zig");
+        const canonical_id = token_id_utils_burn.getCanonicalId(token_id);
 
         // Data contains: address burnedBy
         const burned_by = try abi.ABI.decodeAddress(log.data, 0);
 
-        std.log.debug("NameBurned: tokenId={d}, burnedBy={any}", .{ token_id, burned_by });
+        std.log.debug("NameBurned: tokenId={d}, canonicalId={d}, burnedBy={any}", .{ token_id, canonical_id, burned_by });
 
-        // Look up the name before deleting/marking as burned
-        const maybe_name = try self.database.getNameByTokenId(token_id);
+        // Look up the name by canonical_id (stable across token regenerations)
+        const maybe_name = try self.database.getNameByCanonicalId(canonical_id);
         const name_str = if (maybe_name) |n| blk: {
             var name_copy = n;
             defer name_copy.deinit(self.allocator);
@@ -3207,8 +3211,8 @@ pub const Indexer = struct {
 
         try self.insertEventAndNotify(event);
 
-        // Delete the burned name from the database
-        try self.database.deleteNameByTokenId(@intCast(token_id));
+        // Delete the burned name using canonical_id (stable across token regenerations)
+        try self.database.deleteNameByCanonicalId(canonical_id);
         std.log.debug("Deleted burned name from database: {s}", .{name_str});
     }
 
