@@ -273,11 +273,7 @@ pub fn resolveResolvers(ctx: parser.ExecutionContext, field: *const parser.Field
 
     for (resolvers, 0..) |*resolver, i| {
         if (i > 0) try json.appendSlice(allocator, ",");
-        const handler = FieldHandler{
-            .handleFn = handleResolverField,
-            .context = @constCast(@ptrCast(resolver)),
-        };
-        const resolver_json = try buildJsonWithFields(allocator, field.selections, handler);
+        const resolver_json = try buildResolverJson(resolver.address, field.selections, database, allocator, ctx.loaders);
         defer allocator.free(resolver_json);
         try json.appendSlice(allocator, resolver_json);
     }
@@ -435,7 +431,6 @@ pub fn resolveApprovals(ctx: parser.ExecutionContext, field: *const parser.Field
 /// Resolver for resolverDetail query - provides detailed resolver info with statistics
 pub fn resolveResolver(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
     const allocator = ctx.allocator;
-    const database: *db.Database = @ptrCast(@alignCast(ctx.database));
 
     // Get required id argument (resolver contract address)
     const id_arg = parser.getStringArg(field, "id", null) orelse {
@@ -448,13 +443,29 @@ pub fn resolveResolver(ctx: parser.ExecutionContext, field: *const parser.Field)
         return parser.FieldResult{ .json = json };
     };
 
-    // Build JSON based on requested fields
+    const database: *db.Database = @ptrCast(@alignCast(ctx.database));
+    const json = try buildResolverJson(resolver_addr, field.selections, database, allocator, ctx.loaders);
+    return parser.FieldResult{ .json = json };
+}
+
+// ============================================================================
+// Supporting Types and Functions for Resolvers
+// ============================================================================
+
+/// Shared builder for a single resolver's JSON. Used by both resolver(id) and resolvers(account).
+fn buildResolverJson(
+    resolver_addr: Address,
+    selections: []const parser.Field,
+    database: *db.Database,
+    allocator: std.mem.Allocator,
+    loaders: ?*anyopaque,
+) ![]u8 {
     var json: std.ArrayList(u8) = .{};
     defer json.deinit(allocator);
     try json.appendSlice(allocator, "{");
 
     var first = true;
-    for (field.selections) |*sel| {
+    for (selections) |*sel| {
         const output_key = sel.alias orelse sel.name;
 
         if (!first) try json.appendSlice(allocator, ",");
@@ -505,7 +516,7 @@ pub fn resolveResolver(ctx: parser.ExecutionContext, field: *const parser.Field)
                     .database = database,
                     .depth = 1,
                     .allocator = allocator,
-                    .loaders = ctx.loaders,
+                    .loaders = loaders,
                 });
                 defer allocator.free(domain_json);
                 try json.appendSlice(allocator, domain_json);
@@ -545,7 +556,6 @@ pub fn resolveResolver(ctx: parser.ExecutionContext, field: *const parser.Field)
                         first_sub = false;
                     }
                 }
-                // Default to all fields if none selected
                 if (first_sub) {
                     const escaped_from = try escapeJsonString(allocator, record.from_name);
                     defer allocator.free(escaped_from);
@@ -606,7 +616,7 @@ pub fn resolveResolver(ctx: parser.ExecutionContext, field: *const parser.Field)
                     .database = database,
                     .depth = 1,
                     .allocator = allocator,
-                    .loaders = ctx.loaders,
+                    .loaders = loaders,
                 });
                 defer allocator.free(evt_json);
                 try json.appendSlice(allocator, evt_json);
@@ -617,12 +627,8 @@ pub fn resolveResolver(ctx: parser.ExecutionContext, field: *const parser.Field)
     }
 
     try json.appendSlice(allocator, "}");
-    return parser.FieldResult{ .json = try allocator.dupe(u8, json.items) };
+    return try allocator.dupe(u8, json.items);
 }
-
-// ============================================================================
-// Supporting Types and Functions for Resolvers
-// ============================================================================
 
 /// Generic field handler callback type
 const FieldHandler = struct {
@@ -710,35 +716,6 @@ fn handleEACRoleField(ctx: *anyopaque, output_key: []const u8, field_name: []con
         } else {
             try writer.print("\"{s}\":null", .{output_key});
         }
-        return true;
-    }
-    return false;
-}
-
-/// Resolver field handler
-fn handleResolverField(ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
-    const resolver: *const models.Resolver = @ptrCast(@alignCast(ctx));
-
-    if (std.mem.eql(u8, field_name, "address")) {
-        const addr_hex = try resolver.address.toHex(allocator);
-        defer allocator.free(addr_hex);
-        try writer.print("\"{s}\":\"{s}\"", .{ output_key, addr_hex });
-        return true;
-    } else if (std.mem.eql(u8, field_name, "name")) {
-        const escaped = try escapeJsonString(allocator, resolver.name);
-        defer allocator.free(escaped);
-        try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
-        return true;
-    } else if (std.mem.eql(u8, field_name, "namehash")) {
-        const hash_hex = try resolver.namehash.toHex(allocator);
-        defer allocator.free(hash_hex);
-        try writer.print("\"{s}\":\"{s}\"", .{ output_key, hash_hex });
-        return true;
-    } else if (std.mem.eql(u8, field_name, "setBlock")) {
-        try writer.print("\"{s}\":{d}", .{ output_key, resolver.set_block });
-        return true;
-    } else if (std.mem.eql(u8, field_name, "setAt")) {
-        try writer.print("\"{s}\":{d}", .{ output_key, resolver.set_at });
         return true;
     }
     return false;

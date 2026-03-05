@@ -90,7 +90,20 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
                     }
                 }
             }
-            break;
+        } else if (std.mem.eql(u8, arg.name, "orderBy") and arg.value == .string) {
+            if (std.mem.eql(u8, arg.value.string, "blockNumber")) {
+                filter_opts.sort_field = .block_number;
+            } else if (std.mem.eql(u8, arg.value.string, "timestamp")) {
+                filter_opts.sort_field = .timestamp;
+            } else if (std.mem.eql(u8, arg.value.string, "name")) {
+                filter_opts.sort_field = .name;
+            }
+        } else if (std.mem.eql(u8, arg.name, "orderDirection") and arg.value == .string) {
+            if (std.mem.eql(u8, arg.value.string, "asc")) {
+                filter_opts.order_dir = .asc;
+            } else if (std.mem.eql(u8, arg.value.string, "desc")) {
+                filter_opts.order_dir = .desc;
+            }
         }
     }
 
@@ -111,8 +124,12 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
     // Fetch one extra item to determine hasNextPage/hasPreviousPage
     const fetch_limit = params.limit + 1;
 
-    // For backward pagination (last/before), reverse the query order
-    const order_dir: db.EventOrderDir = if (params.direction == .backward) .asc else .desc;
+    // For backward pagination (last/before), flip the query order
+    const user_dir = filter_opts.order_dir;
+    const order_dir: db.EventOrderDir = if (params.direction == .backward)
+        (if (user_dir == .desc) .asc else .desc)
+    else
+        user_dir;
 
     // Apply filters and fetch
     var fetch_filter = filter_opts;
@@ -283,7 +300,7 @@ pub fn resolveEvents(ctx: parser.ExecutionContext, field: *const parser.Field) !
     var normalized_contract_address: ?[]u8 = null;
     defer if (normalized_contract_address) |addr| allocator.free(addr);
 
-    // Parse 'where' argument
+    // Parse arguments
     for (field.arguments) |arg| {
         if (std.mem.eql(u8, arg.name, "where") and arg.value == .object) {
             for (arg.value.object) |filter_arg| {
@@ -337,6 +354,20 @@ pub fn resolveEvents(ctx: parser.ExecutionContext, field: *const parser.Field) !
                         filter_opts.timestamp_lt = filter_arg.value.int;
                     }
                 }
+            }
+        } else if (std.mem.eql(u8, arg.name, "orderBy") and arg.value == .string) {
+            if (std.mem.eql(u8, arg.value.string, "blockNumber")) {
+                filter_opts.sort_field = .block_number;
+            } else if (std.mem.eql(u8, arg.value.string, "timestamp")) {
+                filter_opts.sort_field = .timestamp;
+            } else if (std.mem.eql(u8, arg.value.string, "name")) {
+                filter_opts.sort_field = .name;
+            }
+        } else if (std.mem.eql(u8, arg.name, "orderDirection") and arg.value == .string) {
+            if (std.mem.eql(u8, arg.value.string, "asc")) {
+                filter_opts.order_dir = .asc;
+            } else if (std.mem.eql(u8, arg.value.string, "desc")) {
+                filter_opts.order_dir = .desc;
             }
         }
     }

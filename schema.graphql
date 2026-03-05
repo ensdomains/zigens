@@ -21,10 +21,10 @@ type Query {
   registrationConnection(first: Int, after: String, last: Int, before: String, where: RegistrationFilter, orderBy: Registration_orderBy, orderDirection: OrderDirection): RegistrationConnection!
 
   """Get events with pagination (legacy offset-based)"""
-  events(first: Int = 100, skip: Int = 0, where: EventFilter): [Event!]!
+  events(first: Int = 100, skip: Int = 0, where: EventFilter, orderBy: Event_orderBy, orderDirection: OrderDirection): [Event!]!
 
   """Get events with cursor-based pagination (recommended)"""
-  eventConnection(first: Int, after: String, last: Int, before: String, where: EventFilter): EventConnection!
+  eventConnection(first: Int, after: String, last: Int, before: String, where: EventFilter, orderBy: Event_orderBy, orderDirection: OrderDirection): EventConnection!
 
   """Get EAC role assignments"""
   roles(resource: String, account: String): [EACRoleAssignment!]!
@@ -33,7 +33,7 @@ type Query {
   roleConnection(first: Int, after: String, last: Int, before: String, resource: String, account: String): EACRoleAssignmentConnection!
 
   """Get dedicated resolvers for an account"""
-  resolvers(account: String!): [ResolverInfo!]!
+  resolvers(account: String!): [ResolverDetail!]!
 
   """Get registries owned by an account"""
   registries(owner: String!): [RegistryInfo!]!
@@ -191,6 +191,9 @@ type Domain {
 
   """Timestamp when domain was created"""
   createdAt: Int!
+
+  """Timestamp when domain was registered"""
+  registrationDate: Int
 
   """Original registrant of the domain"""
   registrant: Account
@@ -506,23 +509,6 @@ type EACRoleAssignment {
 }
 
 """Resolver information"""
-type ResolverInfo {
-  """Resolver contract address"""
-  address: String!
-
-  """Name this resolver is set for"""
-  name: String!
-
-  """Namehash of the name"""
-  namehash: String!
-
-  """Block when resolver was set"""
-  setBlock: Int!
-
-  """Timestamp when resolver was set"""
-  setAt: Int!
-}
-
 """Detailed resolver information with statistics"""
 type ResolverDetail {
   """Resolver contract address"""
@@ -641,6 +627,13 @@ enum Domain_orderBy {
   createdAt
   expiryDate
   registrationDate
+}
+
+"""Fields to order Event results by"""
+enum Event_orderBy {
+  blockNumber
+  timestamp
+  name
 }
 
 """Fields to order Registration results by"""
