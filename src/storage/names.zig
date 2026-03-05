@@ -14,17 +14,17 @@ const Hash = @import("../types/hash.zig").Hash;
 // CONSTANTS
 // ============================================================================
 
-/// Standard SELECT columns for names table (27 columns)
+/// Standard SELECT columns for names table (28 columns)
 /// Column order: name(0), label(1), label_hash(2), parent_name(3), parent_namehash(4),
 ///               chain(5), registry(6), owner(7), registrant(8), resolver(9),
 ///               token_id(10), canonical_id(11), token_version(12), namehash(13), expiry(14),
 ///               registry_locked(15), migrated(16), ejected(17), created_block(18), created_at(19),
-///               updated_block(20), updated_at(21), is_wrapped(22), wrapper_fuses(23),
-///               wrapper_expiry(24), is_v1_name(25), v1_label_hash(26)
+///               registered_at(20), updated_block(21), updated_at(22), is_wrapped(23), wrapper_fuses(24),
+///               wrapper_expiry(25), is_v1_name(26), v1_label_hash(27)
 const SQL_SELECT_NAMES =
     \\SELECT name, label, label_hash, parent_name, parent_namehash, chain, registry,
     \\       owner, registrant, resolver, token_id, canonical_id, token_version, namehash, expiry,
-    \\       registry_locked, migrated, ejected, created_block, created_at, updated_block, updated_at,
+    \\       registry_locked, migrated, ejected, created_block, created_at, registered_at, updated_block, updated_at,
     \\       is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash
     \\FROM names
 ;
@@ -33,7 +33,7 @@ const SQL_SELECT_NAMES =
 const SQL_SELECT_NAMES_SHORT =
     \\SELECT name, label, label_hash, parent_name, parent_namehash, chain, registry,
     \\       owner, registrant, resolver, token_id, canonical_id, token_version, namehash, expiry,
-    \\       registry_locked, migrated, ejected, created_block, created_at, updated_block, updated_at
+    \\       registry_locked, migrated, ejected, created_block, created_at, registered_at, updated_block, updated_at
     \\FROM names
 ;
 
@@ -76,9 +76,9 @@ fn parseNameRow(q: *Query, allocator: std.mem.Allocator) !models.Name {
         try Address.fromHex(owner_str);
 
     // Parse wrapper fields (optional)
-    const wrapper_fuses = if (q.getTextSlice(23)) |fuses| try allocator.dupe(u8, fuses) else null;
-    const wrapper_expiry = q.getOptionalInt64(24);
-    const v1_label_hash = if (q.getTextSlice(26)) |hash| try allocator.dupe(u8, hash) else null;
+    const wrapper_fuses = if (q.getTextSlice(24)) |fuses| try allocator.dupe(u8, fuses) else null;
+    const wrapper_expiry = q.getOptionalInt64(25);
+    const v1_label_hash = if (q.getTextSlice(27)) |hash| try allocator.dupe(u8, hash) else null;
 
     return models.Name{
         .name = try allocator.dupe(u8, name_str),
@@ -101,12 +101,13 @@ fn parseNameRow(q: *Query, allocator: std.mem.Allocator) !models.Name {
         .ejected = q.getBool(17),
         .created_block = @intCast(q.getInt64(18)),
         .created_at = q.getInt64(19),
-        .updated_block = @intCast(q.getInt64(20)),
-        .updated_at = q.getInt64(21),
-        .is_wrapped = q.getBool(22),
+        .registered_at = q.getOptionalInt64(20) orelse q.getInt64(19),
+        .updated_block = @intCast(q.getInt64(21)),
+        .updated_at = q.getInt64(22),
+        .is_wrapped = q.getBool(23),
         .wrapper_fuses = wrapper_fuses,
         .wrapper_expiry = wrapper_expiry,
-        .is_v1_name = q.getBool(25),
+        .is_v1_name = q.getBool(26),
         .v1_label_hash = v1_label_hash,
     };
 }
@@ -153,8 +154,9 @@ fn parseNameRowShort(q: *Query, allocator: std.mem.Allocator) !models.Name {
         .ejected = q.getBool(17),
         .created_block = @intCast(q.getInt64(18)),
         .created_at = q.getInt64(19),
-        .updated_block = @intCast(q.getInt64(20)),
-        .updated_at = q.getInt64(21),
+        .registered_at = q.getOptionalInt64(20) orelse q.getInt64(19),
+        .updated_block = @intCast(q.getInt64(21)),
+        .updated_at = q.getInt64(22),
         .is_wrapped = false,
         .wrapper_fuses = null,
         .wrapper_expiry = null,
@@ -284,12 +286,37 @@ pub fn getRegistriesByOwner(db: *Database, chain: models.Chain, owner: Address) 
 
 pub fn insertName(db: *Database, name: models.Name) !void {
     var q = try Query.init(db,
-        \\INSERT OR REPLACE INTO names
+        \\INSERT INTO names
         \\(namehash, name, label, label_hash, parent_name, parent_namehash, chain,
         \\ registry, owner, registrant, resolver, token_id, canonical_id, token_version, expiry,
-        \\ registry_locked, migrated, ejected, created_block, created_at, updated_block, updated_at,
+        \\ registry_locked, migrated, ejected, created_block, created_at, registered_at, updated_block, updated_at,
         \\ is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        \\ON CONFLICT(chain, namehash) DO UPDATE SET
+        \\ name = excluded.name,
+        \\ label = excluded.label,
+        \\ label_hash = excluded.label_hash,
+        \\ parent_name = excluded.parent_name,
+        \\ parent_namehash = excluded.parent_namehash,
+        \\ registry = excluded.registry,
+        \\ owner = excluded.owner,
+        \\ registrant = excluded.registrant,
+        \\ resolver = excluded.resolver,
+        \\ token_id = excluded.token_id,
+        \\ canonical_id = excluded.canonical_id,
+        \\ token_version = excluded.token_version,
+        \\ expiry = excluded.expiry,
+        \\ registry_locked = excluded.registry_locked,
+        \\ migrated = excluded.migrated,
+        \\ ejected = excluded.ejected,
+        \\ registered_at = excluded.registered_at,
+        \\ updated_block = excluded.updated_block,
+        \\ updated_at = excluded.updated_at,
+        \\ is_wrapped = excluded.is_wrapped,
+        \\ wrapper_fuses = excluded.wrapper_fuses,
+        \\ wrapper_expiry = excluded.wrapper_expiry,
+        \\ is_v1_name = excluded.is_v1_name,
+        \\ v1_label_hash = excluded.v1_label_hash
     );
     defer q.deinit();
 
@@ -319,6 +346,7 @@ pub fn insertName(db: *Database, name: models.Name) !void {
     try q.bindInt(if (name.ejected) 1 else 0);
     try q.bindInt64(@intCast(name.created_block));
     try q.bindInt64(name.created_at);
+    try q.bindInt64(name.registered_at);
     try q.bindInt64(@intCast(name.updated_block));
     try q.bindInt64(name.updated_at);
     try q.bindInt(if (name.is_wrapped) 1 else 0);
@@ -578,6 +606,29 @@ pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Nam
     return names.toOwnedSlice(db.allocator);
 }
 
+/// Get names by resolver address
+pub fn getNamesByResolver(db: *Database, resolver: Address, limit: u32) ![]models.Name {
+    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE resolver = ? ORDER BY created_at DESC LIMIT ?");
+    defer q.deinit();
+
+    try q.bindAddress(resolver);
+    try q.bindInt(@intCast(limit));
+
+    var names: std.ArrayList(models.Name) = .{};
+    errdefer {
+        for (names.items) |*name| {
+            name.deinit(db.allocator);
+        }
+        names.deinit(db.allocator);
+    }
+
+    while (try q.step()) {
+        try names.append(db.allocator, try parseNameRowShort(&q, db.allocator));
+    }
+
+    return names.toOwnedSlice(db.allocator);
+}
+
 /// Get names by registrant address
 pub fn getNamesByRegistrant(db: *Database, registrant: Address, skip: u32, limit: u32) ![]models.Name {
     var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE registrant = ? ORDER BY created_at DESC LIMIT ? OFFSET ?");
@@ -608,6 +659,23 @@ pub const OrderDir = enum {
     desc,
 };
 
+/// Sort field for name queries
+pub const NameSortField = enum {
+    created_at,
+    name,
+    expiry,
+    registered_at,
+
+    pub fn toSql(self: NameSortField) []const u8 {
+        return switch (self) {
+            .created_at => "created_at",
+            .name => "name",
+            .expiry => "expiry",
+            .registered_at => "registered_at",
+        };
+    }
+};
+
 /// Parse name rows from a query result
 fn parseNameRows(q: *Query, allocator: std.mem.Allocator) ![]models.Name {
     var names: std.ArrayList(models.Name) = .{};
@@ -622,8 +690,8 @@ fn parseNameRows(q: *Query, allocator: std.mem.Allocator) ![]models.Name {
         // Column order: name(0), namehash(1), label(2), label_hash(3), parent_name(4), parent_namehash(5),
         //               owner(6), resolver(7), registry(8), chain(9), token_id(10),
         //               canonical_id(11), token_version(12), expiry(13), registry_locked(14),
-        //               migrated(15), ejected(16), created_at(17), created_block(18),
-        //               updated_at(19), updated_block(20)
+        //               migrated(15), ejected(16), created_at(17), registered_at(18),
+        //               created_block(19), updated_at(20), updated_block(21)
         const name_str = q.getTextSlice(0) orelse "";
         const namehash_str = q.getTextSlice(1) orelse "";
         const label_str = q.getTextSlice(2) orelse "";
@@ -657,9 +725,10 @@ fn parseNameRows(q: *Query, allocator: std.mem.Allocator) ![]models.Name {
             .migrated = q.getBool(15),
             .ejected = q.getBool(16),
             .created_at = q.getInt64(17),
-            .created_block = @intCast(q.getInt64(18)),
-            .updated_at = q.getInt64(19),
-            .updated_block = @intCast(q.getInt64(20)),
+            .registered_at = q.getOptionalInt64(18) orelse q.getInt64(17),
+            .created_block = @intCast(q.getInt64(19)),
+            .updated_at = q.getInt64(20),
+            .updated_block = @intCast(q.getInt64(21)),
             .is_wrapped = false,
             .wrapper_fuses = null,
             .wrapper_expiry = null,
@@ -672,7 +741,7 @@ fn parseNameRows(q: *Query, allocator: std.mem.Allocator) ![]models.Name {
 }
 
 pub fn getAllNames(db: *Database, owner: ?Address, skip: u32, limit: u32) ![]models.Name {
-    return getAllNamesWithOrder(db, owner, skip, limit, .desc);
+    return getAllNamesWithOrder(db, owner, skip, limit, .desc, .created_at);
 }
 
 /// Filter options for querying names
@@ -693,6 +762,8 @@ pub const NameFilters = struct {
     expiry_lte: ?i64 = null,
     // Resolved address filter (requires resolver lookup)
     resolved_address: ?Address = null,
+    // Resolver contract address filter
+    resolver: ?Address = null,
     // Subdomain filters (requires subquery)
     has_subdomains: ?bool = null,
     subdomain_count_gt: ?i64 = null,
@@ -700,7 +771,7 @@ pub const NameFilters = struct {
 };
 
 /// Get names with filters pushed down to DB query
-pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u32, order_dir: OrderDir) ![]models.Name {
+pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u32, order_dir: OrderDir, sort_field: NameSortField) ![]models.Name {
     const order_str = if (order_dir == .desc) "DESC" else "ASC";
 
     // Build WHERE clause dynamically using ArrayList for conditions
@@ -771,6 +842,11 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
         try conditions.append(db.allocator, "namehash IN (SELECT namehash FROM resolver_addresses WHERE address = ?)");
     }
 
+    // Resolver contract address filter
+    if (filters.resolver != null) {
+        try conditions.append(db.allocator, "resolver = ?");
+    }
+
     // Subdomain count filters (using subquery)
     if (filters.has_subdomains) |has_subs| {
         if (has_subs) {
@@ -802,9 +878,9 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
     const sql = try std.fmt.allocPrint(db.allocator,
         \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, chain,
         \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated, ejected,
-        \\       created_at, created_block, updated_at, updated_block
-        \\FROM names {s}ORDER BY created_at {s} LIMIT ? OFFSET ?
-    , .{ where_clause.items, order_str });
+        \\       created_at, registered_at, created_block, updated_at, updated_block
+        \\FROM names {s}ORDER BY {s} {s} LIMIT ? OFFSET ?
+    , .{ where_clause.items, sort_field.toSql(), order_str });
     defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
@@ -849,6 +925,9 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
     if (filters.resolved_address) |addr| {
         try q.bindAddress(addr);
     }
+    if (filters.resolver) |addr| {
+        try q.bindAddress(addr);
+    }
     // has_subdomains doesn't need binding (no ?)
     if (filters.subdomain_count_gt) |v| {
         try q.bindInt64(v);
@@ -863,22 +942,22 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
 }
 
 /// Get all names with configurable order direction
-pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u32, order_dir: OrderDir) ![]models.Name {
+pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u32, order_dir: OrderDir, sort_field: NameSortField) ![]models.Name {
     const order_str = if (order_dir == .desc) "DESC" else "ASC";
     const sql = if (owner != null)
         try std.fmt.allocPrint(db.allocator,
             \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, chain,
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated, ejected,
-            \\       created_at, created_block, updated_at, updated_block
-            \\FROM names WHERE owner = ? ORDER BY created_at {s} LIMIT ? OFFSET ?
-        , .{order_str})
+            \\       created_at, registered_at, created_block, updated_at, updated_block
+            \\FROM names WHERE owner = ? ORDER BY {s} {s} LIMIT ? OFFSET ?
+        , .{ sort_field.toSql(), order_str })
     else
         try std.fmt.allocPrint(db.allocator,
             \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, chain,
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated, ejected,
-            \\       created_at, created_block, updated_at, updated_block
-            \\FROM names ORDER BY created_at {s} LIMIT ? OFFSET ?
-        , .{order_str});
+            \\       created_at, registered_at, created_block, updated_at, updated_block
+            \\FROM names ORDER BY {s} {s} LIMIT ? OFFSET ?
+        , .{ sort_field.toSql(), order_str });
     defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
@@ -902,8 +981,8 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
         // Column order: name(0), namehash(1), label(2), label_hash(3), parent_name(4), parent_namehash(5),
         //               owner(6), resolver(7), registry(8), chain(9), token_id(10),
         //               canonical_id(11), token_version(12), expiry(13), registry_locked(14),
-        //               migrated(15), ejected(16), created_at(17), created_block(18),
-        //               updated_at(19), updated_block(20)
+        //               migrated(15), ejected(16), created_at(17), registered_at(18),
+        //               created_block(19), updated_at(20), updated_block(21)
         const name_str = q.getTextSlice(0) orelse "";
         const namehash_str = q.getTextSlice(1) orelse "";
         const label_str = q.getTextSlice(2) orelse "";
@@ -937,9 +1016,10 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
             .migrated = q.getBool(15),
             .ejected = q.getBool(16),
             .created_at = q.getInt64(17),
-            .created_block = @intCast(q.getInt64(18)),
-            .updated_at = q.getInt64(19),
-            .updated_block = @intCast(q.getInt64(20)),
+            .registered_at = q.getOptionalInt64(18) orelse q.getInt64(17),
+            .created_block = @intCast(q.getInt64(19)),
+            .updated_at = q.getInt64(20),
+            .updated_block = @intCast(q.getInt64(21)),
             .is_wrapped = false,
             .wrapper_fuses = null,
             .wrapper_expiry = null,
@@ -1021,6 +1101,9 @@ pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
     if (filters.resolved_address != null) {
         try conditions.append(db.allocator, "namehash IN (SELECT namehash FROM resolver_addresses WHERE address = ?)");
     }
+    if (filters.resolver != null) {
+        try conditions.append(db.allocator, "resolver = ?");
+    }
     if (filters.has_subdomains) |has_subs| {
         if (has_subs) {
             try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) > 0");
@@ -1091,6 +1174,9 @@ pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
         try q.bindInt64(v);
     }
     if (filters.resolved_address) |addr| {
+        try q.bindAddress(addr);
+    }
+    if (filters.resolver) |addr| {
         try q.bindAddress(addr);
     }
     // has_subdomains doesn't need binding (no ?)

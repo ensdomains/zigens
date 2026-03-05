@@ -61,6 +61,7 @@ pub const GraphQLHandler = struct {
         try executor.registerResolver("roles", resolvers.resolveRoles);
         try executor.registerResolver("roleConnection", resolvers.resolveRolesConnection);
         try executor.registerResolver("resolvers", resolvers.resolveResolvers);
+        try executor.registerResolver("resolver", resolvers.resolveResolver);
         try executor.registerResolver("registries", resolvers.resolveRegistries);
         try executor.registerResolver("metadata", resolvers.resolveMetadata);
         try executor.registerResolver("approvals", resolvers.resolveApprovals);
@@ -904,7 +905,7 @@ pub const GraphQLHandler = struct {
         try writer.print("\"isMigrated\":{},", .{domain.migrated});
         try writer.print("\"createdAt\":{d},", .{domain.created_at});
         try writer.print("\"registrant\":{{\"id\":\"{s}\"}},", .{owner_hex});
-        try writer.print("\"registrationDate\":{d},", .{domain.created_at});
+        try writer.print("\"registrationDate\":{d},", .{domain.registered_at});
         if (builders.hasValidExpiry(domain.expiry)) {
             try writer.print("\"expiryDate\":{d},", .{domain.expiry});
         } else {
@@ -1343,7 +1344,7 @@ pub const GraphQLHandler = struct {
 
             if (requested_fields.contains("registrationDate")) {
                 if (!first) try writer.writeAll(",");
-                try writer.print("\"registrationDate\":{d}", .{item.created_at});
+                try writer.print("\"registrationDate\":{d}", .{item.registered_at});
                 first = false;
             }
 

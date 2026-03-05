@@ -1,12 +1,14 @@
 const std = @import("std");
 const testing = std.testing;
 
-// Import modules
-const Address = @import("../src/types/address.zig").Address;
-const Hash = @import("../src/types/hash.zig").Hash;
-const models = @import("../src/types/models.zig");
-const db = @import("../src/storage/database.zig");
-const namehash = @import("../src/types/hash.zig").namehash;
+// Import modules via lib
+const lib = @import("lib");
+const Address = lib.Address;
+const Hash = lib.Hash;
+const models = lib.models;
+const Database = lib.Database;
+const namehash = lib.namehash;
+const keccak256 = lib.keccak256;
 
 test "Database integration - full workflow" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -14,7 +16,7 @@ test "Database integration - full workflow" {
     const allocator = gpa.allocator();
 
     // Create in-memory database
-    var database = try db.Database.init(allocator, ":memory:");
+    var database = try Database.init(allocator, ":memory:");
     defer database.deinit();
 
     // Test 1: Insert a registry
@@ -32,29 +34,42 @@ test "Database integration - full workflow" {
     std.debug.print("✓ Registry inserted\n", .{});
 
     // Test 2: Insert a name
-    const alice_eth = models.Name{
-        .name = try allocator.dupe(u8, "alice.eth"),
-        .namehash = try namehash(allocator, "alice.eth"),
-        .label = try allocator.dupe(u8, "alice"),
-        .label_hash = try @import("../src/types/hash.zig").keccak256(allocator, "alice"),
-        .parent_name = try allocator.dupe(u8, "eth"),
-        .parent_namehash = try namehash(allocator, "eth"),
-        .chain = .l2,
-        .registry = try Address.fromHex("0x0000000000000000000000000000000000000001"),
-        .owner = try Address.fromHex("0x0000000000000000000000000000000000000123"),
-        .resolver = try Address.fromHex("0x0000000000000000000000000000000000000456"),
-        .token_id = 12345,
-        .expiry = std.time.timestamp() + 31536000, // 1 year from now
-        .registry_locked = false,
-        .migrated = true,
-        .ejected = false,
-        .created_block = 101,
-        .created_at = std.time.timestamp(),
-        .updated_block = 101,
-        .updated_at = std.time.timestamp(),
-    };
+    const ts = std.time.timestamp();
+    {
+        var alice_eth = models.Name{
+            .name = try allocator.dupe(u8, "alice.eth"),
+            .namehash = try namehash(allocator, "alice.eth"),
+            .label = try allocator.dupe(u8, "alice"),
+            .label_hash = try keccak256(allocator, "alice"),
+            .parent_name = try allocator.dupe(u8, "eth"),
+            .parent_namehash = try namehash(allocator, "eth"),
+            .chain = .l2,
+            .registry = try Address.fromHex("0x0000000000000000000000000000000000000001"),
+            .owner = try Address.fromHex("0x0000000000000000000000000000000000000123"),
+            .registrant = try Address.fromHex("0x0000000000000000000000000000000000000123"),
+            .resolver = try Address.fromHex("0x0000000000000000000000000000000000000456"),
+            .token_id = 12345,
+            .canonical_id = 12345,
+            .token_version = 1,
+            .expiry = @bitCast(ts + 31536000), // 1 year from now
+            .registry_locked = false,
+            .migrated = true,
+            .ejected = false,
+            .created_block = 101,
+            .created_at = ts,
+            .registered_at = ts,
+            .updated_block = 101,
+            .updated_at = ts,
+            .is_wrapped = false,
+            .wrapper_fuses = null,
+            .wrapper_expiry = null,
+            .is_v1_name = false,
+            .v1_label_hash = null,
+        };
+        defer alice_eth.deinit(allocator);
 
-    try database.insertName(alice_eth);
+        try database.insertName(alice_eth);
+    }
     std.debug.print("✓ Name inserted\n", .{});
 
     // Test 3: Query name by namehash
@@ -62,9 +77,10 @@ test "Database integration - full workflow" {
     const retrieved = try database.getNameByNamehash(nh);
 
     try testing.expect(retrieved != null);
-    if (retrieved) |name| {
+    if (retrieved) |n| {
+        var name = n;
         defer name.deinit(allocator);
-        try testing.expectEqualStrings("alice.eth", name.name);
+        try testing.expectEqualStrings("alice.eth", name.name.?);
         try testing.expect(name.chain == .l2);
         try testing.expect(!name.ejected);
         try testing.expect(name.migrated);
@@ -72,20 +88,23 @@ test "Database integration - full workflow" {
     }
 
     // Test 4: Insert an event
-    const event = models.Event{
-        .event_type = .name_registered,
-        .chain = .l2,
-        .block_number = 101,
-        .tx_hash = try Hash.fromHex("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"),
-        .log_index = 0,
-        .contract_address = try Address.fromHex("0x0000000000000000000000000000000000000001"),
-        .name = try allocator.dupe(u8, "alice.eth"),
-        .namehash = try namehash(allocator, "alice.eth"),
-        .data = try allocator.dupe(u8, "{}"),
-        .timestamp = std.time.timestamp(),
-    };
+    {
+        var event = models.Event{
+            .event_type = .name_registered,
+            .chain = .l2,
+            .block_number = 101,
+            .tx_hash = try Hash.fromHex("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"),
+            .log_index = 0,
+            .contract_address = try Address.fromHex("0x0000000000000000000000000000000000000001"),
+            .name = try allocator.dupe(u8, "alice.eth"),
+            .namehash = try namehash(allocator, "alice.eth"),
+            .data = try allocator.dupe(u8, "{}"),
+            .timestamp = ts,
+        };
+        defer event.deinit(allocator);
 
-    try database.insertEvent(event);
+        try database.insertEvent(event);
+    }
     std.debug.print("✓ Event inserted\n", .{});
 
     // Test 5: Sync state management
@@ -197,34 +216,45 @@ test "Multiple name insertions and queries" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try db.Database.init(allocator, ":memory:");
+    var database = try Database.init(allocator, ":memory:");
     defer database.deinit();
 
     const names = [_][]const u8{ "alice.eth", "bob.eth", "charlie.eth" };
 
     // Insert multiple names
     for (names, 0..) |name_str, i| {
-        const name = models.Name{
+        const loop_ts = std.time.timestamp();
+        var name = models.Name{
             .name = try allocator.dupe(u8, name_str),
             .namehash = try namehash(allocator, name_str),
             .label = try allocator.dupe(u8, name_str[0 .. name_str.len - 4]), // Remove .eth
-            .label_hash = try @import("../src/types/hash.zig").keccak256(allocator, name_str[0 .. name_str.len - 4]),
+            .label_hash = try keccak256(allocator, name_str[0 .. name_str.len - 4]),
             .parent_name = try allocator.dupe(u8, "eth"),
             .parent_namehash = try namehash(allocator, "eth"),
             .chain = .l2,
             .registry = try Address.fromHex("0x0000000000000000000000000000000000000001"),
             .owner = try Address.fromHex("0x0000000000000000000000000000000000000123"),
+            .registrant = try Address.fromHex("0x0000000000000000000000000000000000000123"),
             .resolver = try Address.fromHex("0x0000000000000000000000000000000000000456"),
             .token_id = @intCast(i + 1),
-            .expiry = std.time.timestamp() + 31536000,
+            .canonical_id = @intCast(i + 1),
+            .token_version = 1,
+            .expiry = @bitCast(loop_ts + 31536000),
             .registry_locked = false,
             .migrated = true,
             .ejected = false,
             .created_block = @intCast(100 + i),
-            .created_at = std.time.timestamp(),
+            .created_at = loop_ts,
+            .registered_at = loop_ts,
             .updated_block = @intCast(100 + i),
-            .updated_at = std.time.timestamp(),
+            .updated_at = loop_ts,
+            .is_wrapped = false,
+            .wrapper_fuses = null,
+            .wrapper_expiry = null,
+            .is_v1_name = false,
+            .v1_label_hash = null,
         };
+        defer name.deinit(allocator);
 
         try database.insertName(name);
         std.debug.print("✓ Inserted {s}\n", .{name_str});
@@ -236,9 +266,10 @@ test "Multiple name insertions and queries" {
         const retrieved = try database.getNameByNamehash(nh);
 
         try testing.expect(retrieved != null);
-        if (retrieved) |name| {
+        if (retrieved) |n| {
+            var name = n;
             defer name.deinit(allocator);
-            try testing.expectEqualStrings(name_str, name.name);
+            try testing.expectEqualStrings(name_str, name.name.?);
             std.debug.print("✓ Retrieved {s}\n", .{name_str});
         }
     }
@@ -251,27 +282,38 @@ test "Name expiry checking" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    const ts = std.time.timestamp();
+
     // Create expired name
     const expired_name = models.Name{
         .name = try allocator.dupe(u8, "expired.eth"),
         .namehash = try namehash(allocator, "expired.eth"),
         .label = try allocator.dupe(u8, "expired"),
-        .label_hash = try @import("../src/types/hash.zig").keccak256(allocator, "expired"),
+        .label_hash = try keccak256(allocator, "expired"),
         .parent_name = try allocator.dupe(u8, "eth"),
         .parent_namehash = try namehash(allocator, "eth"),
         .chain = .l2,
         .registry = Address.zero,
         .owner = Address.zero,
+        .registrant = Address.zero,
         .resolver = Address.zero,
         .token_id = 1,
-        .expiry = std.time.timestamp() - 1, // Already expired
+        .canonical_id = 1,
+        .token_version = 1,
+        .expiry = @bitCast(ts - 1), // Already expired
         .registry_locked = false,
         .migrated = false,
         .ejected = false,
         .created_block = 100,
-        .created_at = std.time.timestamp(),
+        .created_at = ts,
+        .registered_at = ts,
         .updated_block = 100,
-        .updated_at = std.time.timestamp(),
+        .updated_at = ts,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
     };
 
     try testing.expect(expired_name.isExpired());
@@ -282,30 +324,41 @@ test "Name expiry checking" {
         .name = try allocator.dupe(u8, "valid.eth"),
         .namehash = try namehash(allocator, "valid.eth"),
         .label = try allocator.dupe(u8, "valid"),
-        .label_hash = try @import("../src/types/hash.zig").keccak256(allocator, "valid"),
+        .label_hash = try keccak256(allocator, "valid"),
         .parent_name = try allocator.dupe(u8, "eth"),
         .parent_namehash = try namehash(allocator, "eth"),
         .chain = .l2,
         .registry = Address.zero,
         .owner = Address.zero,
+        .registrant = Address.zero,
         .resolver = Address.zero,
         .token_id = 1,
-        .expiry = std.time.timestamp() + 31536000, // 1 year from now
+        .canonical_id = 1,
+        .token_version = 1,
+        .expiry = @bitCast(ts + 31536000), // 1 year from now
         .registry_locked = false,
         .migrated = false,
         .ejected = false,
         .created_block = 100,
-        .created_at = std.time.timestamp(),
+        .created_at = ts,
+        .registered_at = ts,
         .updated_block = 100,
-        .updated_at = std.time.timestamp(),
+        .updated_at = ts,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
     };
 
     try testing.expect(!valid_name.isExpired());
     std.debug.print("✓ Valid name not expired\n", .{});
 
     // Clean up
-    expired_name.deinit(allocator);
-    valid_name.deinit(allocator);
+    var expired_copy = expired_name;
+    expired_copy.deinit(allocator);
+    var valid_copy = valid_name;
+    valid_copy.deinit(allocator);
 
     std.debug.print("\n✅ All expiry tests passed!\n", .{});
 }

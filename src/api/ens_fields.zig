@@ -805,6 +805,12 @@ fn getDomainCreatedAt(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue
     return FieldValue{ .int = name.created_at };
 }
 
+/// Get domain registrationDate (current registration timestamp, updates on re-registration)
+fn getDomainRegistrationDate(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue {
+    const name = getNameCtx(ctx);
+    return FieldValue{ .int = name.registered_at };
+}
+
 /// Get domain expiry (may be null)
 fn getDomainExpiry(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue {
     const name = getNameCtx(ctx);
@@ -826,7 +832,7 @@ pub const DomainBuildFields = [_]FieldDef{
     FieldDef.int("tokenVersion", getDomainTokenVersion),
     FieldDef.boolean("isMigrated", getDomainIsMigrated),
     FieldDef.int("createdAt", getDomainCreatedAt),
-    FieldDef.int("registrationDate", getDomainCreatedAt),
+    FieldDef.int("registrationDate", getDomainRegistrationDate),
 };
 
 /// Custom writer for labelName
