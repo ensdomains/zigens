@@ -1062,6 +1062,14 @@
               }
             },
             {
+              "name": "registrationDate",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
               "name": "registrant",
               "args": [],
               "type": {

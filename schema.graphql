@@ -192,6 +192,9 @@ type Domain {
   """Timestamp when domain was created"""
   createdAt: Int!
 
+  """Timestamp when domain was registered"""
+  registrationDate: Int
+
   """Original registrant of the domain"""
   registrant: Account
 
