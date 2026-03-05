@@ -606,6 +606,29 @@ pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Nam
     return names.toOwnedSlice(db.allocator);
 }
 
+/// Get names by resolver address
+pub fn getNamesByResolver(db: *Database, resolver: Address, limit: u32) ![]models.Name {
+    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE resolver = ? ORDER BY created_at DESC LIMIT ?");
+    defer q.deinit();
+
+    try q.bindAddress(resolver);
+    try q.bindInt(@intCast(limit));
+
+    var names: std.ArrayList(models.Name) = .{};
+    errdefer {
+        for (names.items) |*name| {
+            name.deinit(db.allocator);
+        }
+        names.deinit(db.allocator);
+    }
+
+    while (try q.step()) {
+        try names.append(db.allocator, try parseNameRowShort(&q, db.allocator));
+    }
+
+    return names.toOwnedSlice(db.allocator);
+}
+
 /// Get names by registrant address
 pub fn getNamesByRegistrant(db: *Database, registrant: Address, skip: u32, limit: u32) ![]models.Name {
     var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE registrant = ? ORDER BY created_at DESC LIMIT ? OFFSET ?");
@@ -739,6 +762,8 @@ pub const NameFilters = struct {
     expiry_lte: ?i64 = null,
     // Resolved address filter (requires resolver lookup)
     resolved_address: ?Address = null,
+    // Resolver contract address filter
+    resolver: ?Address = null,
     // Subdomain filters (requires subquery)
     has_subdomains: ?bool = null,
     subdomain_count_gt: ?i64 = null,
@@ -817,6 +842,11 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
         try conditions.append(db.allocator, "namehash IN (SELECT namehash FROM resolver_addresses WHERE address = ?)");
     }
 
+    // Resolver contract address filter
+    if (filters.resolver != null) {
+        try conditions.append(db.allocator, "resolver = ?");
+    }
+
     // Subdomain count filters (using subquery)
     if (filters.has_subdomains) |has_subs| {
         if (has_subs) {
@@ -893,6 +923,9 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
         try q.bindInt64(v);
     }
     if (filters.resolved_address) |addr| {
+        try q.bindAddress(addr);
+    }
+    if (filters.resolver) |addr| {
         try q.bindAddress(addr);
     }
     // has_subdomains doesn't need binding (no ?)
@@ -1068,6 +1101,9 @@ pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
     if (filters.resolved_address != null) {
         try conditions.append(db.allocator, "namehash IN (SELECT namehash FROM resolver_addresses WHERE address = ?)");
     }
+    if (filters.resolver != null) {
+        try conditions.append(db.allocator, "resolver = ?");
+    }
     if (filters.has_subdomains) |has_subs| {
         if (has_subs) {
             try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) > 0");
@@ -1138,6 +1174,9 @@ pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
         try q.bindInt64(v);
     }
     if (filters.resolved_address) |addr| {
+        try q.bindAddress(addr);
+    }
+    if (filters.resolver) |addr| {
         try q.bindAddress(addr);
     }
     // has_subdomains doesn't need binding (no ?)

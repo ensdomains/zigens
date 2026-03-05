@@ -40,6 +40,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
     var filter_owner: ?Address = null;
     var filter_owner_in: ?[]Address = null;
     var filter_resolved_address: ?Address = null;
+    var filter_resolver: ?Address = null;
     var filter_has_subdomains: ?bool = null;
     var filter_subdomain_count_gt: ?i64 = null;
     var filter_subdomain_count_lt: ?i64 = null;
@@ -68,6 +69,10 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
                     } else if (std.mem.eql(u8, filter_arg.name, "resolvedAddress")) {
                         if (filter_arg.value == .string) {
                             filter_resolved_address = Address.fromHex(filter_arg.value.string) catch null;
+                        }
+                    } else if (std.mem.eql(u8, filter_arg.name, "resolver")) {
+                        if (filter_arg.value == .string) {
+                            filter_resolver = Address.fromHex(filter_arg.value.string) catch null;
                         }
                     } else if (std.mem.eql(u8, filter_arg.name, "name_contains_nocase")) {
                         if (filter_arg.value == .string) {
@@ -190,7 +195,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
     const has_filters = filter_name != null or filter_name_contains != null or
         filter_name_contains_nocase != null or filter_name_starts_with != null or
         filter_name_ends_with != null or filter_owner != null or filter_owner_in != null or
-        filter_resolved_address != null or filter_has_subdomains != null or
+        filter_resolved_address != null or filter_resolver != null or filter_has_subdomains != null or
         filter_subdomain_count_gt != null or filter_subdomain_count_lt != null or
         filter_expiry_gt != null or filter_expiry_gte != null or
         filter_expiry_lt != null or filter_expiry_lte != null;
@@ -217,6 +222,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
             .expiry_lt = filter_expiry_lt,
             .expiry_lte = filter_expiry_lte,
             .resolved_address = filter_resolved_address,
+            .resolver = filter_resolver,
             .has_subdomains = filter_has_subdomains,
             .subdomain_count_gt = filter_subdomain_count_gt,
             .subdomain_count_lt = filter_subdomain_count_lt,
@@ -347,6 +353,7 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
     var filter_name_starts_with: ?[]const u8 = null;
     var filter_name_ends_with: ?[]const u8 = null;
     var filter_resolved_address: ?Address = null;
+    var filter_resolver: ?Address = null;
     var filter_has_subdomains: ?bool = null;
     var filter_subdomain_count_gt: ?i64 = null;
     var filter_subdomain_count_lt: ?i64 = null;
@@ -373,6 +380,10 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
                 } else if (std.mem.eql(u8, filter_arg.name, "resolvedAddress")) {
                     if (filter_arg.value == .string) {
                         filter_resolved_address = Address.fromHex(filter_arg.value.string) catch null;
+                    }
+                } else if (std.mem.eql(u8, filter_arg.name, "resolver")) {
+                    if (filter_arg.value == .string) {
+                        filter_resolver = Address.fromHex(filter_arg.value.string) catch null;
                     }
                 } else if (std.mem.eql(u8, filter_arg.name, "name_contains_nocase")) {
                     if (filter_arg.value == .string) {
@@ -447,6 +458,7 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         .expiry_lt = filter_expiry_lt,
         .expiry_lte = filter_expiry_lte,
         .resolved_address = filter_resolved_address,
+        .resolver = filter_resolver,
         .has_subdomains = filter_has_subdomains,
         .subdomain_count_gt = filter_subdomain_count_gt,
         .subdomain_count_lt = filter_subdomain_count_lt,
@@ -455,7 +467,7 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
     const has_filters = filter_name != null or filter_name_contains != null or
         filter_name_contains_nocase != null or filter_name_starts_with != null or
         filter_name_ends_with != null or filter_owner != null or filter_owner_in != null or
-        filter_resolved_address != null or filter_has_subdomains != null or
+        filter_resolved_address != null or filter_resolver != null or filter_has_subdomains != null or
         filter_subdomain_count_gt != null or filter_subdomain_count_lt != null or
         filter_expiry_gt != null or filter_expiry_gte != null or
         filter_expiry_lt != null or filter_expiry_lte != null;

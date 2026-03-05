@@ -350,6 +350,12 @@ pub fn deleteDataAfterBlock(db: *Database, block_number: u64) !void {
         .{ .name = "migrations", .block_col = "block_number" },
         .{ .name = "renewal_syncs", .block_col = "block_number" },
         .{ .name = "token_observers", .block_col = "block_number" },
+        .{ .name = "resolver_aliases", .block_col = "block_number" },
+        .{ .name = "resolver_pubkeys", .block_col = "block_number" },
+        .{ .name = "resolver_abis", .block_col = "block_number" },
+        .{ .name = "resolver_names", .block_col = "block_number" },
+        .{ .name = "resolver_interfaces", .block_col = "block_number" },
+        .{ .name = "resolver_versions", .block_col = "block_number" },
     };
 
     // Begin transaction for atomic cleanup
