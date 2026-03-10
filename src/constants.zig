@@ -65,8 +65,8 @@ pub const SQLite = struct {
     pub const busy_timeout_ms: u32 = 5000;
 
     /// Cache size in KB (negative means KB, positive means pages)
-    /// 400MB = 400000 KB
-    pub const cache_size_kb: i32 = -400000;
+    /// 100MB = 100000 KB
+    pub const cache_size_kb: i32 = -100000;
 
     /// Journal size limit in bytes (512MB)
     pub const journal_size_limit: i64 = 512 * 1024 * 1024;

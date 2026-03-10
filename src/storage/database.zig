@@ -38,7 +38,7 @@ pub const Query = query.Query;
 // SQLITE_TRANSIENT - For Zig 0.15.1, we can't use the C constant due to alignment issues
 // Instead, we use null which tells SQLite to make a copy of the string
 // This is functionally equivalent to SQLITE_TRANSIENT for our use case
-inline fn SQLITE_TRANSIENT() c.sqlite3_destructor_type {
+pub inline fn SQLITE_TRANSIENT() c.sqlite3_destructor_type {
     return null;
 }
 
