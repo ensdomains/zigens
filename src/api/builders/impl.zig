@@ -805,11 +805,36 @@ fn domainResolvedAddressHandler(ctx: *anyopaque, field: *const parser.Field, nes
 }
 
 /// Domain nested field handler: resolver
+/// Implements ENSIP-23: always use the first non-zero resolver in the name chain.
+/// This correctly handles:
+/// - Subnames that were never assigned a resolver (inherits from parent)
+/// - Subnames with stale resolver data in DB (walks up to find actual resolver)
 fn domainResolverHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
     const domain: *const models.Name = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
-    if (!domain.resolver.isZero()) {
-        return try buildResolverJson(domain.resolver, domain.namehash, field.selections, .{
+
+    var resolver_addr = domain.resolver;
+    var current_parent_namehash = domain.parent_namehash;
+    var visited: u8 = 0;
+
+    while (resolver_addr.isZero() and !current_parent_namehash.isZero() and visited < 10) {
+        visited += 1;
+        const parent_opt = try database.getNameByNamehash(current_parent_namehash);
+        if (parent_opt) |p| {
+            var parent = p;
+            defer parent.deinit(nested_ctx.allocator);
+            if (!parent.resolver.isZero()) {
+                resolver_addr = parent.resolver;
+                break;
+            }
+            current_parent_namehash = parent.parent_namehash;
+        } else {
+            break;
+        }
+    }
+
+    if (!resolver_addr.isZero()) {
+        return try buildResolverJson(resolver_addr, domain.namehash, field.selections, .{
             .database = database,
             .depth = nested_ctx.depth + 1,
             .allocator = nested_ctx.allocator,
