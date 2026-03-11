@@ -760,8 +760,9 @@ pub fn handleTransfer(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
     std.log.debug("Transfer: from={any}, to={any}, id={d}, value={d}", .{ from, to, id, value });
 
     // Update name owner in database
-    // Look up the name by token ID to get the namehash
-    const maybe_name = try self.database.getNameByTokenId(id);
+    // Look up the name by token ID AND registry to avoid cross-registry tokenId collisions
+    // (e.g., label "1" has the same tokenId in every registry)
+    const maybe_name = try self.database.getNameByTokenIdAndRegistry(id, log.address);
     var namehash_opt: ?Hash = null;
     var name_str_opt: ?[]const u8 = null;
 
@@ -769,23 +770,13 @@ pub fn handleTransfer(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
         name_str_opt = try self.allocator.dupe(u8, name.name orelse "[unknown]");
         namehash_opt = name.namehash;
 
-        // Only update owner if the Transfer came from the name's own registry
-        // This prevents tokenId collisions between registries from causing incorrect updates
-        // (e.g., a User Registry might use the same tokenId as the main .eth registry)
-        const is_from_names_registry = log.address.eql(name.registry);
-        const name_registry = name.registry; // Copy before deinit for logging
-
         // Clean up the name struct
         var name_copy = name;
         name_copy.deinit(self.allocator);
 
-        if (is_from_names_registry) {
-            try self.database.updateNameOwner(namehash_opt.?, to);
-        } else {
-            std.log.debug("  → Skipping owner update: Transfer from {any} but name's registry is {any}", .{ log.address, name_registry });
-        }
+        try self.database.updateNameOwner(namehash_opt.?, to);
     } else {
-        std.log.debug("  → Skipping Transfer for unknown tokenId={d}", .{id});
+        std.log.debug("  → Skipping Transfer for unknown tokenId={d} in registry {any}", .{ id, log.address });
     }
 
     defer if (name_str_opt) |n| self.allocator.free(n);
@@ -1103,8 +1094,8 @@ pub fn handleTokenRegenerated(self: *Indexer, chain: models.Chain, log: rpc.Log)
 
     std.log.debug("TokenRegenerated: oldTokenId={d}, newTokenId={d}", .{ old_token_id, new_token_id });
 
-    // Look up the name by old token ID
-    const maybe_name = try self.database.getNameByTokenId(old_token_id);
+    // Look up the name by old token ID and registry to avoid cross-registry collisions
+    const maybe_name = try self.database.getNameByTokenIdAndRegistry(old_token_id, log.address);
     const name_str = if (maybe_name) |n| blk: {
         var name_copy = n;
         defer name_copy.deinit(self.allocator);
@@ -1173,7 +1164,7 @@ pub fn handleTransferBatch(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
         // Only update if transferring to a non-zero address (not burning)
         if (!to.isZero()) {
             // Try to update the owner - if the name doesn't exist, skip it
-            const maybe_name = self.database.getNameByTokenId(token_id) catch |err| {
+            const maybe_name = self.database.getNameByTokenIdAndRegistry(token_id, log.address) catch |err| {
                 std.log.warn("Failed to get name for tokenId={d} during batch transfer: {any}", .{ token_id, err });
                 continue;
             };
@@ -1205,8 +1196,8 @@ pub fn handleApproval(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
 
     std.log.debug("Approval: owner={any}, approved={any}, tokenId={d}", .{ owner, approved, token_id });
 
-    // Look up the name
-    const maybe_name = try self.database.getNameByTokenId(token_id);
+    // Look up the name by tokenId and registry to avoid cross-registry collisions
+    const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
     const name_str = if (maybe_name) |n| blk: {
         var name_copy = n;
         defer name_copy.deinit(self.allocator);

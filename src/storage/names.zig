@@ -572,7 +572,7 @@ pub fn getNamehashByResolver(db: *Database, resolver: Address) !?Hash {
     return null;
 }
 
-/// Get name by token ID
+/// Get name by token ID (WARNING: token IDs can collide across registries, prefer getNameByTokenIdAndRegistry)
 pub fn getNameByTokenId(db: *Database, token_id: u256) !?models.Name {
     var q = try Query.init(db, SQL_SELECT_NAMES ++ " WHERE token_id = ? LIMIT 1");
     defer q.deinit();
@@ -581,6 +581,23 @@ pub fn getNameByTokenId(db: *Database, token_id: u256) !?models.Name {
     defer db.allocator.free(token_id_hex);
 
     try q.bindText(token_id_hex);
+
+    if (try q.step()) {
+        return try parseNameRow(&q, db.allocator);
+    }
+    return null;
+}
+
+/// Get name by token ID and registry address (avoids cross-registry tokenId collisions)
+pub fn getNameByTokenIdAndRegistry(db: *Database, token_id: u256, registry: Address) !?models.Name {
+    var q = try Query.init(db, SQL_SELECT_NAMES ++ " WHERE token_id = ? AND registry = ? LIMIT 1");
+    defer q.deinit();
+
+    const token_id_hex = try formatU256Hex(db.allocator, token_id);
+    defer db.allocator.free(token_id_hex);
+
+    try q.bindText(token_id_hex);
+    try q.bindAddressBuf(registry);
 
     if (try q.step()) {
         return try parseNameRow(&q, db.allocator);
