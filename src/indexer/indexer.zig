@@ -509,7 +509,7 @@ pub const Indexer = struct {
         const TARGET_EVENTS_PER_CHUNK: usize = 25000; // Target ~25000 events per chunk
 
         var current_chunk_size: u64 = 100; // Start conservative
-        var events_per_block: f64 = 5.0;   // Initial estimate: 5 events/block average
+        var events_per_block: f64 = 5.0; // Initial estimate: 5 events/block average
         var chunk_start = from_block;
 
         while (chunk_start <= to_block) {
@@ -670,7 +670,7 @@ pub const Indexer = struct {
         const TARGET_EVENTS_PER_CHUNK: usize = 25000; // Target ~25000 events per chunk
 
         var current_chunk_size: u64 = 100; // Start conservative
-        var events_per_block: f64 = 5.0;   // Initial estimate: 5 events/block average
+        var events_per_block: f64 = 5.0; // Initial estimate: 5 events/block average
         var chunk_start = from_block;
 
         // Name Wrapper deployment block (from contract config)
@@ -705,61 +705,37 @@ pub const Indexer = struct {
                     events_per_block,
                 });
 
-            // Build batch requests for ALL V1 contracts in this chunk
-            var batch_list: std.ArrayList(rpc.Client.BatchGetLogsRequest) = .{};
-            defer batch_list.deinit(self.allocator);
+                // Build batch requests for ALL V1 contracts in this chunk
+                var batch_list: std.ArrayList(rpc.Client.BatchGetLogsRequest) = .{};
+                defer batch_list.deinit(self.allocator);
 
-            var topics_list: std.ArrayList([]const ?Hash) = .{};
-            defer {
-                for (topics_list.items) |topics| {
-                    self.allocator.free(topics);
+                var topics_list: std.ArrayList([]const ?Hash) = .{};
+                defer {
+                    for (topics_list.items) |topics| {
+                        self.allocator.free(topics);
+                    }
+                    topics_list.deinit(self.allocator);
                 }
-                topics_list.deinit(self.allocator);
-            }
 
-            // Track which contract/event each batch request corresponds to
-            const ContractEventInfo = struct {
-                contract_name: []const u8,
-                event_config: RegistryEventConfig,
-                contract_addr: Address,
-            };
-            var request_info_list: std.ArrayList(ContractEventInfo) = .{};
-            defer request_info_list.deinit(self.allocator);
+                // Track which contract/event each batch request corresponds to
+                const ContractEventInfo = struct {
+                    contract_name: []const u8,
+                    event_config: RegistryEventConfig,
+                    contract_addr: Address,
+                };
+                var request_info_list: std.ArrayList(ContractEventInfo) = .{};
+                defer request_info_list.deinit(self.allocator);
 
-            // 1. ETH Registrar Controller events - MUST BE FIRST!
-            // ETH Controller events contain the label text which Base Registrar needs
-            // Query active controllers dynamically from database
-            const v1_controllers = @import("../storage/v1_controllers.zig");
-            const active_controllers = try v1_controllers.getActiveControllers(self.allocator, self.database);
-            defer self.allocator.free(active_controllers);
+                // 1. ETH Registrar Controller events - MUST BE FIRST!
+                // ETH Controller events contain the label text which Base Registrar needs
+                // Query active controllers dynamically from database
+                const v1_controllers = @import("../storage/v1_controllers.zig");
+                const active_controllers = try v1_controllers.getActiveControllers(self.allocator, self.database);
+                defer self.allocator.free(active_controllers);
 
-            if (active_controllers.len == 0) {
-                std.log.warn("No active V1 controllers found in database - using config fallback", .{});
-                // Fallback to config if no controllers in DB (e.g., fresh database)
-                for (V1_ETH_CONTROLLER_EVENTS) |event_cfg| {
-                    var topics = try self.allocator.alloc(?Hash, 1);
-                    topics[0] = event_cfg.event_hash;
-                    try topics_list.append(self.allocator, topics);
-
-                    try batch_list.append(self.allocator, .{
-                        .from_block = chunk_start,
-                        .to_block = chunk_end,
-                        .address = self.config.l1_contracts.eth_registrar_controller,
-                        .topics = topics,
-                    });
-                    try request_info_list.append(self.allocator, .{
-                        .contract_name = "ETH Registrar Controller",
-                        .event_config = event_cfg,
-                        .contract_addr = self.config.l1_contracts.eth_registrar_controller,
-                    });
-                }
-            } else {
-                // Index events from ALL active controllers
-                for (active_controllers) |controller_addr| {
-                    const controller_hex = try controller_addr.toHex(self.allocator);
-                    defer self.allocator.free(controller_hex);
-                    std.log.debug("Indexing controller: {s}", .{controller_hex});
-
+                if (active_controllers.len == 0) {
+                    std.log.warn("No active V1 controllers found in database - using config fallback", .{});
+                    // Fallback to config if no controllers in DB (e.g., fresh database)
                     for (V1_ETH_CONTROLLER_EVENTS) |event_cfg| {
                         var topics = try self.allocator.alloc(?Hash, 1);
                         topics[0] = event_cfg.event_hash;
@@ -768,214 +744,238 @@ pub const Indexer = struct {
                         try batch_list.append(self.allocator, .{
                             .from_block = chunk_start,
                             .to_block = chunk_end,
-                            .address = controller_addr,
+                            .address = self.config.l1_contracts.eth_registrar_controller,
                             .topics = topics,
                         });
                         try request_info_list.append(self.allocator, .{
                             .contract_name = "ETH Registrar Controller",
                             .event_config = event_cfg,
-                            .contract_addr = controller_addr,
+                            .contract_addr = self.config.l1_contracts.eth_registrar_controller,
                         });
                     }
+                } else {
+                    // Index events from ALL active controllers
+                    for (active_controllers) |controller_addr| {
+                        const controller_hex = try controller_addr.toHex(self.allocator);
+                        defer self.allocator.free(controller_hex);
+                        std.log.debug("Indexing controller: {s}", .{controller_hex});
+
+                        for (V1_ETH_CONTROLLER_EVENTS) |event_cfg| {
+                            var topics = try self.allocator.alloc(?Hash, 1);
+                            topics[0] = event_cfg.event_hash;
+                            try topics_list.append(self.allocator, topics);
+
+                            try batch_list.append(self.allocator, .{
+                                .from_block = chunk_start,
+                                .to_block = chunk_end,
+                                .address = controller_addr,
+                                .topics = topics,
+                            });
+                            try request_info_list.append(self.allocator, .{
+                                .contract_name = "ETH Registrar Controller",
+                                .event_config = event_cfg,
+                                .contract_addr = controller_addr,
+                            });
+                        }
+                    }
                 }
-            }
 
-            // 2. Base Registrar events
-            // These can now look up labels from v1_labels table populated above
-            for (V1_BASE_REGISTRAR_EVENTS) |event_cfg| {
-                var topics = try self.allocator.alloc(?Hash, 1);
-                topics[0] = event_cfg.event_hash;
-                try topics_list.append(self.allocator, topics);
-
-                try batch_list.append(self.allocator, .{
-                    .from_block = chunk_start,
-                    .to_block = chunk_end,
-                    .address = self.config.l1_contracts.base_registrar,
-                    .topics = topics,
-                });
-                try request_info_list.append(self.allocator, .{
-                    .contract_name = "Base Registrar",
-                    .event_config = event_cfg,
-                    .contract_addr = self.config.l1_contracts.base_registrar,
-                });
-            }
-
-            // 3. ENS Registry events
-            for (V1_REGISTRY_EVENTS) |event_cfg| {
-                var topics = try self.allocator.alloc(?Hash, 1);
-                topics[0] = event_cfg.event_hash;
-                try topics_list.append(self.allocator, topics);
-
-                try batch_list.append(self.allocator, .{
-                    .from_block = chunk_start,
-                    .to_block = chunk_end,
-                    .address = self.config.l1_contracts.ens_registry,
-                    .topics = topics,
-                });
-                try request_info_list.append(self.allocator, .{
-                    .contract_name = "ENS Registry",
-                    .event_config = event_cfg,
-                    .contract_addr = self.config.l1_contracts.ens_registry,
-                });
-            }
-
-            // 4. Name Wrapper events (only if we're past deployment block)
-            if (chunk_end >= NAME_WRAPPER_DEPLOYMENT_BLOCK) {
-                for (V1_NAME_WRAPPER_EVENTS) |event_cfg| {
+                // 2. Base Registrar events
+                // These can now look up labels from v1_labels table populated above
+                for (V1_BASE_REGISTRAR_EVENTS) |event_cfg| {
                     var topics = try self.allocator.alloc(?Hash, 1);
                     topics[0] = event_cfg.event_hash;
                     try topics_list.append(self.allocator, topics);
 
                     try batch_list.append(self.allocator, .{
-                        .from_block = @max(chunk_start, NAME_WRAPPER_DEPLOYMENT_BLOCK),
+                        .from_block = chunk_start,
                         .to_block = chunk_end,
-                        .address = self.config.l1_contracts.name_wrapper,
+                        .address = self.config.l1_contracts.base_registrar,
                         .topics = topics,
                     });
                     try request_info_list.append(self.allocator, .{
-                        .contract_name = "Name Wrapper",
+                        .contract_name = "Base Registrar",
                         .event_config = event_cfg,
-                        .contract_addr = self.config.l1_contracts.name_wrapper,
+                        .contract_addr = self.config.l1_contracts.base_registrar,
                     });
                 }
-            }
 
-            // 5. Reverse Registrar events
-            for (V1_REVERSE_REGISTRAR_EVENTS) |event_cfg| {
-                var topics = try self.allocator.alloc(?Hash, 1);
-                topics[0] = event_cfg.event_hash;
-                try topics_list.append(self.allocator, topics);
+                // 3. ENS Registry events
+                for (V1_REGISTRY_EVENTS) |event_cfg| {
+                    var topics = try self.allocator.alloc(?Hash, 1);
+                    topics[0] = event_cfg.event_hash;
+                    try topics_list.append(self.allocator, topics);
 
-                try batch_list.append(self.allocator, .{
-                    .from_block = chunk_start,
-                    .to_block = chunk_end,
-                    .address = self.config.l1_contracts.reverse_registrar,
-                    .topics = topics,
-                });
-                try request_info_list.append(self.allocator, .{
-                    .contract_name = "Reverse Registrar",
-                    .event_config = event_cfg,
-                    .contract_addr = self.config.l1_contracts.reverse_registrar,
-                });
-            }
-
-            // Execute batch RPC call for ALL contracts at once - retry with smaller chunks if buffer overflow
-            const batch_results = client.getLogsBatch(batch_list.items) catch |err| {
-                // Handle both RPC provider buffer overflow (error.RpcError) and curl buffer overflow (error.StdoutStreamTooLong)
-                if ((err == error.RpcError or err == error.StdoutStreamTooLong) and retry_chunk_size > ABSOLUTE_MIN_CHUNK) {
-                    // Buffer overflow - halve chunk size and retry
-                    retry_chunk_size = @max(ABSOLUTE_MIN_CHUNK, retry_chunk_size / 2);
-                    std.log.warn("  🔄 Buffer overflow! Retrying with smaller chunk: {d} blocks", .{retry_chunk_size});
-                    continue :retry_loop;
+                    try batch_list.append(self.allocator, .{
+                        .from_block = chunk_start,
+                        .to_block = chunk_end,
+                        .address = self.config.l1_contracts.ens_registry,
+                        .topics = topics,
+                    });
+                    try request_info_list.append(self.allocator, .{
+                        .contract_name = "ENS Registry",
+                        .event_config = event_cfg,
+                        .contract_addr = self.config.l1_contracts.ens_registry,
+                    });
                 }
-                return err; // Other errors or hit minimum chunk size
-            };
-            defer {
-                for (batch_results) |logs| {
-                    for (logs) |*log| {
-                        log.deinit(self.allocator);
+
+                // 4. Name Wrapper events (only if we're past deployment block)
+                if (chunk_end >= NAME_WRAPPER_DEPLOYMENT_BLOCK) {
+                    for (V1_NAME_WRAPPER_EVENTS) |event_cfg| {
+                        var topics = try self.allocator.alloc(?Hash, 1);
+                        topics[0] = event_cfg.event_hash;
+                        try topics_list.append(self.allocator, topics);
+
+                        try batch_list.append(self.allocator, .{
+                            .from_block = @max(chunk_start, NAME_WRAPPER_DEPLOYMENT_BLOCK),
+                            .to_block = chunk_end,
+                            .address = self.config.l1_contracts.name_wrapper,
+                            .topics = topics,
+                        });
+                        try request_info_list.append(self.allocator, .{
+                            .contract_name = "Name Wrapper",
+                            .event_config = event_cfg,
+                            .contract_addr = self.config.l1_contracts.name_wrapper,
+                        });
                     }
-                    self.allocator.free(logs);
                 }
-                self.allocator.free(batch_results);
-            }
 
-            // Process results
-            // Process events and count total
-            // Track if any ControllerAdded events were found (need to reprocess chunk)
-            const controllers_before = try v1_controllers.getActiveControllers(self.allocator, self.database);
-            defer self.allocator.free(controllers_before);
-            const controller_count_before = controllers_before.len;
+                // 5. Reverse Registrar events
+                for (V1_REVERSE_REGISTRAR_EVENTS) |event_cfg| {
+                    var topics = try self.allocator.alloc(?Hash, 1);
+                    topics[0] = event_cfg.event_hash;
+                    try topics_list.append(self.allocator, topics);
 
-            var total_events: usize = 0;
-            for (batch_results, 0..) |logs, i| {
-                const info = request_info_list.items[i];
-                total_events += logs.len;
-
-                if (logs.len > 0) {
-                    std.log.info("  Found {d} V1 {s} {s} event{s}", .{
-                        logs.len,
-                        info.contract_name,
-                        info.event_config.name,
-                        if (logs.len == 1) "" else "s",
+                    try batch_list.append(self.allocator, .{
+                        .from_block = chunk_start,
+                        .to_block = chunk_end,
+                        .address = self.config.l1_contracts.reverse_registrar,
+                        .topics = topics,
+                    });
+                    try request_info_list.append(self.allocator, .{
+                        .contract_name = "Reverse Registrar",
+                        .event_config = event_cfg,
+                        .contract_addr = self.config.l1_contracts.reverse_registrar,
                     });
                 }
 
-                for (logs) |log| {
-                    try info.event_config.handler(self, chain, log);
-                }
-            }
-
-            // Check if new controllers were added during processing
-            const controllers_after = try v1_controllers.getActiveControllers(self.allocator, self.database);
-            defer self.allocator.free(controllers_after);
-
-            // Detect NEW controllers by comparing address lists
-            var has_new_controller = false;
-            if (controllers_after.len > controller_count_before) {
-                // More controllers now - check which ones are new
-                outer: for (controllers_after) |new_addr| {
-                    for (controllers_before) |old_addr| {
-                        if (std.mem.eql(u8, &new_addr.bytes, &old_addr.bytes)) {
-                            continue :outer; // This controller already existed
+                // Execute batch RPC call for ALL contracts at once - retry with smaller chunks if buffer overflow
+                const batch_results = client.getLogsBatch(batch_list.items) catch |err| {
+                    // Handle both RPC provider buffer overflow (error.RpcError) and curl buffer overflow (error.StdoutStreamTooLong)
+                    if ((err == error.RpcError or err == error.StdoutStreamTooLong) and retry_chunk_size > ABSOLUTE_MIN_CHUNK) {
+                        // Buffer overflow - halve chunk size and retry
+                        retry_chunk_size = @max(ABSOLUTE_MIN_CHUNK, retry_chunk_size / 2);
+                        std.log.warn("  🔄 Buffer overflow! Retrying with smaller chunk: {d} blocks", .{retry_chunk_size});
+                        continue :retry_loop;
+                    }
+                    return err; // Other errors or hit minimum chunk size
+                };
+                defer {
+                    for (batch_results) |logs| {
+                        for (logs) |*log| {
+                            log.deinit(self.allocator);
                         }
+                        self.allocator.free(logs);
                     }
-                    // Found a controller that wasn't in the before list
-                    has_new_controller = true;
-                    const new_controller_hex = try new_addr.toHex(self.allocator);
-                    defer self.allocator.free(new_controller_hex);
-                    std.log.warn("  🔄 New controller discovered: {s}! Reprocessing chunk {d}-{d}", .{ new_controller_hex, chunk_start, chunk_end });
-                    break;
+                    self.allocator.free(batch_results);
                 }
-            }
 
-            if (has_new_controller) {
-                // Set flag to reprocess this chunk with new controllers
-                // This will cause the outer while loop to restart without advancing chunk_start
-                needs_controller_reprocess = true;
-                break :retry_loop;
-            }
+                // Process results
+                // Process events and count total
+                // Track if any ControllerAdded events were found (need to reprocess chunk)
+                const controllers_before = try v1_controllers.getActiveControllers(self.allocator, self.database);
+                defer self.allocator.free(controllers_before);
+                const controller_count_before = controllers_before.len;
 
-            // LEARNING: Update event density estimate using exponential moving average
-            // This smooths out spikes while adapting to trends
-            const actual_events_per_block = @as(f64, @floatFromInt(total_events)) / @as(f64, @floatFromInt(blocks_in_chunk));
-            const LEARNING_RATE = 0.3; // 30% weight to new data, 70% to history
-            const old_density = events_per_block;
-            events_per_block = events_per_block * (1.0 - LEARNING_RATE) + actual_events_per_block * LEARNING_RATE;
+                var total_events: usize = 0;
+                for (batch_results, 0..) |logs, i| {
+                    const info = request_info_list.items[i];
+                    total_events += logs.len;
 
-            // Calculate next chunk size with exponential scaling based on density
-            // Target: 500 events per chunk. If density is 5 events/block, we want 100 blocks.
-            // Calculate ideal chunk size, then apply exponential scaling to current size
-            const ideal_chunk_size = @as(f64, @floatFromInt(TARGET_EVENTS_PER_CHUNK)) / @max(0.001, events_per_block);
-            const size_ratio = ideal_chunk_size / @as(f64, @floatFromInt(retry_chunk_size));
-            const scale_factor = std.math.pow(f64, size_ratio, 0.5); // Square root for smooth exponential scaling
-            const next_chunk_size = @min(MAX_CHUNK_SIZE, @max(MIN_CHUNK_SIZE, @as(u64, @intFromFloat(@as(f64, @floatFromInt(retry_chunk_size)) * scale_factor))));
+                    if (logs.len > 0) {
+                        std.log.info("  Found {d} V1 {s} {s} event{s}", .{
+                            logs.len,
+                            info.contract_name,
+                            info.event_config.name,
+                            if (logs.len == 1) "" else "s",
+                        });
+                    }
 
-            if (total_events > TARGET_EVENTS_PER_CHUNK * 2) {
-                std.log.info("  ⚠️  High density: {d} events ({d:.2}→{d:.2} events/block), next chunk: {d} blocks", .{
-                    total_events,
-                    old_density,
-                    events_per_block,
-                    next_chunk_size,
-                });
-            } else if (total_events < TARGET_EVENTS_PER_CHUNK / 2) {
-                std.log.info("  ✅ Low density: {d} events ({d:.2}→{d:.2} events/block), next chunk: {d} blocks", .{
-                    total_events,
-                    old_density,
-                    events_per_block,
-                    next_chunk_size,
-                });
-            }
-
-            // Only advance to next chunk if we're not reprocessing for new controllers
-            if (!needs_controller_reprocess) {
-                chunk_start = chunk_end + 1;
-                // Rate limit: wait between batches to avoid hitting RPC provider limits
-                if (chunk_start <= to_block) {
-                    std.Thread.sleep(constants.Timing.rpc_retry_delay_ms * std.time.ns_per_ms); // 200ms delay between batches
+                    for (logs) |log| {
+                        try info.event_config.handler(self, chain, log);
+                    }
                 }
-            }
-            break :retry_loop; // Success - move to next chunk (or reprocess current chunk)
+
+                // Check if new controllers were added during processing
+                const controllers_after = try v1_controllers.getActiveControllers(self.allocator, self.database);
+                defer self.allocator.free(controllers_after);
+
+                // Detect NEW controllers by comparing address lists
+                var has_new_controller = false;
+                if (controllers_after.len > controller_count_before) {
+                    // More controllers now - check which ones are new
+                    outer: for (controllers_after) |new_addr| {
+                        for (controllers_before) |old_addr| {
+                            if (std.mem.eql(u8, &new_addr.bytes, &old_addr.bytes)) {
+                                continue :outer; // This controller already existed
+                            }
+                        }
+                        // Found a controller that wasn't in the before list
+                        has_new_controller = true;
+                        const new_controller_hex = try new_addr.toHex(self.allocator);
+                        defer self.allocator.free(new_controller_hex);
+                        std.log.warn("  🔄 New controller discovered: {s}! Reprocessing chunk {d}-{d}", .{ new_controller_hex, chunk_start, chunk_end });
+                        break;
+                    }
+                }
+
+                if (has_new_controller) {
+                    // Set flag to reprocess this chunk with new controllers
+                    // This will cause the outer while loop to restart without advancing chunk_start
+                    needs_controller_reprocess = true;
+                    break :retry_loop;
+                }
+
+                // LEARNING: Update event density estimate using exponential moving average
+                // This smooths out spikes while adapting to trends
+                const actual_events_per_block = @as(f64, @floatFromInt(total_events)) / @as(f64, @floatFromInt(blocks_in_chunk));
+                const LEARNING_RATE = 0.3; // 30% weight to new data, 70% to history
+                const old_density = events_per_block;
+                events_per_block = events_per_block * (1.0 - LEARNING_RATE) + actual_events_per_block * LEARNING_RATE;
+
+                // Calculate next chunk size with exponential scaling based on density
+                // Target: 500 events per chunk. If density is 5 events/block, we want 100 blocks.
+                // Calculate ideal chunk size, then apply exponential scaling to current size
+                const ideal_chunk_size = @as(f64, @floatFromInt(TARGET_EVENTS_PER_CHUNK)) / @max(0.001, events_per_block);
+                const size_ratio = ideal_chunk_size / @as(f64, @floatFromInt(retry_chunk_size));
+                const scale_factor = std.math.pow(f64, size_ratio, 0.5); // Square root for smooth exponential scaling
+                const next_chunk_size = @min(MAX_CHUNK_SIZE, @max(MIN_CHUNK_SIZE, @as(u64, @intFromFloat(@as(f64, @floatFromInt(retry_chunk_size)) * scale_factor))));
+
+                if (total_events > TARGET_EVENTS_PER_CHUNK * 2) {
+                    std.log.info("  ⚠️  High density: {d} events ({d:.2}→{d:.2} events/block), next chunk: {d} blocks", .{
+                        total_events,
+                        old_density,
+                        events_per_block,
+                        next_chunk_size,
+                    });
+                } else if (total_events < TARGET_EVENTS_PER_CHUNK / 2) {
+                    std.log.info("  ✅ Low density: {d} events ({d:.2}→{d:.2} events/block), next chunk: {d} blocks", .{
+                        total_events,
+                        old_density,
+                        events_per_block,
+                        next_chunk_size,
+                    });
+                }
+
+                // Only advance to next chunk if we're not reprocessing for new controllers
+                if (!needs_controller_reprocess) {
+                    chunk_start = chunk_end + 1;
+                    // Rate limit: wait between batches to avoid hitting RPC provider limits
+                    if (chunk_start <= to_block) {
+                        std.Thread.sleep(constants.Timing.rpc_retry_delay_ms * std.time.ns_per_ms); // 200ms delay between batches
+                    }
+                }
+                break :retry_loop; // Success - move to next chunk (or reprocess current chunk)
             }
         }
     }
@@ -1267,7 +1267,7 @@ pub const Indexer = struct {
         // Skip if entire range is before temp registrar start OR if V2 is deployed and range is entirely after V2
         const v2_deployment = if (chain == .l1) l1_contracts.l1_deployment_block else self.config.l2_contracts.l2_deployment_block;
         const should_index_v1 = (temp_registrar_start > 0) and (to_block >= temp_registrar_start) and
-                               (v2_deployment == 0 or from_block < v2_deployment + 10);
+            (v2_deployment == 0 or from_block < v2_deployment + 10);
 
         if (should_index_v1) {
             // EFFICIENT: Index all V1 events together per chunk (Registry, Name Wrapper, Base Registrar, Reverse Registrar)
@@ -2408,12 +2408,10 @@ pub const Indexer = struct {
 
         // In ABI encoding: [offset_to_string, expiration, registeredBy, string_length, string_data]
         // offset_to_string is at 0x00, expiration at 0x20, registeredBy at 0x40
-        const expiration = try abi.ABI.decodeUint256(log.data, 32);  // uint64 but padded to uint256
+        const expiration = try abi.ABI.decodeUint256(log.data, 32); // uint64 but padded to uint256
         const registered_by = try abi.ABI.decodeAddress(log.data, 64);
 
-        std.log.debug("NameRegistered: {s} (tokenId={d}, expiration={d}, registeredBy={any})", .{
-            label_str, token_id, expiration, registered_by
-        });
+        std.log.debug("NameRegistered: {s} (tokenId={d}, expiration={d}, registeredBy={any})", .{ label_str, token_id, expiration, registered_by });
 
         // Determine parent name based on registry address
         // If from main .eth registry, parent is "eth". Otherwise look up subregistry parent.
@@ -2771,12 +2769,10 @@ pub const Indexer = struct {
         const canonical_id = token_id_utils_renew.getCanonicalId(token_id);
 
         // Data contains: uint64 newExpiration, address renewedBy (both padded to 32 bytes)
-        const new_expiration = try abi.ABI.decodeUint256(log.data, 0);  // uint64 but padded
+        const new_expiration = try abi.ABI.decodeUint256(log.data, 0); // uint64 but padded
         const renewed_by = try abi.ABI.decodeAddress(log.data, 32);
 
-        std.log.debug("NameRenewed: tokenId={d}, canonicalId={d}, newExpiration={d}, renewedBy={any}", .{
-            token_id, canonical_id, new_expiration, renewed_by
-        });
+        std.log.debug("NameRenewed: tokenId={d}, canonicalId={d}, newExpiration={d}, renewedBy={any}", .{ token_id, canonical_id, new_expiration, renewed_by });
 
         // Update expiry using canonical_id (stable across token regenerations)
         try self.database.updateNameExpiryByCanonicalId(canonical_id, @intCast(new_expiration));
@@ -2917,15 +2913,13 @@ pub const Indexer = struct {
         const owner = try abi.ABI.decodeAddress(log.data, 32);
         const subregistry = try abi.ABI.decodeAddress(log.data, 64);
         const resolver = try abi.ABI.decodeAddress(log.data, 96);
-        const duration = try abi.ABI.decodeUint256(log.data, 128);  // uint64 padded
+        const duration = try abi.ABI.decodeUint256(log.data, 128); // uint64 padded
         const payment_token = try abi.ABI.decodeAddress(log.data, 160);
         const referrer = try abi.ABI.decodeBytes32(log.data, 192);
         const base_price = try abi.ABI.decodeUint256(log.data, 224);
         const premium = try abi.ABI.decodeUint256(log.data, 256);
 
-        std.log.debug("ETHRegistrar.NameRegistered: {s} (tokenId={d}, owner={any}, duration={d}, base={d}, premium={d})", .{
-            label_str, token_id, owner, duration, base_price, premium
-        });
+        std.log.debug("ETHRegistrar.NameRegistered: {s} (tokenId={d}, owner={any}, duration={d}, base={d}, premium={d})", .{ label_str, token_id, owner, duration, base_price, premium });
 
         // Compute namehash
         const full_name = try std.fmt.allocPrint(self.allocator, "{s}.eth", .{label_str});
@@ -3062,15 +3056,13 @@ pub const Indexer = struct {
             return;
         };
 
-        const duration = try abi.ABI.decodeUint256(log.data, 32);  // uint64 padded
-        const new_expiry = try abi.ABI.decodeUint256(log.data, 64);  // uint64 padded
+        const duration = try abi.ABI.decodeUint256(log.data, 32); // uint64 padded
+        const new_expiry = try abi.ABI.decodeUint256(log.data, 64); // uint64 padded
         const payment_token = try abi.ABI.decodeAddress(log.data, 96);
         const referrer = try abi.ABI.decodeBytes32(log.data, 128);
         const base_price = try abi.ABI.decodeUint256(log.data, 160);
 
-        std.log.debug("ETHRegistrar.NameRenewed: {s} (tokenId={d}, canonicalId={d}, duration={d}, newExpiry={d}, base={d})", .{
-            label_str, token_id, canonical_id, duration, new_expiry, base_price
-        });
+        std.log.debug("ETHRegistrar.NameRenewed: {s} (tokenId={d}, canonicalId={d}, duration={d}, newExpiry={d}, base={d})", .{ label_str, token_id, canonical_id, duration, new_expiry, base_price });
 
         // Update expiry using canonical_id (stable across token regenerations)
         try self.database.updateNameExpiryByCanonicalId(canonical_id, @intCast(new_expiry));
@@ -6175,7 +6167,8 @@ pub const Indexer = struct {
             const label_ptr = c.sqlite3_column_text(query_stmt, 8);
 
             if (namehash_ptr == null or label_hash_ptr == null or parent_node_ptr == null or
-                owner_ptr == null or tx_hash_ptr == null or label_ptr == null) {
+                owner_ptr == null or tx_hash_ptr == null or label_ptr == null)
+            {
                 std.log.warn("Skipping row with null value in backfill", .{});
                 continue;
             }
