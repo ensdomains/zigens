@@ -2317,12 +2317,19 @@ pub const Indexer = struct {
 
         std.log.debug("ResolverUpdate: tokenId={d}, canonicalId={d}, resolver={any}, contract={any}", .{ token_id, canonical_id, resolver_addr, log.address });
 
-        // Look up the name by canonical ID (strip version bits from token_id first)
-        const maybe_name = try self.database.getNameByCanonicalId(canonical_id);
+        // Look up the name by exact token_id first (includes version bits)
+        // This is important because subnames with the same label (e.g., florin.eth and florin.fresh.eth)
+        // share the same canonical_id but have different token_ids
+        var maybe_name = try self.database.getNameByTokenId(token_id);
+
+        // Fall back to canonical_id if exact token_id not found (for backwards compatibility)
+        if (maybe_name == null) {
+            maybe_name = try self.database.getNameByCanonicalId(canonical_id);
+        }
 
         // Skip if name doesn't exist yet (might be out of order event processing)
         if (maybe_name == null) {
-            std.log.warn("  → Skipping ResolverUpdate for unknown canonicalId={d}", .{canonical_id});
+            std.log.warn("  → Skipping ResolverUpdate for unknown tokenId={d} (canonicalId={d})", .{ token_id, canonical_id });
             return;
         }
 
