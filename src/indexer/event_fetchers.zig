@@ -604,16 +604,31 @@ pub fn indexEjectionEvents(self: *Indexer, chain: models.Chain, client: *rpc.Cli
 }
 
 pub fn indexResolverEvents(self: *Indexer, chain: models.Chain, client: *rpc.Client, from_block: u64, to_block: u64) !void {
-    // Get known resolvers and build HashSet for O(1) lookup
-    const resolvers = try self.database.getResolversToIndex(chain, from_block, to_block);
-    defer {
-        for (resolvers) |resolver| {
-            self.allocator.free(resolver);
+    const resolvers_mod = @import("../storage/resolvers.zig");
+
+    // Discover new resolvers and get all known resolvers
+    var discovery = try resolvers_mod.discoverAndGetResolvers(self.database, chain, from_block, to_block);
+    defer discovery.deinit(self.allocator);
+
+    // Backfill historical events for newly discovered resolvers.
+    // When a resolver is first set on a domain, it may have already emitted events
+    // (e.g. EACRolesChanged during initialize()) that we missed. Fetch those now.
+    if (discovery.newly_discovered.len > 0 and from_block > 0) {
+        const backfill_from = self.config.start_block;
+        std.log.info("Backfilling {d} newly discovered resolver(s) from block {d} to {d}", .{
+            discovery.newly_discovered.len,
+            backfill_from,
+            from_block - 1,
+        });
+        for (discovery.newly_discovered) |resolver_str| {
+            const addr = Address.fromHex(resolver_str) catch continue;
+            backfillResolverEvents(self, chain, client, addr, backfill_from, from_block - 1) catch |err| {
+                std.log.warn("Failed to backfill resolver {s}: {}", .{ resolver_str, err });
+            };
         }
-        self.allocator.free(resolvers);
     }
 
-    if (resolvers.len == 0) {
+    if (discovery.all.len == 0) {
         std.log.info("No known resolvers for blocks {d}-{d}", .{ from_block, to_block });
         return;
     }
@@ -622,12 +637,12 @@ pub fn indexResolverEvents(self: *Indexer, chain: models.Chain, client: *rpc.Cli
     var known_resolver_set = std.AutoHashMap([20]u8, void).init(self.allocator);
     defer known_resolver_set.deinit();
 
-    for (resolvers) |resolver_str| {
+    for (discovery.all) |resolver_str| {
         const addr = Address.fromHex(resolver_str) catch continue;
         try known_resolver_set.put(addr.bytes, {});
     }
 
-    std.log.info("Indexing resolver events with topic-only query (1 RPC call, {d} known resolvers)", .{resolvers.len});
+    std.log.info("Indexing resolver events with topic-only query (1 RPC call, {d} known resolvers)", .{discovery.all.len});
 
     // Build event topic array for OR matching (all resolver event types)
     var event_topics: [Indexer.RESOLVER_EVENTS.len]Hash = undefined;
@@ -679,4 +694,60 @@ pub fn indexResolverEvents(self: *Indexer, chain: models.Chain, client: *rpc.Cli
     }
 
     std.log.info("Resolver indexing complete: {d} events processed, {d} skipped (unknown resolvers)", .{ processed_count, skipped_count });
+}
+
+/// Backfill historical events for a specific resolver contract.
+/// Called when a resolver is newly discovered — fetches events from its deployment
+/// to catch initialization events (e.g. EACRolesChanged) that happened before
+/// the resolver was set on any domain.
+fn backfillResolverEvents(self: *Indexer, chain: models.Chain, client: *rpc.Client, resolver_addr: Address, from_block: u64, to_block: u64) !void {
+    if (to_block < from_block) return;
+
+    const resolver_hex = try resolver_addr.toHex(self.allocator);
+    defer self.allocator.free(resolver_hex);
+
+    std.log.info("  Backfilling resolver {s} events from block {d} to {d}", .{ resolver_hex, from_block, to_block });
+
+    // Build event topic array
+    var event_topics: [Indexer.RESOLVER_EVENTS.len]Hash = undefined;
+    inline for (Indexer.RESOLVER_EVENTS, 0..) |event_cfg, i| {
+        event_topics[i] = event_cfg.event_hash;
+    }
+
+    // Query specifically for this resolver's address
+    const logs = try client.getLogsMultiAddress(.{
+        .from_block = from_block,
+        .to_block = to_block,
+        .addresses = &[_]Address{resolver_addr},
+        .topic0_or = &event_topics,
+    });
+    defer {
+        for (logs) |*log| {
+            log.deinit(self.allocator);
+        }
+        self.allocator.free(logs);
+    }
+
+    if (logs.len == 0) {
+        std.log.info("  No historical events found for resolver {s}", .{resolver_hex});
+        return;
+    }
+
+    var processed: usize = 0;
+    for (logs) |log| {
+        if (log.topics.len == 0) continue;
+
+        const event_sig = log.topics[0];
+        inline for (Indexer.RESOLVER_EVENTS) |event_cfg| {
+            if (event_sig.eql(event_cfg.event_hash)) {
+                event_cfg.handler(self, chain, resolver_addr, log) catch |err| {
+                    std.log.warn("  Backfill handler error for resolver {s}: {}", .{ resolver_hex, err });
+                };
+                processed += 1;
+                break;
+            }
+        }
+    }
+
+    std.log.info("  Backfilled {d} historical events for resolver {s}", .{ processed, resolver_hex });
 }
