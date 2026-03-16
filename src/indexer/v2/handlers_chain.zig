@@ -72,7 +72,7 @@ pub fn handleRenewalSynchronized(self: *Indexer, chain: models.Chain, log: rpc.L
 
     // Decode new_expiry (uint64, but padded to 32 bytes)
     const new_expiry_u256 = try abi.ABI.decodeUint256(log.data, 32);
-    const new_expiry: u64 = @intCast(new_expiry_u256);
+    const new_expiry: u64 = @truncate(new_expiry_u256);
 
     std.log.debug("RenewalSynchronized: tokenId={d} newExpiry={d}", .{ token_id, new_expiry });
 

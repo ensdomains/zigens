@@ -161,7 +161,7 @@ pub fn processOrphanedRegistration(
         .canonical_id = canonical_id,
         .token_version = token_version,
         .namehash = namehash,
-        .expiry = @bitCast(@as(i64, @intCast(orphan.expiry))),
+        .expiry = orphan.expiry,
         .registry_locked = false,
         .migrated = false,
         .ejected = false,
@@ -248,7 +248,7 @@ pub fn processRemainingOrphans(self: *Indexer, chain: models.Chain) !void {
 
     while (try oq.step()) {
         // Extract data from row
-        const expiry: u64 = @intCast(oq.getInt64(3));
+        const expiry: u64 = @bitCast(oq.getInt64(3));
         const block_number: u64 = @intCast(oq.getInt64(5));
         const log_index: u32 = @intCast(oq.getInt(7));
 
@@ -723,7 +723,7 @@ pub fn handleNameRenewed(self: *Indexer, chain: models.Chain, log: rpc.Log) !voi
     });
 
     // Update expiry using canonical_id (stable across token regenerations)
-    try self.database.updateNameExpiryByCanonicalId(canonical_id, @intCast(new_expiration));
+    try self.database.updateNameExpiryByCanonicalId(canonical_id, @bitCast(@as(u64, @truncate(new_expiration))));
 
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"tokenId\":{d},\"newExpiration\":{d}}}", .{
         token_id,
@@ -978,7 +978,7 @@ pub fn handleETHNameRenewed(self: *Indexer, chain: models.Chain, log: rpc.Log) !
     });
 
     // Update expiry using canonical_id (stable across token regenerations)
-    try self.database.updateNameExpiryByCanonicalId(canonical_id, @intCast(new_expiry));
+    try self.database.updateNameExpiryByCanonicalId(canonical_id, @bitCast(@as(u64, @truncate(new_expiry))));
 
     // Store event with payment details
     const payment_token_hex = try payment_token.toHex(self.allocator);
