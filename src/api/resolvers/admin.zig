@@ -49,7 +49,7 @@ pub fn resolveRoles(ctx: parser.ExecutionContext, field: *const parser.Field) !p
             break :blk try database.getRolesByAccount(chain, account_addr);
         }
     else
-        try allocator.alloc(models.EACRoleAssignment, 0); // No arguments, return empty
+        try allocator.alloc(models.EACRoleAssignment, 0); // Requires resource or account filter
 
     defer {
         for (roles) |*role| {

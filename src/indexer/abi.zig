@@ -108,6 +108,16 @@ pub const EventSignatures = struct {
     // Resolver events (from resolver contracts)
     // ========================================================================
 
+    /// AddrChanged(bytes32 indexed node, address a)
+    /// Legacy resolver event (2017) — ETH address only (coinType=60)
+    pub const legacy_addr_changed = "AddrChanged(bytes32,address)";
+    pub const legacy_addr_changed_hash: Hash = eventHash(legacy_addr_changed);
+
+    /// ContentChanged(bytes32 indexed node, bytes32 hash)
+    /// Legacy resolver event (2017) — fixed bytes32 content hash
+    pub const legacy_content_changed = "ContentChanged(bytes32,bytes32)";
+    pub const legacy_content_changed_hash: Hash = eventHash(legacy_content_changed);
+
     /// AddressChanged(bytes32 indexed node, uint256 coinType, bytes newAddress)
     pub const address_changed = "AddressChanged(bytes32,uint256,bytes)";
     pub const address_changed_hash: Hash = eventHash(address_changed);

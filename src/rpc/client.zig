@@ -99,6 +99,8 @@ pub const Log = struct {
     removed: bool,
     /// Block timestamp - optional, some RPC providers include it in eth_getLogs response
     block_timestamp: ?u64,
+    /// Block hash - included in eth_getLogs responses per Ethereum JSON-RPC spec
+    block_hash: ?Hash,
 
     pub fn deinit(self: *Log, allocator: std.mem.Allocator) void {
         allocator.free(self.topics);
@@ -515,6 +517,7 @@ pub const Client = struct {
                 .log_index = @intCast(try std.fmt.parseInt(u64, log_obj.get("logIndex").?.string[2..], 16)),
                 .removed = if (log_obj.get("removed")) |r| r.bool else false,
                 .block_timestamp = if (log_obj.get("blockTimestamp")) |ts| std.fmt.parseInt(u64, ts.string[2..], 16) catch null else null,
+                .block_hash = if (log_obj.get("blockHash")) |bh| Hash.fromHex(bh.string) catch null else null,
             };
         }
 
@@ -639,6 +642,7 @@ pub const Client = struct {
                     .log_index = @intCast(try std.fmt.parseInt(u64, log_obj.get("logIndex").?.string[2..], 16)),
                     .removed = if (log_obj.get("removed")) |r| r.bool else false,
                     .block_timestamp = if (log_obj.get("blockTimestamp")) |ts| std.fmt.parseInt(u64, ts.string[2..], 16) catch null else null,
+                    .block_hash = if (log_obj.get("blockHash")) |bh| Hash.fromHex(bh.string) catch null else null,
                 };
             }
 
@@ -750,6 +754,7 @@ pub const Client = struct {
                 .log_index = @intCast(try std.fmt.parseInt(u64, log_obj.get("logIndex").?.string[2..], 16)),
                 .removed = if (log_obj.get("removed")) |r| r.bool else false,
                 .block_timestamp = if (log_obj.get("blockTimestamp")) |ts| std.fmt.parseInt(u64, ts.string[2..], 16) catch null else null,
+                .block_hash = if (log_obj.get("blockHash")) |bh| Hash.fromHex(bh.string) catch null else null,
             };
         }
         const parse_elapsed = std.time.milliTimestamp() - parse_start;
@@ -883,6 +888,7 @@ pub const Client = struct {
                     .log_index = @intCast(try std.fmt.parseInt(u64, log_obj.get("logIndex").?.string[2..], 16)),
                     .removed = if (log_obj.get("removed")) |r| r.bool else false,
                     .block_timestamp = if (log_obj.get("blockTimestamp")) |ts| std.fmt.parseInt(u64, ts.string[2..], 16) catch null else null,
+                    .block_hash = if (log_obj.get("blockHash")) |bh| Hash.fromHex(bh.string) catch null else null,
                 };
             }
 
