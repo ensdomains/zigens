@@ -31,10 +31,12 @@ pub const Query = struct {
     stmt: ?*c.sqlite3_stmt,
     allocator: std.mem.Allocator,
     param_idx: c_int,
-    sql_z: [:0]u8,
+    sql_z: ?[:0]u8,
     /// Tracks allocated strings that need to be freed after exec/step
     bound_strings: [MAX_BOUND_STRINGS]?[]u8,
     bound_string_count: usize,
+    /// If true, the statement is from the cache and should NOT be finalized on deinit
+    is_cached: bool,
 
     /// Initialize a query with the given SQL
     /// The SQL is prepared immediately; call deinit() when done
@@ -58,17 +60,82 @@ pub const Query = struct {
             .sql_z = sql_z,
             .bound_strings = [_]?[]u8{null} ** MAX_BOUND_STRINGS,
             .bound_string_count = 0,
+            .is_cached = false,
+        };
+    }
+
+    /// Initialize a query using the prepared statement cache
+    /// On first call with a given SQL, prepares and caches the statement.
+    /// On subsequent calls, reuses the cached statement (reset + clear bindings).
+    /// The statement is NOT finalized on deinit — the cache owns it.
+    pub fn initCached(database: *Database, sql: []const u8) !Query {
+        if (database.stmt_cache.get(sql)) |cached_stmt| {
+            // Cache hit — reset the statement for reuse
+            _ = c.sqlite3_reset(cached_stmt);
+            _ = c.sqlite3_clear_bindings(cached_stmt);
+            return Query{
+                .db = database.db,
+                .stmt = cached_stmt,
+                .allocator = database.allocator,
+                .param_idx = 1,
+                .sql_z = null,
+                .bound_strings = [_]?[]u8{null} ** MAX_BOUND_STRINGS,
+                .bound_string_count = 0,
+                .is_cached = true,
+            };
+        }
+
+        // Cache miss — prepare, cache, and return
+        const sql_key = try database.allocator.dupe(u8, sql);
+        errdefer database.allocator.free(sql_key);
+
+        const sql_z = try database.allocator.dupeZ(u8, sql);
+        errdefer database.allocator.free(sql_z);
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        const prepare_result = c.sqlite3_prepare_v2(database.db, sql_z.ptr, -1, &stmt, null);
+        if (prepare_result != c.SQLITE_OK) {
+            std.log.err("Failed to prepare SQL statement: {s}", .{c.sqlite3_errmsg(database.db)});
+            std.log.err("SQL: {s}", .{sql});
+            return error.PrepareFailed;
+        }
+
+        // Store in cache (the cache keeps the stmt alive)
+        try database.stmt_cache.put(sql_key, stmt.?);
+
+        // Free sql_z since the cache uses sql_key, not sql_z
+        database.allocator.free(sql_z);
+
+        return Query{
+            .db = database.db,
+            .stmt = stmt,
+            .allocator = database.allocator,
+            .param_idx = 1,
+            .sql_z = null,
+            .bound_strings = [_]?[]u8{null} ** MAX_BOUND_STRINGS,
+            .bound_string_count = 0,
+            .is_cached = true,
         };
     }
 
     /// Clean up resources
     pub fn deinit(self: *Query) void {
         self.freeBoundStrings();
-        if (self.stmt) |s| {
-            _ = c.sqlite3_finalize(s);
-            self.stmt = null;
+        if (!self.is_cached) {
+            if (self.stmt) |s| {
+                _ = c.sqlite3_finalize(s);
+                self.stmt = null;
+            }
+        } else {
+            // Cached: just reset for next use, do NOT finalize
+            if (self.stmt) |s| {
+                _ = c.sqlite3_reset(s);
+                _ = c.sqlite3_clear_bindings(s);
+            }
         }
-        self.allocator.free(self.sql_z);
+        if (self.sql_z) |z| {
+            self.allocator.free(z);
+        }
     }
 
     /// Reset the query for re-use with new parameters
@@ -178,6 +245,28 @@ pub const Query = struct {
         const hex = try hash.toHex(self.allocator);
         self.trackBoundString(hex);
         try self.bindTextTracked(hex);
+    }
+
+    /// Bind an Address type efficiently: computes hex on stack, copies to tracked heap allocation.
+    /// Avoids the overhead of Address.toHex() which allocates and returns separately.
+    pub fn bindAddressBuf(self: *Query, addr: Address) !void {
+        var buf: [42]u8 = undefined;
+        _ = addr.toHexBuf(&buf);
+        // Copy to tracked heap memory (SQLite needs it alive until step/exec)
+        const copy = try self.allocator.dupe(u8, &buf);
+        self.trackBoundString(copy);
+        try self.bindTextTracked(copy);
+    }
+
+    /// Bind a Hash type efficiently: computes hex on stack, copies to tracked heap allocation.
+    /// Avoids the overhead of Hash.toHex() which allocates and returns separately.
+    pub fn bindHashBuf(self: *Query, hash: Hash) !void {
+        var buf: [66]u8 = undefined;
+        _ = hash.toHexBuf(&buf);
+        // Copy to tracked heap memory (SQLite needs it alive until step/exec)
+        const copy = try self.allocator.dupe(u8, &buf);
+        self.trackBoundString(copy);
+        try self.bindTextTracked(copy);
     }
 
     /// Bind a text parameter that we're tracking (uses SQLITE_STATIC since we own the memory)
