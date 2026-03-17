@@ -6,7 +6,12 @@ const unknown_labels_storage = @import("../storage/unknown_labels.zig");
 const v1_names = @import("../utils/v1_names.zig");
 const CalldataDecoder = @import("../utils/calldata_decoder.zig").CalldataDecoder;
 const Hash = @import("../types/hash.zig").Hash;
+const Address = @import("../types/address.zig").Address;
+const models = @import("../types/models.zig");
+const names_storage = @import("../storage/names.zig");
 const Rainbow = @import("../rainbow/rainbow.zig").Rainbow;
+const constants = @import("../constants.zig");
+const Keccak256 = std.crypto.hash.sha3.Keccak256;
 
 // SQLITE_TRANSIENT constant
 inline fn SQLITE_TRANSIENT() c.sqlite3_destructor_type {
@@ -19,47 +24,17 @@ pub const LabelBackfill = struct {
     allocator: std.mem.Allocator,
     rpc_client: *rpc.Client,
     database: *db_module.Database,
-    rainbow: ?Rainbow, // Optional rainbow table for fast lookups
+    rainbow: ?*Rainbow, // Borrowed from Indexer (not owned)
 
     const BATCH_SIZE = 100; // Fetch 100 transactions at a time
-    const RAINBOW_DB_PATH = "./data/ens_rainbow.db";
 
-    pub fn init(allocator: std.mem.Allocator, rpc_client: *rpc.Client, database: *db_module.Database) LabelBackfill {
-        // Try to load rainbow table (optional - gracefully handle if not available)
-        const rainbow = Rainbow.init(allocator, RAINBOW_DB_PATH) catch |err| {
-            std.log.info("Rainbow table not available ({any}), using calldata decoding only", .{err});
-            return LabelBackfill{
-                .allocator = allocator,
-                .rpc_client = rpc_client,
-                .database = database,
-                .rainbow = null,
-            };
-        };
-
-        // Rainbow table loaded successfully - log stats
-        const stats = rainbow.getDbStats() catch {
-            return LabelBackfill{
-                .allocator = allocator,
-                .rpc_client = rpc_client,
-                .database = database,
-                .rainbow = rainbow,
-            };
-        };
-
-        std.log.info("✅ Rainbow table loaded: {d} labels available", .{stats.total_labels});
-
+    pub fn init(allocator: std.mem.Allocator, rpc_client: *rpc.Client, database: *db_module.Database, rainbow: ?*Rainbow) LabelBackfill {
         return LabelBackfill{
             .allocator = allocator,
             .rpc_client = rpc_client,
             .database = database,
             .rainbow = rainbow,
         };
-    }
-
-    pub fn deinit(self: *LabelBackfill) void {
-        if (self.rainbow) |*rainbow| {
-            rainbow.deinit();
-        }
     }
 
     /// Run backfill process for all unknown labels
@@ -101,17 +76,57 @@ pub const LabelBackfill = struct {
     fn backfillBatch(self: *LabelBackfill, unknown_labels: []unknown_labels_storage.UnknownLabel) !u64 {
         var resolved_count: u64 = 0;
 
-        // STEP 1: Try rainbow table first (if available)
-        if (self.rainbow) |*rainbow| {
-            std.log.info("🔍 Attempting rainbow lookups for {} labels...", .{unknown_labels.len});
+        // addr.reverse namehash for fast comparison
+        var addr_reverse_hex_buf: [66]u8 = undefined;
+        const addr_reverse_hex = constants.WellKnown.reverse_namehash.toHexBuf(&addr_reverse_hex_buf);
+
+        // STEP 0: Resolve addr.reverse labels (no RPC needed)
+        // For addr.reverse subnames, the label is the lowercase address without 0x prefix.
+        // We try the owner address from the event and verify keccak256(label) == labelhash.
+        for (unknown_labels) |label| {
+            if (!std.mem.eql(u8, label.parent_node, addr_reverse_hex)) continue;
+
+            if (self.tryResolveAddrReverse(label)) |addr_label| {
+                defer self.allocator.free(addr_label);
+
+                const namehash = try Hash.fromHex(label.namehash);
+                try v1_names.storeTokenIdLabel(
+                    self.allocator,
+                    self.database,
+                    label.labelhash,
+                    addr_label,
+                    namehash,
+                    @intCast(label.block_number),
+                    label.transaction_hash,
+                    "addr_reverse",
+                );
+
+                self.createSubdomainNameRecord(addr_label, label) catch |err| {
+                    std.log.warn("Failed to create addr.reverse name for labelhash={s}: {}", .{ label.labelhash, err });
+                };
+
+                try unknown_labels_storage.deleteUnknownLabel(self.database.db.?, label.id);
+                resolved_count += 1;
+            } else {
+                // Owner address didn't match — mark as failed (no point retrying via RPC)
+                unknown_labels_storage.incrementBackfillAttempt(self.database.db.?, label.id) catch {};
+                unknown_labels_storage.incrementBackfillAttempt(self.database.db.?, label.id) catch {};
+                unknown_labels_storage.incrementBackfillAttempt(self.database.db.?, label.id) catch {};
+            }
+        }
+
+        // STEP 1: Try rainbow table (if available)
+        if (self.rainbow) |rainbow| {
             for (unknown_labels) |label| {
+                // Skip already-resolved labels
+                if (std.mem.eql(u8, label.parent_node, addr_reverse_hex)) continue;
+
                 const labelhash_binary = try Hash.fromHex(label.labelhash);
-                std.log.info("  Looking up labelhash: {s}", .{label.labelhash});
 
                 if (try rainbow.lookup(labelhash_binary.bytes)) |label_text| {
                     defer self.allocator.free(label_text);
 
-                    std.log.info("✅ Resolved via rainbow: {s} (labelhash={s})", .{ label_text, label.labelhash });
+                    std.log.debug("Resolved via rainbow: {s} (labelhash={s})", .{ label_text, label.labelhash });
 
                     // Store the label in v1_labels table
                     const namehash = try Hash.fromHex(label.namehash);
@@ -126,6 +141,11 @@ pub const LabelBackfill = struct {
                         "rainbow_table",
                     );
 
+                    // Create subdomain name record now that we have the label
+                    self.createSubdomainNameRecord(label_text, label) catch |err| {
+                        std.log.warn("Failed to create subdomain name for labelhash={s}: {}", .{ label.labelhash, err });
+                    };
+
                     // Delete from unknown_labels (successfully resolved)
                     try unknown_labels_storage.deleteUnknownLabel(self.database.db.?, label.id);
 
@@ -135,12 +155,15 @@ pub const LabelBackfill = struct {
         }
 
         // STEP 2: For remaining unknown labels, try calldata decoding
-        // Collect labels still needing resolution
+        // Collect labels still needing resolution (skip addr.reverse — already handled)
         var remaining_labels: std.ArrayList(unknown_labels_storage.UnknownLabel) = .{};
         defer remaining_labels.deinit(self.allocator);
 
         for (unknown_labels) |label| {
-            // Check if this label was already resolved
+            // Skip addr.reverse entries (already resolved or marked failed in step 0)
+            if (std.mem.eql(u8, label.parent_node, addr_reverse_hex)) continue;
+
+            // Check if this label was already resolved by rainbow
             const exists_query = "SELECT COUNT(*) FROM unknown_labels WHERE id = ?";
             var stmt: ?*c.sqlite3_stmt = null;
             const rc = c.sqlite3_prepare_v2(self.database.db.?, exists_query.ptr, @intCast(exists_query.len), &stmt, null);
@@ -157,7 +180,6 @@ pub const LabelBackfill = struct {
         }
 
         if (remaining_labels.items.len == 0) {
-            // All labels resolved via rainbow
             return resolved_count;
         }
 
@@ -217,9 +239,10 @@ pub const LabelBackfill = struct {
                     "transaction_calldata",
                 );
 
-                // TODO: Create the name record now that we have the label
-                // This requires reconstructing the full name from parent + label
-                // For now, we just store the label mapping
+                // Create subdomain name record now that we have the label
+                self.createSubdomainNameRecord(label_text, label) catch |err| {
+                    std.log.warn("Failed to create subdomain name for labelhash={s}: {}", .{ label.labelhash, err });
+                };
 
                 // Delete from unknown_labels (successfully resolved)
                 try unknown_labels_storage.deleteUnknownLabel(self.database.db.?, label.id);
@@ -236,6 +259,78 @@ pub const LabelBackfill = struct {
         }
 
         return resolved_count;
+    }
+
+    /// Try to resolve an addr.reverse label from the owner address.
+    /// For addr.reverse subnames, the label is the lowercase hex address without "0x".
+    /// Returns the label string (caller-owned) if keccak256(label) matches the labelhash.
+    fn tryResolveAddrReverse(self: *LabelBackfill, label: unknown_labels_storage.UnknownLabel) ?[]const u8 {
+        // Owner is stored as "0x..." hex string — the reverse label is the address without "0x", lowercased
+        const owner_hex = label.owner;
+        if (owner_hex.len < 3) return null;
+
+        // Strip "0x" prefix
+        const addr_str = if (std.mem.startsWith(u8, owner_hex, "0x")) owner_hex[2..] else owner_hex;
+        if (addr_str.len != 40) return null;
+
+        // Lowercase the address
+        var lower_addr: [40]u8 = undefined;
+        for (addr_str, 0..) |ch, i| {
+            lower_addr[i] = if (ch >= 'A' and ch <= 'F') ch + 32 else ch;
+        }
+
+        // Compute keccak256 of the lowercase address string
+        var hash_result: [32]u8 = undefined;
+        Keccak256.hash(&lower_addr, &hash_result, .{});
+
+        // Compare with the stored labelhash
+        const labelhash_binary = Hash.fromHex(label.labelhash) catch return null;
+        if (!std.mem.eql(u8, &hash_result, &labelhash_binary.bytes)) return null;
+
+        // Match! Return the lowercase address as the label
+        return self.allocator.dupe(u8, &lower_addr) catch null;
+    }
+
+    /// Heal a name record after resolving its label via backfill.
+    /// The name record was already created during indexing with a [labelhash] label.
+    /// Now that we know the plaintext label, update the name and label fields.
+    fn createSubdomainNameRecord(
+        self: *LabelBackfill,
+        label_text: []const u8,
+        unknown_label: unknown_labels_storage.UnknownLabel,
+    ) !void {
+        const namehash = try Hash.fromHex(unknown_label.namehash);
+
+        // Check if name exists — it should, since handleV1NewOwner now creates records inline
+        if (try names_storage.getNameByNamehash(self.database, namehash)) |existing| {
+            var existing_mut = existing;
+            defer existing_mut.deinit(self.allocator);
+
+            // Only heal if the label is still in [labelhash] notation
+            const needs_heal = existing.label != null and existing.label.?[0] == '[';
+            if (!needs_heal) return; // Already has a real label
+
+            // Look up parent name to reconstruct full name
+            const parent_namehash = try Hash.fromHex(unknown_label.parent_node);
+            var parent_name_str: ?[]const u8 = null;
+            var parent_record_to_free: ?models.Name = null;
+            if (try names_storage.getNameByNamehash(self.database, parent_namehash)) |parent_record| {
+                parent_record_to_free = parent_record;
+                parent_name_str = parent_record.name;
+            }
+            defer if (parent_record_to_free) |*pr| pr.deinit(self.allocator);
+
+            // Construct full name
+            const full_name = if (parent_name_str) |pn|
+                try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_text, pn })
+            else
+                try self.allocator.dupe(u8, label_text);
+            defer self.allocator.free(full_name);
+
+            try names_storage.updateNameLabel(self.database, namehash, label_text, full_name);
+            std.log.debug("Healed subdomain label: {s}", .{full_name});
+        }
+        // If name doesn't exist (shouldn't happen with new indexing), skip silently
     }
 
     /// Get statistics about unknown labels

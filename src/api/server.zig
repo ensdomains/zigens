@@ -76,7 +76,7 @@ pub const Server = struct {
             };
 
             // Spawn a thread to handle each connection concurrently
-            const thread = std.Thread.spawn(.{}, handleConnectionThread, .{ self, connection }) catch |err| {
+            const thread = std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, handleConnectionThread, .{ self, connection }) catch |err| {
                 std.log.warn("Failed to spawn handler thread: {}", .{err});
                 connection.stream.close();
                 continue;

@@ -34,6 +34,15 @@ pub const Hash = struct {
         return result;
     }
 
+    /// Convert to hex string using a caller-provided stack buffer (no allocation)
+    pub fn toHexBuf(self: Hash, buf: *[66]u8) []const u8 {
+        buf[0] = '0';
+        buf[1] = 'x';
+        const hex_bytes = std.fmt.bytesToHex(self.bytes, .lower);
+        @memcpy(buf[2..], &hex_bytes);
+        return buf[0..66];
+    }
+
     pub fn eql(self: Hash, other: Hash) bool {
         return std.mem.eql(u8, &self.bytes, &other.bytes);
     }

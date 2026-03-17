@@ -358,6 +358,88 @@ pub fn getResolversToIndex(db: *Database, chain: models.Chain, from_block: u64, 
     return resolvers.toOwnedSlice(db.allocator);
 }
 
+/// Result from resolver discovery: all known resolvers + any newly discovered ones
+pub const ResolverDiscoveryResult = struct {
+    all: [][]u8,
+    newly_discovered: [][]u8,
+
+    pub fn deinit(self: *ResolverDiscoveryResult, allocator: std.mem.Allocator) void {
+        for (self.all) |r| allocator.free(r);
+        allocator.free(self.all);
+        for (self.newly_discovered) |r| allocator.free(r);
+        allocator.free(self.newly_discovered);
+    }
+};
+
+/// Get resolvers to index, also returning which ones were newly discovered in this block range.
+/// Newly discovered resolvers need their historical events backfilled.
+pub fn discoverAndGetResolvers(db: *Database, chain: models.Chain, from_block: u64, to_block: u64) !ResolverDiscoveryResult {
+    const discover_sql =
+        \\SELECT DISTINCT n.resolver
+        \\FROM names n
+        \\LEFT JOIN known_resolvers kr ON kr.chain = n.chain AND kr.address = n.resolver
+        \\WHERE n.chain = ?
+        \\  AND n.resolver != '0x0000000000000000000000000000000000000000'
+        \\  AND n.created_block >= ?
+        \\  AND n.created_block <= ?
+        \\  AND kr.address IS NULL
+    ;
+
+    const chain_str = chain.toString();
+
+    var new_resolvers: std.ArrayList([]u8) = .{};
+    errdefer {
+        for (new_resolvers.items) |r| db.allocator.free(r);
+        new_resolvers.deinit(db.allocator);
+    }
+
+    {
+        var q = try Query.init(db, discover_sql);
+        defer q.deinit();
+
+        try q.bindTextStatic(chain_str);
+        try q.bindInt64(@intCast(from_block));
+        try q.bindInt64(@intCast(to_block));
+
+        while (try q.step()) {
+            if (q.getTextSlice(0)) |addr_slice| {
+                try db.registerResolver(chain, addr_slice, from_block);
+                const copy = try db.allocator.dupe(u8, addr_slice);
+                try new_resolvers.append(db.allocator, copy);
+            }
+        }
+    }
+
+    // Get ALL known resolvers from cache
+    const get_sql =
+        \\SELECT address FROM known_resolvers
+        \\WHERE chain = ?
+        \\ORDER BY address
+    ;
+
+    var q2 = try Query.init(db, get_sql);
+    defer q2.deinit();
+
+    try q2.bindTextStatic(chain_str);
+
+    var resolvers: std.ArrayList([]u8) = .{};
+    errdefer {
+        for (resolvers.items) |r| db.allocator.free(r);
+        resolvers.deinit(db.allocator);
+    }
+
+    while (try q2.step()) {
+        if (try q2.getText(0)) |addr| {
+            try resolvers.append(db.allocator, addr);
+        }
+    }
+
+    return .{
+        .all = try resolvers.toOwnedSlice(db.allocator),
+        .newly_discovered = try new_resolvers.toOwnedSlice(db.allocator),
+    };
+}
+
 /// Get all distinct resolver addresses set on domains owned by an account
 pub fn getResolversByOwner(db: *Database, chain: models.Chain, owner: Address) ![]models.Resolver {
     const sql =

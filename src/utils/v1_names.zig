@@ -80,42 +80,24 @@ pub fn labelToTokenId(allocator: std.mem.Allocator, label: []const u8) ![]const 
 /// Returns null if not found
 /// Caller owns the returned string and must free it
 pub fn tokenIdToLabel(
-    allocator: std.mem.Allocator,
+    _: std.mem.Allocator,
     db: anytype,
     token_id: []const u8,
 ) !?[]const u8 {
-    const c = @import("../storage/database.zig").c;
+    const db_module = @import("../storage/database.zig");
+    const Query = db_module.Query;
 
-    const query =
+    const sql =
         \\SELECT label FROM v1_labels WHERE token_id = ?
     ;
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    const prepare_result = c.sqlite3_prepare_v2(
-        db.db,
-        query.ptr,
-        @intCast(query.len),
-        &stmt,
-        null,
-    );
+    var q = try Query.initCached(db, sql);
+    defer q.deinit();
 
-    if (prepare_result != c.SQLITE_OK) {
-        std.log.err("Failed to prepare tokenIdToLabel query: {d}", .{prepare_result});
-        return error.SqliteError;
-    }
-    defer _ = c.sqlite3_finalize(stmt);
+    try q.bindText(token_id);
 
-    // Bind token_id
-    const token_id_z = try allocator.dupeZ(u8, token_id);
-    defer allocator.free(token_id_z);
-
-    _ = c.sqlite3_bind_text(stmt, 1, token_id_z.ptr, @intCast(token_id.len), SQLITE_TRANSIENT());
-
-    // Execute query
-    if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const label_ptr = c.sqlite3_column_text(stmt, 0);
-        const label_slice = std.mem.span(label_ptr);
-        return try allocator.dupe(u8, label_slice);
+    if (try q.step()) {
+        return try q.getText(0);
     }
 
     return null; // Not found
@@ -124,7 +106,7 @@ pub fn tokenIdToLabel(
 /// Stores a tokenID → label mapping in the v1_labels table
 /// This is called when we learn a label (from NameRegistered, NameRenewed, etc.)
 pub fn storeTokenIdLabel(
-    allocator: std.mem.Allocator,
+    _: std.mem.Allocator,
     db: anytype,
     token_id: []const u8,
     label: []const u8,
@@ -133,61 +115,26 @@ pub fn storeTokenIdLabel(
     tx_hash: []const u8,
     source: []const u8,
 ) !void {
-    const c = @import("../storage/database.zig").c;
+    const db_module = @import("../storage/database.zig");
+    const Query = db_module.Query;
 
-    const query =
+    const sql =
         \\INSERT OR IGNORE INTO v1_labels
         \\(token_id, label, namehash, first_seen_block, first_seen_tx, source)
         \\VALUES (?, ?, ?, ?, ?, ?)
     ;
 
-    var stmt: ?*c.sqlite3_stmt = null;
-    const prepare_result = c.sqlite3_prepare_v2(
-        db.db,
-        query.ptr,
-        @intCast(query.len),
-        &stmt,
-        null,
-    );
+    var q = try Query.initCached(db, sql);
+    defer q.deinit();
 
-    if (prepare_result != c.SQLITE_OK) {
-        std.log.err("Failed to prepare storeTokenIdLabel query: {d}", .{prepare_result});
-        return error.SqliteError;
-    }
-    defer _ = c.sqlite3_finalize(stmt);
+    try q.bindText(token_id);
+    try q.bindText(label);
+    try q.bindHashBuf(namehash);
+    try q.bindInt64(@intCast(block_number));
+    try q.bindText(tx_hash);
+    try q.bindText(source);
 
-    // Bind parameters
-    const token_id_z = try allocator.dupeZ(u8, token_id);
-    defer allocator.free(token_id_z);
-
-    const label_z = try allocator.dupeZ(u8, label);
-    defer allocator.free(label_z);
-
-    const namehash_hex = try namehash.toHex(allocator);
-    defer allocator.free(namehash_hex);
-
-    const namehash_z = try allocator.dupeZ(u8, namehash_hex);
-    defer allocator.free(namehash_z);
-
-    const tx_hash_z = try allocator.dupeZ(u8, tx_hash);
-    defer allocator.free(tx_hash_z);
-
-    const source_z = try allocator.dupeZ(u8, source);
-    defer allocator.free(source_z);
-
-    _ = c.sqlite3_bind_text(stmt, 1, token_id_z.ptr, @intCast(token_id.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 2, label_z.ptr, @intCast(label.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 3, namehash_z.ptr, @intCast(namehash_hex.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int64(stmt, 4, @intCast(block_number));
-    _ = c.sqlite3_bind_text(stmt, 5, tx_hash_z.ptr, @intCast(tx_hash.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 6, source_z.ptr, @intCast(source.len), SQLITE_TRANSIENT());
-
-    // Execute
-    const step_result = c.sqlite3_step(stmt);
-    if (step_result != c.SQLITE_DONE) {
-        std.log.err("Failed to store tokenID label mapping: {d}", .{step_result});
-        return error.SqliteError;
-    }
+    try q.exec();
 }
 
 test "computeEthNamehash - known values" {
