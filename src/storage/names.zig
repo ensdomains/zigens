@@ -285,7 +285,7 @@ pub fn getRegistriesByOwner(db: *Database, chain: models.Chain, owner: Address) 
 // ============================================================================
 
 pub fn insertName(db: *Database, name: models.Name) !void {
-    var q = try Query.init(db,
+    var q = try Query.initCached(db,
         \\INSERT INTO names
         \\(namehash, name, label, label_hash, parent_name, parent_namehash, chain,
         \\ registry, owner, registrant, resolver, token_id, canonical_id, token_version, expiry,
@@ -359,34 +359,34 @@ pub fn insertName(db: *Database, name: models.Name) !void {
 
 /// Update name expiry (for renewals)
 pub fn updateNameExpiry(db: *Database, namehash: Hash, expiry: i64) !void {
-    var q = try Query.init(db, "UPDATE names SET expiry = ?, updated_at = ? WHERE namehash = ?");
+    var q = try Query.initCached(db, "UPDATE names SET expiry = ?, updated_at = ? WHERE namehash = ?");
     defer q.deinit();
 
     try q.bindInt64(expiry);
     try q.bindInt64(std.time.timestamp());
-    try q.bindHash(namehash);
+    try q.bindHashBuf(namehash);
     try q.exec();
 }
 
 /// Update name owner (for transfers)
 pub fn updateNameOwner(db: *Database, namehash: Hash, new_owner: Address) !void {
-    var q = try Query.init(db, "UPDATE names SET owner = ?, updated_at = ? WHERE namehash = ?");
+    var q = try Query.initCached(db, "UPDATE names SET owner = ?, updated_at = ? WHERE namehash = ?");
     defer q.deinit();
 
-    try q.bindAddress(new_owner);
+    try q.bindAddressBuf(new_owner);
     try q.bindInt64(std.time.timestamp());
-    try q.bindHash(namehash);
+    try q.bindHashBuf(namehash);
     try q.exec();
 }
 
 /// Update name resolver
 pub fn updateNameResolver(db: *Database, namehash: Hash, resolver: Address) !void {
-    var q = try Query.init(db, "UPDATE names SET resolver = ?, updated_at = ? WHERE namehash = ?");
+    var q = try Query.initCached(db, "UPDATE names SET resolver = ?, updated_at = ? WHERE namehash = ?");
     defer q.deinit();
 
-    try q.bindAddress(resolver);
+    try q.bindAddressBuf(resolver);
     try q.bindInt64(std.time.timestamp());
-    try q.bindHash(namehash);
+    try q.bindHashBuf(namehash);
     try q.exec();
 }
 
@@ -527,6 +527,20 @@ pub fn updateNameWrapperExpiry(db: *Database, namehash: Hash, expiry: i64) !void
     try q.exec();
 }
 
+/// Update label and name fields for a name record (used by label healing)
+pub fn updateNameLabel(database: *Database, namehash: Hash, label: []const u8, name: []const u8) !void {
+    var q = try Query.init(database,
+        \\UPDATE names SET label = ?, name = ?
+        \\WHERE namehash = ?
+    );
+    defer q.deinit();
+
+    try q.bindText(label);
+    try q.bindText(name);
+    try q.bindHash(namehash);
+    try q.exec();
+}
+
 /// Update creation date if the new block is earlier (for backfill scenarios)
 pub fn updateNameCreationDateIfEarlier(db: *Database, namehash: Hash, block_number: u64, created_at: i64) !void {
     var q = try Query.init(db,
@@ -572,7 +586,7 @@ pub fn getNamehashByResolver(db: *Database, resolver: Address) !?Hash {
     return null;
 }
 
-/// Get name by token ID
+/// Get name by token ID (WARNING: token IDs can collide across registries, prefer getNameByTokenIdAndRegistry)
 pub fn getNameByTokenId(db: *Database, token_id: u256) !?models.Name {
     var q = try Query.init(db, SQL_SELECT_NAMES ++ " WHERE token_id = ? LIMIT 1");
     defer q.deinit();
@@ -581,6 +595,23 @@ pub fn getNameByTokenId(db: *Database, token_id: u256) !?models.Name {
     defer db.allocator.free(token_id_hex);
 
     try q.bindText(token_id_hex);
+
+    if (try q.step()) {
+        return try parseNameRow(&q, db.allocator);
+    }
+    return null;
+}
+
+/// Get name by token ID and registry address (avoids cross-registry tokenId collisions)
+pub fn getNameByTokenIdAndRegistry(db: *Database, token_id: u256, registry: Address) !?models.Name {
+    var q = try Query.init(db, SQL_SELECT_NAMES ++ " WHERE token_id = ? AND registry = ? LIMIT 1");
+    defer q.deinit();
+
+    const token_id_hex = try formatU256Hex(db.allocator, token_id);
+    defer db.allocator.free(token_id_hex);
+
+    try q.bindText(token_id_hex);
+    try q.bindAddressBuf(registry);
 
     if (try q.step()) {
         return try parseNameRow(&q, db.allocator);

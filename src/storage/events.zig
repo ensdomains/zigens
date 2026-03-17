@@ -61,7 +61,7 @@ pub fn insertEvent(db: *Database, event: models.Event) !void {
         \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ;
 
-    var q = try Query.init(db, sql);
+    var q = try Query.initCached(db, sql);
     defer q.deinit();
 
     // Bind event type and chain as static text
@@ -70,9 +70,9 @@ pub fn insertEvent(db: *Database, event: models.Event) !void {
     try q.bindTextStatic(event_type_str);
     try q.bindTextStatic(chain_str);
     try q.bindInt64(@intCast(event.block_number));
-    try q.bindHash(event.tx_hash);
+    try q.bindHashBuf(event.tx_hash);
     try q.bindInt(@intCast(event.log_index));
-    try q.bindAddress(event.contract_address);
+    try q.bindAddressBuf(event.contract_address);
     try q.bindOptionalText(event.name);
     try q.bindOptionalHash(event.namehash);
     try q.bindText(event.data);

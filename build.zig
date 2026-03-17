@@ -72,6 +72,7 @@ pub fn build(b: *std.Build) void {
         "schema.graphql",
         "src/api/introspection.json",
     });
+    generate_schema.setCwd(b.path("."));
 
     // API server executable (standalone)
     const api_exe = b.addExecutable(.{
@@ -149,6 +150,7 @@ pub fn build(b: *std.Build) void {
     unit_tests.linkSystemLibrary("sqlite3");
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    run_unit_tests.setCwd(b.path("."));
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
@@ -174,6 +176,7 @@ pub fn build(b: *std.Build) void {
     integration_tests.linkSystemLibrary("sqlite3");
 
     const run_integration_tests = b.addRunArtifact(integration_tests);
+    run_integration_tests.setCwd(b.path("."));
     const integration_test_step = b.step("test-integration", "Run integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
 
@@ -241,6 +244,7 @@ pub fn build(b: *std.Build) void {
     events_tests.linkSystemLibrary("sqlite3");
 
     const run_events_tests = b.addRunArtifact(events_tests);
+    run_events_tests.setCwd(b.path("."));
     const events_test_step = b.step("test-events", "Run event filtering tests");
     events_test_step.dependOn(&run_events_tests.step);
 
@@ -330,6 +334,7 @@ pub fn build(b: *std.Build) void {
     storage_names_tests.linkSystemLibrary("sqlite3");
 
     const run_storage_names_tests = b.addRunArtifact(storage_names_tests);
+    run_storage_names_tests.setCwd(b.path("."));
 
     // Storage tests - resolvers
     const storage_resolvers_tests = b.addTest(.{
@@ -347,6 +352,7 @@ pub fn build(b: *std.Build) void {
     storage_resolvers_tests.linkSystemLibrary("sqlite3");
 
     const run_storage_resolvers_tests = b.addRunArtifact(storage_resolvers_tests);
+    run_storage_resolvers_tests.setCwd(b.path("."));
 
     // Storage tests - roles
     const storage_roles_tests = b.addTest(.{
@@ -364,6 +370,7 @@ pub fn build(b: *std.Build) void {
     storage_roles_tests.linkSystemLibrary("sqlite3");
 
     const run_storage_roles_tests = b.addRunArtifact(storage_roles_tests);
+    run_storage_roles_tests.setCwd(b.path("."));
 
     // Storage tests - webhooks
     const storage_webhooks_tests = b.addTest(.{
@@ -381,6 +388,7 @@ pub fn build(b: *std.Build) void {
     storage_webhooks_tests.linkSystemLibrary("sqlite3");
 
     const run_storage_webhooks_tests = b.addRunArtifact(storage_webhooks_tests);
+    run_storage_webhooks_tests.setCwd(b.path("."));
 
     // Storage test step
     const storage_test_step = b.step("test-storage", "Run storage module tests");
