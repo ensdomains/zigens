@@ -136,7 +136,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
 
     // Parse orderBy and orderDirection
     var order_by: ?[]const u8 = null;
-    var order_direction: []const u8 = "asc"; // default
+    var order_direction: []const u8 = "desc"; // default: newest first
 
     for (field.arguments) |arg| {
         if (std.mem.eql(u8, arg.name, "orderBy")) {
