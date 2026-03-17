@@ -623,6 +623,7 @@ pub const Database = struct {
     pub const updateNameOwner = names.updateNameOwner;
     pub const updateNameResolver = names.updateNameResolver;
     pub const getNameByTokenId = names.getNameByTokenId;
+    pub const getNameByTokenIdAndRegistry = names.getNameByTokenIdAndRegistry;
     pub const getNameByCanonicalId = names.getNameByCanonicalId;
     pub const updateNameExpiryByTokenId = names.updateNameExpiryByTokenId;
     pub const updateNameExpiryByCanonicalId = names.updateNameExpiryByCanonicalId;
