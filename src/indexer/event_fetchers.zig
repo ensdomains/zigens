@@ -76,17 +76,24 @@ pub fn indexEthRegistryEvents(self: *Indexer, chain: models.Chain, client: *rpc.
     defer utils.deinitBatchResults(self.allocator, batch_results);
 
     // Process each event type's logs
+    var total_events: usize = 0;
     inline for (Indexer.ETH_REGISTRY_EVENTS, 0..) |event_cfg, i| {
         const logs = batch_results[i];
-        std.log.info("    Found {d} {s} event{s}", .{
-            logs.len,
-            event_cfg.name,
-            if (logs.len == 1) "" else "s",
-        });
+        if (logs.len > 0) {
+            std.log.info("    Found {d} {s} event{s}", .{
+                logs.len,
+                event_cfg.name,
+                if (logs.len == 1) "" else "s",
+            });
+        }
+        total_events += logs.len;
 
         for (logs) |log| {
             try event_cfg.handler(self, chain, log);
         }
+    }
+    if (total_events == 0) {
+        std.log.debug("    No ETH Registry events in blocks {d}-{d}", .{ from_block, to_block });
     }
 }
 
@@ -113,17 +120,24 @@ pub fn indexETHRegistrarEvents(self: *Indexer, chain: models.Chain, client: *rpc
     defer utils.deinitBatchResults(self.allocator, batch_results);
 
     // Process each event type's logs
+    var total_events: usize = 0;
     inline for (Indexer.ETH_REGISTRAR_EVENTS, 0..) |event_cfg, i| {
         const logs = batch_results[i];
-        std.log.info("    Found {d} {s} event{s}", .{
-            logs.len,
-            event_cfg.name,
-            if (logs.len == 1) "" else "s",
-        });
+        if (logs.len > 0) {
+            std.log.info("    Found {d} {s} event{s}", .{
+                logs.len,
+                event_cfg.name,
+                if (logs.len == 1) "" else "s",
+            });
+        }
+        total_events += logs.len;
 
         for (logs) |log| {
             try event_cfg.handler(self, chain, log);
         }
+    }
+    if (total_events == 0) {
+        std.log.debug("    No ETH Registrar events in blocks {d}-{d}", .{ from_block, to_block });
     }
 }
 
@@ -147,7 +161,7 @@ pub fn indexSubregistryEvents(self: *Indexer, chain: models.Chain, client: *rpc.
         return;
     }
 
-    std.log.info("Indexing {d} subregistr{s} for {s} from blocks {d}-{d} (hybrid approach)", .{
+    std.log.debug("Indexing {d} subregistr{s} for {s} from blocks {d}-{d}", .{
         subregistries.len,
         if (subregistries.len == 1) "y" else "ies",
         chain.toString(),
@@ -176,7 +190,6 @@ pub fn indexSubregistryEvents(self: *Indexer, chain: models.Chain, client: *rpc.
 
     const ENS_MAX_CHUNK: u64 = 10000; // ENS events are less common, can use larger chunks
     const ENS_MIN_CHUNK: u64 = 500; // Minimum before giving up
-    std.log.info("  Step 1: Topic-only query for {d} ENS-specific events (adaptive chunking, max {d} blocks)", .{ Indexer.SUBREGISTRY_ENS_EVENTS.len, ENS_MAX_CHUNK });
 
     // Process ENS events, auto-registering unknown subregistries
     var ens_processed: usize = 0;
@@ -237,15 +250,11 @@ pub fn indexSubregistryEvents(self: *Indexer, chain: models.Chain, client: *rpc.
                 continue;
             }
 
-            // If this address is unknown, auto-register it as a subregistry
-            // ENS-specific events are unique signatures - only ENS contracts emit them
+            // Only process events from known subregistries (registered via SubregistryUpdate)
+            // Topic-only queries can match non-ENS contracts with similar event signatures
             if (!known_subreg_set.contains(log.address.bytes)) {
-                const addr_hex = try log.address.toHex(self.allocator);
-                defer self.allocator.free(addr_hex);
-                try self.database.registerSubregistry(chain, addr_hex, log.block_number);
-                try known_subreg_set.put(log.address.bytes, {});
                 ens_auto_registered += 1;
-                std.log.debug("  → Auto-registered subregistry from ENS event: {s}", .{addr_hex});
+                continue;
             }
 
             const event_sig = log.topics[0];
@@ -279,14 +288,12 @@ pub fn indexSubregistryEvents(self: *Indexer, chain: models.Chain, client: *rpc.
         }
     }
 
-    if (ens_auto_registered > 0) {
-        std.log.info("    Fetched {d} events, processed {d}, auto-registered {d} new subregistries", .{
+    if (ens_total_fetched > 0) {
+        std.log.info("    Fetched {d} events, processed {d}, skipped {d} (unknown contracts)", .{
             ens_total_fetched,
             ens_processed,
             ens_auto_registered,
         });
-    } else {
-        std.log.info("    Fetched {d} events, processed {d}", .{ ens_total_fetched, ens_processed });
     }
 
     // ========================================================================
@@ -297,7 +304,7 @@ pub fn indexSubregistryEvents(self: *Indexer, chain: models.Chain, client: *rpc.
     // ========================================================================
     const CHUNK_SIZE: u64 = 2000; // TransferSingle is very common, stay conservative
     const BATCH_SIZE: usize = 10; // Number of chunks per HTTP request
-    std.log.info("  Step 2: Topic-only query for TransferSingle (batched, {d} chunks x {d} blocks per request)", .{ BATCH_SIZE, CHUNK_SIZE });
+    std.log.debug("  Step 2: Topic-only query for TransferSingle (batched, {d} chunks x {d} blocks per request)", .{ BATCH_SIZE, CHUNK_SIZE });
 
     const transfer_topics = [_]Hash{Indexer.SUBREGISTRY_TRANSFER_EVENT.event_hash};
     var transfer_processed: usize = 0;
@@ -441,17 +448,14 @@ pub fn indexSubregistryEvents(self: *Indexer, chain: models.Chain, client: *rpc.
         try self.database.registerSubregistry(chain, subreg_hex, to_block);
     }
 
-    std.log.info("    Fetched {d} events, processed {d}, filtered {d} (small ID) + {d} (unknown addr)", .{
-        transfer_total_fetched,
-        transfer_processed,
-        transfer_filtered_small_id,
-        transfer_filtered_unknown,
-    });
-    std.log.info("Subregistry indexing complete: {d} ENS events + {d} transfers from {d} subregistries", .{
-        ens_processed,
-        transfer_processed,
-        subregistries.len,
-    });
+    const total_processed = ens_processed + transfer_processed;
+    if (total_processed > 0) {
+        std.log.info("Subregistry indexing: {d} ENS events + {d} transfers from {d} subregistries", .{
+            ens_processed,
+            transfer_processed,
+            subregistries.len,
+        });
+    }
 }
 
 pub fn indexTransferEvents(self: *Indexer, chain: models.Chain, client: *rpc.Client, from_block: u64, to_block: u64) !void {
@@ -520,33 +524,26 @@ pub fn indexEjectionEvents(self: *Indexer, chain: models.Chain, client: *rpc.Cli
             const batch_results = try client.getLogsBatch(&batch_requests);
             defer utils.deinitBatchResults(self.allocator, batch_results);
 
-            // Process NameEjectedToL1 events
-            std.log.info("Found {d} NameEjectedToL1 event{s} from {s}", .{
-                batch_results[0].len,
-                if (batch_results[0].len == 1) "" else "s",
-                chain.toString(),
-            });
             for (batch_results[0]) |log| {
                 try self.handleNameEjectedToL1(chain, log);
             }
-
-            // Process NameEjectedToL2 events
-            std.log.info("Found {d} NameEjectedToL2 event{s} from {s}", .{
-                batch_results[1].len,
-                if (batch_results[1].len == 1) "" else "s",
-                chain.toString(),
-            });
             for (batch_results[1]) |log| {
                 try self.handleNameEjectedToL2(chain, log);
             }
-
-            // Process RenewalSynchronized events
-            std.log.info("Found {d} RenewalSynchronized event{s}", .{
-                batch_results[2].len,
-                if (batch_results[2].len == 1) "" else "s",
-            });
             for (batch_results[2]) |log| {
                 try self.handleRenewalSynchronized(chain, log);
+            }
+
+            const bridge_total = batch_results[0].len + batch_results[1].len + batch_results[2].len;
+            if (bridge_total > 0) {
+                std.log.info("Found {d} bridge event{s} from {s} ({d} EjectedToL1, {d} EjectedToL2, {d} RenewalSync)", .{
+                    bridge_total,
+                    if (bridge_total == 1) "" else "s",
+                    chain.toString(),
+                    batch_results[0].len,
+                    batch_results[1].len,
+                    batch_results[2].len,
+                });
             }
         } else {
             // L2: No RenewalSynchronized
@@ -558,24 +555,22 @@ pub fn indexEjectionEvents(self: *Indexer, chain: models.Chain, client: *rpc.Cli
             const batch_results = try client.getLogsBatch(&batch_requests);
             defer utils.deinitBatchResults(self.allocator, batch_results);
 
-            // Process NameEjectedToL1 events
-            std.log.info("Found {d} NameEjectedToL1 event{s} from {s}", .{
-                batch_results[0].len,
-                if (batch_results[0].len == 1) "" else "s",
-                chain.toString(),
-            });
             for (batch_results[0]) |log| {
                 try self.handleNameEjectedToL1(chain, log);
             }
-
-            // Process NameEjectedToL2 events
-            std.log.info("Found {d} NameEjectedToL2 event{s} from {s}", .{
-                batch_results[1].len,
-                if (batch_results[1].len == 1) "" else "s",
-                chain.toString(),
-            });
             for (batch_results[1]) |log| {
                 try self.handleNameEjectedToL2(chain, log);
+            }
+
+            const bridge_total = batch_results[0].len + batch_results[1].len;
+            if (bridge_total > 0) {
+                std.log.info("Found {d} bridge event{s} from {s} ({d} EjectedToL1, {d} EjectedToL2)", .{
+                    bridge_total,
+                    if (bridge_total == 1) "" else "s",
+                    chain.toString(),
+                    batch_results[0].len,
+                    batch_results[1].len,
+                });
             }
         }
     }
@@ -591,11 +586,13 @@ pub fn indexEjectionEvents(self: *Indexer, chain: models.Chain, client: *rpc.Cli
             self.allocator.free(logs);
         }
 
-        std.log.info("Found {d} TokenObserverSet event{s} from {s}", .{
-            logs.len,
-            if (logs.len == 1) "" else "s",
-            chain.toString(),
-        });
+        if (logs.len > 0) {
+            std.log.info("Found {d} TokenObserverSet event{s} from {s}", .{
+                logs.len,
+                if (logs.len == 1) "" else "s",
+                chain.toString(),
+            });
+        }
 
         for (logs) |log| {
             try self.handleTokenObserverSet(chain, log);
@@ -629,7 +626,7 @@ pub fn indexResolverEvents(self: *Indexer, chain: models.Chain, client: *rpc.Cli
     }
 
     if (discovery.all.len == 0) {
-        std.log.info("No known resolvers for blocks {d}-{d}", .{ from_block, to_block });
+        std.log.debug("No known resolvers for blocks {d}-{d}", .{ from_block, to_block });
         return;
     }
 
@@ -642,7 +639,7 @@ pub fn indexResolverEvents(self: *Indexer, chain: models.Chain, client: *rpc.Cli
         try known_resolver_set.put(addr.bytes, {});
     }
 
-    std.log.info("Indexing resolver events with topic-only query (1 RPC call, {d} known resolvers)", .{discovery.all.len});
+    std.log.debug("Indexing resolver events with topic-only query (1 RPC call, {d} known resolvers)", .{discovery.all.len});
 
     // Build event topic array for OR matching (all resolver event types)
     var event_topics: [Indexer.RESOLVER_EVENTS.len]Hash = undefined;
@@ -664,8 +661,6 @@ pub fn indexResolverEvents(self: *Indexer, chain: models.Chain, client: *rpc.Cli
         }
         self.allocator.free(logs);
     }
-
-    std.log.info("  Fetched {d} total events (topic-only query)", .{logs.len});
 
     // Process logs, filtering by known resolvers
     var processed_count: usize = 0;
@@ -693,7 +688,9 @@ pub fn indexResolverEvents(self: *Indexer, chain: models.Chain, client: *rpc.Cli
         }
     }
 
-    std.log.info("Resolver indexing complete: {d} events processed, {d} skipped (unknown resolvers)", .{ processed_count, skipped_count });
+    if (processed_count > 0) {
+        std.log.info("Resolver indexing: {d} events processed, {d} skipped (unknown resolvers)", .{ processed_count, skipped_count });
+    }
 }
 
 /// Backfill historical events for a specific resolver contract.
