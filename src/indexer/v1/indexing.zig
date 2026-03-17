@@ -25,9 +25,13 @@ pub fn indexV1EventsChunked(
     const MAX_CHUNK_SIZE: u64 = self.config.batch_size; // Use configured batch size as maximum
     const TARGET_EVENTS_PER_CHUNK: usize = 25000; // Target ~25000 events per chunk
 
-    var current_chunk_size: u64 = 100; // Start conservative
-    var events_per_block: f64 = 5.0; // Initial estimate: 5 events/block average
+    // Start with smarter initial estimates based on block range
+    const v1_mig_block = self.config.l1_contracts.v1_migration_block;
+    var current_chunk_size: u64 = if (v1_mig_block > 0 and from_block < v1_mig_block) 10000 else 100;
+    var events_per_block: f64 = if (v1_mig_block > 0 and from_block < v1_mig_block) 0.1 else 5.0;
     var chunk_start = from_block;
+    // RPC overflow ceiling — learned from actual overflow failures
+    var max_rpc_chunk_size: u64 = MAX_CHUNK_SIZE;
 
     while (chunk_start <= to_block) {
         // PREDICTIVE: Calculate optimal chunk size BEFORE making request
@@ -35,12 +39,11 @@ pub fn indexV1EventsChunked(
         const predicted_chunk_size = blk: {
             if (events_per_block < 0.1) {
                 // Very sparse: use maximum chunk size
-                break :blk MAX_CHUNK_SIZE;
+                break :blk max_rpc_chunk_size;
             }
-            // Calculate chunk size to hit target event count
+            // Calculate chunk size to hit target event count, capped by RPC ceiling
             const calculated = @as(u64, @intFromFloat(@ceil(@as(f64, @floatFromInt(TARGET_EVENTS_PER_CHUNK)) / events_per_block)));
-            // Clamp to min/max bounds
-            break :blk @min(MAX_CHUNK_SIZE, @max(MIN_CHUNK_SIZE, calculated));
+            break :blk @min(max_rpc_chunk_size, @max(MIN_CHUNK_SIZE, calculated));
         };
         current_chunk_size = predicted_chunk_size;
 
@@ -95,9 +98,9 @@ pub fn indexV1EventsChunked(
             const batch_results = client.getLogsBatch(batch_requests) catch |err| {
                 // Handle both RPC provider buffer overflow (error.RpcError) and curl buffer overflow (error.StdoutStreamTooLong)
                 if ((err == error.RpcError or err == error.StdoutStreamTooLong) and retry_chunk_size > ABSOLUTE_MIN_CHUNK) {
-                    // Buffer overflow - halve chunk size and retry
+                    max_rpc_chunk_size = retry_chunk_size; // Learn from overflow
                     retry_chunk_size = @max(ABSOLUTE_MIN_CHUNK, retry_chunk_size / 2);
-                    std.log.warn("  🔄 Buffer overflow! Retrying with smaller chunk: {d} blocks", .{retry_chunk_size});
+                    std.log.warn("  Buffer overflow! Retrying with {d} blocks (rpc ceiling now {d})", .{ retry_chunk_size, max_rpc_chunk_size });
                     continue :retry_loop;
                 }
                 return err; // Other errors or hit minimum chunk size
@@ -131,15 +134,18 @@ pub fn indexV1EventsChunked(
             events_per_block = events_per_block * (1.0 - LEARNING_RATE) + actual_events_per_block * LEARNING_RATE;
 
             // Calculate next chunk size with exponential scaling based on density
-            // Target: 500 events per chunk. If density is 5 events/block, we want 100 blocks.
-            // Calculate ideal chunk size, then apply exponential scaling to current size
             const ideal_chunk_size = @as(f64, @floatFromInt(TARGET_EVENTS_PER_CHUNK)) / @max(0.001, events_per_block);
             const size_ratio = ideal_chunk_size / @as(f64, @floatFromInt(retry_chunk_size));
             const scale_factor = std.math.pow(f64, size_ratio, 0.5); // Square root for smooth exponential scaling
-            const next_chunk_size = @min(MAX_CHUNK_SIZE, @max(MIN_CHUNK_SIZE, @as(u64, @intFromFloat(@as(f64, @floatFromInt(retry_chunk_size)) * scale_factor))));
+            const density_chunk = @min(MAX_CHUNK_SIZE, @max(MIN_CHUNK_SIZE, @as(u64, @intFromFloat(@as(f64, @floatFromInt(retry_chunk_size)) * scale_factor))));
+            // Cap at RPC overflow ceiling (learned from past failures), then slowly grow ceiling back
+            const next_chunk_size = @min(density_chunk, max_rpc_chunk_size);
+            if (max_rpc_chunk_size < MAX_CHUNK_SIZE) {
+                max_rpc_chunk_size = @min(MAX_CHUNK_SIZE, max_rpc_chunk_size + max_rpc_chunk_size / 10);
+            }
 
             if (total_events > TARGET_EVENTS_PER_CHUNK * 2) {
-                std.log.info("  ⚠️  High density: {d} events ({d:.2}→{d:.2} events/block), next chunk: {d} blocks", .{
+                std.log.info("  High density: {d} events ({d:.2}->{d:.2} events/block), next chunk: {d} blocks", .{
                     total_events,
                     old_density,
                     events_per_block,
@@ -154,10 +160,13 @@ pub fn indexV1EventsChunked(
                 });
             }
 
+            // Apply learned chunk size for next iteration
+            current_chunk_size = next_chunk_size;
+
             chunk_start = chunk_end + 1;
             // Rate limit: wait between batches to avoid hitting RPC provider limits
             if (chunk_start <= to_block) {
-                std.Thread.sleep(constants.Timing.rpc_retry_delay_ms * std.time.ns_per_ms); // 200ms delay between batches
+                std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms); // 50ms delay between batches
             }
             break :retry_loop; // Success - move to next chunk
         }
@@ -165,7 +174,9 @@ pub fn indexV1EventsChunked(
 }
 
 /// EFFICIENT V1 indexing: Process ALL V1 contracts together per chunk
-/// This avoids reprocessing the same block range multiple times
+/// Uses topic0 OR matching to combine event types per contract, reducing ~18 RPC sub-requests to ~5
+/// Processing order: ETH Controller → Base Registrar → ENS Registry → Name Wrapper → Reverse Registrar
+/// (ETH Controller must be first because it provides label text that Base Registrar handlers need)
 pub fn indexAllV1Events(self: *Indexer, chain: models.Chain, client: *rpc.Client, from_block: u64, to_block: u64) !void {
     if (chain != .l1) return; // V1 events only exist on mainnet L1
 
@@ -178,24 +189,67 @@ pub fn indexAllV1Events(self: *Indexer, chain: models.Chain, client: *rpc.Client
     const MAX_CHUNK_SIZE: u64 = self.config.batch_size; // Use configured batch size as maximum
     const TARGET_EVENTS_PER_CHUNK: usize = 25000; // Target ~25000 events per chunk
 
-    var current_chunk_size: u64 = 100; // Start conservative
-    var events_per_block: f64 = 5.0; // Initial estimate: 5 events/block average
+    // Start with smarter initial estimates based on block range
+    // Pre-migration era has ~0.01 events/block, post-migration is denser
+    const v1_migration_block = self.config.l1_contracts.v1_migration_block;
+    var current_chunk_size: u64 = if (v1_migration_block > 0 and from_block < v1_migration_block) 10000 else 100;
+    var events_per_block: f64 = if (v1_migration_block > 0 and from_block < v1_migration_block) 0.1 else 5.0;
     var chunk_start = from_block;
+    // RPC overflow ceiling — learned from actual overflow failures.
+    // Prevents the density predictor from overshooting into sizes that will overflow.
+    var max_rpc_chunk_size: u64 = MAX_CHUNK_SIZE;
 
     // Name Wrapper deployment block (from contract config)
     const NAME_WRAPPER_DEPLOYMENT_BLOCK = self.config.l1_contracts.name_wrapper_deployment_block;
+
+    // Pre-build topic arrays for each contract group (constant across chunks)
+    const eth_controller_topics = comptime blk: {
+        var topics: [Indexer.V1_ETH_CONTROLLER_EVENTS.len]Hash = undefined;
+        for (Indexer.V1_ETH_CONTROLLER_EVENTS, 0..) |cfg, i| {
+            topics[i] = cfg.event_hash;
+        }
+        break :blk topics;
+    };
+    const base_registrar_topics = comptime blk: {
+        var topics: [Indexer.V1_BASE_REGISTRAR_EVENTS.len]Hash = undefined;
+        for (Indexer.V1_BASE_REGISTRAR_EVENTS, 0..) |cfg, i| {
+            topics[i] = cfg.event_hash;
+        }
+        break :blk topics;
+    };
+    const registry_topics = comptime blk: {
+        var topics: [Indexer.V1_REGISTRY_EVENTS.len]Hash = undefined;
+        for (Indexer.V1_REGISTRY_EVENTS, 0..) |cfg, i| {
+            topics[i] = cfg.event_hash;
+        }
+        break :blk topics;
+    };
+    const name_wrapper_topics = comptime blk: {
+        var topics: [Indexer.V1_NAME_WRAPPER_EVENTS.len]Hash = undefined;
+        for (Indexer.V1_NAME_WRAPPER_EVENTS, 0..) |cfg, i| {
+            topics[i] = cfg.event_hash;
+        }
+        break :blk topics;
+    };
+    const reverse_registrar_topics = comptime blk: {
+        var topics: [Indexer.V1_REVERSE_REGISTRAR_EVENTS.len]Hash = undefined;
+        for (Indexer.V1_REVERSE_REGISTRAR_EVENTS, 0..) |cfg, i| {
+            topics[i] = cfg.event_hash;
+        }
+        break :blk topics;
+    };
 
     while (chunk_start <= to_block) {
         // Flag to indicate if we need to reprocess this chunk due to new controllers
         var needs_controller_reprocess = false;
 
-        // PREDICTIVE: Calculate optimal chunk size BEFORE making request
+        // PREDICTIVE: Calculate optimal chunk size BEFORE making request, capped by RPC ceiling
         const predicted_chunk_size = blk: {
             if (events_per_block < 0.1) {
-                break :blk MAX_CHUNK_SIZE;
+                break :blk max_rpc_chunk_size;
             }
             const calculated = @as(u64, @intFromFloat(@ceil(@as(f64, @floatFromInt(TARGET_EVENTS_PER_CHUNK)) / events_per_block)));
-            break :blk @min(MAX_CHUNK_SIZE, @max(MIN_CHUNK_SIZE, calculated));
+            break :blk @min(max_rpc_chunk_size, @max(MIN_CHUNK_SIZE, calculated));
         };
         current_chunk_size = predicted_chunk_size;
 
@@ -214,275 +268,275 @@ pub fn indexAllV1Events(self: *Indexer, chain: models.Chain, client: *rpc.Client
                 events_per_block,
             });
 
-            // Build batch requests for ALL V1 contracts in this chunk
-            var batch_list: std.ArrayList(rpc.Client.BatchGetLogsRequest) = .{};
-            defer batch_list.deinit(self.allocator);
+            // Build combined requests using topic0 OR matching (5 requests instead of ~18)
+            // Each request covers one contract group with ALL event types combined
+            const active_controllers = try self.getOrLoadActiveControllers();
 
-            var topics_list: std.ArrayList([]const ?Hash) = .{};
-            defer {
-                for (topics_list.items) |topics| {
-                    self.allocator.free(topics);
-                }
-                topics_list.deinit(self.allocator);
-            }
+            // Batch request index mapping:
+            // [0] = ETH Controllers (all addresses, topic0 OR NameRegistered|NameRenewed)
+            // [1] = Base Registrar (topic0 OR Transfer|NameRegistered|NameRenewed|ControllerAdded|ControllerRemoved)
+            // [2] = ENS Registry (topic0 OR NewOwner|Transfer|NewResolver|NewTTL)
+            // [3] = Name Wrapper (topic0 OR NameWrapped|NameUnwrapped|FusesSet|ExpiryExtended) - conditional
+            // [4] = Reverse Registrar (topic0 ReverseClaimed)
+            const include_name_wrapper = chunk_end >= NAME_WRAPPER_DEPLOYMENT_BLOCK;
+            const num_requests: usize = if (include_name_wrapper) 5 else 4;
 
-            // Track which contract/event each batch request corresponds to
-            const ContractEventInfo = struct {
-                contract_name: []const u8,
-                event_config: Indexer.RegistryEventConfig,
-                contract_addr: Address,
-            };
-            var request_info_list: std.ArrayList(ContractEventInfo) = .{};
-            defer request_info_list.deinit(self.allocator);
-
-            // 1. ETH Registrar Controller events - MUST BE FIRST!
-            // ETH Controller events contain the label text which Base Registrar needs
-            // Query active controllers dynamically from database
-            const v1_controllers = @import("../../storage/v1_controllers.zig");
-            const active_controllers = try v1_controllers.getActiveControllers(self.allocator, self.database);
-            defer self.allocator.free(active_controllers);
+            // Build controller addresses for ETH Controller request
+            var controller_addrs: []const Address = undefined;
+            var controller_addrs_heap: ?[]Address = null;
+            defer if (controller_addrs_heap) |h| self.allocator.free(h);
 
             if (active_controllers.len == 0) {
+                // Fallback to config
+                const fallback = try self.allocator.alloc(Address, 1);
+                fallback[0] = self.config.l1_contracts.eth_registrar_controller;
+                controller_addrs_heap = fallback;
+                controller_addrs = fallback;
                 std.log.warn("No active V1 controllers found in database - using config fallback", .{});
-                // Fallback to config if no controllers in DB (e.g., fresh database)
-                for (Indexer.V1_ETH_CONTROLLER_EVENTS) |event_cfg| {
-                    var topics = try self.allocator.alloc(?Hash, 1);
-                    topics[0] = event_cfg.event_hash;
-                    try topics_list.append(self.allocator, topics);
-
-                    try batch_list.append(self.allocator, .{
-                        .from_block = chunk_start,
-                        .to_block = chunk_end,
-                        .address = self.config.l1_contracts.eth_registrar_controller,
-                        .topics = topics,
-                    });
-                    try request_info_list.append(self.allocator, .{
-                        .contract_name = "ETH Registrar Controller",
-                        .event_config = event_cfg,
-                        .contract_addr = self.config.l1_contracts.eth_registrar_controller,
-                    });
-                }
             } else {
-                // Index events from ALL active controllers
-                for (active_controllers) |controller_addr| {
-                    const controller_hex = try controller_addr.toHex(self.allocator);
-                    defer self.allocator.free(controller_hex);
-                    std.log.debug("Indexing controller: {s}", .{controller_hex});
-
-                    for (Indexer.V1_ETH_CONTROLLER_EVENTS) |event_cfg| {
-                        var topics = try self.allocator.alloc(?Hash, 1);
-                        topics[0] = event_cfg.event_hash;
-                        try topics_list.append(self.allocator, topics);
-
-                        try batch_list.append(self.allocator, .{
-                            .from_block = chunk_start,
-                            .to_block = chunk_end,
-                            .address = controller_addr,
-                            .topics = topics,
-                        });
-                        try request_info_list.append(self.allocator, .{
-                            .contract_name = "ETH Registrar Controller",
-                            .event_config = event_cfg,
-                            .contract_addr = controller_addr,
-                        });
-                    }
-                }
+                controller_addrs = active_controllers;
             }
 
-            // 2. Base Registrar events
-            // These can now look up labels from v1_labels table populated above
-            for (Indexer.V1_BASE_REGISTRAR_EVENTS) |event_cfg| {
-                var topics = try self.allocator.alloc(?Hash, 1);
-                topics[0] = event_cfg.event_hash;
-                try topics_list.append(self.allocator, topics);
+            var requests = try self.allocator.alloc(rpc.Client.MultiAddressLogsRequest, num_requests);
+            defer self.allocator.free(requests);
 
-                try batch_list.append(self.allocator, .{
+            // [0] ETH Controllers - all controller addresses, topic0 OR
+            requests[0] = .{
+                .from_block = chunk_start,
+                .to_block = chunk_end,
+                .addresses = controller_addrs,
+                .topic0_or = &eth_controller_topics,
+            };
+
+            // [1] Base Registrar
+            const base_registrar_addr = [_]Address{self.config.l1_contracts.base_registrar};
+            requests[1] = .{
+                .from_block = chunk_start,
+                .to_block = chunk_end,
+                .addresses = &base_registrar_addr,
+                .topic0_or = &base_registrar_topics,
+            };
+
+            // [2] ENS Registry
+            const ens_registry_addr = [_]Address{self.config.l1_contracts.ens_registry};
+            requests[2] = .{
+                .from_block = chunk_start,
+                .to_block = chunk_end,
+                .addresses = &ens_registry_addr,
+                .topic0_or = &registry_topics,
+            };
+
+            // [3] Name Wrapper (conditional) or [3] Reverse Registrar
+            const reverse_registrar_addr = [_]Address{self.config.l1_contracts.reverse_registrar};
+            if (include_name_wrapper) {
+                const name_wrapper_addr = [_]Address{self.config.l1_contracts.name_wrapper};
+                requests[3] = .{
+                    .from_block = @max(chunk_start, NAME_WRAPPER_DEPLOYMENT_BLOCK),
+                    .to_block = chunk_end,
+                    .addresses = &name_wrapper_addr,
+                    .topic0_or = &name_wrapper_topics,
+                };
+                requests[4] = .{
                     .from_block = chunk_start,
                     .to_block = chunk_end,
-                    .address = self.config.l1_contracts.base_registrar,
-                    .topics = topics,
-                });
-                try request_info_list.append(self.allocator, .{
-                    .contract_name = "Base Registrar",
-                    .event_config = event_cfg,
-                    .contract_addr = self.config.l1_contracts.base_registrar,
-                });
-            }
-
-            // 3. ENS Registry events
-            for (Indexer.V1_REGISTRY_EVENTS) |event_cfg| {
-                var topics = try self.allocator.alloc(?Hash, 1);
-                topics[0] = event_cfg.event_hash;
-                try topics_list.append(self.allocator, topics);
-
-                try batch_list.append(self.allocator, .{
+                    .addresses = &reverse_registrar_addr,
+                    .topic0_or = &reverse_registrar_topics,
+                };
+            } else {
+                requests[3] = .{
                     .from_block = chunk_start,
                     .to_block = chunk_end,
-                    .address = self.config.l1_contracts.ens_registry,
-                    .topics = topics,
-                });
-                try request_info_list.append(self.allocator, .{
-                    .contract_name = "ENS Registry",
-                    .event_config = event_cfg,
-                    .contract_addr = self.config.l1_contracts.ens_registry,
-                });
+                    .addresses = &reverse_registrar_addr,
+                    .topic0_or = &reverse_registrar_topics,
+                };
             }
 
-            // 4. Name Wrapper events (only if we're past deployment block)
-            if (chunk_end >= NAME_WRAPPER_DEPLOYMENT_BLOCK) {
-                for (Indexer.V1_NAME_WRAPPER_EVENTS) |event_cfg| {
-                    var topics = try self.allocator.alloc(?Hash, 1);
-                    topics[0] = event_cfg.event_hash;
-                    try topics_list.append(self.allocator, topics);
-
-                    try batch_list.append(self.allocator, .{
-                        .from_block = @max(chunk_start, NAME_WRAPPER_DEPLOYMENT_BLOCK),
-                        .to_block = chunk_end,
-                        .address = self.config.l1_contracts.name_wrapper,
-                        .topics = topics,
-                    });
-                    try request_info_list.append(self.allocator, .{
-                        .contract_name = "Name Wrapper",
-                        .event_config = event_cfg,
-                        .contract_addr = self.config.l1_contracts.name_wrapper,
-                    });
-                }
-            }
-
-            // 5. Reverse Registrar events
-            for (Indexer.V1_REVERSE_REGISTRAR_EVENTS) |event_cfg| {
-                var topics = try self.allocator.alloc(?Hash, 1);
-                topics[0] = event_cfg.event_hash;
-                try topics_list.append(self.allocator, topics);
-
-                try batch_list.append(self.allocator, .{
-                    .from_block = chunk_start,
-                    .to_block = chunk_end,
-                    .address = self.config.l1_contracts.reverse_registrar,
-                    .topics = topics,
-                });
-                try request_info_list.append(self.allocator, .{
-                    .contract_name = "Reverse Registrar",
-                    .event_config = event_cfg,
-                    .contract_addr = self.config.l1_contracts.reverse_registrar,
-                });
-            }
-
-            // Execute batch RPC call for ALL contracts at once - retry with smaller chunks if buffer overflow
-            const batch_results = client.getLogsBatch(batch_list.items) catch |err| {
-                // Handle both RPC provider buffer overflow (error.RpcError) and curl buffer overflow (error.StdoutStreamTooLong)
+            // Execute combined batch RPC call - retry with smaller chunks if buffer overflow
+            const batch_results = client.getLogsMultiAddressBatch(requests) catch |err| {
                 if ((err == error.RpcError or err == error.StdoutStreamTooLong) and retry_chunk_size > ABSOLUTE_MIN_CHUNK) {
-                    // Buffer overflow - halve chunk size and retry
+                    // Learn from overflow: cap future predictions to avoid repeated failures
+                    max_rpc_chunk_size = retry_chunk_size; // The size that failed
                     retry_chunk_size = @max(ABSOLUTE_MIN_CHUNK, retry_chunk_size / 2);
-                    std.log.warn("  🔄 Buffer overflow! Retrying with smaller chunk: {d} blocks", .{retry_chunk_size});
+                    std.log.warn("  Buffer overflow! Retrying with {d} blocks (rpc ceiling now {d})", .{ retry_chunk_size, max_rpc_chunk_size });
                     continue :retry_loop;
                 }
-                return err; // Other errors or hit minimum chunk size
+                return err;
             };
             defer utils.deinitBatchResults(self.allocator, batch_results);
 
-            // Process results
-            // Process events and count total
-            // Track if any ControllerAdded events were found (need to reprocess chunk)
-            const controllers_before = try v1_controllers.getActiveControllers(self.allocator, self.database);
-            defer self.allocator.free(controllers_before);
-            const controller_count_before = controllers_before.len;
-
+            // Track controller count before processing to detect new controllers
+            const controller_count_before = active_controllers.len;
             var total_events: usize = 0;
-            for (batch_results, 0..) |logs, i| {
-                const info = request_info_list.items[i];
-                total_events += logs.len;
 
-                if (logs.len > 0) {
-                    std.log.info("  Found {d} V1 {s} {s} event{s}", .{
-                        logs.len,
-                        info.contract_name,
-                        info.event_config.name,
-                        if (logs.len == 1) "" else "s",
-                    });
+            // Activate write buffer for batched DB writes
+            self.write_buffer.active = true;
+            errdefer {
+                self.write_buffer.active = false;
+                self.write_buffer.reset();
+            }
+
+            // Process results in required order, dispatching by topic[0]
+            const chunk_timer = std.time.milliTimestamp();
+
+            // 1. ETH Controller events (MUST be first - provides labels for Base Registrar)
+            const eth_logs = batch_results[0];
+            total_events += eth_logs.len;
+            for (eth_logs) |log| {
+                if (log.topics.len == 0) continue;
+                inline for (Indexer.V1_ETH_CONTROLLER_EVENTS) |cfg| {
+                    if (log.topics[0].eql(cfg.event_hash)) {
+                        try cfg.handler(self, chain, log);
+                        break;
+                    }
                 }
+            }
+            const eth_elapsed = std.time.milliTimestamp() - chunk_timer;
 
-                for (logs) |log| {
-                    try info.event_config.handler(self, chain, log);
+            // 2. Base Registrar events
+            const base_timer = std.time.milliTimestamp();
+            const base_logs = batch_results[1];
+            total_events += base_logs.len;
+            for (base_logs) |log| {
+                if (log.topics.len == 0) continue;
+                inline for (Indexer.V1_BASE_REGISTRAR_EVENTS) |cfg| {
+                    if (log.topics[0].eql(cfg.event_hash)) {
+                        try cfg.handler(self, chain, log);
+                        break;
+                    }
+                }
+            }
+            const base_elapsed = std.time.milliTimestamp() - base_timer;
+
+            // 3. ENS Registry events
+            const registry_timer = std.time.milliTimestamp();
+            const registry_logs = batch_results[2];
+            total_events += registry_logs.len;
+            for (registry_logs) |log| {
+                if (log.topics.len == 0) continue;
+                inline for (Indexer.V1_REGISTRY_EVENTS) |cfg| {
+                    if (log.topics[0].eql(cfg.event_hash)) {
+                        try cfg.handler(self, chain, log);
+                        break;
+                    }
+                }
+            }
+            const registry_elapsed = std.time.milliTimestamp() - registry_timer;
+
+            // 4. Name Wrapper events (if included)
+            var wrapper_count: usize = 0;
+            var wrapper_elapsed: i64 = 0;
+            if (include_name_wrapper) {
+                const wrapper_timer = std.time.milliTimestamp();
+                const wrapper_logs = batch_results[3];
+                wrapper_count = wrapper_logs.len;
+                total_events += wrapper_logs.len;
+                for (wrapper_logs) |log| {
+                    if (log.topics.len == 0) continue;
+                    inline for (Indexer.V1_NAME_WRAPPER_EVENTS) |cfg| {
+                        if (log.topics[0].eql(cfg.event_hash)) {
+                            try cfg.handler(self, chain, log);
+                            break;
+                        }
+                    }
+                }
+                wrapper_elapsed = std.time.milliTimestamp() - wrapper_timer;
+            }
+
+            // 5. Reverse Registrar events
+            const reverse_idx: usize = if (include_name_wrapper) 4 else 3;
+            const reverse_logs = batch_results[reverse_idx];
+            total_events += reverse_logs.len;
+            for (reverse_logs) |log| {
+                if (log.topics.len == 0) continue;
+                inline for (Indexer.V1_REVERSE_REGISTRAR_EVENTS) |cfg| {
+                    if (log.topics[0].eql(cfg.event_hash)) {
+                        try cfg.handler(self, chain, log);
+                        break;
+                    }
                 }
             }
 
-            // Check if new controllers were added during processing
-            const controllers_after = try v1_controllers.getActiveControllers(self.allocator, self.database);
-            defer self.allocator.free(controllers_after);
+            const total_process_elapsed = std.time.milliTimestamp() - chunk_timer;
 
-            // Detect NEW controllers by comparing address lists
+            // Flush write buffer to database (batched writes)
+            self.write_buffer.active = false;
+            try self.write_buffer.flush(self.database);
+
+            const total_with_flush = std.time.milliTimestamp() - chunk_timer;
+            std.log.info("  Processed {d} events in {d}ms, flushed in {d}ms (eth={d}/{d}ms base={d}/{d}ms reg={d}/{d}ms wrap={d}/{d}ms rev={d})", .{
+                total_events,
+                total_process_elapsed,
+                total_with_flush - total_process_elapsed,
+                eth_logs.len,
+                eth_elapsed,
+                base_logs.len,
+                base_elapsed,
+                registry_logs.len,
+                registry_elapsed,
+                wrapper_count,
+                wrapper_elapsed,
+                reverse_logs.len,
+            });
+
+            // Check if new controllers were added during processing
             var has_new_controller = false;
-            if (controllers_after.len > controller_count_before) {
-                // More controllers now - check which ones are new
-                outer: for (controllers_after) |new_addr| {
-                    for (controllers_before) |old_addr| {
-                        if (std.mem.eql(u8, &new_addr.bytes, &old_addr.bytes)) {
-                            continue :outer; // This controller already existed
-                        }
-                    }
-                    // Found a controller that wasn't in the before list
+            if (self.v1_active_controllers == null) {
+                const controllers_after = try self.getOrLoadActiveControllers();
+                if (controllers_after.len > controller_count_before) {
                     has_new_controller = true;
-                    const new_controller_hex = try new_addr.toHex(self.allocator);
-                    defer self.allocator.free(new_controller_hex);
-                    std.log.warn("  🔄 New controller discovered: {s}! Reprocessing chunk {d}-{d}", .{ new_controller_hex, chunk_start, chunk_end });
-                    break;
+                    std.log.warn("  New controller discovered! Reprocessing chunk {d}-{d}", .{ chunk_start, chunk_end });
                 }
             }
 
             if (has_new_controller) {
-                // Set flag to reprocess this chunk with new controllers
-                // This will cause the outer while loop to restart without advancing chunk_start
                 needs_controller_reprocess = true;
                 break :retry_loop;
             }
 
             // LEARNING: Update event density estimate using exponential moving average
-            // This smooths out spikes while adapting to trends
             const actual_events_per_block = @as(f64, @floatFromInt(total_events)) / @as(f64, @floatFromInt(blocks_in_chunk));
-            const LEARNING_RATE = 0.3; // 30% weight to new data, 70% to history
+            const LEARNING_RATE = 0.3;
             const old_density = events_per_block;
             events_per_block = events_per_block * (1.0 - LEARNING_RATE) + actual_events_per_block * LEARNING_RATE;
 
-            // Calculate next chunk size with exponential scaling based on density
-            // Target: 500 events per chunk. If density is 5 events/block, we want 100 blocks.
-            // Calculate ideal chunk size, then apply exponential scaling to current size
             const ideal_chunk_size = @as(f64, @floatFromInt(TARGET_EVENTS_PER_CHUNK)) / @max(0.001, events_per_block);
             const size_ratio = ideal_chunk_size / @as(f64, @floatFromInt(retry_chunk_size));
-            const scale_factor = std.math.pow(f64, size_ratio, 0.5); // Square root for smooth exponential scaling
-            const next_chunk_size = @min(MAX_CHUNK_SIZE, @max(MIN_CHUNK_SIZE, @as(u64, @intFromFloat(@as(f64, @floatFromInt(retry_chunk_size)) * scale_factor))));
+            const scale_factor = std.math.pow(f64, size_ratio, 0.5);
+            const density_chunk = @min(MAX_CHUNK_SIZE, @max(MIN_CHUNK_SIZE, @as(u64, @intFromFloat(@as(f64, @floatFromInt(retry_chunk_size)) * scale_factor))));
+            // Cap at RPC overflow ceiling (learned from past failures), then slowly grow ceiling back
+            const next_chunk_size = @min(density_chunk, max_rpc_chunk_size);
+            if (max_rpc_chunk_size < MAX_CHUNK_SIZE) {
+                // Gradually relax ceiling by 10% per successful chunk (density may change in later blocks)
+                max_rpc_chunk_size = @min(MAX_CHUNK_SIZE, max_rpc_chunk_size + max_rpc_chunk_size / 10);
+            }
 
             if (total_events > TARGET_EVENTS_PER_CHUNK * 2) {
-                std.log.info("  ⚠️  High density: {d} events ({d:.2}→{d:.2} events/block), next chunk: {d} blocks", .{
-                    total_events,
-                    old_density,
-                    events_per_block,
-                    next_chunk_size,
+                std.log.info("  High density: {d} events ({d:.2}->{d:.2} events/block), next chunk: {d} blocks", .{
+                    total_events, old_density, events_per_block, next_chunk_size,
                 });
             } else if (total_events < TARGET_EVENTS_PER_CHUNK / 2) {
-                std.log.info("  ✅ Low density: {d} events ({d:.2}→{d:.2} events/block), next chunk: {d} blocks", .{
-                    total_events,
-                    old_density,
-                    events_per_block,
-                    next_chunk_size,
+                std.log.info("  Low density: {d} events ({d:.2}->{d:.2} events/block), next chunk: {d} blocks", .{
+                    total_events, old_density, events_per_block, next_chunk_size,
                 });
             }
 
-            // Only advance to next chunk if we're not reprocessing for new controllers
+            // Apply learned chunk size for next iteration
+            current_chunk_size = next_chunk_size;
+
             if (!needs_controller_reprocess) {
                 chunk_start = chunk_end + 1;
-                // Rate limit: wait between batches to avoid hitting RPC provider limits
                 if (chunk_start <= to_block) {
-                    std.Thread.sleep(constants.Timing.rpc_retry_delay_ms * std.time.ns_per_ms); // 200ms delay between batches
+                    std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
                 }
             }
-            break :retry_loop; // Success - move to next chunk (or reprocess current chunk)
+            break :retry_loop;
             }
         }
     }
 
-/// Index Temporary Registrar events (Pre-V1 Migration, only on L1/mainnet)
-/// AuctionStarted, NewBid, BidRevealed, HashRegistered, HashReleased, HashInvalidated
+/// Index pre-migration events: Temporary Registrar + Old ENS Registry in a single batched pass.
+/// Temporary Registrar: AuctionStarted, NewBid, BidRevealed, HashRegistered, HashReleased, HashInvalidated
+/// Old ENS Registry (0x314159...): NewOwner, Transfer, NewResolver, NewTTL
 /// Active from May 2017 (block 3327417) to May 2019 (block 9380410)
 pub fn indexTempRegistrarEvents(self: *Indexer, chain: models.Chain, client: *rpc.Client, from_block: u64, to_block: u64) !void {
     if (chain != .l1) return; // Temporary Registrar only exists on mainnet L1
@@ -495,30 +549,158 @@ pub fn indexTempRegistrarEvents(self: *Indexer, chain: models.Chain, client: *rp
     // Adjust to_block to not exceed migration block
     const adjusted_to_block = if (to_block >= v1_migration_block) v1_migration_block - 1 else to_block;
 
-    try indexV1EventsChunked(
-        self,
-        chain,
-        client,
-        from_block,
-        adjusted_to_block,
-        self.config.l1_contracts.temporary_registrar,
-        &Indexer.TEMP_REGISTRAR_EVENTS,
-        "Temporary Registrar",
-    );
+    // Use old ENS registry for pre-migration period (new registry didn't exist yet)
+    const old_registry = self.config.l1_contracts.old_ens_registry;
 
-    // Index ENS Registry events to create name relationships
-    // NewOwner, NewResolver, Transfer events from the ENS Registry contract
-    // This captures the actual domain ownership and metadata during the temp registrar period
-    try indexV1EventsChunked(
-        self,
-        chain,
-        client,
-        from_block,
-        adjusted_to_block,
-        self.config.l1_contracts.ens_registry,
-        &Indexer.V1_REGISTRY_EVENTS,
-        "ENS Registry (Pre-Migration)",
-    );
+    // Combine both contracts into a single batched pass
+    const total_event_configs = Indexer.TEMP_REGISTRAR_EVENTS.len + Indexer.V1_REGISTRY_EVENTS.len;
+
+    const ContractEventPair = struct {
+        address: Address,
+        config: Indexer.RegistryEventConfig,
+    };
+
+    var pairs: [total_event_configs]ContractEventPair = undefined;
+    var idx: usize = 0;
+
+    // Temporary Registrar events
+    for (Indexer.TEMP_REGISTRAR_EVENTS) |event_cfg| {
+        pairs[idx] = .{
+            .address = self.config.l1_contracts.temporary_registrar,
+            .config = event_cfg,
+        };
+        idx += 1;
+    }
+
+    // Old ENS Registry events
+    for (Indexer.V1_REGISTRY_EVENTS) |event_cfg| {
+        pairs[idx] = .{
+            .address = old_registry,
+            .config = event_cfg,
+        };
+        idx += 1;
+    }
+
+    // Adaptive chunked indexing (single pass over the block range)
+    const MIN_CHUNK_SIZE: u64 = constants.RpcBatching.min_chunk_size;
+    const MAX_CHUNK_SIZE: u64 = self.config.batch_size;
+    const TARGET_EVENTS_PER_CHUNK: usize = 25000;
+
+    // Pre-migration era is sparse (~0.01 events/block), start with large chunks
+    var current_chunk_size: u64 = 10000;
+    var events_per_block: f64 = 0.1;
+    var chunk_start = from_block;
+
+    while (chunk_start <= adjusted_to_block) {
+        const predicted_chunk_size = blk: {
+            if (events_per_block < 0.1) {
+                break :blk MAX_CHUNK_SIZE;
+            }
+            const calculated = @as(u64, @intFromFloat(@ceil(@as(f64, @floatFromInt(TARGET_EVENTS_PER_CHUNK)) / events_per_block)));
+            break :blk @min(MAX_CHUNK_SIZE, @max(MIN_CHUNK_SIZE, calculated));
+        };
+        current_chunk_size = predicted_chunk_size;
+
+        var retry_chunk_size = current_chunk_size;
+        const ABSOLUTE_MIN_CHUNK: u64 = 10;
+
+        retry_loop: while (true) {
+            const chunk_end = @min(chunk_start + retry_chunk_size - 1, adjusted_to_block);
+            const blocks_in_chunk = chunk_end - chunk_start + 1;
+
+            std.log.info("Indexing pre-migration events from blocks {d}-{d} (chunk_size={d}, predicted_density={d:.2} events/block)", .{
+                chunk_start,
+                chunk_end,
+                retry_chunk_size,
+                events_per_block,
+            });
+
+            // Build batch requests for all event types across both contracts
+            var batch_requests = try self.allocator.alloc(rpc.Client.BatchGetLogsRequest, total_event_configs);
+            defer self.allocator.free(batch_requests);
+
+            var topics_arrays = try self.allocator.alloc([]const ?Hash, total_event_configs);
+            defer {
+                for (topics_arrays) |topics| {
+                    self.allocator.free(topics);
+                }
+                self.allocator.free(topics_arrays);
+            }
+
+            for (&pairs, 0..) |*pair, i| {
+                var topics = try self.allocator.alloc(?Hash, 1);
+                topics[0] = pair.config.event_hash;
+                topics_arrays[i] = topics;
+
+                batch_requests[i] = .{
+                    .from_block = chunk_start,
+                    .to_block = chunk_end,
+                    .address = pair.address,
+                    .topics = topics,
+                };
+            }
+
+            const batch_results = client.getLogsBatch(batch_requests) catch |err| {
+                if ((err == error.RpcError or err == error.StdoutStreamTooLong) and retry_chunk_size > ABSOLUTE_MIN_CHUNK) {
+                    retry_chunk_size = @max(ABSOLUTE_MIN_CHUNK, retry_chunk_size / 2);
+                    std.log.warn("  🔄 Buffer overflow! Retrying with smaller chunk: {d} blocks", .{retry_chunk_size});
+                    continue :retry_loop;
+                }
+                return err;
+            };
+            defer utils.deinitBatchResults(self.allocator, batch_results);
+
+            var total_events: usize = 0;
+            for (&pairs, 0..) |*pair, i| {
+                const logs = batch_results[i];
+                total_events += logs.len;
+
+                if (logs.len > 0) {
+                    const contract_name = if (i < Indexer.TEMP_REGISTRAR_EVENTS.len) "Temporary Registrar" else "Old ENS Registry";
+                    std.log.info("  Found {d} {s} {s} event{s}", .{
+                        logs.len,
+                        contract_name,
+                        pair.config.name,
+                        if (logs.len == 1) "" else "s",
+                    });
+                }
+
+                for (logs) |log| {
+                    try pair.config.handler(self, chain, log);
+                }
+            }
+
+            // Update density estimate
+            const actual_events_per_block = @as(f64, @floatFromInt(total_events)) / @as(f64, @floatFromInt(blocks_in_chunk));
+            const LEARNING_RATE = 0.3;
+            const old_density = events_per_block;
+            events_per_block = events_per_block * (1.0 - LEARNING_RATE) + actual_events_per_block * LEARNING_RATE;
+
+            const ideal_chunk_size = @as(f64, @floatFromInt(TARGET_EVENTS_PER_CHUNK)) / @max(0.001, events_per_block);
+            const size_ratio = ideal_chunk_size / @as(f64, @floatFromInt(retry_chunk_size));
+            const scale_factor = std.math.pow(f64, size_ratio, 0.5);
+            const next_chunk_size = @min(MAX_CHUNK_SIZE, @max(MIN_CHUNK_SIZE, @as(u64, @intFromFloat(@as(f64, @floatFromInt(retry_chunk_size)) * scale_factor))));
+
+            if (total_events > TARGET_EVENTS_PER_CHUNK * 2) {
+                std.log.info("  ⚠️  High density: {d} events ({d:.2}→{d:.2} events/block), next chunk: {d} blocks", .{
+                    total_events, old_density, events_per_block, next_chunk_size,
+                });
+            } else if (total_events < TARGET_EVENTS_PER_CHUNK / 2) {
+                std.log.info("  ✅ Low density: {d} events ({d:.2}→{d:.2} events/block), next chunk: {d} blocks", .{
+                    total_events, old_density, events_per_block, next_chunk_size,
+                });
+            }
+
+            // Apply learned chunk size for next iteration
+            current_chunk_size = next_chunk_size;
+
+            chunk_start = chunk_end + 1;
+            if (chunk_start <= adjusted_to_block) {
+                std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
+            }
+            break :retry_loop;
+        }
+    }
 }
 
 /// Index V1 ENS Registry events (only on L1/mainnet)

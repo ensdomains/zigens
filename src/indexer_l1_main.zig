@@ -9,6 +9,8 @@ pub const std_options: std.Options = .{
     .log_level = .info,  // Only show info, warn, err (no debug)
 };
 
+const CliMode = enum { index, backfill };
+
 fn printHelp() void {
     std.debug.print(
         \\ENSv2 L1 Indexer
@@ -18,6 +20,7 @@ fn printHelp() void {
         \\Options:
         \\  --from-block <BLOCK>    Start indexing from this block number
         \\  --to-block <BLOCK>      Stop indexing at this block number (default: continuous)
+        \\  --backfill              Rebuild names table from stored events (no RPC needed)
         \\  --help                  Show this help message
         \\
         \\Configuration is loaded from .env file. Command-line flags override .env values.
@@ -25,9 +28,11 @@ fn printHelp() void {
     , .{});
 }
 
-fn parseArgs(allocator: std.mem.Allocator, cfg: *config.Config) !void {
+fn parseArgs(allocator: std.mem.Allocator, cfg: *config.Config) !CliMode {
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
+
+    var mode: CliMode = .index;
 
     // Skip program name
     _ = args.skip();
@@ -36,6 +41,8 @@ fn parseArgs(allocator: std.mem.Allocator, cfg: *config.Config) !void {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
             std.process.exit(0);
+        } else if (std.mem.eql(u8, arg, "--backfill")) {
+            mode = .backfill;
         } else if (std.mem.eql(u8, arg, "--from-block")) {
             if (args.next()) |block_str| {
                 cfg.start_block = try std.fmt.parseInt(u64, block_str, 10);
@@ -54,6 +61,8 @@ fn parseArgs(allocator: std.mem.Allocator, cfg: *config.Config) !void {
             std.log.warn("Unknown argument: {s}", .{arg});
         }
     }
+
+    return mode;
 }
 
 pub fn main() !void {
@@ -75,19 +84,11 @@ pub fn main() !void {
     defer cfg.deinit();
 
     // Parse command-line arguments (override .env values)
-    try parseArgs(allocator, &cfg);
+    const mode = try parseArgs(allocator, &cfg);
 
     std.log.info("ENSv2 L1 Indexer starting...", .{});
     std.log.info("Network: {s}", .{cfg.network.toString()});
-    std.log.info("L1 RPC: [CONFIGURED]", .{});
-    std.log.info("Start block: {d}", .{cfg.start_block});
-    if (cfg.end_block) |end| {
-        std.log.info("End block: {d}", .{end});
-    } else {
-        std.log.info("End block: continuous (will index indefinitely)", .{});
-    }
-    std.log.info("Batch size: {d}", .{cfg.batch_size});
-    std.log.info("Rate limit: {d} req/s", .{cfg.rate_limit_per_second});
+    std.log.info("Database: {s}", .{cfg.database_path});
 
     // Initialize database
     var database = try db.Database.init(allocator, cfg.database_path);
@@ -95,23 +96,37 @@ pub fn main() !void {
 
     std.log.info("Database initialized at: {s}", .{cfg.database_path});
 
-    // Check database integrity on startup
-    const integrity_ok = try database.checkIntegrity();
-    if (!integrity_ok) {
-        std.log.err("Database integrity check failed! Database may be corrupted.", .{});
-        std.log.err("Please restore from backup or delete database to start fresh.", .{});
-        return error.DatabaseCorrupted;
+    // In backfill mode, disable status server and webhooks to avoid DB lock contention
+    if (mode == .backfill) {
+        cfg.status_port = null;
+        cfg.webhooks_enabled = false;
     }
-    std.log.info("Database integrity check passed", .{});
 
     // Initialize indexer with only L1 client
     var idx = try indexer.Indexer.initSingleChain(allocator, cfg, &database, .l1, cfg.end_block);
     defer idx.deinit();
 
-    std.log.info("L1 Indexer started - indexing blocks...", .{});
+    switch (mode) {
+        .backfill => {
+            std.log.info("Running in --backfill mode: rebuilding names from stored events", .{});
+            try idx.replayEventsToRebuildNames();
+            std.log.info("Backfill complete. Exiting.", .{});
+        },
+        .index => {
+            std.log.info("L1 RPC: [CONFIGURED]", .{});
+            std.log.info("Start block: {d}", .{cfg.start_block});
+            if (cfg.end_block) |end| {
+                std.log.info("End block: {d}", .{end});
+            } else {
+                std.log.info("End block: continuous (will index indefinitely)", .{});
+            }
+            std.log.info("Batch size: {d}", .{cfg.batch_size});
+            std.log.info("Rate limit: {d} req/s", .{cfg.rate_limit_per_second});
 
-    // Run indexer
-    try idx.startSingleChain(.l1);
+            std.log.info("L1 Indexer started - indexing blocks...", .{});
+            try idx.startSingleChain(.l1);
+        },
+    }
 }
 
 test {

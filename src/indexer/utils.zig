@@ -16,6 +16,9 @@ pub fn emitEvent(
     namehash: ?Hash,
     data: []const u8,
 ) !void {
+    // Track block hash from log for reorg detection (avoids extra RPC call)
+    self.trackBlockHash(log.block_number, log.block_hash);
+
     const event = models.Event{
         .event_type = event_type,
         .chain = chain,

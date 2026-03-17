@@ -47,13 +47,13 @@ pub fn storeBlockHash(db: *Database, chain: models.Chain, block_number: u64, blo
         \\VALUES (?, ?, ?, ?, ?)
     ;
 
-    var q = try Query.init(db, sql);
+    var q = try Query.initCached(db, sql);
     defer q.deinit();
 
     try q.bindTextStatic(chain.toString());
     try q.bindInt64(@intCast(block_number));
-    try q.bindHash(block_hash);
-    try q.bindHash(parent_hash);
+    try q.bindHashBuf(block_hash);
+    try q.bindHashBuf(parent_hash);
     try q.bindInt64(std.time.timestamp());
 
     try q.exec();
@@ -184,7 +184,7 @@ pub fn registerResolver(db: *Database, chain: models.Chain, address: []const u8,
         \\  last_indexed_block = MAX(last_indexed_block, excluded.last_indexed_block)
     ;
 
-    var q = try Query.init(db, sql);
+    var q = try Query.initCached(db, sql);
     defer q.deinit();
 
     try q.bindTextStatic(chain.toString());
@@ -301,7 +301,7 @@ pub fn insertRenewalSync(db: *Database, chain: models.Chain, token_id: u256, new
 
     try q.bindTextStatic(chain.toString());
     try q.bindText(token_id_str);
-    try q.bindInt64(@intCast(new_expiry));
+    try q.bindInt64(@bitCast(new_expiry));
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
     try q.bindInt(@intCast(log_index));
@@ -442,7 +442,7 @@ pub fn insertOrphanedRegistration(
     try q.bindText(subregistry_address);
     try q.bindText(token_id_str);
     try q.bindText(label);
-    try q.bindInt64(@intCast(expiry));
+    try q.bindInt64(@bitCast(expiry));
     try q.bindAddress(owner);
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
@@ -492,7 +492,7 @@ pub fn getOrphanedRegistrations(db: *Database, chain: models.Chain, subregistry_
             .subregistry_address = try db.allocator.dupe(u8, addr_str),
             .token_id = token_id,
             .label = try db.allocator.dupe(u8, label_str),
-            .expiry = @intCast(q.getInt64(4)),
+            .expiry = @bitCast(q.getInt64(4)),
             .owner = Address.fromHex(owner_str) catch continue,
             .block_number = @intCast(q.getInt64(6)),
             .tx_hash = Hash.fromHex(tx_hash_str) catch continue,

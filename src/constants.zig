@@ -14,7 +14,7 @@ pub const Timing = struct {
     pub const rpc_batch_delay_ms: u64 = 50;
 
     /// Delay before retrying a failed RPC call (milliseconds)
-    pub const rpc_retry_delay_ms: u64 = 200;
+    pub const rpc_retry_delay_ms: u64 = 50;
 
     /// Delay after non-network errors before retry (milliseconds)
     pub const error_recovery_delay_ms: u64 = 5000;

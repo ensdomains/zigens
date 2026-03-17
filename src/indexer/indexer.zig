@@ -20,7 +20,10 @@ const v1_indexing = @import("v1/indexing.zig");
 const handlers_v1 = @import("v1/handlers.zig");
 const handlers_v1_temp = @import("v1/handlers_temp.zig");
 const backfill_mod = @import("v1/backfill.zig");
+const replay_mod = @import("replay.zig");
 pub const utils = @import("utils.zig");
+const WriteBuffer = @import("write_buffer.zig").WriteBuffer;
+const Rainbow = @import("../rainbow/rainbow.zig").Rainbow;
 
 pub const Indexer = struct {
     allocator: std.mem.Allocator,
@@ -41,6 +44,17 @@ pub const Indexer = struct {
     status_server: ?*status_mod.StatusServer,
     // Block timestamp cache to avoid repeated RPC calls
     block_timestamp_cache: std.AutoHashMap(u64, i64),
+    // Cached active V1 controllers (invalidated on ControllerAdded/Removed)
+    v1_active_controllers: ?[]Address = null,
+    // Cached V1 token_id → label mappings (populated on miss from DB)
+    v1_label_cache: std.StringHashMap([]const u8),
+    // Track block hash from processed logs to avoid extra getBlockByNumber RPC calls
+    last_seen_block_hash: ?Hash = null,
+    last_seen_block_number: u64 = 0,
+    // Write buffer for batching DB operations during chunk processing
+    write_buffer: WriteBuffer,
+    // Rainbow table for resolving labelhashes to labels (optional)
+    rainbow: ?Rainbow = null,
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.Config, database: *db.Database, end_block: ?u64) !Indexer {
         // Create ONE shared HTTP client for both L1 and L2
@@ -105,6 +119,12 @@ pub const Indexer = struct {
             std.log.info("Status server enabled on port {d}", .{port});
         }
 
+        // Load rainbow table (optional — graceful fallback if not available)
+        const rainbow = Rainbow.init(allocator, "./data/ens_rainbow.db") catch |err| blk: {
+            std.log.info("Rainbow table not available ({any}), label resolution will use [labelhash] format", .{err});
+            break :blk null;
+        };
+
         return Indexer{
             .allocator = allocator,
             .config = cfg,
@@ -123,6 +143,9 @@ pub const Indexer = struct {
             .indexer_status = indexer_status,
             .status_server = status_server,
             .block_timestamp_cache = std.AutoHashMap(u64, i64).init(allocator),
+            .v1_label_cache = std.StringHashMap([]const u8).init(allocator),
+            .write_buffer = WriteBuffer.init(allocator),
+            .rainbow = rainbow,
         };
     }
 
@@ -188,6 +211,12 @@ pub const Indexer = struct {
             std.log.info("Status server enabled on port {d}", .{port});
         }
 
+        // Load rainbow table (optional — graceful fallback if not available)
+        const rainbow = Rainbow.init(allocator, "./data/ens_rainbow.db") catch |err| blk: {
+            std.log.info("Rainbow table not available ({any}), label resolution will use [labelhash] format", .{err});
+            break :blk null;
+        };
+
         return Indexer{
             .allocator = allocator,
             .config = cfg,
@@ -206,6 +235,9 @@ pub const Indexer = struct {
             .indexer_status = indexer_status,
             .status_server = status_server,
             .block_timestamp_cache = std.AutoHashMap(u64, i64).init(allocator),
+            .v1_label_cache = std.StringHashMap([]const u8).init(allocator),
+            .write_buffer = WriteBuffer.init(allocator),
+            .rainbow = rainbow,
         };
     }
 
@@ -236,6 +268,97 @@ pub const Indexer = struct {
             wm.deinit();
         }
         self.block_timestamp_cache.deinit();
+        self.write_buffer.deinit();
+        if (self.rainbow) |*r| r.deinit();
+
+        // Free cached controllers
+        if (self.v1_active_controllers) |controllers| {
+            self.allocator.free(controllers);
+        }
+
+        // Free cached v1 labels
+        var label_it = self.v1_label_cache.iterator();
+        while (label_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.v1_label_cache.deinit();
+    }
+
+    /// Invalidate the cached active controllers list (call after ControllerAdded/Removed)
+    pub fn invalidateControllerCache(self: *Indexer) void {
+        if (self.v1_active_controllers) |controllers| {
+            self.allocator.free(controllers);
+            self.v1_active_controllers = null;
+        }
+    }
+
+    /// Get active controllers, loading from DB on first access or after invalidation
+    pub fn getOrLoadActiveControllers(self: *Indexer) ![]const Address {
+        if (self.v1_active_controllers) |controllers| {
+            return controllers;
+        }
+        const v1_controllers = @import("../storage/v1_controllers.zig");
+        const controllers = try v1_controllers.getActiveControllers(self.allocator, self.database);
+        self.v1_active_controllers = controllers;
+        return controllers;
+    }
+
+    /// Look up a label from v1_label_cache, falling back to DB on miss
+    pub fn getCachedV1Label(self: *Indexer, token_id_hex: []const u8) !?[]const u8 {
+        // Check cache first
+        if (self.v1_label_cache.get(token_id_hex)) |label| {
+            return label;
+        }
+
+        // Cache miss - query DB
+        const v1_names = @import("../utils/v1_names.zig");
+        const label = try v1_names.tokenIdToLabel(self.allocator, self.database, token_id_hex) orelse return null;
+
+        // Store in cache (need to dupe the key since token_id_hex may be temporary)
+        const key_copy = try self.allocator.dupe(u8, token_id_hex);
+        errdefer self.allocator.free(key_copy);
+        try self.v1_label_cache.put(key_copy, label);
+
+        return label;
+    }
+
+    /// Add a label to the v1_label_cache (called when storeTokenIdLabel succeeds)
+    pub fn putCachedV1Label(self: *Indexer, token_id_hex: []const u8, label: []const u8) !void {
+        // Check if already cached
+        if (self.v1_label_cache.contains(token_id_hex)) return;
+
+        const key_copy = try self.allocator.dupe(u8, token_id_hex);
+        errdefer self.allocator.free(key_copy);
+        const val_copy = try self.allocator.dupe(u8, label);
+        errdefer self.allocator.free(val_copy);
+        try self.v1_label_cache.put(key_copy, val_copy);
+    }
+
+    /// Resolve a labelhash to its plaintext label using the rainbow table.
+    /// Returns owned string (caller must free) or null if not found.
+    pub fn resolveLabel(self: *Indexer, labelhash: Hash) ?[]const u8 {
+        var r = self.rainbow orelse return null;
+        return r.lookup(labelhash.bytes) catch null;
+    }
+
+    /// Replay all stored events to rebuild the names table (--backfill mode).
+    pub const replayEventsToRebuildNames = replay_mod.replayEventsToRebuildNames;
+
+    /// Track block hash from a processed log (for reorg detection without extra RPC calls)
+    pub fn trackBlockHash(self: *Indexer, log_block_number: u64, log_block_hash: ?Hash) void {
+        if (log_block_hash) |bh| {
+            if (log_block_number >= self.last_seen_block_number) {
+                self.last_seen_block_hash = bh;
+                self.last_seen_block_number = log_block_number;
+            }
+        }
+    }
+
+    /// Reset block hash tracking (call before each outer batch)
+    pub fn resetBlockHashTracking(self: *Indexer) void {
+        self.last_seen_block_hash = null;
+        self.last_seen_block_number = 0;
     }
 
     /// Get block timestamp, using log's timestamp if available, then cache, then RPC fallback
@@ -431,6 +554,10 @@ pub const Indexer = struct {
     };
 
     pub const RESOLVER_EVENTS = [_]ResolverEventConfig{
+        // Legacy resolver events (2017 Public Resolver: 0x112234455c3a32fd11230c42e7bccd4a84e02010)
+        .{ .event_hash = abi.EventSignatures.legacy_addr_changed_hash, .handler = handleLegacyAddrChanged, .name = "AddrChanged (legacy)" },
+        .{ .event_hash = abi.EventSignatures.legacy_content_changed_hash, .handler = handleLegacyContentChanged, .name = "ContentChanged (legacy)" },
+        // Modern resolver events (EIP-2304+)
         .{ .event_hash = abi.EventSignatures.address_changed_hash, .handler = handleAddressChanged, .name = "AddressChanged" },
         .{ .event_hash = abi.EventSignatures.content_hash_changed_hash, .handler = handleContentHashChanged, .name = "ContentHashChanged" },
         .{ .event_hash = abi.EventSignatures.text_changed_hash, .handler = handleTextChanged, .name = "TextChanged" },
@@ -507,6 +634,13 @@ pub const Indexer = struct {
     /// Helper function to insert an event and trigger webhooks with proper memory cleanup
     /// This ensures that event.name and event.data are ALWAYS freed after use
     pub fn insertEventAndNotify(self: *Indexer, event: models.Event) !void {
+        // When write buffer is active, buffer the event instead of writing to DB.
+        // Buffer takes ownership of the strings — do NOT free them here.
+        if (self.write_buffer.active) {
+            try self.write_buffer.addEvent(event);
+            return;
+        }
+
         // Insert event into database (database makes a copy via SQLITE_TRANSIENT)
         // We must free our allocations whether insert succeeds or fails
         defer {
@@ -533,6 +667,13 @@ pub const Indexer = struct {
     pub fn start(self: *Indexer) !void {
         std.log.info("Indexer starting...", .{});
 
+        // Drop non-essential indexes for faster bulk inserts during initial sync
+        if (!self.initial_sync_complete.load(.acquire)) {
+            self.database.dropSyncIndexes() catch |err| {
+                std.log.warn("Failed to drop sync indexes (non-fatal): {}", .{err});
+            };
+        }
+
         while (!self.should_stop.load(.acquire)) {
             // Index L1 first (SQLite doesn't support concurrent writes from different threads)
             try self.indexChain(.l1, self.l1_client);
@@ -540,8 +681,12 @@ pub const Indexer = struct {
             // Then index L2
             try self.indexChain(.l2, self.l2_client);
 
-            // After first successful sync of both chains, start webhook workers
+            // After first successful sync of both chains, recreate indexes and start webhook workers
             if (!self.initial_sync_complete.load(.acquire)) {
+                self.database.createSyncIndexes() catch |err| {
+                    std.log.err("Failed to recreate sync indexes: {}", .{err});
+                };
+
                 self.initial_sync_complete.store(true, .release);
                 if (self.webhook_manager) |wm| {
                     std.log.info("Initial sync complete - starting 8 webhook workers", .{});
@@ -567,10 +712,22 @@ pub const Indexer = struct {
         const client = self.getClient(chain);
         var network_health = if (chain == .l1) &self.l1_network_health else &self.l2_network_health;
 
+        // Drop non-essential indexes for faster bulk inserts during initial sync
+        if (!self.initial_sync_complete.load(.acquire)) {
+            self.database.dropSyncIndexes() catch |err| {
+                std.log.warn("Failed to drop sync indexes (non-fatal): {}", .{err});
+            };
+        }
+
         while (!self.should_stop.load(.acquire)) {
             if (self.indexChain(chain, client)) |_| {
-                // Success - after first successful sync, start webhook workers
+                // Success - after first successful sync, recreate indexes and start webhook workers
                 if (!self.initial_sync_complete.load(.acquire)) {
+                    // Recreate all indexes before marking sync complete
+                    self.database.createSyncIndexes() catch |err| {
+                        std.log.err("Failed to recreate sync indexes: {}", .{err});
+                    };
+
                     self.initial_sync_complete.store(true, .release);
                     if (self.webhook_manager) |wm| {
                         std.log.info("Initial sync complete - starting webhook workers", .{});
@@ -588,6 +745,13 @@ pub const Indexer = struct {
                         std.log.info("Running unknown labels backfill...", .{});
                         self.backfillUnknownLabels() catch |err| {
                             std.log.err("Failed to backfill unknown labels: {}", .{err});
+                        };
+
+                        // Retroactive recovery: create name records for .eth 2LDs
+                        // where the label was resolved but no name record was created
+                        std.log.info("Running missing .eth 2LD names backfill...", .{});
+                        self.backfillMissingEth2LDNames() catch |err| {
+                            std.log.err("Failed to backfill missing .eth 2LD names: {}", .{err});
                         };
                     }
                 }
@@ -706,6 +870,9 @@ pub const Indexer = struct {
             // Rate limit RPC calls to avoid hitting provider limits
             self.rate_limiter.acquire();
 
+            // Reset block hash tracking for this batch
+            self.resetBlockHashTracking();
+
             // Use transaction for batch atomicity
             try self.database.beginTransaction();
 
@@ -739,10 +906,14 @@ pub const Indexer = struct {
             try self.database.beginTransaction();
             errdefer self.database.rollbackTransaction();
 
-            // Only store block hashes at checkpoint intervals to reduce RPC calls
-            // We only need the last block hash for reorg detection
-            const block_info = try client.getBlockByNumber(to_block, false);
-            try self.database.storeBlockHash(chain, to_block, block_info.hash, block_info.parent_hash);
+            // Use block hash from processed logs if available (avoids extra RPC call)
+            // Fall back to getBlockByNumber only when no logs were processed in this range
+            if (self.last_seen_block_hash != null and self.last_seen_block_number == to_block) {
+                try self.database.storeBlockHash(chain, to_block, self.last_seen_block_hash.?, Hash.zero);
+            } else {
+                const block_info = try client.getBlockByNumber(to_block, false);
+                try self.database.storeBlockHash(chain, to_block, block_info.hash, block_info.parent_hash);
+            }
 
             // Update sync state
             try self.database.setSyncState(chain, to_block);
@@ -877,6 +1048,8 @@ pub const Indexer = struct {
     pub const handleEACRolesChanged = handlers_v2_registry.handleEACRolesChanged;
 
     // V2 resolver handlers (extracted to handlers_v2_resolver.zig)
+    pub const handleLegacyAddrChanged = handlers_v2_resolver.handleLegacyAddrChanged;
+    pub const handleLegacyContentChanged = handlers_v2_resolver.handleLegacyContentChanged;
     pub const handleAddressChanged = handlers_v2_resolver.handleAddressChanged;
     pub const handleContentHashChanged = handlers_v2_resolver.handleContentHashChanged;
     pub const handleTextChanged = handlers_v2_resolver.handleTextChanged;
@@ -924,6 +1097,7 @@ pub const Indexer = struct {
     // Backfill functions (extracted to backfill.zig)
     const backfillPreMigrationNames = backfill_mod.backfillPreMigrationNames;
     pub const backfillUnknownLabels = backfill_mod.backfillUnknownLabels;
+    pub const backfillMissingEth2LDNames = backfill_mod.backfillMissingEth2LDNames;
 
     // Shared utility functions (extracted to utils.zig)
     pub const emitEvent = utils.emitEvent;

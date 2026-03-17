@@ -9,6 +9,113 @@ const utils = @import("../utils.zig");
 const unicode = @import("../../utils/unicode.zig");
 const json_utils = @import("../../utils/json.zig");
 
+/// Handle legacy AddrChanged event (2017 Public Resolver)
+/// AddrChanged(bytes32 indexed node, address a)
+/// Stores as coinType=60 (ETH) to match modern AddressChanged format
+pub fn handleLegacyAddrChanged(self: *Indexer, chain: models.Chain, resolver: Address, log: rpc.Log) !void {
+    // topics[0] = event signature
+    // topics[1] = indexed node (namehash)
+    if (log.topics.len < 2) return error.InvalidTopicCount;
+    var namehash = log.topics[1];
+
+    // Decode address from data (20 bytes, left-padded to 32)
+    const addr = try abi.ABI.decodeAddress(log.data, 0);
+
+    if (!try utils.resolveNamehash(self, &namehash, resolver, "AddrChanged")) return;
+
+    const addr_hex = try addr.toHex(self.allocator);
+    defer self.allocator.free(addr_hex);
+
+    const nh_hex_log = try namehash.toHex(self.allocator);
+    defer self.allocator.free(nh_hex_log);
+    std.log.debug("AddrChanged (legacy): namehash={s} address={s}", .{
+        nh_hex_log,
+        addr_hex,
+    });
+
+    // Store as coinType=60 (ETH)
+    try self.database.storeResolverAddress(
+        namehash,
+        resolver,
+        60, // ETH coin type
+        addr_hex,
+        chain,
+        log.block_number,
+        log.transaction_hash,
+        std.time.timestamp(),
+    );
+
+    // Store event
+    const nh_hex = try namehash.toHex(self.allocator);
+    defer self.allocator.free(nh_hex);
+    const resolver_hex = try resolver.toHex(self.allocator);
+    defer self.allocator.free(resolver_hex);
+
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"coinType\":60,\"address\":\"{s}\"}}", .{
+        nh_hex,
+        resolver_hex,
+        addr_hex,
+    });
+
+    const domain_name = self.getNameFromNamehash(namehash);
+    try utils.emitEvent(self, chain, log, .address_changed, domain_name, namehash, event_data);
+}
+
+/// Handle legacy ContentChanged event (2017 Public Resolver)
+/// ContentChanged(bytes32 indexed node, bytes32 hash)
+/// Stores as hex-encoded content hash to match modern ContentHashChanged format
+pub fn handleLegacyContentChanged(self: *Indexer, chain: models.Chain, resolver: Address, log: rpc.Log) !void {
+    // topics[0] = event signature
+    // topics[1] = indexed node (namehash)
+    if (log.topics.len < 2) return error.InvalidTopicCount;
+    var namehash = log.topics[1];
+
+    // Decode bytes32 content hash from data
+    const content_hash = try abi.ABI.decodeBytes32(log.data, 0);
+
+    if (!try utils.resolveNamehash(self, &namehash, resolver, "ContentChanged")) return;
+
+    const content_hex = try content_hash.toHex(self.allocator);
+    defer self.allocator.free(content_hex);
+
+    // Prepend 0x for consistent storage format
+    const content_hash_hex = try std.fmt.allocPrint(self.allocator, "0x{s}", .{content_hex});
+    defer self.allocator.free(content_hash_hex);
+
+    const nh_hex_log = try namehash.toHex(self.allocator);
+    defer self.allocator.free(nh_hex_log);
+    std.log.debug("ContentChanged (legacy): namehash={s} contentHash={s}", .{
+        nh_hex_log,
+        content_hash_hex,
+    });
+
+    // Store in database
+    try self.database.storeResolverContentHash(
+        namehash,
+        resolver,
+        content_hash_hex,
+        chain,
+        log.block_number,
+        log.transaction_hash,
+        std.time.timestamp(),
+    );
+
+    // Store event
+    const nh_hex = try namehash.toHex(self.allocator);
+    defer self.allocator.free(nh_hex);
+    const resolver_hex = try resolver.toHex(self.allocator);
+    defer self.allocator.free(resolver_hex);
+
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"contentHash\":\"{s}\"}}", .{
+        nh_hex,
+        resolver_hex,
+        content_hash_hex,
+    });
+
+    const domain_name = self.getNameFromNamehash(namehash);
+    try utils.emitEvent(self, chain, log, .contenthash_changed, domain_name, namehash, event_data);
+}
+
 /// Handle AddressChanged event
 /// AddressChanged(bytes32 indexed node, uint256 coinType, bytes newAddress)
 pub fn handleAddressChanged(self: *Indexer, chain: models.Chain, resolver: Address, log: rpc.Log) !void {

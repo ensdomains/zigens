@@ -201,11 +201,190 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
     }
 }
 
+/// Retroactive recovery for .eth 2LD names that were missed during initial indexing.
+/// When BaseRegistrar NameRegistered fires before the ETH Controller event (cross-chunk race),
+/// the handler stores the event but skips name creation because the label isn't in v1_labels yet.
+/// Once the label is later resolved (by ETH Controller NameRegistered/NameRenewed), this function
+/// finds v1_labels entries without corresponding name records and creates them.
+pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
+    // Check if backfill already completed
+    {
+        var check_q = Query.init(self.database, "SELECT completed FROM backfill_status WHERE task = 'missing_eth_2ld_names'") catch |err| {
+            std.log.warn("Failed to check eth 2LD backfill status: {}", .{err});
+            return;
+        };
+        defer check_q.deinit();
+        if (try check_q.step()) {
+            if (check_q.getInt(0) == 1) {
+                std.log.info("Missing .eth 2LD names backfill already completed, skipping", .{});
+                return;
+            }
+        }
+    }
+
+    std.log.info("Starting missing .eth 2LD names backfill...", .{});
+
+    // Find v1_labels entries that don't have a corresponding name record
+    const query_sql =
+        \\SELECT l.token_id, l.label, l.namehash, l.first_seen_block, l.first_seen_tx, l.source
+        \\FROM v1_labels l
+        \\LEFT JOIN names n ON l.namehash = n.namehash
+        \\WHERE n.namehash IS NULL
+    ;
+
+    var q = try Query.init(self.database, query_sql);
+    defer q.deinit();
+
+    var total_found: usize = 0;
+    var created_count: usize = 0;
+    const tx = @import("../../storage/transactions.zig");
+
+    // Use transaction for bulk insert speed (individual auto-commits are very slow)
+    try tx.beginTransaction(self.database);
+
+    while (try q.step()) {
+        const token_id_str = q.getTextSlice(0) orelse continue;
+        const label = q.getTextSlice(1) orelse continue;
+        const namehash_hex = q.getTextSlice(2) orelse continue;
+        const first_seen_block = q.getInt64(3);
+
+        total_found += 1;
+
+        // Verify this is an .eth 2LD by checking the namehash matches computeEthNamehash(label)
+        const computed_namehash = v1_names.computeEthNamehash(label);
+        const stored_namehash = Hash.fromHex(namehash_hex) catch continue;
+
+        if (!std.mem.eql(u8, &computed_namehash.bytes, &stored_namehash.bytes)) {
+            // Not an .eth 2LD (subdomain with different parent) - skip
+            continue;
+        }
+
+        // This is an .eth 2LD - try to find owner and expiry from events table
+        var owner = Address.zero;
+        var expiry: u64 = 0;
+        var reg_timestamp: i64 = std.time.timestamp();
+        var reg_block: i64 = first_seen_block;
+
+        // Look up registration event for this name (ETH Controller events have namehash set)
+        event_lookup: {
+            var eq = Query.init(self.database,
+                \\SELECT json_extract(data, '$.owner'), json_extract(data, '$.expires'),
+                \\       timestamp, block_number
+                \\FROM events
+                \\WHERE namehash = ? AND event_type = 'name_registered' AND chain = 'l1'
+                \\ORDER BY block_number ASC
+                \\LIMIT 1
+            ) catch {
+                std.log.debug("Failed to query events for owner/expiry, using defaults", .{});
+                break :event_lookup;
+            };
+            defer eq.deinit();
+            eq.bindText(namehash_hex) catch break :event_lookup;
+
+            if (eq.step() catch null) |_| {
+                if (eq.getTextSlice(0)) |owner_hex| {
+                    owner = Address.fromHex(owner_hex) catch Address.zero;
+                }
+                if (eq.getOptionalInt64(1)) |exp| {
+                    expiry = @bitCast(exp);
+                }
+                reg_timestamp = eq.getInt64(2);
+                reg_block = eq.getInt64(3);
+            }
+        }
+
+        // Parse token_id from hex string to u256
+        const clean_token_id = if (std.mem.startsWith(u8, token_id_str, "0x")) token_id_str[2..] else token_id_str;
+        const token_id = std.fmt.parseInt(u256, clean_token_id, 16) catch continue;
+
+        // Compute derived values
+        const label_hash = v1_names.computeLabelHash(label);
+        const parent_namehash = Hash.fromHex("93cdeb708b7545dc668eb9280176169d1c33cfd8ed6f04690a0bcc88a93fc4ae") catch continue;
+        const registry = Address.fromHex("00000000000C2E074eC69A0dFb2997BA6C7d2e1e") catch continue;
+
+        // Allocate owned strings for the Name struct
+        const full_name = try std.fmt.allocPrint(self.allocator, "{s}.eth", .{label});
+        const label_copy = try self.allocator.dupe(u8, label);
+        const parent_name_copy = try self.allocator.dupe(u8, "eth");
+        const v1_label_hash = try self.allocator.dupe(u8, token_id_str);
+
+        var name = models.Name{
+            .chain = .l1,
+            .name = full_name,
+            .namehash = stored_namehash,
+            .label = label_copy,
+            .label_hash = label_hash,
+            .parent_name = parent_name_copy,
+            .parent_namehash = parent_namehash,
+            .registry = registry,
+            .owner = owner,
+            .registrant = owner,
+            .resolver = Address.zero,
+            .token_id = token_id,
+            .canonical_id = token_id, // V1 doesn't use versioning
+            .token_version = 0,
+            .expiry = expiry,
+            .registry_locked = false,
+            .migrated = false,
+            .ejected = false,
+            .created_block = @intCast(reg_block),
+            .created_at = reg_timestamp,
+            .registered_at = reg_timestamp,
+            .updated_block = @intCast(reg_block),
+            .updated_at = std.time.timestamp(),
+            .is_wrapped = false,
+            .wrapper_fuses = null,
+            .wrapper_expiry = null,
+            .is_v1_name = true,
+            .v1_label_hash = v1_label_hash,
+        };
+        defer name.deinit(self.allocator);
+
+        names_storage.insertName(self.database, name) catch |err| {
+            std.log.warn("Failed to create missing .eth 2LD name {s}: {}", .{ full_name, err });
+            continue;
+        };
+
+        std.log.debug("Created missing .eth 2LD name: {s}", .{full_name});
+        created_count += 1;
+
+        if (created_count % 50_000 == 0) {
+            // Periodic commit to bound WAL size (cursor stays valid within same connection)
+            tx.commitTransaction(self.database) catch |err| {
+                std.log.err("Failed to commit batch: {}", .{err});
+            };
+            try tx.beginTransaction(self.database);
+            std.log.info("Created {d} missing .eth 2LD names...", .{created_count});
+        } else if (created_count % 1000 == 0) {
+            std.log.info("Created {d} missing .eth 2LD names...", .{created_count});
+        }
+    }
+
+    // Commit final batch
+    tx.commitTransaction(self.database) catch |err| {
+        std.log.err("Failed to commit final batch: {}", .{err});
+    };
+
+    std.log.info("Missing .eth 2LD backfill complete: found {d} labels without names, created {d} records", .{ total_found, created_count });
+
+    // Mark backfill as completed
+    mark: {
+        var mq = Query.init(self.database,
+            \\INSERT OR REPLACE INTO backfill_status (task, completed, completed_at, records_processed)
+            \\VALUES ('missing_eth_2ld_names', 1, ?, ?)
+        ) catch break :mark;
+        defer mq.deinit();
+        mq.bindInt64(std.time.timestamp()) catch break :mark;
+        mq.bindInt64(@intCast(created_count)) catch break :mark;
+        mq.exec() catch {};
+    }
+}
+
 /// Backfill unknown subdomain labels from transaction calldata
 /// This runs after initial sync completes to resolve labels that weren't in events
 pub fn backfillUnknownLabels(self: *Indexer) !void {
     // Get statistics first
-    var label_backfill = LabelBackfill.init(self.allocator, self.l1_client, self.database);
+    var label_backfill = LabelBackfill.init(self.allocator, self.l1_client, self.database, if (self.rainbow != null) &self.rainbow.? else null);
     const stats = try label_backfill.getStats();
 
     if (stats.total == 0) {
