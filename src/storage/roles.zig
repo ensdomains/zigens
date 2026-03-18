@@ -16,13 +16,12 @@ pub fn upsertEACRole(db: *Database, chain: models.Chain, resource: []const u8, a
         \\INSERT INTO eac_roles
         \\(chain, resource, account, role_bitmap, block_number, transaction_hash, log_index, timestamp, contract_address)
         \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        \\ON CONFLICT(chain, resource, account) DO UPDATE SET
+        \\ON CONFLICT(chain, resource, account, contract_address) DO UPDATE SET
         \\  role_bitmap = excluded.role_bitmap,
         \\  block_number = excluded.block_number,
         \\  transaction_hash = excluded.transaction_hash,
         \\  log_index = excluded.log_index,
-        \\  timestamp = excluded.timestamp,
-        \\  contract_address = excluded.contract_address
+        \\  timestamp = excluded.timestamp
     ;
 
     var q = try Query.init(db, sql);
@@ -77,7 +76,7 @@ pub fn getRolesByResource(db: *Database, chain: models.Chain, resource: []const 
     const sql =
         \\SELECT r.id, r.chain, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp, n.name
         \\FROM eac_roles r
-        \\LEFT JOIN names n ON r.resource = n.canonical_id
+        \\LEFT JOIN names n ON r.resource = n.canonical_id AND r.contract_address = n.registry
         \\WHERE r.chain = ? AND r.resource = ?
         \\ORDER BY r.timestamp DESC
     ;
@@ -109,7 +108,7 @@ pub fn getRolesByAccount(db: *Database, chain: models.Chain, account: Address) !
     const sql =
         \\SELECT r.id, r.chain, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp, n.name
         \\FROM eac_roles r
-        \\LEFT JOIN names n ON r.resource = n.canonical_id
+        \\LEFT JOIN names n ON r.resource = n.canonical_id AND r.contract_address = n.registry
         \\WHERE r.chain = ? AND r.account = ?
         \\ORDER BY r.timestamp DESC
     ;
@@ -154,7 +153,7 @@ pub fn getRolesWithPagination(db: *Database, chain: models.Chain, options: RoleP
     const base =
         \\SELECT r.id, r.chain, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp, n.name
         \\FROM eac_roles r
-        \\LEFT JOIN names n ON r.resource = n.canonical_id
+        \\LEFT JOIN names n ON r.resource = n.canonical_id AND r.contract_address = n.registry
         \\WHERE r.chain = ?
     ;
     @memcpy(sql_buf[sql_len .. sql_len + base.len], base);
@@ -269,8 +268,8 @@ pub fn getTotalRoleCount(db: *Database, chain: models.Chain, resource: ?[]const 
 }
 
 /// Delete role assignment (when all roles revoked)
-pub fn deleteEACRole(db: *Database, chain: models.Chain, resource: []const u8, account: Address) !void {
-    const sql = "DELETE FROM eac_roles WHERE chain = ? AND resource = ? AND account = ?";
+pub fn deleteEACRole(db: *Database, chain: models.Chain, resource: []const u8, account: Address, contract_address: Address) !void {
+    const sql = "DELETE FROM eac_roles WHERE chain = ? AND resource = ? AND account = ? AND contract_address = ?";
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -278,6 +277,7 @@ pub fn deleteEACRole(db: *Database, chain: models.Chain, resource: []const u8, a
     try q.bindTextStatic(chain.toString());
     try q.bindText(resource);
     try q.bindAddress(account);
+    try q.bindAddress(contract_address);
 
     try q.exec();
 }

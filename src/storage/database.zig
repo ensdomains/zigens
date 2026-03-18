@@ -347,6 +347,82 @@ pub const Database = struct {
 
             std.log.info("Migration completed successfully", .{});
         }
+
+        // Migration 2: Registry-scoped unique constraints (migration 020)
+        // For existing DBs, the schema files are skipped, so we need to apply the constraint
+        // changes here. Check if the approvals table has a 'registry' column as a proxy.
+        if (self.hasTable("approvals")) {
+            var has_registry_col = false;
+
+            const check_approvals_sql = "PRAGMA table_info(approvals)";
+            const check_approvals_z = try self.allocator.dupeZ(u8, check_approvals_sql);
+            defer self.allocator.free(check_approvals_z);
+
+            var stmt2: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, check_approvals_z.ptr, -1, &stmt2, null) == c.SQLITE_OK) {
+                defer _ = c.sqlite3_finalize(stmt2);
+                while (c.sqlite3_step(stmt2) == c.SQLITE_ROW) {
+                    const col_name2 = c.sqlite3_column_text(stmt2, 1);
+                    if (std.mem.eql(u8, std.mem.span(col_name2), "registry")) {
+                        has_registry_col = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!has_registry_col) {
+                std.log.info("Running migration: Registry-scoped unique constraints (020)", .{});
+
+                // Recreate eac_roles with contract_address in unique constraint
+                try self.exec(
+                    \\CREATE TABLE IF NOT EXISTS eac_roles_new (
+                    \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    \\  chain TEXT NOT NULL,
+                    \\  resource TEXT NOT NULL,
+                    \\  account TEXT NOT NULL,
+                    \\  role_bitmap TEXT NOT NULL,
+                    \\  block_number INTEGER NOT NULL,
+                    \\  transaction_hash TEXT NOT NULL,
+                    \\  log_index INTEGER NOT NULL,
+                    \\  timestamp INTEGER NOT NULL,
+                    \\  contract_address TEXT NOT NULL DEFAULT '',
+                    \\  UNIQUE(chain, resource, account, contract_address)
+                    \\)
+                );
+                try self.exec("INSERT OR IGNORE INTO eac_roles_new SELECT id, chain, resource, account, role_bitmap, block_number, transaction_hash, log_index, timestamp, contract_address FROM eac_roles");
+                try self.exec("DROP TABLE eac_roles");
+                try self.exec("ALTER TABLE eac_roles_new RENAME TO eac_roles");
+                try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_chain ON eac_roles(chain)");
+                try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_resource ON eac_roles(chain, resource)");
+                try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_account ON eac_roles(chain, account)");
+                try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_block ON eac_roles(chain, block_number)");
+                try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_contract ON eac_roles(chain, contract_address)");
+
+                // Recreate approvals with registry in unique constraint
+                try self.exec(
+                    \\CREATE TABLE IF NOT EXISTS approvals_new (
+                    \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    \\  chain TEXT NOT NULL,
+                    \\  token_id TEXT NOT NULL,
+                    \\  owner TEXT NOT NULL,
+                    \\  approved TEXT NOT NULL,
+                    \\  block_number INTEGER NOT NULL,
+                    \\  tx_hash TEXT NOT NULL,
+                    \\  timestamp INTEGER NOT NULL,
+                    \\  registry TEXT NOT NULL DEFAULT '',
+                    \\  UNIQUE(chain, token_id, registry)
+                    \\)
+                );
+                try self.exec("INSERT OR IGNORE INTO approvals_new SELECT id, chain, token_id, owner, approved, block_number, tx_hash, timestamp, '' FROM approvals");
+                try self.exec("DROP TABLE approvals");
+                try self.exec("ALTER TABLE approvals_new RENAME TO approvals");
+                try self.exec("CREATE INDEX IF NOT EXISTS idx_approvals_chain ON approvals(chain)");
+                try self.exec("CREATE INDEX IF NOT EXISTS idx_approvals_token_id ON approvals(token_id)");
+                try self.exec("CREATE INDEX IF NOT EXISTS idx_approvals_owner ON approvals(owner)");
+
+                std.log.info("Migration 020 completed: registry-scoped constraints applied", .{});
+            }
+        }
     }
 
     // ========================================================================
@@ -622,14 +698,9 @@ pub const Database = struct {
     pub const updateNameExpiry = names.updateNameExpiry;
     pub const updateNameOwner = names.updateNameOwner;
     pub const updateNameResolver = names.updateNameResolver;
-    pub const getNameByTokenId = names.getNameByTokenId;
     pub const getNameByTokenIdAndRegistry = names.getNameByTokenIdAndRegistry;
-    pub const getNameByCanonicalId = names.getNameByCanonicalId;
-    pub const updateNameExpiryByTokenId = names.updateNameExpiryByTokenId;
-    pub const updateNameExpiryByCanonicalId = names.updateNameExpiryByCanonicalId;
-    pub const deleteNameByTokenId = names.deleteNameByTokenId;
-    pub const deleteNameByCanonicalId = names.deleteNameByCanonicalId;
-    pub const updateNameTokenId = names.updateNameTokenId;
+    pub const deleteNameByNamehash = names.deleteNameByNamehash;
+    pub const updateNameTokenIdByNamehash = names.updateNameTokenIdByNamehash;
     pub const getNamesByOwner = names.getNamesByOwner;
     pub const getNamesByRegistrant = names.getNamesByRegistrant;
     pub const getAllNames = names.getAllNames;
@@ -722,6 +793,7 @@ pub const Database = struct {
     pub const getEventsByNamehash = events.getEventsByNamehash;
     pub const getEventsByDomain = events.getEventsByDomain;
     pub const insertApproval = events.insertApproval;
+    pub const updateApprovalTokenId = events.updateApprovalTokenId;
     pub const getTotalEventCount = events.getTotalEventCount;
     pub const getEventCount = events.getEventCount;
     pub const countEventsByNamehash = events.countEventsByNamehash;
