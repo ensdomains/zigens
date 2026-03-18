@@ -150,7 +150,7 @@ test "updateNameExpiry updates expiry timestamp" {
     const nh = try helpers.createTestName(allocator, database, "expiry.eth", helpers.TEST_OWNER_1);
 
     // Update expiry
-    const new_expiry: i64 = 1800000000;
+    const new_expiry: u64 = 1800000000;
     try database.updateNameExpiry(nh, new_expiry);
 
     // Verify
@@ -159,7 +159,302 @@ test "updateNameExpiry updates expiry timestamp" {
     var name = name_opt.?;
     defer name.deinit(allocator);
 
-    try testing.expectEqual(@as(u64, @intCast(new_expiry)), name.expiry);
+    try testing.expectEqual(new_expiry, name.expiry);
+}
+
+test "updateNameExpiry clamps u64 > i64::max to 0 (never expires)" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try helpers.createTestName(allocator, database, "forever.eth", helpers.TEST_OWNER_1);
+
+    // Update with a value exceeding i64::max — should be stored as 0
+    const huge_expiry: u64 = @as(u64, @intCast(std.math.maxInt(i64))) + 1;
+    try database.updateNameExpiry(nh, huge_expiry);
+
+    const name_opt = try database.getNameByNamehash(nh);
+    try testing.expect(name_opt != null);
+    var name = name_opt.?;
+    defer name.deinit(allocator);
+
+    // Stored as 0 — which means "never expires"
+    try testing.expectEqual(@as(u64, 0), name.expiry);
+    try testing.expect(!name.isExpired());
+}
+
+test "updateNameExpiry with maxInt(u64) stores as 0 (never expires)" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try helpers.createTestName(allocator, database, "maxexpiry.eth", helpers.TEST_OWNER_1);
+
+    try database.updateNameExpiry(nh, std.math.maxInt(u64));
+
+    const name_opt = try database.getNameByNamehash(nh);
+    try testing.expect(name_opt != null);
+    var name = name_opt.?;
+    defer name.deinit(allocator);
+
+    try testing.expectEqual(@as(u64, 0), name.expiry);
+    try testing.expect(!name.isExpired());
+}
+
+test "updateNameExpiry with normal u64 value stores correctly" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try helpers.createTestName(allocator, database, "normal.eth", helpers.TEST_OWNER_1);
+
+    // A normal future timestamp (within i64 range)
+    const normal_expiry: u64 = 1900000000;
+    try database.updateNameExpiry(nh, normal_expiry);
+
+    const name_opt = try database.getNameByNamehash(nh);
+    try testing.expect(name_opt != null);
+    var name = name_opt.?;
+    defer name.deinit(allocator);
+
+    try testing.expectEqual(normal_expiry, name.expiry);
+}
+
+test "expiry 0 means never expires" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try helpers.createTestName(allocator, database, "noexpiry.eth", helpers.TEST_OWNER_1);
+
+    // Default expiry from createTestName is 0
+    const name_opt = try database.getNameByNamehash(nh);
+    try testing.expect(name_opt != null);
+    var name = name_opt.?;
+    defer name.deinit(allocator);
+
+    try testing.expectEqual(@as(u64, 0), name.expiry);
+    try testing.expect(!name.isExpired());
+}
+
+test "insertName with expiry > i64::max stores as 0 (never expires)" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "hugeinsert.eth");
+    const label_hash = try labelhash_fn(allocator, "hugeinsert");
+    const parent_nh = try namehash_fn(allocator, "eth");
+
+    const huge_expiry: u64 = @as(u64, @intCast(std.math.maxInt(i64))) + 100;
+
+    try database.insertName(models.Name{
+        .chain = .l2,
+        .name = "hugeinsert.eth",
+        .namehash = nh,
+        .label = "hugeinsert",
+        .label_hash = label_hash,
+        .parent_name = "eth",
+        .parent_namehash = parent_nh,
+        .registry = Address.zero,
+        .owner = helpers.TEST_OWNER_1,
+        .registrant = helpers.TEST_OWNER_1,
+        .resolver = Address.zero,
+        .token_id = 0,
+        .canonical_id = 0,
+        .token_version = 1,
+        .expiry = huge_expiry,
+        .registry_locked = false,
+        .migrated = false,
+        .ejected = false,
+        .created_block = 1000,
+        .created_at = 1700000000,
+        .registered_at = 1700000000,
+        .updated_block = 1000,
+        .updated_at = 1700000000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    });
+
+    const name_opt = try database.getNameByNamehash(nh);
+    try testing.expect(name_opt != null);
+    var name = name_opt.?;
+    defer name.deinit(allocator);
+
+    // Should be clamped to 0 (never expires)
+    try testing.expectEqual(@as(u64, 0), name.expiry);
+    try testing.expect(!name.isExpired());
+}
+
+test "updateNameWrapperState with expiry > i64::max stores as 0" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try helpers.createTestName(allocator, database, "wrapped.eth", helpers.TEST_OWNER_1);
+
+    const names_storage = @import("lib").storage.names;
+    const huge_expiry: u64 = @as(u64, @intCast(std.math.maxInt(i64))) + 1;
+    try names_storage.updateNameWrapperState(database, nh, 196608, huge_expiry);
+
+    const name_opt = try database.getNameByNamehash(nh);
+    try testing.expect(name_opt != null);
+    var name = name_opt.?;
+    defer name.deinit(allocator);
+
+    try testing.expect(name.is_wrapped);
+    try testing.expectEqual(@as(i64, 0), name.wrapper_expiry.?);
+}
+
+test "updateNameWrapperExpiry with expiry > i64::max stores as 0" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try helpers.createTestName(allocator, database, "wrapexp.eth", helpers.TEST_OWNER_1);
+
+    const names_storage = @import("lib").storage.names;
+    // First wrap the name
+    try names_storage.updateNameWrapperState(database, nh, 196608, 1800000000);
+
+    // Then extend expiry with huge value
+    const huge_expiry: u64 = @as(u64, @intCast(std.math.maxInt(i64))) + 1;
+    try names_storage.updateNameWrapperExpiry(database, nh, huge_expiry);
+
+    const name_opt = try database.getNameByNamehash(nh);
+    try testing.expect(name_opt != null);
+    var name = name_opt.?;
+    defer name.deinit(allocator);
+
+    try testing.expectEqual(@as(i64, 0), name.wrapper_expiry.?);
+}
+
+test "updateNameExpiry with exactly i64::max stores correctly (not clamped)" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try helpers.createTestName(allocator, database, "boundary.eth", helpers.TEST_OWNER_1);
+
+    // Exactly i64::max should fit — should NOT be clamped to 0
+    const max_valid: u64 = @intCast(std.math.maxInt(i64));
+    try database.updateNameExpiry(nh, max_valid);
+
+    const name_opt = try database.getNameByNamehash(nh);
+    try testing.expect(name_opt != null);
+    var name = name_opt.?;
+    defer name.deinit(allocator);
+
+    try testing.expectEqual(max_valid, name.expiry);
+}
+
+test "updateNameExpiryByCanonicalId clamps u64 > i64::max to 0" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "canonical.eth");
+    const label_hash = try labelhash_fn(allocator, "canonical");
+    const parent_nh = try namehash_fn(allocator, "eth");
+
+    const test_canonical_id: u256 = 12345;
+    try database.insertName(models.Name{
+        .chain = .l2,
+        .name = "canonical.eth",
+        .namehash = nh,
+        .label = "canonical",
+        .label_hash = label_hash,
+        .parent_name = "eth",
+        .parent_namehash = parent_nh,
+        .registry = Address.zero,
+        .owner = helpers.TEST_OWNER_1,
+        .registrant = helpers.TEST_OWNER_1,
+        .resolver = Address.zero,
+        .token_id = 0,
+        .canonical_id = test_canonical_id,
+        .token_version = 1,
+        .expiry = 1700000000,
+        .registry_locked = false,
+        .migrated = false,
+        .ejected = false,
+        .created_block = 1000,
+        .created_at = 1700000000,
+        .registered_at = 1700000000,
+        .updated_block = 1000,
+        .updated_at = 1700000000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    });
+
+    // Update with huge expiry via canonical_id
+    const huge_expiry: u64 = @as(u64, @intCast(std.math.maxInt(i64))) + 1;
+    try database.updateNameExpiryByCanonicalId(test_canonical_id, huge_expiry);
+
+    const name_opt = try database.getNameByNamehash(nh);
+    try testing.expect(name_opt != null);
+    var name = name_opt.?;
+    defer name.deinit(allocator);
+
+    try testing.expectEqual(@as(u64, 0), name.expiry);
+    try testing.expect(!name.isExpired());
+}
+
+test "insertRenewalSync with expiry > i64::max stores as 0" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const sync_storage = @import("lib").storage.sync;
+    const huge_expiry: u64 = @as(u64, @intCast(std.math.maxInt(i64))) + 1;
+    const tx_hash = helpers.randomHash();
+
+    try sync_storage.insertRenewalSync(database, .l2, 999, huge_expiry, 1000, tx_hash, 0);
+
+    // Verify by querying raw SQL — renewal_syncs stores new_expiry as integer
+    var q = try @import("lib").storage.Query.init(database, "SELECT new_expiry FROM renewal_syncs WHERE token_id = '999'");
+    defer q.deinit();
+
+    try testing.expect(try q.step());
+    const stored_expiry: i64 = q.getInt64(0);
+    try testing.expectEqual(@as(i64, 0), stored_expiry);
+}
+
+test "insertOrphanedRegistration with expiry > i64::max stores as 0 and reads back as 0" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const sync_storage = @import("lib").storage.sync;
+    const huge_expiry: u64 = @as(u64, @intCast(std.math.maxInt(i64))) + 1;
+    const tx_hash = helpers.randomHash();
+
+    try sync_storage.insertOrphanedRegistration(
+        database,
+        .l2,
+        "0xaaaa",
+        42,
+        "testlabel",
+        huge_expiry,
+        helpers.TEST_OWNER_1,
+        1000,
+        tx_hash,
+        0,
+    );
+
+    const orphans = try sync_storage.getOrphanedRegistrations(database, .l2, "0xaaaa");
+    defer {
+        for (orphans) |*o| o.deinit(allocator);
+        allocator.free(orphans);
+    }
+
+    try testing.expectEqual(@as(usize, 1), orphans.len);
+    try testing.expectEqual(@as(u64, 0), orphans[0].expiry);
 }
 
 test "updateNameOwner transfers ownership" {

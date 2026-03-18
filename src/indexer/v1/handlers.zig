@@ -328,7 +328,7 @@ pub fn handleV1NameWrapped(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
 
     // Decode expiry (uint64, word 3, offset 96)
     const expiry_u256 = try abi.ABI.decodeUint256(log.data, 96);
-    const expiry: u64 = @intCast(expiry_u256);
+    const expiry: u64 = @truncate(expiry_u256);
 
     var node_buf: [66]u8 = undefined;
     const node_hex = node.toHexBuf(&node_buf);
@@ -338,10 +338,10 @@ pub fn handleV1NameWrapped(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
     std.log.debug("V1 NameWrapped: node={s} owner={s} fuses={d} expiry={d}", .{ node_hex, owner_hex, fuses, expiry });
 
     if (self.write_buffer.active) {
-        try self.write_buffer.updateNameWrapperState(node, fuses, @bitCast(expiry));
+        try self.write_buffer.updateNameWrapperState(node, fuses, expiry);
         try self.write_buffer.updateNameOwner(node, owner);
     } else {
-        try names_storage.updateNameWrapperState(self.database, node, fuses, @bitCast(expiry));
+        try names_storage.updateNameWrapperState(self.database, node, fuses, expiry);
         try names_storage.updateNameOwner(self.database, node, owner);
     }
 
@@ -444,7 +444,7 @@ pub fn handleV1ExpiryExtended(self: *Indexer, chain: models.Chain, log: rpc.Log)
 
     // Decode expiry from data (uint64, but padded to 32 bytes)
     const expiry_u256 = try abi.ABI.decodeUint256(log.data, 0);
-    const expiry: u64 = @intCast(expiry_u256);
+    const expiry: u64 = @truncate(expiry_u256);
 
     var node_buf: [66]u8 = undefined;
     const node_hex = node.toHexBuf(&node_buf);
@@ -453,10 +453,9 @@ pub fn handleV1ExpiryExtended(self: *Indexer, chain: models.Chain, log: rpc.Log)
 
     // Update name wrapper expiry
     if (self.write_buffer.active) {
-        try self.write_buffer.updateNameWrapperExpiry(node, @bitCast(expiry));
+        try self.write_buffer.updateNameWrapperExpiry(node, expiry);
     } else {
-
-        try names_storage.updateNameWrapperExpiry(self.database, node, @bitCast(expiry));
+        try names_storage.updateNameWrapperExpiry(self.database, node, expiry);
     }
 
     std.log.debug("Updated name wrapper expiry: node={s} expiry={d}", .{ node_hex, expiry });
@@ -686,9 +685,9 @@ pub fn handleV1BaseRegistrarNameRenewed(self: *Indexer, chain: models.Chain, log
 
         // Update the name's expiry
         if (self.write_buffer.active) {
-            try self.write_buffer.updateNameExpiry(namehash, @bitCast(@as(u64, @truncate(expires))));
+            try self.write_buffer.updateNameExpiry(namehash, @truncate(expires));
         } else {
-            try names_storage.updateNameExpiry(self.database, namehash, @bitCast(@as(u64, @truncate(expires))));
+            try names_storage.updateNameExpiry(self.database, namehash, @truncate(expires));
         }
 
         const full_name = try std.fmt.allocPrint(self.allocator, "{s}.eth", .{label});

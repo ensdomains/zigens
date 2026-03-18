@@ -11,6 +11,17 @@ const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
 
 // ============================================================================
+// HELPERS
+// ============================================================================
+
+/// Safely convert u64 expiry to i64 for SQLite storage.
+/// Values exceeding i64::max are mapped to 0 (never expires).
+fn safeU64ToI64(val: u64) i64 {
+    if (val > @as(u64, @intCast(std.math.maxInt(i64)))) return 0;
+    return @intCast(val);
+}
+
+// ============================================================================
 // CONSTANTS
 // ============================================================================
 
@@ -340,7 +351,7 @@ pub fn insertName(db: *Database, name: models.Name) !void {
     try q.bindText(token_id_hex);
     try q.bindText(canonical_id_hex);
     try q.bindInt64(@intCast(name.token_version));
-    try q.bindInt64(@bitCast(name.expiry));
+    try q.bindInt64(safeU64ToI64(name.expiry));
     try q.bindInt(if (name.registry_locked) 1 else 0);
     try q.bindInt(if (name.migrated) 1 else 0);
     try q.bindInt(if (name.ejected) 1 else 0);
@@ -358,11 +369,11 @@ pub fn insertName(db: *Database, name: models.Name) !void {
 }
 
 /// Update name expiry (for renewals)
-pub fn updateNameExpiry(db: *Database, namehash: Hash, expiry: i64) !void {
+pub fn updateNameExpiry(db: *Database, namehash: Hash, expiry: u64) !void {
     var q = try Query.initCached(db, "UPDATE names SET expiry = ?, updated_at = ? WHERE namehash = ?");
     defer q.deinit();
 
-    try q.bindInt64(expiry);
+    try q.bindInt64(safeU64ToI64(expiry));
     try q.bindInt64(std.time.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
@@ -391,14 +402,14 @@ pub fn updateNameResolver(db: *Database, namehash: Hash, resolver: Address) !voi
 }
 
 /// Update name expiry by token ID (for V2 renewals)
-pub fn updateNameExpiryByTokenId(db: *Database, token_id: i64, expiry: i64) !void {
+pub fn updateNameExpiryByTokenId(db: *Database, token_id: i64, expiry: u64) !void {
     var q = try Query.init(db, "UPDATE names SET expiry = ?, updated_at = ? WHERE token_id = ?");
     defer q.deinit();
 
     const token_id_hex = try formatU256Hex(db.allocator, @as(u256, @intCast(token_id)));
     defer db.allocator.free(token_id_hex);
 
-    try q.bindInt64(expiry);
+    try q.bindInt64(safeU64ToI64(expiry));
     try q.bindInt64(std.time.timestamp());
     try q.bindText(token_id_hex);
     try q.exec();
@@ -417,14 +428,14 @@ pub fn deleteNameByTokenId(db: *Database, token_id: i64) !void {
 }
 
 /// Update name expiry by canonical ID (version-stable lookup for V2 renewals)
-pub fn updateNameExpiryByCanonicalId(db: *Database, canonical_id: u256, expiry: i64) !void {
+pub fn updateNameExpiryByCanonicalId(db: *Database, canonical_id: u256, expiry: u64) !void {
     var q = try Query.init(db, "UPDATE names SET expiry = ?, updated_at = ? WHERE canonical_id = ?");
     defer q.deinit();
 
     const canonical_id_hex = try formatU256Hex(db.allocator, canonical_id);
     defer db.allocator.free(canonical_id_hex);
 
-    try q.bindInt64(expiry);
+    try q.bindInt64(safeU64ToI64(expiry));
     try q.bindInt64(std.time.timestamp());
     try q.bindText(canonical_id_hex);
     try q.exec();
@@ -468,7 +479,7 @@ pub fn updateNameTokenId(db: *Database, old_token_id: u256, new_token_id: u256) 
 }
 
 /// Update wrapper state for a name
-pub fn updateNameWrapperState(db: *Database, namehash: Hash, fuses: u32, expiry: i64) !void {
+pub fn updateNameWrapperState(db: *Database, namehash: Hash, fuses: u32, expiry: u64) !void {
     var q = try Query.init(db,
         \\UPDATE names SET is_wrapped = 1, wrapper_fuses = ?, wrapper_expiry = ?,
         \\updated_at = ? WHERE namehash = ?
@@ -479,7 +490,7 @@ pub fn updateNameWrapperState(db: *Database, namehash: Hash, fuses: u32, expiry:
     defer db.allocator.free(fuses_str);
 
     try q.bindText(fuses_str);
-    try q.bindInt64(expiry);
+    try q.bindInt64(safeU64ToI64(expiry));
     try q.bindInt64(std.time.timestamp());
     try q.bindHash(namehash);
     try q.exec();
@@ -515,13 +526,13 @@ pub fn updateNameWrapperFuses(db: *Database, namehash: Hash, fuses: u32) !void {
 }
 
 /// Update wrapper expiry only
-pub fn updateNameWrapperExpiry(db: *Database, namehash: Hash, expiry: i64) !void {
+pub fn updateNameWrapperExpiry(db: *Database, namehash: Hash, expiry: u64) !void {
     var q = try Query.init(db,
         \\UPDATE names SET wrapper_expiry = ?, updated_at = ? WHERE namehash = ?
     );
     defer q.deinit();
 
-    try q.bindInt64(expiry);
+    try q.bindInt64(safeU64ToI64(expiry));
     try q.bindInt64(std.time.timestamp());
     try q.bindHash(namehash);
     try q.exec();

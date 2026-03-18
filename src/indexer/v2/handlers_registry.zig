@@ -723,7 +723,7 @@ pub fn handleNameRenewed(self: *Indexer, chain: models.Chain, log: rpc.Log) !voi
     });
 
     // Update expiry using canonical_id (stable across token regenerations)
-    try self.database.updateNameExpiryByCanonicalId(canonical_id, @bitCast(@as(u64, @truncate(new_expiration))));
+    try self.database.updateNameExpiryByCanonicalId(canonical_id, @truncate(new_expiration));
 
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"tokenId\":{d},\"newExpiration\":{d}}}", .{
         token_id,
@@ -844,7 +844,7 @@ pub fn handleETHNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log
 
     // Calculate expiry from registration block timestamp + duration
     const block_timestamp = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp);
-    const expiry: u64 = @intCast(block_timestamp + @as(i64, @intCast(duration)));
+    const expiry: u64 = @as(u64, @intCast(block_timestamp)) + @as(u64, @truncate(duration));
 
     // Extract canonical_id and version from token_id
     const token_id_utils = @import("../../types/token_id.zig");
@@ -969,7 +969,7 @@ pub fn handleETHNameRenewed(self: *Indexer, chain: models.Chain, log: rpc.Log) !
     });
 
     // Update expiry using canonical_id (stable across token regenerations)
-    try self.database.updateNameExpiryByCanonicalId(canonical_id, @bitCast(@as(u64, @truncate(new_expiry))));
+    try self.database.updateNameExpiryByCanonicalId(canonical_id, @truncate(new_expiry));
 
     // Store event with payment details
     const payment_token_hex = try payment_token.toHex(self.allocator);
