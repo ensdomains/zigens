@@ -190,7 +190,8 @@ CREATE TABLE IF NOT EXISTS approvals (
   block_number INTEGER NOT NULL,
   tx_hash TEXT NOT NULL,
   timestamp INTEGER NOT NULL,
-  UNIQUE(chain, token_id)
+  registry TEXT NOT NULL DEFAULT '',
+  UNIQUE(chain, token_id, registry)
 );
 
 CREATE INDEX IF NOT EXISTS idx_approvals_chain ON approvals(chain);
