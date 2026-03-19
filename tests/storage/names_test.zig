@@ -351,7 +351,7 @@ test "updateNameExpiry with exactly i64::max stores correctly (not clamped)" {
     try testing.expectEqual(max_valid, name.expiry);
 }
 
-test "updateNameExpiryByCanonicalId clamps u64 > i64::max to 0" {
+test "updateNameExpiry via namehash clamps u64 > i64::max to 0" {
     const allocator = testing.allocator;
     const database = try helpers.createTestDatabase(allocator);
     defer helpers.destroyTestDatabase(allocator, database);
@@ -360,7 +360,6 @@ test "updateNameExpiryByCanonicalId clamps u64 > i64::max to 0" {
     const label_hash = try labelhash_fn(allocator, "canonical");
     const parent_nh = try namehash_fn(allocator, "eth");
 
-    const test_canonical_id: u256 = 12345;
     try database.insertName(models.Name{
         .chain = .l2,
         .name = "canonical.eth",
@@ -374,7 +373,7 @@ test "updateNameExpiryByCanonicalId clamps u64 > i64::max to 0" {
         .registrant = helpers.TEST_OWNER_1,
         .resolver = Address.zero,
         .token_id = 0,
-        .canonical_id = test_canonical_id,
+        .canonical_id = 12345,
         .token_version = 1,
         .expiry = 1700000000,
         .registry_locked = false,
@@ -392,9 +391,9 @@ test "updateNameExpiryByCanonicalId clamps u64 > i64::max to 0" {
         .v1_label_hash = null,
     });
 
-    // Update with huge expiry via canonical_id
+    // Update with huge expiry via namehash
     const huge_expiry: u64 = @as(u64, @intCast(std.math.maxInt(i64))) + 1;
-    try database.updateNameExpiryByCanonicalId(test_canonical_id, huge_expiry);
+    try database.updateNameExpiry(nh, huge_expiry);
 
     const name_opt = try database.getNameByNamehash(nh);
     try testing.expect(name_opt != null);

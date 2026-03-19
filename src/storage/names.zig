@@ -401,80 +401,31 @@ pub fn updateNameResolver(db: *Database, namehash: Hash, resolver: Address) !voi
     try q.exec();
 }
 
-/// Update name expiry by token ID (for V2 renewals)
-pub fn updateNameExpiryByTokenId(db: *Database, token_id: i64, expiry: u64) !void {
-    var q = try Query.init(db, "UPDATE names SET expiry = ?, updated_at = ? WHERE token_id = ?");
+/// Delete a name by its namehash (registry-safe: only deletes the exact name)
+pub fn deleteNameByNamehash(db: *Database, namehash: Hash) !void {
+    var q = try Query.init(db, "DELETE FROM names WHERE namehash = ?");
     defer q.deinit();
 
-    const token_id_hex = try formatU256Hex(db.allocator, @as(u256, @intCast(token_id)));
-    defer db.allocator.free(token_id_hex);
-
-    try q.bindInt64(safeU64ToI64(expiry));
-    try q.bindInt64(std.time.timestamp());
-    try q.bindText(token_id_hex);
+    try q.bindHashBuf(namehash);
     try q.exec();
 }
 
-/// Delete a name by token ID (for burned names)
-pub fn deleteNameByTokenId(db: *Database, token_id: i64) !void {
-    var q = try Query.init(db, "DELETE FROM names WHERE token_id = ?");
-    defer q.deinit();
-
-    const token_id_hex = try formatU256Hex(db.allocator, @as(u256, @intCast(token_id)));
-    defer db.allocator.free(token_id_hex);
-
-    try q.bindText(token_id_hex);
-    try q.exec();
-}
-
-/// Update name expiry by canonical ID (version-stable lookup for V2 renewals)
-pub fn updateNameExpiryByCanonicalId(db: *Database, canonical_id: u256, expiry: u64) !void {
-    var q = try Query.init(db, "UPDATE names SET expiry = ?, updated_at = ? WHERE canonical_id = ?");
-    defer q.deinit();
-
-    const canonical_id_hex = try formatU256Hex(db.allocator, canonical_id);
-    defer db.allocator.free(canonical_id_hex);
-
-    try q.bindInt64(safeU64ToI64(expiry));
-    try q.bindInt64(std.time.timestamp());
-    try q.bindText(canonical_id_hex);
-    try q.exec();
-}
-
-/// Delete a name by canonical ID (version-stable lookup for burned names)
-pub fn deleteNameByCanonicalId(db: *Database, canonical_id: u256) !void {
-    var q = try Query.init(db, "DELETE FROM names WHERE canonical_id = ?");
-    defer q.deinit();
-
-    const canonical_id_hex = try formatU256Hex(db.allocator, canonical_id);
-    defer db.allocator.free(canonical_id_hex);
-
-    try q.bindText(canonical_id_hex);
-    try q.exec();
-}
-
-/// Update token_id for a name (for TokenRegenerated events)
-pub fn updateNameTokenId(db: *Database, old_token_id: u256, new_token_id: u256) !void {
+/// Update token_id for a specific name by namehash (registry-safe: only updates the exact name).
+/// Only updates token_id and token_version — canonical_id is unchanged across regeneration.
+pub fn updateNameTokenIdByNamehash(db: *Database, namehash: Hash, new_token_id: u256) !void {
     const token_id_utils = @import("../types/token_id.zig");
-
-    const canonical_id = token_id_utils.getCanonicalId(new_token_id);
     const token_version = token_id_utils.getTokenVersion(new_token_id);
 
-    var q = try Query.init(db, "UPDATE names SET token_id = ?, canonical_id = ?, token_version = ?, updated_at = ? WHERE token_id = ?");
+    var q = try Query.init(db, "UPDATE names SET token_id = ?, token_version = ?, updated_at = ? WHERE namehash = ?");
     defer q.deinit();
 
     const new_token_id_hex = try formatU256Hex(db.allocator, new_token_id);
     defer db.allocator.free(new_token_id_hex);
-    const old_token_id_hex = try formatU256Hex(db.allocator, old_token_id);
-    defer db.allocator.free(old_token_id_hex);
-    const canonical_id_hex = try formatU256Hex(db.allocator, canonical_id);
-    defer db.allocator.free(canonical_id_hex);
 
     try q.bindText(new_token_id_hex);
-    try q.bindText(canonical_id_hex);
     try q.bindInt64(@intCast(token_version));
     try q.bindInt64(std.time.timestamp());
-    try q.bindText(old_token_id_hex);
+    try q.bindHashBuf(namehash);
     try q.exec();
 }
 
@@ -597,48 +548,20 @@ pub fn getNamehashByResolver(db: *Database, resolver: Address) !?Hash {
     return null;
 }
 
-/// Get name by token ID (WARNING: token IDs can collide across registries, prefer getNameByTokenIdAndRegistry)
-pub fn getNameByTokenId(db: *Database, token_id: u256) !?models.Name {
-    var q = try Query.init(db, SQL_SELECT_NAMES ++ " WHERE token_id = ? LIMIT 1");
-    defer q.deinit();
-
-    const token_id_hex = try formatU256Hex(db.allocator, token_id);
-    defer db.allocator.free(token_id_hex);
-
-    try q.bindText(token_id_hex);
-
-    if (try q.step()) {
-        return try parseNameRow(&q, db.allocator);
-    }
-    return null;
-}
-
-/// Get name by token ID and registry address (avoids cross-registry tokenId collisions)
+/// Get name by token ID and registry address (avoids cross-registry tokenId collisions).
+/// Strips to canonical_id (version-independent) for lookup, so this works with any
+/// version of the token_id and is resilient to TokenRegenerated events.
 pub fn getNameByTokenIdAndRegistry(db: *Database, token_id: u256, registry: Address) !?models.Name {
-    var q = try Query.init(db, SQL_SELECT_NAMES ++ " WHERE token_id = ? AND registry = ? LIMIT 1");
+    var q = try Query.init(db, SQL_SELECT_NAMES ++ " WHERE canonical_id = ? AND registry = ? LIMIT 1");
     defer q.deinit();
 
-    const token_id_hex = try formatU256Hex(db.allocator, token_id);
-    defer db.allocator.free(token_id_hex);
-
-    try q.bindText(token_id_hex);
-    try q.bindAddressBuf(registry);
-
-    if (try q.step()) {
-        return try parseNameRow(&q, db.allocator);
-    }
-    return null;
-}
-
-/// Get name by canonical ID
-pub fn getNameByCanonicalId(db: *Database, canonical_id: u256) !?models.Name {
-    var q = try Query.init(db, SQL_SELECT_NAMES ++ " WHERE canonical_id = ? LIMIT 1");
-    defer q.deinit();
-
+    const token_id_utils = @import("../types/token_id.zig");
+    const canonical_id = token_id_utils.getCanonicalId(token_id);
     const canonical_id_hex = try formatU256Hex(db.allocator, canonical_id);
     defer db.allocator.free(canonical_id_hex);
 
     try q.bindText(canonical_id_hex);
+    try q.bindAddressBuf(registry);
 
     if (try q.step()) {
         return try parseNameRow(&q, db.allocator);

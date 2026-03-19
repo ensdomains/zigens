@@ -158,7 +158,7 @@ test "deleteEACRole removes role assignment" {
     }
 
     // Delete
-    try roles.deleteEACRole(database, .l2, resource, helpers.TEST_OWNER_1);
+    try roles.deleteEACRole(database, .l2, resource, helpers.TEST_OWNER_1, helpers.TEST_RESOLVER);
 
     // Verify deleted
     const role_list = try roles.getRolesByResource(database, .l2, resource);
@@ -173,5 +173,5 @@ test "deleteEACRole with nonexistent role is no-op" {
     defer helpers.destroyTestDatabase(allocator, database);
 
     // Should not error
-    try roles.deleteEACRole(database, .l2, "nonexistent", helpers.TEST_OWNER_1);
+    try roles.deleteEACRole(database, .l2, "nonexistent", helpers.TEST_OWNER_1, helpers.TEST_RESOLVER);
 }

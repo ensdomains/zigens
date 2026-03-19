@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS eac_roles (
   transaction_hash TEXT NOT NULL,
   log_index INTEGER NOT NULL,
   timestamp INTEGER NOT NULL,
-  UNIQUE(chain, resource, account)
+  contract_address TEXT NOT NULL DEFAULT '',  -- Registry/contract that emitted the event
+  UNIQUE(chain, resource, account, contract_address)
 );
 
 CREATE INDEX IF NOT EXISTS idx_eac_roles_chain ON eac_roles(chain);

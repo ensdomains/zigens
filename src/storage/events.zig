@@ -466,11 +466,26 @@ pub fn getEventsByDomain(db: *Database, domain_name: []const u8, limit: u32) ![]
 }
 
 /// Insert or update an approval
-pub fn insertApproval(db: *Database, chain: models.Chain, token_id: u256, owner: Address, approved: Address, block_number: u64, tx_hash: Hash) !void {
+/// Update token_id for all approvals when a token is regenerated.
+/// Scoped by registry to avoid cross-registry collisions.
+pub fn updateApprovalTokenId(db: *Database, old_token_id: []const u8, new_token_id: []const u8, registry: Address) !void {
+    const sql = "UPDATE approvals SET token_id = ? WHERE token_id = ? AND registry = ?";
+
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+
+    try q.bindText(new_token_id);
+    try q.bindText(old_token_id);
+    try q.bindAddress(registry);
+
+    try q.exec();
+}
+
+pub fn insertApproval(db: *Database, chain: models.Chain, token_id: u256, owner: Address, approved: Address, block_number: u64, tx_hash: Hash, registry: Address) !void {
     const sql =
         \\INSERT OR REPLACE INTO approvals
-        \\(chain, token_id, owner, approved, block_number, tx_hash, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?)
+        \\(chain, token_id, owner, approved, block_number, tx_hash, timestamp, registry)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ;
 
     var q = try Query.init(db, sql);
@@ -486,6 +501,7 @@ pub fn insertApproval(db: *Database, chain: models.Chain, token_id: u256, owner:
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
     try q.bindInt64(std.time.timestamp());
+    try q.bindAddress(registry);
 
     try q.exec();
 }

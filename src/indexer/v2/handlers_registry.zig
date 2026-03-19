@@ -36,8 +36,8 @@ pub fn handleSubregistryUpdate(self: *Indexer, chain: models.Chain, log: rpc.Log
         return;
     }
 
-    // Look up the name by canonical ID (token_id with version bits cleared)
-    const maybe_name = try self.database.getNameByCanonicalId(canonical_id);
+    // Look up the name by token_id AND registry to avoid cross-registry collisions
+    const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
     const name_str = if (maybe_name) |n| blk: {
         var name_copy = n;
         defer name_copy.deinit(self.allocator);
@@ -328,12 +328,13 @@ pub fn handleResolverUpdate(self: *Indexer, chain: models.Chain, log: rpc.Log) !
 
     std.log.debug("ResolverUpdate: tokenId={d}, canonicalId={d}, resolver={any}, contract={any}", .{ token_id, canonical_id, resolver_addr, log.address });
 
-    // Look up the name by canonical ID (strip version bits from token_id first)
-    const maybe_name = try self.database.getNameByCanonicalId(canonical_id);
+    // Look up the name by token_id AND registry to avoid cross-registry collisions
+    // (e.g., "tester.eth" and "tester.calendars.eth" share the same token_id)
+    const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
 
     // Skip if name doesn't exist yet (might be out of order event processing)
     if (maybe_name == null) {
-        std.log.warn("  → Skipping ResolverUpdate for unknown canonicalId={d}", .{canonical_id});
+        std.log.warn("  → Skipping ResolverUpdate for unknown tokenId={d} in registry {any}", .{ token_id, log.address });
         return;
     }
 
@@ -722,24 +723,28 @@ pub fn handleNameRenewed(self: *Indexer, chain: models.Chain, log: rpc.Log) !voi
         token_id, canonical_id, new_expiration, renewed_by
     });
 
-    // Update expiry using canonical_id (stable across token regenerations)
-    try self.database.updateNameExpiryByCanonicalId(canonical_id, @truncate(new_expiration));
+    // Look up the name by token_id AND registry to avoid cross-registry collisions
+    const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
+
+    var name_str: []const u8 = undefined;
+    var namehash: Hash = Hash.zero;
+
+    if (maybe_name) |n| {
+        // Update expiry using namehash (scoped to the correct name)
+        try self.database.updateNameExpiry(n.namehash, @truncate(new_expiration));
+        name_str = try self.allocator.dupe(u8, n.name orelse "[unknown]");
+        namehash = n.namehash;
+        var name_copy = n;
+        name_copy.deinit(self.allocator);
+    } else {
+        name_str = try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{token_id});
+    }
+    defer self.allocator.free(name_str);
 
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"tokenId\":{d},\"newExpiration\":{d}}}", .{
         token_id,
         new_expiration,
     });
-
-    // Look up the name by canonical_id (stable across token regenerations)
-    const maybe_name = try self.database.getNameByCanonicalId(canonical_id);
-    const name_str = if (maybe_name) |n| blk: {
-        var name_copy = n;
-        defer name_copy.deinit(self.allocator);
-        break :blk try self.allocator.dupe(u8, name_copy.name orelse "[unknown]");
-    } else try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{token_id});
-    defer self.allocator.free(name_str);
-
-    const namehash = if (maybe_name) |n| n.namehash else Hash.zero;
 
     const event_name = try self.allocator.dupe(u8, name_str);
 
@@ -968,8 +973,14 @@ pub fn handleETHNameRenewed(self: *Indexer, chain: models.Chain, log: rpc.Log) !
         label_str, token_id, canonical_id, duration, new_expiry, base_price
     });
 
-    // Update expiry using canonical_id (stable across token regenerations)
-    try self.database.updateNameExpiryByCanonicalId(canonical_id, @truncate(new_expiry));
+    // Look up the name by token_id AND the .eth registry (NOT log.address, which is the registrar)
+    const eth_registry = self.getEthRegistry(chain);
+    const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, eth_registry);
+
+    // Update expiry using namehash (scoped to the correct name)
+    if (maybe_name) |name| {
+        try self.database.updateNameExpiry(name.namehash, @truncate(new_expiry));
+    }
 
     // Store event with payment details
     const payment_token_hex = try payment_token.toHex(self.allocator);
@@ -991,16 +1002,17 @@ pub fn handleETHNameRenewed(self: *Indexer, chain: models.Chain, log: rpc.Log) !
         base_price,
     });
 
-    // Look up the name by canonical_id (stable across token regenerations)
-    const maybe_name = try self.database.getNameByCanonicalId(canonical_id);
-    const name_str = if (maybe_name) |n| blk: {
+    var name_str: []const u8 = undefined;
+    var namehash: Hash = Hash.zero;
+    if (maybe_name) |n| {
+        name_str = try self.allocator.dupe(u8, n.name orelse "[unknown]");
+        namehash = n.namehash;
         var name_copy = n;
-        defer name_copy.deinit(self.allocator);
-        break :blk try self.allocator.dupe(u8, name_copy.name orelse "[unknown]");
-    } else try std.fmt.allocPrint(self.allocator, "{s}.eth", .{label_str});
+        name_copy.deinit(self.allocator);
+    } else {
+        name_str = try std.fmt.allocPrint(self.allocator, "{s}.eth", .{label_str});
+    }
     defer self.allocator.free(name_str);
-
-    const namehash = if (maybe_name) |n| n.namehash else Hash.zero;
 
     const event_name = try self.allocator.dupe(u8, name_str);
 
@@ -1039,8 +1051,8 @@ pub fn handleNameBurned(self: *Indexer, chain: models.Chain, log: rpc.Log) !void
 
     std.log.debug("NameBurned: tokenId={d}, canonicalId={d}, burnedBy={any}", .{ token_id, canonical_id, burned_by });
 
-    // Look up the name by canonical_id (stable across token regenerations)
-    const maybe_name = try self.database.getNameByCanonicalId(canonical_id);
+    // Look up the name by token_id AND registry to avoid cross-registry collisions
+    const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
     const name_str = if (maybe_name) |n| blk: {
         var name_copy = n;
         defer name_copy.deinit(self.allocator);
@@ -1068,9 +1080,14 @@ pub fn handleNameBurned(self: *Indexer, chain: models.Chain, log: rpc.Log) !void
 
     try utils.emitEvent(self, chain, log, .name_burned, event_name, namehash, event_data);
 
-    // Delete the burned name using canonical_id (stable across token regenerations)
-    try self.database.deleteNameByCanonicalId(canonical_id);
-    std.log.debug("Deleted burned name from database: {s}", .{name_str});
+    // Delete the burned name using namehash (registry-safe: only deletes the exact name)
+    // Cannot use canonical_id because it collides across registries (e.g., tester.eth and tester.calendars.eth)
+    if (!namehash.eql(Hash.zero)) {
+        try self.database.deleteNameByNamehash(namehash);
+        std.log.debug("Deleted burned name from database: {s}", .{name_str});
+    } else {
+        std.log.warn("Cannot delete burned name - unknown namehash for tokenId={d}", .{token_id});
+    }
 }
 
 pub fn handleTokenRegenerated(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
@@ -1120,9 +1137,26 @@ pub fn handleTokenRegenerated(self: *Indexer, chain: models.Chain, log: rpc.Log)
 
     try utils.emitEvent(self, chain, log, .token_regenerated, event_name, namehash, event_data);
 
-    // Update token_id in database from old to new
-    try self.database.updateNameTokenId(old_token_id, new_token_id);
-    std.log.debug("Updated token_id in database: {d} -> {d} for {s}", .{ old_token_id, new_token_id, name_str });
+    // Update token_id in database from old to new (registry-safe: only updates the exact name)
+    // Cannot use old_token_id alone because it collides across registries
+    if (!namehash.eql(Hash.zero)) {
+        try self.database.updateNameTokenIdByNamehash(namehash, new_token_id);
+        std.log.debug("Updated token_id in database: {d} -> {d} for {s}", .{ old_token_id, new_token_id, name_str });
+
+        // Note: eac_roles.resource stores canonical_id (version-stripped), so it remains
+        // stable across TokenRegenerated events — no update needed.
+
+        // Update approvals.token_id from old to new (scoped by registry)
+        // Approvals are tied to specific token versions, so they must be updated.
+        const old_token_id_dec = try std.fmt.allocPrint(self.allocator, "{d}", .{old_token_id});
+        defer self.allocator.free(old_token_id_dec);
+        const new_token_id_dec = try std.fmt.allocPrint(self.allocator, "{d}", .{new_token_id});
+        defer self.allocator.free(new_token_id_dec);
+
+        try self.database.updateApprovalTokenId(old_token_id_dec, new_token_id_dec, log.address);
+    } else {
+        std.log.warn("Cannot update token_id - unknown namehash for oldTokenId={d}", .{old_token_id});
+    }
 }
 
 pub fn handleTransferBatch(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
@@ -1228,8 +1262,8 @@ pub fn handleApproval(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
 
     try utils.emitEvent(self, chain, log, .approval, event_name, namehash, event_data);
 
-    // Store approval in database
-    try self.database.insertApproval(chain, token_id, owner, approved, log.block_number, log.transaction_hash);
+    // Store approval in database (registry-scoped to avoid cross-registry token_id collisions)
+    try self.database.insertApproval(chain, token_id, owner, approved, log.block_number, log.transaction_hash, log.address);
     std.log.debug("Stored approval in database for tokenId={d}", .{token_id});
 }
 
@@ -1255,9 +1289,14 @@ pub fn handleEACRolesChanged(self: *Indexer, chain: models.Chain, log: rpc.Log) 
     const old_role_bitmap = try abi.ABI.decodeUint256(log.data, 0);
     const new_role_bitmap = try abi.ABI.decodeUint256(log.data, 32);
 
-    // Convert resource uint256 to hex string (this is the namehash/tokenId)
+    // Strip to canonical_id (clear lower 32 version bits) so the resource is stable
+    // across TokenRegenerated events. Works whether the contract emits token_id or canonical_id.
+    const token_id_utils = @import("../../types/token_id.zig");
+    const canonical_id = token_id_utils.getCanonicalId(resource_uint);
+
+    // Convert canonical_id to hex string for storage
     var resource_bytes: [32]u8 = undefined;
-    std.mem.writeInt(u256, &resource_bytes, resource_uint, .big);
+    std.mem.writeInt(u256, &resource_bytes, canonical_id, .big);
     const resource_hex_chars = std.fmt.bytesToHex(resource_bytes, .lower);
     const resource_hex = try std.fmt.allocPrint(self.allocator, "0x{s}", .{resource_hex_chars});
     defer self.allocator.free(resource_hex);
@@ -1289,7 +1328,7 @@ pub fn handleEACRolesChanged(self: *Indexer, chain: models.Chain, log: rpc.Log) 
     // If newRoleBitmap is 0, all roles were revoked - delete the entry
     // Otherwise, upsert with the new bitmap
     if (new_role_bitmap == 0) {
-        try self.database.deleteEACRole(chain, resource_hex, account);
+        try self.database.deleteEACRole(chain, resource_hex, account, log.address);
         std.log.debug("  → Deleted EAC role (all roles revoked)", .{});
     } else {
         try self.database.upsertEACRole(
@@ -1313,9 +1352,8 @@ pub fn handleEACRolesChanged(self: *Indexer, chain: models.Chain, log: rpc.Log) 
         new_bitmap_hex,
     });
 
-    // Try to look up name for this resource (canonical_id, not tokenId)
-    // EAC resource is the canonical_id (version=0), not the full token_id
-    const maybe_name = try self.database.getNameByCanonicalId(resource_uint);
+    // Look up name by canonical_id AND registry to avoid cross-registry collisions
+    const maybe_name = try self.database.getNameByTokenIdAndRegistry(canonical_id, log.address);
     var name_str_opt: ?[]const u8 = null;
     var namehash_opt: ?Hash = null;
 
