@@ -534,6 +534,9 @@ pub const Indexer = struct {
         .{ .event_hash = abi.EventSignatures.token_regenerated_hash, .handler = handleTokenRegenerated, .name = "TokenRegenerated" },
         .{ .event_hash = abi.EventSignatures.resolver_update_hash, .handler = handleResolverUpdate, .name = "ResolverUpdate" },
         .{ .event_hash = abi.EventSignatures.eac_roles_changed_hash, .handler = handleEACRolesChanged, .name = "EACRolesChanged" },
+        // OLD signatures from earlier subregistry deployments (non-indexed params)
+        .{ .event_hash = abi.EventSignatures.eac_roles_granted_hash, .handler = handleEACRolesGranted, .name = "EACRolesGranted" },
+        .{ .event_hash = abi.EventSignatures.eac_roles_revoked_hash, .handler = handleEACRolesRevoked, .name = "EACRolesRevoked" },
     };
 
     // TransferSingle is ERC1155 standard - uses topic-only query with two-stage filtering:
@@ -975,51 +978,28 @@ pub const Indexer = struct {
         const should_index_v2 = (v2_deployment > 0) and (to_block >= v2_deployment);
 
         if (should_index_v2) {
-            // Index ETH Registry events (batched RPC requests)
-            try self.indexEthRegistryEvents(chain, client, from_block, to_block);
-            std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms); // Rate limit between RPC batches
+            // Phase 1: Fetch EthRegistry + ETHRegistrar + Datastore events in a single batch RPC call
+            // (1 HTTP request instead of 3, eliminates ~100ms of inter-batch sleeps)
+            try self.indexPhase1V2Events(chain, client, from_block, to_block);
 
-            // Index ETH Registrar events (batched RPC requests)
-            try self.indexETHRegistrarEvents(chain, client, from_block, to_block);
-            std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms); // Rate limit between RPC batches
-
-            // Get events from RegistryDatastore (SubregistryUpdate, ResolverUpdate)
-            // Process BEFORE subregistries so new registries are discovered first
-            try self.indexDatastoreEvents(chain, client, from_block, to_block);
-            std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms); // Rate limit between RPC batches
-
-            // Get events from all subregistries (for subdomain indexing - NewSubname)
-            // Process AFTER SubregistryUpdate so we know which registries to query
+            // Phase 2: Subregistry events (depends on Phase 1 discovering subregistries)
             try self.indexSubregistryEvents(chain, client, from_block, to_block);
-
-            // Process any orphaned registrations that now have valid parents
-            // This handles cases where NameRegistered events are processed after SubregistryUpdate
-            // within the same batch (due to event type ordering, not block ordering)
             try self.processRemainingOrphans(chain);
 
-            std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms); // Rate limit between RPC batches
-
-            // Get Transfer events (ERC1155)
+            // Phase 3: Transfer + Ejection events (depends on names existing)
             try self.indexTransferEvents(chain, client, from_block, to_block);
-            std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms); // Rate limit between RPC batches
-
-            // Get resolver data events (AddressChanged, ContentHashChanged, TextChanged)
-            // Process AFTER names and resolvers are set
-            try self.indexResolverEvents(chain, client, from_block, to_block);
-            std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms); // Rate limit between RPC batches
-
-            // Get migration events
             if (chain == .l1) {
                 try self.indexMigrationEvents(client, from_block, to_block);
-                std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms); // Rate limit between RPC batches
             }
-
-            // Get ejection events
             try self.indexEjectionEvents(chain, client, from_block, to_block);
+
+            // Phase 4: Resolver events (depends on names + resolvers being set)
+            try self.indexResolverEvents(chain, client, from_block, to_block);
         }
     }
 
     // V2 event fetchers (extracted to event_fetchers.zig)
+    pub const indexPhase1V2Events = event_fetchers.indexPhase1V2Events;
     pub const indexDatastoreEvents = event_fetchers.indexDatastoreEvents;
     pub const indexEthRegistryEvents = event_fetchers.indexEthRegistryEvents;
     pub const indexETHRegistrarEvents = event_fetchers.indexETHRegistrarEvents;
@@ -1046,6 +1026,8 @@ pub const Indexer = struct {
     pub const handleTransferBatch = handlers_v2_registry.handleTransferBatch;
     pub const handleApproval = handlers_v2_registry.handleApproval;
     pub const handleEACRolesChanged = handlers_v2_registry.handleEACRolesChanged;
+    pub const handleEACRolesGranted = handlers_v2_registry.handleEACRolesGranted;
+    pub const handleEACRolesRevoked = handlers_v2_registry.handleEACRolesRevoked;
 
     // V2 resolver handlers (extracted to handlers_v2_resolver.zig)
     pub const handleLegacyAddrChanged = handlers_v2_resolver.handleLegacyAddrChanged;

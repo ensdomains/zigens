@@ -67,8 +67,21 @@ pub const EventSignatures = struct {
 
     /// EACRolesChanged(uint256 indexed resource, address indexed account, uint256 oldRoleBitmap, uint256 newRoleBitmap)
     /// Emitted when roles are changed for an account on a resource (tokenId)
+    /// NEW signature - current ETH registry deployment
     pub const eac_roles_changed = "EACRolesChanged(uint256,address,uint256,uint256)";
     pub const eac_roles_changed_hash: Hash = eventHash(eac_roles_changed);
+
+    /// EACRolesGranted(uint256 resource, uint256 roleBitmap, address account)
+    /// OLD signature - used by earlier subregistry deployments on Sepolia
+    /// data = resource (uint256) + roleBitmap (uint256) + account (address)
+    pub const eac_roles_granted = "EACRolesGranted(uint256,uint256,address)";
+    pub const eac_roles_granted_hash: Hash = eventHash(eac_roles_granted);
+
+    /// EACRolesRevoked(uint256 resource, uint256 roleBitmap, address account)
+    /// OLD signature - used by earlier subregistry deployments on Sepolia
+    /// data = resource (uint256) + roleBitmap (uint256) + account (address)
+    pub const eac_roles_revoked = "EACRolesRevoked(uint256,uint256,address)";
+    pub const eac_roles_revoked_hash: Hash = eventHash(eac_roles_revoked);
 
     // ========================================================================
     // IETHRegistrar events (from L2/registrar/interfaces/IETHRegistrar.sol)
