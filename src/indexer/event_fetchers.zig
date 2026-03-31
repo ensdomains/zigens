@@ -147,14 +147,30 @@ pub fn indexSubregistryEvents(self: *Indexer, chain: models.Chain, client: *rpc.
     const main_registry_hex = try main_registry_addr.toHex(self.allocator);
     defer self.allocator.free(main_registry_hex);
 
-    // Get subregistries to index (uses cache table for performance)
-    const subregistries = try self.database.getSubregistriesToIndex(chain, main_registry_hex, from_block, to_block);
-    defer {
-        for (subregistries) |subreg| {
-            self.allocator.free(subreg);
+    // Discover new subregistries and get all known ones (uses cache table for performance)
+    var discovery = try self.database.discoverAndGetSubregistries(chain, main_registry_hex, from_block, to_block);
+    defer discovery.deinit(self.allocator);
+
+    // Backfill historical events for newly discovered subregistries.
+    // When a subregistry is first registered via SubregistryUpdate, it may have already emitted events
+    // (e.g. NameRegistered, EACRolesGranted during initialization) that we missed. Fetch those now.
+    if (discovery.newly_discovered.len > 0 and from_block > 0) {
+        const backfill_from = self.config.start_block;
+        std.log.info("Backfilling {d} newly discovered subregistr{s} from block {d} to {d}", .{
+            discovery.newly_discovered.len,
+            if (discovery.newly_discovered.len == 1) "y" else "ies",
+            backfill_from,
+            from_block - 1,
+        });
+        for (discovery.newly_discovered) |subreg_str| {
+            const addr = Address.fromHex(subreg_str) catch continue;
+            backfillSubregistryEvents(self, chain, client, addr, backfill_from, from_block - 1) catch |err| {
+                std.log.warn("Failed to backfill subregistry {s}: {}", .{ subreg_str, err });
+            };
         }
-        self.allocator.free(subregistries);
     }
+
+    const subregistries = discovery.all;
 
     if (subregistries.len == 0) {
         std.log.debug("No subregistries found for {s}", .{chain.toString()});
@@ -444,7 +460,7 @@ pub fn indexSubregistryEvents(self: *Indexer, chain: models.Chain, client: *rpc.
     }
 
     // Update last_indexed_block for all subregistries
-    for (subregistries) |subreg_hex| {
+    for (discovery.all) |subreg_hex| {
         try self.database.registerSubregistry(chain, subreg_hex, to_block);
     }
 
@@ -747,4 +763,251 @@ fn backfillResolverEvents(self: *Indexer, chain: models.Chain, client: *rpc.Clie
     }
 
     std.log.info("  Backfilled {d} historical events for resolver {s}", .{ processed, resolver_hex });
+}
+
+/// Backfill historical events for a specific subregistry contract.
+/// Called when a subregistry is newly discovered — fetches events from start_block
+/// to catch initialization events (e.g. NameRegistered, EACRolesGranted) that happened
+/// before the SubregistryUpdate event was processed.
+fn backfillSubregistryEvents(self: *Indexer, chain: models.Chain, client: *rpc.Client, subreg_addr: Address, from_block: u64, to_block: u64) !void {
+    if (to_block < from_block) return;
+
+    const subreg_hex = try subreg_addr.toHex(self.allocator);
+    defer self.allocator.free(subreg_hex);
+
+    std.log.info("  Backfilling subregistry {s} events from block {d} to {d}", .{ subreg_hex, from_block, to_block });
+
+    // Build ENS event topic array for OR matching
+    var ens_event_topics: [Indexer.SUBREGISTRY_ENS_EVENTS.len]Hash = undefined;
+    inline for (Indexer.SUBREGISTRY_ENS_EVENTS, 0..) |event_cfg, i| {
+        ens_event_topics[i] = event_cfg.event_hash;
+    }
+
+    // Also include TransferSingle
+    const all_topics_len = Indexer.SUBREGISTRY_ENS_EVENTS.len + 1;
+    var all_topics: [all_topics_len]Hash = undefined;
+    inline for (Indexer.SUBREGISTRY_ENS_EVENTS, 0..) |event_cfg, i| {
+        all_topics[i] = event_cfg.event_hash;
+    }
+    all_topics[Indexer.SUBREGISTRY_ENS_EVENTS.len] = Indexer.SUBREGISTRY_TRANSFER_EVENT.event_hash;
+
+    // Query specifically for this subregistry's address (no false positives)
+    const logs = try client.getLogsMultiAddress(.{
+        .from_block = from_block,
+        .to_block = to_block,
+        .addresses = &[_]Address{subreg_addr},
+        .topic0_or = &all_topics,
+    });
+    defer {
+        for (logs) |*log| {
+            log.deinit(self.allocator);
+        }
+        self.allocator.free(logs);
+    }
+
+    if (logs.len == 0) {
+        std.log.info("  No historical events found for subregistry {s}", .{subreg_hex});
+        return;
+    }
+
+    var processed: usize = 0;
+    for (logs) |log| {
+        if (log.topics.len == 0) continue;
+
+        const event_sig = log.topics[0];
+
+        // Check ENS-specific events first
+        inline for (Indexer.SUBREGISTRY_ENS_EVENTS) |event_cfg| {
+            if (event_sig.eql(event_cfg.event_hash)) {
+                event_cfg.handler(self, chain, log) catch |err| {
+                    std.log.warn("  Backfill handler error for subregistry {s}: {}", .{ subreg_hex, err });
+                };
+                processed += 1;
+                break;
+            }
+        }
+
+        // Check TransferSingle
+        if (event_sig.eql(Indexer.SUBREGISTRY_TRANSFER_EVENT.event_hash)) {
+            Indexer.SUBREGISTRY_TRANSFER_EVENT.handler(self, chain, log) catch |err| {
+                std.log.warn("  Backfill transfer error for subregistry {s}: {}", .{ subreg_hex, err });
+            };
+            processed += 1;
+        }
+    }
+
+    std.log.info("  Backfilled {d} historical events for subregistry {s}", .{ processed, subreg_hex });
+}
+
+/// Combined Phase 1 fetch: EthRegistry + ETHRegistrar + Datastore events in a single batch RPC call.
+/// This eliminates 2 HTTP round trips and ~100ms of inter-batch sleeps compared to 3 separate calls.
+/// Processing order is preserved: EthRegistry → ETHRegistrar → Datastore (same as sequential).
+pub fn indexPhase1V2Events(self: *Indexer, chain: models.Chain, client: *rpc.Client, from_block: u64, to_block: u64) !void {
+    const eth_registry = self.getEthRegistry(chain);
+
+    // Pre-compute all topic arrays on the stack (pointers must remain valid until batch call returns)
+    var reg_topics: [Indexer.ETH_REGISTRY_EVENTS.len][1]?Hash = undefined;
+    inline for (Indexer.ETH_REGISTRY_EVENTS, 0..) |event_cfg, i| {
+        reg_topics[i] = .{event_cfg.event_hash};
+    }
+
+    var registrar_topics: [Indexer.ETH_REGISTRAR_EVENTS.len][1]?Hash = undefined;
+    inline for (Indexer.ETH_REGISTRAR_EVENTS, 0..) |event_cfg, i| {
+        registrar_topics[i] = .{event_cfg.event_hash};
+    }
+
+    const ds_topics = [4][1]?Hash{
+        .{abi.EventSignatures.subregistry_update_hash},
+        .{abi.EventSignatures.subregistry_updated_hash},
+        .{abi.EventSignatures.resolver_update_hash},
+        .{abi.EventSignatures.resolver_updated_hash},
+    };
+
+    const N_REG = Indexer.ETH_REGISTRY_EVENTS.len;
+    const N_REGISTRAR = Indexer.ETH_REGISTRAR_EVENTS.len;
+    const N_DS: usize = 4;
+
+    if (chain == .l2) {
+        const eth_registrar = self.config.l2_contracts.l2_eth_registrar;
+        const TOTAL = N_REG + N_REGISTRAR + N_DS;
+
+        var batch: [TOTAL]rpc.Client.BatchGetLogsRequest = undefined;
+
+        // EthRegistry events (indices 0..N_REG)
+        inline for (Indexer.ETH_REGISTRY_EVENTS, 0..) |_, i| {
+            batch[i] = .{
+                .from_block = from_block,
+                .to_block = to_block,
+                .address = eth_registry,
+                .topics = &reg_topics[i],
+            };
+        }
+
+        // ETHRegistrar events (indices N_REG..N_REG+N_REGISTRAR)
+        inline for (Indexer.ETH_REGISTRAR_EVENTS, 0..) |_, i| {
+            batch[N_REG + i] = .{
+                .from_block = from_block,
+                .to_block = to_block,
+                .address = eth_registrar,
+                .topics = &registrar_topics[i],
+            };
+        }
+
+        // Datastore events (indices N_REG+N_REGISTRAR..TOTAL)
+        batch[N_REG + N_REGISTRAR + 0] = .{ .from_block = from_block, .to_block = to_block, .address = eth_registry, .topics = &ds_topics[0] };
+        batch[N_REG + N_REGISTRAR + 1] = .{ .from_block = from_block, .to_block = to_block, .address = eth_registry, .topics = &ds_topics[1] };
+        batch[N_REG + N_REGISTRAR + 2] = .{ .from_block = from_block, .to_block = to_block, .address = eth_registry, .topics = &ds_topics[2] };
+        batch[N_REG + N_REGISTRAR + 3] = .{ .from_block = from_block, .to_block = to_block, .address = eth_registry, .topics = &ds_topics[3] };
+
+        // Single HTTP call for all 13 requests
+        const results = try client.getLogsBatch(&batch);
+        defer utils.deinitBatchResults(self.allocator, results);
+
+        // Process EthRegistry events (same order as sequential indexEthRegistryEvents)
+        var total_registry: usize = 0;
+        inline for (Indexer.ETH_REGISTRY_EVENTS, 0..) |event_cfg, i| {
+            const logs = results[i];
+            if (logs.len > 0) {
+                std.log.info("    Found {d} {s} event{s}", .{
+                    logs.len,
+                    event_cfg.name,
+                    if (logs.len == 1) "" else "s",
+                });
+            }
+            total_registry += logs.len;
+            for (logs) |log| {
+                try event_cfg.handler(self, chain, log);
+            }
+        }
+        if (total_registry == 0) {
+            std.log.debug("    No ETH Registry events in blocks {d}-{d}", .{ from_block, to_block });
+        }
+
+        // Process ETHRegistrar events (same order as sequential indexETHRegistrarEvents)
+        var total_registrar: usize = 0;
+        inline for (Indexer.ETH_REGISTRAR_EVENTS, 0..) |event_cfg, i| {
+            const logs = results[N_REG + i];
+            if (logs.len > 0) {
+                std.log.info("    Found {d} {s} event{s}", .{
+                    logs.len,
+                    event_cfg.name,
+                    if (logs.len == 1) "" else "s",
+                });
+            }
+            total_registrar += logs.len;
+            for (logs) |log| {
+                try event_cfg.handler(self, chain, log);
+            }
+        }
+        if (total_registrar == 0) {
+            std.log.debug("    No ETH Registrar events in blocks {d}-{d}", .{ from_block, to_block });
+        }
+
+        // Process Datastore events (same order as sequential indexDatastoreEvents)
+        for (results[N_REG + N_REGISTRAR + 0]) |log| {
+            try self.handleSubregistryUpdate(chain, log);
+        }
+        for (results[N_REG + N_REGISTRAR + 1]) |log| {
+            try self.handleSubregistryUpdate(chain, log);
+        }
+        for (results[N_REG + N_REGISTRAR + 2]) |log| {
+            try self.handleResolverUpdate(chain, log);
+        }
+        for (results[N_REG + N_REGISTRAR + 3]) |log| {
+            try self.handleResolverUpdate(chain, log);
+        }
+    } else {
+        // L1: No ETH Registrar
+        const TOTAL = N_REG + N_DS;
+
+        var batch: [TOTAL]rpc.Client.BatchGetLogsRequest = undefined;
+
+        inline for (Indexer.ETH_REGISTRY_EVENTS, 0..) |_, i| {
+            batch[i] = .{
+                .from_block = from_block,
+                .to_block = to_block,
+                .address = eth_registry,
+                .topics = &reg_topics[i],
+            };
+        }
+
+        batch[N_REG + 0] = .{ .from_block = from_block, .to_block = to_block, .address = eth_registry, .topics = &ds_topics[0] };
+        batch[N_REG + 1] = .{ .from_block = from_block, .to_block = to_block, .address = eth_registry, .topics = &ds_topics[1] };
+        batch[N_REG + 2] = .{ .from_block = from_block, .to_block = to_block, .address = eth_registry, .topics = &ds_topics[2] };
+        batch[N_REG + 3] = .{ .from_block = from_block, .to_block = to_block, .address = eth_registry, .topics = &ds_topics[3] };
+
+        const results = try client.getLogsBatch(&batch);
+        defer utils.deinitBatchResults(self.allocator, results);
+
+        // Process EthRegistry events
+        var total_registry: usize = 0;
+        inline for (Indexer.ETH_REGISTRY_EVENTS, 0..) |event_cfg, i| {
+            const logs = results[i];
+            if (logs.len > 0) {
+                std.log.info("    Found {d} {s} event{s}", .{
+                    logs.len,
+                    event_cfg.name,
+                    if (logs.len == 1) "" else "s",
+                });
+            }
+            total_registry += logs.len;
+            for (logs) |log| {
+                try event_cfg.handler(self, chain, log);
+            }
+        }
+
+        // Process Datastore events
+        for (results[N_REG + 0]) |log| {
+            try self.handleSubregistryUpdate(chain, log);
+        }
+        for (results[N_REG + 1]) |log| {
+            try self.handleSubregistryUpdate(chain, log);
+        }
+        for (results[N_REG + 2]) |log| {
+            try self.handleResolverUpdate(chain, log);
+        }
+        for (results[N_REG + 3]) |log| {
+            try self.handleResolverUpdate(chain, log);
+        }
+    }
 }
