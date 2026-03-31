@@ -14,6 +14,13 @@ const Database = @import("../storage/database.zig").Database;
 const names_storage = @import("../storage/names.zig");
 const events_storage = @import("../storage/events.zig");
 
+/// Safely convert u64 expiry to i64 for SQLite storage.
+/// Values exceeding i64::max are mapped to 0 (never expires).
+fn safeU64ToI64(val: u64) i64 {
+    if (val > @as(u64, @intCast(std.math.maxInt(i64)))) return 0;
+    return @intCast(val);
+}
+
 pub const WriteBuffer = struct {
     allocator: std.mem.Allocator,
 
@@ -43,11 +50,11 @@ pub const WriteBuffer = struct {
         unwrap: bool = false,
         /// Individual wrapper field updates
         fuses_update: ?u32 = null,
-        wrapper_expiry_update: ?i64 = null,
+        wrapper_expiry_update: ?u64 = null,
 
         const WrapperState = struct {
             fuses: u32,
-            expiry: i64,
+            expiry: u64,
         };
     };
 
@@ -165,7 +172,7 @@ pub const WriteBuffer = struct {
     }
 
     /// Buffer a wrapper state update (NameWrapped event).
-    pub fn updateNameWrapperState(self: *WriteBuffer, namehash: Hash, fuses: u32, expiry: i64) !void {
+    pub fn updateNameWrapperState(self: *WriteBuffer, namehash: Hash, fuses: u32, expiry: u64) !void {
         const key = namehash.bytes;
         const gop = try self.names.getOrPut(key);
 
@@ -177,7 +184,7 @@ pub const WriteBuffer = struct {
                     self.allocator.free(old);
                 }
                 gop.value_ptr.record.?.wrapper_fuses = std.fmt.allocPrint(self.allocator, "{d}", .{fuses}) catch null;
-                gop.value_ptr.record.?.wrapper_expiry = expiry;
+                gop.value_ptr.record.?.wrapper_expiry = safeU64ToI64(expiry);
             } else {
                 gop.value_ptr.wrapper_state = .{ .fuses = fuses, .expiry = expiry };
                 gop.value_ptr.unwrap = false; // Cancel any pending unwrap
@@ -234,13 +241,13 @@ pub const WriteBuffer = struct {
     }
 
     /// Buffer a wrapper expiry-only update (ExpiryExtended event).
-    pub fn updateNameWrapperExpiry(self: *WriteBuffer, namehash: Hash, expiry: i64) !void {
+    pub fn updateNameWrapperExpiry(self: *WriteBuffer, namehash: Hash, expiry: u64) !void {
         const key = namehash.bytes;
         const gop = try self.names.getOrPut(key);
 
         if (gop.found_existing) {
             if (gop.value_ptr.is_new) {
-                gop.value_ptr.record.?.wrapper_expiry = expiry;
+                gop.value_ptr.record.?.wrapper_expiry = safeU64ToI64(expiry);
             } else {
                 gop.value_ptr.wrapper_expiry_update = expiry;
             }
@@ -310,7 +317,7 @@ pub const WriteBuffer = struct {
                     try names_storage.updateNameOwner(db, namehash, owner);
                 }
                 if (bn.expiry) |expiry| {
-                    try names_storage.updateNameExpiry(db, namehash, @bitCast(expiry));
+                    try names_storage.updateNameExpiry(db, namehash, expiry);
                 }
                 if (bn.resolver) |resolver| {
                     try names_storage.updateNameResolver(db, namehash, resolver);

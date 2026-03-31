@@ -731,7 +731,7 @@ pub fn handleNameRenewed(self: *Indexer, chain: models.Chain, log: rpc.Log) !voi
 
     if (maybe_name) |n| {
         // Update expiry using namehash (scoped to the correct name)
-        try self.database.updateNameExpiry(n.namehash, @bitCast(@as(u64, @truncate(new_expiration))));
+        try self.database.updateNameExpiry(n.namehash, @truncate(new_expiration));
         name_str = try self.allocator.dupe(u8, n.name orelse "[unknown]");
         namehash = n.namehash;
         var name_copy = n;
@@ -849,7 +849,7 @@ pub fn handleETHNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log
 
     // Calculate expiry from registration block timestamp + duration
     const block_timestamp = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp);
-    const expiry: u64 = @intCast(block_timestamp + @as(i64, @intCast(duration)));
+    const expiry: u64 = @as(u64, @intCast(block_timestamp)) + @as(u64, @truncate(duration));
 
     // Extract canonical_id and version from token_id
     const token_id_utils = @import("../../types/token_id.zig");
@@ -979,7 +979,7 @@ pub fn handleETHNameRenewed(self: *Indexer, chain: models.Chain, log: rpc.Log) !
 
     // Update expiry using namehash (scoped to the correct name)
     if (maybe_name) |name| {
-        try self.database.updateNameExpiry(name.namehash, @bitCast(@as(u64, @truncate(new_expiry))));
+        try self.database.updateNameExpiry(name.namehash, @truncate(new_expiry));
     }
 
     // Store event with payment details
@@ -1366,6 +1366,121 @@ pub fn handleEACRolesChanged(self: *Indexer, chain: models.Chain, log: rpc.Log) 
 
     const event_name = if (name_str_opt) |n| try self.allocator.dupe(u8, n) else null;
     defer if (name_str_opt) |n| self.allocator.free(n);
+
+    try utils.emitEvent(self, chain, log, .eac_roles_changed, event_name, namehash_opt, event_data);
+}
+
+/// Handle EACRolesGranted events (OLD signature from earlier subregistry deployments)
+/// Event: EACRolesGranted(uint256 resource, uint256 roleBitmap, address account)
+/// All params are non-indexed (1 topic = event sig only), data = 3 words
+pub fn handleEACRolesGranted(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+    if (log.data.len < 96) return error.InvalidDataLength;
+
+    // Decode from data (no indexed params)
+    const resource_uint = try abi.ABI.decodeUint256(log.data, 0);
+    const new_role_bitmap = try abi.ABI.decodeUint256(log.data, 32);
+    const account = try abi.ABI.decodeAddress(log.data, 64);
+
+    const token_id_utils = @import("../../types/token_id.zig");
+    const canonical_id = token_id_utils.getCanonicalId(resource_uint);
+
+    var resource_bytes: [32]u8 = undefined;
+    std.mem.writeInt(u256, &resource_bytes, canonical_id, .big);
+    const resource_hex_chars = std.fmt.bytesToHex(resource_bytes, .lower);
+    const resource_hex = try std.fmt.allocPrint(self.allocator, "0x{s}", .{resource_hex_chars});
+    defer self.allocator.free(resource_hex);
+
+    var new_bitmap_bytes: [32]u8 = undefined;
+    std.mem.writeInt(u256, &new_bitmap_bytes, new_role_bitmap, .big);
+    const new_bitmap_hex_chars = std.fmt.bytesToHex(new_bitmap_bytes, .lower);
+    const new_bitmap_hex = try std.fmt.allocPrint(self.allocator, "0x{s}", .{new_bitmap_hex_chars});
+    defer self.allocator.free(new_bitmap_hex);
+
+    const account_hex = try account.toHex(self.allocator);
+    defer self.allocator.free(account_hex);
+
+    std.log.debug("EACRolesGranted: resource={s}, account={s}, bitmap={s}", .{
+        resource_hex, account_hex, new_bitmap_hex,
+    });
+
+    try self.database.upsertEACRole(
+        chain,
+        resource_hex,
+        account,
+        new_bitmap_hex,
+        log.block_number,
+        log.transaction_hash,
+        log.log_index,
+        log.address,
+    );
+
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resource\":\"{s}\",\"account\":\"{s}\",\"newRoleBitmap\":\"{s}\"}}", .{
+        resource_hex, account_hex, new_bitmap_hex,
+    });
+
+    const maybe_name = try self.database.getNameByTokenIdAndRegistry(canonical_id, log.address);
+    var event_name: ?[]const u8 = null;
+    var namehash_opt: ?Hash = null;
+
+    if (maybe_name) |name| {
+        event_name = if (name.name) |n| try self.allocator.dupe(u8, n) else null;
+        namehash_opt = name.namehash;
+        var name_copy = name;
+        name_copy.deinit(self.allocator);
+    }
+
+    try utils.emitEvent(self, chain, log, .eac_roles_changed, event_name, namehash_opt, event_data);
+}
+
+/// Handle EACRolesRevoked events (OLD signature from earlier subregistry deployments)
+/// Event: EACRolesRevoked(uint256 resource, uint256 roleBitmap, address account)
+/// All params are non-indexed (1 topic = event sig only), data = 3 words
+pub fn handleEACRolesRevoked(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+    if (log.data.len < 96) return error.InvalidDataLength;
+
+    const resource_uint = try abi.ABI.decodeUint256(log.data, 0);
+    const revoked_bitmap = try abi.ABI.decodeUint256(log.data, 32);
+    const account = try abi.ABI.decodeAddress(log.data, 64);
+
+    const token_id_utils = @import("../../types/token_id.zig");
+    const canonical_id = token_id_utils.getCanonicalId(resource_uint);
+
+    var resource_bytes: [32]u8 = undefined;
+    std.mem.writeInt(u256, &resource_bytes, canonical_id, .big);
+    const resource_hex_chars = std.fmt.bytesToHex(resource_bytes, .lower);
+    const resource_hex = try std.fmt.allocPrint(self.allocator, "0x{s}", .{resource_hex_chars});
+    defer self.allocator.free(resource_hex);
+
+    var revoked_bitmap_bytes: [32]u8 = undefined;
+    std.mem.writeInt(u256, &revoked_bitmap_bytes, revoked_bitmap, .big);
+    const revoked_bitmap_hex_chars = std.fmt.bytesToHex(revoked_bitmap_bytes, .lower);
+    const revoked_bitmap_hex = try std.fmt.allocPrint(self.allocator, "0x{s}", .{revoked_bitmap_hex_chars});
+    defer self.allocator.free(revoked_bitmap_hex);
+
+    const account_hex = try account.toHex(self.allocator);
+    defer self.allocator.free(account_hex);
+
+    std.log.debug("EACRolesRevoked: resource={s}, account={s}, bitmap={s}", .{
+        resource_hex, account_hex, revoked_bitmap_hex,
+    });
+
+    // Revoke = delete the role entry
+    try self.database.deleteEACRole(chain, resource_hex, account, log.address);
+
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resource\":\"{s}\",\"account\":\"{s}\",\"revokedRoleBitmap\":\"{s}\"}}", .{
+        resource_hex, account_hex, revoked_bitmap_hex,
+    });
+
+    const maybe_name = try self.database.getNameByTokenIdAndRegistry(canonical_id, log.address);
+    var event_name: ?[]const u8 = null;
+    var namehash_opt: ?Hash = null;
+
+    if (maybe_name) |name| {
+        event_name = if (name.name) |n| try self.allocator.dupe(u8, n) else null;
+        namehash_opt = name.namehash;
+        var name_copy = name;
+        name_copy.deinit(self.allocator);
+    }
 
     try utils.emitEvent(self, chain, log, .eac_roles_changed, event_name, namehash_opt, event_data);
 }

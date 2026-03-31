@@ -190,6 +190,7 @@ pub const Client = struct {
                 .argv = &.{
                     "curl",
                     "-s", // Silent mode
+                    "--compressed", // Request gzip/deflate compression (9x speedup on large responses)
                     "--connect-timeout",
                     "30", // 30 second connection timeout
                     "--max-time",

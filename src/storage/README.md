@@ -22,7 +22,7 @@ The `database.zig` file contains 45 functions organized into categories:
 - `insertRegistry()`, `insertName()` - Create
 - `getNameByNamehash()`, `getNameByTokenId()` - Read
 - `updateNameExpiry()`, `updateNameOwner()`, `updateNameResolver()` - Update
-- `updateNameExpiryByTokenId()`, `deleteNameByTokenId()`, `updateNameTokenId()` - Update/Delete
+- `deleteNameByNamehash()`, `updateNameTokenIdByNamehash()` - Delete/Update by namehash
 - `getNamesByOwner()`, `getAllNames()` - Query
 
 ### Resolver Operations (8 functions)

@@ -582,7 +582,7 @@ fn replayBaseRegistrarRenewal(self: *Indexer, q: *Query) !void {
 
     if (try self.getCachedV1Label(token_id_hex)) |label| {
         const namehash = v1_names.computeEthNamehash(label);
-        names_storage.updateNameExpiry(self.database, namehash, @bitCast(expires)) catch {};
+        names_storage.updateNameExpiry(self.database, namehash, expires) catch {};
     }
 }
 
@@ -597,8 +597,8 @@ fn replayNameWrapped(self: *Indexer, q: *Query) !void {
     const node = try Hash.fromHex(node_hex);
     const owner = try Address.fromHex(owner_hex);
     const fuses: u32 = std.fmt.parseInt(u32, fuses_str, 10) catch 0;
-    const expiry: i64 = if (expiry_str) |es|
-        std.fmt.parseInt(i64, es, 10) catch 0
+    const expiry: u64 = if (expiry_str) |es|
+        std.fmt.parseInt(u64, es, 10) catch 0
     else
         0;
 
@@ -637,7 +637,7 @@ fn replayExpiryExtended(self: *Indexer, q: *Query) !void {
     const expiry_str = q.getTextSlice(COL_EXPIRY) orelse return;
 
     const node = try Hash.fromHex(node_hex);
-    const expiry: i64 = std.fmt.parseInt(i64, expiry_str, 10) catch 0;
+    const expiry: u64 = std.fmt.parseInt(u64, expiry_str, 10) catch 0;
 
     names_storage.updateNameWrapperExpiry(self.database, node, expiry) catch {};
 }

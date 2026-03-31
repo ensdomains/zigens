@@ -51,7 +51,7 @@ test "Database integration - full workflow" {
             .token_id = 12345,
             .canonical_id = 12345,
             .token_version = 1,
-            .expiry = @bitCast(ts + 31536000), // 1 year from now
+            .expiry = @intCast(ts + 31536000), // 1 year from now
             .registry_locked = false,
             .migrated = true,
             .ejected = false,
@@ -239,7 +239,7 @@ test "Multiple name insertions and queries" {
             .token_id = @intCast(i + 1),
             .canonical_id = @intCast(i + 1),
             .token_version = 1,
-            .expiry = @bitCast(loop_ts + 31536000),
+            .expiry = @intCast(loop_ts + 31536000),
             .registry_locked = false,
             .migrated = true,
             .ejected = false,
@@ -300,7 +300,7 @@ test "Name expiry checking" {
         .token_id = 1,
         .canonical_id = 1,
         .token_version = 1,
-        .expiry = @bitCast(ts - 1), // Already expired
+        .expiry = @intCast(ts - 1), // Already expired
         .registry_locked = false,
         .migrated = false,
         .ejected = false,
@@ -335,7 +335,7 @@ test "Name expiry checking" {
         .token_id = 1,
         .canonical_id = 1,
         .token_version = 1,
-        .expiry = @bitCast(ts + 31536000), // 1 year from now
+        .expiry = @intCast(ts + 31536000), // 1 year from now
         .registry_locked = false,
         .migrated = false,
         .ejected = false,

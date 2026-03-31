@@ -6,6 +6,13 @@ const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
 
+/// Safely convert u64 expiry to i64 for SQLite storage.
+/// Values exceeding i64::max are mapped to 0 (never expires).
+fn safeU64ToI64(val: u64) i64 {
+    if (val > @as(u64, @intCast(std.math.maxInt(i64)))) return 0;
+    return @intCast(val);
+}
+
 // ============================================================================
 // SYNC/MIGRATION OPERATIONS
 // ============================================================================
@@ -197,7 +204,20 @@ pub fn registerResolver(db: *Database, chain: models.Chain, address: []const u8,
 
 /// Get subregistries to index for a block range
 /// Uses cache table for O(1) lookup, falls back to full scan on first run
-pub fn getSubregistriesToIndex(db: *Database, chain: models.Chain, main_registry: []const u8, from_block: u64, to_block: u64) ![][]u8 {
+/// Result of subregistry discovery, including which ones are newly discovered and need backfill.
+pub const SubregistryDiscoveryResult = struct {
+    all: [][]u8,
+    newly_discovered: [][]u8,
+
+    pub fn deinit(self: *SubregistryDiscoveryResult, allocator: std.mem.Allocator) void {
+        for (self.all) |s| allocator.free(s);
+        allocator.free(self.all);
+        for (self.newly_discovered) |s| allocator.free(s);
+        allocator.free(self.newly_discovered);
+    }
+};
+
+pub fn discoverAndGetSubregistries(db: *Database, chain: models.Chain, main_registry: []const u8, from_block: u64, to_block: u64) !SubregistryDiscoveryResult {
     const chain_str = chain.toString();
 
     // First, discover any NEW subregistries from registries table (only those registered in this block range)
@@ -213,6 +233,12 @@ pub fn getSubregistriesToIndex(db: *Database, chain: models.Chain, main_registry
         \\  AND ks.address IS NULL
     ;
 
+    var new_subregistries: std.ArrayList([]u8) = .{};
+    errdefer {
+        for (new_subregistries.items) |s| db.allocator.free(s);
+        new_subregistries.deinit(db.allocator);
+    }
+
     {
         var q = try Query.init(db, discover_sql);
         defer q.deinit();
@@ -222,10 +248,12 @@ pub fn getSubregistriesToIndex(db: *Database, chain: models.Chain, main_registry
         try q.bindInt64(@intCast(from_block));
         try q.bindInt64(@intCast(to_block));
 
-        // Register newly discovered subregistries
+        // Register newly discovered subregistries and track them
         while (try q.step()) {
             if (q.getTextSlice(0)) |addr_slice| {
                 try db.registerSubregistry(chain, addr_slice, from_block);
+                const copy = try db.allocator.dupe(u8, addr_slice);
+                try new_subregistries.append(db.allocator, copy);
             }
         }
     }
@@ -256,7 +284,10 @@ pub fn getSubregistriesToIndex(db: *Database, chain: models.Chain, main_registry
         }
     }
 
-    return subregistries.toOwnedSlice(db.allocator);
+    return .{
+        .all = try subregistries.toOwnedSlice(db.allocator),
+        .newly_discovered = try new_subregistries.toOwnedSlice(db.allocator),
+    };
 }
 
 /// Insert a migration event
@@ -301,7 +332,7 @@ pub fn insertRenewalSync(db: *Database, chain: models.Chain, token_id: u256, new
 
     try q.bindTextStatic(chain.toString());
     try q.bindText(token_id_str);
-    try q.bindInt64(@bitCast(new_expiry));
+    try q.bindInt64(safeU64ToI64(new_expiry));
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
     try q.bindInt(@intCast(log_index));
@@ -442,7 +473,7 @@ pub fn insertOrphanedRegistration(
     try q.bindText(subregistry_address);
     try q.bindText(token_id_str);
     try q.bindText(label);
-    try q.bindInt64(@bitCast(expiry));
+    try q.bindInt64(safeU64ToI64(expiry));
     try q.bindAddress(owner);
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
