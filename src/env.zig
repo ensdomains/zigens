@@ -35,7 +35,7 @@ pub fn loadEnv(allocator: std.mem.Allocator, path: []const u8) !std.StringHashMa
         const eq_pos = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
 
         const key = std.mem.trim(u8, trimmed[0..eq_pos], &std.ascii.whitespace);
-        const value = std.mem.trim(u8, trimmed[eq_pos + 1..], &std.ascii.whitespace);
+        const value = std.mem.trim(u8, trimmed[eq_pos + 1 ..], &std.ascii.whitespace);
 
         if (key.len == 0) continue;
 

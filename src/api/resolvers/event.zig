@@ -279,7 +279,6 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
 }
 
 /// Resolver for domain query (single domain)
-
 pub fn resolveEvents(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
     const allocator = ctx.allocator;

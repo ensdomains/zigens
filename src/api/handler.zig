@@ -983,9 +983,10 @@ pub const GraphQLHandler = struct {
             // Extract field name
             const field_start = i;
             while (i < selection.len and
-                   selection[i] != ' ' and selection[i] != '\n' and
-                   selection[i] != '\r' and selection[i] != '\t' and
-                   selection[i] != '{' and selection[i] != '}' and selection[i] != ',') {
+                selection[i] != ' ' and selection[i] != '\n' and
+                selection[i] != '\r' and selection[i] != '\t' and
+                selection[i] != '{' and selection[i] != '}' and selection[i] != ',')
+            {
                 i += 1;
             }
 
@@ -1027,9 +1028,10 @@ pub const GraphQLHandler = struct {
                         // Extract nested field name
                         const nested_field_start = j;
                         while (j < nested_selection.len and
-                               nested_selection[j] != ' ' and nested_selection[j] != '\n' and
-                               nested_selection[j] != '\r' and nested_selection[j] != '\t' and
-                               nested_selection[j] != '{' and nested_selection[j] != '}' and nested_selection[j] != ',') {
+                            nested_selection[j] != ' ' and nested_selection[j] != '\n' and
+                            nested_selection[j] != '\r' and nested_selection[j] != '\t' and
+                            nested_selection[j] != '{' and nested_selection[j] != '}' and nested_selection[j] != ',')
+                        {
                             j += 1;
                         }
 

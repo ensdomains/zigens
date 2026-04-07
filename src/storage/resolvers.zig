@@ -1028,4 +1028,3 @@ pub fn getResolverRoles(db: *Database, resolver: Address) ![]models.EACRoleAssig
 
     return roles.toOwnedSlice(db.allocator);
 }
-

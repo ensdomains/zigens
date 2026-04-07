@@ -6,7 +6,7 @@ const db = @import("storage/database.zig");
 
 // Configure logging: filter debug logs, use file redirection in production
 pub const std_options: std.Options = .{
-    .log_level = .info,  // Only show info, warn, err (no debug)
+    .log_level = .info, // Only show info, warn, err (no debug)
 };
 
 pub fn main() !void {

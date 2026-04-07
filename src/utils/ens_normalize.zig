@@ -3,7 +3,6 @@
 /// Wraps the z_ens_normalize library to provide ENSIP-15 compliant
 /// name normalization. Names that fail normalization are flagged
 /// as non-normalized but still stored.
-
 const std = @import("std");
 const ens = @import("ens_normalize");
 

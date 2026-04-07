@@ -14,13 +14,13 @@ const RateLimiter = @import("../rate_limiter.zig").RateLimiter;
 pub const Server = struct {
     allocator: std.mem.Allocator,
     database: *db.Database,
-    webhook_database: ?*db.Database,  // Optional - only initialized if webhooks enabled
+    webhook_database: ?*db.Database, // Optional - only initialized if webhooks enabled
     port: u16,
     server: ?std.net.Server,
     graphql_handler: graphql.GraphQLHandler,
     rate_limiter: RateLimiter,
-    webhook_admin_username: ?[]const u8,  // Optional - if set with password, requires Basic Auth
-    webhook_admin_password: ?[]const u8,  // Optional - if set, requires Basic Auth for webhook endpoints
+    webhook_admin_username: ?[]const u8, // Optional - if set with password, requires Basic Auth
+    webhook_admin_password: ?[]const u8, // Optional - if set, requires Basic Auth for webhook endpoints
 
     pub fn init(allocator: std.mem.Allocator, database: *db.Database, webhook_db_path: ?[]const u8, port: u16, complexity_max_depth: u32, complexity_max_cost: u32, metrics_enabled: bool, rate_limit_per_second: u32, webhook_admin_username: ?[]const u8, webhook_admin_password: ?[]const u8) !Server {
         // Only open webhook database if path is provided (webhooks enabled)
@@ -312,21 +312,20 @@ pub const Server = struct {
             defer self.allocator.free(name_escaped);
 
             const writer = response_buf.writer(self.allocator);
-            try writer.print("{{\"name\":\"{s}\",\"namehash\":\"{s}\",\"owner\":\"{s}\",\"resolver\":\"{s}\",\"registry\":\"{s}\",\"chain\":\"{s}\",\"expiry\":{d},\"registry_locked\":{},\"migrated\":{},\"ejected\":{},\"created_at\":{d},\"updated_at\":{d}}}",
-                .{
-                    name_escaped,
-                    namehash_hex,
-                    owner_hex,
-                    resolver_hex,
-                    registry_hex,
-                    record_copy.chain.toString(),
-                    record_copy.expiry,
-                    record_copy.registry_locked,
-                    record_copy.migrated,
-                    record_copy.ejected,
-                    record_copy.created_at,
-                    record_copy.updated_at,
-                });
+            try writer.print("{{\"name\":\"{s}\",\"namehash\":\"{s}\",\"owner\":\"{s}\",\"resolver\":\"{s}\",\"registry\":\"{s}\",\"chain\":\"{s}\",\"expiry\":{d},\"registry_locked\":{},\"migrated\":{},\"ejected\":{},\"created_at\":{d},\"updated_at\":{d}}}", .{
+                name_escaped,
+                namehash_hex,
+                owner_hex,
+                resolver_hex,
+                registry_hex,
+                record_copy.chain.toString(),
+                record_copy.expiry,
+                record_copy.registry_locked,
+                record_copy.migrated,
+                record_copy.ejected,
+                record_copy.created_at,
+                record_copy.updated_at,
+            });
             try self.sendJsonResponse(stream, 200, response_buf.items);
         } else {
             try self.sendNotFound(stream);
@@ -377,8 +376,7 @@ pub const Server = struct {
             const name_escaped = try json_utils.escapeString(self.allocator, name.name orelse "[unknown]");
             defer self.allocator.free(name_escaped);
 
-            try writer.print("{{\"name\":\"{s}\",\"expiry\":{d},\"owner\":\"{s}\"}}",
-                .{ name_escaped, name.expiry, owner_str });
+            try writer.print("{{\"name\":\"{s}\",\"expiry\":{d},\"owner\":\"{s}\"}}", .{ name_escaped, name.expiry, owner_str });
         }
 
         try writer.writeAll("]");
@@ -792,7 +790,8 @@ pub const Server = struct {
             }
             try event_types_json.appendSlice(self.allocator, "]");
 
-            const webhook_json = try std.fmt.allocPrint(self.allocator,
+            const webhook_json = try std.fmt.allocPrint(
+                self.allocator,
                 "{{\"id\":{d},\"url\":\"{s}\",\"event_types\":{s},\"active\":{},\"max_retries\":{d},\"created_at\":{d}}}",
                 .{ webhook.id, webhook.url, event_types_json.items, webhook.active, webhook.max_retries, webhook.created_at },
             );
@@ -823,7 +822,8 @@ pub const Server = struct {
             }
             try event_types_json.appendSlice(self.allocator, "]");
 
-            const webhook_json = try std.fmt.allocPrint(self.allocator,
+            const webhook_json = try std.fmt.allocPrint(
+                self.allocator,
                 "{{\"id\":{d},\"url\":\"{s}\",\"event_types\":{s},\"active\":{},\"max_retries\":{d},\"created_at\":{d}}}",
                 .{ wh.id, wh.url, event_types_json.items, wh.active, wh.max_retries, wh.created_at },
             );

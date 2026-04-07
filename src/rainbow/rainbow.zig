@@ -16,7 +16,6 @@
 ///       defer allocator.free(text);
 ///       // Use label text
 ///   }
-
 const std = @import("std");
 const c = @cImport({
     @cInclude("sqlite3.h");

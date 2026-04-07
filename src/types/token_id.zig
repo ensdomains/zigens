@@ -11,7 +11,6 @@ const std = @import("std");
 /// 1. Token regeneration with version tracking
 /// 2. Efficient storage lookups using canonical ID
 /// 3. Multiple versions of the same name to coexist
-
 /// Extract the canonical ID from a token ID
 /// Canonical ID is the token ID with the lower 32 bits cleared
 pub fn getCanonicalId(token_id: u256) u256 {

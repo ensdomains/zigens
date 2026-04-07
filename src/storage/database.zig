@@ -139,10 +139,10 @@ pub const Database = struct {
 
         // Performance and reliability PRAGMAs (values from constants.zig)
         try database.exec(std.fmt.comptimePrint("PRAGMA busy_timeout = {d};", .{constants.SQLite.busy_timeout_ms}));
-        try database.exec("PRAGMA synchronous = NORMAL;");       // Faster writes (safe with WAL)
+        try database.exec("PRAGMA synchronous = NORMAL;"); // Faster writes (safe with WAL)
         try database.exec(std.fmt.comptimePrint("PRAGMA cache_size = {d};", .{constants.SQLite.cache_size_kb}));
-        try database.exec("PRAGMA foreign_keys = ON;");          // Enable foreign key constraints
-        try database.exec("PRAGMA temp_store = memory;");        // Use RAM for temp tables
+        try database.exec("PRAGMA foreign_keys = ON;"); // Enable foreign key constraints
+        try database.exec("PRAGMA temp_store = memory;"); // Use RAM for temp tables
 
         // Load and apply schema files from schema/ directory
         try database.loadSchemaFiles();

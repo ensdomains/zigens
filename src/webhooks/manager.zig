@@ -11,14 +11,14 @@ inline fn SQLITE_TRANSIENT() db.c.sqlite3_destructor_type {
 
 pub const WebhookManager = struct {
     allocator: std.mem.Allocator,
-    database: *db.Database,  // Separate webhook database connection
+    database: *db.Database, // Separate webhook database connection
     http_client: std.http.Client,
     max_retries: u32,
     worker_threads: std.ArrayList(std.Thread),
     should_stop: std.atomic.Value(bool),
-    rate_limit_ms: u64,  // Milliseconds between requests to same endpoint
-    db_mutex: std.Thread.Mutex,  // Protects database access from worker threads
-    last_cleanup_at: std.atomic.Value(i64),  // Timestamp of last queue cleanup
+    rate_limit_ms: u64, // Milliseconds between requests to same endpoint
+    db_mutex: std.Thread.Mutex, // Protects database access from worker threads
+    last_cleanup_at: std.atomic.Value(i64), // Timestamp of last queue cleanup
 
     pub fn init(allocator: std.mem.Allocator, webhook_db_path: []const u8, max_retries: u32, rate_limit_ms: u64) !*WebhookManager {
         const manager = try allocator.create(WebhookManager);
@@ -44,7 +44,7 @@ pub const WebhookManager = struct {
             .should_stop = std.atomic.Value(bool).init(false),
             .rate_limit_ms = rate_limit_ms,
             .db_mutex = std.Thread.Mutex{},
-            .last_cleanup_at = std.atomic.Value(i64).init(0),  // Will run cleanup on first check
+            .last_cleanup_at = std.atomic.Value(i64).init(0), // Will run cleanup on first check
         };
         return manager;
     }
@@ -238,15 +238,14 @@ pub const WebhookManager = struct {
         const writer = payload.writer(self.allocator);
 
         // Build base payload with required fields
-        try writer.print("{{\"event_type\":\"{s}\",\"chain\":\"{s}\",\"block_number\":{d},\"tx_hash\":\"{s}\",\"log_index\":{d},\"contract_address\":\"{s}\"",
-            .{
-                event.event_type.toString(),
-                event.chain.toString(),
-                event.block_number,
-                tx_hex,
-                event.log_index,
-                contract_hex,
-            });
+        try writer.print("{{\"event_type\":\"{s}\",\"chain\":\"{s}\",\"block_number\":{d},\"tx_hash\":\"{s}\",\"log_index\":{d},\"contract_address\":\"{s}\"", .{
+            event.event_type.toString(),
+            event.chain.toString(),
+            event.block_number,
+            tx_hex,
+            event.log_index,
+            contract_hex,
+        });
 
         // Add optional name field
         if (event.name) |name| {
@@ -500,11 +499,11 @@ pub const WebhookManager = struct {
             .allocator = self.allocator,
             .argv = &.{
                 "curl",
-                "-s",                  // Silent mode
+                "-s", // Silent mode
                 "--connect-timeout",
-                "5",                   // 5 second connection timeout
+                "5", // 5 second connection timeout
                 "--max-time",
-                "30",                  // 30 second total timeout
+                "30", // 30 second total timeout
                 "-X",
                 "POST",
                 "-H",
@@ -514,9 +513,9 @@ pub const WebhookManager = struct {
                 "-d",
                 payload,
                 "-w",
-                "%{http_code}",        // Write HTTP status code to stdout
+                "%{http_code}", // Write HTTP status code to stdout
                 "-o",
-                "/dev/null",           // Don't output response body
+                "/dev/null", // Don't output response body
                 url,
             },
             .max_output_bytes = 1024,
