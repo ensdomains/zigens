@@ -81,26 +81,26 @@ fn sepoliaAddresses() ContractAddresses {
         .reverse_registrar = Address.fromHex("0xf79f9970030fe60bd89d21591c7f2d80d7d21242") catch unreachable,
         .name_wrapper = Address.fromHex("0xca7e6d0ddc5f373197bbe6fc2f09c2314399f028") catch unreachable,
 
-        // L1 Sepolia Contracts (from DEPLOYMENTS.v2.md)
-        .root_registry = Address.fromHex("0x245de1984f9bb890c5db0b1fb839470c6a4c7e08") catch unreachable,
-        .eth_registry = Address.fromHex("0x3f0920aa92c5f9bce54643c09955c5f241f1f763") catch unreachable,
+        // L1 Sepolia Contracts (V2 deployment)
+        .root_registry = Address.fromHex("0x3a3e15a5d27ff6f05c844313312f2e72096d3ed3") catch unreachable,
+        .eth_registry = Address.fromHex("0x796fff2e907449be8d5921bcc215b1b76d89d080") catch unreachable,
         .registry_datastore = Address.fromHex("0x2a1d9588f3931fc7495867c82cd0d78cfb144945") catch unreachable,
-        .eth_reverse_registrar = Address.fromHex("0xeb8269fb39290f31c4c29cec548807ca2133abb4") catch unreachable,
+        .eth_reverse_registrar = Address.fromHex("0xa35e6c5dc06e820cc6716ca33dfcd203503fb1d3") catch unreachable,
 
-        // L2 Sepolia Contracts (from DEPLOYMENTS.v2.md)
-        .l2_eth_registry = Address.fromHex("0xf332544e6234f1ca149907d0d4658afd5feb6831") catch unreachable,
-        .l2_eth_registrar = Address.fromHex("0xe37a1366c827d18dc0ad57f3767de4b3025ceac2") catch unreachable, // ETHRegistrar
-        .l2_registry_datastore = Address.fromHex("0xe82b3bef599d45806fcce747df176808ff6244cf") catch unreachable,
+        // L2 Sepolia Contracts (V2 deployment - same chain as L1, different contract version)
+        .l2_eth_registry = Address.fromHex("0x796fff2e907449be8d5921bcc215b1b76d89d080") catch unreachable,
+        .l2_eth_registrar = Address.fromHex("0x68586418353b771cf2425ed14a07512aa880c532") catch unreachable,
+        .l2_registry_datastore = Address.fromHex("0x2a1d9588f3931fc7495867c82cd0d78cfb144945") catch unreachable,
 
-        // Bridge Contracts (from DEPLOYMENTS.v2.md)
+        // Bridge Contracts (V2 deployment)
         .l1_bridge_controller = Address.fromHex("0xf951f03ad34d000af619da491cf369b7992a6f72") catch unreachable,
         .l2_bridge_controller = Address.fromHex("0xbb84d5d658bbdb48bf99689f3a14f780ab2f9220") catch unreachable,
 
         // Deployment blocks (verified from on-chain)
         // For Sepolia testnet, these are the actual deployment blocks
-        .v1_deployment_block = 4700000, // Approximate ENS V1 deployment on Sepolia
-        .l1_deployment_block = 6500000, // Approximate ENS V2 L1 deployment
-        .l2_deployment_block = 9374806, // Verified: L2 ETH Registry deployment on Sepolia
+        .v1_deployment_block = 4700000, // ENS V1 deployment on Sepolia
+        .l1_deployment_block = 9374806, // V2 deployment block on Sepolia
+        .l2_deployment_block = 9374806, // V2 deployment block on Sepolia (same chain)
 
         // Historical markers (not applicable for testnets)
         .temp_registrar_start_block = 0,

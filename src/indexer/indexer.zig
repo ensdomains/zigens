@@ -29,16 +29,16 @@ pub const Indexer = struct {
     allocator: std.mem.Allocator,
     config: config.Config,
     database: *db.Database,
-    l1_client: *rpc.Client,
-    l2_client: *rpc.Client,
+    v1_client: *rpc.Client,
+    v2_client: *rpc.Client,
     shared_http_client: *std.http.Client,
     webhook_manager: ?*webhooks.WebhookManager,
     should_stop: std.atomic.Value(bool),
     rate_limiter: RateLimiter,
     blocks_since_checkpoint: u64,
     initial_sync_complete: std.atomic.Value(bool),
-    l1_network_health: NetworkHealth,
-    l2_network_health: NetworkHealth,
+    v1_network_health: NetworkHealth,
+    v2_network_health: NetworkHealth,
     end_block: ?u64,
     indexer_status: ?*IndexerStatus,
     status_server: ?*status_mod.StatusServer,
@@ -65,11 +65,11 @@ pub const Indexer = struct {
             allocator.destroy(http_client);
         }
 
-        const l1_client = try rpc.Client.initWithSharedHttpClient(allocator, cfg.l1_rpc_url, http_client);
-        errdefer l1_client.deinit();
+        const v1_client = try rpc.Client.initWithSharedHttpClient(allocator, cfg.v1_rpc_url, http_client);
+        errdefer v1_client.deinit();
 
-        const l2_client = try rpc.Client.initWithSharedHttpClient(allocator, cfg.l2_rpc_url, http_client);
-        errdefer l2_client.deinit();
+        const v2_client = try rpc.Client.initWithSharedHttpClient(allocator, cfg.v2_rpc_url, http_client);
+        errdefer v2_client.deinit();
 
         var webhook_manager: ?*webhooks.WebhookManager = null;
         if (cfg.webhooks_enabled) {
@@ -85,11 +85,11 @@ pub const Indexer = struct {
 
         if (cfg.status_port) |port| {
             // Get current block from database (resume point) or use start_block
-            const current_block = try database.getSyncState(.l1) orelse cfg.start_block;
+            const current_block = try database.getSyncState(.v1) orelse cfg.start_block;
 
             // Fetch target block from chain if not specified
             const target_block = if (end_block) |eb| eb else blk: {
-                const current = l1_client.getBlockNumber() catch |err| {
+                const current = v1_client.getBlockNumber() catch |err| {
                     std.log.warn("Failed to fetch current block number from RPC: {any}. Using start_block as fallback.", .{err});
                     break :blk cfg.start_block;
                 };
@@ -129,16 +129,16 @@ pub const Indexer = struct {
             .allocator = allocator,
             .config = cfg,
             .database = database,
-            .l1_client = l1_client,
-            .l2_client = l2_client,
+            .v1_client = v1_client,
+            .v2_client = v2_client,
             .shared_http_client = http_client,
             .webhook_manager = webhook_manager,
             .should_stop = std.atomic.Value(bool).init(false),
             .rate_limiter = RateLimiter.init(cfg.rate_limit_per_second, cfg.rate_limit_per_second),
             .blocks_since_checkpoint = 0,
             .initial_sync_complete = std.atomic.Value(bool).init(false),
-            .l1_network_health = NetworkHealth.init(allocator, cfg.l1_rpc_url, 3000), // Check every 3s
-            .l2_network_health = NetworkHealth.init(allocator, cfg.l2_rpc_url, 3000),
+            .v1_network_health = NetworkHealth.init(allocator, cfg.v1_rpc_url, 3000), // Check every 3s
+            .v2_network_health = NetworkHealth.init(allocator, cfg.v2_rpc_url, 3000),
             .end_block = end_block,
             .indexer_status = indexer_status,
             .status_server = status_server,
@@ -149,7 +149,7 @@ pub const Indexer = struct {
         };
     }
 
-    /// Initialize indexer for a single chain (L1 or L2 only)
+    /// Initialize indexer for a single chain (V1 or V2 only)
     pub fn initSingleChain(allocator: std.mem.Allocator, cfg: config.Config, database: *db.Database, chain: models.Chain, end_block: ?u64) !Indexer {
         const http_client = try allocator.create(std.http.Client);
         http_client.* = std.http.Client{ .allocator = allocator };
@@ -158,7 +158,7 @@ pub const Indexer = struct {
             allocator.destroy(http_client);
         }
 
-        const rpc_url = if (chain == .l1) cfg.l1_rpc_url else cfg.l2_rpc_url;
+        const rpc_url = if (chain == .v1) cfg.v1_rpc_url else cfg.v2_rpc_url;
         const client = try rpc.Client.initWithSharedHttpClient(allocator, rpc_url, http_client);
         errdefer client.deinit();
 
@@ -176,7 +176,7 @@ pub const Indexer = struct {
 
         if (cfg.status_port) |port| {
             // Get current block from database (resume point) or use appropriate deployment block
-            const deployment_block = if (chain == .l1) cfg.l1_contracts.l1_deployment_block else cfg.l2_contracts.l2_deployment_block;
+            const deployment_block = if (chain == .v1) cfg.v1_contracts.l1_deployment_block else cfg.v2_contracts.l2_deployment_block;
             const current_block = try database.getSyncState(chain) orelse deployment_block;
 
             // Fetch target block from chain if not specified
@@ -221,16 +221,16 @@ pub const Indexer = struct {
             .allocator = allocator,
             .config = cfg,
             .database = database,
-            .l1_client = client,
-            .l2_client = client, // Same client - only one will be used
+            .v1_client = client,
+            .v2_client = client, // Same client - only one will be used
             .shared_http_client = http_client,
             .webhook_manager = webhook_manager,
             .should_stop = std.atomic.Value(bool).init(false),
             .rate_limiter = RateLimiter.init(cfg.rate_limit_per_second, cfg.rate_limit_per_second),
             .blocks_since_checkpoint = 0,
             .initial_sync_complete = std.atomic.Value(bool).init(false),
-            .l1_network_health = NetworkHealth.init(allocator, rpc_url, 3000),
-            .l2_network_health = NetworkHealth.init(allocator, rpc_url, 3000), // Same for single chain
+            .v1_network_health = NetworkHealth.init(allocator, rpc_url, 3000),
+            .v2_network_health = NetworkHealth.init(allocator, rpc_url, 3000), // Same for single chain
             .end_block = end_block,
             .indexer_status = indexer_status,
             .status_server = status_server,
@@ -256,11 +256,11 @@ pub const Indexer = struct {
             self.allocator.destroy(status);
         }
 
-        // Only deinit l1_client - in single-chain mode, both pointers are the same
-        self.l1_client.deinit();
-        // Only deinit l2_client if it's a different pointer
-        if (self.l1_client != self.l2_client) {
-            self.l2_client.deinit();
+        // Only deinit v1_client - in single-chain mode, both pointers are the same
+        self.v1_client.deinit();
+        // Only deinit v2_client if it's a different pointer
+        if (self.v1_client != self.v2_client) {
+            self.v2_client.deinit();
         }
         self.shared_http_client.deinit();
         self.allocator.destroy(self.shared_http_client);
@@ -419,19 +419,19 @@ pub const Indexer = struct {
 
     // Helper methods to eliminate chain-specific conditionals
     pub inline fn getEthRegistry(self: *Indexer, chain: models.Chain) Address {
-        return if (chain == .l1) self.config.l1_contracts.eth_registry else self.config.l2_contracts.l2_eth_registry;
+        return if (chain == .v1) self.config.v1_contracts.eth_registry else self.config.v2_contracts.l2_eth_registry;
     }
 
     pub inline fn getDatastore(self: *Indexer, chain: models.Chain) Address {
-        return if (chain == .l1) self.config.l1_contracts.registry_datastore else self.config.l2_contracts.l2_registry_datastore;
+        return if (chain == .v1) self.config.v1_contracts.registry_datastore else self.config.v2_contracts.l2_registry_datastore;
     }
 
     pub inline fn getBridgeController(self: *Indexer, chain: models.Chain) Address {
-        return if (chain == .l1) self.config.l1_contracts.l1_bridge_controller else self.config.l2_contracts.l2_bridge_controller;
+        return if (chain == .v1) self.config.v1_contracts.l1_bridge_controller else self.config.v2_contracts.l2_bridge_controller;
     }
 
     pub inline fn getClient(self: *Indexer, chain: models.Chain) *rpc.Client {
-        return if (chain == .l1) self.l1_client else self.l2_client;
+        return if (chain == .v1) self.v1_client else self.v2_client;
     }
 
     // Generic event indexing abstraction
@@ -525,18 +525,18 @@ pub const Indexer = struct {
         .{ .event_hash = abi.EventSignatures.eth_name_renewed_hash, .handler = handleETHNameRenewed, .name = "ETH NameRenewed" },
     };
 
-    // ENS-specific subregistry events - safe for topic-only queries (low noise on mainnet)
+    // ENS-specific subregistry events from PermissionedRegistry (and UserRegistry/WrapperRegistry)
     pub const SUBREGISTRY_ENS_EVENTS = [_]RegistryEventConfig{
-        .{ .event_hash = abi.EventSignatures.name_registered_hash, .handler = handleNameRegistered, .name = "NameRegistered" },
-        .{ .event_hash = abi.EventSignatures.new_subname_hash, .handler = handleNewSubname, .name = "NewSubname" },
-        .{ .event_hash = abi.EventSignatures.name_renewed_hash, .handler = handleNameRenewed, .name = "NameRenewed" },
-        .{ .event_hash = abi.EventSignatures.name_burned_hash, .handler = handleNameBurned, .name = "NameBurned" },
+        .{ .event_hash = abi.EventSignatures.label_registered_hash, .handler = handleLabelRegistered, .name = "LabelRegistered" },
+        .{ .event_hash = abi.EventSignatures.label_reserved_hash, .handler = handleLabelReserved, .name = "LabelReserved" },
+        .{ .event_hash = abi.EventSignatures.label_unregistered_hash, .handler = handleLabelUnregistered, .name = "LabelUnregistered" },
+        .{ .event_hash = abi.EventSignatures.expiry_updated_hash, .handler = handleExpiryUpdated, .name = "ExpiryUpdated" },
+        .{ .event_hash = abi.EventSignatures.parent_updated_hash, .handler = handleParentUpdated, .name = "ParentUpdated" },
+        .{ .event_hash = abi.EventSignatures.subregistry_updated_hash, .handler = handleSubregistryUpdated, .name = "SubregistryUpdated" },
+        .{ .event_hash = abi.EventSignatures.resolver_updated_hash, .handler = handleResolverUpdated, .name = "ResolverUpdated" },
         .{ .event_hash = abi.EventSignatures.token_regenerated_hash, .handler = handleTokenRegenerated, .name = "TokenRegenerated" },
-        .{ .event_hash = abi.EventSignatures.resolver_update_hash, .handler = handleResolverUpdate, .name = "ResolverUpdate" },
+        .{ .event_hash = abi.EventSignatures.token_regenerated_v2_hash, .handler = handleTokenRegenerated, .name = "TokenRegeneratedV2" },
         .{ .event_hash = abi.EventSignatures.eac_roles_changed_hash, .handler = handleEACRolesChanged, .name = "EACRolesChanged" },
-        // OLD signatures from earlier subregistry deployments (non-indexed params)
-        .{ .event_hash = abi.EventSignatures.eac_roles_granted_hash, .handler = handleEACRolesGranted, .name = "EACRolesGranted" },
-        .{ .event_hash = abi.EventSignatures.eac_roles_revoked_hash, .handler = handleEACRolesRevoked, .name = "EACRolesRevoked" },
     };
 
     // TransferSingle is ERC1155 standard - uses topic-only query with two-stage filtering:
@@ -678,11 +678,11 @@ pub const Indexer = struct {
         }
 
         while (!self.should_stop.load(.acquire)) {
-            // Index L1 first (SQLite doesn't support concurrent writes from different threads)
-            try self.indexChain(.l1, self.l1_client);
+            // Index V1 first (SQLite doesn't support concurrent writes from different threads)
+            try self.indexChain(.v1, self.v1_client);
 
-            // Then index L2
-            try self.indexChain(.l2, self.l2_client);
+            // Then index V2
+            try self.indexChain(.v2, self.v2_client);
 
             // After first successful sync of both chains, recreate indexes and start webhook workers
             if (!self.initial_sync_complete.load(.acquire)) {
@@ -713,7 +713,7 @@ pub const Indexer = struct {
         std.log.info("Single-chain indexer starting for {s}...", .{chain.toString()});
 
         const client = self.getClient(chain);
-        var network_health = if (chain == .l1) &self.l1_network_health else &self.l2_network_health;
+        var network_health = if (chain == .v1) &self.v1_network_health else &self.v2_network_health;
 
         // Drop non-essential indexes for faster bulk inserts during initial sync
         if (!self.initial_sync_complete.load(.acquire)) {
@@ -738,7 +738,7 @@ pub const Indexer = struct {
                     }
 
                     // Backfill pre-migration names after initial sync completes
-                    if (chain == .l1) {
+                    if (chain == .v1) {
                         std.log.info("Running pre-migration names backfill...", .{});
                         self.backfillPreMigrationNames() catch |err| {
                             std.log.err("Failed to backfill pre-migration names: {}", .{err});
@@ -787,8 +787,8 @@ pub const Indexer = struct {
     fn indexChain(self: *Indexer, chain: models.Chain, client: *rpc.Client) !void {
         // Use chain-specific deployment block as fallback for fresh databases
         const deployment_block = switch (chain) {
-            .l1 => self.config.l1_contracts.l1_deployment_block,
-            .l2 => self.config.l2_contracts.l2_deployment_block,
+            .v1 => self.config.v1_contracts.l1_deployment_block,
+            .v2 => self.config.v2_contracts.l2_deployment_block,
         };
 
         // Get last synced block from database (resumability)
@@ -957,15 +957,15 @@ pub const Indexer = struct {
         // 3. Then process data dependent on names existing (resolver records)
 
         // Block range constants from contract config (chain-specific)
-        const l1_contracts = self.config.l1_contracts;
-        const temp_registrar_start = l1_contracts.temp_registrar_start_block;
+        const v1_contracts = self.config.v1_contracts;
+        const temp_registrar_start = v1_contracts.temp_registrar_start_block;
 
-        // === V1 EVENTS (ENS V1 - Mainnet L1 only) ===
+        // === V1 EVENTS (ENS V1 - Mainnet V1 only) ===
         // Only index V1 events if the block range overlaps with V1 deployment period
         // Skip if entire range is before temp registrar start OR if V2 is deployed and range is entirely after V2
-        const v2_deployment = if (chain == .l1) l1_contracts.l1_deployment_block else self.config.l2_contracts.l2_deployment_block;
+        const v2_deployment = if (chain == .v1) v1_contracts.l1_deployment_block else self.config.v2_contracts.l2_deployment_block;
         const should_index_v1 = (temp_registrar_start > 0) and (to_block >= temp_registrar_start) and
-                               (v2_deployment == 0 or from_block < v2_deployment + 10);
+            (v2_deployment == 0 or from_block < v2_deployment + 10);
 
         if (should_index_v1) {
             // EFFICIENT: Index all V1 events together per chunk (Registry, Name Wrapper, Base Registrar, Reverse Registrar)
@@ -988,7 +988,7 @@ pub const Indexer = struct {
 
             // Phase 3: Transfer + Ejection events (depends on names existing)
             try self.indexTransferEvents(chain, client, from_block, to_block);
-            if (chain == .l1) {
+            if (chain == .v1) {
                 try self.indexMigrationEvents(client, from_block, to_block);
             }
             try self.indexEjectionEvents(chain, client, from_block, to_block);
@@ -1028,6 +1028,13 @@ pub const Indexer = struct {
     pub const handleEACRolesChanged = handlers_v2_registry.handleEACRolesChanged;
     pub const handleEACRolesGranted = handlers_v2_registry.handleEACRolesGranted;
     pub const handleEACRolesRevoked = handlers_v2_registry.handleEACRolesRevoked;
+    pub const handleLabelRegistered = handlers_v2_registry.handleLabelRegistered;
+    pub const handleLabelReserved = handlers_v2_registry.handleLabelReserved;
+    pub const handleLabelUnregistered = handlers_v2_registry.handleLabelUnregistered;
+    pub const handleExpiryUpdated = handlers_v2_registry.handleExpiryUpdated;
+    pub const handleParentUpdated = handlers_v2_registry.handleParentUpdated;
+    pub const handleSubregistryUpdated = handlers_v2_registry.handleSubregistryUpdated;
+    pub const handleResolverUpdated = handlers_v2_registry.handleResolverUpdated;
 
     // V2 resolver handlers (extracted to handlers_v2_resolver.zig)
     pub const handleLegacyAddrChanged = handlers_v2_resolver.handleLegacyAddrChanged;

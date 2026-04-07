@@ -26,7 +26,7 @@ test "upsertEACRole inserts new role" {
 
     try roles.upsertEACRole(
         database,
-        .l2,
+        .v2,
         resource,
         account,
         role_bitmap,
@@ -37,7 +37,7 @@ test "upsertEACRole inserts new role" {
     );
 
     // Verify by querying
-    const role_list = try roles.getRolesByResource(database, .l2, resource);
+    const role_list = try roles.getRolesByResource(database, .v2, resource);
     defer {
         for (role_list) |*r| r.deinit(allocator);
         allocator.free(role_list);
@@ -57,14 +57,14 @@ test "upsertEACRole updates existing role bitmap" {
     const tx_hash = helpers.randomHash();
 
     // Insert initial role
-    try roles.upsertEACRole(database, .l2, resource, account, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, resource, account, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER);
 
     // Update role bitmap
     const tx_hash2 = helpers.randomHash();
-    try roles.upsertEACRole(database, .l2, resource, account, "0x03", 2000, tx_hash2, 0, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, resource, account, "0x03", 2000, tx_hash2, 0, helpers.TEST_RESOLVER);
 
     // Verify updated
-    const role_list = try roles.getRolesByResource(database, .l2, resource);
+    const role_list = try roles.getRolesByResource(database, .v2, resource);
     defer {
         for (role_list) |*r| r.deinit(allocator);
         allocator.free(role_list);
@@ -87,10 +87,10 @@ test "getRolesByResource returns roles for resource" {
     const tx_hash = helpers.randomHash();
 
     // Assign multiple accounts to same resource
-    try roles.upsertEACRole(database, .l2, resource, helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER);
-    try roles.upsertEACRole(database, .l2, resource, helpers.TEST_OWNER_2, "0x02", 1000, tx_hash, 1, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_2, "0x02", 1000, tx_hash, 1, helpers.TEST_RESOLVER);
 
-    const role_list = try roles.getRolesByResource(database, .l2, resource);
+    const role_list = try roles.getRolesByResource(database, .v2, resource);
     defer {
         for (role_list) |*r| r.deinit(allocator);
         allocator.free(role_list);
@@ -107,11 +107,11 @@ test "getRolesByAccount returns roles for account" {
     const tx_hash = helpers.randomHash();
 
     // Assign account to multiple resources
-    try roles.upsertEACRole(database, .l2, "resource1", helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER);
-    try roles.upsertEACRole(database, .l2, "resource2", helpers.TEST_OWNER_1, "0x02", 1000, tx_hash, 1, helpers.TEST_RESOLVER);
-    try roles.upsertEACRole(database, .l2, "resource3", helpers.TEST_OWNER_1, "0x04", 1000, tx_hash, 2, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, "resource1", helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, "resource2", helpers.TEST_OWNER_1, "0x02", 1000, tx_hash, 1, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, "resource3", helpers.TEST_OWNER_1, "0x04", 1000, tx_hash, 2, helpers.TEST_RESOLVER);
 
-    const role_list = try roles.getRolesByAccount(database, .l2, helpers.TEST_OWNER_1);
+    const role_list = try roles.getRolesByAccount(database, .v2, helpers.TEST_OWNER_1);
     defer {
         for (role_list) |*r| r.deinit(allocator);
         allocator.free(role_list);
@@ -126,7 +126,7 @@ test "getRolesByAccount with unknown account returns empty" {
     defer helpers.destroyTestDatabase(allocator, database);
 
     const unknown_account = helpers.randomAddress();
-    const role_list = try roles.getRolesByAccount(database, .l2, unknown_account);
+    const role_list = try roles.getRolesByAccount(database, .v2, unknown_account);
     defer allocator.free(role_list);
 
     try testing.expectEqual(@as(usize, 0), role_list.len);
@@ -145,11 +145,11 @@ test "deleteEACRole removes role assignment" {
     const tx_hash = helpers.randomHash();
 
     // Insert role
-    try roles.upsertEACRole(database, .l2, resource, helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER);
 
     // Verify exists
     {
-        const role_list = try roles.getRolesByResource(database, .l2, resource);
+        const role_list = try roles.getRolesByResource(database, .v2, resource);
         defer {
             for (role_list) |*r| r.deinit(allocator);
             allocator.free(role_list);
@@ -158,10 +158,10 @@ test "deleteEACRole removes role assignment" {
     }
 
     // Delete
-    try roles.deleteEACRole(database, .l2, resource, helpers.TEST_OWNER_1, helpers.TEST_RESOLVER);
+    try roles.deleteEACRole(database, .v2, resource, helpers.TEST_OWNER_1, helpers.TEST_RESOLVER);
 
     // Verify deleted
-    const role_list = try roles.getRolesByResource(database, .l2, resource);
+    const role_list = try roles.getRolesByResource(database, .v2, resource);
     defer allocator.free(role_list);
 
     try testing.expectEqual(@as(usize, 0), role_list.len);
@@ -173,5 +173,5 @@ test "deleteEACRole with nonexistent role is no-op" {
     defer helpers.destroyTestDatabase(allocator, database);
 
     // Should not error
-    try roles.deleteEACRole(database, .l2, "nonexistent", helpers.TEST_OWNER_1, helpers.TEST_RESOLVER);
+    try roles.deleteEACRole(database, .v2, "nonexistent", helpers.TEST_OWNER_1, helpers.TEST_RESOLVER);
 }

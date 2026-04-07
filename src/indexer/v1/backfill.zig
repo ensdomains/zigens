@@ -9,7 +9,6 @@ const v1_names = @import("../../utils/v1_names.zig");
 const LabelBackfill = @import("../label_backfill.zig").LabelBackfill;
 const Indexer = @import("../indexer.zig").Indexer;
 
-
 /// Backfill pre-migration names with labels from v1_labels table
 /// This runs once after initial sync completes and v1_labels is populated
 pub fn backfillPreMigrationNames(self: *Indexer) !void {
@@ -94,7 +93,7 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
 
         // Create the name entry
         var name = models.Name{
-            .chain = .l1,
+            .chain = .v1,
             .name = full_name,
             .namehash = namehash,
             .label = label_copy,
@@ -271,7 +270,7 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
                 \\SELECT json_extract(data, '$.owner'), json_extract(data, '$.expires'),
                 \\       timestamp, block_number
                 \\FROM events
-                \\WHERE namehash = ? AND event_type = 'name_registered' AND chain = 'l1'
+                \\WHERE namehash = ? AND event_type = 'name_registered' AND chain = 'v1'
                 \\ORDER BY block_number ASC
                 \\LIMIT 1
             ) catch {
@@ -309,7 +308,7 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
         const v1_label_hash = try self.allocator.dupe(u8, token_id_str);
 
         var name = models.Name{
-            .chain = .l1,
+            .chain = .v1,
             .name = full_name,
             .namehash = stored_namehash,
             .label = label_copy,
@@ -384,7 +383,7 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
 /// This runs after initial sync completes to resolve labels that weren't in events
 pub fn backfillUnknownLabels(self: *Indexer) !void {
     // Get statistics first
-    var label_backfill = LabelBackfill.init(self.allocator, self.l1_client, self.database, if (self.rainbow != null) &self.rainbow.? else null);
+    var label_backfill = LabelBackfill.init(self.allocator, self.v1_client, self.database, if (self.rainbow != null) &self.rainbow.? else null);
     const stats = try label_backfill.getStats();
 
     if (stats.total == 0) {

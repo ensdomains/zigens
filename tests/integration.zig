@@ -22,7 +22,7 @@ test "Database integration - full workflow" {
     // Test 1: Insert a registry
     const eth_registry = models.Registry{
         .address = try Address.fromHex("0x0000000000000000000000000000000000000001"),
-        .chain = .l2,
+        .chain = .v2,
         .name = "eth",
         .namehash = try namehash(allocator, "eth"),
         .parent_registry = Address.zero,
@@ -43,7 +43,7 @@ test "Database integration - full workflow" {
             .label_hash = try keccak256(allocator, "alice"),
             .parent_name = try allocator.dupe(u8, "eth"),
             .parent_namehash = try namehash(allocator, "eth"),
-            .chain = .l2,
+            .chain = .v2,
             .registry = try Address.fromHex("0x0000000000000000000000000000000000000001"),
             .owner = try Address.fromHex("0x0000000000000000000000000000000000000123"),
             .registrant = try Address.fromHex("0x0000000000000000000000000000000000000123"),
@@ -81,7 +81,7 @@ test "Database integration - full workflow" {
         var name = n;
         defer name.deinit(allocator);
         try testing.expectEqualStrings("alice.eth", name.name.?);
-        try testing.expect(name.chain == .l2);
+        try testing.expect(name.chain == .v2);
         try testing.expect(!name.ejected);
         try testing.expect(name.migrated);
         std.debug.print("✓ Name retrieved successfully\n", .{});
@@ -91,7 +91,7 @@ test "Database integration - full workflow" {
     {
         var event = models.Event{
             .event_type = .name_registered,
-            .chain = .l2,
+            .chain = .v2,
             .block_number = 101,
             .tx_hash = try Hash.fromHex("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"),
             .log_index = 0,
@@ -108,8 +108,8 @@ test "Database integration - full workflow" {
     std.debug.print("✓ Event inserted\n", .{});
 
     // Test 5: Sync state management
-    try database.setSyncState(.l2, 200);
-    const sync_state = try database.getSyncState(.l2);
+    try database.setSyncState(.v2, 200);
+    const sync_state = try database.getSyncState(.v2);
     try testing.expect(sync_state != null);
     try testing.expectEqual(@as(u64, 200), sync_state.?);
     std.debug.print("✓ Sync state managed correctly\n", .{});
@@ -195,8 +195,8 @@ test "Event type conversion" {
 }
 
 test "Chain type conversion" {
-    const l1 = models.Chain.l1;
-    const l2 = models.Chain.l2;
+    const l1 = models.Chain.v1;
+    const l2 = models.Chain.v2;
 
     try testing.expectEqualStrings("l1", l1.toString());
     try testing.expectEqualStrings("l2", l2.toString());
@@ -204,8 +204,8 @@ test "Chain type conversion" {
     const l1_parsed = try models.Chain.fromString("l1");
     const l2_parsed = try models.Chain.fromString("l2");
 
-    try testing.expect(l1_parsed == .l1);
-    try testing.expect(l2_parsed == .l2);
+    try testing.expect(l1_parsed == .v1);
+    try testing.expect(l2_parsed == .v2);
 
     std.debug.print("✓ Chain types converted correctly\n", .{});
     std.debug.print("\n✅ All chain type tests passed!\n", .{});
@@ -231,7 +231,7 @@ test "Multiple name insertions and queries" {
             .label_hash = try keccak256(allocator, name_str[0 .. name_str.len - 4]),
             .parent_name = try allocator.dupe(u8, "eth"),
             .parent_namehash = try namehash(allocator, "eth"),
-            .chain = .l2,
+            .chain = .v2,
             .registry = try Address.fromHex("0x0000000000000000000000000000000000000001"),
             .owner = try Address.fromHex("0x0000000000000000000000000000000000000123"),
             .registrant = try Address.fromHex("0x0000000000000000000000000000000000000123"),
@@ -292,7 +292,7 @@ test "Name expiry checking" {
         .label_hash = try keccak256(allocator, "expired"),
         .parent_name = try allocator.dupe(u8, "eth"),
         .parent_namehash = try namehash(allocator, "eth"),
-        .chain = .l2,
+        .chain = .v2,
         .registry = Address.zero,
         .owner = Address.zero,
         .registrant = Address.zero,
@@ -327,7 +327,7 @@ test "Name expiry checking" {
         .label_hash = try keccak256(allocator, "valid"),
         .parent_name = try allocator.dupe(u8, "eth"),
         .parent_namehash = try namehash(allocator, "eth"),
-        .chain = .l2,
+        .chain = .v2,
         .registry = Address.zero,
         .owner = Address.zero,
         .registrant = Address.zero,

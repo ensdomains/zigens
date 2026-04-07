@@ -33,11 +33,11 @@ pub fn build(b: *std.Build) void {
     indexer_exe.linkSystemLibrary("sqlite3");
     b.installArtifact(indexer_exe);
 
-    // L1-only indexer executable (separate process)
-    const indexer_l1_exe = b.addExecutable(.{
-        .name = "ensv2-indexer-l1",
+    // V1-only indexer executable (separate process)
+    const indexer_v1_exe = b.addExecutable(.{
+        .name = "ensv2-indexer-v1",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/indexer_l1_main.zig"),
+            .root_source_file = b.path("src/indexer_v1_main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -45,15 +45,15 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    indexer_l1_exe.linkLibC();
-    indexer_l1_exe.linkSystemLibrary("sqlite3");
-    b.installArtifact(indexer_l1_exe);
+    indexer_v1_exe.linkLibC();
+    indexer_v1_exe.linkSystemLibrary("sqlite3");
+    b.installArtifact(indexer_v1_exe);
 
-    // L2-only indexer executable (separate process)
-    const indexer_l2_exe = b.addExecutable(.{
-        .name = "ensv2-indexer-l2",
+    // V2-only indexer executable (separate process)
+    const indexer_v2_exe = b.addExecutable(.{
+        .name = "ensv2-indexer-v2",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/indexer_l2_main.zig"),
+            .root_source_file = b.path("src/indexer_v2_main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -61,9 +61,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    indexer_l2_exe.linkLibC();
-    indexer_l2_exe.linkSystemLibrary("sqlite3");
-    b.installArtifact(indexer_l2_exe);
+    indexer_v2_exe.linkLibC();
+    indexer_v2_exe.linkSystemLibrary("sqlite3");
+    b.installArtifact(indexer_v2_exe);
 
     // Generate GraphQL introspection from schema.graphql
     const generate_schema = b.addSystemCommand(&[_][]const u8{

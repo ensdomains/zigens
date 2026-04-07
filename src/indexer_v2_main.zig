@@ -4,9 +4,9 @@ const indexer = @import("indexer/indexer.zig");
 const db = @import("storage/database.zig");
 
 // Configure logging: filter debug logs, use file redirection in production
-// Run with: ./ensv2-indexer-l2 > logs/indexer-l2.log 2>&1 &
+// Run with: ./ensv2-indexer-v2 > logs/indexer-v2.log 2>&1 &
 pub const std_options: std.Options = .{
-    .log_level = .info,  // Only show info, warn, err (no debug)
+    .log_level = .info, // Only show info, warn, err (no debug)
 };
 
 pub fn main() !void {
@@ -27,10 +27,10 @@ pub fn main() !void {
     var cfg = try config.Config.fromEnv(allocator);
     defer cfg.deinit();
 
-    std.log.info("ENSv2 L2 Indexer starting...", .{});
-    std.log.info("L2 Network: {s}", .{cfg.network_l2.toString()});
-    std.log.info("L2 RPC: [CONFIGURED]", .{});
-    std.log.info("L2 Deployment block: {d}", .{cfg.l2_contracts.l2_deployment_block});
+    std.log.info("ENSv2 V2 Indexer starting...", .{});
+    std.log.info("V2 Network: {s}", .{cfg.network_v2.toString()});
+    std.log.info("V2 RPC: [CONFIGURED]", .{});
+    std.log.info("V2 Deployment block: {d}", .{cfg.v2_contracts.l2_deployment_block});
     std.log.info("Batch size: {d}", .{cfg.batch_size});
     std.log.info("Rate limit: {d} req/s", .{cfg.rate_limit_per_second});
 
@@ -49,14 +49,14 @@ pub fn main() !void {
     }
     std.log.info("Database integrity check passed", .{});
 
-    // Initialize indexer with only L2 client
-    var idx = try indexer.Indexer.initSingleChain(allocator, cfg, &database, .l2, null);
+    // Initialize indexer with only V2 client
+    var idx = try indexer.Indexer.initSingleChain(allocator, cfg, &database, .v2, null);
     defer idx.deinit();
 
-    std.log.info("L2 Indexer started - indexing blocks...", .{});
+    std.log.info("V2 Indexer started - indexing blocks...", .{});
 
     // Run indexer
-    try idx.startSingleChain(.l2);
+    try idx.startSingleChain(.v2);
 }
 
 test {

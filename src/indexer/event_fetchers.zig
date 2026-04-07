@@ -98,10 +98,10 @@ pub fn indexEthRegistryEvents(self: *Indexer, chain: models.Chain, client: *rpc.
 }
 
 pub fn indexETHRegistrarEvents(self: *Indexer, chain: models.Chain, client: *rpc.Client, from_block: u64, to_block: u64) !void {
-    // Only index L2 ETH Registrar events (L1 doesn't have the registrar)
-    if (chain != .l2) return;
+    // Only index V2 ETH Registrar events (V1 doesn't have the registrar)
+    if (chain != .v2) return;
 
-    const eth_registrar = self.config.l2_contracts.l2_eth_registrar;
+    const eth_registrar = self.config.v2_contracts.l2_eth_registrar;
 
     // Build batch request for all ETH registrar events
     var batch_requests: [Indexer.ETH_REGISTRAR_EVENTS.len]rpc.Client.BatchGetLogsRequest = undefined;
@@ -529,8 +529,8 @@ pub fn indexEjectionEvents(self: *Indexer, chain: models.Chain, client: *rpc.Cli
         const topics_renewal_sync = [_]?Hash{abi.EventSignatures.renewal_synchronized_hash};
 
         // Build batch request for bridge events (2-3 calls → 1 batch depending on chain)
-        if (chain == .l1) {
-            // L1: Include RenewalSynchronized
+        if (chain == .v1) {
+            // V1: Include RenewalSynchronized
             const batch_requests = [_]rpc.Client.BatchGetLogsRequest{
                 .{ .from_block = from_block, .to_block = to_block, .address = bridge_addr, .topics = &topics_ejected_l1 },
                 .{ .from_block = from_block, .to_block = to_block, .address = bridge_addr, .topics = &topics_ejected_l2 },
@@ -867,8 +867,8 @@ pub fn indexPhase1V2Events(self: *Indexer, chain: models.Chain, client: *rpc.Cli
     const N_REGISTRAR = Indexer.ETH_REGISTRAR_EVENTS.len;
     const N_DS: usize = 4;
 
-    if (chain == .l2) {
-        const eth_registrar = self.config.l2_contracts.l2_eth_registrar;
+    if (chain == .v2) {
+        const eth_registrar = self.config.v2_contracts.l2_eth_registrar;
         const TOTAL = N_REG + N_REGISTRAR + N_DS;
 
         var batch: [TOTAL]rpc.Client.BatchGetLogsRequest = undefined;

@@ -23,10 +23,10 @@ test "insertRegistry creates new registry" {
     const registry_addr = helpers.TEST_REGISTRY;
     const nh = try namehash_fn(allocator, "eth");
 
-    try helpers.createTestRegistry(database, .l2, registry_addr, "eth", nh);
+    try helpers.createTestRegistry(database, .v2, registry_addr, "eth", nh);
 
     // Verify registry was created by querying
-    const registries = try database.getRegistriesByOwner(.l2, helpers.TEST_OWNER_1);
+    const registries = try database.getRegistriesByOwner(.v2, helpers.TEST_OWNER_1);
     defer {
         for (registries) |*r| r.deinit(allocator);
         allocator.free(registries);
@@ -44,11 +44,11 @@ test "insertRegistry updates existing registry on conflict" {
     const nh = try namehash_fn(allocator, "eth");
 
     // Insert first time
-    try helpers.createTestRegistry(database, .l2, registry_addr, "eth", nh);
+    try helpers.createTestRegistry(database, .v2, registry_addr, "eth", nh);
 
     // Insert again with same address - should update, not fail
     try database.insertRegistry(models.Registry{
-        .chain = .l2,
+        .chain = .v2,
         .address = registry_addr,
         .name = "eth-updated",
         .namehash = nh,
@@ -65,7 +65,7 @@ test "getRegistriesByOwner returns empty for unknown owner" {
     defer helpers.destroyTestDatabase(allocator, database);
 
     const unknown_owner = helpers.randomAddress();
-    const registries = try database.getRegistriesByOwner(.l2, unknown_owner);
+    const registries = try database.getRegistriesByOwner(.v2, unknown_owner);
     defer allocator.free(registries);
 
     try testing.expectEqual(@as(usize, 0), registries.len);
@@ -103,7 +103,7 @@ test "insertName with null optional fields" {
     const parent_nh = try namehash_fn(allocator, "eth");
 
     try database.insertName(models.Name{
-        .chain = .l2,
+        .chain = .v2,
         .name = "minimal.eth",
         .namehash = nh,
         .label = "minimal",
@@ -249,7 +249,7 @@ test "insertName with expiry > i64::max stores as 0 (never expires)" {
     const huge_expiry: u64 = @as(u64, @intCast(std.math.maxInt(i64))) + 100;
 
     try database.insertName(models.Name{
-        .chain = .l2,
+        .chain = .v2,
         .name = "hugeinsert.eth",
         .namehash = nh,
         .label = "hugeinsert",
@@ -361,7 +361,7 @@ test "updateNameExpiry via namehash clamps u64 > i64::max to 0" {
     const parent_nh = try namehash_fn(allocator, "eth");
 
     try database.insertName(models.Name{
-        .chain = .l2,
+        .chain = .v2,
         .name = "canonical.eth",
         .namehash = nh,
         .label = "canonical",
@@ -413,7 +413,7 @@ test "insertRenewalSync with expiry > i64::max stores as 0" {
     const huge_expiry: u64 = @as(u64, @intCast(std.math.maxInt(i64))) + 1;
     const tx_hash = helpers.randomHash();
 
-    try sync_storage.insertRenewalSync(database, .l2, 999, huge_expiry, 1000, tx_hash, 0);
+    try sync_storage.insertRenewalSync(database, .v2, 999, huge_expiry, 1000, tx_hash, 0);
 
     // Verify by querying raw SQL — renewal_syncs stores new_expiry as integer
     var q = try @import("lib").storage.Query.init(database, "SELECT new_expiry FROM renewal_syncs WHERE token_id = '999'");
@@ -435,7 +435,7 @@ test "insertOrphanedRegistration with expiry > i64::max stores as 0 and reads ba
 
     try sync_storage.insertOrphanedRegistration(
         database,
-        .l2,
+        .v2,
         "0xaaaa",
         42,
         "testlabel",
@@ -446,7 +446,7 @@ test "insertOrphanedRegistration with expiry > i64::max stores as 0 and reads ba
         0,
     );
 
-    const orphans = try sync_storage.getOrphanedRegistrations(database, .l2, "0xaaaa");
+    const orphans = try sync_storage.getOrphanedRegistrations(database, .v2, "0xaaaa");
     defer {
         for (orphans) |*o| o.deinit(allocator);
         allocator.free(orphans);
@@ -680,7 +680,7 @@ test "multiple names with same owner different chains" {
 
     // Insert on L2
     try database.insertName(models.Name{
-        .chain = .l2,
+        .chain = .v2,
         .name = "multichain.eth",
         .namehash = nh,
         .label = "multichain",
@@ -712,7 +712,7 @@ test "multiple names with same owner different chains" {
 
     // Insert on L1
     try database.insertName(models.Name{
-        .chain = .l1,
+        .chain = .v1,
         .name = "multichain.eth",
         .namehash = nh,
         .label = "multichain",

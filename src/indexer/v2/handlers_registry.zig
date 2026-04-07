@@ -11,7 +11,6 @@ const Indexer = @import("../indexer.zig").Indexer;
 const utils = @import("../utils.zig");
 const json_utils = @import("../../utils/json.zig");
 
-
 pub fn handleSubregistryUpdate(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
     // Event: SubregistryUpdate(uint256 indexed id, address subregistry)
     // Note: The 'id' in SubregistryUpdate is the canonical_id (version=0), not the full token_id
@@ -407,12 +406,10 @@ pub fn handleNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !
 
     // In ABI encoding: [offset_to_string, expiration, registeredBy, string_length, string_data]
     // offset_to_string is at 0x00, expiration at 0x20, registeredBy at 0x40
-    const expiration = try abi.ABI.decodeUint256(log.data, 32);  // uint64 but padded to uint256
+    const expiration = try abi.ABI.decodeUint256(log.data, 32); // uint64 but padded to uint256
     const registered_by = try abi.ABI.decodeAddress(log.data, 64);
 
-    std.log.debug("NameRegistered: {s} (tokenId={d}, expiration={d}, registeredBy={any})", .{
-        label_str, token_id, expiration, registered_by
-    });
+    std.log.debug("NameRegistered: {s} (tokenId={d}, expiration={d}, registeredBy={any})", .{ label_str, token_id, expiration, registered_by });
 
     // Determine parent name based on registry address
     // If from main .eth registry, parent is "eth". Otherwise look up subregistry parent.
@@ -716,12 +713,10 @@ pub fn handleNameRenewed(self: *Indexer, chain: models.Chain, log: rpc.Log) !voi
     const canonical_id = token_id_utils_renew.getCanonicalId(token_id);
 
     // Data contains: uint64 newExpiration, address renewedBy (both padded to 32 bytes)
-    const new_expiration = try abi.ABI.decodeUint256(log.data, 0);  // uint64 but padded
+    const new_expiration = try abi.ABI.decodeUint256(log.data, 0); // uint64 but padded
     const renewed_by = try abi.ABI.decodeAddress(log.data, 32);
 
-    std.log.debug("NameRenewed: tokenId={d}, canonicalId={d}, newExpiration={d}, renewedBy={any}", .{
-        token_id, canonical_id, new_expiration, renewed_by
-    });
+    std.log.debug("NameRenewed: tokenId={d}, canonicalId={d}, newExpiration={d}, renewedBy={any}", .{ token_id, canonical_id, new_expiration, renewed_by });
 
     // Look up the name by token_id AND registry to avoid cross-registry collisions
     const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
@@ -831,15 +826,13 @@ pub fn handleETHNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log
     const owner = try abi.ABI.decodeAddress(log.data, 32);
     const subregistry = try abi.ABI.decodeAddress(log.data, 64);
     const resolver = try abi.ABI.decodeAddress(log.data, 96);
-    const duration = try abi.ABI.decodeUint256(log.data, 128);  // uint64 padded
+    const duration = try abi.ABI.decodeUint256(log.data, 128); // uint64 padded
     const payment_token = try abi.ABI.decodeAddress(log.data, 160);
     const referrer = try abi.ABI.decodeBytes32(log.data, 192);
     const base_price = try abi.ABI.decodeUint256(log.data, 224);
     const premium = try abi.ABI.decodeUint256(log.data, 256);
 
-    std.log.debug("ETHRegistrar.NameRegistered: {s} (tokenId={d}, owner={any}, duration={d}, base={d}, premium={d})", .{
-        label_str, token_id, owner, duration, base_price, premium
-    });
+    std.log.debug("ETHRegistrar.NameRegistered: {s} (tokenId={d}, owner={any}, duration={d}, base={d}, premium={d})", .{ label_str, token_id, owner, duration, base_price, premium });
 
     // Compute namehash
     const full_name = try std.fmt.allocPrint(self.allocator, "{s}.eth", .{label_str});
@@ -963,15 +956,13 @@ pub fn handleETHNameRenewed(self: *Indexer, chain: models.Chain, log: rpc.Log) !
         return;
     };
 
-    const duration = try abi.ABI.decodeUint256(log.data, 32);  // uint64 padded
-    const new_expiry = try abi.ABI.decodeUint256(log.data, 64);  // uint64 padded
+    const duration = try abi.ABI.decodeUint256(log.data, 32); // uint64 padded
+    const new_expiry = try abi.ABI.decodeUint256(log.data, 64); // uint64 padded
     const payment_token = try abi.ABI.decodeAddress(log.data, 96);
     const referrer = try abi.ABI.decodeBytes32(log.data, 128);
     const base_price = try abi.ABI.decodeUint256(log.data, 160);
 
-    std.log.debug("ETHRegistrar.NameRenewed: {s} (tokenId={d}, canonicalId={d}, duration={d}, newExpiry={d}, base={d})", .{
-        label_str, token_id, canonical_id, duration, new_expiry, base_price
-    });
+    std.log.debug("ETHRegistrar.NameRenewed: {s} (tokenId={d}, canonicalId={d}, duration={d}, newExpiry={d}, base={d})", .{ label_str, token_id, canonical_id, duration, new_expiry, base_price });
 
     // Look up the name by token_id AND the .eth registry (NOT log.address, which is the registrar)
     const eth_registry = self.getEthRegistry(chain);
@@ -1432,6 +1423,503 @@ pub fn handleEACRolesGranted(self: *Indexer, chain: models.Chain, log: rpc.Log) 
     try utils.emitEvent(self, chain, log, .eac_roles_changed, event_name, namehash_opt, event_data);
 }
 
+/// Handle LabelRegistered events from PermissionedRegistry
+/// Event: LabelRegistered(uint256 indexed tokenId, bytes32 indexed labelHash, string label, address owner, uint64 expiry, address indexed sender)
+pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+    if (log.topics.len < 3) return error.InvalidTopicCount;
+
+    const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
+    const token_id: u256 = token_id_raw;
+    const token_id_utils = @import("../../types/token_id.zig");
+    const canonical_id = token_id_utils.getCanonicalId(token_id);
+
+    const label_hash = Hash{ .bytes = log.topics[2].bytes };
+
+    const label_str = try abi.ABI.decodeString(self.allocator, log.data, 0);
+    defer self.allocator.free(label_str);
+
+    unicode.validateName(label_str) catch |err| {
+        std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
+        return;
+    };
+
+    const owner = try abi.ABI.decodeAddress(log.data, 32);
+    const expiry: u64 = @truncate(try abi.ABI.decodeUint256(log.data, 52));
+    const sender = try abi.ABI.decodeAddress(log.data, 84);
+
+    std.log.debug("LabelRegistered: {s} (tokenId={d}, canonicalId={d}, owner={any}, expiry={d}, sender={any})", .{ label_str, token_id, canonical_id, owner, expiry, sender });
+
+    const eth_registry = self.getEthRegistry(chain);
+    const is_main_registry = log.address.eql(eth_registry);
+
+    var parent_name: []const u8 = "eth";
+    var parent_name_allocated = false;
+    var parent_namehash: Hash = try @import("../../types/hash.zig").namehash(self.allocator, "eth");
+
+    if (!is_main_registry) {
+        const registry_hex = try log.address.toHex(self.allocator);
+        defer self.allocator.free(registry_hex);
+
+        var rq = try Query.init(self.database,
+            \\SELECT name, namehash FROM registries
+            \\WHERE address = ? AND chain = ? AND created_block <= ?
+            \\ORDER BY created_block DESC
+            \\LIMIT 1
+        );
+        defer rq.deinit();
+
+        if (try rq.step()) {
+            if (rq.getTextSlice(0)) |name_span| {
+                parent_name = try self.allocator.dupe(u8, name_span);
+                parent_name_allocated = true;
+            }
+            if (rq.getTextSlice(1)) |namehash_hex| {
+                parent_namehash = try Hash.fromHex(namehash_hex);
+            }
+        } else {
+            std.log.debug("LabelRegistered: orphaning {s} - no parent found for subregistry {s} at block {d}", .{
+                label_str, registry_hex, log.block_number,
+            });
+            try self.database.insertOrphanedRegistration(
+                chain,
+                registry_hex,
+                token_id,
+                label_str,
+                expiry,
+                owner,
+                log.block_number,
+                log.transaction_hash,
+                log.log_index,
+            );
+            return;
+        }
+    }
+    defer if (parent_name_allocated) self.allocator.free(parent_name);
+
+    const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
+    defer self.allocator.free(full_name);
+
+    const namehash_val = try @import("../../types/hash.zig").namehash(self.allocator, full_name);
+
+    const name_dup = try self.allocator.dupe(u8, full_name);
+    defer self.allocator.free(name_dup);
+    const label_dup = try self.allocator.dupe(u8, label_str);
+    defer self.allocator.free(label_dup);
+    const parent_name_dup = try self.allocator.dupe(u8, parent_name);
+    defer self.allocator.free(parent_name_dup);
+
+    const name = models.Name{
+        .name = name_dup,
+        .label = label_dup,
+        .label_hash = label_hash,
+        .parent_name = parent_name_dup,
+        .parent_namehash = parent_namehash,
+        .chain = chain,
+        .registry = log.address,
+        .owner = owner,
+        .registrant = owner,
+        .resolver = Address.zero,
+        .token_id = token_id,
+        .canonical_id = canonical_id,
+        .token_version = token_id_utils.getTokenVersion(token_id),
+        .namehash = namehash_val,
+        .expiry = expiry,
+        .registry_locked = false,
+        .migrated = false,
+        .ejected = false,
+        .created_block = log.block_number,
+        .created_at = 0,
+        .registered_at = 0,
+        .updated_block = log.block_number,
+        .updated_at = 0,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    };
+
+    try self.database.insertName(name);
+
+    const owner_hex = try owner.toHex(self.allocator);
+    defer self.allocator.free(owner_hex);
+    const registry_hex = try log.address.toHex(self.allocator);
+    defer self.allocator.free(registry_hex);
+    const sender_hex = try sender.toHex(self.allocator);
+    defer self.allocator.free(sender_hex);
+
+    const escaped_name = try json_utils.escapeString(self.allocator, full_name);
+    defer self.allocator.free(escaped_name);
+
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\",\"tokenId\":{d},\"canonicalId\":{d},\"owner\":\"{s}\",\"expiry\":{d},\"sender\":\"{s}\",\"registry\":\"{s}\"}}", .{
+        escaped_name,
+        token_id,
+        canonical_id,
+        owner_hex,
+        expiry,
+        sender_hex,
+        registry_hex,
+    });
+
+    const event_name = try self.allocator.dupe(u8, full_name);
+
+    try utils.emitEvent(self, chain, log, .label_registered, event_name, namehash_val, event_data);
+}
+
+/// Handle LabelReserved events from PermissionedRegistry (when owner == 0)
+/// Event: LabelReserved(uint256 indexed tokenId, bytes32 indexed labelHash, string label, uint64 expiry, address indexed sender)
+pub fn handleLabelReserved(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+    if (log.topics.len < 3) return error.InvalidTopicCount;
+
+    const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
+    const token_id: u256 = token_id_raw;
+
+    const label_hash = Hash{ .bytes = log.topics[2].bytes };
+
+    const label_str = try abi.ABI.decodeString(self.allocator, log.data, 0);
+    defer self.allocator.free(label_str);
+
+    unicode.validateName(label_str) catch |err| {
+        std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
+        return;
+    };
+
+    const expiry: u64 = @truncate(try abi.ABI.decodeUint256(log.data, 32));
+    const sender = try abi.ABI.decodeAddress(log.data, 64);
+
+    std.log.debug("LabelReserved: {s} (tokenId={d}, expiry={d}, sender={any})", .{ label_str, token_id, expiry, sender });
+
+    const eth_registry = self.getEthRegistry(chain);
+    const is_main_registry = log.address.eql(eth_registry);
+
+    var parent_name: []const u8 = "eth";
+    var parent_name_allocated = false;
+    var parent_namehash: Hash = try @import("../../types/hash.zig").namehash(self.allocator, "eth");
+
+    if (!is_main_registry) {
+        const registry_hex = try log.address.toHex(self.allocator);
+        defer self.allocator.free(registry_hex);
+
+        var rq = try Query.init(self.database,
+            \\SELECT name, namehash FROM registries
+            \\WHERE address = ? AND chain = ? AND created_block <= ?
+            \\ORDER BY created_block DESC
+            \\LIMIT 1
+        );
+        defer rq.deinit();
+
+        if (try rq.step()) {
+            if (rq.getTextSlice(0)) |name_span| {
+                parent_name = try self.allocator.dupe(u8, name_span);
+                parent_name_allocated = true;
+            }
+            if (rq.getTextSlice(1)) |namehash_hex| {
+                parent_namehash = try Hash.fromHex(namehash_hex);
+            }
+        }
+    }
+    defer if (parent_name_allocated) self.allocator.free(parent_name);
+
+    const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
+    defer self.allocator.free(full_name);
+
+    const namehash_val = try @import("../../types/hash.zig").namehash(self.allocator, full_name);
+
+    const name_dup = try self.allocator.dupe(u8, full_name);
+    defer self.allocator.free(name_dup);
+    const label_dup = try self.allocator.dupe(u8, label_str);
+    defer self.allocator.free(label_dup);
+    const parent_name_dup = try self.allocator.dupe(u8, parent_name);
+    defer self.allocator.free(parent_name_dup);
+
+    const token_id_utils = @import("../../types/token_id.zig");
+    const canonical_id = token_id_utils.getCanonicalId(token_id);
+
+    const name = models.Name{
+        .name = name_dup,
+        .label = label_dup,
+        .label_hash = label_hash,
+        .parent_name = parent_name_dup,
+        .parent_namehash = parent_namehash,
+        .chain = chain,
+        .registry = log.address,
+        .owner = Address.zero,
+        .registrant = Address.zero,
+        .resolver = Address.zero,
+        .token_id = token_id,
+        .canonical_id = canonical_id,
+        .token_version = token_id_utils.getTokenVersion(token_id),
+        .namehash = namehash_val,
+        .expiry = expiry,
+        .registry_locked = false,
+        .migrated = false,
+        .ejected = false,
+        .created_block = log.block_number,
+        .created_at = 0,
+        .registered_at = 0,
+        .updated_block = log.block_number,
+        .updated_at = 0,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    };
+
+    try self.database.insertName(name);
+
+    const sender_hex = try sender.toHex(self.allocator);
+    defer self.allocator.free(sender_hex);
+    const registry_hex = try log.address.toHex(self.allocator);
+    defer self.allocator.free(registry_hex);
+
+    const escaped_name = try json_utils.escapeString(self.allocator, full_name);
+    defer self.allocator.free(escaped_name);
+
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\",\"tokenId\":{d},\"expiry\":{d},\"sender\":\"{s}\",\"registry\":\"{s}\",\"reserved\":true}}", .{
+        escaped_name,
+        token_id,
+        expiry,
+        sender_hex,
+        registry_hex,
+    });
+
+    const event_name = try self.allocator.dupe(u8, full_name);
+
+    try utils.emitEvent(self, chain, log, .label_reserved, event_name, namehash_val, event_data);
+}
+
+/// Handle LabelUnregistered events from PermissionedRegistry
+/// Event: LabelUnregistered(uint256 indexed tokenId, address indexed sender)
+pub fn handleLabelUnregistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+    if (log.topics.len < 2) return error.InvalidTopicCount;
+
+    const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
+    const token_id: u256 = token_id_raw;
+
+    const sender = try abi.ABI.decodeAddress(log.data, 0);
+
+    std.log.debug("LabelUnregistered: tokenId={d}, sender={any}", .{ token_id, sender });
+
+    const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
+
+    var name_str: []const u8 = undefined;
+    var namehash_opt: ?Hash = null;
+
+    if (maybe_name) |n| {
+        try self.database.deleteNameByNamehash(n.namehash);
+        name_str = try self.allocator.dupe(u8, n.name orelse "[unknown]");
+        namehash_opt = n.namehash;
+        var name_copy = n;
+        name_copy.deinit(self.allocator);
+    } else {
+        name_str = try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{token_id});
+    }
+    defer self.allocator.free(name_str);
+
+    const sender_hex = try sender.toHex(self.allocator);
+    defer self.allocator.free(sender_hex);
+
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"tokenId\":{d},\"sender\":\"{s}\"}}", .{
+        token_id,
+        sender_hex,
+    });
+
+    const event_name = try self.allocator.dupe(u8, name_str);
+
+    try utils.emitEvent(self, chain, log, .label_unregistered, event_name, namehash_opt, event_data);
+}
+
+/// Handle ExpiryUpdated events from PermissionedRegistry (replaces NameRenewed)
+/// Event: ExpiryUpdated(uint256 indexed tokenId, uint64 indexed newExpiry, address indexed sender)
+pub fn handleExpiryUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+    if (log.topics.len < 3) return error.InvalidTopicCount;
+
+    const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
+    const token_id: u256 = token_id_raw;
+
+    const new_expiry_raw = try abi.ABI.decodeUint256(&log.topics[2].bytes, 0);
+    const new_expiry: u64 = @truncate(new_expiry_raw);
+
+    const sender = try abi.ABI.decodeAddress(log.data, 0);
+
+    std.log.debug("ExpiryUpdated: tokenId={d}, newExpiry={d}, sender={any}", .{ token_id, new_expiry, sender });
+
+    const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
+
+    var name_str: []const u8 = undefined;
+    var namehash_opt: ?Hash = null;
+
+    if (maybe_name) |n| {
+        try self.database.updateNameExpiry(n.namehash, new_expiry);
+        name_str = try self.allocator.dupe(u8, n.name orelse "[unknown]");
+        namehash_opt = n.namehash;
+        var name_copy = n;
+        name_copy.deinit(self.allocator);
+    } else {
+        name_str = try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{token_id});
+    }
+    defer self.allocator.free(name_str);
+
+    const sender_hex = try sender.toHex(self.allocator);
+    defer self.allocator.free(sender_hex);
+
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"tokenId\":{d},\"newExpiry\":{d},\"sender\":\"{s}\"}}", .{
+        token_id,
+        new_expiry,
+        sender_hex,
+    });
+
+    const event_name = try self.allocator.dupe(u8, name_str);
+
+    try utils.emitEvent(self, chain, log, .expiry_updated, event_name, namehash_opt, event_data);
+}
+
+/// Handle ParentUpdated events from PermissionedRegistry
+/// Event: ParentUpdated(IRegistry indexed parent, string label, address indexed sender)
+pub fn handleParentUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+    if (log.topics.len < 2) return error.InvalidTopicCount;
+
+    const parent_addr = try abi.ABI.decodeAddress(&log.topics[1].bytes, 0);
+
+    const label_str = try abi.ABI.decodeString(self.allocator, log.data, 0);
+    defer self.allocator.free(label_str);
+
+    const sender = try abi.ABI.decodeAddress(log.data, 32);
+
+    std.log.debug("ParentUpdated: parent={any}, label={s}, sender={any}", .{ parent_addr, label_str, sender });
+
+    const parent_hex = try parent_addr.toHex(self.allocator);
+    defer self.allocator.free(parent_hex);
+    const sender_hex = try sender.toHex(self.allocator);
+    defer self.allocator.free(sender_hex);
+
+    const escaped_label = try json_utils.escapeString(self.allocator, label_str);
+    defer self.allocator.free(escaped_label);
+
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"parent\":\"{s}\",\"label\":\"{s}\",\"sender\":\"{s}\"}}", .{
+        parent_hex,
+        escaped_label,
+        sender_hex,
+    });
+
+    const event_name = try self.allocator.dupe(u8, label_str);
+
+    try utils.emitEvent(self, chain, log, .parent_updated, event_name, null, event_data);
+}
+
+/// Handle SubregistryUpdated events from PermissionedRegistry (NEW signature)
+/// Event: SubregistryUpdated(uint256 indexed tokenId, IRegistry indexed subregistry, address indexed sender)
+/// Note: Different from SubregistryUpdate - uses indexed IRegistry instead of non-indexed address
+pub fn handleSubregistryUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+    if (log.topics.len < 3) return error.InvalidTopicCount;
+
+    const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
+    const token_id: u256 = token_id_raw;
+    const token_id_utils = @import("../../types/token_id.zig");
+    const canonical_id = token_id_utils.getCanonicalId(token_id);
+
+    const subregistry_addr = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
+    const sender = try abi.ABI.decodeAddress(log.data, 0);
+
+    std.log.debug("SubregistryUpdated: tokenId={d}, canonicalId={d}, subregistry={any}, sender={any}", .{ token_id, canonical_id, subregistry_addr, sender });
+
+    if (subregistry_addr.isZero()) {
+        std.log.debug("  → Skipping zero address subregistry", .{});
+        return;
+    }
+
+    const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
+    const name_str = if (maybe_name) |n| blk: {
+        var name_copy = n;
+        defer name_copy.deinit(self.allocator);
+        break :blk try self.allocator.dupe(u8, name_copy.name orelse "[unknown]");
+    } else try std.fmt.allocPrint(self.allocator, "canonicalId:{d}", .{canonical_id});
+    defer self.allocator.free(name_str);
+
+    const namehash = if (maybe_name) |n| n.namehash else Hash.zero;
+
+    const registry = models.Registry{
+        .address = subregistry_addr,
+        .chain = chain,
+        .name = name_str,
+        .namehash = namehash,
+        .parent_registry = log.address,
+        .created_block = log.block_number,
+        .created_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+    };
+
+    try self.database.insertRegistry(registry);
+
+    const subreg_hex = try subregistry_addr.toHex(self.allocator);
+    defer self.allocator.free(subreg_hex);
+    const contract_hex = try log.address.toHex(self.allocator);
+    defer self.allocator.free(contract_hex);
+    const sender_hex = try sender.toHex(self.allocator);
+    defer self.allocator.free(sender_hex);
+
+    const escaped_name = try json_utils.escapeString(self.allocator, name_str);
+    defer self.allocator.free(escaped_name);
+
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\",\"canonicalId\":{d},\"subregistry\":\"{s}\",\"registry\":\"{s}\",\"sender\":\"{s}\"}}", .{
+        escaped_name,
+        canonical_id,
+        subreg_hex,
+        contract_hex,
+        sender_hex,
+    });
+
+    const event_name = try self.allocator.dupe(u8, name_str);
+
+    try utils.emitEvent(self, chain, log, .subregistry_updated, event_name, namehash, event_data);
+}
+
+/// Handle ResolverUpdated events from PermissionedRegistry (NEW signature)
+/// Event: ResolverUpdated(uint256 indexed tokenId, address indexed resolver, address indexed sender)
+/// Note: Different from ResolverUpdate - uses indexed address
+pub fn handleResolverUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+    if (log.topics.len < 3) return error.InvalidTopicCount;
+
+    const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
+    const token_id: u256 = token_id_raw;
+
+    const resolver_addr = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
+    const sender = try abi.ABI.decodeAddress(log.data, 0);
+
+    std.log.debug("ResolverUpdated: tokenId={d}, resolver={any}, sender={any}", .{ token_id, resolver_addr, sender });
+
+    const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
+
+    var name_str: []const u8 = undefined;
+    var namehash_opt: ?Hash = null;
+
+    if (maybe_name) |n| {
+        try self.database.updateNameResolver(n.namehash, resolver_addr);
+        name_str = try self.allocator.dupe(u8, n.name orelse "[unknown]");
+        namehash_opt = n.namehash;
+        var name_copy = n;
+        name_copy.deinit(self.allocator);
+    } else {
+        name_str = try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{token_id});
+    }
+    defer self.allocator.free(name_str);
+
+    const resolver_hex = try resolver_addr.toHex(self.allocator);
+    defer self.allocator.free(resolver_hex);
+    const sender_hex = try sender.toHex(self.allocator);
+    defer self.allocator.free(sender_hex);
+
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"tokenId\":{d},\"resolver\":\"{s}\",\"sender\":\"{s}\"}}", .{
+        token_id,
+        resolver_hex,
+        sender_hex,
+    });
+
+    const event_name = try self.allocator.dupe(u8, name_str);
+
+    try utils.emitEvent(self, chain, log, .resolver_updated, event_name, namehash_opt, event_data);
+}
+
 /// Handle EACRolesRevoked events (OLD signature from earlier subregistry deployments)
 /// Event: EACRolesRevoked(uint256 resource, uint256 roleBitmap, address account)
 /// All params are non-indexed (1 topic = event sig only), data = 3 words
@@ -1464,7 +1952,6 @@ pub fn handleEACRolesRevoked(self: *Indexer, chain: models.Chain, log: rpc.Log) 
         resource_hex, account_hex, revoked_bitmap_hex,
     });
 
-    // Revoke = delete the role entry
     try self.database.deleteEACRole(chain, resource_hex, account, log.address);
 
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resource\":\"{s}\",\"account\":\"{s}\",\"revokedRoleBitmap\":\"{s}\"}}", .{

@@ -84,7 +84,7 @@ pub const Resolver = struct {
         // 2. For each label, call getSubregistry() and getResolver()
         // 3. Return the first non-zero resolver found (closest to target)
 
-        return try self.findResolverRecursive(labels.items, .l2, self.config.l2_root_registry);
+        return try self.findResolverRecursive(labels.items, .v2, self.config.l2_root_registry);
     }
 
     fn findResolverRecursive(
@@ -126,7 +126,7 @@ pub const Resolver = struct {
     }
 
     fn callGetResolver(self: *Resolver, chain: models.Chain, registry: Address, label: []const u8) !Address {
-        const client = if (chain == .l1) self.l1_client else self.l2_client;
+        const client = if (chain == .v1) self.l1_client else self.l2_client;
 
         // Encode call: getResolver(string)
         const sig = "getResolver(string)";
@@ -144,7 +144,7 @@ pub const Resolver = struct {
     }
 
     fn callGetSubregistry(self: *Resolver, chain: models.Chain, registry: Address, label: []const u8) !Address {
-        const client = if (chain == .l1) self.l1_client else self.l2_client;
+        const client = if (chain == .v1) self.l1_client else self.l2_client;
 
         // Encode call: getSubregistry(string)
         const sig = "getSubregistry(string)";
@@ -268,11 +268,11 @@ test "Resolver init" {
 
     const cfg = config.Config{
         .allocator = allocator,
-        .l1_rpc_url = "http://localhost:8545",
-        .l2_rpc_url = "http://localhost:8546",
+        .v1_rpc_url = "http://localhost:8545",
+        .v2_rpc_url = "http://localhost:8546",
         .database_path = ":memory:",
-        .network_l1 = .sepolia,
-        .network_l2 = .sepolia,
+        .network_v1 = .sepolia,
+        .network_v2 = .sepolia,
         .start_block = 0,
         .end_block = null,
         .poll_interval = 12,
@@ -289,8 +289,8 @@ test "Resolver init" {
         .graphql_max_depth = 10,
         .graphql_max_cost = 1000,
         .metrics_enabled = false,
-        .l1_contracts = test_contracts,
-        .l2_contracts = test_contracts,
+        .v1_contracts = test_contracts,
+        .v2_contracts = test_contracts,
         .network = .sepolia,
         .contracts = test_contracts,
     };

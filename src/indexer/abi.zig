@@ -61,27 +61,39 @@ pub const EventSignatures = struct {
     pub const expiry_updated = "ExpiryUpdated(uint256,uint64,address)";
     pub const expiry_updated_hash: Hash = eventHash(expiry_updated);
 
+    /// LabelRegistered(uint256 indexed tokenId, bytes32 indexed labelHash, string label, address owner, uint64 expiry, address indexed sender)
+    /// Emitted when a label is registered (owner != 0) in PermissionedRegistry
+    pub const label_registered = "LabelRegistered(uint256,bytes32,string,address,uint64,address)";
+    pub const label_registered_hash: Hash = eventHash(label_registered);
+
+    /// LabelReserved(uint256 indexed tokenId, bytes32 indexed labelHash, string label, uint64 expiry, address indexed sender)
+    /// Emitted when a label is reserved (owner == 0) in PermissionedRegistry
+    pub const label_reserved = "LabelReserved(uint256,bytes32,string,uint64,address)";
+    pub const label_reserved_hash: Hash = eventHash(label_reserved);
+
+    /// LabelUnregistered(uint256 indexed tokenId, address indexed sender)
+    /// Emitted when a label is unregistered in PermissionedRegistry
+    pub const label_unregistered = "LabelUnregistered(uint256,address)";
+    pub const label_unregistered_hash: Hash = eventHash(label_unregistered);
+
+    /// ParentUpdated(IRegistry indexed parent, string label, address indexed sender)
+    /// Emitted when the parent of a registry is changed
+    pub const parent_updated = "ParentUpdated(address,string,address)";
+    pub const parent_updated_hash: Hash = eventHash(parent_updated);
+
+    /// TokenResource(uint256 indexed tokenId, uint256 indexed resource)
+    /// Emitted when a token's resource is set during registration
+    pub const token_resource = "TokenResource(uint256,uint256)";
+    pub const token_resource_hash: Hash = eventHash(token_resource);
+
     // ========================================================================
     // Enhanced Access Control events (from common/access-control/interfaces/IEnhancedAccessControl.sol)
     // ========================================================================
 
     /// EACRolesChanged(uint256 indexed resource, address indexed account, uint256 oldRoleBitmap, uint256 newRoleBitmap)
     /// Emitted when roles are changed for an account on a resource (tokenId)
-    /// NEW signature - current ETH registry deployment
     pub const eac_roles_changed = "EACRolesChanged(uint256,address,uint256,uint256)";
     pub const eac_roles_changed_hash: Hash = eventHash(eac_roles_changed);
-
-    /// EACRolesGranted(uint256 resource, uint256 roleBitmap, address account)
-    /// OLD signature - used by earlier subregistry deployments on Sepolia
-    /// data = resource (uint256) + roleBitmap (uint256) + account (address)
-    pub const eac_roles_granted = "EACRolesGranted(uint256,uint256,address)";
-    pub const eac_roles_granted_hash: Hash = eventHash(eac_roles_granted);
-
-    /// EACRolesRevoked(uint256 resource, uint256 roleBitmap, address account)
-    /// OLD signature - used by earlier subregistry deployments on Sepolia
-    /// data = resource (uint256) + roleBitmap (uint256) + account (address)
-    pub const eac_roles_revoked = "EACRolesRevoked(uint256,uint256,address)";
-    pub const eac_roles_revoked_hash: Hash = eventHash(eac_roles_revoked);
 
     // ========================================================================
     // IETHRegistrar events (from L2/registrar/interfaces/IETHRegistrar.sol)
@@ -166,6 +178,21 @@ pub const EventSignatures = struct {
     /// AliasChanged(bytes indexed indexedFromName, bytes indexed indexedToName, bytes fromName, bytes toName)
     pub const alias_changed = "AliasChanged(bytes,bytes,bytes,bytes)";
     pub const alias_changed_hash: Hash = eventHash(alias_changed);
+
+    /// NamedResource(uint256 indexed resource, bytes name)
+    /// Emitted when a named resource is set in PermissionedResolver
+    pub const named_resource = "NamedResource(uint256,bytes)";
+    pub const named_resource_hash: Hash = eventHash(named_resource);
+
+    /// NamedTextResource(uint256 indexed resource, bytes name, bytes32 indexed key)
+    /// Emitted when a named text resource is set in PermissionedResolver
+    pub const named_text_resource = "NamedTextResource(uint256,bytes,bytes32)";
+    pub const named_text_resource_hash: Hash = eventHash(named_text_resource);
+
+    /// NamedAddrResource(uint256 indexed resource, bytes name, uint256 indexed coinType)
+    /// Emitted when a named address resource is set in PermissionedResolver
+    pub const named_addr_resource = "NamedAddrResource(uint256,bytes,uint256)";
+    pub const named_addr_resource_hash: Hash = eventHash(named_addr_resource);
 
     // ========================================================================
     // ENS Temporary Registrar events (Pre-V1 Migration, May 2017 - May 2019)
@@ -635,14 +662,14 @@ test "ABI decodeString accepts string at MAX_STRING_LENGTH" {
     data[31] = @intCast(offset);
 
     // String length
-    @memset(data[offset..offset + 32], 0);
+    @memset(data[offset .. offset + 32], 0);
     data[offset + 28] = @intCast((length >> 24) & 0xFF);
     data[offset + 29] = @intCast((length >> 16) & 0xFF);
     data[offset + 30] = @intCast((length >> 8) & 0xFF);
     data[offset + 31] = @intCast(length & 0xFF);
 
     // String data (fill with 'a')
-    @memset(data[offset + 32..], 'a');
+    @memset(data[offset + 32 ..], 'a');
 
     const result = try ABI.decodeString(allocator, data, 0);
     defer allocator.free(result);
