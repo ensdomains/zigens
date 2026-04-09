@@ -63,7 +63,7 @@ pub const Indexer = struct {
             allocator.destroy(http_client);
         }
 
-        const v1_client = try rpc.Client.initWithSharedHttpClient(allocator, cfg.v1_rpc_url, http_client);
+        const v1_client = try rpc.Client.initWithSharedHttpClient(allocator, cfg.rpc_url, http_client);
         errdefer v1_client.deinit();
 
         var webhook_manager: ?*webhooks.WebhookManager = null;
@@ -131,7 +131,7 @@ pub const Indexer = struct {
             .rate_limiter = RateLimiter.init(cfg.rate_limit_per_second, cfg.rate_limit_per_second),
             .blocks_since_checkpoint = 0,
             .initial_sync_complete = std.atomic.Value(bool).init(false),
-            .v1_network_health = NetworkHealth.init(allocator, cfg.v1_rpc_url, 3000),
+            .v1_network_health = NetworkHealth.init(allocator, cfg.rpc_url, 3000),
             .end_block = end_block,
             .indexer_status = indexer_status,
             .status_server = status_server,
@@ -151,7 +151,7 @@ pub const Indexer = struct {
             allocator.destroy(http_client);
         }
 
-        const client = try rpc.Client.initWithSharedHttpClient(allocator, cfg.v1_rpc_url, http_client);
+        const client = try rpc.Client.initWithSharedHttpClient(allocator, cfg.rpc_url, http_client);
         errdefer client.deinit();
 
         var webhook_manager: ?*webhooks.WebhookManager = null;
@@ -220,7 +220,7 @@ pub const Indexer = struct {
             .rate_limiter = RateLimiter.init(cfg.rate_limit_per_second, cfg.rate_limit_per_second),
             .blocks_since_checkpoint = 0,
             .initial_sync_complete = std.atomic.Value(bool).init(false),
-            .v1_network_health = NetworkHealth.init(allocator, cfg.v1_rpc_url, 3000),
+            .v1_network_health = NetworkHealth.init(allocator, cfg.rpc_url, 3000),
             .end_block = end_block,
             .indexer_status = indexer_status,
             .status_server = status_server,

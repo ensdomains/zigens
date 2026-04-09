@@ -4,7 +4,7 @@ const contracts = @import("contracts.zig");
 
 pub const Config = struct {
     allocator: std.mem.Allocator,
-    v1_rpc_url: []const u8,
+    rpc_url: []const u8,
     database_path: []const u8,
     network: contracts.Network,
     start_block: u64,
@@ -40,7 +40,7 @@ pub const Config = struct {
 
         return Config{
             .allocator = allocator,
-            .v1_rpc_url = try allocator.dupe(u8, env_mod.getEnv(&env_map, "V1_RPC_URL", "http://localhost:8545")),
+            .rpc_url = try allocator.dupe(u8, env_mod.getEnv(&env_map, "RPC_URL", "http://localhost:8545")),
             .database_path = try allocator.dupe(u8, env_mod.getEnv(&env_map, "DATABASE_PATH", "./data/ens.db")),
             .network = network,
             .v1_contracts = v1_contract_addrs,
@@ -96,7 +96,7 @@ pub const Config = struct {
     }
 
     pub fn deinit(self: *Config) void {
-        self.allocator.free(self.v1_rpc_url);
+        self.allocator.free(self.rpc_url);
         self.allocator.free(self.database_path);
         self.allocator.free(self.webhook_db_path);
         if (self.webhook_admin_username) |user| {

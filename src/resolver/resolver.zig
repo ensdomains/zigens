@@ -268,7 +268,7 @@ test "Resolver init" {
 
     const cfg = config.Config{
         .allocator = allocator,
-        .v1_rpc_url = "http://localhost:8545",
+        .rpc_url = "http://localhost:8545",
         .database_path = ":memory:",
         .network = .sepolia,
         .start_block = 0,
