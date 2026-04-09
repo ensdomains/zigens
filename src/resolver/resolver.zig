@@ -270,8 +270,7 @@ test "Resolver init" {
         .allocator = allocator,
         .v1_rpc_url = "http://localhost:8545",
         .database_path = ":memory:",
-        .network_v1 = .sepolia,
-        .network_v2 = .sepolia,
+        .network = .sepolia,
         .start_block = 0,
         .end_block = null,
         .poll_interval = 12,
@@ -290,8 +289,6 @@ test "Resolver init" {
         .metrics_enabled = false,
         .v1_contracts = test_contracts,
         .v2_contracts = test_contracts,
-        .network = .sepolia,
-        .contracts = test_contracts,
     };
 
     const resolver = Resolver.init(allocator, &database, l1_client, l2_client, cfg);

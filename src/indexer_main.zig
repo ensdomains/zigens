@@ -108,10 +108,8 @@ pub fn main() !void {
     defer cfg.deinit();
 
     std.log.info("ENSv2 Indexer starting...", .{});
-    std.log.info("V1 Network: {s}", .{cfg.network_v1.toString()});
-    std.log.info("V2 Network: {s}", .{cfg.network_v2.toString()});
-    std.log.info("V1 RPC: [CONFIGURED]", .{});
-    std.log.info("V2 RPC: [CONFIGURED]", .{});
+    std.log.info("Network: {s}", .{cfg.network.toString()});
+    std.log.info("RPC: [CONFIGURED]", .{});
     std.log.info("Start block: {d}", .{cfg.start_block});
     std.log.info("Batch size: {d}", .{cfg.batch_size});
     std.log.info("Rate limit: {d} req/s", .{cfg.rate_limit_per_second});

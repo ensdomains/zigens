@@ -27,9 +27,9 @@ pub fn main() !void {
     var cfg = try config.Config.fromEnv(allocator);
     defer cfg.deinit();
 
-    std.log.info("ENSv2 V2 Indexer starting...", .{});
-    std.log.info("V2 Network: {s}", .{cfg.network_v2.toString()});
-    std.log.info("V2 RPC: [CONFIGURED]", .{});
+    std.log.info("ENSv2 Indexer starting...", .{});
+    std.log.info("Network: {s}", .{cfg.network.toString()});
+    std.log.info("RPC: [CONFIGURED]", .{});
     std.log.info("V2 Deployment block: {d}", .{cfg.v2_contracts.l2_deployment_block});
     std.log.info("Batch size: {d}", .{cfg.batch_size});
     std.log.info("Rate limit: {d} req/s", .{cfg.rate_limit_per_second});

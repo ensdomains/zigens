@@ -6,8 +6,7 @@ pub const Config = struct {
     allocator: std.mem.Allocator,
     v1_rpc_url: []const u8,
     database_path: []const u8,
-    network_v1: contracts.Network,
-    network_v2: contracts.Network,
+    network: contracts.Network,
     start_block: u64,
     end_block: ?u64, // null means index continuously
     poll_interval: u64,
@@ -30,41 +29,23 @@ pub const Config = struct {
     v1_contracts: contracts.ContractAddresses,
     v2_contracts: contracts.ContractAddresses,
 
-    // Deprecated: kept for backwards compatibility with single-network mode
-    network: contracts.Network,
-    contracts: contracts.ContractAddresses,
-
     pub fn fromEnv(allocator: std.mem.Allocator) !Config {
         var env_map = try env_mod.loadEnv(allocator, ".env");
         defer env_mod.deinitEnv(&env_map);
 
-        // Support dual-network configuration: NETWORK_V1 and NETWORK_V2
-        // Falls back to single NETWORK for backwards compatibility
-        const network_v1 = contracts.Network.fromString(env_mod.getEnv(&env_map, "NETWORK_V1", env_mod.getEnv(&env_map, "NETWORK", "sepolia"))) catch .sepolia;
+        const network = contracts.Network.fromString(env_mod.getEnv(&env_map, "NETWORK", "sepolia")) catch .sepolia;
 
-        const network_v2 = contracts.Network.fromString(env_mod.getEnv(&env_map, "NETWORK_V2", env_mod.getEnv(&env_map, "NETWORK", "sepolia"))) catch .sepolia;
-
-        const v1_contract_addrs = try contracts.getContractAddresses(network_v1);
-        const v2_contract_addrs = try contracts.getContractAddresses(network_v2);
-
-        // Use V1 contract deployment blocks as default start if START_BLOCK not specified
-        const default_start = v1_contract_addrs.v1_deployment_block;
-
-        // Backwards compatibility: use V1 network as primary
-        const network = network_v1;
-        const contract_addrs = v1_contract_addrs;
+        const v1_contract_addrs = try contracts.getContractAddresses(network);
+        const v2_contract_addrs = try contracts.getContractAddresses(network);
 
         return Config{
             .allocator = allocator,
             .v1_rpc_url = try allocator.dupe(u8, env_mod.getEnv(&env_map, "V1_RPC_URL", "http://localhost:8545")),
             .database_path = try allocator.dupe(u8, env_mod.getEnv(&env_map, "DATABASE_PATH", "./data/ens.db")),
-            .network_v1 = network_v1,
-            .network_v2 = network_v2,
+            .network = network,
             .v1_contracts = v1_contract_addrs,
             .v2_contracts = v2_contract_addrs,
-            .network = network,
-            .contracts = contract_addrs,
-            .start_block = env_mod.getEnvInt(&env_map, u64, "START_BLOCK", default_start),
+            .start_block = env_mod.getEnvInt(&env_map, u64, "START_BLOCK", v1_contract_addrs.v1_deployment_block),
             .end_block = blk: {
                 const end_str = env_mod.getEnv(&env_map, "END_BLOCK", "");
                 if (end_str.len == 0) {
