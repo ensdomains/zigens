@@ -17,7 +17,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Combined indexer executable (both L1 and L2 in one process)
+    // Combined indexer executable (both V1 and V2 in one process)
     const indexer_exe = b.addExecutable(.{
         .name = "ensv2-indexer",
         .root_module = b.createModule(.{

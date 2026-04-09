@@ -124,17 +124,17 @@ if (total_events > TARGET * 2) {
 
 Watch for chunk size changes in logs:
 ```bash
-tail -f logs/indexer-l1.log | grep "chunk_size="
+tail -f logs/indexer-v1.log | grep "chunk_size="
 ```
 
 High-density warnings indicate automatic downscaling:
 ```bash
-tail -f logs/indexer-l1.log | grep "High event density"
+tail -f logs/indexer-v1.log | grep "High event density"
 ```
 
 Watch for retry events (should be rare):
 ```bash
-tail -f logs/indexer-l1.log | grep "🔄"
+tail -f logs/indexer-v1.log | grep "🔄"
 ```
 
 Typical retry output:

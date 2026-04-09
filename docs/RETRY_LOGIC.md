@@ -122,10 +122,10 @@ Chunk: 100 blocks (9412127-9412226) → 10159 events ✅
 
 ```bash
 # See when retries occur
-tail -f logs/indexer-l1.log | grep "🔄"
+tail -f logs/indexer-v1.log | grep "🔄"
 
 # Count retry frequency
-grep "🔄" logs/indexer-l1.log | wc -l
+grep "🔄" logs/indexer-v1.log | wc -l
 ```
 
 ### Typical Output

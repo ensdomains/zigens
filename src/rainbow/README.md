@@ -246,7 +246,7 @@ The rainbow table is automatically detected and used by the indexer if present:
 ./scripts/build_rainbow.sh
 
 # Run indexer (will auto-detect rainbow table)
-./zig-out/bin/ensv2-indexer-l1 --from-block 9456489 --to-block 9457489
+./zig-out/bin/ensv2-indexer-v1 --from-block 9456489 --to-block 9457489
 ```
 
 Expected output:

@@ -3,9 +3,9 @@
 ## Overview
 
 The ENSv2 Indexer now runs as **separate processes** for production reliability:
-- **ensv2-indexer-l1**: Indexes L1 blockchain events (RECOMMENDED)
-- **ensv2-indexer-l2**: Indexes L2 blockchain events (RECOMMENDED)
-- **ensv2-indexer**: Combined L1+L2 indexer (legacy, may have connection issues)
+- **ensv2-indexer-v1**: Indexes V1 (legacy ENS) events
+- **ensv2-indexer-v2**: Indexes V2 (new ENS) events
+- **ensv2-indexer**: Combined V1+V2 indexer
 - **ensv2-api**: Serves GraphQL and REST APIs to query indexed data
 
 **Why separate processes?**
@@ -23,9 +23,9 @@ zig build
 ```
 
 This creates:
-- `zig-out/bin/ensv2-indexer-l1` - L1 indexer (separate process)
-- `zig-out/bin/ensv2-indexer-l2` - L2 indexer (separate process)
-- `zig-out/bin/ensv2-indexer` - Combined indexer (legacy)
+- `zig-out/bin/ensv2-indexer-v1` - V1 indexer (separate process)
+- `zig-out/bin/ensv2-indexer-v2` - V2 indexer (separate process)
+- `zig-out/bin/ensv2-indexer` - Combined indexer
 - `zig-out/bin/ensv2-api` - The API server
 
 ### 2. Configure Environment
@@ -33,9 +33,8 @@ This creates:
 Edit `.env` file with your RPC URLs:
 
 ```bash
-# RPC Configuration (REQUIRED - add your API keys)
-L1_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_API_KEY
-L2_RPC_URL=https://arb-sepolia.g.alchemy.com/v2/YOUR_API_KEY
+# RPC Configuration (REQUIRED - add your API key)
+RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_API_KEY
 
 # Indexing Configuration
 NETWORK=sepolia
@@ -57,22 +56,21 @@ CHECKPOINT_INTERVAL=100
 
 ### 3. Run the Indexers (Recommended: Separate Processes)
 
-**Terminal 1 - L1 Indexer:**
+**Terminal 1 - V1 Indexer:**
 ```bash
-./zig-out/bin/ensv2-indexer-l1
+./zig-out/bin/ensv2-indexer-v1
 ```
 
-**Terminal 2 - L2 Indexer:**
+**Terminal 2 - V2 Indexer:**
 ```bash
-./zig-out/bin/ensv2-indexer-l2
+./zig-out/bin/ensv2-indexer-v2
 ```
 
 **Expected Output:**
 ```
 info: ENSv2 Indexer starting...
 info: Network: sepolia
-info: L1 RPC: [CONFIGURED]
-info: L2 RPC: [CONFIGURED]
+info: RPC: [CONFIGURED]
 info: Start block: 6800000
 info: Batch size: 10
 info: Database initialized at: ./data/ens.db

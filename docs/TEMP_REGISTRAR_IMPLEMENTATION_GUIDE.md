@@ -167,7 +167,7 @@ if (to_block >= V1_MIGRATION_BLOCK) {
    ```bash
    zig build
    rm -f ./data/*.db*
-   ./zig-out/bin/ensv2-indexer-l1 --from-block 3327417 --to-block 3327500
+   ./zig-out/bin/ensv2-indexer-v1 --from-block 3327417 --to-block 3327500
    ```
 
 2. **Verify Schema Loaded**:
@@ -190,7 +190,7 @@ if (to_block >= V1_MIGRATION_BLOCK) {
 
 4. **Test V1 Migration Boundary**:
    ```bash
-   ./zig-out/bin/ensv2-indexer-l1 --from-block 9380400 --to-block 9380420
+   ./zig-out/bin/ensv2-indexer-v1 --from-block 9380400 --to-block 9380420
    ```
    Should index temp registrar events before 9380410, then switch to V1 events after.
 

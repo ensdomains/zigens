@@ -198,11 +198,11 @@ test "Chain type conversion" {
     const l1 = models.Chain.v1;
     const l2 = models.Chain.v2;
 
-    try testing.expectEqualStrings("l1", l1.toString());
-    try testing.expectEqualStrings("l2", l2.toString());
+    try testing.expectEqualStrings("v1", l1.toString());
+    try testing.expectEqualStrings("v2", l2.toString());
 
-    const l1_parsed = try models.Chain.fromString("l1");
-    const l2_parsed = try models.Chain.fromString("l2");
+    const l1_parsed = try models.Chain.fromString("v1");
+    const l2_parsed = try models.Chain.fromString("v2");
 
     try testing.expect(l1_parsed == .v1);
     try testing.expect(l2_parsed == .v2);

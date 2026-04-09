@@ -55,7 +55,7 @@ pub const Indexer = struct {
     rainbow: ?Rainbow = null,
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.Config, database: *db.Database, end_block: ?u64) !Indexer {
-        // Create ONE shared HTTP client for both L1 and L2
+        // Create ONE shared HTTP client
         const http_client = try allocator.create(std.http.Client);
         http_client.* = std.http.Client{ .allocator = allocator };
         errdefer {
@@ -959,7 +959,7 @@ pub const Indexer = struct {
             try self.indexAllV1Events(chain, client, from_block, to_block);
         }
 
-        // === V2 EVENTS (ENS V2 - L1 and L2) ===
+        // === V2 EVENTS (ENS V2) ===
         // Only index V2 events if V2 is deployed and the block range includes deployment block or later
         const should_index_v2 = (v2_deployment > 0) and (to_block >= v2_deployment);
 

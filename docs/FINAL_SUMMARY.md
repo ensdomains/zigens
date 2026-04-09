@@ -119,10 +119,10 @@ events_per_block = (0.7 × events_per_block) + (0.3 × actual_density);
 
 ```bash
 # Watch predictions in real-time
-tail -f logs/indexer-l1.log | grep "predicted_density="
+tail -f logs/indexer-v1.log | grep "predicted_density="
 
 # See learning in action
-tail -f logs/indexer-l1.log | grep "⚠️"
+tail -f logs/indexer-v1.log | grep "⚠️"
 ```
 
 Example output:
