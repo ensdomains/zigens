@@ -30,7 +30,6 @@ pub const Indexer = struct {
     config: config.Config,
     database: *db.Database,
     v1_client: *rpc.Client,
-    v2_client: *rpc.Client,
     shared_http_client: *std.http.Client,
     webhook_manager: ?*webhooks.WebhookManager,
     should_stop: std.atomic.Value(bool),
@@ -38,7 +37,6 @@ pub const Indexer = struct {
     blocks_since_checkpoint: u64,
     initial_sync_complete: std.atomic.Value(bool),
     v1_network_health: NetworkHealth,
-    v2_network_health: NetworkHealth,
     end_block: ?u64,
     indexer_status: ?*IndexerStatus,
     status_server: ?*status_mod.StatusServer,
@@ -67,9 +65,6 @@ pub const Indexer = struct {
 
         const v1_client = try rpc.Client.initWithSharedHttpClient(allocator, cfg.v1_rpc_url, http_client);
         errdefer v1_client.deinit();
-
-        const v2_client = try rpc.Client.initWithSharedHttpClient(allocator, cfg.v2_rpc_url, http_client);
-        errdefer v2_client.deinit();
 
         var webhook_manager: ?*webhooks.WebhookManager = null;
         if (cfg.webhooks_enabled) {
@@ -130,15 +125,13 @@ pub const Indexer = struct {
             .config = cfg,
             .database = database,
             .v1_client = v1_client,
-            .v2_client = v2_client,
             .shared_http_client = http_client,
             .webhook_manager = webhook_manager,
             .should_stop = std.atomic.Value(bool).init(false),
             .rate_limiter = RateLimiter.init(cfg.rate_limit_per_second, cfg.rate_limit_per_second),
             .blocks_since_checkpoint = 0,
             .initial_sync_complete = std.atomic.Value(bool).init(false),
-            .v1_network_health = NetworkHealth.init(allocator, cfg.v1_rpc_url, 3000), // Check every 3s
-            .v2_network_health = NetworkHealth.init(allocator, cfg.v2_rpc_url, 3000),
+            .v1_network_health = NetworkHealth.init(allocator, cfg.v1_rpc_url, 3000),
             .end_block = end_block,
             .indexer_status = indexer_status,
             .status_server = status_server,
@@ -158,8 +151,7 @@ pub const Indexer = struct {
             allocator.destroy(http_client);
         }
 
-        const rpc_url = if (chain == .v1) cfg.v1_rpc_url else cfg.v2_rpc_url;
-        const client = try rpc.Client.initWithSharedHttpClient(allocator, rpc_url, http_client);
+        const client = try rpc.Client.initWithSharedHttpClient(allocator, cfg.v1_rpc_url, http_client);
         errdefer client.deinit();
 
         var webhook_manager: ?*webhooks.WebhookManager = null;
@@ -222,15 +214,13 @@ pub const Indexer = struct {
             .config = cfg,
             .database = database,
             .v1_client = client,
-            .v2_client = client, // Same client - only one will be used
             .shared_http_client = http_client,
             .webhook_manager = webhook_manager,
             .should_stop = std.atomic.Value(bool).init(false),
             .rate_limiter = RateLimiter.init(cfg.rate_limit_per_second, cfg.rate_limit_per_second),
             .blocks_since_checkpoint = 0,
             .initial_sync_complete = std.atomic.Value(bool).init(false),
-            .v1_network_health = NetworkHealth.init(allocator, rpc_url, 3000),
-            .v2_network_health = NetworkHealth.init(allocator, rpc_url, 3000), // Same for single chain
+            .v1_network_health = NetworkHealth.init(allocator, cfg.v1_rpc_url, 3000),
             .end_block = end_block,
             .indexer_status = indexer_status,
             .status_server = status_server,
@@ -256,12 +246,7 @@ pub const Indexer = struct {
             self.allocator.destroy(status);
         }
 
-        // Only deinit v1_client - in single-chain mode, both pointers are the same
         self.v1_client.deinit();
-        // Only deinit v2_client if it's a different pointer
-        if (self.v1_client != self.v2_client) {
-            self.v2_client.deinit();
-        }
         self.shared_http_client.deinit();
         self.allocator.destroy(self.shared_http_client);
         if (self.webhook_manager) |wm| {
@@ -431,7 +416,8 @@ pub const Indexer = struct {
     }
 
     pub inline fn getClient(self: *Indexer, chain: models.Chain) *rpc.Client {
-        return if (chain == .v1) self.v1_client else self.v2_client;
+        _ = chain;
+        return self.v1_client;
     }
 
     // Generic event indexing abstraction
@@ -682,7 +668,7 @@ pub const Indexer = struct {
             try self.indexChain(.v1, self.v1_client);
 
             // Then index V2
-            try self.indexChain(.v2, self.v2_client);
+            try self.indexChain(.v2, self.v1_client);
 
             // After first successful sync of both chains, recreate indexes and start webhook workers
             if (!self.initial_sync_complete.load(.acquire)) {
@@ -713,7 +699,7 @@ pub const Indexer = struct {
         std.log.info("Single-chain indexer starting for {s}...", .{chain.toString()});
 
         const client = self.getClient(chain);
-        var network_health = if (chain == .v1) &self.v1_network_health else &self.v2_network_health;
+        var network_health = &self.v1_network_health;
 
         // Drop non-essential indexes for faster bulk inserts during initial sync
         if (!self.initial_sync_complete.load(.acquire)) {
