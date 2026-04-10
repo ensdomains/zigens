@@ -46,6 +46,12 @@ fn getCanonicalRegistryAddresses(allocator: std.mem.Allocator) ![][]const u8 {
         try addresses.append(allocator, hex);
     }
 
+    // V2 Sepolia L2 ETH Registrar (emits NameRegistered for .eth 2LDs)
+    if (!sepolia.l2_eth_registrar.isZero()) {
+        const hex = try sepolia.l2_eth_registrar.toHex(allocator);
+        try addresses.append(allocator, hex);
+    }
+
     // Get addresses from Mainnet
     const mainnet = contracts.getContractAddresses(.mainnet) catch unreachable;
 
@@ -58,6 +64,12 @@ fn getCanonicalRegistryAddresses(allocator: std.mem.Allocator) ![][]const u8 {
     // V2 Mainnet L2 ETH Registry (when deployed)
     if (!mainnet.l2_eth_registry.isZero()) {
         const hex = try mainnet.l2_eth_registry.toHex(allocator);
+        try addresses.append(allocator, hex);
+    }
+
+    // V2 Mainnet L2 ETH Registrar (when deployed)
+    if (!mainnet.l2_eth_registrar.isZero()) {
+        const hex = try mainnet.l2_eth_registrar.toHex(allocator);
         try addresses.append(allocator, hex);
     }
 
@@ -82,22 +94,17 @@ pub const RegistrationFilterOptions = struct {
 /// canonical registries (base_registrar for V1, l2_eth_registry for V2).
 /// This prevents duplicates from non-authoritative contracts like FastTestETHRegistrar.
 pub fn getRegistrations(database: *Database, filter: RegistrationFilterOptions) ![]models.Event {
-    const allocator = database.allocator;
+    // Both V1 (name_registered) and V2 (label_registered) events represent registrations.
+    // V2 LabelRegistered events come from dynamically discovered subregistries,
+    // so we cannot filter by a static canonical address list.
+    const registration_event_types = [_][]const u8{
+        models.EventType.name_registered.toString(),
+        models.EventType.label_registered.toString(),
+    };
 
-    // Get canonical registry addresses from contracts.zig
-    const canonical_addresses = try getCanonicalRegistryAddresses(allocator);
-    defer {
-        for (canonical_addresses) |addr| {
-            allocator.free(addr);
-        }
-        allocator.free(canonical_addresses);
-    }
-
-    // Build event filter options
     const event_filter = events.EventFilterOptions{
-        .event_type = models.EventType.name_registered.toString(),
+        .event_types = &registration_event_types,
         .chain = filter.chain,
-        .contract_addresses = if (canonical_addresses.len > 0) canonical_addresses else null,
         .data_json_owner = filter.registrant,
         .data_json_owners = filter.registrant_in,
         .limit = filter.limit,
@@ -219,41 +226,14 @@ fn getRegistrationCountFromNames(database: *Database, filter: RegistrationFilter
 }
 
 /// Count registrations using the events table (for unfiltered counts).
-/// Uses event_type index to find NameRegistered events, then checks contract_address.
+/// Counts both V1 (name_registered) and V2 (label_registered) events.
 fn getRegistrationCountFromEvents(database: *Database, filter: RegistrationFilterOptions) !usize {
-    const allocator = database.allocator;
-    const canonical_addresses = try getCanonicalRegistryAddresses(allocator);
-    defer {
-        for (canonical_addresses) |addr| {
-            allocator.free(addr);
-        }
-        allocator.free(canonical_addresses);
-    }
-
     var sql_buf: [1024]u8 = undefined;
     var sql_len: usize = 0;
 
-    const base = "SELECT COUNT(*) FROM events WHERE event_type = ?";
+    const base = "SELECT COUNT(*) FROM events WHERE event_type IN (?, ?)";
     @memcpy(sql_buf[sql_len..][0..base.len], base);
     sql_len += base.len;
-
-    if (canonical_addresses.len > 0) {
-        const and_in = " AND contract_address IN (";
-        @memcpy(sql_buf[sql_len..][0..and_in.len], and_in);
-        sql_len += and_in.len;
-
-        for (canonical_addresses, 0..) |_, i| {
-            if (i > 0) {
-                sql_buf[sql_len] = ',';
-                sql_len += 1;
-            }
-            sql_buf[sql_len] = '?';
-            sql_len += 1;
-        }
-
-        sql_buf[sql_len] = ')';
-        sql_len += 1;
-    }
 
     if (filter.chain != null) {
         const cond = " AND chain = ?";
@@ -285,9 +265,7 @@ fn getRegistrationCountFromEvents(database: *Database, filter: RegistrationFilte
     defer q.deinit();
 
     try q.bindTextStatic(models.EventType.name_registered.toString());
-    for (canonical_addresses) |addr| {
-        try q.bindText(addr);
-    }
+    try q.bindTextStatic(models.EventType.label_registered.toString());
     if (filter.chain) |ch| {
         try q.bindTextStatic(ch.toString());
     }
