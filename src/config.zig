@@ -40,7 +40,7 @@ pub const Config = struct {
 
         return Config{
             .allocator = allocator,
-            .rpc_url = try allocator.dupe(u8, env_mod.getEnv(&env_map, "L2_RPC_URL", "http://localhost:8545")),
+            .rpc_url = try allocator.dupe(u8, env_mod.getEnv(&env_map, "RPC_URL", "http://localhost:8545")),
             .database_path = try allocator.dupe(u8, env_mod.getEnv(&env_map, "DATABASE_PATH", "./data/ens.db")),
             .network = network,
             .v1_contracts = v1_contract_addrs,
