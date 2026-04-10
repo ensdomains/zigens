@@ -70,6 +70,17 @@ build_rainbow() {
     echo ""
 }
 
+# Rainbow table is only used by V1 (L1) indexing for labelhash resolution.
+# Skip download when running the L2-only indexer to save ~6GB and 10-20 min.
+case "$1" in
+    */ensv2-indexer-l2)
+        if [ "$DOWNLOAD_RAINBOW" = "true" ]; then
+            echo "Running L2-only indexer — skipping rainbow table download (not needed for V2)"
+            DOWNLOAD_RAINBOW=false
+        fi
+        ;;
+esac
+
 # Check if rainbow table needs to be downloaded
 if [ "$DOWNLOAD_RAINBOW" = "true" ] && [ ! -f "$RAINBOW_DB" ]; then
     echo "Rainbow table not found at $RAINBOW_DB"

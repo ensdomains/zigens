@@ -407,6 +407,10 @@ pub fn indexAllV1Events(self: *Indexer, chain: models.Chain, client: *rpc.Client
             }
             const base_elapsed = std.time.milliTimestamp() - base_timer;
 
+            // Flush write buffer so Registry event handlers can look up names
+            // created by BaseRegistrar (e.g., subname parent lookups in handleV1NewOwner)
+            try self.write_buffer.flush(self.database);
+
             // 3. ENS Registry events
             const registry_timer = std.time.milliTimestamp();
             const registry_logs = batch_results[2];

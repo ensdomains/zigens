@@ -13,6 +13,7 @@ const names_storage = @import("../storage/names.zig");
 const v1_names = @import("../utils/v1_names.zig");
 const Indexer = @import("indexer.zig").Indexer;
 const utils = @import("utils.zig");
+const v1_handlers = @import("v1/handlers.zig");
 
 const Keccak256 = std.crypto.hash.sha3.Keccak256;
 
@@ -213,6 +214,11 @@ pub fn replayEventsToRebuildNames(self: *Indexer) !void {
         std.log.warn("backfillMissingEth2LDNames failed: {}", .{err});
     };
 
+    // 7d: Reconcile orphaned subnames (parent_name="" from fallback during sync)
+    backfill_mod.reconcileOrphanedSubnames(self) catch |err| {
+        std.log.warn("reconcileOrphanedSubnames failed: {}", .{err});
+    };
+
     // ── Summary ──
     const name_count = blk: {
         var ncq = try Query.init(database, "SELECT COUNT(*) FROM names");
@@ -385,12 +391,16 @@ fn replayNewOwner(self: *Indexer, q: *Query) !void {
     var parent_name_str: ?[]const u8 = null;
     var parent_record_to_free: ?models.Name = null;
     defer if (parent_record_to_free) |*pr| pr.deinit(self.allocator);
+    const is_tld = parent_node.eql(constants.WellKnown.root_namehash);
 
-    if (parent_node.eql(constants.WellKnown.root_namehash)) {
+    if (is_tld) {
         parent_name_str = null;
     } else if (try names_storage.getNameByNamehash(self.database, parent_node)) |parent_record| {
         parent_record_to_free = parent_record;
         parent_name_str = parent_record.name;
+    } else if (try v1_handlers.promotePreMigrationParent(self, .l1, parent_node, parent_hex, block_number)) |promoted| {
+        parent_record_to_free = promoted;
+        parent_name_str = promoted.name;
     }
 
     // Construct full name
@@ -410,7 +420,11 @@ fn replayNewOwner(self: *Indexer, q: *Query) !void {
 
         const name_copy = try self.allocator.dupe(u8, full_name);
         const label_copy = try self.allocator.dupe(u8, label_str);
-        const parent_copy = if (parent_name_str) |pn| try self.allocator.dupe(u8, pn) else null;
+        // For TLDs or unknown parents, use "" as fallback to satisfy NOT NULL
+        const parent_copy = if (parent_name_str) |pn|
+            try self.allocator.dupe(u8, pn)
+        else
+            try self.allocator.dupe(u8, "");
 
         var name = models.Name{
             .chain = .l1,

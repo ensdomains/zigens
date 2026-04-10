@@ -128,21 +128,35 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
         const existing_name = names_storage.getNameByNamehash(self.database, namehash) catch null;
 
         if (existing_name) |existing| {
-            // Free the existing name record (we only needed to check existence)
             var existing_copy = existing;
-            existing_copy.deinit(self.allocator);
-            // Name exists from V1 events - only update creation date if ours is earlier
-            names_storage.updateNameCreationDateIfEarlier(
-                self.database,
-                namehash,
-                @intCast(block_number),
-                @intCast(created_at),
-            ) catch |err| {
-                std.log.warn("Failed to update creation date for {s}: {}", .{ full_name, err });
-                name.deinit(self.allocator);
-                continue;
-            };
-            std.log.debug("Updated creation date for existing name: {s}", .{full_name});
+            defer existing_copy.deinit(self.allocator);
+
+            // If existing record has a placeholder label ([labelhash]), replace it entirely
+            const has_placeholder = existing_copy.label != null and
+                existing_copy.label.?.len > 0 and existing_copy.label.?[0] == '[';
+
+            if (has_placeholder) {
+                // UPSERT to replace placeholder with real name/label
+                names_storage.insertName(self.database, name) catch |err| {
+                    std.log.warn("Failed to update placeholder name {s}: {}", .{ full_name, err });
+                    name.deinit(self.allocator);
+                    continue;
+                };
+                std.log.debug("Healed placeholder name: {s}", .{full_name});
+            } else {
+                // Name exists with real label — only update creation date if ours is earlier
+                names_storage.updateNameCreationDateIfEarlier(
+                    self.database,
+                    namehash,
+                    @intCast(block_number),
+                    @intCast(created_at),
+                ) catch |err| {
+                    std.log.warn("Failed to update creation date for {s}: {}", .{ full_name, err });
+                    name.deinit(self.allocator);
+                    continue;
+                };
+                std.log.debug("Updated creation date for existing name: {s}", .{full_name});
+            }
         } else {
             // Name doesn't exist - create it
             names_storage.insertName(self.database, name) catch |err| {
@@ -377,6 +391,64 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
         mq.bindInt64(std.time.timestamp()) catch break :mark;
         mq.bindInt64(@intCast(created_count)) catch break :mark;
         mq.exec() catch {};
+    }
+}
+
+/// Reconcile orphaned subnames: during sync, some subnames are created with parent_name = ""
+/// because their parent wasn't in the names table yet. Now that sync + backfills are complete,
+/// we can look up the parent by parent_namehash and fix both parent_name and the full name.
+pub fn reconcileOrphanedSubnames(self: *Indexer) !void {
+    const root_hex = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+    // Count orphaned records first
+    var count_q = try Query.init(self.database,
+        \\SELECT COUNT(*) FROM names
+        \\WHERE parent_name = '' AND parent_namehash != ?
+    );
+    defer count_q.deinit();
+    try count_q.bindTextStatic(root_hex);
+
+    var orphan_count: i64 = 0;
+    if (try count_q.step()) {
+        orphan_count = count_q.getInt64(0);
+    }
+
+    if (orphan_count == 0) {
+        std.log.info("No orphaned subnames to reconcile", .{});
+        return;
+    }
+
+    std.log.info("Reconciling {d} orphaned subnames...", .{orphan_count});
+
+    // Single SQL UPDATE: fix parent_name and reconstruct full name from label + parent's name
+    var update_q = try Query.init(self.database,
+        \\UPDATE names
+        \\SET parent_name = (SELECT p.name FROM names p WHERE p.namehash = names.parent_namehash AND p.chain = names.chain),
+        \\    name = names.label || '.' || (SELECT p.name FROM names p WHERE p.namehash = names.parent_namehash AND p.chain = names.chain)
+        \\WHERE parent_name = '' AND parent_namehash != ?
+        \\  AND EXISTS (SELECT 1 FROM names p WHERE p.namehash = names.parent_namehash AND p.chain = names.chain AND p.name IS NOT NULL AND p.name != '')
+    );
+    defer update_q.deinit();
+    try update_q.bindTextStatic(root_hex);
+    try update_q.exec();
+
+    // Count remaining orphans (parents still not found)
+    var remain_q = try Query.init(self.database,
+        \\SELECT COUNT(*) FROM names
+        \\WHERE parent_name = '' AND parent_namehash != ?
+    );
+    defer remain_q.deinit();
+    try remain_q.bindTextStatic(root_hex);
+
+    var remaining: i64 = 0;
+    if (try remain_q.step()) {
+        remaining = remain_q.getInt64(0);
+    }
+
+    const fixed = orphan_count - remaining;
+    std.log.info("Reconciled {d} orphaned subnames", .{fixed});
+    if (remaining > 0) {
+        std.log.warn("{d} orphaned subnames remain (parent not found in names table)", .{remaining});
     }
 }
 

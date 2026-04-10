@@ -139,13 +139,17 @@ pub fn handleV1NewOwner(self: *Indexer, chain: models.Chain, log: rpc.Log) !void
     var parent_name_str: ?[]const u8 = null;
     var parent_record_to_free: ?models.Name = null;
     defer if (parent_record_to_free) |*pr| pr.deinit(self.allocator);
+    const is_tld = parent_node.eql(constants.WellKnown.root_namehash);
 
-    if (parent_node.eql(constants.WellKnown.root_namehash)) {
-        // TLD: parent is root, no suffix needed
+    if (is_tld) {
+        // TLD: parent is root — no suffix needed for name construction
         parent_name_str = null;
     } else if (try names_storage.getNameByNamehash(self.database, parent_node)) |parent_record| {
         parent_record_to_free = parent_record;
         parent_name_str = parent_record.name;
+    } else if (try promotePreMigrationParent(self, chain, parent_node, parent_hex, log.block_number)) |promoted| {
+        parent_record_to_free = promoted;
+        parent_name_str = promoted.name;
     }
 
     // Construct the full name
@@ -170,7 +174,13 @@ pub fn handleV1NewOwner(self: *Indexer, chain: models.Chain, log: rpc.Log) !void
         // Create new name record
         const name_copy = try self.allocator.dupe(u8, full_name);
         const label_copy = try self.allocator.dupe(u8, label_str);
-        const parent_copy = if (parent_name_str) |pn| try self.allocator.dupe(u8, pn) else null;
+        // For TLDs (children of root), parent_name is "" (root's name is the empty string).
+        // For unknown parents (not found in names or temp_pre_migration_names),
+        // use "" as fallback to satisfy NOT NULL and prevent cascading failures.
+        const parent_copy = if (parent_name_str) |pn|
+            try self.allocator.dupe(u8, pn)
+        else
+            try self.allocator.dupe(u8, "");
 
         var name = models.Name{
             .chain = chain,
@@ -205,7 +215,7 @@ pub fn handleV1NewOwner(self: *Indexer, chain: models.Chain, log: rpc.Log) !void
         defer name.deinit(self.allocator);
 
         names_storage.insertName(self.database, name) catch |err| {
-            std.log.warn("Failed to create subdomain name {s}: {}", .{ full_name, err });
+            std.log.warn("Failed to create subdomain name {s} (parent={s}, is_tld={}, block={d}): {}", .{ full_name, parent_hex, is_tld, log.block_number, err });
         };
     }
 
@@ -230,6 +240,135 @@ pub fn handleV1NewOwner(self: *Indexer, chain: models.Chain, log: rpc.Log) !void
     });
 
     try utils.emitEvent(self, chain, log, .transfer, null, subdomain_namehash, event_data);
+}
+
+/// Check if a parent namehash exists in temp_pre_migration_names and if so,
+/// create and return a name record in the names table. This handles the case where
+/// pre-migration .eth 2LDs (registered before the permanent registrar) have subnames
+/// created after the migration block — the parent only exists in temp_pre_migration_names
+/// and hasn't been backfilled to names yet.
+pub fn promotePreMigrationParent(self: *Indexer, chain: models.Chain, parent_node: Hash, parent_hex: []const u8, current_block: u64) !?models.Name {
+    const Query = db.Query;
+    var pm_q = try Query.init(self.database,
+        "SELECT label_hash, parent_node, owner, block_number, created_at FROM temp_pre_migration_names WHERE namehash = ?",
+    );
+    defer pm_q.deinit();
+    try pm_q.bindTextStatic(parent_hex);
+
+    if (!(try pm_q.step())) return null;
+
+    const pm_label_hash_hex = pm_q.getTextSlice(0) orelse return null;
+    const pm_parent_node_hex = pm_q.getTextSlice(1) orelse return null;
+    const pm_owner_hex_str = pm_q.getTextSlice(2) orelse return null;
+    const pm_block: u64 = @intCast(pm_q.getInt64(3));
+    const pm_created = pm_q.getInt64(4);
+
+    // Parse the parent's parent_node to determine the namespace
+    const pm_parent_node = try Hash.fromHex(pm_parent_node_hex);
+
+    // Resolve the parent name from the parent's parent_node
+    var parent_name_resolved: ?[]const u8 = null; // static string, no free
+    var parent_name_from_db: ?[]const u8 = null; // allocated, must free
+    var parent_record_for_name: ?models.Name = null;
+    defer if (parent_record_for_name) |*pr| pr.deinit(self.allocator);
+    defer if (parent_name_from_db) |d| self.allocator.free(d);
+
+    if (pm_parent_node.eql(constants.WellKnown.root_namehash)) {
+        parent_name_resolved = ""; // TLD
+    } else if (pm_parent_node.eql(constants.WellKnown.eth_namehash)) {
+        parent_name_resolved = "eth";
+    } else if (pm_parent_node.eql(constants.WellKnown.reverse_namehash)) {
+        parent_name_resolved = "reverse";
+    } else if (try names_storage.getNameByNamehash(self.database, pm_parent_node)) |parent_rec| {
+        parent_record_for_name = parent_rec;
+        if (parent_rec.name) |pn| {
+            parent_name_from_db = try self.allocator.dupe(u8, pn);
+        }
+    }
+
+    const actual_parent_name = parent_name_resolved orelse parent_name_from_db orelse return null;
+
+    // Parse the label hash
+    const label_hash = try Hash.fromHex(pm_label_hash_hex);
+
+    // Try to resolve the label: cache → rainbow → placeholder
+    var resolved_label: ?[]const u8 = null;
+    var label_is_allocated = false;
+
+    if (try self.getCachedV1Label(pm_label_hash_hex)) |cached| {
+        resolved_label = cached;
+    } else if (self.resolveLabel(label_hash)) |rainbow| {
+        resolved_label = rainbow;
+        label_is_allocated = true;
+    }
+
+    // Build the label string
+    var placeholder_buf: [66]u8 = undefined;
+    const label_str = if (resolved_label) |l| l else blk: {
+        placeholder_buf[0] = '[';
+        const hex_start: usize = if (pm_label_hash_hex.len > 2 and pm_label_hash_hex[0] == '0' and pm_label_hash_hex[1] == 'x') 2 else 0;
+        @memcpy(placeholder_buf[1..65], pm_label_hash_hex[hex_start..][0..64]);
+        placeholder_buf[65] = ']';
+        break :blk placeholder_buf[0..66];
+    };
+    defer if (label_is_allocated) self.allocator.free(resolved_label.?);
+
+    // Build full name: "label.parent" or just "label" for TLDs
+    const full_name = if (actual_parent_name.len > 0)
+        try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, actual_parent_name })
+    else
+        try self.allocator.dupe(u8, label_str);
+    errdefer self.allocator.free(full_name);
+    const label_copy = try self.allocator.dupe(u8, label_str);
+    errdefer self.allocator.free(label_copy);
+    const parent_name_copy = try self.allocator.dupe(u8, actual_parent_name);
+    errdefer self.allocator.free(parent_name_copy);
+    const v1_lh = try self.allocator.dupe(u8, pm_label_hash_hex);
+    errdefer self.allocator.free(v1_lh);
+
+    const pm_owner = try Address.fromHex(pm_owner_hex_str);
+    const registry = try Address.fromHex("00000000000C2E074eC69A0dFb2997BA6C7d2e1e");
+    const token_id = std.mem.readInt(u256, &label_hash.bytes, .big);
+
+    var name = models.Name{
+        .chain = chain,
+        .name = full_name,
+        .namehash = parent_node,
+        .label = label_copy,
+        .label_hash = label_hash,
+        .parent_name = parent_name_copy,
+        .parent_namehash = pm_parent_node,
+        .registry = registry,
+        .owner = pm_owner,
+        .registrant = pm_owner,
+        .resolver = Address.zero,
+        .token_id = token_id,
+        .canonical_id = token_id,
+        .token_version = 0,
+        .expiry = 0,
+        .registry_locked = false,
+        .migrated = false,
+        .ejected = false,
+        .created_block = pm_block,
+        .created_at = pm_created,
+        .registered_at = pm_created,
+        .updated_block = current_block,
+        .updated_at = std.time.timestamp(),
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = true,
+        .v1_label_hash = v1_lh,
+    };
+
+    names_storage.insertName(self.database, name) catch |err| {
+        std.log.warn("Failed to promote pre-migration parent {s}: {}", .{ full_name, err });
+        name.deinit(self.allocator);
+        return null;
+    };
+
+    std.log.info("Promoted pre-migration parent to names: {s}", .{full_name});
+    return name;
 }
 
 /// Handle V1 ENS Registry Transfer event
@@ -294,7 +433,7 @@ pub fn handleV1NewTTL(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
 
     const node = log.topics[1];
     const ttl_u256 = try abi.ABI.decodeUint256(log.data, 0);
-    const ttl: u64 = @intCast(ttl_u256);
+    const ttl: u64 = if (ttl_u256 > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(ttl_u256);
 
     var node_buf: [66]u8 = undefined;
     const node_hex = node.toHexBuf(&node_buf);
@@ -639,17 +778,85 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, chain: models.Chain, 
 
         try utils.emitEvent(self, chain, log, .name_registered, full_name, namehash, event_data);
     } else {
-        // Label not found yet - might come in a later ETH Controller event
-        std.log.warn("V1 BaseRegistrar NameRegistered: tokenID {s} label not found (will store event only)", .{token_id_hex});
+        // Label not found yet — create name record with [labelhash] placeholder so
+        // subnames can find their parent. Backfill will update with the real label later.
+        std.log.debug("V1 BaseRegistrar NameRegistered: tokenID {s} label not found, creating placeholder", .{token_id_hex});
 
-        // Store event without name/namehash
+        const label_hash = blk: {
+            var bytes: [32]u8 = undefined;
+            std.mem.writeInt(u256, &bytes, token_id, .big);
+            break :blk Hash{ .bytes = bytes };
+        };
+
+        // Compute namehash: keccak256(eth_node + labelhash)
+        const eth_node = v1_names.computeEthNamehash("");
+        var nh_input: [64]u8 = undefined;
+        @memcpy(nh_input[0..32], &eth_node.bytes);
+        @memcpy(nh_input[32..64], &label_hash.bytes);
+        var nh_bytes: [32]u8 = undefined;
+        std.crypto.hash.sha3.Keccak256.hash(&nh_input, &nh_bytes, .{});
+        const namehash = Hash{ .bytes = nh_bytes };
+
+        // Build [labelhash] placeholder label
+        var placeholder_label_buf: [66]u8 = undefined;
+        placeholder_label_buf[0] = '[';
+        const lh_hex = label_hash.toHexBuf(&placeholder_label_buf);
+        _ = lh_hex;
+        var lh_buf: [66]u8 = undefined;
+        const lh_hex2 = label_hash.toHexBuf(&lh_buf);
+        @memcpy(placeholder_label_buf[1..65], lh_hex2[2..66]);
+        placeholder_label_buf[65] = ']';
+        const placeholder_label: []const u8 = placeholder_label_buf[0..66];
+
+        const full_name = try std.fmt.allocPrint(self.allocator, "{s}.eth", .{placeholder_label});
+
+        var v1lh_buf: [66]u8 = undefined;
+        const v1_label_hash_hex = label_hash.toHexBuf(&v1lh_buf);
+
+        const name_record = models.Name{
+            .name = full_name,
+            .namehash = namehash,
+            .label = placeholder_label,
+            .label_hash = label_hash,
+            .parent_name = "eth",
+            .parent_namehash = eth_node,
+            .chain = chain,
+            .registry = self.config.l1_contracts.ens_registry,
+            .owner = owner,
+            .registrant = owner,
+            .resolver = Address.zero,
+            .token_id = token_id,
+            .canonical_id = token_id,
+            .token_version = 0,
+            .expiry = @truncate(expires),
+            .registry_locked = false,
+            .migrated = false,
+            .ejected = false,
+            .created_block = log.block_number,
+            .created_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+            .registered_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+            .updated_block = log.block_number,
+            .updated_at = std.time.timestamp(),
+            .is_wrapped = false,
+            .wrapper_fuses = null,
+            .wrapper_expiry = null,
+            .is_v1_name = true,
+            .v1_label_hash = v1_label_hash_hex,
+        };
+
+        if (self.write_buffer.active) {
+            try self.write_buffer.insertName(name_record);
+        } else {
+            try names_storage.insertName(self.database, name_record);
+        }
+
         const event_data = try std.fmt.allocPrint(self.allocator, "{{\"id\":\"{s}\",\"owner\":\"{s}\",\"expires\":{d}}}", .{
             token_id_hex,
             owner_hex,
             expires,
         });
 
-        try utils.emitEvent(self, chain, log, .name_registered, null, null, event_data);
+        try utils.emitEvent(self, chain, log, .name_registered, full_name, namehash, event_data);
     }
 }
 

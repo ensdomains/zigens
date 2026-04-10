@@ -695,6 +695,28 @@ pub const Indexer = struct {
                     std.log.info("Initial sync complete - starting 8 webhook workers", .{});
                     try wm.startWorkers(8);
                 }
+
+                // Run L1 backfills (same as startSingleChain's L1 path)
+                std.log.info("Running pre-migration names backfill...", .{});
+                self.backfillPreMigrationNames() catch |err| {
+                    std.log.err("Failed to backfill pre-migration names: {}", .{err});
+                };
+
+                std.log.info("Running unknown labels backfill...", .{});
+                self.backfillUnknownLabels() catch |err| {
+                    std.log.err("Failed to backfill unknown labels: {}", .{err});
+                };
+
+                std.log.info("Running missing .eth 2LD names backfill...", .{});
+                self.backfillMissingEth2LDNames() catch |err| {
+                    std.log.err("Failed to backfill missing .eth 2LD names: {}", .{err});
+                };
+
+                // Reconcile orphaned subnames (parent_name="" from fallback during sync)
+                std.log.info("Reconciling orphaned subnames...", .{});
+                self.reconcileOrphanedSubnames() catch |err| {
+                    std.log.err("Failed to reconcile orphaned subnames: {}", .{err});
+                };
             }
 
             // Sleep for poll interval before next iteration
@@ -755,6 +777,12 @@ pub const Indexer = struct {
                         std.log.info("Running missing .eth 2LD names backfill...", .{});
                         self.backfillMissingEth2LDNames() catch |err| {
                             std.log.err("Failed to backfill missing .eth 2LD names: {}", .{err});
+                        };
+
+                        // Reconcile orphaned subnames (parent_name="" from fallback during sync)
+                        std.log.info("Reconciling orphaned subnames...", .{});
+                        self.reconcileOrphanedSubnames() catch |err| {
+                            std.log.err("Failed to reconcile orphaned subnames: {}", .{err});
                         };
                     }
                 }
@@ -1080,6 +1108,7 @@ pub const Indexer = struct {
     const backfillPreMigrationNames = backfill_mod.backfillPreMigrationNames;
     pub const backfillUnknownLabels = backfill_mod.backfillUnknownLabels;
     pub const backfillMissingEth2LDNames = backfill_mod.backfillMissingEth2LDNames;
+    pub const reconcileOrphanedSubnames = backfill_mod.reconcileOrphanedSubnames;
 
     // Shared utility functions (extracted to utils.zig)
     pub const emitEvent = utils.emitEvent;
