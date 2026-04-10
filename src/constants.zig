@@ -1,7 +1,6 @@
 /// Centralized constants for the ENS indexer
 /// This module contains all magic numbers, timing values, and well-known hashes
 /// that were previously scattered throughout the codebase.
-
 const Hash = @import("types/hash.zig").Hash;
 
 // ============================================================================

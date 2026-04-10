@@ -6,7 +6,7 @@ const Hash = @import("../types/hash.zig").Hash;
 fn writeJsonValue(writer: anytype, value: anytype) !void {
     const T = @TypeOf(value);
     switch (@typeInfo(T)) {
-        .@"bool" => try writer.print("{}", .{value}),
+        .bool => try writer.print("{}", .{value}),
         .int, .comptime_int => try writer.print("{d}", .{value}),
         .float, .comptime_float => try writer.print("{d}", .{value}),
         .pointer => |ptr_info| {

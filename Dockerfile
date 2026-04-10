@@ -1,5 +1,5 @@
 # Multi-stage Dockerfile for ENSv2 Indexer + API
-# Builds L2 indexer and GraphQL API server
+# Builds V1+V2 indexer and GraphQL API server
 # Rainbow table is downloaded automatically on first startup
 
 # Stage 1: Build Zig applications
@@ -67,8 +67,8 @@ WORKDIR /app
 
 # Copy binaries from builder
 COPY --from=builder /app/zig-out/bin/ensv2-indexer /app/ensv2-indexer
-COPY --from=builder /app/zig-out/bin/ensv2-indexer-l1 /app/ensv2-indexer-l1
-COPY --from=builder /app/zig-out/bin/ensv2-indexer-l2 /app/ensv2-indexer-l2
+COPY --from=builder /app/zig-out/bin/ensv2-indexer-v1 /app/ensv2-indexer-v1
+COPY --from=builder /app/zig-out/bin/ensv2-indexer-v2 /app/ensv2-indexer-v2
 COPY --from=builder /app/zig-out/bin/ensv2-api /app/ensv2-api
 
 # Copy schema files (needed for database initialization)

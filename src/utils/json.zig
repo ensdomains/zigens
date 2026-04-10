@@ -15,8 +15,8 @@ pub fn escapeString(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
             '\n' => try result.appendSlice(allocator, "\\n"),
             '\r' => try result.appendSlice(allocator, "\\r"),
             '\t' => try result.appendSlice(allocator, "\\t"),
-            '\x08' => try result.appendSlice(allocator, "\\b"),  // backspace
-            '\x0C' => try result.appendSlice(allocator, "\\f"),  // form feed
+            '\x08' => try result.appendSlice(allocator, "\\b"), // backspace
+            '\x0C' => try result.appendSlice(allocator, "\\f"), // form feed
             // All other control characters (0x00-0x1F except the ones above, plus 0x7F) must be escaped as \uXXXX
             0x00...0x07, 0x0B, 0x0E...0x1F, 0x7F => {
                 try result.writer(allocator).print("\\u{x:0>4}", .{c});

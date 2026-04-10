@@ -118,26 +118,20 @@ sudo journalctl -u ensv2-indexer -f
 
 ```json
 {
-  "l1_rpc_url": "https://eth-mainnet.g.alchemy.com/v2/YOUR_API_KEY",
-  "l2_rpc_url": "https://base-mainnet.g.alchemy.com/v2/YOUR_API_KEY",
-  "l1_root_registry": "0x...",
-  "l2_root_registry": "0x...",
-  "l1_eth_registry": "0x...",
-  "l2_eth_registry": "0x...",
-  "l1_datastore": "0x...",
-  "l2_datastore": "0x...",
-  "l1_start_block": 19000000,
-  "l2_start_block": 10000000
+  "rpc_url": "https://eth-mainnet.g.alchemy.com/v2/YOUR_API_KEY",
+  "root_registry": "0x...",
+  "eth_registry": "0x...",
+  "registry_datastore": "0x...",
+  "start_block": 19000000
 }
 ```
 
 ### Contract Addresses
 
 You'll need to obtain the deployed contract addresses for:
-- L1 Root Registry
-- L2 Root Registry
-- L1 .eth Registry
-- L2 .eth Registry
+- Root Registry
+- .eth Registry
+- Registry Datastore
 - L1 Registry Datastore
 - L2 Registry Datastore
 - L1 Universal Resolver

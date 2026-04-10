@@ -16,13 +16,13 @@ const pagination = common.pagination;
 const builders = common.builders;
 const escapeJsonString = common.escapeJsonString;
 
-/// Parse chain argument from field (defaults to l2)
+/// Parse chain argument from field (defaults to v2)
 fn parseChainArg(field: *const parser.Field) models.Chain {
-    const chain_str = parser.getStringArg(field, "chain", null) orelse models.Chain.l2.toString();
-    if (std.mem.eql(u8, chain_str, models.Chain.l1.toString())) {
-        return .l1;
+    const chain_str = parser.getStringArg(field, "chain", null) orelse models.Chain.v2.toString();
+    if (std.mem.eql(u8, chain_str, models.Chain.v1.toString())) {
+        return .v1;
     }
-    return .l2; // Default to L2
+    return .v2; // Default to V2
 }
 
 pub fn resolveRoles(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
@@ -39,17 +39,14 @@ pub fn resolveRoles(ctx: parser.ExecutionContext, field: *const parser.Field) !p
     // Determine which database method to call based on arguments
     const roles = if (resource_arg) |resource|
         try database.getRolesByResource(chain, resource)
-    else if (account_arg) |account_str|
-        blk: {
-            const account_addr = Address.fromHex(account_str) catch {
-                // Invalid address, return empty array
-                const json = try allocator.dupe(u8, "[]");
-                return parser.FieldResult{ .json = json };
-            };
-            break :blk try database.getRolesByAccount(chain, account_addr);
-        }
-    else
-        try allocator.alloc(models.EACRoleAssignment, 0); // Requires resource or account filter
+    else if (account_arg) |account_str| blk: {
+        const account_addr = Address.fromHex(account_str) catch {
+            // Invalid address, return empty array
+            const json = try allocator.dupe(u8, "[]");
+            return parser.FieldResult{ .json = json };
+        };
+        break :blk try database.getRolesByAccount(chain, account_addr);
+    } else try allocator.alloc(models.EACRoleAssignment, 0); // Requires resource or account filter
 
     defer {
         for (roles) |*role| {
@@ -67,7 +64,7 @@ pub fn resolveRoles(ctx: parser.ExecutionContext, field: *const parser.Field) !p
         if (i > 0) try json.appendSlice(allocator, ",");
         const handler = FieldHandler{
             .handleFn = handleEACRoleField,
-            .context = @constCast(@ptrCast(role)),
+            .context = @ptrCast(@constCast(role)),
         };
         const role_json = try buildJsonWithFields(allocator, field.selections, handler);
         defer allocator.free(role_json);
@@ -215,7 +212,7 @@ pub fn resolveRolesConnection(ctx: parser.ExecutionContext, field: *const parser
         // Build role JSON using the existing field handler
         const handler = FieldHandler{
             .handleFn = handleEACRoleField,
-            .context = @constCast(@ptrCast(role)),
+            .context = @ptrCast(@constCast(role)),
         };
         const role_json = try buildJsonWithFields(allocator, node_selections, handler);
         defer allocator.free(role_json);
@@ -319,7 +316,7 @@ pub fn resolveRegistries(ctx: parser.ExecutionContext, field: *const parser.Fiel
         if (i > 0) try json.appendSlice(allocator, ",");
         const handler = FieldHandler{
             .handleFn = handleRegistryField,
-            .context = @constCast(@ptrCast(registry)),
+            .context = @ptrCast(@constCast(registry)),
         };
         const registry_json = try buildJsonWithFields(allocator, field.selections, handler);
         defer allocator.free(registry_json);
@@ -357,7 +354,7 @@ pub fn resolveMetadata(ctx: parser.ExecutionContext, field: *const parser.Field)
 
         const handler = FieldHandler{
             .handleFn = handleResolverMetadataField,
-            .context = @constCast(@ptrCast(&metadata_mut)),
+            .context = @ptrCast(@constCast(&metadata_mut)),
         };
         const json = try buildJsonWithFields(allocator, field.selections, handler);
         return parser.FieldResult{ .json = json };
@@ -380,26 +377,21 @@ pub fn resolveApprovals(ctx: parser.ExecutionContext, field: *const parser.Field
     const delegate_arg = parser.getStringArg(field, "delegate", null);
 
     // Determine which database method to call based on arguments
-    const approvals = if (namehash_arg) |namehash_str|
-        blk: {
-            const namehash_hash = Hash.fromHex(namehash_str) catch {
-                // Invalid hash, return empty array
-                const json = try allocator.dupe(u8, "[]");
-                return parser.FieldResult{ .json = json };
-            };
-            break :blk try database.getApprovalsForName(chain, namehash_hash, null);
-        }
-    else if (delegate_arg) |delegate_str|
-        blk: {
-            const delegate_addr = Address.fromHex(delegate_str) catch {
-                // Invalid address, return empty array
-                const json = try allocator.dupe(u8, "[]");
-                return parser.FieldResult{ .json = json };
-            };
-            break :blk try database.getApprovalsForDelegate(chain, delegate_addr);
-        }
-    else
-        try allocator.alloc(models.ResolverApproval, 0); // No arguments, return empty
+    const approvals = if (namehash_arg) |namehash_str| blk: {
+        const namehash_hash = Hash.fromHex(namehash_str) catch {
+            // Invalid hash, return empty array
+            const json = try allocator.dupe(u8, "[]");
+            return parser.FieldResult{ .json = json };
+        };
+        break :blk try database.getApprovalsForName(chain, namehash_hash, null);
+    } else if (delegate_arg) |delegate_str| blk: {
+        const delegate_addr = Address.fromHex(delegate_str) catch {
+            // Invalid address, return empty array
+            const json = try allocator.dupe(u8, "[]");
+            return parser.FieldResult{ .json = json };
+        };
+        break :blk try database.getApprovalsForDelegate(chain, delegate_addr);
+    } else try allocator.alloc(models.ResolverApproval, 0); // No arguments, return empty
 
     defer {
         for (approvals) |*approval| {
@@ -417,7 +409,7 @@ pub fn resolveApprovals(ctx: parser.ExecutionContext, field: *const parser.Field
         if (i > 0) try json.appendSlice(allocator, ",");
         const handler = FieldHandler{
             .handleFn = handleResolverApprovalField,
-            .context = @constCast(@ptrCast(approval)),
+            .context = @ptrCast(@constCast(approval)),
         };
         const approval_json = try buildJsonWithFields(allocator, field.selections, handler);
         defer allocator.free(approval_json);
@@ -583,7 +575,7 @@ fn buildResolverJson(
                 if (i > 0) try json.appendSlice(allocator, ",");
                 const handler = FieldHandler{
                     .handleFn = handleEACRoleField,
-                    .context = @constCast(@ptrCast(role)),
+                    .context = @ptrCast(@constCast(role)),
                 };
                 const role_json = try buildJsonWithFields(allocator, sel.selections, handler);
                 defer allocator.free(role_json);

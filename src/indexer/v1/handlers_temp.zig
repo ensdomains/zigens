@@ -6,7 +6,6 @@ const db = @import("../../storage/database.zig");
 const Query = db.Query;
 const Indexer = @import("../indexer.zig").Indexer;
 
-
 /// Handle Temporary Registrar HashRegistered event
 /// HashRegistered(bytes32 indexed hash, address indexed owner, uint256 value, uint256 registrationDate)
 pub fn handleTempHashRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {

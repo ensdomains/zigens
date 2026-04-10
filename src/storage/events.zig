@@ -16,7 +16,7 @@ const Hash = @import("../types/hash.zig").Hash;
 ///               contract_address(5), name(6), namehash(7), data(8), timestamp(9)
 fn parseEventRow(q: *Query, allocator: std.mem.Allocator) !models.Event {
     const event_type_str = q.getTextSlice(0) orelse models.EventType.transfer.toString();
-    const chain_str = q.getTextSlice(1) orelse models.Chain.l2.toString();
+    const chain_str = q.getTextSlice(1) orelse models.Chain.v2.toString();
     const tx_hash_str = q.getTextSlice(3) orelse return error.MissingTxHash;
     const contract_addr_str = q.getTextSlice(5) orelse return error.MissingContractAddress;
     const data_str = q.getTextSlice(8) orelse "{}";
@@ -774,7 +774,7 @@ fn createTestEvent(
 
     return models.Event{
         .event_type = event_type,
-        .chain = .l2,
+        .chain = .v2,
         .block_number = block_number,
         .tx_hash = Hash{ .bytes = tx_hash_bytes },
         .log_index = 0,

@@ -4,19 +4,19 @@ const Hash = @import("hash.zig").Hash;
 
 /// Chain identifier
 pub const Chain = enum {
-    l1,
-    l2,
+    v1,
+    v2,
 
     pub fn toString(self: Chain) []const u8 {
         return switch (self) {
-            .l1 => "l1",
-            .l2 => "l2",
+            .v1 => "v1",
+            .v2 => "v2",
         };
     }
 
     pub fn fromString(s: []const u8) !Chain {
-        if (std.mem.eql(u8, s, "l1")) return .l1;
-        if (std.mem.eql(u8, s, "l2")) return .l2;
+        if (std.mem.eql(u8, s, "v1")) return .v1;
+        if (std.mem.eql(u8, s, "v2")) return .v2;
         return error.InvalidChain;
     }
 };
@@ -146,17 +146,26 @@ pub const Resolver = struct {
 
 /// Event types in ENSv2
 pub const EventType = enum {
-    // Registry events
+    // Registry events (ENSIP-16)
     new_subname,
     subregistry_update,
+    subregistry_updated,
     resolver_update,
+    resolver_updated,
     transfer,
 
     // Registration events
     name_registered,
     name_renewed,
     name_burned,
+    label_registered,
+    label_reserved,
+    label_unregistered,
+    expiry_updated,
     commitment_made,
+
+    // Parent events
+    parent_updated,
 
     // Token events
     token_regenerated,
@@ -193,12 +202,19 @@ pub const EventType = enum {
         return switch (self) {
             .new_subname => "NewSubname",
             .subregistry_update => "SubregistryUpdate",
+            .subregistry_updated => "SubregistryUpdated",
             .resolver_update => "ResolverUpdate",
+            .resolver_updated => "ResolverUpdated",
             .transfer => "Transfer",
             .name_registered => "NameRegistered",
             .name_renewed => "NameRenewed",
             .name_burned => "NameBurned",
+            .label_registered => "LabelRegistered",
+            .label_reserved => "LabelReserved",
+            .label_unregistered => "LabelUnregistered",
+            .expiry_updated => "ExpiryUpdated",
             .commitment_made => "CommitmentMade",
+            .parent_updated => "ParentUpdated",
             .token_regenerated => "TokenRegenerated",
             .approval => "Approval",
             .name_migrated => "NameMigrated",
@@ -222,7 +238,9 @@ pub const EventType = enum {
     pub fn fromString(s: []const u8) ?EventType {
         if (std.mem.eql(u8, s, "NewSubname")) return .new_subname;
         if (std.mem.eql(u8, s, "SubregistryUpdate")) return .subregistry_update;
+        if (std.mem.eql(u8, s, "SubregistryUpdated")) return .subregistry_updated;
         if (std.mem.eql(u8, s, "ResolverUpdate")) return .resolver_update;
+        if (std.mem.eql(u8, s, "ResolverUpdated")) return .resolver_updated;
         if (std.mem.eql(u8, s, "Transfer")) return .transfer;
         if (std.mem.eql(u8, s, "NameRegistered")) return .name_registered;
         if (std.mem.eql(u8, s, "NameRenewed")) return .name_renewed;
@@ -245,6 +263,11 @@ pub const EventType = enum {
         if (std.mem.eql(u8, s, "EACRolesChanged")) return .eac_roles_changed;
         if (std.mem.eql(u8, s, "VersionChanged")) return .version_changed;
         if (std.mem.eql(u8, s, "AliasChanged")) return .alias_changed;
+        if (std.mem.eql(u8, s, "LabelRegistered")) return .label_registered;
+        if (std.mem.eql(u8, s, "LabelReserved")) return .label_reserved;
+        if (std.mem.eql(u8, s, "LabelUnregistered")) return .label_unregistered;
+        if (std.mem.eql(u8, s, "ExpiryUpdated")) return .expiry_updated;
+        if (std.mem.eql(u8, s, "ParentUpdated")) return .parent_updated;
         return null;
     }
 };

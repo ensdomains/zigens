@@ -65,8 +65,7 @@ nano config.json
 ```
 
 **Required changes:**
-- `l1_rpc_url`: Your Ethereum mainnet RPC
-- `l2_rpc_url`: Your L2 RPC (Base, etc.)
+- `rpc_url`: Your Ethereum RPC
 - Contract addresses (will be available after ENSv2 deployment)
 - Start blocks (deployment blocks)
 

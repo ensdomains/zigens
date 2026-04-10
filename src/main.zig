@@ -6,7 +6,7 @@ const db = @import("storage/database.zig");
 
 // Configure logging: filter debug logs, use file redirection in production
 pub const std_options: std.Options = .{
-    .log_level = .info,  // Only show info, warn, err (no debug)
+    .log_level = .info, // Only show info, warn, err (no debug)
 };
 
 pub fn main() !void {
@@ -21,9 +21,7 @@ pub fn main() !void {
 
     std.log.info("ENSv2 Indexer starting...", .{});
     std.log.info("Network: {s}", .{cfg.network.toString()});
-    // Don't log RPC URLs as they may contain API keys
-    std.log.info("L1 RPC: [CONFIGURED]", .{});
-    std.log.info("L2 RPC: [CONFIGURED]", .{});
+    std.log.info("RPC: [CONFIGURED]", .{});
     std.log.info("Start block: {d}", .{cfg.start_block});
     std.log.info("Batch size: {d}", .{cfg.batch_size});
     std.log.info("Rate limit: {d} req/s", .{cfg.rate_limit_per_second});

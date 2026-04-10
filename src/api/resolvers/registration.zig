@@ -296,7 +296,6 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
 }
 
 /// Resolver for eventConnection query (cursor-based pagination)
-
 pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
     const allocator = ctx.allocator;

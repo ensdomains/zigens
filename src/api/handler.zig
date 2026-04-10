@@ -470,7 +470,7 @@ pub const GraphQLHandler = struct {
         const resource = try self.extractStringParam(query, "resource:");
         const account_str = try self.extractStringParam(query, "account:");
 
-        const chain = models.Chain.l2; // TODO: Make configurable
+        const chain = models.Chain.v2; // TODO: Make configurable
 
         var roles: []models.EACRoleAssignment = undefined;
         defer {
@@ -561,7 +561,7 @@ pub const GraphQLHandler = struct {
             return try self.buildErrorResponse("Invalid account address");
         };
 
-        const chain = models.Chain.l2; // TODO: Make configurable
+        const chain = models.Chain.v2; // TODO: Make configurable
 
         // Get all resolvers for this account (works for N-level domains)
         const resolvers_list = try self.database.getResolversByOwner(chain, account);
@@ -610,7 +610,7 @@ pub const GraphQLHandler = struct {
             return try self.buildErrorResponse("Invalid owner address");
         };
 
-        const chain = models.Chain.l2; // TODO: Make configurable
+        const chain = models.Chain.v2; // TODO: Make configurable
 
         // Get all registries owned by this account (works for N-level domains)
         const registries = try self.database.getRegistriesByOwner(chain, owner);
@@ -661,7 +661,7 @@ pub const GraphQLHandler = struct {
             return try self.buildErrorResponse("Invalid resolver address");
         };
 
-        const chain = models.Chain.l2; // TODO: Make configurable
+        const chain = models.Chain.v2; // TODO: Make configurable
 
         // Get resolver metadata
         const metadata_opt = try self.database.getResolverMetadata(chain, resolver);
@@ -692,7 +692,7 @@ pub const GraphQLHandler = struct {
         const namehash_str = self.extractStringParam(query, "namehash:") catch "";
         const delegate_str = self.extractStringParam(query, "delegate:") catch "";
 
-        const chain = models.Chain.l2; // TODO: Make configurable
+        const chain = models.Chain.v2; // TODO: Make configurable
 
         // Determine which query to use based on parameters
         var approvals_list: []models.ResolverApproval = undefined;
@@ -983,9 +983,10 @@ pub const GraphQLHandler = struct {
             // Extract field name
             const field_start = i;
             while (i < selection.len and
-                   selection[i] != ' ' and selection[i] != '\n' and
-                   selection[i] != '\r' and selection[i] != '\t' and
-                   selection[i] != '{' and selection[i] != '}' and selection[i] != ',') {
+                selection[i] != ' ' and selection[i] != '\n' and
+                selection[i] != '\r' and selection[i] != '\t' and
+                selection[i] != '{' and selection[i] != '}' and selection[i] != ',')
+            {
                 i += 1;
             }
 
@@ -1027,9 +1028,10 @@ pub const GraphQLHandler = struct {
                         // Extract nested field name
                         const nested_field_start = j;
                         while (j < nested_selection.len and
-                               nested_selection[j] != ' ' and nested_selection[j] != '\n' and
-                               nested_selection[j] != '\r' and nested_selection[j] != '\t' and
-                               nested_selection[j] != '{' and nested_selection[j] != '}' and nested_selection[j] != ',') {
+                            nested_selection[j] != ' ' and nested_selection[j] != '\n' and
+                            nested_selection[j] != '\r' and nested_selection[j] != '\t' and
+                            nested_selection[j] != '{' and nested_selection[j] != '}' and nested_selection[j] != ',')
+                        {
                             j += 1;
                         }
 

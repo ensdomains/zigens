@@ -4,7 +4,7 @@ This file provides guidelines for agentic coding agents working on this codebase
 
 ## Project Overview
 
-ENSv2 Indexer is a high-performance Ethereum Name Service v2 indexer written in Zig. It indexes ENSv2 events from both L1 (Ethereum) and L2 (e.g., Arbitrum) chains, provides a GraphQL API, and supports webhooks.
+ENSv2 Indexer is a high-performance Ethereum Name Service indexer written in Zig. It indexes both ENS V1 (legacy) and ENS V2 (new) contract events on Ethereum, provides a GraphQL API, and supports webhooks.
 
 - **Language**: Zig 0.15.1+
 - **Database**: SQLite
@@ -44,9 +44,9 @@ zig build run-api
 
 ### Available Binaries
 
-- `zig-out/bin/ensv2-indexer` - Combined L1+L2 indexer
-- `zig-out/bin/ensv2-indexer-l1` - L1-only indexer
-- `zig-out/bin/ensv2-indexer-l2` - L2-only indexer
+- `zig-out/bin/ensv2-indexer` - Combined V1+V2 indexer
+- `zig-out/bin/ensv2-indexer-v1` - V1-only indexer
+- `zig-out/bin/ensv2-indexer-v2` - V2-only indexer
 - `zig-out/bin/ensv2-api` - Standalone GraphQL API server
 - `zig-out/bin/rainbow-backfill` - Rainbow table label backfill tool
 
@@ -135,7 +135,7 @@ Schema in `schema.graphql`, introspection via `tools/generate_introspection.py`,
 
 ### Configuration
 
-Environment variables - see `.env.example`: `L1_RPC_URL`, `L2_RPC_URL`, `NETWORK` (sepolia/mainnet), `DATABASE_PATH`, `API_PORT` (default 8080).
+Environment variables - see `.env.example`: `RPC_URL`, `NETWORK` (sepolia/mainnet), `DATABASE_PATH`, `API_PORT` (default 8080).
 
 ### Project Structure
 

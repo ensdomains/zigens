@@ -32,7 +32,7 @@ test "storeResolverAddress inserts address record" {
         resolver,
         coin_type,
         address,
-        .l2,
+        .v2,
         1000,
         tx_hash,
         1700000000,
@@ -63,7 +63,7 @@ test "storeResolverAddress updates existing coin_type" {
         resolver,
         coin_type,
         "0xaaaa",
-        .l2,
+        .v2,
         1000,
         tx_hash,
         1700000000,
@@ -77,7 +77,7 @@ test "storeResolverAddress updates existing coin_type" {
         resolver,
         coin_type,
         "0xbbbb",
-        .l2,
+        .v2,
         2000,
         tx_hash2,
         1700001000,
@@ -112,9 +112,9 @@ test "getResolverAllAddresses returns all coin types" {
     const tx_hash = helpers.randomHash();
 
     // Store addresses for different coin types
-    try resolvers.storeResolverAddress(database, nh, resolver, 60, "0xeth", .l2, 1000, tx_hash, 1700000000);
-    try resolvers.storeResolverAddress(database, nh, resolver, 0, "bc1qbtc", .l2, 1000, tx_hash, 1700000000);
-    try resolvers.storeResolverAddress(database, nh, resolver, 501, "sol123", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverAddress(database, nh, resolver, 60, "0xeth", .v2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverAddress(database, nh, resolver, 0, "bc1qbtc", .v2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverAddress(database, nh, resolver, 501, "sol123", .v2, 1000, tx_hash, 1700000000);
 
     const addresses = try resolvers.getResolverAllAddresses(database, nh);
     defer {
@@ -144,7 +144,7 @@ test "storeResolverContentHash inserts contenthash" {
         nh,
         resolver,
         content_hash,
-        .l2,
+        .v2,
         1000,
         tx_hash,
         1700000000,
@@ -187,7 +187,7 @@ test "storeResolverText inserts text record" {
         resolver,
         "avatar",
         "https://example.com/avatar.png",
-        .l2,
+        .v2,
         1000,
         tx_hash,
         1700000000,
@@ -210,9 +210,9 @@ test "getResolverTextKeys returns distinct keys" {
     const tx_hash = helpers.randomHash();
 
     // Store multiple text records
-    try resolvers.storeResolverText(database, nh, resolver, "avatar", "avatar.png", .l2, 1000, tx_hash, 1700000000);
-    try resolvers.storeResolverText(database, nh, resolver, "url", "https://example.com", .l2, 1000, tx_hash, 1700000000);
-    try resolvers.storeResolverText(database, nh, resolver, "description", "A test name", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverText(database, nh, resolver, "avatar", "avatar.png", .v2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverText(database, nh, resolver, "url", "https://example.com", .v2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverText(database, nh, resolver, "description", "A test name", .v2, 1000, tx_hash, 1700000000);
 
     const keys = try resolvers.getResolverTextKeys(database, nh);
     defer {
@@ -244,7 +244,7 @@ test "getResolverTextByResolver for V2 names" {
     const tx_hash = helpers.randomHash();
 
     // Store text record
-    try resolvers.storeResolverText(database, nh, resolver, "email", "test@example.com", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverText(database, nh, resolver, "email", "test@example.com", .v2, 1000, tx_hash, 1700000000);
 
     // Query by resolver address (V2 style)
     const value = try resolvers.getResolverTextByResolver(database, resolver, "email");
@@ -263,8 +263,8 @@ test "getResolverTextKeysByResolver returns keys by resolver address" {
     const resolver = helpers.TEST_RESOLVER;
     const tx_hash = helpers.randomHash();
 
-    try resolvers.storeResolverText(database, nh, resolver, "avatar", "img.png", .l2, 1000, tx_hash, 1700000000);
-    try resolvers.storeResolverText(database, nh, resolver, "url", "https://x.com", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverText(database, nh, resolver, "avatar", "img.png", .v2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverText(database, nh, resolver, "url", "https://x.com", .v2, 1000, tx_hash, 1700000000);
 
     const keys = try resolvers.getResolverTextKeysByResolver(database, resolver);
     defer {
@@ -291,7 +291,7 @@ test "getResolversToIndex discovers new resolvers" {
     try database.updateNameResolver(try namehash_fn(allocator, "discover.eth"), helpers.TEST_RESOLVER);
 
     // Discovery should find the resolver
-    const discovered = try resolvers.getResolversToIndex(database, .l2, 900, 1100);
+    const discovered = try resolvers.getResolversToIndex(database, .v2, 900, 1100);
     defer {
         for (discovered) |r| allocator.free(r);
         allocator.free(discovered);
@@ -313,7 +313,7 @@ test "getResolversByOwner returns owner resolvers" {
     const nh2 = try helpers.createTestName(allocator, database, "owned2.eth", helpers.TEST_OWNER_1);
     try database.updateNameResolver(nh2, helpers.TEST_RESOLVER);
 
-    const resolver_list = try resolvers.getResolversByOwner(database, .l2, helpers.TEST_OWNER_1);
+    const resolver_list = try resolvers.getResolversByOwner(database, .v2, helpers.TEST_OWNER_1);
     defer {
         for (resolver_list) |*r| r.deinit(allocator);
         allocator.free(resolver_list);
@@ -328,7 +328,7 @@ test "getResolversByOwner returns empty for unknown owner" {
     defer helpers.destroyTestDatabase(allocator, database);
 
     const unknown_owner = helpers.randomAddress();
-    const resolver_list = try resolvers.getResolversByOwner(database, .l2, unknown_owner);
+    const resolver_list = try resolvers.getResolversByOwner(database, .v2, unknown_owner);
     defer allocator.free(resolver_list);
 
     try testing.expectEqual(@as(usize, 0), resolver_list.len);
@@ -351,7 +351,7 @@ test "storeResolverAlias inserts alias record" {
         resolver,
         "sub.eth",
         "target.eth",
-        .l2,
+        .v2,
         1000,
         tx_hash,
         1700000000,
@@ -377,11 +377,11 @@ test "storeResolverAlias upserts existing alias" {
     const tx_hash = helpers.randomHash();
 
     // Insert initial alias
-    try resolvers.storeResolverAlias(database, resolver, "sub.eth", "old-target.eth", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverAlias(database, resolver, "sub.eth", "old-target.eth", .v2, 1000, tx_hash, 1700000000);
 
     // Update with new target
     const tx_hash2 = helpers.randomHash();
-    try resolvers.storeResolverAlias(database, resolver, "sub.eth", "new-target.eth", .l2, 2000, tx_hash2, 1700001000);
+    try resolvers.storeResolverAlias(database, resolver, "sub.eth", "new-target.eth", .v2, 2000, tx_hash2, 1700001000);
 
     const aliases = try resolvers.getResolverAliases(database, resolver);
     defer {
@@ -401,9 +401,9 @@ test "getResolverAliases returns multiple aliases" {
     const resolver = helpers.TEST_RESOLVER;
     const tx_hash = helpers.randomHash();
 
-    try resolvers.storeResolverAlias(database, resolver, "a.eth", "target-a.eth", .l2, 1000, tx_hash, 1700000000);
-    try resolvers.storeResolverAlias(database, resolver, "b.eth", "target-b.eth", .l2, 1000, tx_hash, 1700000000);
-    try resolvers.storeResolverAlias(database, resolver, "c.eth", "target-c.eth", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverAlias(database, resolver, "a.eth", "target-a.eth", .v2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverAlias(database, resolver, "b.eth", "target-b.eth", .v2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverAlias(database, resolver, "c.eth", "target-c.eth", .v2, 1000, tx_hash, 1700000000);
 
     const aliases = try resolvers.getResolverAliases(database, resolver);
     defer {
@@ -434,8 +434,8 @@ test "deleteResolverAlias removes specific alias" {
     const resolver = helpers.TEST_RESOLVER;
     const tx_hash = helpers.randomHash();
 
-    try resolvers.storeResolverAlias(database, resolver, "keep.eth", "target1.eth", .l2, 1000, tx_hash, 1700000000);
-    try resolvers.storeResolverAlias(database, resolver, "remove.eth", "target2.eth", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverAlias(database, resolver, "keep.eth", "target1.eth", .v2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverAlias(database, resolver, "remove.eth", "target2.eth", .v2, 1000, tx_hash, 1700000000);
 
     // Delete one alias
     try resolvers.deleteResolverAlias(database, resolver, "remove.eth");
@@ -469,7 +469,7 @@ test "storeResolverPubkey inserts pubkey record" {
         resolver,
         "0xaabbccdd",
         "0x11223344",
-        .l2,
+        .v2,
         1000,
         tx_hash,
         1700000000,
@@ -493,9 +493,9 @@ test "storeResolverPubkey upserts existing" {
     const resolver = helpers.TEST_RESOLVER;
     const tx_hash = helpers.randomHash();
 
-    try resolvers.storeResolverPubkey(database, nh, resolver, "0x0001", "0x0002", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverPubkey(database, nh, resolver, "0x0001", "0x0002", .v2, 1000, tx_hash, 1700000000);
     const tx_hash2 = helpers.randomHash();
-    try resolvers.storeResolverPubkey(database, nh, resolver, "0xnewx", "0xnewy", .l2, 2000, tx_hash2, 1700001000);
+    try resolvers.storeResolverPubkey(database, nh, resolver, "0xnewx", "0xnewy", .v2, 2000, tx_hash2, 1700001000);
 
     const result = try resolvers.getResolverPubkey(database, nh);
     try testing.expect(result != null);
@@ -524,7 +524,7 @@ test "deleteResolverPubkeys clears pubkey" {
     const nh = try namehash_fn(allocator, "pubkey-del.eth");
     const tx_hash = helpers.randomHash();
 
-    try resolvers.storeResolverPubkey(database, nh, helpers.TEST_RESOLVER, "0x01", "0x02", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverPubkey(database, nh, helpers.TEST_RESOLVER, "0x01", "0x02", .v2, 1000, tx_hash, 1700000000);
 
     // Verify exists
     {
@@ -554,9 +554,9 @@ test "storeResolverABI inserts ABI content type" {
     const resolver = helpers.TEST_RESOLVER;
     const tx_hash = helpers.randomHash();
 
-    try resolvers.storeResolverABI(database, nh, resolver, 1, .l2, 1000, tx_hash, 1700000000);
-    try resolvers.storeResolverABI(database, nh, resolver, 2, .l2, 1000, tx_hash, 1700000000);
-    try resolvers.storeResolverABI(database, nh, resolver, 4, .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverABI(database, nh, resolver, 1, .v2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverABI(database, nh, resolver, 2, .v2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverABI(database, nh, resolver, 4, .v2, 1000, tx_hash, 1700000000);
 
     const content_types = try resolvers.getResolverAbiContentTypes(database, nh);
     defer allocator.free(content_types);
@@ -587,8 +587,8 @@ test "deleteResolverAbis clears all ABI records" {
     const nh = try namehash_fn(allocator, "abi-del.eth");
     const tx_hash = helpers.randomHash();
 
-    try resolvers.storeResolverABI(database, nh, helpers.TEST_RESOLVER, 1, .l2, 1000, tx_hash, 1700000000);
-    try resolvers.storeResolverABI(database, nh, helpers.TEST_RESOLVER, 2, .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverABI(database, nh, helpers.TEST_RESOLVER, 1, .v2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverABI(database, nh, helpers.TEST_RESOLVER, 2, .v2, 1000, tx_hash, 1700000000);
 
     try resolvers.deleteResolverAbis(database, nh);
 
@@ -611,7 +611,7 @@ test "storeResolverName inserts reverse name" {
     const resolver = helpers.TEST_RESOLVER;
     const tx_hash = helpers.randomHash();
 
-    try resolvers.storeResolverName(database, nh, resolver, "vitalik.eth", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverName(database, nh, resolver, "vitalik.eth", .v2, 1000, tx_hash, 1700000000);
 
     const result = try resolvers.getResolverReverseName(database, nh);
     try testing.expect(result != null);
@@ -628,9 +628,9 @@ test "storeResolverName upserts existing" {
     const nh = try namehash_fn(allocator, "reverse-update.eth");
     const tx_hash = helpers.randomHash();
 
-    try resolvers.storeResolverName(database, nh, helpers.TEST_RESOLVER, "old.eth", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverName(database, nh, helpers.TEST_RESOLVER, "old.eth", .v2, 1000, tx_hash, 1700000000);
     const tx_hash2 = helpers.randomHash();
-    try resolvers.storeResolverName(database, nh, helpers.TEST_RESOLVER, "new.eth", .l2, 2000, tx_hash2, 1700001000);
+    try resolvers.storeResolverName(database, nh, helpers.TEST_RESOLVER, "new.eth", .v2, 2000, tx_hash2, 1700001000);
 
     const result = try resolvers.getResolverReverseName(database, nh);
     try testing.expect(result != null);
@@ -657,7 +657,7 @@ test "deleteResolverNames clears reverse name" {
     const nh = try namehash_fn(allocator, "reverse-del.eth");
     const tx_hash = helpers.randomHash();
 
-    try resolvers.storeResolverName(database, nh, helpers.TEST_RESOLVER, "name.eth", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverName(database, nh, helpers.TEST_RESOLVER, "name.eth", .v2, 1000, tx_hash, 1700000000);
     try resolvers.deleteResolverNames(database, nh);
 
     const result = try resolvers.getResolverReverseName(database, nh);
@@ -683,7 +683,7 @@ test "storeResolverInterface inserts interface record" {
         resolver,
         "0x01ffc9a7",
         "0xaaaa",
-        .l2,
+        .v2,
         1000,
         tx_hash,
         1700000000,
@@ -708,8 +708,8 @@ test "storeResolverInterface inserts multiple interfaces" {
     const nh = try namehash_fn(allocator, "multi-iface.eth");
     const tx_hash = helpers.randomHash();
 
-    try resolvers.storeResolverInterface(database, nh, helpers.TEST_RESOLVER, "0x01ffc9a7", "0xaaaa", .l2, 1000, tx_hash, 1700000000);
-    try resolvers.storeResolverInterface(database, nh, helpers.TEST_RESOLVER, "0x3b3b57de", "0xbbbb", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverInterface(database, nh, helpers.TEST_RESOLVER, "0x01ffc9a7", "0xaaaa", .v2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverInterface(database, nh, helpers.TEST_RESOLVER, "0x3b3b57de", "0xbbbb", .v2, 1000, tx_hash, 1700000000);
 
     const ifaces = try resolvers.getResolverInterfaces(database, nh);
     defer {
@@ -740,8 +740,8 @@ test "deleteResolverInterfaces clears all interfaces" {
     const nh = try namehash_fn(allocator, "iface-del.eth");
     const tx_hash = helpers.randomHash();
 
-    try resolvers.storeResolverInterface(database, nh, helpers.TEST_RESOLVER, "0x01ffc9a7", "0xaaaa", .l2, 1000, tx_hash, 1700000000);
-    try resolvers.storeResolverInterface(database, nh, helpers.TEST_RESOLVER, "0x3b3b57de", "0xbbbb", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverInterface(database, nh, helpers.TEST_RESOLVER, "0x01ffc9a7", "0xaaaa", .v2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverInterface(database, nh, helpers.TEST_RESOLVER, "0x3b3b57de", "0xbbbb", .v2, 1000, tx_hash, 1700000000);
 
     try resolvers.deleteResolverInterfaces(database, nh);
 
@@ -763,7 +763,7 @@ test "storeResolverVersion inserts version" {
     const nh = try namehash_fn(allocator, "version.eth");
     const tx_hash = helpers.randomHash();
 
-    try resolvers.storeResolverVersion(database, nh, helpers.TEST_RESOLVER, 1, .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverVersion(database, nh, helpers.TEST_RESOLVER, 1, .v2, 1000, tx_hash, 1700000000);
 
     const result = try resolvers.getResolverVersion(database, nh);
     try testing.expect(result != null);
@@ -778,9 +778,9 @@ test "storeResolverVersion upserts to higher version" {
     const nh = try namehash_fn(allocator, "version-up.eth");
     const tx_hash = helpers.randomHash();
 
-    try resolvers.storeResolverVersion(database, nh, helpers.TEST_RESOLVER, 1, .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverVersion(database, nh, helpers.TEST_RESOLVER, 1, .v2, 1000, tx_hash, 1700000000);
     const tx_hash2 = helpers.randomHash();
-    try resolvers.storeResolverVersion(database, nh, helpers.TEST_RESOLVER, 5, .l2, 2000, tx_hash2, 1700001000);
+    try resolvers.storeResolverVersion(database, nh, helpers.TEST_RESOLVER, 5, .v2, 2000, tx_hash2, 1700001000);
 
     const result = try resolvers.getResolverVersion(database, nh);
     try testing.expect(result != null);
@@ -809,8 +809,8 @@ test "deleteResolverAddresses clears all addresses for namehash" {
     const nh = try namehash_fn(allocator, "addr-del.eth");
     const tx_hash = helpers.randomHash();
 
-    try resolvers.storeResolverAddress(database, nh, helpers.TEST_RESOLVER, 60, "0xeth", .l2, 1000, tx_hash, 1700000000);
-    try resolvers.storeResolverAddress(database, nh, helpers.TEST_RESOLVER, 0, "bc1q", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverAddress(database, nh, helpers.TEST_RESOLVER, 60, "0xeth", .v2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverAddress(database, nh, helpers.TEST_RESOLVER, 0, "bc1q", .v2, 1000, tx_hash, 1700000000);
 
     try resolvers.deleteResolverAddresses(database, nh);
 
@@ -828,7 +828,7 @@ test "deleteResolverContentHash clears contenthash" {
     const nh = try namehash_fn(allocator, "ch-del.eth");
     const tx_hash = helpers.randomHash();
 
-    try resolvers.storeResolverContentHash(database, nh, helpers.TEST_RESOLVER, "ipfs://Qm123", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverContentHash(database, nh, helpers.TEST_RESOLVER, "ipfs://Qm123", .v2, 1000, tx_hash, 1700000000);
     try resolvers.deleteResolverContentHash(database, nh);
 
     const result = try resolvers.getResolverContentHash(database, nh);
@@ -843,8 +843,8 @@ test "deleteResolverTexts clears all text records" {
     const nh = try namehash_fn(allocator, "text-del.eth");
     const tx_hash = helpers.randomHash();
 
-    try resolvers.storeResolverText(database, nh, helpers.TEST_RESOLVER, "avatar", "img.png", .l2, 1000, tx_hash, 1700000000);
-    try resolvers.storeResolverText(database, nh, helpers.TEST_RESOLVER, "url", "https://x.com", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverText(database, nh, helpers.TEST_RESOLVER, "avatar", "img.png", .v2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverText(database, nh, helpers.TEST_RESOLVER, "url", "https://x.com", .v2, 1000, tx_hash, 1700000000);
 
     try resolvers.deleteResolverTexts(database, nh);
 
@@ -895,8 +895,8 @@ test "getResolverAliasCount counts aliases for resolver" {
     const resolver = helpers.TEST_RESOLVER;
     const tx_hash = helpers.randomHash();
 
-    try resolvers.storeResolverAlias(database, resolver, "a.eth", "b.eth", .l2, 1000, tx_hash, 1700000000);
-    try resolvers.storeResolverAlias(database, resolver, "c.eth", "d.eth", .l2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverAlias(database, resolver, "a.eth", "b.eth", .v2, 1000, tx_hash, 1700000000);
+    try resolvers.storeResolverAlias(database, resolver, "c.eth", "d.eth", .v2, 1000, tx_hash, 1700000000);
 
     const count = try resolvers.getResolverAliasCount(database, resolver);
     try testing.expectEqual(@as(usize, 2), count);
@@ -921,10 +921,10 @@ test "getResolverRoleHolderCount counts distinct accounts" {
     const tx_hash = helpers.randomHash();
 
     // Two different accounts on the same resolver contract
-    try roles.upsertEACRole(database, .l2, "resource1", helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER);
-    try roles.upsertEACRole(database, .l2, "resource2", helpers.TEST_OWNER_2, "0x02", 1000, tx_hash, 1, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, "resource1", helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, "resource2", helpers.TEST_OWNER_2, "0x02", 1000, tx_hash, 1, helpers.TEST_RESOLVER);
     // Same account, different resource — should not add to distinct count
-    try roles.upsertEACRole(database, .l2, "resource3", helpers.TEST_OWNER_1, "0x04", 1000, tx_hash, 2, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, "resource3", helpers.TEST_OWNER_1, "0x04", 1000, tx_hash, 2, helpers.TEST_RESOLVER);
 
     const count = try resolvers.getResolverRoleHolderCount(database, helpers.TEST_RESOLVER);
     try testing.expectEqual(@as(usize, 2), count);
@@ -950,10 +950,10 @@ test "getResolverRoles returns roles by contract address" {
     const other_resolver = helpers.randomAddress();
 
     // Roles on TEST_RESOLVER
-    try roles.upsertEACRole(database, .l2, "res1", helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER);
-    try roles.upsertEACRole(database, .l2, "res2", helpers.TEST_OWNER_2, "0x02", 1000, tx_hash, 1, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, "res1", helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, "res2", helpers.TEST_OWNER_2, "0x02", 1000, tx_hash, 1, helpers.TEST_RESOLVER);
     // Role on different resolver — should not be returned
-    try roles.upsertEACRole(database, .l2, "res3", helpers.TEST_OWNER_1, "0x04", 1000, tx_hash, 2, other_resolver);
+    try roles.upsertEACRole(database, .v2, "res3", helpers.TEST_OWNER_1, "0x04", 1000, tx_hash, 2, other_resolver);
 
     const role_list = try resolvers.getResolverRoles(database, helpers.TEST_RESOLVER);
     defer {

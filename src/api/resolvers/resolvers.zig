@@ -6,7 +6,6 @@
 /// - event: Event-related resolvers
 /// - account: Account-related resolvers
 /// - admin: Admin/Role/Registry resolvers
-
 pub const domain = @import("domain.zig");
 pub const registration = @import("registration.zig");
 pub const event = @import("event.zig");

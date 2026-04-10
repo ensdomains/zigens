@@ -4,18 +4,18 @@ const indexer = @import("indexer/indexer.zig");
 const db = @import("storage/database.zig");
 
 // Configure logging: filter debug logs, use file redirection in production
-// Run with: ./ensv2-indexer-l1 > logs/indexer.log 2>&1 &
+// Run with: ./ensv2-indexer-v1 > logs/indexer.log 2>&1 &
 pub const std_options: std.Options = .{
-    .log_level = .info,  // Only show info, warn, err (no debug)
+    .log_level = .info, // Only show info, warn, err (no debug)
 };
 
 const CliMode = enum { index, backfill };
 
 fn printHelp() void {
     std.debug.print(
-        \\ENSv2 L1 Indexer
+        \\ENSv2 V1 Indexer
         \\
-        \\Usage: ensv2-indexer-l1 [OPTIONS]
+        \\Usage: ensv2-indexer-v1 [OPTIONS]
         \\
         \\Options:
         \\  --from-block <BLOCK>    Start indexing from this block number
@@ -86,7 +86,7 @@ pub fn main() !void {
     // Parse command-line arguments (override .env values)
     const mode = try parseArgs(allocator, &cfg);
 
-    std.log.info("ENSv2 L1 Indexer starting...", .{});
+    std.log.info("ENSv2 V1 Indexer starting...", .{});
     std.log.info("Network: {s}", .{cfg.network.toString()});
     std.log.info("Database: {s}", .{cfg.database_path});
 
@@ -102,8 +102,8 @@ pub fn main() !void {
         cfg.webhooks_enabled = false;
     }
 
-    // Initialize indexer with only L1 client
-    var idx = try indexer.Indexer.initSingleChain(allocator, cfg, &database, .l1, cfg.end_block);
+    // Initialize indexer with only V1 client
+    var idx = try indexer.Indexer.initSingleChain(allocator, cfg, &database, .v1, cfg.end_block);
     defer idx.deinit();
 
     switch (mode) {
@@ -113,7 +113,7 @@ pub fn main() !void {
             std.log.info("Backfill complete. Exiting.", .{});
         },
         .index => {
-            std.log.info("L1 RPC: [CONFIGURED]", .{});
+            std.log.info("V1 RPC: [CONFIGURED]", .{});
             std.log.info("Start block: {d}", .{cfg.start_block});
             if (cfg.end_block) |end| {
                 std.log.info("End block: {d}", .{end});
@@ -123,8 +123,8 @@ pub fn main() !void {
             std.log.info("Batch size: {d}", .{cfg.batch_size});
             std.log.info("Rate limit: {d} req/s", .{cfg.rate_limit_per_second});
 
-            std.log.info("L1 Indexer started - indexing blocks...", .{});
-            try idx.startSingleChain(.l1);
+            std.log.info("V1 Indexer started - indexing blocks...", .{});
+            try idx.startSingleChain(.v1);
         },
     }
 }

@@ -110,7 +110,7 @@ pub fn createTestName(
     const label_hash = try lib.labelhash(allocator, label);
 
     try database.insertName(models.Name{
-        .chain = .l2,
+        .chain = .v2,
         .name = name,
         .namehash = nh,
         .label = label,
@@ -155,7 +155,7 @@ pub fn createTestEvent(
     std.crypto.random.bytes(&tx_hash);
 
     try database.insertEvent(models.Event{
-        .chain = .l2,
+        .chain = .v2,
         .event_type = event_type,
         .block_number = 1000,
         .tx_hash = Hash{ .bytes = tx_hash },

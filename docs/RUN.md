@@ -4,32 +4,32 @@
 
 The indexer uses file redirection for logging, which is the standard approach for production services.
 
-### L1 Indexer Only
+### V1 Indexer Only
 
 ```bash
 # Create logs directory
 mkdir -p logs
 
-# Run L1 indexer in background
-./zig-out/bin/ensv2-indexer-l1 > logs/indexer-l1.log 2>&1 &
+# Run V1 indexer in background
+./zig-out/bin/ensv2-indexer-v1 > logs/indexer-v1.log 2>&1 &
 
 # Monitor logs in real-time
-tail -f logs/indexer-l1.log
+tail -f logs/indexer-v1.log
 
 # Search logs
-grep "error" logs/indexer-l1.log
-grep "Progress" logs/indexer-l1.log
+grep "error" logs/indexer-v1.log
+grep "Progress" logs/indexer-v1.log
 ```
 
-### L2 Indexer Only
+### V2 Indexer Only
 
 ```bash
 mkdir -p logs
-./zig-out/bin/ensv2-indexer-l2 > logs/indexer-l2.log 2>&1 &
-tail -f logs/indexer-l2.log
+./zig-out/bin/ensv2-indexer-v2 > logs/indexer-v2.log 2>&1 &
+tail -f logs/indexer-v2.log
 ```
 
-### Combined L1 + L2 Indexer
+### Combined V1 + V2 Indexer
 
 ```bash
 mkdir -p logs
@@ -40,16 +40,16 @@ tail -f logs/indexer.log
 ## Log Levels
 
 The indexer is configured with `.info` log level by default, showing:
-- ✅ **info**: Progress updates, event summaries, checkpoints
-- ✅ **warning**: Missing data, skipped events
-- ✅ **error**: Failures, critical issues
-- ❌ **debug**: Filtered out (per-event details)
+- **info**: Progress updates, event summaries, checkpoints
+- **warning**: Missing data, skipped events
+- **error**: Failures, critical issues
+- **debug**: Filtered out (per-event details)
 
 ### Enable Debug Logging
 
 To see detailed per-event logs during development:
 
-1. Edit the relevant `*_main.zig` file (e.g., `src/indexer_l1_main.zig`)
+1. Edit the relevant `*_main.zig` file (e.g., `src/indexer_v1_main.zig`)
 2. Change `.info` to `.debug`:
    ```zig
    pub const std_options: std.Options = .{
@@ -57,7 +57,7 @@ To see detailed per-event logs during development:
    };
    ```
 3. Rebuild: `zig build`
-4. Run with file redirection: `./zig-out/bin/ensv2-indexer-l1 > debug.log 2>&1`
+4. Run with file redirection: `./zig-out/bin/ensv2-indexer-v1 > debug.log 2>&1`
 
 ## Why File Redirection?
 
@@ -84,24 +84,6 @@ The indexer uses **machine learning with automatic retry** to handle all event d
 - **Adapts 100-100000 blocks** based on learned patterns (1000x dynamic range!)
 - **Auto-retries** with smaller chunks if buffer overflow occurs (sudden density spikes)
 - **Target**: ~500 events per chunk for optimal 4KB buffer usage
-
-**Example Learning with Retry**:
-```
-Chunk 1: predicted_density=1.23 → chunk_size=408 → OVERFLOW!
-Retry:   predicted_density=1.23 → chunk_size=204 → SUCCESS (1377 events)
-Chunk 2: predicted_density=2.88 → chunk_size=174 → OVERFLOW!
-Retry:   predicted_density=2.88 → chunk_size=87  → SUCCESS (4487 events)
-Chunk 3: predicted_density=28.37 → chunk_size=100 → SUCCESS (13058 events)
-(continues learning and adapting...)
-```
-
-**Benefits**:
-- Zero extra RPC calls (learns from actual data, no pre-flight requests)
-- Predicts BEFORE making requests (proactive, not reactive)
-- Handles sudden density spikes (reactive retry with exponential backoff)
-- Guaranteed zero crashes (retry logic catches all buffer overflows)
-- Handles all densities automatically (from 0.1 to 150+ events/block)
-- Gets smarter over time (self-improving algorithm)
 
 ## Stopping the Indexer
 

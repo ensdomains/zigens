@@ -13,7 +13,6 @@ const dns = @import("../../utils/dns.zig");
 const names_storage = @import("../../storage/names.zig");
 const v1_names = @import("../../utils/v1_names.zig");
 
-
 /// Handle V1 ENS Registry NewOwner event
 /// NewOwner(bytes32 indexed node, bytes32 indexed label, address owner)
 /// This event is emitted when a subdomain is created
@@ -53,7 +52,7 @@ pub fn handleV1NewOwner(self: *Indexer, chain: models.Chain, log: rpc.Log) !void
     });
 
     // V1 migration block - before this, we're in the temporary registrar period
-    const v1_migration_block = self.config.l1_contracts.v1_migration_block;
+    const v1_migration_block = self.config.v1_contracts.v1_migration_block;
     const is_pre_migration = v1_migration_block > 0 and log.block_number < v1_migration_block;
 
     if (is_pre_migration) {
@@ -274,7 +273,6 @@ pub fn handleV1NewResolver(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
     if (self.write_buffer.active) {
         try self.write_buffer.updateNameResolver(node, resolver);
     } else {
-
         try names_storage.updateNameResolver(self.database, node, resolver);
     }
     try self.database.registerResolver(chain, resolver_hex, log.block_number);
@@ -382,7 +380,6 @@ pub fn handleV1NameUnwrapped(self: *Indexer, chain: models.Chain, log: rpc.Log) 
         try self.write_buffer.clearNameWrapperState(node);
         try self.write_buffer.updateNameOwner(node, owner);
     } else {
-
         try names_storage.updateNameUnwrapperState(self.database, node);
         try names_storage.updateNameOwner(self.database, node, owner);
     }
@@ -417,7 +414,6 @@ pub fn handleV1FusesSet(self: *Indexer, chain: models.Chain, log: rpc.Log) !void
     if (self.write_buffer.active) {
         try self.write_buffer.updateNameWrapperFuses(node, fuses);
     } else {
-
         try names_storage.updateNameWrapperFuses(self.database, node, fuses);
     }
 
@@ -600,7 +596,7 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, chain: models.Chain, 
             .parent_name = "eth",
             .parent_namehash = eth_node,
             .chain = chain,
-            .registry = self.config.l1_contracts.ens_registry, // ENS Registry, not Base Registrar!
+            .registry = self.config.v1_contracts.ens_registry, // ENS Registry, not Base Registrar!
             .owner = owner,
             .registrant = owner, // Original registrant from V1 NameRegistered
             .resolver = Address.zero, // Will be updated when resolver is set
@@ -770,7 +766,6 @@ pub fn handleV1ControllerRemoved(self: *Indexer, chain: models.Chain, log: rpc.L
 /// NameRegistered(string name, bytes32 indexed label, address indexed owner, uint256 baseCost, uint256 premium, uint256 expires)
 pub fn handleV1ETHControllerNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
 
-
     // topics[0] = event signature
     // topics[1] = indexed label (bytes32)
     // topics[2] = indexed owner (address)
@@ -843,7 +838,6 @@ pub fn handleV1ETHControllerNameRegistered(self: *Indexer, chain: models.Chain, 
 /// Handle V1 ETH Registrar Controller NameRenewed event
 /// NameRenewed(string name, bytes32 indexed label, uint256 cost, uint256 expires)
 pub fn handleV1ETHControllerNameRenewed(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
-
 
     // topics[0] = event signature
     // topics[1] = indexed label (bytes32)

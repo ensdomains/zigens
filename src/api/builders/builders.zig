@@ -10,7 +10,6 @@
 /// - buildRegistrationJson: Build JSON for Registration entities
 /// - buildAccountJson: Build JSON for Account entities
 /// - buildResolverJson: Build JSON for Resolver entities
-
 const impl = @import("impl.zig");
 
 // Re-export all public functions and types

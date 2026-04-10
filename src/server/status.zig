@@ -123,7 +123,8 @@ pub const StatusServer = struct {
         const html = try generateHTML(self.allocator, self.status);
         defer self.allocator.free(html);
 
-        const response = try std.fmt.allocPrint(self.allocator,
+        const response = try std.fmt.allocPrint(
+            self.allocator,
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\n\r\n{s}",
             .{ html.len, html },
         );
@@ -136,7 +137,8 @@ pub const StatusServer = struct {
         const json = try generateJSON(self.allocator, self.status);
         defer self.allocator.free(json);
 
-        const response = try std.fmt.allocPrint(self.allocator,
+        const response = try std.fmt.allocPrint(
+            self.allocator,
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {d}\r\n\r\n{s}",
             .{ json.len, json },
         );
@@ -147,7 +149,8 @@ pub const StatusServer = struct {
 
     fn serve404(self: *StatusServer, stream: std.net.Stream) !void {
         const body = "404 Not Found\n";
-        const response = try std.fmt.allocPrint(self.allocator,
+        const response = try std.fmt.allocPrint(
+            self.allocator,
             "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\n\r\n{s}",
             .{ body.len, body },
         );
