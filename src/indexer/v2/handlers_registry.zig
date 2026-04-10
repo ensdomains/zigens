@@ -1426,7 +1426,7 @@ pub fn handleEACRolesGranted(self: *Indexer, chain: models.Chain, log: rpc.Log) 
 /// Handle LabelRegistered events from PermissionedRegistry
 /// Event: LabelRegistered(uint256 indexed tokenId, bytes32 indexed labelHash, string label, address owner, uint64 expiry, address indexed sender)
 pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
-    if (log.topics.len < 3) return error.InvalidTopicCount;
+    if (log.topics.len < 4) return error.InvalidTopicCount;
 
     const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
     const token_id: u256 = token_id_raw;
@@ -1434,6 +1434,7 @@ pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) 
     const canonical_id = token_id_utils.getCanonicalId(token_id);
 
     const label_hash = Hash{ .bytes = log.topics[2].bytes };
+    const sender = try abi.ABI.decodeAddress(&log.topics[3].bytes, 0);
 
     const label_str = try abi.ABI.decodeString(self.allocator, log.data, 0);
     defer self.allocator.free(label_str);
@@ -1444,8 +1445,7 @@ pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) 
     };
 
     const owner = try abi.ABI.decodeAddress(log.data, 32);
-    const expiry: u64 = @truncate(try abi.ABI.decodeUint256(log.data, 52));
-    const sender = try abi.ABI.decodeAddress(log.data, 84);
+    const expiry: u64 = @truncate(try abi.ABI.decodeUint256(log.data, 64));
 
     std.log.debug("LabelRegistered: {s} (tokenId={d}, canonicalId={d}, owner={any}, expiry={d}, sender={any})", .{ label_str, token_id, canonical_id, owner, expiry, sender });
 
@@ -1467,6 +1467,9 @@ pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) 
             \\LIMIT 1
         );
         defer rq.deinit();
+        try rq.bindText(registry_hex);
+        try rq.bindText(chain.toString());
+        try rq.bindInt64(@intCast(log.block_number));
 
         if (try rq.step()) {
             if (rq.getTextSlice(0)) |name_span| {
@@ -1569,12 +1572,13 @@ pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) 
 /// Handle LabelReserved events from PermissionedRegistry (when owner == 0)
 /// Event: LabelReserved(uint256 indexed tokenId, bytes32 indexed labelHash, string label, uint64 expiry, address indexed sender)
 pub fn handleLabelReserved(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
-    if (log.topics.len < 3) return error.InvalidTopicCount;
+    if (log.topics.len < 4) return error.InvalidTopicCount;
 
     const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
     const token_id: u256 = token_id_raw;
 
     const label_hash = Hash{ .bytes = log.topics[2].bytes };
+    const sender = try abi.ABI.decodeAddress(&log.topics[3].bytes, 0);
 
     const label_str = try abi.ABI.decodeString(self.allocator, log.data, 0);
     defer self.allocator.free(label_str);
@@ -1585,7 +1589,6 @@ pub fn handleLabelReserved(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
     };
 
     const expiry: u64 = @truncate(try abi.ABI.decodeUint256(log.data, 32));
-    const sender = try abi.ABI.decodeAddress(log.data, 64);
 
     std.log.debug("LabelReserved: {s} (tokenId={d}, expiry={d}, sender={any})", .{ label_str, token_id, expiry, sender });
 
@@ -1607,6 +1610,9 @@ pub fn handleLabelReserved(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
             \\LIMIT 1
         );
         defer rq.deinit();
+        try rq.bindText(registry_hex);
+        try rq.bindText(chain.toString());
+        try rq.bindInt64(@intCast(log.block_number));
 
         if (try rq.step()) {
             if (rq.getTextSlice(0)) |name_span| {
@@ -1692,12 +1698,12 @@ pub fn handleLabelReserved(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
 /// Handle LabelUnregistered events from PermissionedRegistry
 /// Event: LabelUnregistered(uint256 indexed tokenId, address indexed sender)
 pub fn handleLabelUnregistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
-    if (log.topics.len < 2) return error.InvalidTopicCount;
+    if (log.topics.len < 3) return error.InvalidTopicCount;
 
     const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
     const token_id: u256 = token_id_raw;
 
-    const sender = try abi.ABI.decodeAddress(log.data, 0);
+    const sender = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
 
     std.log.debug("LabelUnregistered: tokenId={d}, sender={any}", .{ token_id, sender });
 
@@ -1733,7 +1739,7 @@ pub fn handleLabelUnregistered(self: *Indexer, chain: models.Chain, log: rpc.Log
 /// Handle ExpiryUpdated events from PermissionedRegistry (replaces NameRenewed)
 /// Event: ExpiryUpdated(uint256 indexed tokenId, uint64 indexed newExpiry, address indexed sender)
 pub fn handleExpiryUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
-    if (log.topics.len < 3) return error.InvalidTopicCount;
+    if (log.topics.len < 4) return error.InvalidTopicCount;
 
     const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
     const token_id: u256 = token_id_raw;
@@ -1741,7 +1747,7 @@ pub fn handleExpiryUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
     const new_expiry_raw = try abi.ABI.decodeUint256(&log.topics[2].bytes, 0);
     const new_expiry: u64 = @truncate(new_expiry_raw);
 
-    const sender = try abi.ABI.decodeAddress(log.data, 0);
+    const sender = try abi.ABI.decodeAddress(&log.topics[3].bytes, 0);
 
     std.log.debug("ExpiryUpdated: tokenId={d}, newExpiry={d}, sender={any}", .{ token_id, new_expiry, sender });
 
@@ -1778,14 +1784,13 @@ pub fn handleExpiryUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
 /// Handle ParentUpdated events from PermissionedRegistry
 /// Event: ParentUpdated(IRegistry indexed parent, string label, address indexed sender)
 pub fn handleParentUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
-    if (log.topics.len < 2) return error.InvalidTopicCount;
+    if (log.topics.len < 3) return error.InvalidTopicCount;
 
     const parent_addr = try abi.ABI.decodeAddress(&log.topics[1].bytes, 0);
+    const sender = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
 
     const label_str = try abi.ABI.decodeString(self.allocator, log.data, 0);
     defer self.allocator.free(label_str);
-
-    const sender = try abi.ABI.decodeAddress(log.data, 32);
 
     std.log.debug("ParentUpdated: parent={any}, label={s}, sender={any}", .{ parent_addr, label_str, sender });
 
@@ -1812,7 +1817,7 @@ pub fn handleParentUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
 /// Event: SubregistryUpdated(uint256 indexed tokenId, IRegistry indexed subregistry, address indexed sender)
 /// Note: Different from SubregistryUpdate - uses indexed IRegistry instead of non-indexed address
 pub fn handleSubregistryUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
-    if (log.topics.len < 3) return error.InvalidTopicCount;
+    if (log.topics.len < 4) return error.InvalidTopicCount;
 
     const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
     const token_id: u256 = token_id_raw;
@@ -1820,7 +1825,7 @@ pub fn handleSubregistryUpdated(self: *Indexer, chain: models.Chain, log: rpc.Lo
     const canonical_id = token_id_utils.getCanonicalId(token_id);
 
     const subregistry_addr = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
-    const sender = try abi.ABI.decodeAddress(log.data, 0);
+    const sender = try abi.ABI.decodeAddress(&log.topics[3].bytes, 0);
 
     std.log.debug("SubregistryUpdated: tokenId={d}, canonicalId={d}, subregistry={any}, sender={any}", .{ token_id, canonical_id, subregistry_addr, sender });
 
@@ -1878,15 +1883,20 @@ pub fn handleSubregistryUpdated(self: *Indexer, chain: models.Chain, log: rpc.Lo
 /// Event: ResolverUpdated(uint256 indexed tokenId, address indexed resolver, address indexed sender)
 /// Note: Different from ResolverUpdate - uses indexed address
 pub fn handleResolverUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
-    if (log.topics.len < 3) return error.InvalidTopicCount;
+    if (log.topics.len < 4) return error.InvalidTopicCount;
 
     const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
     const token_id: u256 = token_id_raw;
 
     const resolver_addr = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
-    const sender = try abi.ABI.decodeAddress(log.data, 0);
+    const sender = try abi.ABI.decodeAddress(&log.topics[3].bytes, 0);
 
     std.log.debug("ResolverUpdated: tokenId={d}, resolver={any}, sender={any}", .{ token_id, resolver_addr, sender });
+
+    // Register the resolver for record indexing
+    const resolver_hex = try resolver_addr.toHex(self.allocator);
+    defer self.allocator.free(resolver_hex);
+    try self.database.registerResolver(chain, resolver_hex, log.block_number);
 
     const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
 
@@ -1904,8 +1914,6 @@ pub fn handleResolverUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) 
     }
     defer self.allocator.free(name_str);
 
-    const resolver_hex = try resolver_addr.toHex(self.allocator);
-    defer self.allocator.free(resolver_hex);
     const sender_hex = try sender.toHex(self.allocator);
     defer self.allocator.free(sender_hex);
 

@@ -40,9 +40,9 @@ pub fn indexDatastoreEvents(self: *Indexer, chain: models.Chain, client: *rpc.Cl
         try self.handleSubregistryUpdate(chain, log);
     }
 
-    // Process SubregistryUpdated events (NEW signature)
+    // Process SubregistryUpdated events (NEW signature — all indexed, empty data)
     for (batch_results[1]) |log| {
-        try self.handleSubregistryUpdate(chain, log);
+        try self.handleSubregistryUpdated(chain, log);
     }
 
     // Process ResolverUpdate events (OLD signature)
@@ -50,9 +50,9 @@ pub fn indexDatastoreEvents(self: *Indexer, chain: models.Chain, client: *rpc.Cl
         try self.handleResolverUpdate(chain, log);
     }
 
-    // Process ResolverUpdated events (NEW signature)
+    // Process ResolverUpdated events (NEW signature — all indexed, empty data)
     for (batch_results[3]) |log| {
-        try self.handleResolverUpdate(chain, log);
+        try self.handleResolverUpdated(chain, log);
     }
 }
 
@@ -945,16 +945,16 @@ pub fn indexPhase1V2Events(self: *Indexer, chain: models.Chain, client: *rpc.Cli
 
         // Process Datastore events (same order as sequential indexDatastoreEvents)
         for (results[N_REG + N_REGISTRAR + 0]) |log| {
-            try self.handleSubregistryUpdate(chain, log);
+            try self.handleSubregistryUpdate(chain, log); // OLD signature (data has address)
         }
         for (results[N_REG + N_REGISTRAR + 1]) |log| {
-            try self.handleSubregistryUpdate(chain, log);
+            try self.handleSubregistryUpdated(chain, log); // NEW signature (all indexed)
         }
         for (results[N_REG + N_REGISTRAR + 2]) |log| {
-            try self.handleResolverUpdate(chain, log);
+            try self.handleResolverUpdate(chain, log); // OLD signature (data has address)
         }
         for (results[N_REG + N_REGISTRAR + 3]) |log| {
-            try self.handleResolverUpdate(chain, log);
+            try self.handleResolverUpdated(chain, log); // NEW signature (all indexed)
         }
     } else {
         // L1: No ETH Registrar

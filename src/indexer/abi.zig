@@ -31,16 +31,16 @@ pub const EventSignatures = struct {
     pub const subregistry_update = "SubregistryUpdate(uint256,address)";
     pub const subregistry_update_hash: Hash = eventHash(subregistry_update);
 
-    /// SubregistryUpdated(uint256 indexed id, address subregistry) - NEW signature (current deployment)
-    pub const subregistry_updated = "SubregistryUpdated(uint256,address)";
+    /// SubregistryUpdated(uint256 indexed id, address indexed subregistry, address indexed sender) - NEW signature (current deployment)
+    pub const subregistry_updated = "SubregistryUpdated(uint256,address,address)";
     pub const subregistry_updated_hash: Hash = eventHash(subregistry_updated);
 
     /// ResolverUpdate(uint256 indexed id, address resolver) - OLD signature (pre-deployment)
     pub const resolver_update = "ResolverUpdate(uint256,address)";
     pub const resolver_update_hash: Hash = eventHash(resolver_update);
 
-    /// ResolverUpdated(uint256 indexed id, address resolver) - NEW signature (current deployment)
-    pub const resolver_updated = "ResolverUpdated(uint256,address)";
+    /// ResolverUpdated(uint256 indexed id, address indexed resolver, address indexed sender) - NEW signature (current deployment)
+    pub const resolver_updated = "ResolverUpdated(uint256,address,address)";
     pub const resolver_updated_hash: Hash = eventHash(resolver_updated);
 
     /// TokenRegenerated(uint256 oldTokenId, uint256 newTokenId) - OLD signature (2 params)
