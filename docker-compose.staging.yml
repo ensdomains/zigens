@@ -1,0 +1,100 @@
+# ENSv2 Staging Indexer + GraphQL API
+# Usage: docker compose -f docker-compose.staging.yml up -d
+
+services:
+  # V2 Indexer (Staging)
+  indexer-v2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ensv2-indexer-v2-staging
+    restart: unless-stopped
+    command: ["/app/ensv2-indexer-v2"]
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - ens-data-staging:/app/data
+      - webhook-data-staging:/app/webhooks
+    environment:
+      - DATABASE_PATH=/app/data/ens_staging.db
+      - RAINBOW_PATH=/app/data/ens_rainbow.db
+      - DOWNLOAD_RAINBOW=true
+      - RPC_URL=${RPC_URL}
+      - NETWORK=${NETWORK:-sepolia}
+      - BATCH_SIZE=10000
+      - POLL_INTERVAL=12
+      - RATE_LIMIT_PER_SECOND=25
+      - STATUS_PORT=3002
+      - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
+      - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
+      - WEBHOOK_MAX_RETRIES=${WEBHOOK_MAX_RETRIES:-3}
+    healthcheck:
+      test: ["CMD", "/app/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - ens-network-staging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # GraphQL API Server (Staging)
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ensv2-api-staging
+    restart: unless-stopped
+    command: ["/app/api-entrypoint.sh"]
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "5656:5656"
+    volumes:
+      - ens-data-staging:/app/data:ro
+      - webhook-data-staging:/app/webhooks
+    environment:
+      - DATABASE_PATH=/app/data/ens_staging.db
+      - RAINBOW_PATH=/app/data/ens_rainbow.db
+      - DOWNLOAD_RAINBOW=false
+      - API_PORT=5656
+      - GRAPHQL_MAX_DEPTH=10
+      - GRAPHQL_MAX_COST=1000
+      - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
+      - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
+      - WEBHOOK_ADMIN_USERNAME=${WEBHOOK_ADMIN_USERNAME:-}
+      - WEBHOOK_ADMIN_PASSWORD=${WEBHOOK_ADMIN_PASSWORD:-}
+      - METRICS_ENABLED=false
+    depends_on:
+      - indexer-v2
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:5656/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - ens-network-staging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  ens-network-staging:
+    driver: bridge
+
+volumes:
+  ens-data-staging:
+    driver: local
+  webhook-data-staging:
+    driver: local
