@@ -411,8 +411,12 @@ pub const Indexer = struct {
         return if (chain == .v1) self.config.v1_contracts.registry_datastore else self.config.v2_contracts.l2_registry_datastore;
     }
 
-    pub inline fn getBridgeController(self: *Indexer, chain: models.Chain) Address {
-        return if (chain == .v1) self.config.v1_contracts.l1_bridge_controller else self.config.v2_contracts.l2_bridge_controller;
+    /// Check if an address is one of the migration controllers (V1→V2).
+    /// Used to detect that a LabelRegistered event was triggered by migration.
+    pub inline fn isMigrationController(self: *Indexer, addr: Address) bool {
+        const contracts = self.config.v1_contracts; // same for v1/v2 config
+        return (!contracts.locked_migration_controller.isZero() and addr.eql(contracts.locked_migration_controller)) or
+            (!contracts.unlocked_migration_controller.isZero() and addr.eql(contracts.unlocked_migration_controller));
     }
 
     pub inline fn getClient(self: *Indexer, chain: models.Chain) *rpc.Client {
@@ -503,6 +507,9 @@ pub const Indexer = struct {
         // NEW: TokenRegenerated V2 with 3 params (oldTokenId, newTokenId, flags) - current Sepolia deployment
         .{ .event_hash = abi.EventSignatures.token_regenerated_v2_hash, .handler = handleTokenRegenerated, .name = "TokenRegeneratedV2" },
         .{ .event_hash = abi.EventSignatures.eac_roles_changed_hash, .handler = handleEACRolesChanged, .name = "EACRolesChanged" },
+        // LabelRegistered on the main ETH Registry happens during V1→V2 migration
+        // (migration controllers call ETHRegistry directly, not through a subregistry)
+        .{ .event_hash = abi.EventSignatures.label_registered_hash, .handler = handleLabelRegistered, .name = "LabelRegistered" },
     };
 
     pub const ETH_REGISTRAR_EVENTS = [_]RegistryEventConfig{
@@ -972,12 +979,10 @@ pub const Indexer = struct {
             try self.indexSubregistryEvents(chain, client, from_block, to_block);
             try self.processRemainingOrphans(chain);
 
-            // Phase 3: Transfer + Ejection events (depends on names existing)
+            // Phase 3: Transfer + Observer events (depends on names existing)
+            // Note: V1→V2 migration is detected in handleLabelRegistered via sender address
             try self.indexTransferEvents(chain, client, from_block, to_block);
-            if (chain == .v1) {
-                try self.indexMigrationEvents(client, from_block, to_block);
-            }
-            try self.indexEjectionEvents(chain, client, from_block, to_block);
+            try self.indexTokenObserverEvents(chain, client, from_block, to_block);
 
             // Phase 4: Resolver events (depends on names + resolvers being set)
             try self.indexResolverEvents(chain, client, from_block, to_block);
@@ -991,8 +996,7 @@ pub const Indexer = struct {
     pub const indexETHRegistrarEvents = event_fetchers.indexETHRegistrarEvents;
     pub const indexSubregistryEvents = event_fetchers.indexSubregistryEvents;
     pub const indexTransferEvents = event_fetchers.indexTransferEvents;
-    pub const indexMigrationEvents = event_fetchers.indexMigrationEvents;
-    pub const indexEjectionEvents = event_fetchers.indexEjectionEvents;
+    pub const indexTokenObserverEvents = event_fetchers.indexTokenObserverEvents;
     pub const indexResolverEvents = event_fetchers.indexResolverEvents;
 
     // V2 registry handlers (extracted to handlers_v2_registry.zig)
@@ -1038,9 +1042,6 @@ pub const Indexer = struct {
     pub const handleResolverEACRolesChanged = handlers_v2_resolver.handleResolverEACRolesChanged;
 
     // V2 chain sync handlers (extracted to handlers_v2_chain.zig)
-    pub const handleNameEjectedToL1 = handlers_v2_chain.handleNameEjectedToL1;
-    pub const handleNameEjectedToL2 = handlers_v2_chain.handleNameEjectedToL2;
-    pub const handleRenewalSynchronized = handlers_v2_chain.handleRenewalSynchronized;
     pub const handleTokenObserverSet = handlers_v2_chain.handleTokenObserverSet;
 
     // V1 event handlers (extracted to handlers_v1.zig)

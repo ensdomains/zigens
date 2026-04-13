@@ -510,109 +510,31 @@ pub fn indexTransferEvents(self: *Indexer, chain: models.Chain, client: *rpc.Cli
     }
 }
 
-pub fn indexMigrationEvents(_: *Indexer, _: *rpc.Client, _: u64, _: u64) !void {
-    // Migration events from L1 migration contract
-    // This would track ENSv1 -> ENSv2 migrations
-    // TODO: Implement when migration event signatures are defined
-}
-
-pub fn indexEjectionEvents(self: *Indexer, chain: models.Chain, client: *rpc.Client, from_block: u64, to_block: u64) !void {
-    // Get the appropriate bridge controller contract address
-    const bridge_addr = self.getBridgeController(chain);
+/// Index TokenObserverSet events from the V2 registry contract.
+/// Migration detection (V1→V2) is handled in handleLabelRegistered by checking
+/// if the sender is a migration controller — no separate event fetching needed.
+pub fn indexTokenObserverEvents(self: *Indexer, chain: models.Chain, client: *rpc.Client, from_block: u64, to_block: u64) !void {
     const registry_addr = self.getEthRegistry(chain);
 
-    // Skip bridge events if bridge contract is not configured (zero address)
-    if (!bridge_addr.isZero()) {
-        // Topics for bridge events
-        const topics_ejected_l1 = [_]?Hash{abi.EventSignatures.name_ejected_to_l1_hash};
-        const topics_ejected_l2 = [_]?Hash{abi.EventSignatures.name_ejected_to_l2_hash};
-        const topics_renewal_sync = [_]?Hash{abi.EventSignatures.renewal_synchronized_hash};
-
-        // Build batch request for bridge events (2-3 calls → 1 batch depending on chain)
-        if (chain == .v1) {
-            // V1: Include RenewalSynchronized
-            const batch_requests = [_]rpc.Client.BatchGetLogsRequest{
-                .{ .from_block = from_block, .to_block = to_block, .address = bridge_addr, .topics = &topics_ejected_l1 },
-                .{ .from_block = from_block, .to_block = to_block, .address = bridge_addr, .topics = &topics_ejected_l2 },
-                .{ .from_block = from_block, .to_block = to_block, .address = bridge_addr, .topics = &topics_renewal_sync },
-            };
-
-            const batch_results = try client.getLogsBatch(&batch_requests);
-            defer utils.deinitBatchResults(self.allocator, batch_results);
-
-            for (batch_results[0]) |log| {
-                try self.handleNameEjectedToL1(chain, log);
-            }
-            for (batch_results[1]) |log| {
-                try self.handleNameEjectedToL2(chain, log);
-            }
-            for (batch_results[2]) |log| {
-                try self.handleRenewalSynchronized(chain, log);
-            }
-
-            const bridge_total = batch_results[0].len + batch_results[1].len + batch_results[2].len;
-            if (bridge_total > 0) {
-                std.log.info("Found {d} bridge event{s} from {s} ({d} EjectedToL1, {d} EjectedToL2, {d} RenewalSync)", .{
-                    bridge_total,
-                    if (bridge_total == 1) "" else "s",
-                    chain.toString(),
-                    batch_results[0].len,
-                    batch_results[1].len,
-                    batch_results[2].len,
-                });
-            }
-        } else {
-            // L2: No RenewalSynchronized
-            const batch_requests = [_]rpc.Client.BatchGetLogsRequest{
-                .{ .from_block = from_block, .to_block = to_block, .address = bridge_addr, .topics = &topics_ejected_l1 },
-                .{ .from_block = from_block, .to_block = to_block, .address = bridge_addr, .topics = &topics_ejected_l2 },
-            };
-
-            const batch_results = try client.getLogsBatch(&batch_requests);
-            defer utils.deinitBatchResults(self.allocator, batch_results);
-
-            for (batch_results[0]) |log| {
-                try self.handleNameEjectedToL1(chain, log);
-            }
-            for (batch_results[1]) |log| {
-                try self.handleNameEjectedToL2(chain, log);
-            }
-
-            const bridge_total = batch_results[0].len + batch_results[1].len;
-            if (bridge_total > 0) {
-                std.log.info("Found {d} bridge event{s} from {s} ({d} EjectedToL1, {d} EjectedToL2)", .{
-                    bridge_total,
-                    if (bridge_total == 1) "" else "s",
-                    chain.toString(),
-                    batch_results[0].len,
-                    batch_results[1].len,
-                });
-            }
+    const topics = [_]?Hash{abi.EventSignatures.token_observer_set_hash};
+    const logs = try client.getLogs(from_block, to_block, registry_addr, &topics);
+    defer {
+        for (logs) |*log| {
+            log.deinit(self.allocator);
         }
+        self.allocator.free(logs);
     }
 
-    // TokenObserverSet events (from registry contract - separate batch)
-    {
-        const topics = [_]?Hash{abi.EventSignatures.token_observer_set_hash};
-        const logs = try client.getLogs(from_block, to_block, registry_addr, &topics);
-        defer {
-            for (logs) |*log| {
-                log.deinit(self.allocator);
-            }
-            self.allocator.free(logs);
-        }
+    if (logs.len > 0) {
+        std.log.info("Found {d} TokenObserverSet event{s} from {s}", .{
+            logs.len,
+            if (logs.len == 1) "" else "s",
+            chain.toString(),
+        });
+    }
 
-        if (logs.len > 0) {
-            std.log.info("Found {d} TokenObserverSet event{s} from {s}", .{
-                logs.len,
-                if (logs.len == 1) "" else "s",
-                chain.toString(),
-            });
-        }
-
-        for (logs) |log| {
-            try self.handleTokenObserverSet(chain, log);
-        }
+    for (logs) |log| {
+        try self.handleTokenObserverSet(chain, log);
     }
 }
 

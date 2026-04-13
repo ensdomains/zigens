@@ -48,6 +48,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
     var filter_expiry_gte: ?i64 = null;
     var filter_expiry_lt: ?i64 = null;
     var filter_expiry_lte: ?i64 = null;
+    var filter_migrated: ?bool = null;
 
     // Look for "where" argument
     for (field.arguments) |arg| {
@@ -127,6 +128,10 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
                         if (filter_arg.value == .int) {
                             filter_expiry_lte = filter_arg.value.int;
                         }
+                    } else if (std.mem.eql(u8, filter_arg.name, "isMigrated")) {
+                        if (filter_arg.value == .boolean) {
+                            filter_migrated = filter_arg.value.boolean;
+                        }
                     }
                 }
             }
@@ -198,7 +203,8 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
         filter_resolved_address != null or filter_resolver != null or filter_has_subdomains != null or
         filter_subdomain_count_gt != null or filter_subdomain_count_lt != null or
         filter_expiry_gt != null or filter_expiry_gte != null or
-        filter_expiry_lt != null or filter_expiry_lte != null;
+        filter_expiry_lt != null or filter_expiry_lte != null or
+        filter_migrated != null;
 
     // All filters pushed to DB - no need to over-fetch
     const fetch_limit: u32 = @intCast(first);
@@ -223,6 +229,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
             .expiry_lte = filter_expiry_lte,
             .resolved_address = filter_resolved_address,
             .resolver = filter_resolver,
+            .migrated = filter_migrated,
             .has_subdomains = filter_has_subdomains,
             .subdomain_count_gt = filter_subdomain_count_gt,
             .subdomain_count_lt = filter_subdomain_count_lt,
