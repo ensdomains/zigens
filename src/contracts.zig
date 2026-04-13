@@ -44,9 +44,10 @@ pub const ContractAddresses = struct {
     l2_eth_registrar: Address,
     l2_registry_datastore: Address,
 
-    // Bridge Contracts
-    l1_bridge_controller: Address,
-    l2_bridge_controller: Address,
+    // Migration Contracts (V1→V2)
+    migration_helper: Address, // V1 side: initiates migration by transferring tokens
+    locked_migration_controller: Address, // V2 side: receives locked/wrapped names
+    unlocked_migration_controller: Address, // V2 side: receives unlocked/unwrapped names
 
     // Deployment blocks for efficient sync start
     v1_deployment_block: u64,
@@ -92,9 +93,10 @@ fn sepoliaAddresses() ContractAddresses {
         .l2_eth_registrar = Address.fromHex("0x68586418353b771cf2425ed14a07512aa880c532") catch unreachable,
         .l2_registry_datastore = Address.fromHex("0x2a1d9588f3931fc7495867c82cd0d78cfb144945") catch unreachable,
 
-        // Bridge Contracts (V2 deployment)
-        .l1_bridge_controller = Address.fromHex("0xf951f03ad34d000af619da491cf369b7992a6f72") catch unreachable,
-        .l2_bridge_controller = Address.fromHex("0xbb84d5d658bbdb48bf99689f3a14f780ab2f9220") catch unreachable,
+        // Migration Contracts (V1→V2, Sepolia deployment)
+        .migration_helper = Address.fromHex("0x8fa8b82a70e400ba99423c8f76cc2cead2adc590") catch unreachable,
+        .locked_migration_controller = Address.fromHex("0x22cd7e6a89f5bf4510ef22b3dd4ef190d22f95c3") catch unreachable,
+        .unlocked_migration_controller = Address.fromHex("0x76ae358d9ad91651b78463ae609dadc9e7ce4402") catch unreachable,
 
         // Deployment blocks (verified from on-chain)
         // For Sepolia testnet, these are the actual deployment blocks
@@ -136,9 +138,10 @@ fn mainnetAddresses() ContractAddresses {
         .l2_eth_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
         .l2_registry_datastore = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
 
-        // Bridge Contracts (Not yet deployed)
-        .l1_bridge_controller = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .l2_bridge_controller = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
+        // Migration Contracts (Not yet deployed on mainnet)
+        .migration_helper = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
+        .locked_migration_controller = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
+        .unlocked_migration_controller = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
 
         // Deployment blocks
         // ENS Registry + Temporary Registrar deployed in block 3327417 (May 2017)

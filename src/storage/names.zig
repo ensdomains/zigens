@@ -755,6 +755,8 @@ pub const NameFilters = struct {
     resolved_address: ?Address = null,
     // Resolver contract address filter
     resolver: ?Address = null,
+    // Migration filter
+    migrated: ?bool = null,
     // Subdomain filters (requires subquery)
     has_subdomains: ?bool = null,
     subdomain_count_gt: ?i64 = null,
@@ -836,6 +838,15 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
     // Resolver contract address filter
     if (filters.resolver != null) {
         try conditions.append(db.allocator, "resolver = ?");
+    }
+
+    // Migration filter
+    if (filters.migrated) |m| {
+        if (m) {
+            try conditions.append(db.allocator, "migrated = 1");
+        } else {
+            try conditions.append(db.allocator, "migrated = 0");
+        }
     }
 
     // Subdomain count filters (using subquery)
@@ -1094,6 +1105,13 @@ pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
     }
     if (filters.resolver != null) {
         try conditions.append(db.allocator, "resolver = ?");
+    }
+    if (filters.migrated) |m| {
+        if (m) {
+            try conditions.append(db.allocator, "migrated = 1");
+        } else {
+            try conditions.append(db.allocator, "migrated = 0");
+        }
     }
     if (filters.has_subdomains) |has_subs| {
         if (has_subs) {

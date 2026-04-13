@@ -1447,7 +1447,10 @@ pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) 
     const owner = try abi.ABI.decodeAddress(log.data, 32);
     const expiry: u64 = @truncate(try abi.ABI.decodeUint256(log.data, 64));
 
-    std.log.debug("LabelRegistered: {s} (tokenId={d}, canonicalId={d}, owner={any}, expiry={d}, sender={any})", .{ label_str, token_id, canonical_id, owner, expiry, sender });
+    // Detect if this registration was triggered by a migration controller (V1→V2 migration)
+    const is_migration = self.isMigrationController(sender);
+
+    std.log.debug("LabelRegistered: {s} (tokenId={d}, canonicalId={d}, owner={any}, expiry={d}, sender={any}, migrated={any})", .{ label_str, token_id, canonical_id, owner, expiry, sender, is_migration });
 
     const eth_registry = self.getEthRegistry(chain);
     const is_main_registry = log.address.eql(eth_registry);
@@ -1528,7 +1531,7 @@ pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) 
         .namehash = namehash_val,
         .expiry = expiry,
         .registry_locked = false,
-        .migrated = false,
+        .migrated = is_migration,
         .ejected = false,
         .created_block = log.block_number,
         .created_at = 0,
@@ -1543,6 +1546,10 @@ pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) 
     };
 
     try self.database.insertName(name);
+
+    if (is_migration) {
+        std.log.info("Migration detected: {s} migrated from V1→V2 (sender={any})", .{ full_name, sender });
+    }
 
     const owner_hex = try owner.toHex(self.allocator);
     defer self.allocator.free(owner_hex);
