@@ -368,6 +368,7 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
     var filter_expiry_gte: ?i64 = null;
     var filter_expiry_lt: ?i64 = null;
     var filter_expiry_lte: ?i64 = null;
+    var filter_migrated: ?bool = null;
 
     for (field.arguments) |arg| {
         if (std.mem.eql(u8, arg.name, "where") and arg.value == .object) {
@@ -445,6 +446,10 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
                     if (filter_arg.value == .int) {
                         filter_expiry_lte = filter_arg.value.int;
                     }
+                } else if (std.mem.eql(u8, filter_arg.name, "isMigrated")) {
+                    if (filter_arg.value == .boolean) {
+                        filter_migrated = filter_arg.value.boolean;
+                    }
                 }
             }
             break;
@@ -466,6 +471,7 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         .expiry_lte = filter_expiry_lte,
         .resolved_address = filter_resolved_address,
         .resolver = filter_resolver,
+        .migrated = filter_migrated,
         .has_subdomains = filter_has_subdomains,
         .subdomain_count_gt = filter_subdomain_count_gt,
         .subdomain_count_lt = filter_subdomain_count_lt,
@@ -477,7 +483,8 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         filter_resolved_address != null or filter_resolver != null or filter_has_subdomains != null or
         filter_subdomain_count_gt != null or filter_subdomain_count_lt != null or
         filter_expiry_gt != null or filter_expiry_gte != null or
-        filter_expiry_lt != null or filter_expiry_lte != null;
+        filter_expiry_lt != null or filter_expiry_lte != null or
+        filter_migrated != null;
 
     // Extract node selections from query: domainConnection { edges { node { ... } } }
     var node_selections: []const parser.Field = &[_]parser.Field{};
