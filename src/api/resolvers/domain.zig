@@ -486,6 +486,23 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         filter_expiry_lt != null or filter_expiry_lte != null or
         filter_migrated != null;
 
+    // Check which top-level fields are requested
+    var wants_edges = false;
+    var wants_page_info = false;
+    var wants_total_count = false;
+    for (field.selections) |*sel| {
+        if (std.mem.eql(u8, sel.name, "edges")) wants_edges = true;
+        if (std.mem.eql(u8, sel.name, "pageInfo")) wants_page_info = true;
+        if (std.mem.eql(u8, sel.name, "totalCount")) wants_total_count = true;
+    }
+
+    // Fast path: only totalCount requested — skip row fetching entirely
+    if (wants_total_count and !wants_edges and !wants_page_info) {
+        const count = try database.getFilteredNameCount(name_filters);
+        const result = try std.fmt.allocPrint(allocator, "{{\"totalCount\":{d}}}", .{count});
+        return parser.FieldResult{ .json = result };
+    }
+
     // Extract node selections from query: domainConnection { edges { node { ... } } }
     var node_selections: []const parser.Field = &[_]parser.Field{};
     for (field.selections) |*sel| {
@@ -585,14 +602,7 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         };
     }
 
-    // Only compute total count when requested in the GraphQL selection
-    var wants_total_count = false;
-    for (field.selections) |*sel| {
-        if (std.mem.eql(u8, sel.name, "totalCount")) {
-            wants_total_count = true;
-            break;
-        }
-    }
+    // Compute total count if requested (wants_total_count determined above)
     const total_count: ?usize = if (wants_total_count)
         try database.getFilteredNameCount(name_filters)
     else
