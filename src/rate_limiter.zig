@@ -66,12 +66,4 @@ pub const RateLimiter = struct {
         }
     }
 
-    /// Wait for a specific number of tokens
-    pub fn acquireN(self: *RateLimiter, n: u32) void {
-        var acquired: u32 = 0;
-        while (acquired < n) {
-            self.acquire();
-            acquired += 1;
-        }
-    }
 };

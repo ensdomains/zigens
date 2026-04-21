@@ -127,7 +127,6 @@ pub fn createTestName(
         .expiry = 0,
         .registry_locked = false,
         .migrated = false,
-        .ejected = false,
         .created_block = 1000,
         .created_at = 1700000000,
         .registered_at = 1700000000,

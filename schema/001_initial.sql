@@ -64,7 +64,6 @@ CREATE TABLE IF NOT EXISTS names (
   expiry INTEGER,
   registry_locked INTEGER NOT NULL DEFAULT 0,
   migrated INTEGER NOT NULL DEFAULT 0,
-  ejected INTEGER NOT NULL DEFAULT 0,
   created_block INTEGER NOT NULL,
   created_at INTEGER NOT NULL,
   updated_block INTEGER NOT NULL,

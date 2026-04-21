@@ -21,14 +21,6 @@ pub const LabelSource = enum {
     }
 };
 
-pub const RainbowLabel = struct {
-    labelhash: Hash,
-    label: []const u8,
-    source: LabelSource,
-    first_seen_block: u64,
-    first_seen_tx: Hash,
-};
-
 /// Store a label in the rainbow table
 /// Silently ignores duplicates (INSERT OR IGNORE)
 pub fn storeLabel(

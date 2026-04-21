@@ -661,49 +661,6 @@ pub const WebhookManager = struct {
         return self.cleanupQueue(1, 7);
     }
 
-    /// Get queue statistics for monitoring
-    pub const QueueStats = struct {
-        pending: u32,
-        processing: u32,
-        delivered: u32,
-        failed: u32,
-    };
-
-    pub fn getQueueStats(self: *WebhookManager) !QueueStats {
-        self.db_mutex.lock();
-        defer self.db_mutex.unlock();
-
-        var stats = QueueStats{ .pending = 0, .processing = 0, .delivered = 0, .failed = 0 };
-
-        const sql =
-            \\SELECT status, COUNT(*) FROM webhook_queue GROUP BY status
-        ;
-        const sql_z = try self.allocator.dupeZ(u8, sql);
-        defer self.allocator.free(sql_z);
-
-        var stmt: ?*db.c.sqlite3_stmt = null;
-        if (db.c.sqlite3_prepare_v2(self.database.db, sql_z.ptr, -1, &stmt, null) != db.c.SQLITE_OK) {
-            return error.PrepareFailed;
-        }
-        defer _ = db.c.sqlite3_finalize(stmt);
-
-        while (db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW) {
-            const status = std.mem.span(db.c.sqlite3_column_text(stmt, 0));
-            const count: u32 = @intCast(db.c.sqlite3_column_int(stmt, 1));
-
-            if (std.mem.eql(u8, status, "pending")) {
-                stats.pending = count;
-            } else if (std.mem.eql(u8, status, "processing")) {
-                stats.processing = count;
-            } else if (std.mem.eql(u8, status, "delivered")) {
-                stats.delivered = count;
-            } else if (std.mem.eql(u8, status, "failed")) {
-                stats.failed = count;
-            }
-        }
-
-        return stats;
-    }
 };
 
 test "WebhookManager init" {

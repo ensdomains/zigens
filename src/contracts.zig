@@ -158,36 +158,3 @@ fn mainnetAddresses() ContractAddresses {
     };
 }
 
-// Event signatures for indexing
-pub const EventSignatures = struct {
-    // Temporary Registrar Events (Pre-V1 Migration, May 2017 - May 2019)
-    pub const AuctionStarted = "0x87e97e825a1d1fa0c54e1d36c7506c1dea8b1efd451fe68b000cf96f7cf40003"; // AuctionStarted(bytes32,uint256)
-    pub const NewBid = "0xb556ff269c1b6714f432c36431e2041d28436a73b6c3f19c021827bbdc6bfc29"; // NewBid(bytes32,address,uint256)
-    pub const BidRevealed = "0x11da1fd92a40ce5b493b2e24a1d5b9f7e6c49efaf592cc00e57e6ba5e04b2461"; // BidRevealed(bytes32,address,uint256,uint8)
-    pub const HashRegistered = "0x0f0c27adfd84b60b6f456b0e87cdccb1e5fb9603991588d87fa99f5b6b61e670"; // HashRegistered(bytes32,address,uint256,uint256)
-    pub const HashReleased = "0x292b79b9246fa2c8e77d3fe195b251f9cb839d7d038e667c069ee7708c631e16"; // HashReleased(bytes32,uint256)
-    pub const HashInvalidated = "0x1f9c649fe47e58bb60f4e52f0d90e4c47a526c9f90c5113df842c025353a6766"; // HashInvalidated(bytes32,string,uint256,uint256)
-
-    // V1 Events
-    pub const NewOwner = "0xce0457fe73731f824cc272376169235128c118b49d344817417c6d108d155e82"; // NewOwner(bytes32,bytes32,address)
-    pub const Transfer = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"; // Transfer(address,address,uint256)
-    pub const NameRegistered = "0x69e37f151eb98a09618ddaa80c8cfaf1ce5996867c489f45b555d412271ebf27"; // NameRegistered(string,bytes32,address,uint256,uint256)
-    pub const NameRenewed = "0x3da24c024582931cfaf8267d8ed24d13a82a8068d5bd337d30ec45cea4e506ae"; // NameRenewed(string,bytes32,uint256,uint256)
-
-    // V2 Registry Events (OLD signatures - pre-deployment)
-    pub const SubregistryUpdate = "0x335721b01866dc23fbee8b6b2c7b1e14d6f05c28cd35a2c934239f94095602a0"; // SubregistryUpdate(uint256,address)
-    pub const ResolverUpdate = "0x8bf46bf4cfd674fa735a3d63ec1c9ad4153f033c290341f3a588b75685141b35"; // ResolverUpdate(uint256,address)
-
-    // V2 Registry Events (NEW signatures - current Sepolia deployment)
-    pub const SubregistryUpdated = "0xca01ade22fed8a886bda52d1fb12deaff178499347b6c13b1a892a60985a51e2"; // SubregistryUpdated(uint256,address)
-    pub const ResolverUpdated = "0x3c055b8ebff34805cc0c0216cfd96bfe2613c75002ce000f6268324952541d06"; // ResolverUpdated(uint256,address)
-    pub const TokenRegeneratedV2 = "0x88d074c8fc078bb1c0b9cfa9e3ca1f65a96141df8b0da854fe3083df813cbcca"; // TokenRegenerated(uint256,uint256,uint256)
-    pub const ExpiryUpdated = "0x3260962d42d8f7ae0af25cbfdb2983c214a859cfa2ac6df8ea29b534c267d429"; // ExpiryUpdated(uint256,uint64,address)
-
-    // Enhanced Access Control Events (from IEnhancedAccessControl.sol)
-    pub const EACRolesChanged = "0x0d35bf721a39b614de00ca5038e1deb0cb0c69a278645e83405a7226cf80ba3c"; // EACRolesChanged(uint256,address,uint256,uint256)
-
-    // V2 Datastore Events
-    pub const RecordSet = "0x851..."; // RecordSet(bytes32,bytes)
-    pub const RecordDeleted = "0x852..."; // RecordDeleted(bytes32)
-};

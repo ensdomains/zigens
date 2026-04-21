@@ -908,41 +908,7 @@ pub const Client = struct {
         return results;
     }
 
-    /// Fetch a single transaction by hash
-    pub fn getTransactionByHash(self: *Client, tx_hash: Hash) !Transaction {
-        const tx_hash_hex = try tx_hash.toHex(self.allocator);
-        defer self.allocator.free(tx_hash_hex);
-
-        const parsed = try self.makeRpcCall("eth_getTransactionByHash", .{tx_hash_hex});
-        defer parsed.deinit();
-
-        const result = parsed.value.object.get("result").?;
-        if (result == .null) {
-            return error.TransactionNotFound;
-        }
-
-        const tx_obj = result.object;
-
-        // Parse input data
-        const input_hex = tx_obj.get("input").?.string;
-        const input_bytes = try self.hexToBytes(input_hex);
-
-        return Transaction{
-            .hash = try Hash.fromHex(tx_obj.get("hash").?.string),
-            .block_number = try std.fmt.parseInt(u64, tx_obj.get("blockNumber").?.string[2..], 16),
-            .from = try Address.fromHex(tx_obj.get("from").?.string),
-            .to = if (tx_obj.get("to")) |to_val|
-                if (to_val == .null) null else try Address.fromHex(to_val.string)
-            else
-                null,
-            .input = input_bytes,
-            .value = tx_obj.get("value").?.string,
-            .gas = try std.fmt.parseInt(u64, tx_obj.get("gas").?.string[2..], 16),
-            .gas_price = tx_obj.get("gasPrice").?.string,
-        };
-    }
-
-    /// Batch version of getTransactionByHash - fetches multiple transactions in a single HTTP request
+    /// Batch version of eth_getTransactionByHash - fetches multiple transactions in a single HTTP request
     /// Returns array of transactions in the same order as requested hashes
     /// Caller must free the returned array and each transaction's contents
     pub fn getTransactionsByHashBatch(self: *Client, tx_hashes: []const Hash) ![]Transaction {

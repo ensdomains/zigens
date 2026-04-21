@@ -312,7 +312,7 @@ pub const Server = struct {
             defer self.allocator.free(name_escaped);
 
             const writer = response_buf.writer(self.allocator);
-            try writer.print("{{\"name\":\"{s}\",\"namehash\":\"{s}\",\"owner\":\"{s}\",\"resolver\":\"{s}\",\"registry\":\"{s}\",\"chain\":\"{s}\",\"expiry\":{d},\"registry_locked\":{},\"migrated\":{},\"ejected\":{},\"created_at\":{d},\"updated_at\":{d}}}", .{
+            try writer.print("{{\"name\":\"{s}\",\"namehash\":\"{s}\",\"owner\":\"{s}\",\"resolver\":\"{s}\",\"registry\":\"{s}\",\"chain\":\"{s}\",\"expiry\":{d},\"registry_locked\":{},\"migrated\":{},\"created_at\":{d},\"updated_at\":{d}}}", .{
                 name_escaped,
                 namehash_hex,
                 owner_hex,
@@ -322,7 +322,6 @@ pub const Server = struct {
                 record_copy.expiry,
                 record_copy.registry_locked,
                 record_copy.migrated,
-                record_copy.ejected,
                 record_copy.created_at,
                 record_copy.updated_at,
             });
@@ -1431,23 +1430,6 @@ pub const Server = struct {
             \\
             \\              <div class="event-category">
             \\                <div class="category-title">
-            \\                  Migration
-            \\                  <span class="select-all" data-category="migration" onclick="toggleCategory('migration')">Select All</span>
-            \\                </div>
-            \\                <div class="checkbox-item">
-            \\                  <input type="checkbox" id="name_migrated" value="name_migrated" class="event-checkbox migration-event">
-            \\                  <label for="name_migrated">NameMigrated</label>
-            \\                </div>
-            \\                <div class="checkbox-item">
-            \\                  <input type="checkbox" id="name_ejected_to_l1" value="name_ejected_to_l1" class="event-checkbox migration-event">
-            \\                  <label for="name_ejected_to_l1">NameEjectedToL1</label>
-            \\                </div>
-            \\                <div class="checkbox-item">
-            \\                  <input type="checkbox" id="name_returned_to_l2" value="name_returned_to_l2" class="event-checkbox migration-event">
-            \\                  <label for="name_returned_to_l2">NameReturnedToL2</label>
-            \\                </div>
-            \\              </div>
-            \\
             \\              <div class="event-category">
             \\                <div class="category-title">
             \\                  Resolver Records
@@ -1562,7 +1544,6 @@ pub const Server = struct {
             \\      registry: ['new_subname', 'subregistry_update', 'resolver_update', 'transfer'],
             \\      registration: ['name_registered', 'name_renewed', 'name_burned', 'commitment_made'],
             \\      token: ['token_regenerated', 'approval', 'metadata_changed', 'resolver_approved'],
-            \\      migration: ['name_migrated', 'name_ejected_to_l1', 'name_returned_to_l2'],
             \\      resolver: ['text_changed', 'address_changed', 'contenthash_changed', 'abi_changed', 'pubkey_changed', 'name_changed', 'interface_changed']
             \\    };
             \\
@@ -1579,9 +1560,6 @@ pub const Server = struct {
             \\      'approval': 'Approval',
             \\      'metadata_changed': 'MetadataChanged',
             \\      'resolver_approved': 'ResolverApproved',
-            \\      'name_migrated': 'NameMigrated',
-            \\      'name_ejected_to_l1': 'NameEjectedToL1',
-            \\      'name_returned_to_l2': 'NameReturnedToL2',
             \\      'text_changed': 'TextChanged',
             \\      'address_changed': 'AddressChanged',
             \\      'contenthash_changed': 'ContenthashChanged',
