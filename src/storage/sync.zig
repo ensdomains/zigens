@@ -290,57 +290,6 @@ pub fn discoverAndGetSubregistries(db: *Database, chain: models.Chain, main_regi
     };
 }
 
-/// Insert a migration event
-pub fn insertMigration(db: *Database, chain: models.Chain, token_id: u256, direction: models.MigrationDirection, dns_encoded_name: []const u8, block_number: u64, tx_hash: Hash, log_index: u32) !void {
-    const sql =
-        \\INSERT OR IGNORE INTO migrations
-        \\(chain, token_id, direction, dns_encoded_name, block_number, transaction_hash, log_index, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ;
-
-    var q = try Query.init(db, sql);
-    defer q.deinit();
-
-    const token_id_str = try std.fmt.allocPrint(db.allocator, "{d}", .{token_id});
-    defer db.allocator.free(token_id_str);
-
-    try q.bindTextStatic(chain.toString());
-    try q.bindText(token_id_str);
-    try q.bindTextStatic(direction.toString());
-    try q.bindText(dns_encoded_name);
-    try q.bindInt64(@intCast(block_number));
-    try q.bindHash(tx_hash);
-    try q.bindInt(@intCast(log_index));
-    try q.bindInt64(std.time.timestamp());
-
-    try q.exec();
-}
-
-/// Insert a renewal sync event
-pub fn insertRenewalSync(db: *Database, chain: models.Chain, token_id: u256, new_expiry: u64, block_number: u64, tx_hash: Hash, log_index: u32) !void {
-    const sql =
-        \\INSERT OR IGNORE INTO renewal_syncs
-        \\(chain, token_id, new_expiry, block_number, transaction_hash, log_index, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?)
-    ;
-
-    var q = try Query.init(db, sql);
-    defer q.deinit();
-
-    const token_id_str = try std.fmt.allocPrint(db.allocator, "{d}", .{token_id});
-    defer db.allocator.free(token_id_str);
-
-    try q.bindTextStatic(chain.toString());
-    try q.bindText(token_id_str);
-    try q.bindInt64(safeU64ToI64(new_expiry));
-    try q.bindInt64(@intCast(block_number));
-    try q.bindHash(tx_hash);
-    try q.bindInt(@intCast(log_index));
-    try q.bindInt64(std.time.timestamp());
-
-    try q.exec();
-}
-
 /// Insert a token observer event
 pub fn insertTokenObserver(db: *Database, chain: models.Chain, token_id: u256, observer: Address, block_number: u64, tx_hash: Hash, log_index: u32) !void {
     const sql =

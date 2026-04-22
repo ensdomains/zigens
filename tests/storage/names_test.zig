@@ -120,7 +120,6 @@ test "insertName with null optional fields" {
         .expiry = 0,
         .registry_locked = false,
         .migrated = false,
-        .ejected = false,
         .created_block = 1000,
         .created_at = 1700000000,
         .registered_at = 1700000000,
@@ -266,7 +265,6 @@ test "insertName with expiry > i64::max stores as 0 (never expires)" {
         .expiry = huge_expiry,
         .registry_locked = false,
         .migrated = false,
-        .ejected = false,
         .created_block = 1000,
         .created_at = 1700000000,
         .registered_at = 1700000000,
@@ -378,7 +376,6 @@ test "updateNameExpiry via namehash clamps u64 > i64::max to 0" {
         .expiry = 1700000000,
         .registry_locked = false,
         .migrated = false,
-        .ejected = false,
         .created_block = 1000,
         .created_at = 1700000000,
         .registered_at = 1700000000,
@@ -404,25 +401,6 @@ test "updateNameExpiry via namehash clamps u64 > i64::max to 0" {
     try testing.expect(!name.isExpired());
 }
 
-test "insertRenewalSync with expiry > i64::max stores as 0" {
-    const allocator = testing.allocator;
-    const database = try helpers.createTestDatabase(allocator);
-    defer helpers.destroyTestDatabase(allocator, database);
-
-    const sync_storage = @import("lib").storage.sync;
-    const huge_expiry: u64 = @as(u64, @intCast(std.math.maxInt(i64))) + 1;
-    const tx_hash = helpers.randomHash();
-
-    try sync_storage.insertRenewalSync(database, .v2, 999, huge_expiry, 1000, tx_hash, 0);
-
-    // Verify by querying raw SQL — renewal_syncs stores new_expiry as integer
-    var q = try @import("lib").storage.Query.init(database, "SELECT new_expiry FROM renewal_syncs WHERE token_id = '999'");
-    defer q.deinit();
-
-    try testing.expect(try q.step());
-    const stored_expiry: i64 = q.getInt64(0);
-    try testing.expectEqual(@as(i64, 0), stored_expiry);
-}
 
 test "insertOrphanedRegistration with expiry > i64::max stores as 0 and reads back as 0" {
     const allocator = testing.allocator;
@@ -697,7 +675,6 @@ test "multiple names with same owner different chains" {
         .expiry = 0,
         .registry_locked = false,
         .migrated = false,
-        .ejected = false,
         .created_block = 1000,
         .created_at = 1700000000,
         .registered_at = 1700000000,
@@ -729,7 +706,6 @@ test "multiple names with same owner different chains" {
         .expiry = 0,
         .registry_locked = false,
         .migrated = false,
-        .ejected = false,
         .created_block = 1000,
         .created_at = 1700000000,
         .registered_at = 1700000000,

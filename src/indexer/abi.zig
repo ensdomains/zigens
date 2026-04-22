@@ -51,11 +51,6 @@ pub const EventSignatures = struct {
     pub const token_regenerated_v2 = "TokenRegenerated(uint256,uint256,uint256)";
     pub const token_regenerated_v2_hash: Hash = eventHash(token_regenerated_v2);
 
-    /// NewSubname(uint256 indexed tokenId, string label)
-    /// This event is emitted by UserRegistry contracts instead of NameRegistered
-    pub const new_subname = "NewSubname(uint256,string)";
-    pub const new_subname_hash: Hash = eventHash(new_subname);
-
     /// ExpiryUpdated(uint256 indexed tokenId, uint64 newExpiry, address changedBy)
     /// New event signature that replaces NameRenewed in current namechain deployment
     pub const expiry_updated = "ExpiryUpdated(uint256,uint64,address)";
@@ -335,21 +330,6 @@ pub const EventSignatures = struct {
     pub const approved_hash: Hash = eventHash(approved);
 
     // ========================================================================
-    // Bridge/Ejection events (from EjectionController and L1BridgeController)
-    // ========================================================================
-
-    /// NameEjectedToL1(bytes dnsEncodedName, uint256 tokenId)
-    pub const name_ejected_to_l1 = "NameEjectedToL1(bytes,uint256)";
-    pub const name_ejected_to_l1_hash: Hash = eventHash(name_ejected_to_l1);
-
-    /// NameEjectedToL2(bytes dnsEncodedName, uint256 tokenId)
-    pub const name_ejected_to_l2 = "NameEjectedToL2(bytes,uint256)";
-    pub const name_ejected_to_l2_hash: Hash = eventHash(name_ejected_to_l2);
-
-    /// RenewalSynchronized(uint256 tokenId, uint64 newExpiry)
-    pub const renewal_synchronized = "RenewalSynchronized(uint256,uint64)";
-    pub const renewal_synchronized_hash: Hash = eventHash(renewal_synchronized);
-
     // ========================================================================
     // PermissionedRegistry events
     // ========================================================================
@@ -542,15 +522,6 @@ pub const ABI = struct {
         return try allocator.dupe(u8, bytes_data);
     }
 
-    /// Encode function call
-    pub fn encodeCall(allocator: std.mem.Allocator, signature: []const u8) ![]u8 {
-        const sig_hash = try @import("../types/hash.zig").keccak256(allocator, signature);
-
-        const result = try allocator.alloc(u8, 4);
-        @memcpy(result, sig_hash.bytes[0..4]);
-
-        return result;
-    }
 };
 
 test "ABI decode uint256" {

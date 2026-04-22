@@ -82,8 +82,6 @@ pub const Name = struct {
     registry_locked: bool,
     /// Whether this is a migrated name from ENSv1
     migrated: bool,
-    /// Whether this is an ejected name (on L1 but registered on L2)
-    ejected: bool,
     /// Block number when created
     created_block: u64,
     /// Timestamp when created
@@ -171,13 +169,6 @@ pub const EventType = enum {
     token_regenerated,
     approval,
 
-    // Migration events
-    name_migrated,
-
-    // Ejection events
-    name_ejected_to_l1,
-    name_returned_to_l2,
-
     // ENSIP-16 Offchain metadata events
     metadata_changed,
     resolver_approved,
@@ -217,9 +208,6 @@ pub const EventType = enum {
             .parent_updated => "ParentUpdated",
             .token_regenerated => "TokenRegenerated",
             .approval => "Approval",
-            .name_migrated => "NameMigrated",
-            .name_ejected_to_l1 => "NameEjectedToL1",
-            .name_returned_to_l2 => "NameReturnedToL2",
             .metadata_changed => "MetadataChanged",
             .resolver_approved => "ResolverApproved",
             .text_changed => "TextChanged",
@@ -248,9 +236,6 @@ pub const EventType = enum {
         if (std.mem.eql(u8, s, "CommitmentMade")) return .commitment_made;
         if (std.mem.eql(u8, s, "TokenRegenerated")) return .token_regenerated;
         if (std.mem.eql(u8, s, "Approval")) return .approval;
-        if (std.mem.eql(u8, s, "NameMigrated")) return .name_migrated;
-        if (std.mem.eql(u8, s, "NameEjectedToL1")) return .name_ejected_to_l1;
-        if (std.mem.eql(u8, s, "NameReturnedToL2")) return .name_returned_to_l2;
         if (std.mem.eql(u8, s, "MetadataChanged")) return .metadata_changed;
         if (std.mem.eql(u8, s, "ResolverApproved")) return .resolver_approved;
         if (std.mem.eql(u8, s, "TextChanged")) return .text_changed;
@@ -322,90 +307,6 @@ pub const Webhook = struct {
     }
 };
 
-/// Migration direction
-pub const MigrationDirection = enum {
-    to_l1,
-    to_l2,
-
-    pub fn toString(self: MigrationDirection) []const u8 {
-        return switch (self) {
-            .to_l1 => "to_l1",
-            .to_l2 => "to_l2",
-        };
-    }
-
-    pub fn fromString(s: []const u8) !MigrationDirection {
-        if (std.mem.eql(u8, s, "to_l1")) return .to_l1;
-        if (std.mem.eql(u8, s, "to_l2")) return .to_l2;
-        return error.InvalidDirection;
-    }
-};
-
-/// Migration record
-pub const Migration = struct {
-    /// Migration ID
-    id: u64,
-    /// Chain where the migration event occurred
-    chain: Chain,
-    /// Token ID being migrated
-    token_id: u256,
-    /// Migration direction
-    direction: MigrationDirection,
-    /// DNS-encoded name
-    dns_encoded_name: []const u8,
-    /// Block number
-    block_number: u64,
-    /// Transaction hash
-    tx_hash: Hash,
-    /// Log index
-    log_index: u32,
-    /// Timestamp
-    timestamp: i64,
-
-    pub fn deinit(self: *Migration, allocator: std.mem.Allocator) void {
-        allocator.free(self.dns_encoded_name);
-    }
-};
-
-/// Renewal synchronization record (cross-chain renewal sync)
-pub const RenewalSync = struct {
-    /// Record ID
-    id: u64,
-    /// Chain where the sync event occurred
-    chain: Chain,
-    /// Token ID being renewed
-    token_id: u256,
-    /// New expiration timestamp
-    new_expiry: u64,
-    /// Block number
-    block_number: u64,
-    /// Transaction hash
-    tx_hash: Hash,
-    /// Log index
-    log_index: u32,
-    /// Timestamp
-    timestamp: i64,
-};
-
-/// Token observer record
-pub const TokenObserver = struct {
-    /// Record ID
-    id: u64,
-    /// Chain where the observer was set
-    chain: Chain,
-    /// Token ID being observed
-    token_id: u256,
-    /// Observer contract address
-    observer: Address,
-    /// Block number
-    block_number: u64,
-    /// Transaction hash
-    tx_hash: Hash,
-    /// Log index
-    log_index: u32,
-    /// Timestamp
-    timestamp: i64,
-};
 
 /// EAC (Enhanced Access Control) role types
 /// Each role is a nybble (4 bits) in the role bitmap

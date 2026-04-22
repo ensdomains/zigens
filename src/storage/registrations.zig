@@ -3,7 +3,6 @@ const constants = @import("../constants.zig");
 const db_module = @import("database.zig");
 const Database = db_module.Database;
 const models = @import("../types/models.zig");
-const contracts = @import("../contracts.zig");
 const events = @import("events.zig");
 
 // ============================================================================
@@ -19,62 +18,6 @@ const events = @import("events.zig");
 //
 // This prevents duplicates from non-authoritative contracts like FastTestETHRegistrar.
 // ============================================================================
-
-/// Get canonical registry addresses from contracts.zig for all networks.
-/// Returns addresses from both Sepolia and Mainnet deployments.
-fn getCanonicalRegistryAddresses(allocator: std.mem.Allocator) ![][]const u8 {
-    var addresses: std.ArrayList([]const u8) = .{};
-    errdefer {
-        for (addresses.items) |addr| {
-            allocator.free(addr);
-        }
-        addresses.deinit(allocator);
-    }
-
-    // Get addresses from Sepolia
-    const sepolia = contracts.getContractAddresses(.sepolia) catch unreachable;
-
-    // V1 Sepolia Base Registrar
-    if (!sepolia.base_registrar.isZero()) {
-        const hex = try sepolia.base_registrar.toHex(allocator);
-        try addresses.append(allocator, hex);
-    }
-
-    // V2 Sepolia L2 ETH Registry
-    if (!sepolia.l2_eth_registry.isZero()) {
-        const hex = try sepolia.l2_eth_registry.toHex(allocator);
-        try addresses.append(allocator, hex);
-    }
-
-    // V2 Sepolia L2 ETH Registrar (emits NameRegistered for .eth 2LDs)
-    if (!sepolia.l2_eth_registrar.isZero()) {
-        const hex = try sepolia.l2_eth_registrar.toHex(allocator);
-        try addresses.append(allocator, hex);
-    }
-
-    // Get addresses from Mainnet
-    const mainnet = contracts.getContractAddresses(.mainnet) catch unreachable;
-
-    // V1 Mainnet Base Registrar
-    if (!mainnet.base_registrar.isZero()) {
-        const hex = try mainnet.base_registrar.toHex(allocator);
-        try addresses.append(allocator, hex);
-    }
-
-    // V2 Mainnet L2 ETH Registry (when deployed)
-    if (!mainnet.l2_eth_registry.isZero()) {
-        const hex = try mainnet.l2_eth_registry.toHex(allocator);
-        try addresses.append(allocator, hex);
-    }
-
-    // V2 Mainnet L2 ETH Registrar (when deployed)
-    if (!mainnet.l2_eth_registrar.isZero()) {
-        const hex = try mainnet.l2_eth_registrar.toHex(allocator);
-        try addresses.append(allocator, hex);
-    }
-
-    return addresses.toOwnedSlice(allocator);
-}
 
 pub const RegistrationFilterOptions = struct {
     chain: ?models.Chain = null, // Filter by chain (l1 or l2)
@@ -302,24 +245,3 @@ test "getRegistrations filters by canonical contracts" {
     // For now, we just verify the module compiles correctly
 }
 
-test "getCanonicalRegistryAddresses returns addresses from contracts.zig" {
-    const allocator = std.testing.allocator;
-
-    const addresses = try getCanonicalRegistryAddresses(allocator);
-    defer {
-        for (addresses) |addr| {
-            allocator.free(addr);
-        }
-        allocator.free(addresses);
-    }
-
-    // Should have at least the Sepolia addresses
-    try std.testing.expect(addresses.len >= 2);
-
-    // All addresses should start with 0x and be 42 characters
-    for (addresses) |addr| {
-        try std.testing.expect(addr.len == 42);
-        try std.testing.expect(addr[0] == '0');
-        try std.testing.expect(addr[1] == 'x');
-    }
-}

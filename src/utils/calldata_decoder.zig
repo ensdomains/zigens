@@ -86,24 +86,6 @@ pub const CalldataDecoder = struct {
         return try allocator.dupe(u8, label_text);
     }
 
-    /// Decode label from ENS Registry setSubnode* function calldata (hex string version)
-    /// This is a convenience wrapper that first converts hex string to bytes
-    pub fn decodeSubnodeLabelFromHex(allocator: std.mem.Allocator, calldata_hex: []const u8) !?[]u8 {
-        // Remove 0x prefix if present
-        const hex_data = if (std.mem.startsWith(u8, calldata_hex, "0x"))
-            calldata_hex[2..]
-        else
-            calldata_hex;
-
-        // Convert hex to bytes
-        const calldata_bytes = try allocator.alloc(u8, hex_data.len / 2);
-        defer allocator.free(calldata_bytes);
-
-        _ = try std.fmt.hexToBytes(calldata_bytes, hex_data);
-
-        return try decodeSubnodeLabel(allocator, calldata_bytes);
-    }
-
     /// Decode label from multicall pattern
     /// This function searches for setSubnode* calls within multicall(bytes[]) patterns
     ///

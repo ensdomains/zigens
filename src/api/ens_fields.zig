@@ -114,11 +114,6 @@ pub const FieldDef = struct {
         return .{ .name = name, .field_type = .address, .getter = getter, .custom_writer = null };
     }
 
-    /// Create an optional address field
-    pub fn optionalAddress(name: []const u8, getter: FieldGetter) FieldDef {
-        return .{ .name = name, .field_type = .optional_address, .getter = getter, .custom_writer = null };
-    }
-
     /// Create a hash field
     pub fn hashField(name: []const u8, getter: FieldGetter) FieldDef {
         return .{ .name = name, .field_type = .hash, .getter = getter, .custom_writer = null };

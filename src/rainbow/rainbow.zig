@@ -154,13 +154,6 @@ pub const Rainbow = struct {
         }
     }
 
-    /// Lookup label by labelhash (hex string like "0x123abc...")
-    /// Convenience wrapper for hex input
-    pub fn lookupHex(self: *Rainbow, labelhash_hex: []const u8) !?[]u8 {
-        const labelhash = try hexToBytes(labelhash_hex);
-        return try self.lookup(labelhash);
-    }
-
     /// Get database statistics
     pub fn getDbStats(self: *const Rainbow) !DbStats {
         const query = "SELECT COUNT(*) FROM rainbow_labels";

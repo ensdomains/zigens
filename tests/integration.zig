@@ -54,7 +54,6 @@ test "Database integration - full workflow" {
             .expiry = @intCast(ts + 31536000), // 1 year from now
             .registry_locked = false,
             .migrated = true,
-            .ejected = false,
             .created_block = 101,
             .created_at = ts,
             .registered_at = ts,
@@ -82,7 +81,6 @@ test "Database integration - full workflow" {
         defer name.deinit(allocator);
         try testing.expectEqualStrings("alice.eth", name.name.?);
         try testing.expect(name.chain == .v2);
-        try testing.expect(!name.ejected);
         try testing.expect(name.migrated);
         std.debug.print("✓ Name retrieved successfully\n", .{});
     }
@@ -242,7 +240,6 @@ test "Multiple name insertions and queries" {
             .expiry = @intCast(loop_ts + 31536000),
             .registry_locked = false,
             .migrated = true,
-            .ejected = false,
             .created_block = @intCast(100 + i),
             .created_at = loop_ts,
             .registered_at = loop_ts,
@@ -303,7 +300,6 @@ test "Name expiry checking" {
         .expiry = @intCast(ts - 1), // Already expired
         .registry_locked = false,
         .migrated = false,
-        .ejected = false,
         .created_block = 100,
         .created_at = ts,
         .registered_at = ts,
@@ -338,7 +334,6 @@ test "Name expiry checking" {
         .expiry = @intCast(ts + 31536000), // 1 year from now
         .registry_locked = false,
         .migrated = false,
-        .ejected = false,
         .created_block = 100,
         .created_at = ts,
         .registered_at = ts,

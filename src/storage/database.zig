@@ -199,18 +199,6 @@ pub const Database = struct {
         }
     }
 
-    /// Finalize and clear all cached prepared statements.
-    /// Call before DDL operations (DROP TABLE, DELETE FROM large tables)
-    /// to release any implicit locks held by cached statements.
-    pub fn clearStatementCache(self: *Database) void {
-        var it = self.stmt_cache.iterator();
-        while (it.next()) |entry| {
-            _ = c.sqlite3_finalize(entry.value_ptr.*);
-            self.allocator.free(entry.key_ptr.*);
-        }
-        self.stmt_cache.clearRetainingCapacity();
-    }
-
     /// Check if a table exists in the database
     fn hasTable(self: *Database, table_name: []const u8) bool {
         var q = Query.init(self, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?") catch return false;
@@ -773,8 +761,6 @@ pub const Database = struct {
     pub const registerSubregistry = sync.registerSubregistry;
     pub const registerResolver = sync.registerResolver;
     pub const discoverAndGetSubregistries = sync.discoverAndGetSubregistries;
-    pub const insertMigration = sync.insertMigration;
-    pub const insertRenewalSync = sync.insertRenewalSync;
     pub const insertTokenObserver = sync.insertTokenObserver;
     pub const deleteDataAfterBlock = sync.deleteDataAfterBlock;
     pub const OrphanedRegistration = sync.OrphanedRegistration;

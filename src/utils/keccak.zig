@@ -15,21 +15,6 @@ pub fn eventSignature(comptime sig: []const u8) [32]u8 {
     return keccak256(sig);
 }
 
-/// Convert bytes to hex string at compile time
-pub fn toHexString(comptime bytes: []const u8) [bytes.len * 2 + 2]u8 {
-    const hex_chars = "0123456789abcdef";
-    var result: [bytes.len * 2 + 2]u8 = undefined;
-    result[0] = '0';
-    result[1] = 'x';
-
-    inline for (bytes, 0..) |byte, i| {
-        result[2 + i * 2] = hex_chars[byte >> 4];
-        result[2 + i * 2 + 1] = hex_chars[byte & 0x0f];
-    }
-
-    return result;
-}
-
 test "keccak256 basic" {
     const result = keccak256("hello");
     // Known keccak256("hello") = 0x1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8

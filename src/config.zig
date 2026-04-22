@@ -26,6 +26,7 @@ pub const Config = struct {
     graphql_max_depth: u32,
     graphql_max_cost: u32,
     metrics_enabled: bool,
+    rainbow_path: []const u8,
     v1_contracts: contracts.ContractAddresses,
     v2_contracts: contracts.ContractAddresses,
 
@@ -92,6 +93,7 @@ pub const Config = struct {
             .graphql_max_depth = env_mod.getEnvInt(&env_map, u32, "GRAPHQL_MAX_DEPTH", 10),
             .graphql_max_cost = env_mod.getEnvInt(&env_map, u32, "GRAPHQL_MAX_COST", 1000),
             .metrics_enabled = env_mod.getEnvBool(&env_map, "METRICS_ENABLED", false),
+            .rainbow_path = try allocator.dupe(u8, env_mod.getEnv(&env_map, "RAINBOW_PATH", "./data/ens_rainbow.db")),
         };
     }
 
@@ -99,6 +101,7 @@ pub const Config = struct {
         self.allocator.free(self.rpc_url);
         self.allocator.free(self.database_path);
         self.allocator.free(self.webhook_db_path);
+        self.allocator.free(self.rainbow_path);
         if (self.webhook_admin_username) |user| {
             self.allocator.free(user);
         }

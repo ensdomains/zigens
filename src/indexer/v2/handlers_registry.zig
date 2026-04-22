@@ -163,12 +163,11 @@ pub fn processOrphanedRegistration(
         .expiry = orphan.expiry,
         .registry_locked = false,
         .migrated = false,
-        .ejected = false,
         .created_block = orphan.block_number,
-        .created_at = 0, // We don't have the timestamp, will be approximate
-        .registered_at = 0,
+        .created_at = self.getBlockTimestamp(chain, orphan.block_number, null),
+        .registered_at = self.getBlockTimestamp(chain, orphan.block_number, null),
         .updated_block = orphan.block_number,
-        .updated_at = 0,
+        .updated_at = self.getBlockTimestamp(chain, orphan.block_number, null),
         .is_wrapped = false,
         .wrapper_fuses = null,
         .wrapper_expiry = null,
@@ -511,7 +510,6 @@ pub fn handleNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !
         .expiry = @truncate(expiration),
         .registry_locked = false,
         .migrated = false,
-        .ejected = false,
         .created_block = log.block_number,
         .created_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
         .registered_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
@@ -556,149 +554,6 @@ pub fn handleNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !
     const event_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
 
     try utils.emitEvent(self, chain, log, .name_registered, event_name, namehash, event_data);
-}
-
-pub fn handleNewSubname(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
-    // NewSubname event: NewSubname(uint256 indexed tokenId, string label)
-    // This event is emitted by UserRegistry contracts instead of NameRegistered
-    if (log.topics.len < 2) return error.InvalidTopicCount;
-
-    // Topics[0] = event signature
-    // Topics[1] = indexed tokenId
-    const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
-    const token_id: u256 = token_id_raw;
-
-    // Data contains: string label
-    const label_str = try abi.ABI.decodeString(self.allocator, log.data, 0);
-    defer self.allocator.free(label_str);
-
-    // Validate label is valid UTF-8 and contains no control characters
-    unicode.validateName(label_str) catch |err| {
-        std.log.warn("Invalid subname label for tokenId={d}: {any}", .{ token_id, err });
-        return;
-    };
-
-    std.log.debug("NewSubname: {s} (tokenId={d}, registry={any})", .{
-        label_str,
-        token_id,
-        log.address,
-    });
-
-    // Get the parent name from the registry that emitted this event
-    // The registry is stored in the registries table
-    const registry_hex = try log.address.toHex(self.allocator);
-    defer self.allocator.free(registry_hex);
-
-    // Query the registries table to find the parent name
-    // With multiple parents possible per address (due to address reuse),
-    // find the one that was set most recently BEFORE this event
-    var rq = try Query.init(self.database,
-        \\SELECT name, namehash FROM registries
-        \\WHERE address = ? AND chain = ? AND created_block <= ?
-        \\ORDER BY created_block DESC
-        \\LIMIT 1
-    );
-    defer rq.deinit();
-    try rq.bindText(registry_hex);
-    try rq.bindText(chain.toString());
-    try rq.bindInt64(@intCast(log.block_number));
-
-    var parent_name: ?[]const u8 = null;
-    var parent_namehash: Hash = Hash.zero;
-
-    if (try rq.step()) {
-        if (rq.getTextSlice(0)) |name_span| {
-            parent_name = try self.allocator.dupe(u8, name_span);
-        }
-
-        if (rq.getTextSlice(1)) |namehash_hex| {
-            parent_namehash = try Hash.fromHex(namehash_hex);
-        }
-    }
-
-    if (parent_name == null) {
-        std.log.warn("  → Could not find parent name for registry {s}, skipping subname", .{registry_hex});
-        return;
-    }
-    defer self.allocator.free(parent_name.?);
-
-    // Construct full subname: label.parent_name
-    const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name.? });
-    defer self.allocator.free(full_name);
-
-    // Compute namehash for the full subname
-    const namehash = try @import("../../types/hash.zig").namehash(self.allocator, full_name);
-
-    // Compute label hash
-    const label_hash = try @import("../../types/hash.zig").keccak256(self.allocator, label_str);
-
-    // Extract canonical_id and version from token_id
-    const token_id_utils = @import("../../types/token_id.zig");
-    const canonical_id = token_id_utils.getCanonicalId(token_id);
-    const token_version = token_id_utils.getTokenVersion(token_id);
-
-    // NewSubname doesn't include owner or expiration, so we need to get them from TransferSingle event
-    // or query the datastore. For now, we'll use zero values and they'll be updated by Transfer events
-    const name_str = try self.allocator.dupe(u8, full_name);
-    defer self.allocator.free(name_str);
-
-    const label_dup = try self.allocator.dupe(u8, label_str);
-    defer self.allocator.free(label_dup);
-
-    const parent_name_dup = try self.allocator.dupe(u8, parent_name.?);
-    defer self.allocator.free(parent_name_dup);
-
-    const name = models.Name{
-        .name = name_str,
-        .namehash = namehash,
-        .label = label_dup,
-        .label_hash = label_hash,
-        .parent_name = parent_name_dup,
-        .parent_namehash = parent_namehash,
-        .chain = chain,
-        .registry = log.address,
-        .owner = Address.zero, // Will be updated by Transfer event
-        .registrant = Address.zero, // Subnames don't have a registrant in the same sense
-        .resolver = Address.zero,
-        .token_id = @intCast(token_id),
-        .canonical_id = canonical_id,
-        .token_version = token_version,
-        .expiry = 0, // Subnames may not have expiration
-        .registry_locked = false,
-        .migrated = false,
-        .ejected = false,
-        .created_block = log.block_number,
-        .created_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
-        .registered_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
-        .updated_block = log.block_number,
-        .updated_at = std.time.timestamp(),
-        .is_wrapped = false,
-        .wrapper_fuses = null,
-        .wrapper_expiry = null,
-        .is_v1_name = false,
-        .v1_label_hash = null,
-    };
-
-    try self.database.insertName(name);
-
-    // Store event
-    const nh_hex = try namehash.toHex(self.allocator);
-    defer self.allocator.free(nh_hex);
-
-    // Escape label_str for safe JSON inclusion
-    const escaped_label = try json_utils.escapeString(self.allocator, label_str);
-    defer self.allocator.free(escaped_label);
-
-    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"label\":\"{s}\",\"tokenId\":{d},\"namehash\":\"{s}\",\"parent\":\"{s}\"}}", .{
-        escaped_label,
-        token_id,
-        nh_hex,
-        parent_name.?,
-    });
-
-    const event_name = try self.allocator.dupe(u8, full_name);
-
-    try utils.emitEvent(self, chain, log, .new_subname, event_name, namehash, event_data);
 }
 
 pub fn handleNameRenewed(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
@@ -876,7 +731,6 @@ pub fn handleETHNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log
         .expiry = expiry,
         .registry_locked = false,
         .migrated = false,
-        .ejected = false,
         .created_block = log.block_number,
         .created_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
         .registered_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
@@ -1361,68 +1215,6 @@ pub fn handleEACRolesChanged(self: *Indexer, chain: models.Chain, log: rpc.Log) 
     try utils.emitEvent(self, chain, log, .eac_roles_changed, event_name, namehash_opt, event_data);
 }
 
-/// Handle EACRolesGranted events (OLD signature from earlier subregistry deployments)
-/// Event: EACRolesGranted(uint256 resource, uint256 roleBitmap, address account)
-/// All params are non-indexed (1 topic = event sig only), data = 3 words
-pub fn handleEACRolesGranted(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
-    if (log.data.len < 96) return error.InvalidDataLength;
-
-    // Decode from data (no indexed params)
-    const resource_uint = try abi.ABI.decodeUint256(log.data, 0);
-    const new_role_bitmap = try abi.ABI.decodeUint256(log.data, 32);
-    const account = try abi.ABI.decodeAddress(log.data, 64);
-
-    const token_id_utils = @import("../../types/token_id.zig");
-    const canonical_id = token_id_utils.getCanonicalId(resource_uint);
-
-    var resource_bytes: [32]u8 = undefined;
-    std.mem.writeInt(u256, &resource_bytes, canonical_id, .big);
-    const resource_hex_chars = std.fmt.bytesToHex(resource_bytes, .lower);
-    const resource_hex = try std.fmt.allocPrint(self.allocator, "0x{s}", .{resource_hex_chars});
-    defer self.allocator.free(resource_hex);
-
-    var new_bitmap_bytes: [32]u8 = undefined;
-    std.mem.writeInt(u256, &new_bitmap_bytes, new_role_bitmap, .big);
-    const new_bitmap_hex_chars = std.fmt.bytesToHex(new_bitmap_bytes, .lower);
-    const new_bitmap_hex = try std.fmt.allocPrint(self.allocator, "0x{s}", .{new_bitmap_hex_chars});
-    defer self.allocator.free(new_bitmap_hex);
-
-    const account_hex = try account.toHex(self.allocator);
-    defer self.allocator.free(account_hex);
-
-    std.log.debug("EACRolesGranted: resource={s}, account={s}, bitmap={s}", .{
-        resource_hex, account_hex, new_bitmap_hex,
-    });
-
-    try self.database.upsertEACRole(
-        chain,
-        resource_hex,
-        account,
-        new_bitmap_hex,
-        log.block_number,
-        log.transaction_hash,
-        log.log_index,
-        log.address,
-    );
-
-    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resource\":\"{s}\",\"account\":\"{s}\",\"newRoleBitmap\":\"{s}\"}}", .{
-        resource_hex, account_hex, new_bitmap_hex,
-    });
-
-    const maybe_name = try self.database.getNameByTokenIdAndRegistry(canonical_id, log.address);
-    var event_name: ?[]const u8 = null;
-    var namehash_opt: ?Hash = null;
-
-    if (maybe_name) |name| {
-        event_name = if (name.name) |n| try self.allocator.dupe(u8, n) else null;
-        namehash_opt = name.namehash;
-        var name_copy = name;
-        name_copy.deinit(self.allocator);
-    }
-
-    try utils.emitEvent(self, chain, log, .eac_roles_changed, event_name, namehash_opt, event_data);
-}
-
 /// Handle LabelRegistered events from PermissionedRegistry
 /// Event: LabelRegistered(uint256 indexed tokenId, bytes32 indexed labelHash, string label, address owner, uint64 expiry, address indexed sender)
 pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
@@ -1532,12 +1324,11 @@ pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) 
         .expiry = expiry,
         .registry_locked = false,
         .migrated = is_migration,
-        .ejected = false,
         .created_block = log.block_number,
-        .created_at = 0,
-        .registered_at = 0,
+        .created_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        .registered_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
         .updated_block = log.block_number,
-        .updated_at = 0,
+        .updated_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
         .is_wrapped = false,
         .wrapper_fuses = null,
         .wrapper_expiry = null,
@@ -1666,12 +1457,11 @@ pub fn handleLabelReserved(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
         .expiry = expiry,
         .registry_locked = false,
         .migrated = false,
-        .ejected = false,
         .created_block = log.block_number,
-        .created_at = 0,
-        .registered_at = 0,
+        .created_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        .registered_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
         .updated_block = log.block_number,
-        .updated_at = 0,
+        .updated_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
         .is_wrapped = false,
         .wrapper_fuses = null,
         .wrapper_expiry = null,
@@ -1935,54 +1725,3 @@ pub fn handleResolverUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) 
     try utils.emitEvent(self, chain, log, .resolver_updated, event_name, namehash_opt, event_data);
 }
 
-/// Handle EACRolesRevoked events (OLD signature from earlier subregistry deployments)
-/// Event: EACRolesRevoked(uint256 resource, uint256 roleBitmap, address account)
-/// All params are non-indexed (1 topic = event sig only), data = 3 words
-pub fn handleEACRolesRevoked(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
-    if (log.data.len < 96) return error.InvalidDataLength;
-
-    const resource_uint = try abi.ABI.decodeUint256(log.data, 0);
-    const revoked_bitmap = try abi.ABI.decodeUint256(log.data, 32);
-    const account = try abi.ABI.decodeAddress(log.data, 64);
-
-    const token_id_utils = @import("../../types/token_id.zig");
-    const canonical_id = token_id_utils.getCanonicalId(resource_uint);
-
-    var resource_bytes: [32]u8 = undefined;
-    std.mem.writeInt(u256, &resource_bytes, canonical_id, .big);
-    const resource_hex_chars = std.fmt.bytesToHex(resource_bytes, .lower);
-    const resource_hex = try std.fmt.allocPrint(self.allocator, "0x{s}", .{resource_hex_chars});
-    defer self.allocator.free(resource_hex);
-
-    var revoked_bitmap_bytes: [32]u8 = undefined;
-    std.mem.writeInt(u256, &revoked_bitmap_bytes, revoked_bitmap, .big);
-    const revoked_bitmap_hex_chars = std.fmt.bytesToHex(revoked_bitmap_bytes, .lower);
-    const revoked_bitmap_hex = try std.fmt.allocPrint(self.allocator, "0x{s}", .{revoked_bitmap_hex_chars});
-    defer self.allocator.free(revoked_bitmap_hex);
-
-    const account_hex = try account.toHex(self.allocator);
-    defer self.allocator.free(account_hex);
-
-    std.log.debug("EACRolesRevoked: resource={s}, account={s}, bitmap={s}", .{
-        resource_hex, account_hex, revoked_bitmap_hex,
-    });
-
-    try self.database.deleteEACRole(chain, resource_hex, account, log.address);
-
-    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resource\":\"{s}\",\"account\":\"{s}\",\"revokedRoleBitmap\":\"{s}\"}}", .{
-        resource_hex, account_hex, revoked_bitmap_hex,
-    });
-
-    const maybe_name = try self.database.getNameByTokenIdAndRegistry(canonical_id, log.address);
-    var event_name: ?[]const u8 = null;
-    var namehash_opt: ?Hash = null;
-
-    if (maybe_name) |name| {
-        event_name = if (name.name) |n| try self.allocator.dupe(u8, n) else null;
-        namehash_opt = name.namehash;
-        var name_copy = name;
-        name_copy.deinit(self.allocator);
-    }
-
-    try utils.emitEvent(self, chain, log, .eac_roles_changed, event_name, namehash_opt, event_data);
-}

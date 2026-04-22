@@ -189,7 +189,6 @@ pub fn handleV1NewOwner(self: *Indexer, chain: models.Chain, log: rpc.Log) !void
             .expiry = 0,
             .registry_locked = false,
             .migrated = false,
-            .ejected = false,
             .created_block = log.block_number,
             .created_at = now,
             .registered_at = now,
@@ -606,7 +605,6 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, chain: models.Chain, 
             .expiry = @truncate(expires),
             .registry_locked = false, // V1 names don't have registry locking
             .migrated = false, // This is a native V1 name
-            .ejected = false, // V1 names on L1 are not ejected
             .created_block = log.block_number,
             .created_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
             .registered_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),

@@ -115,7 +115,7 @@ pub const Indexer = struct {
         }
 
         // Load rainbow table (optional — graceful fallback if not available)
-        const rainbow = Rainbow.init(allocator, "./data/ens_rainbow.db") catch |err| blk: {
+        const rainbow = Rainbow.init(allocator, cfg.rainbow_path) catch |err| blk: {
             std.log.info("Rainbow table not available ({any}), label resolution will use [labelhash] format", .{err});
             break :blk null;
         };
@@ -131,7 +131,7 @@ pub const Indexer = struct {
             .rate_limiter = RateLimiter.init(cfg.rate_limit_per_second, cfg.rate_limit_per_second),
             .blocks_since_checkpoint = 0,
             .initial_sync_complete = std.atomic.Value(bool).init(false),
-            .v1_network_health = NetworkHealth.init(allocator, cfg.rpc_url, 3000),
+            .v1_network_health = NetworkHealth.init(allocator, cfg.rpc_url, constants.Timing.network_check_interval_ms),
             .end_block = end_block,
             .indexer_status = indexer_status,
             .status_server = status_server,
@@ -204,7 +204,7 @@ pub const Indexer = struct {
         }
 
         // Load rainbow table (optional — graceful fallback if not available)
-        const rainbow = Rainbow.init(allocator, "./data/ens_rainbow.db") catch |err| blk: {
+        const rainbow = Rainbow.init(allocator, cfg.rainbow_path) catch |err| blk: {
             std.log.info("Rainbow table not available ({any}), label resolution will use [labelhash] format", .{err});
             break :blk null;
         };
@@ -220,7 +220,7 @@ pub const Indexer = struct {
             .rate_limiter = RateLimiter.init(cfg.rate_limit_per_second, cfg.rate_limit_per_second),
             .blocks_since_checkpoint = 0,
             .initial_sync_complete = std.atomic.Value(bool).init(false),
-            .v1_network_health = NetworkHealth.init(allocator, cfg.rpc_url, 3000),
+            .v1_network_health = NetworkHealth.init(allocator, cfg.rpc_url, constants.Timing.network_check_interval_ms),
             .end_block = end_block,
             .indexer_status = indexer_status,
             .status_server = status_server,
@@ -422,74 +422,6 @@ pub const Indexer = struct {
     pub inline fn getClient(self: *Indexer, chain: models.Chain) *rpc.Client {
         _ = chain;
         return self.v1_client;
-    }
-
-    // Generic event indexing abstraction
-    pub const EventIndexConfig = struct {
-        event_hash: Hash,
-        contract: Address,
-        handler: *const fn (*Indexer, models.Chain, rpc.Log) anyerror!void,
-        name: []const u8,
-    };
-
-    pub fn indexEvent(
-        self: *Indexer,
-        chain: models.Chain,
-        client: *rpc.Client,
-        from_block: u64,
-        to_block: u64,
-        event_config: EventIndexConfig,
-    ) !void {
-        const topics = [_]?Hash{event_config.event_hash};
-        const logs = try client.getLogs(from_block, to_block, event_config.contract, &topics);
-        defer {
-            for (logs) |*log| {
-                log.deinit(self.allocator);
-            }
-            self.allocator.free(logs);
-        }
-
-        std.log.info("    Found {d} {s} event{s}", .{
-            logs.len,
-            event_config.name,
-            if (logs.len == 1) "" else "s",
-        });
-
-        for (logs) |log| {
-            try event_config.handler(self, chain, log);
-        }
-    }
-
-    // Specialized indexEvent for resolver events (includes resolver address parameter)
-    pub fn indexResolverEvent(
-        self: *Indexer,
-        chain: models.Chain,
-        client: *rpc.Client,
-        resolver: Address,
-        from_block: u64,
-        to_block: u64,
-        event_hash: Hash,
-        handler: *const fn (*Indexer, models.Chain, Address, rpc.Log) anyerror!void,
-        name: []const u8,
-    ) !void {
-        const topics = [_]?Hash{event_hash};
-        const logs = try client.getLogs(from_block, to_block, resolver, &topics);
-        defer {
-            for (logs) |*log| {
-                log.deinit(self.allocator);
-            }
-            self.allocator.free(logs);
-        }
-
-        std.log.info("  Found {d} {s} event{s}", .{
-            logs.len,
-            name,
-            if (logs.len == 1) "" else "s",
-        });
-
-        for (logs) |log| {
-            try handler(self, chain, resolver, log);
-        }
     }
 
     // Event configuration tables for declarative event indexing
@@ -1005,7 +937,6 @@ pub const Indexer = struct {
     pub const processRemainingOrphans = handlers_v2_registry.processRemainingOrphans;
     pub const handleResolverUpdate = handlers_v2_registry.handleResolverUpdate;
     pub const handleNameRegistered = handlers_v2_registry.handleNameRegistered;
-    pub const handleNewSubname = handlers_v2_registry.handleNewSubname;
     pub const handleNameRenewed = handlers_v2_registry.handleNameRenewed;
     pub const handleTransfer = handlers_v2_registry.handleTransfer;
     pub const handleETHNameRegistered = handlers_v2_registry.handleETHNameRegistered;
@@ -1016,8 +947,6 @@ pub const Indexer = struct {
     pub const handleTransferBatch = handlers_v2_registry.handleTransferBatch;
     pub const handleApproval = handlers_v2_registry.handleApproval;
     pub const handleEACRolesChanged = handlers_v2_registry.handleEACRolesChanged;
-    pub const handleEACRolesGranted = handlers_v2_registry.handleEACRolesGranted;
-    pub const handleEACRolesRevoked = handlers_v2_registry.handleEACRolesRevoked;
     pub const handleLabelRegistered = handlers_v2_registry.handleLabelRegistered;
     pub const handleLabelReserved = handlers_v2_registry.handleLabelReserved;
     pub const handleLabelUnregistered = handlers_v2_registry.handleLabelUnregistered;
