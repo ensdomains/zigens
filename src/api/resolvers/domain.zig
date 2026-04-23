@@ -9,10 +9,10 @@ const models = common.models;
 const Address = common.Address;
 const parser = common.parser;
 const pagination = common.pagination;
-const builders = common.builders;
+const builders = @import("../builders/builders.zig");
 const loaders = common.loaders;
 const namehash = common.namehash_fn;
-const NestedContext = common.NestedContext;
+const NestedContext = builders.NestedContext;
 
 fn mapDomainOrderBy(order_by: ?[]const u8) db.NameSortField {
     const field_name = order_by orelse return .created_at;
@@ -27,11 +27,11 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
     const allocator = ctx.allocator;
 
-    // Extract arguments
-    const first = parser.getIntArg(field, "first", 100) orelse 100;
-    const skip = parser.getIntArg(field, "skip", 0) orelse 0;
+    const page = common.parsePagination(field, 100);
+    const first = page.first;
+    const skip = page.skip;
 
-    // Parse filter if provided
+    // Parse `where` filter
     var filter_name: ?[]const u8 = null;
     var filter_name_contains: ?[]const u8 = null;
     var filter_name_contains_nocase: ?[]const u8 = null;
@@ -50,146 +50,81 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
     var filter_expiry_lte: ?i64 = null;
     var filter_migrated: ?bool = null;
 
-    // Look for "where" argument
-    for (field.arguments) |arg| {
-        if (std.mem.eql(u8, arg.name, "where")) {
-            if (arg.value == .object) {
-                for (arg.value.object) |filter_arg| {
-                    if (std.mem.eql(u8, filter_arg.name, "name")) {
-                        if (filter_arg.value == .string) {
-                            filter_name = filter_arg.value.string;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "name_contains")) {
-                        if (filter_arg.value == .string) {
-                            filter_name_contains = filter_arg.value.string;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "owner")) {
-                        if (filter_arg.value == .string) {
-                            filter_owner = Address.fromHex(filter_arg.value.string) catch null;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "resolvedAddress")) {
-                        if (filter_arg.value == .string) {
-                            filter_resolved_address = Address.fromHex(filter_arg.value.string) catch null;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "resolver")) {
-                        if (filter_arg.value == .string) {
-                            filter_resolver = Address.fromHex(filter_arg.value.string) catch null;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "name_contains_nocase")) {
-                        if (filter_arg.value == .string) {
-                            filter_name_contains_nocase = filter_arg.value.string;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "name_starts_with")) {
-                        if (filter_arg.value == .string) {
-                            filter_name_starts_with = filter_arg.value.string;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "name_ends_with")) {
-                        if (filter_arg.value == .string) {
-                            filter_name_ends_with = filter_arg.value.string;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "owner_in")) {
-                        if (filter_arg.value == .list) {
-                            var addresses: std.ArrayList(Address) = .{};
-                            defer addresses.deinit(allocator);
-                            for (filter_arg.value.list) |item| {
-                                if (item == .string) {
-                                    if (Address.fromHex(item.string)) |addr| {
-                                        try addresses.append(allocator, addr);
-                                    } else |_| {}
-                                }
-                            }
-                            filter_owner_in = try addresses.toOwnedSlice(allocator);
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "hasSubdomains")) {
-                        if (filter_arg.value == .boolean) {
-                            filter_has_subdomains = filter_arg.value.boolean;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "subdomainCount_gt")) {
-                        if (filter_arg.value == .int) {
-                            filter_subdomain_count_gt = filter_arg.value.int;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "subdomainCount_lt")) {
-                        if (filter_arg.value == .int) {
-                            filter_subdomain_count_lt = filter_arg.value.int;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "expiry_gt")) {
-                        if (filter_arg.value == .int) {
-                            filter_expiry_gt = filter_arg.value.int;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "expiry_gte")) {
-                        if (filter_arg.value == .int) {
-                            filter_expiry_gte = filter_arg.value.int;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "expiry_lt")) {
-                        if (filter_arg.value == .int) {
-                            filter_expiry_lt = filter_arg.value.int;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "expiry_lte")) {
-                        if (filter_arg.value == .int) {
-                            filter_expiry_lte = filter_arg.value.int;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "isMigrated")) {
-                        if (filter_arg.value == .boolean) {
-                            filter_migrated = filter_arg.value.boolean;
-                        }
+    if (common.getObjectArg(field, "where")) |where_args| {
+        for (where_args) |a| {
+            // owner_in: list-of-Address — handled inline because it allocates.
+            if (std.mem.eql(u8, a.name, "owner_in") and a.value == .list) {
+                var addresses: std.ArrayList(Address) = .{};
+                defer addresses.deinit(allocator);
+                for (a.value.list) |item| {
+                    if (item == .string) {
+                        if (Address.fromHex(item.string)) |addr| {
+                            try addresses.append(allocator, addr);
+                        } else |_| {}
                     }
                 }
+                filter_owner_in = try addresses.toOwnedSlice(allocator);
+                continue;
             }
-            break;
+
+            _ = common.matchStringArg(a, "name", &filter_name) or
+                common.matchStringArg(a, "name_contains", &filter_name_contains) or
+                common.matchStringArg(a, "name_contains_nocase", &filter_name_contains_nocase) or
+                common.matchStringArg(a, "name_starts_with", &filter_name_starts_with) or
+                common.matchStringArg(a, "name_ends_with", &filter_name_ends_with) or
+                common.matchAddressArg(a, "owner", &filter_owner) or
+                common.matchAddressArg(a, "resolvedAddress", &filter_resolved_address) or
+                common.matchAddressArg(a, "resolver", &filter_resolver) or
+                common.matchBoolArg(a, "hasSubdomains", &filter_has_subdomains) or
+                common.matchIntArg(a, "subdomainCount_gt", &filter_subdomain_count_gt) or
+                common.matchIntArg(a, "subdomainCount_lt", &filter_subdomain_count_lt) or
+                common.matchIntArg(a, "expiry_gt", &filter_expiry_gt) or
+                common.matchIntArg(a, "expiry_gte", &filter_expiry_gte) or
+                common.matchIntArg(a, "expiry_lt", &filter_expiry_lt) or
+                common.matchIntArg(a, "expiry_lte", &filter_expiry_lte) or
+                common.matchBoolArg(a, "isMigrated", &filter_migrated);
         }
     }
 
-    // Parse orderBy and orderDirection
-    var order_by: ?[]const u8 = null;
-    var order_direction: []const u8 = "desc"; // default: newest first
-
-    for (field.arguments) |arg| {
-        if (std.mem.eql(u8, arg.name, "orderBy")) {
-            if (arg.value == .string) {
-                order_by = arg.value.string;
-            }
-        } else if (std.mem.eql(u8, arg.name, "orderDirection")) {
-            if (arg.value == .string) {
-                order_direction = arg.value.string;
-            }
-        }
-    }
+    const order_by = parser.getStringArg(field, "orderBy", null);
+    const order_dir_parsed = common.parseOrderDirection(field, db.OrderDir, .desc);
 
     // Get names from database
-    // Optimization 1: if exact name filter is set, use direct lookup by namehash
-    // This is O(1) lookup instead of scanning/filtering
-    if (filter_name) |exact_name| {
-        // Compute namehash for exact lookup
+    // Optimization: if ONLY name filter is set (no other filters), use direct namehash lookup (O(1))
+    // If additional filters are present, fall through to getFilteredNames so all filters apply correctly
+    const only_name_filter = filter_name != null and
+        filter_owner == null and filter_owner_in == null and
+        filter_name_contains == null and filter_name_contains_nocase == null and
+        filter_name_starts_with == null and filter_name_ends_with == null and
+        filter_resolved_address == null and filter_resolver == null and
+        filter_has_subdomains == null and
+        filter_subdomain_count_gt == null and filter_subdomain_count_lt == null and
+        filter_expiry_gt == null and filter_expiry_gte == null and
+        filter_expiry_lt == null and filter_expiry_lte == null and
+        filter_migrated == null;
+
+    if (only_name_filter) {
+        const exact_name = filter_name.?;
         const nh = try namehash(allocator, exact_name);
 
-        // Direct lookup by namehash
         var found_name = try database.getNameByNamehash(nh);
         if (found_name) |*name| {
             defer name.deinit(allocator);
 
-            // Apply any additional filters (owner, etc.)
-            var matches = true;
-            if (filter_owner) |owner| {
-                if (!name.owner.eql(owner)) matches = false;
-            }
+            const name_json = try builders.buildDomainJson(name, field.selections, .{
+                .database = database,
+                .depth = 0,
+                .allocator = allocator,
+                .loaders = ctx.loaders,
+            });
+            defer allocator.free(name_json);
 
-            if (matches) {
-                // Build JSON result for single domain, wrapped in array
-                const name_json = try builders.buildDomainJson(name, field.selections, .{
-                    .database = database,
-                    .depth = 0,
-                    .allocator = allocator,
-                    .loaders = ctx.loaders,
-                });
-                defer allocator.free(name_json);
-
-                // Wrap in array: [{...}]
-                var result = try allocator.alloc(u8, name_json.len + 2);
-                result[0] = '[';
-                @memcpy(result[1..][0..name_json.len], name_json);
-                result[name_json.len + 1] = ']';
-                return .{ .json = result };
-            }
+            // Wrap in array: [{...}]
+            var result = try allocator.alloc(u8, name_json.len + 2);
+            result[0] = '[';
+            @memcpy(result[1..][0..name_json.len], name_json);
+            result[name_json.len + 1] = ']';
+            return .{ .json = result };
         }
 
         // No match found - return empty array
@@ -207,11 +142,11 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
         filter_migrated != null;
 
     // All filters pushed to DB - no need to over-fetch
-    const fetch_limit: u32 = @intCast(first);
+    const fetch_limit: u32 = first;
 
     // Map GraphQL orderBy to SQL sort field
     const sort_field = mapDomainOrderBy(order_by);
-    const order_dir: db.OrderDir = if (std.mem.eql(u8, order_direction, "desc")) .desc else .asc;
+    const order_dir = order_dir_parsed;
 
     // Use filtered query with all filters pushed to DB
     const names = if (has_filters)
@@ -249,69 +184,6 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
 
     try json.appendSlice(allocator, "[");
     const items_to_return = @min(first, names.len);
-
-    // Pre-load resolver data for all domains to enable batching (solves N+1 query problem)
-    // Check if resolver fields that need data loading are requested
-    if (ctx.loaders != null and items_to_return > 0) {
-        const dataloader_mod = loaders;
-        var needs_resolver_addr = false;
-        var needs_content_hash = false;
-        var needs_text_records = false;
-        var needs_resolved_address = false;
-
-        // Check field selections for resolver sub-fields
-        for (field.selections) |sel| {
-            if (std.mem.eql(u8, sel.name, "resolver")) {
-                for (sel.selections) |resolver_sel| {
-                    if (std.mem.eql(u8, resolver_sel.name, "addr")) {
-                        needs_resolver_addr = true;
-                    } else if (std.mem.eql(u8, resolver_sel.name, "contentHash")) {
-                        needs_content_hash = true;
-                    } else if (std.mem.eql(u8, resolver_sel.name, "texts") or
-                        std.mem.eql(u8, resolver_sel.name, "text"))
-                    {
-                        needs_text_records = true;
-                    }
-                }
-            } else if (std.mem.eql(u8, sel.name, "resolvedAddress")) {
-                needs_resolved_address = true;
-            }
-        }
-
-        // Collect namehashes for items that will be returned
-        if (needs_resolver_addr or needs_content_hash or needs_text_records or needs_resolved_address) {
-            const loader_ctx: *dataloader_mod.LoaderContext = @ptrCast(@alignCast(ctx.loaders.?));
-            const return_items = names[0..@as(usize, @intCast(items_to_return))];
-
-            var namehashes = try allocator.alloc([32]u8, return_items.len);
-            defer allocator.free(namehashes);
-
-            for (return_items, 0..) |*name, idx| {
-                namehashes[idx] = name.namehash.bytes;
-            }
-
-            // Pre-load resolver addresses (for addr field and resolvedAddress)
-            if (needs_resolver_addr or needs_resolved_address) {
-                const loader = try loader_ctx.getResolverAddressLoader();
-                const preloaded = try loader.loadMany(namehashes);
-                allocator.free(preloaded);
-            }
-
-            // Pre-load content hashes
-            if (needs_content_hash) {
-                const loader = try loader_ctx.getContentHashLoader();
-                const preloaded = try loader.loadMany(namehashes);
-                allocator.free(preloaded);
-            }
-
-            // Pre-load text records
-            if (needs_text_records) {
-                const loader = try loader_ctx.getTextRecordsLoader();
-                const preloaded = try loader.loadMany(namehashes);
-                allocator.free(preloaded);
-            }
-        }
-    }
 
     for (names[0..@as(usize, @intCast(items_to_return))], 0..) |*name, i| {
         if (i > 0) try json.appendSlice(allocator, ",");
@@ -370,89 +242,38 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
     var filter_expiry_lte: ?i64 = null;
     var filter_migrated: ?bool = null;
 
-    for (field.arguments) |arg| {
-        if (std.mem.eql(u8, arg.name, "where") and arg.value == .object) {
-            for (arg.value.object) |filter_arg| {
-                if (std.mem.eql(u8, filter_arg.name, "name")) {
-                    if (filter_arg.value == .string) {
-                        filter_name = filter_arg.value.string;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "name_contains")) {
-                    if (filter_arg.value == .string) {
-                        filter_name_contains = filter_arg.value.string;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "owner")) {
-                    if (filter_arg.value == .string) {
-                        filter_owner = Address.fromHex(filter_arg.value.string) catch null;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "resolvedAddress")) {
-                    if (filter_arg.value == .string) {
-                        filter_resolved_address = Address.fromHex(filter_arg.value.string) catch null;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "resolver")) {
-                    if (filter_arg.value == .string) {
-                        filter_resolver = Address.fromHex(filter_arg.value.string) catch null;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "name_contains_nocase")) {
-                    if (filter_arg.value == .string) {
-                        filter_name_contains_nocase = filter_arg.value.string;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "name_starts_with")) {
-                    if (filter_arg.value == .string) {
-                        filter_name_starts_with = filter_arg.value.string;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "name_ends_with")) {
-                    if (filter_arg.value == .string) {
-                        filter_name_ends_with = filter_arg.value.string;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "owner_in")) {
-                    if (filter_arg.value == .list) {
-                        var addresses: std.ArrayList(Address) = .{};
-                        defer addresses.deinit(allocator);
-                        for (filter_arg.value.list) |item| {
-                            if (item == .string) {
-                                if (Address.fromHex(item.string)) |addr| {
-                                    try addresses.append(allocator, addr);
-                                } else |_| {}
-                            }
-                        }
-                        filter_owner_in = try addresses.toOwnedSlice(allocator);
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "hasSubdomains")) {
-                    if (filter_arg.value == .boolean) {
-                        filter_has_subdomains = filter_arg.value.boolean;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "subdomainCount_gt")) {
-                    if (filter_arg.value == .int) {
-                        filter_subdomain_count_gt = filter_arg.value.int;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "subdomainCount_lt")) {
-                    if (filter_arg.value == .int) {
-                        filter_subdomain_count_lt = filter_arg.value.int;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "expiry_gt")) {
-                    if (filter_arg.value == .int) {
-                        filter_expiry_gt = filter_arg.value.int;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "expiry_gte")) {
-                    if (filter_arg.value == .int) {
-                        filter_expiry_gte = filter_arg.value.int;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "expiry_lt")) {
-                    if (filter_arg.value == .int) {
-                        filter_expiry_lt = filter_arg.value.int;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "expiry_lte")) {
-                    if (filter_arg.value == .int) {
-                        filter_expiry_lte = filter_arg.value.int;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "isMigrated")) {
-                    if (filter_arg.value == .boolean) {
-                        filter_migrated = filter_arg.value.boolean;
+    if (common.getObjectArg(field, "where")) |where_args| {
+        for (where_args) |a| {
+            if (std.mem.eql(u8, a.name, "owner_in") and a.value == .list) {
+                var addresses: std.ArrayList(Address) = .{};
+                defer addresses.deinit(allocator);
+                for (a.value.list) |item| {
+                    if (item == .string) {
+                        if (Address.fromHex(item.string)) |addr| {
+                            try addresses.append(allocator, addr);
+                        } else |_| {}
                     }
                 }
+                filter_owner_in = try addresses.toOwnedSlice(allocator);
+                continue;
             }
-            break;
+
+            _ = common.matchStringArg(a, "name", &filter_name) or
+                common.matchStringArg(a, "name_contains", &filter_name_contains) or
+                common.matchStringArg(a, "name_contains_nocase", &filter_name_contains_nocase) or
+                common.matchStringArg(a, "name_starts_with", &filter_name_starts_with) or
+                common.matchStringArg(a, "name_ends_with", &filter_name_ends_with) or
+                common.matchAddressArg(a, "owner", &filter_owner) or
+                common.matchAddressArg(a, "resolvedAddress", &filter_resolved_address) or
+                common.matchAddressArg(a, "resolver", &filter_resolver) or
+                common.matchBoolArg(a, "hasSubdomains", &filter_has_subdomains) or
+                common.matchIntArg(a, "subdomainCount_gt", &filter_subdomain_count_gt) or
+                common.matchIntArg(a, "subdomainCount_lt", &filter_subdomain_count_lt) or
+                common.matchIntArg(a, "expiry_gt", &filter_expiry_gt) or
+                common.matchIntArg(a, "expiry_gte", &filter_expiry_gte) or
+                common.matchIntArg(a, "expiry_lt", &filter_expiry_lt) or
+                common.matchIntArg(a, "expiry_lte", &filter_expiry_lte) or
+                common.matchBoolArg(a, "isMigrated", &filter_migrated);
         }
     }
     defer if (filter_owner_in) |owners| allocator.free(owners);
@@ -517,35 +338,40 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         }
     }
 
-    // Parse orderBy and orderDirection for connection
-    var order_by: ?[]const u8 = null;
-    var order_direction: ?[]const u8 = null;
-    for (field.arguments) |arg| {
-        if (std.mem.eql(u8, arg.name, "orderBy")) {
-            if (arg.value == .string) order_by = arg.value.string;
-        } else if (std.mem.eql(u8, arg.name, "orderDirection")) {
-            if (arg.value == .string) order_direction = arg.value.string;
-        }
-    }
+    const order_by = parser.getStringArg(field, "orderBy", null);
     const sort_field = mapDomainOrderBy(order_by);
 
-    // Default order: desc (newest first) when no orderDirection specified, matching original behavior
-    const order_dir_str = order_direction orelse "desc";
+    // Default order: desc (newest first) when no orderDirection specified
+    const base_dir = common.parseOrderDirection(field, db.OrderDir, .desc);
 
     // Fetch one extra item to determine hasNextPage/hasPreviousPage
     const fetch_limit = params.limit + 1;
 
     // Combine pagination direction with user-requested order
-    const base_dir: db.OrderDir = if (std.mem.eql(u8, order_dir_str, "desc")) .desc else .asc;
     const order_dir: db.OrderDir = if (params.direction == .backward)
         (if (base_dir == .desc) .asc else .desc)
     else
         base_dir;
 
+    // Convert the cursor (encoded namehash) into a SKIP offset for the SQL query.
+    // The cursor points to the last item the client already saw; we skip everything up
+    // to and including it. This uses countRowsBeforeNamehash which does a (sort_field, namehash)
+    // stable comparison to get the count of rows that sort BEFORE the cursor row, then +1 to
+    // skip the cursor row itself.
+    var skip: u32 = 0;
+    if (params.cursor) |c| {
+        const cursor_namehash = pagination.CursorCodec.decodeString(allocator, c) catch null;
+        if (cursor_namehash) |nh| {
+            defer allocator.free(nh);
+            const rows_before = database.countRowsBeforeNamehash(nh, sort_field, order_dir) catch 0;
+            skip = rows_before +| 1; // +1 to skip past the cursor row itself
+        }
+    }
+
     const names = if (has_filters)
-        try database.getFilteredNames(name_filters, 0, @intCast(fetch_limit), order_dir, sort_field)
+        try database.getFilteredNames(name_filters, skip, @intCast(fetch_limit), order_dir, sort_field)
     else
-        try database.getAllNamesWithOrder(null, 0, @intCast(fetch_limit), order_dir, sort_field);
+        try database.getAllNamesWithOrder(null, skip, @intCast(fetch_limit), order_dir, sort_field);
     defer {
         for (names) |*name| {
             name.deinit(allocator);
@@ -553,7 +379,9 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         allocator.free(names);
     }
 
-    // Determine actual items to return (exclude the extra item)
+    // We fetched `params.limit + 1` to detect a trailing page; if we actually got
+    // more than `limit`, there's more data in the pagination direction.
+    const has_more = names.len > params.limit;
     const actual_items = @min(names.len, params.limit);
 
     // For backward pagination, reverse the results to maintain proper edge order
@@ -614,6 +442,7 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         allocator,
         wrapper_items,
         params,
+        has_more,
         getId,
         total_count,
     );

@@ -13,8 +13,8 @@ const Address = common.Address;
 const Hash = common.Hash;
 const parser = common.parser;
 const pagination = common.pagination;
-const builders = common.builders;
-const escapeJsonString = common.escapeJsonString;
+const builders = @import("../builders/builders.zig");
+const json_utils = common.json_utils;
 
 /// Parse chain argument from field (defaults to v2)
 fn parseChainArg(field: *const parser.Field) models.Chain {
@@ -114,6 +114,23 @@ pub fn resolveRolesConnection(ctx: parser.ExecutionContext, field: *const parser
         cursor_id = pagination.CursorCodec.decodeInt(allocator, cursor) catch null;
     }
 
+    // Check which top-level fields are requested (for totalCount-only fast path)
+    var wants_edges = false;
+    var wants_page_info = false;
+    var wants_total_count = false;
+    for (field.selections) |*sel| {
+        if (std.mem.eql(u8, sel.name, "edges")) wants_edges = true;
+        if (std.mem.eql(u8, sel.name, "pageInfo")) wants_page_info = true;
+        if (std.mem.eql(u8, sel.name, "totalCount")) wants_total_count = true;
+    }
+
+    // Fast path: only totalCount requested — skip row fetching entirely
+    if (wants_total_count and !wants_edges and !wants_page_info) {
+        const count = try database.getTotalRoleCount(chain, resource_arg, account_addr);
+        const result = try std.fmt.allocPrint(allocator, "{{\"totalCount\":{d}}}", .{count});
+        return parser.FieldResult{ .json = result };
+    }
+
     // Extract node selections from query
     var node_selections: []const parser.Field = &[_]parser.Field{};
     for (field.selections) |*sel| {
@@ -156,14 +173,7 @@ pub fn resolveRolesConnection(ctx: parser.ExecutionContext, field: *const parser
 
     const items_slice = roles[0..actual_items];
 
-    // Only compute total count when requested in the GraphQL selection
-    var wants_total_count = false;
-    for (field.selections) |*sel| {
-        if (std.mem.eql(u8, sel.name, "totalCount")) {
-            wants_total_count = true;
-            break;
-        }
-    }
+    // Only compute total count when requested (reuse wants_total_count from earlier scan)
     const total_count: ?usize = if (wants_total_count)
         try database.getTotalRoleCount(chain, resource_arg, account_addr)
     else
@@ -532,7 +542,7 @@ fn buildResolverJson(
                 for (sel.selections) |subfield| {
                     if (std.mem.eql(u8, subfield.name, "fromName")) {
                         if (!first_sub) try json.appendSlice(allocator, ",");
-                        const escaped = try escapeJsonString(allocator, record.from_name);
+                        const escaped = try json_utils.escapeString(allocator, record.from_name);
                         defer allocator.free(escaped);
                         const val = try std.fmt.allocPrint(allocator, "\"fromName\":\"{s}\"", .{escaped});
                         defer allocator.free(val);
@@ -540,7 +550,7 @@ fn buildResolverJson(
                         first_sub = false;
                     } else if (std.mem.eql(u8, subfield.name, "toName")) {
                         if (!first_sub) try json.appendSlice(allocator, ",");
-                        const escaped = try escapeJsonString(allocator, record.to_name);
+                        const escaped = try json_utils.escapeString(allocator, record.to_name);
                         defer allocator.free(escaped);
                         const val = try std.fmt.allocPrint(allocator, "\"toName\":\"{s}\"", .{escaped});
                         defer allocator.free(val);
@@ -549,9 +559,9 @@ fn buildResolverJson(
                     }
                 }
                 if (first_sub) {
-                    const escaped_from = try escapeJsonString(allocator, record.from_name);
+                    const escaped_from = try json_utils.escapeString(allocator, record.from_name);
                     defer allocator.free(escaped_from);
-                    const escaped_to = try escapeJsonString(allocator, record.to_name);
+                    const escaped_to = try json_utils.escapeString(allocator, record.to_name);
                     defer allocator.free(escaped_to);
                     const val = try std.fmt.allocPrint(allocator, "\"fromName\":\"{s}\",\"toName\":\"{s}\"", .{ escaped_from, escaped_to });
                     defer allocator.free(val);
@@ -675,7 +685,7 @@ fn handleEACRoleField(ctx: *anyopaque, output_key: []const u8, field_name: []con
         try writer.print("\"{s}\":\"{d}\"", .{ output_key, role.id });
         return true;
     } else if (std.mem.eql(u8, field_name, "resource")) {
-        const escaped = try escapeJsonString(allocator, role.resource);
+        const escaped = try json_utils.escapeString(allocator, role.resource);
         defer allocator.free(escaped);
         try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         return true;
@@ -685,7 +695,7 @@ fn handleEACRoleField(ctx: *anyopaque, output_key: []const u8, field_name: []con
         try writer.print("\"{s}\":\"{s}\"", .{ output_key, account_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "roleBitmap")) {
-        const escaped = try escapeJsonString(allocator, role.role_bitmap);
+        const escaped = try json_utils.escapeString(allocator, role.role_bitmap);
         defer allocator.free(escaped);
         try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         return true;
@@ -702,7 +712,7 @@ fn handleEACRoleField(ctx: *anyopaque, output_key: []const u8, field_name: []con
         return true;
     } else if (std.mem.eql(u8, field_name, "name")) {
         if (role.name) |name| {
-            const escaped = try escapeJsonString(allocator, name);
+            const escaped = try json_utils.escapeString(allocator, name);
             defer allocator.free(escaped);
             try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         } else {
@@ -723,7 +733,7 @@ fn handleRegistryField(ctx: *anyopaque, output_key: []const u8, field_name: []co
         try writer.print("\"{s}\":\"{s}\"", .{ output_key, addr_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "name")) {
-        const escaped = try escapeJsonString(allocator, registry.name);
+        const escaped = try json_utils.escapeString(allocator, registry.name);
         defer allocator.free(escaped);
         try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         return true;
@@ -760,7 +770,7 @@ fn handleResolverMetadataField(ctx: *anyopaque, output_key: []const u8, field_na
         try writer.print("\"{s}\":\"{s}\"", .{ output_key, resolver_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "graphqlUrl")) {
-        const escaped = try escapeJsonString(allocator, metadata.graphql_url);
+        const escaped = try json_utils.escapeString(allocator, metadata.graphql_url);
         defer allocator.free(escaped);
         try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         return true;
@@ -798,7 +808,7 @@ fn handleResolverApprovalField(ctx: *anyopaque, output_key: []const u8, field_na
         return true;
     } else if (std.mem.eql(u8, field_name, "context")) {
         if (approval.context) |ctx_str| {
-            const escaped = try escapeJsonString(allocator, ctx_str);
+            const escaped = try json_utils.escapeString(allocator, ctx_str);
             defer allocator.free(escaped);
             try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         } else {

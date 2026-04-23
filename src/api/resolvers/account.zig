@@ -6,7 +6,7 @@ const db = common.db;
 const models = common.models;
 const Address = common.Address;
 const parser = common.parser;
-const builders = common.builders;
+const builders = @import("../builders/builders.zig");
 
 /// Resolver for account query
 pub fn resolveAccount(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
