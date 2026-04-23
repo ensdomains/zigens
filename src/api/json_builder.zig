@@ -80,9 +80,20 @@ pub fn buildEntityJson(
     try writer.writeAll("{");
     var first = true;
 
+    // GraphQL §5.3.2: fields with the same response name (alias or name) are merged.
+    // Our simple case: scalar selections with no args — dedupe by output_key so we don't
+    // emit `{"id":"x","id":"x"}` (invalid per JSON RFC 8259). Richer merging for nested
+    // selections with same name / different args is out of scope; that would require an
+    // error per spec anyway.
+    var seen_keys: std.StringHashMap(void) = .init(allocator);
+    defer seen_keys.deinit();
+
     for (selections) |*field| {
         // Use alias if provided, otherwise use field name (GraphQL spec compliance)
         const output_key = field.alias orelse field.name;
+
+        const gop = try seen_keys.getOrPut(output_key);
+        if (gop.found_existing) continue;
 
         // Handle __typename introspection field
         if (std.mem.eql(u8, field.name, "__typename")) {

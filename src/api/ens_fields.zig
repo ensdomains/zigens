@@ -740,16 +740,8 @@ fn writeNameExpiryDate(ctx: *anyopaque, output_key: []const u8, writer: std.Arra
     return true;
 }
 
-/// Check if expiry is valid (non-zero and not max value)
+/// Check if expiry is valid. We store 0 for "no expiry" (subnames without duration).
 pub fn hasValidExpiry(expiry: anytype) bool {
-    const T = @TypeOf(expiry);
-    if (@typeInfo(T) == .int) {
-        // For unsigned types, check against maxInt of that type
-        if (@typeInfo(T).int.signedness == .unsigned) {
-            return expiry > 0 and expiry < std.math.maxInt(T);
-        }
-    }
-    // For signed types or other, just check > 0
     return expiry > 0;
 }
 
