@@ -526,12 +526,7 @@ pub const Database = struct {
         try self.exec("DROP INDEX IF EXISTS idx_temp_pre_migration_label_hash");
         try self.exec("DROP INDEX IF EXISTS idx_temp_pre_migration_chain");
 
-        // Bridge events: drop all 8 indexes
-        try self.exec("DROP INDEX IF EXISTS idx_migrations_token_id");
-        try self.exec("DROP INDEX IF EXISTS idx_migrations_block");
-        try self.exec("DROP INDEX IF EXISTS idx_migrations_direction");
-        try self.exec("DROP INDEX IF EXISTS idx_renewal_syncs_token_id");
-        try self.exec("DROP INDEX IF EXISTS idx_renewal_syncs_block");
+        // Token observers (V2 Registry) indexes
         try self.exec("DROP INDEX IF EXISTS idx_token_observers_token_id");
         try self.exec("DROP INDEX IF EXISTS idx_token_observers_block");
         try self.exec("DROP INDEX IF EXISTS idx_token_observers_observer");
@@ -651,12 +646,7 @@ pub const Database = struct {
         try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_pre_migration_label_hash ON temp_pre_migration_names(label_hash)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_pre_migration_chain ON temp_pre_migration_names(chain)");
 
-        // Bridge events indexes (8)
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_migrations_token_id ON migrations(chain, token_id)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_migrations_block ON migrations(chain, block_number)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_migrations_direction ON migrations(direction)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_renewal_syncs_token_id ON renewal_syncs(chain, token_id)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_renewal_syncs_block ON renewal_syncs(chain, block_number)");
+        // Token observers (V2 Registry) indexes
         try self.exec("CREATE INDEX IF NOT EXISTS idx_token_observers_token_id ON token_observers(chain, token_id)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_token_observers_block ON token_observers(chain, block_number)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_token_observers_observer ON token_observers(observer)");
@@ -694,6 +684,7 @@ pub const Database = struct {
     pub const getAllNames = names.getAllNames;
     pub const getAllNamesWithOrder = names.getAllNamesWithOrder;
     pub const getFilteredNames = names.getFilteredNames;
+    pub const countRowsBeforeNamehash = names.countRowsBeforeNamehash;
     pub const OrderDir = names.OrderDir;
     pub const NameSortField = names.NameSortField;
     pub const NameFilters = names.NameFilters;
@@ -710,12 +701,12 @@ pub const Database = struct {
     pub const storeResolverAddress = resolvers.storeResolverAddress;
     pub const storeResolverContentHash = resolvers.storeResolverContentHash;
     pub const storeResolverText = resolvers.storeResolverText;
-    pub const getResolverAddress = resolvers.getResolverAddress;
-    pub const getResolverContentHash = resolvers.getResolverContentHash;
-    pub const getResolverTextKeys = resolvers.getResolverTextKeys;
-    pub const getResolverText = resolvers.getResolverText;
-    pub const getResolverTextKeysByResolver = resolvers.getResolverTextKeysByResolver;
-    pub const getResolverTextByResolver = resolvers.getResolverTextByResolver;
+    pub const getAddressRecord = resolvers.getAddressRecord;
+    pub const getAddressRecords = resolvers.getAddressRecords;
+    pub const countEventsBeforeCursor = events.countEventsBeforeCursor;
+    pub const getContentHashRecord = resolvers.getContentHashRecord;
+    pub const getTextRecordKeys = resolvers.getTextRecordKeys;
+    pub const getTextRecord = resolvers.getTextRecord;
     pub const getResolversToIndex = resolvers.getResolversToIndex;
     pub const getResolversByOwner = resolvers.getResolversByOwner;
     pub const deleteResolverAddresses = resolvers.deleteResolverAddresses;
@@ -735,12 +726,12 @@ pub const Database = struct {
     pub const storeResolverInterface = resolvers.storeResolverInterface;
     pub const storeResolverVersion = resolvers.storeResolverVersion;
     pub const PubkeyRecord = resolvers.PubkeyRecord;
-    pub const getResolverPubkey = resolvers.getResolverPubkey;
-    pub const getResolverAbiContentTypes = resolvers.getResolverAbiContentTypes;
-    pub const getResolverReverseName = resolvers.getResolverReverseName;
+    pub const getPubkeyRecord = resolvers.getPubkeyRecord;
+    pub const getAbiContentTypes = resolvers.getAbiContentTypes;
+    pub const getReverseNameRecord = resolvers.getReverseNameRecord;
     pub const InterfaceRecord = resolvers.InterfaceRecord;
-    pub const getResolverInterfaces = resolvers.getResolverInterfaces;
-    pub const getResolverVersion = resolvers.getResolverVersion;
+    pub const getInterfaceRecords = resolvers.getInterfaceRecords;
+    pub const getNodeRecordVersion = resolvers.getNodeRecordVersion;
     pub const getResolverNodeCount = resolvers.getResolverNodeCount;
     pub const getResolverAliasCount = resolvers.getResolverAliasCount;
     pub const getResolverRoleHolderCount = resolvers.getResolverRoleHolderCount;
@@ -821,5 +812,6 @@ pub const Database = struct {
     pub const RegistrationFilterOptions = registrations.RegistrationFilterOptions;
     pub const getRegistrations = registrations.getRegistrations;
     pub const getRegistrationCount = registrations.getRegistrationCount;
+    pub const insertRegistration = registrations.insertRegistration;
     pub const getTotalRegistrationCount = registrations.getTotalRegistrationCount;
 };

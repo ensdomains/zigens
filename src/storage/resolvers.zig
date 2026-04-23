@@ -106,29 +106,6 @@ pub fn storeResolverText(
     try q.exec();
 }
 
-/// Get the latest address record for a namehash (coin type 60 = ETH)
-pub fn getResolverAddress(db: *Database, namehash: Hash, coin_type: u64) !?[]u8 {
-    const sql =
-        \\SELECT address FROM resolver_addresses
-        \\WHERE namehash = ? AND coin_type = ?
-        \\ORDER BY block_number DESC
-        \\LIMIT 1
-    ;
-
-    var q = try Query.init(db, sql);
-    defer q.deinit();
-
-    try q.bindHash(namehash);
-    try q.bindInt64(@intCast(coin_type));
-
-    if (try q.step()) {
-        return try q.getText(0);
-    }
-    return null;
-}
-
-/// Get all addresses for a namehash (all coin types)
-/// Returns array of (coin_type, address) pairs
 pub const CoinAddress = struct {
     coin_type: u64,
     address: []u8,
@@ -138,17 +115,48 @@ pub const CoinAddress = struct {
     }
 };
 
-pub fn getResolverAllAddresses(db: *Database, namehash: Hash) ![]CoinAddress {
+/// Latest addr record for a given (resolver, namehash, coin_type).
+/// Scoped to the currently authoritative resolver so records set by a legacy
+/// resolver on a migrated name don't leak through.
+pub fn getAddressRecord(db: *Database, resolver: Address, namehash: Hash, coin_type: u64) !?[]u8 {
+    const sql =
+        \\SELECT address FROM resolver_addresses
+        \\WHERE resolver = ? AND namehash = ? AND coin_type = ?
+        \\ORDER BY block_number DESC
+        \\LIMIT 1
+    ;
+
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+
+    try q.bindAddress(resolver);
+    try q.bindHash(namehash);
+    try q.bindInt64(@intCast(coin_type));
+
+    if (try q.step()) {
+        return try q.getText(0);
+    }
+    return null;
+}
+
+/// All multi-coin addr records for a given (resolver, namehash).
+/// Scoped to the currently authoritative resolver — same reason as getAddressRecord.
+pub fn getAddressRecords(db: *Database, resolver: Address, namehash: Hash) ![]CoinAddress {
     const sql =
         \\SELECT coin_type, address FROM resolver_addresses
-        \\WHERE namehash = ?
+        \\WHERE resolver = ? AND namehash = ?
         \\ORDER BY coin_type
     ;
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
+    try q.bindAddress(resolver);
     try q.bindHash(namehash);
+    return try readCoinAddresses(db, &q);
+}
+
+fn readCoinAddresses(db: *Database, q: *Query) ![]CoinAddress {
 
     var addresses: std.ArrayList(CoinAddress) = .{};
     errdefer {
@@ -172,11 +180,12 @@ pub fn getResolverAllAddresses(db: *Database, namehash: Hash) ![]CoinAddress {
     return addresses.toOwnedSlice(db.allocator);
 }
 
-/// Get the latest content hash for a namehash
-pub fn getResolverContentHash(db: *Database, namehash: Hash) !?[]u8 {
+/// Latest contenthash record for (resolver, namehash).
+/// Scoped to the given resolver so a migrated name doesn't surface its legacy V1 value.
+pub fn getContentHashRecord(db: *Database, resolver: Address, namehash: Hash) !?[]u8 {
     const sql =
         \\SELECT contenthash FROM resolver_contenthashes
-        \\WHERE namehash = ?
+        \\WHERE resolver = ? AND namehash = ?
         \\ORDER BY block_number DESC
         \\LIMIT 1
     ;
@@ -184,6 +193,7 @@ pub fn getResolverContentHash(db: *Database, namehash: Hash) !?[]u8 {
     var q = try Query.init(db, sql);
     defer q.deinit();
 
+    try q.bindAddress(resolver);
     try q.bindHash(namehash);
 
     if (try q.step()) {
@@ -192,17 +202,18 @@ pub fn getResolverContentHash(db: *Database, namehash: Hash) !?[]u8 {
     return null;
 }
 
-/// Get all text records for a namehash (returns list of keys)
-pub fn getResolverTextKeys(db: *Database, namehash: Hash) ![][]u8 {
+/// All text record keys set by (resolver, namehash).
+pub fn getTextRecordKeys(db: *Database, resolver: Address, namehash: Hash) ![][]u8 {
     const sql =
         \\SELECT DISTINCT key FROM resolver_texts
-        \\WHERE namehash = ?
+        \\WHERE resolver = ? AND namehash = ?
         \\ORDER BY key
     ;
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
+    try q.bindAddress(resolver);
     try q.bindHash(namehash);
 
     var keys: std.ArrayList([]u8) = .{};
@@ -222,11 +233,11 @@ pub fn getResolverTextKeys(db: *Database, namehash: Hash) ![][]u8 {
     return keys.toOwnedSlice(db.allocator);
 }
 
-/// Get a specific text record value for a namehash and key
-pub fn getResolverText(db: *Database, namehash: Hash, key: []const u8) !?[]u8 {
+/// Latest text record value for (resolver, namehash, key).
+pub fn getTextRecord(db: *Database, resolver: Address, namehash: Hash, key: []const u8) !?[]u8 {
     const sql =
         \\SELECT value FROM resolver_texts
-        \\WHERE namehash = ? AND key = ?
+        \\WHERE resolver = ? AND namehash = ? AND key = ?
         \\ORDER BY block_number DESC
         \\LIMIT 1
     ;
@@ -234,60 +245,8 @@ pub fn getResolverText(db: *Database, namehash: Hash, key: []const u8) !?[]u8 {
     var q = try Query.init(db, sql);
     defer q.deinit();
 
+    try q.bindAddress(resolver);
     try q.bindHash(namehash);
-    try q.bindText(key);
-
-    if (try q.step()) {
-        return try q.getText(0);
-    }
-    return null;
-}
-
-/// Get all text record keys for a resolver address (for V2 names)
-/// NOTE: V2 names have different namehashes than V1 resolver events, so we
-/// must look up by resolver address to find text records for V2 names.
-pub fn getResolverTextKeysByResolver(db: *Database, resolver: Address) ![][]u8 {
-    const sql =
-        \\SELECT DISTINCT key FROM resolver_texts
-        \\WHERE resolver = ?
-        \\ORDER BY key
-    ;
-
-    var q = try Query.init(db, sql);
-    defer q.deinit();
-
-    try q.bindAddress(resolver);
-
-    var keys: std.ArrayList([]u8) = .{};
-    errdefer {
-        for (keys.items) |key| {
-            db.allocator.free(key);
-        }
-        keys.deinit(db.allocator);
-    }
-
-    while (try q.step()) {
-        if (try q.getText(0)) |key| {
-            try keys.append(db.allocator, key);
-        }
-    }
-
-    return keys.toOwnedSlice(db.allocator);
-}
-
-/// Get a specific text record value by resolver address and key (for V2 names)
-pub fn getResolverTextByResolver(db: *Database, resolver: Address, key: []const u8) !?[]u8 {
-    const sql =
-        \\SELECT value FROM resolver_texts
-        \\WHERE resolver = ? AND key = ?
-        \\ORDER BY block_number DESC
-        \\LIMIT 1
-    ;
-
-    var q = try Query.init(db, sql);
-    defer q.deinit();
-
-    try q.bindAddress(resolver);
     try q.bindText(key);
 
     if (try q.step()) {
@@ -642,16 +601,18 @@ pub const PubkeyRecord = struct {
     }
 };
 
-pub fn getResolverPubkey(db: *Database, namehash_val: Hash) !?PubkeyRecord {
+/// Pubkey record (x, y) for (resolver, namehash).
+pub fn getPubkeyRecord(db: *Database, resolver: Address, namehash_val: Hash) !?PubkeyRecord {
     const sql =
         \\SELECT x, y FROM resolver_pubkeys
-        \\WHERE namehash = ?
+        \\WHERE resolver = ? AND namehash = ?
         \\LIMIT 1
     ;
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
+    try q.bindAddress(resolver);
     try q.bindHash(namehash_val);
 
     if (try q.step()) {
@@ -668,16 +629,18 @@ pub fn getResolverPubkey(db: *Database, namehash_val: Hash) !?PubkeyRecord {
     return null;
 }
 
-pub fn getResolverAbiContentTypes(db: *Database, namehash_val: Hash) ![]u64 {
+/// ABI content-type ids present for (resolver, namehash).
+pub fn getAbiContentTypes(db: *Database, resolver: Address, namehash_val: Hash) ![]u64 {
     const sql =
         \\SELECT content_type FROM resolver_abis
-        \\WHERE namehash = ?
+        \\WHERE resolver = ? AND namehash = ?
         \\ORDER BY content_type
     ;
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
+    try q.bindAddress(resolver);
     try q.bindHash(namehash_val);
 
     var types: std.ArrayList(u64) = .{};
@@ -690,16 +653,18 @@ pub fn getResolverAbiContentTypes(db: *Database, namehash_val: Hash) ![]u64 {
     return types.toOwnedSlice(db.allocator);
 }
 
-pub fn getResolverReverseName(db: *Database, namehash_val: Hash) !?[]u8 {
+/// Reverse-name record (name() on the resolver) for (resolver, namehash).
+pub fn getReverseNameRecord(db: *Database, resolver: Address, namehash_val: Hash) !?[]u8 {
     const sql =
         \\SELECT name FROM resolver_names
-        \\WHERE namehash = ?
+        \\WHERE resolver = ? AND namehash = ?
         \\LIMIT 1
     ;
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
+    try q.bindAddress(resolver);
     try q.bindHash(namehash_val);
 
     if (try q.step()) {
@@ -718,16 +683,18 @@ pub const InterfaceRecord = struct {
     }
 };
 
-pub fn getResolverInterfaces(db: *Database, namehash_val: Hash) ![]InterfaceRecord {
+/// Interface records (interfaceImplementer entries) for (resolver, namehash).
+pub fn getInterfaceRecords(db: *Database, resolver: Address, namehash_val: Hash) ![]InterfaceRecord {
     const sql =
         \\SELECT interface_id, implementer FROM resolver_interfaces
-        \\WHERE namehash = ?
+        \\WHERE resolver = ? AND namehash = ?
         \\ORDER BY interface_id
     ;
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
+    try q.bindAddress(resolver);
     try q.bindHash(namehash_val);
 
     var records: std.ArrayList(InterfaceRecord) = .{};
@@ -754,16 +721,20 @@ pub fn getResolverInterfaces(db: *Database, namehash_val: Hash) ![]InterfaceReco
     return records.toOwnedSlice(db.allocator);
 }
 
-pub fn getResolverVersion(db: *Database, namehash_val: Hash) !?u64 {
+/// Per-node record version (PublicResolver's `recordVersions[node]`) for (resolver, namehash).
+/// This is a node-scoped counter used to invalidate all records at once — not a
+/// "resolver version." Returns null if no VersionChanged has been emitted.
+pub fn getNodeRecordVersion(db: *Database, resolver: Address, namehash_val: Hash) !?u64 {
     const sql =
         \\SELECT version FROM resolver_versions
-        \\WHERE namehash = ?
+        \\WHERE resolver = ? AND namehash = ?
         \\LIMIT 1
     ;
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
+    try q.bindAddress(resolver);
     try q.bindHash(namehash_val);
 
     if (try q.step()) {
