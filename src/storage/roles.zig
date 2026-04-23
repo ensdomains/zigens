@@ -71,12 +71,21 @@ fn parseEACRoleRow(q: *Query, allocator: std.mem.Allocator) !models.EACRoleAssig
     };
 }
 
-/// Get all role assignments for a resource
+/// Get all role assignments for a resource.
+/// Resolves the human-readable name via two paths:
+///   1. Registry EAC (today's primary path): `contract_address` matches a registry row,
+///      resource = token's canonical_id — joins to `names` by (canonical_id, registry).
+///   2. Resolver EAC (future-proofing): if/when resolver contracts emit `EACRolesChanged`
+///      where `resource = namehash`, the resolvers JOIN resolves to a name. No handler
+///      currently stores roles in this shape; the JOIN is a no-op on current data.
 pub fn getRolesByResource(db: *Database, chain: models.Chain, resource: []const u8) ![]models.EACRoleAssignment {
     const sql =
-        \\SELECT r.id, r.chain, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp, n.name
+        \\SELECT r.id, r.chain, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp,
+        \\       COALESCE(reg_name.name, resolver_name.name) AS name
         \\FROM eac_roles r
-        \\LEFT JOIN names n ON r.resource = n.canonical_id AND r.contract_address = n.registry
+        \\LEFT JOIN names reg_name ON r.resource = reg_name.canonical_id AND r.contract_address = reg_name.registry
+        \\LEFT JOIN resolvers res ON r.contract_address = res.address AND r.resource = res.namehash AND res.chain = r.chain
+        \\LEFT JOIN names resolver_name ON res.namehash = resolver_name.namehash AND resolver_name.chain = r.chain
         \\WHERE r.chain = ? AND r.resource = ?
         \\ORDER BY r.timestamp DESC
     ;
@@ -103,12 +112,16 @@ pub fn getRolesByResource(db: *Database, chain: models.Chain, resource: []const 
     return roles.toOwnedSlice(db.allocator);
 }
 
-/// Get all role assignments for an account
+/// Get all role assignments for an account.
+/// Resolves name via registry or resolver paths (see getRolesByResource).
 pub fn getRolesByAccount(db: *Database, chain: models.Chain, account: Address) ![]models.EACRoleAssignment {
     const sql =
-        \\SELECT r.id, r.chain, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp, n.name
+        \\SELECT r.id, r.chain, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp,
+        \\       COALESCE(reg_name.name, resolver_name.name) AS name
         \\FROM eac_roles r
-        \\LEFT JOIN names n ON r.resource = n.canonical_id AND r.contract_address = n.registry
+        \\LEFT JOIN names reg_name ON r.resource = reg_name.canonical_id AND r.contract_address = reg_name.registry
+        \\LEFT JOIN resolvers res ON r.contract_address = res.address AND r.resource = res.namehash AND res.chain = r.chain
+        \\LEFT JOIN names resolver_name ON res.namehash = resolver_name.namehash AND resolver_name.chain = r.chain
         \\WHERE r.chain = ? AND r.account = ?
         \\ORDER BY r.timestamp DESC
     ;
@@ -151,9 +164,12 @@ pub fn getRolesWithPagination(db: *Database, chain: models.Chain, options: RoleP
     var sql_len: usize = 0;
 
     const base =
-        \\SELECT r.id, r.chain, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp, n.name
+        \\SELECT r.id, r.chain, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp,
+        \\       COALESCE(reg_name.name, resolver_name.name) AS name
         \\FROM eac_roles r
-        \\LEFT JOIN names n ON r.resource = n.canonical_id AND r.contract_address = n.registry
+        \\LEFT JOIN names reg_name ON r.resource = reg_name.canonical_id AND r.contract_address = reg_name.registry
+        \\LEFT JOIN resolvers res ON r.contract_address = res.address AND r.resource = res.namehash AND res.chain = r.chain
+        \\LEFT JOIN names resolver_name ON res.namehash = resolver_name.namehash AND resolver_name.chain = r.chain
         \\WHERE r.chain = ?
     ;
     @memcpy(sql_buf[sql_len .. sql_len + base.len], base);
