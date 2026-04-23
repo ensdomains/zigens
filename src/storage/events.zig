@@ -197,9 +197,69 @@ pub const EventFilterOptions = struct {
     expiry_lt: ?i64 = null,
     expiry_lte: ?i64 = null,
     limit: u32 = constants.Pagination.default_limit,
+    skip: u32 = 0,
     order_dir: OrderDir = .desc,
     sort_field: EventSortField = .block_number,
 };
+
+/// Count events that sort BEFORE the event identified by (tx_hash, log_index)
+/// in the events table's canonical (block_number, log_index) order. Used to
+/// convert a cursor to a skip offset for paginated queries on registrations/events.
+///
+/// `event_types` optionally restricts the count to rows matching those event_type values
+/// — critical for getting the right offset when the outer query filters by event_type
+/// (e.g. registrationConnection only counts NameRegistered/LabelRegistered).
+///
+/// Returns 0 if the cursor's event can't be found (caller should fall through to offset=0).
+pub fn countEventsBeforeCursor(
+    db: *Database,
+    tx_hash: []const u8,
+    log_index: u32,
+    order_dir: OrderDir,
+    event_types: ?[]const []const u8,
+) !u32 {
+    // First resolve the cursor event's block_number.
+    var lookup = try Query.init(db, "SELECT block_number FROM events WHERE tx_hash = ? AND log_index = ? LIMIT 1");
+    defer lookup.deinit();
+    try lookup.bindText(tx_hash);
+    try lookup.bindInt(@intCast(log_index));
+    if (!try lookup.step()) return 0;
+    const cursor_block = lookup.getInt64(0);
+
+    // Build SQL: cursor-based position filter + optional event_type IN (...) filter.
+    // DESC (newest first): "before" = higher (block_number, log_index)
+    // ASC  (oldest first): "before" = lower  (block_number, log_index)
+    var sql_buf: std.ArrayList(u8) = .{};
+    defer sql_buf.deinit(db.allocator);
+
+    const base = if (order_dir == .desc)
+        "SELECT COUNT(*) FROM events WHERE (block_number > ? OR (block_number = ? AND log_index > ?))"
+    else
+        "SELECT COUNT(*) FROM events WHERE (block_number < ? OR (block_number = ? AND log_index < ?))";
+    try sql_buf.appendSlice(db.allocator, base);
+
+    if (event_types) |types| {
+        if (types.len > 0) {
+            try sql_buf.appendSlice(db.allocator, " AND event_type IN (");
+            for (types, 0..) |_, i| {
+                if (i > 0) try sql_buf.append(db.allocator, ',');
+                try sql_buf.append(db.allocator, '?');
+            }
+            try sql_buf.append(db.allocator, ')');
+        }
+    }
+
+    var q = try Query.init(db, sql_buf.items);
+    defer q.deinit();
+    try q.bindInt64(cursor_block);
+    try q.bindInt64(cursor_block);
+    try q.bindInt(@intCast(log_index));
+    if (event_types) |types| {
+        for (types) |t| try q.bindText(t);
+    }
+    if (!try q.step()) return 0;
+    return @intCast(q.getInt64(0));
+}
 
 /// Get events with flexible filtering
 pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Event {
@@ -314,17 +374,22 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
         try allocated_clauses.append(db.allocator, clause);
         try conditions.append(db.allocator, clause);
     }
+    // Registration events store expiry in two different shapes:
+    //   - V2 LabelRegistered: {"expiry": <absolute unix seconds>}
+    //   - V1 NameRegistered:  {"duration": <seconds>} → absolute = events.timestamp + duration
+    // Fall back to NULL for non-registration events (they'll be filtered out by `> ?` etc.).
+    const expiry_expr = "COALESCE(CAST(json_extract(data, '$.expiry') AS INTEGER), timestamp + CAST(json_extract(data, '$.duration') AS INTEGER))";
     if (filter.expiry_gt != null) {
-        try conditions.append(db.allocator, "json_extract(data, '$.expiration') > ?");
+        try conditions.append(db.allocator, expiry_expr ++ " > ?");
     }
     if (filter.expiry_gte != null) {
-        try conditions.append(db.allocator, "json_extract(data, '$.expiration') >= ?");
+        try conditions.append(db.allocator, expiry_expr ++ " >= ?");
     }
     if (filter.expiry_lt != null) {
-        try conditions.append(db.allocator, "json_extract(data, '$.expiration') < ?");
+        try conditions.append(db.allocator, expiry_expr ++ " < ?");
     }
     if (filter.expiry_lte != null) {
-        try conditions.append(db.allocator, "json_extract(data, '$.expiration') <= ?");
+        try conditions.append(db.allocator, expiry_expr ++ " <= ?");
     }
 
     // Add WHERE clause if there are conditions
@@ -370,6 +435,14 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
 
     const limit_str = try std.fmt.bufPrint(sql_buf[sql_len..], "{d}", .{filter.limit});
     sql_len += limit_str.len;
+
+    if (filter.skip > 0) {
+        const offset_prefix = " OFFSET ";
+        @memcpy(sql_buf[sql_len..][0..offset_prefix.len], offset_prefix);
+        sql_len += offset_prefix.len;
+        const offset_str = try std.fmt.bufPrint(sql_buf[sql_len..], "{d}", .{filter.skip});
+        sql_len += offset_str.len;
+    }
 
     var q = try Query.init(db, sql_buf[0..sql_len]);
     defer q.deinit();
@@ -628,17 +701,19 @@ pub fn getEventCount(db: *Database, filter: EventFilterOptions) !usize {
         try allocated_clauses.append(db.allocator, clause);
         try conditions.append(db.allocator, clause);
     }
+    // Same two-shape handling as getEventsFiltered — see there for rationale.
+    const expiry_expr_count = "COALESCE(CAST(json_extract(data, '$.expiry') AS INTEGER), timestamp + CAST(json_extract(data, '$.duration') AS INTEGER))";
     if (filter.expiry_gt != null) {
-        try conditions.append(db.allocator, "json_extract(data, '$.expiration') > ?");
+        try conditions.append(db.allocator, expiry_expr_count ++ " > ?");
     }
     if (filter.expiry_gte != null) {
-        try conditions.append(db.allocator, "json_extract(data, '$.expiration') >= ?");
+        try conditions.append(db.allocator, expiry_expr_count ++ " >= ?");
     }
     if (filter.expiry_lt != null) {
-        try conditions.append(db.allocator, "json_extract(data, '$.expiration') < ?");
+        try conditions.append(db.allocator, expiry_expr_count ++ " < ?");
     }
     if (filter.expiry_lte != null) {
-        try conditions.append(db.allocator, "json_extract(data, '$.expiration') <= ?");
+        try conditions.append(db.allocator, expiry_expr_count ++ " <= ?");
     }
 
     if (conditions.items.len > 0) {

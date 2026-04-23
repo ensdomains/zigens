@@ -762,6 +762,25 @@ pub fn handleETHNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log
         std.log.debug("  → Registered subregistry {any} for {s}", .{ subregistry, full_name });
     }
 
+    // Best-effort registration insert. If this fails (disk full, constraint, etc.), log a warning
+    // but continue — the event is the source of truth and the `registrations` table can be
+    // re-populated via the schema/021 backfill query on a later startup.
+    self.database.insertRegistration(
+        chain,
+        namehash,
+        label_str,
+        "eth",
+        owner,
+        block_timestamp,
+        if (expiry == 0) null else expiry,
+        log.block_number,
+        log.transaction_hash,
+        log.log_index,
+        .name_registered,
+    ) catch |err| {
+        std.log.warn("insertRegistration failed for {s}.eth: {}", .{ label_str, err });
+    };
+
     // Store event with payment details
     const payment_token_hex = try payment_token.toHex(self.allocator);
     defer self.allocator.free(payment_token_hex);
@@ -1255,11 +1274,15 @@ pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) 
         const registry_hex = try log.address.toHex(self.allocator);
         defer self.allocator.free(registry_hex);
 
+        // V2 invariant: each subregistry contract is deployed for a single parent position
+        // (VerifiableFactory deploys a fresh instance per name). If this invariant breaks
+        // in a future deployment, we'd need path-based parent resolution. The query below
+        // takes the most-recently-set parent, which is correct under the current invariant.
         var rq = try Query.init(self.database,
             \\SELECT name, namehash FROM registries
             \\WHERE address = ? AND chain = ? AND created_block <= ?
             \\ORDER BY created_block DESC
-            \\LIMIT 1
+            \\LIMIT 2
         );
         defer rq.deinit();
         try rq.bindText(registry_hex);
@@ -1273,6 +1296,10 @@ pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) 
             }
             if (rq.getTextSlice(1)) |namehash_hex| {
                 parent_namehash = try Hash.fromHex(namehash_hex);
+            }
+            // Warn if the V2 per-name-subregistry invariant is broken
+            if (try rq.step()) {
+                std.log.warn("Multi-parent subregistry detected: address={s} has >1 parent at block {d}; this breaks the current lookup assumption", .{ registry_hex, log.block_number });
             }
         } else {
             std.log.debug("LabelRegistered: orphaning {s} - no parent found for subregistry {s} at block {d}", .{
@@ -1306,6 +1333,8 @@ pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) 
     const parent_name_dup = try self.allocator.dupe(u8, parent_name);
     defer self.allocator.free(parent_name_dup);
 
+    const block_timestamp = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp);
+
     const name = models.Name{
         .name = name_dup,
         .label = label_dup,
@@ -1325,10 +1354,10 @@ pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) 
         .registry_locked = false,
         .migrated = is_migration,
         .created_block = log.block_number,
-        .created_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
-        .registered_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        .created_at = block_timestamp,
+        .registered_at = block_timestamp,
         .updated_block = log.block_number,
-        .updated_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        .updated_at = block_timestamp,
         .is_wrapped = false,
         .wrapper_fuses = null,
         .wrapper_expiry = null,
@@ -1341,6 +1370,23 @@ pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) 
     if (is_migration) {
         std.log.info("Migration detected: {s} migrated from V1→V2 (sender={any})", .{ full_name, sender });
     }
+
+    // Best-effort; see handleETHNameRegistered for rationale.
+    self.database.insertRegistration(
+        chain,
+        namehash_val,
+        label_str,
+        parent_name,
+        owner,
+        block_timestamp,
+        if (expiry == 0) null else expiry,
+        log.block_number,
+        log.transaction_hash,
+        log.log_index,
+        .label_registered,
+    ) catch |err| {
+        std.log.warn("insertRegistration failed for {s}: {}", .{ full_name, err });
+    };
 
     const owner_hex = try owner.toHex(self.allocator);
     defer self.allocator.free(owner_hex);
@@ -1401,11 +1447,13 @@ pub fn handleLabelReserved(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
         const registry_hex = try log.address.toHex(self.allocator);
         defer self.allocator.free(registry_hex);
 
+        // V2 invariant: each subregistry contract is deployed for a single parent position.
+        // Same LIMIT 2 + warning pattern as handleLabelRegistered.
         var rq = try Query.init(self.database,
             \\SELECT name, namehash FROM registries
             \\WHERE address = ? AND chain = ? AND created_block <= ?
             \\ORDER BY created_block DESC
-            \\LIMIT 1
+            \\LIMIT 2
         );
         defer rq.deinit();
         try rq.bindText(registry_hex);
@@ -1419,6 +1467,9 @@ pub fn handleLabelReserved(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
             }
             if (rq.getTextSlice(1)) |namehash_hex| {
                 parent_namehash = try Hash.fromHex(namehash_hex);
+            }
+            if (try rq.step()) {
+                std.log.warn("Multi-parent subregistry detected in LabelReserved: address={s} has >1 parent at block {d}", .{ registry_hex, log.block_number });
             }
         }
     }

@@ -2,8 +2,60 @@ const std = @import("std");
 const constants = @import("../constants.zig");
 const db_module = @import("database.zig");
 const Database = db_module.Database;
+const Hash = @import("../types/hash.zig").Hash;
+const Address = @import("../types/address.zig").Address;
 const models = @import("../types/models.zig");
 const events = @import("events.zig");
+
+/// Insert a registration into the `registrations` table.
+/// Idempotent on (chain, tx_hash, log_index) via UNIQUE constraint.
+pub fn insertRegistration(
+    db: *Database,
+    chain: models.Chain,
+    namehash: Hash,
+    label: []const u8,
+    parent_name: []const u8,
+    registrant: Address,
+    registered_at: i64,
+    expiry: ?u64,
+    block_number: u64,
+    tx_hash: Hash,
+    log_index: u32,
+    event_type: models.EventType,
+) !void {
+    const sql =
+        \\INSERT OR IGNORE INTO registrations
+        \\(chain, namehash, label, parent_name, registrant, registered_at, expiry, block_number, transaction_hash, log_index, event_type)
+        \\VALUES (?, ?, ?, ?, LOWER(?), ?, ?, ?, ?, ?, ?)
+    ;
+
+    var q = try db_module.Query.initCached(db, sql);
+    defer q.deinit();
+
+    try q.bindTextStatic(chain.toString());
+    try q.bindHash(namehash);
+    try q.bindText(label);
+    try q.bindText(parent_name);
+    try q.bindAddress(registrant);
+    try q.bindInt64(registered_at);
+    // Clamp overflow to 0 — matches names.zig safeU64ToI64 convention where "0 = no expiry".
+    // Callers pass `null` when the registration has no expiry at all.
+    if (expiry) |e| {
+        const clamped: i64 = if (e > std.math.maxInt(i64)) 0 else @intCast(e);
+        if (e > std.math.maxInt(i64)) {
+            std.log.warn("insertRegistration: expiry {d} exceeds i64 max; storing 0 (matches names.zig convention)", .{e});
+        }
+        try q.bindInt64(clamped);
+    } else {
+        try q.bindNull();
+    }
+    try q.bindInt64(@intCast(block_number));
+    try q.bindHash(tx_hash);
+    try q.bindInt(@intCast(log_index));
+    try q.bindTextStatic(event_type.toString());
+
+    try q.exec();
+}
 
 // ============================================================================
 // REGISTRATION QUERIES
@@ -24,6 +76,7 @@ pub const RegistrationFilterOptions = struct {
     registrant: ?[]const u8 = null, // Filter by registrant (owner in event data JSON)
     registrant_in: ?[]const []const u8 = null, // Filter by registrant IN list
     limit: u32 = constants.Pagination.default_limit,
+    skip: u32 = 0,
     order_dir: events.OrderDir = .desc,
     sort_field: events.EventSortField = .block_number,
     expiry_gt: ?i64 = null,
@@ -51,6 +104,7 @@ pub fn getRegistrations(database: *Database, filter: RegistrationFilterOptions) 
         .data_json_owner = filter.registrant,
         .data_json_owners = filter.registrant_in,
         .limit = filter.limit,
+        .skip = filter.skip,
         .order_dir = filter.order_dir,
         .sort_field = filter.sort_field,
         .expiry_gt = filter.expiry_gt,
@@ -67,24 +121,12 @@ pub fn getRegistrations(database: *Database, filter: RegistrationFilterOptions) 
 // ============================================================================
 
 /// Get count of registrations with optional filters.
-/// When registrant/registrant_in is set, queries the `names` table using the indexed
-/// `registrant` column for O(log N) performance instead of scanning events with json_extract.
-/// For unfiltered counts, queries the events table with event_type + contract_address filters.
+/// Single unified query against the `registrations` table (indexed columns).
 pub fn getRegistrationCount(database: *Database, filter: RegistrationFilterOptions) !usize {
-    if (filter.registrant != null or (filter.registrant_in != null and filter.registrant_in.?.len > 0)) {
-        return getRegistrationCountFromNames(database, filter);
-    }
-    return getRegistrationCountFromEvents(database, filter);
-}
-
-/// Count registrations using the names table (fast — uses idx_names_registrant index).
-/// Filters 2LDs by parent_name = 'eth' which matches what canonical registries handle.
-/// Addresses are stored lowercase via Address.toHex(.lower), so we LOWER() the input.
-fn getRegistrationCountFromNames(database: *Database, filter: RegistrationFilterOptions) !usize {
     var sql_buf: [1024]u8 = undefined;
     var sql_len: usize = 0;
 
-    const base = "SELECT COUNT(*) FROM names WHERE parent_name = 'eth'";
+    const base = "SELECT COUNT(*) FROM registrations WHERE 1=1";
     @memcpy(sql_buf[sql_len..][0..base.len], base);
     sql_len += base.len;
 
@@ -149,81 +191,10 @@ fn getRegistrationCountFromNames(database: *Database, filter: RegistrationFilter
             try q.bindText(reg);
         }
     }
-    if (filter.expiry_gt) |exp| {
-        try q.bindInt64(exp);
-    }
-    if (filter.expiry_gte) |exp| {
-        try q.bindInt64(exp);
-    }
-    if (filter.expiry_lt) |exp| {
-        try q.bindInt64(exp);
-    }
-    if (filter.expiry_lte) |exp| {
-        try q.bindInt64(exp);
-    }
-
-    if (try q.step()) {
-        return @intCast(q.getInt64(0));
-    }
-    return 0;
-}
-
-/// Count registrations using the events table (for unfiltered counts).
-/// Counts both V1 (name_registered) and V2 (label_registered) events.
-fn getRegistrationCountFromEvents(database: *Database, filter: RegistrationFilterOptions) !usize {
-    var sql_buf: [1024]u8 = undefined;
-    var sql_len: usize = 0;
-
-    const base = "SELECT COUNT(*) FROM events WHERE event_type IN (?, ?)";
-    @memcpy(sql_buf[sql_len..][0..base.len], base);
-    sql_len += base.len;
-
-    if (filter.chain != null) {
-        const cond = " AND chain = ?";
-        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
-        sql_len += cond.len;
-    }
-    if (filter.expiry_gt != null) {
-        const cond = " AND json_extract(data, '$.expiration') > ?";
-        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
-        sql_len += cond.len;
-    }
-    if (filter.expiry_gte != null) {
-        const cond = " AND json_extract(data, '$.expiration') >= ?";
-        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
-        sql_len += cond.len;
-    }
-    if (filter.expiry_lt != null) {
-        const cond = " AND json_extract(data, '$.expiration') < ?";
-        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
-        sql_len += cond.len;
-    }
-    if (filter.expiry_lte != null) {
-        const cond = " AND json_extract(data, '$.expiration') <= ?";
-        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
-        sql_len += cond.len;
-    }
-
-    var q = try db_module.Query.init(database, sql_buf[0..sql_len]);
-    defer q.deinit();
-
-    try q.bindTextStatic(models.EventType.name_registered.toString());
-    try q.bindTextStatic(models.EventType.label_registered.toString());
-    if (filter.chain) |ch| {
-        try q.bindTextStatic(ch.toString());
-    }
-    if (filter.expiry_gt) |exp| {
-        try q.bindInt64(exp);
-    }
-    if (filter.expiry_gte) |exp| {
-        try q.bindInt64(exp);
-    }
-    if (filter.expiry_lt) |exp| {
-        try q.bindInt64(exp);
-    }
-    if (filter.expiry_lte) |exp| {
-        try q.bindInt64(exp);
-    }
+    if (filter.expiry_gt) |exp| try q.bindInt64(exp);
+    if (filter.expiry_gte) |exp| try q.bindInt64(exp);
+    if (filter.expiry_lt) |exp| try q.bindInt64(exp);
+    if (filter.expiry_lte) |exp| try q.bindInt64(exp);
 
     if (try q.step()) {
         return @intCast(q.getInt64(0));
