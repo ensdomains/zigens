@@ -663,6 +663,35 @@ pub const NameSortField = enum {
     }
 };
 
+/// Count rows that come before the given namehash in the current sort order.
+/// Used to convert a cursor (namehash) to an offset for paginated queries.
+/// Returns 0 if the namehash isn't found (caller falls through to offset=0).
+pub fn countRowsBeforeNamehash(
+    db: *Database,
+    cursor_namehash: []const u8,
+    sort_field: NameSortField,
+    order_dir: OrderDir,
+) !u32 {
+    const field = sort_field.toSql();
+    // "before" means "would appear earlier in the result set" — depends on sort direction:
+    //   DESC sort: row A is before row B if A.field > B.field OR (A.field == B.field AND A.namehash > B.namehash)
+    //   ASC sort:  row A is before row B if A.field < B.field OR (A.field == B.field AND A.namehash < B.namehash)
+    // Tiebreaker by namehash ensures a stable total order across the full result set.
+    const op = if (order_dir == .desc) ">" else "<";
+    const sql = try std.fmt.allocPrint(
+        db.allocator,
+        "SELECT COUNT(*) FROM names n WHERE EXISTS (SELECT 1 FROM names c WHERE c.namehash = ? AND (n.{s} {s} c.{s} OR (n.{s} = c.{s} AND n.namehash {s} c.namehash)))",
+        .{ field, op, field, field, field, op },
+    );
+    defer db.allocator.free(sql);
+
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+    try q.bindText(cursor_namehash);
+    if (!try q.step()) return 0;
+    return @intCast(q.getInt64(0));
+}
+
 /// Parse name rows from a query result
 fn parseNameRows(q: *Query, allocator: std.mem.Allocator) ![]models.Name {
     var names: std.ArrayList(models.Name) = .{};
@@ -872,12 +901,16 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
         try where_clause.appendSlice(db.allocator, " ");
     }
 
+    // Secondary sort on namehash (same direction) gives a stable total order across tied
+    // primary keys — required so cursor pagination matches countRowsBeforeNamehash's
+    // stable comparator. Without it, SQLite's tie-breaking is non-deterministic and pages
+    // can duplicate or skip items.
     const sql = try std.fmt.allocPrint(db.allocator,
         \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, chain,
         \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated,
         \\       created_at, registered_at, created_block, updated_at, updated_block
-        \\FROM names {s}ORDER BY {s} {s} LIMIT ? OFFSET ?
-    , .{ where_clause.items, sort_field.toSql(), order_str });
+        \\FROM names {s}ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
+    , .{ where_clause.items, sort_field.toSql(), order_str, order_str });
     defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
@@ -941,20 +974,21 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
 /// Get all names with configurable order direction
 pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u32, order_dir: OrderDir, sort_field: NameSortField) ![]models.Name {
     const order_str = if (order_dir == .desc) "DESC" else "ASC";
+    // Secondary sort on namehash (same direction) — see countRowsBeforeNamehash for why.
     const sql = if (owner != null)
         try std.fmt.allocPrint(db.allocator,
             \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, chain,
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated,
             \\       created_at, registered_at, created_block, updated_at, updated_block
-            \\FROM names WHERE owner = ? ORDER BY {s} {s} LIMIT ? OFFSET ?
-        , .{ sort_field.toSql(), order_str })
+            \\FROM names WHERE owner = ? ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
+        , .{ sort_field.toSql(), order_str, order_str })
     else
         try std.fmt.allocPrint(db.allocator,
             \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, chain,
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated,
             \\       created_at, registered_at, created_block, updated_at, updated_block
-            \\FROM names ORDER BY {s} {s} LIMIT ? OFFSET ?
-        , .{ sort_field.toSql(), order_str });
+            \\FROM names ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
+        , .{ sort_field.toSql(), order_str, order_str });
     defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);

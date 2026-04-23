@@ -170,12 +170,19 @@ pub const CursorCodec = struct {
     }
 };
 
-/// Build a connection from a slice of items with integer IDs
+/// Build a connection from a slice of items with integer IDs.
+///
+/// `has_more` must be computed by the caller from the pre-trim fetch result
+/// (typically: fetch limit+1 items, `has_more = fetched.len > limit`, then
+/// pass the trimmed limit-sized slice here). Inferring has_more from `items.len ==
+/// params.limit` after trimming is ambiguous — it can't distinguish "end of data"
+/// from "more available" when the dataset size is an exact multiple of limit.
 pub fn buildConnectionInt(
     comptime T: type,
     allocator: std.mem.Allocator,
     items: []const T,
     params: PaginationParams,
+    has_more: bool,
     /// Extract ID from item (for cursor generation)
     getId: fn (T) i64,
     /// Optional total count
@@ -186,7 +193,7 @@ pub fn buildConnectionInt(
             .edges = &[_]Edge(T){},
             .page_info = PageInfo{
                 .has_next_page = false,
-                .has_previous_page = params.cursor != null,
+                .has_previous_page = false,
                 .start_cursor = null,
                 .end_cursor = null,
             },
@@ -211,13 +218,9 @@ pub fn buildConnectionInt(
         };
     }
 
-    // Determine if there are more pages
-    // If we got exactly limit items, there might be more
-    const has_more = items.len == params.limit;
-
     const page_info = PageInfo{
-        .has_next_page = if (params.direction == .forward) has_more else false,
-        .has_previous_page = if (params.direction == .backward) has_more else params.cursor != null,
+        .has_next_page = if (params.direction == .forward) has_more else (params.cursor != null),
+        .has_previous_page = if (params.direction == .backward) has_more else (params.cursor != null),
         .start_cursor = if (edges.len > 0) try allocator.dupe(u8, edges[0].cursor) else null,
         .end_cursor = if (edges.len > 0) try allocator.dupe(u8, edges[edges.len - 1].cursor) else null,
     };
@@ -229,12 +232,14 @@ pub fn buildConnectionInt(
     };
 }
 
-/// Build a connection from a slice of items with string IDs
+/// Build a connection from a slice of items with string IDs. See buildConnectionInt
+/// for the has_more contract.
 pub fn buildConnectionString(
     comptime T: type,
     allocator: std.mem.Allocator,
     items: []const T,
     params: PaginationParams,
+    has_more: bool,
     /// Extract ID from item (for cursor generation)
     getId: fn (T) []const u8,
     /// Optional total count
@@ -245,7 +250,7 @@ pub fn buildConnectionString(
             .edges = &[_]Edge(T){},
             .page_info = PageInfo{
                 .has_next_page = false,
-                .has_previous_page = params.cursor != null,
+                .has_previous_page = false,
                 .start_cursor = null,
                 .end_cursor = null,
             },
@@ -270,12 +275,9 @@ pub fn buildConnectionString(
         };
     }
 
-    // Determine if there are more pages
-    const has_more = items.len == params.limit;
-
     const page_info = PageInfo{
-        .has_next_page = if (params.direction == .forward) has_more else false,
-        .has_previous_page = if (params.direction == .backward) has_more else params.cursor != null,
+        .has_next_page = if (params.direction == .forward) has_more else (params.cursor != null),
+        .has_previous_page = if (params.direction == .backward) has_more else (params.cursor != null),
         .start_cursor = if (edges.len > 0) try allocator.dupe(u8, edges[0].cursor) else null,
         .end_cursor = if (edges.len > 0) try allocator.dupe(u8, edges[edges.len - 1].cursor) else null,
     };
