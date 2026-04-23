@@ -169,72 +169,93 @@ pub const Client = struct {
         return self.request_id.fetchAdd(1, .monotonic);
     }
 
-    /// Execute curl with retry logic and exponential backoff
-    /// Returns stdout on success, error on failure after all retries exhausted
-    fn executeCurlWithRetry(self: *Client, arena_allocator: std.mem.Allocator, request_body: []const u8) ![]const u8 {
+    /// Execute a JSON-RPC POST using std.http.Client with retry and exponential backoff.
+    /// Uses the shared http_client (connection pooling + keep-alive) and gzip/deflate decompression.
+    /// Returns the response body on success, error on failure after all retries exhausted.
+    ///
+    /// Timeout NOTE: Zig 0.15's std.http.Client does not expose per-request connect/read
+    /// timeouts. Previously `curl --connect-timeout 30 --max-time 120` protected against
+    /// hung RPC endpoints. Until Zig's http client exposes timeouts (or we wrap fetch in a
+    /// watchdog thread), a single request that hangs can block this indexer thread indefinitely.
+    /// Mitigation today: most real RPC providers return quickly; TCP keep-alive detects dead
+    /// connections within ~2 hours by default.
+    fn executeHttpRequest(self: *Client, arena_allocator: std.mem.Allocator, request_body: []const u8) ![]const u8 {
         const max_retries: u32 = 3;
+        const max_response_bytes: usize = 50 * 1024 * 1024;
         var attempt: u32 = 0;
         var last_error: ?anyerror = null;
 
+        const extra_headers = [_]std.http.Header{
+            .{ .name = "Content-Type", .value = "application/json" },
+            .{ .name = "Accept-Encoding", .value = "gzip, deflate" },
+        };
+
         while (attempt < max_retries) : (attempt += 1) {
-            // Exponential backoff: 0ms, 1000ms, 2000ms, 4000ms
             if (attempt > 0) {
                 const delay_ms: u64 = @as(u64, 1000) * (@as(u64, 1) << @intCast(attempt - 1));
                 std.log.warn("RPC request failed, retrying in {d}ms (attempt {d}/{d})", .{ delay_ms, attempt + 1, max_retries });
                 std.Thread.sleep(delay_ms * std.time.ns_per_ms);
             }
 
-            const curl_start = std.time.milliTimestamp();
-            const curl_result = std.process.Child.run(.{
-                .allocator = arena_allocator,
-                .argv = &.{
-                    "curl",
-                    "-s", // Silent mode
-                    "--compressed", // Request gzip/deflate compression (9x speedup on large responses)
-                    "--connect-timeout",
-                    "30", // 30 second connection timeout
-                    "--max-time",
-                    "120", // 120 second total timeout
-                    "-X",
-                    "POST",
-                    "-H",
-                    "Content-Type: application/json",
-                    "-d",
-                    request_body,
-                    self.rpc_url,
-                },
-                .max_output_bytes = 50 * 1024 * 1024, // 50MB max response (handles spam bursts)
+            const start_ms = std.time.milliTimestamp();
+
+            var response_buf: std.Io.Writer.Allocating = .init(arena_allocator);
+            defer response_buf.deinit();
+
+            const result = self.http_client.fetch(.{
+                .location = .{ .url = self.rpc_url },
+                .method = .POST,
+                .payload = request_body,
+                .extra_headers = &extra_headers,
+                .response_writer = &response_buf.writer,
+                .keep_alive = true,
             }) catch |err| {
-                // StdoutStreamTooLong means response is too big - retrying won't help
-                // Return immediately so caller can reduce query size
-                if (err == error.StdoutStreamTooLong) {
-                    std.log.debug("Response too large for buffer, returning immediately", .{});
+                if (err == error.StreamTooLong or err == error.WriteFailed) {
+                    std.log.debug("Response too large or write failed: {}", .{err});
                     return err;
                 }
                 last_error = err;
-                std.log.warn("curl spawn error: {}", .{err});
+                std.log.warn("http.fetch error: {}", .{err});
                 continue;
             };
 
-            if (curl_result.term != .Exited or curl_result.term.Exited != 0) {
+            const status_code = @intFromEnum(result.status);
+            if (status_code < 200 or status_code >= 300) {
+                // Capture response body for diagnostics (RPC providers typically send a
+                // JSON error describing the issue: "block range too large", "too many logs", etc.).
+                const body_preview_len = @min(response_buf.written().len, 512);
+                const body_preview = response_buf.written()[0..body_preview_len];
+
+                // 4xx = permanent client error (request too big, malformed, etc.). Do not retry —
+                // signal to the caller so adaptive-chunking can halve the range and try again.
+                if (status_code >= 400 and status_code < 500) {
+                    std.log.warn("HTTP {d} from RPC (permanent; not retrying). Body: {s}", .{ status_code, body_preview });
+                    return error.RpcError;
+                }
+
+                // 5xx or other: transient, retry with backoff
                 last_error = error.HttpError;
-                std.log.warn("curl process failed with exit: {}", .{curl_result.term});
+                std.log.warn("HTTP {d} from RPC. Body: {s}", .{ status_code, body_preview });
                 continue;
             }
 
-            // Check for empty response (network issues sometimes return empty)
-            if (curl_result.stdout.len == 0) {
+            const body = response_buf.written();
+            if (body.len == 0) {
                 last_error = error.HttpError;
-                std.log.warn("curl returned empty response", .{});
+                std.log.warn("http.fetch returned empty response", .{});
                 continue;
             }
-
-            const curl_elapsed = std.time.milliTimestamp() - curl_start;
-            if (curl_elapsed > 500) {
-                std.log.debug("RPC curl took {d}ms, response {d} bytes", .{ curl_elapsed, curl_result.stdout.len });
+            if (body.len > max_response_bytes) {
+                return error.StreamTooLong;
             }
 
-            return curl_result.stdout;
+            const elapsed = std.time.milliTimestamp() - start_ms;
+            if (elapsed > 500) {
+                std.log.debug("RPC http took {d}ms, response {d} bytes", .{ elapsed, body.len });
+            }
+
+            // Copy out of the allocating writer's arena-backed buffer
+            return try arena_allocator.dupe(u8, body);
         }
 
         std.log.err("RPC request failed after {d} retries", .{max_retries});
@@ -279,8 +300,8 @@ pub const Client = struct {
 
         try writer.writeAll("}");
 
-        // Execute curl with retry logic
-        const response_body = try self.executeCurlWithRetry(arena_allocator, request_buf.items);
+        // Execute HTTP request with retry logic
+        const response_body = try self.executeHttpRequest(arena_allocator, request_buf.items);
 
         // Parse JSON response with main allocator (result will outlive this function)
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response_body, .{}) catch |err| {
@@ -323,8 +344,8 @@ pub const Client = struct {
 
         try writer.writeAll("}");
 
-        // Execute curl with retry logic
-        const response_body = try self.executeCurlWithRetry(arena_allocator, request_buf.items);
+        // Execute HTTP request with retry logic
+        const response_body = try self.executeHttpRequest(arena_allocator, request_buf.items);
 
         // Parse JSON response with main allocator (result will outlive this function)
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response_body, .{}) catch |err| {
@@ -377,8 +398,8 @@ pub const Client = struct {
 
         try writer.writeAll("]");
 
-        // Execute curl with retry logic
-        const response_body = try self.executeCurlWithRetry(arena_allocator, request_buf.items);
+        // Execute HTTP request with retry logic
+        const response_body = try self.executeHttpRequest(arena_allocator, request_buf.items);
 
         // Parse JSON response with main allocator (result will outlive this function)
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response_body, .{}) catch |err| {

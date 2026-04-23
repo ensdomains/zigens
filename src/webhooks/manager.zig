@@ -493,54 +493,41 @@ pub const WebhookManager = struct {
         }
     }
 
+    /// POST JSON to `url`. Returns true on 2xx, false on non-2xx (transport errors bubble up).
+    ///
+    /// Timeout NOTE: Zig 0.15's std.http.Client does not expose per-request connect/read
+    /// timeouts. The prior curl-based implementation enforced 5s connect / 30s total.
+    /// Until Zig's http client exposes timeouts (or we wrap fetch in a watchdog), a single
+    /// unresponsive webhook endpoint can stall a worker thread. Mitigated by running multiple
+    /// worker threads and by TCP keep-alive detecting dead connections.
     fn sendHttpPost(self: *WebhookManager, url: []const u8, payload: []const u8) !bool {
-        // Use curl for HTTP POST (same workaround as RPC client for Zig 0.15.1 TLS issues)
-        const result = try std.process.Child.run(.{
-            .allocator = self.allocator,
-            .argv = &.{
-                "curl",
-                "-s", // Silent mode
-                "--connect-timeout",
-                "5", // 5 second connection timeout
-                "--max-time",
-                "30", // 30 second total timeout
-                "-X",
-                "POST",
-                "-H",
-                "Content-Type: application/json",
-                "-H",
-                "User-Agent: ENSv2-Indexer/0.1.0",
-                "-d",
-                payload,
-                "-w",
-                "%{http_code}", // Write HTTP status code to stdout
-                "-o",
-                "/dev/null", // Don't output response body
-                url,
-            },
-            .max_output_bytes = 1024,
-        });
-        defer self.allocator.free(result.stdout);
-        defer self.allocator.free(result.stderr);
-
-        if (result.term != .Exited or result.term.Exited != 0) {
-            std.log.err("curl process failed: {}", .{result.term});
-            return error.HttpError;
-        }
-
-        // Parse status code
-        const status_code = std.fmt.parseInt(u16, result.stdout, 10) catch {
-            std.log.err("Failed to parse HTTP status code: {s}", .{result.stdout});
-            return error.InvalidStatusCode;
+        const extra_headers = [_]std.http.Header{
+            .{ .name = "Content-Type", .value = "application/json" },
+            .{ .name = "User-Agent", .value = "ENSv2-Indexer/0.1.0" },
         };
 
-        // 2xx is success
+        var response_buf: std.Io.Writer.Allocating = .init(self.allocator);
+        defer response_buf.deinit();
+
+        const result = self.http_client.fetch(.{
+            .location = .{ .url = url },
+            .method = .POST,
+            .payload = payload,
+            .extra_headers = &extra_headers,
+            .response_writer = &response_buf.writer,
+            .keep_alive = true,
+        }) catch |err| {
+            std.log.err("Webhook http.fetch error for {s}: {}", .{ url, err });
+            return error.HttpError;
+        };
+
+        const status_code = @intFromEnum(result.status);
         if (status_code >= 200 and status_code < 300) {
             return true;
-        } else {
-            std.log.err("Webhook returned status {d}", .{status_code});
-            return false;
         }
+
+        std.log.err("Webhook {s} returned status {d}", .{ url, status_code });
+        return false;
     }
 
     /// Register a new webhook

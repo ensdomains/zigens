@@ -808,7 +808,7 @@ pub const Indexer = struct {
             self.indexBlockRange(chain, client, from_block, to_block) catch |err| {
                 self.database.rollbackTransaction();
 
-                if ((err == error.RpcError or err == error.StdoutStreamTooLong) and current_batch_size > ABSOLUTE_MIN_BATCH) {
+                if ((err == error.RpcError or err == error.StreamTooLong) and current_batch_size > ABSOLUTE_MIN_BATCH) {
                     current_batch_size = @max(ABSOLUTE_MIN_BATCH, current_batch_size / 2);
                     std.log.warn("RPC response too large for blocks {d}-{d}! Reducing batch size to {d} blocks and retrying", .{ from_block, to_block, current_batch_size });
                     continue; // Retry same from_block with smaller batch
