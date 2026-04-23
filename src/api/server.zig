@@ -457,10 +457,19 @@ pub const Server = struct {
         };
         defer parsed.deinit();
 
+        // Body must be a JSON object. Null, arrays, primitives, etc. would panic on .object access.
+        if (parsed.value != .object) {
+            return try self.sendBadRequest(stream, "Request body must be a JSON object");
+        }
+
         const query_value = parsed.value.object.get("query") orelse {
             return try self.sendBadRequest(stream, "Query field required");
         };
 
+        // Query must be a string. Integer/null/etc. would panic on .string access.
+        if (query_value != .string) {
+            return try self.sendBadRequest(stream, "`query` field must be a string");
+        }
         const query = query_value.string;
 
         // SECURITY: Validate GraphQL query length to prevent DoS attacks
@@ -493,82 +502,7 @@ pub const Server = struct {
     }
 
     fn handleGraphQLPlayground(self: *Server, stream: std.net.Stream) !void {
-        // Return GraphiQL - Interactive GraphQL IDE with autocomplete enabled
-        const html =
-            \\<!DOCTYPE html>
-            \\<html>
-            \\<head>
-            \\  <title>ENSv2 GraphQL Playground</title>
-            \\  <style>
-            \\    body { height: 100%; margin: 0; width: 100%; overflow: hidden; }
-            \\    #graphiql { height: 100vh; }
-            \\  </style>
-            \\  <script crossorigin src="https://unpkg.com/react@17/umd/react.production.min.js"></script>
-            \\  <script crossorigin src="https://unpkg.com/react-dom@17/umd/react-dom.production.min.js"></script>
-            \\  <link rel="stylesheet" href="https://unpkg.com/graphiql@2.4.7/graphiql.min.css" />
-            \\</head>
-            \\<body>
-            \\  <div id="graphiql">Loading GraphQL Playground...</div>
-            \\  <script src="https://unpkg.com/graphiql@2.4.7/graphiql.min.js" crossorigin></script>
-            \\  <script>
-            \\    // Custom fetcher function for GraphQL queries
-            \\    function graphQLFetcher(graphQLParams) {
-            \\      return fetch('/graphql', {
-            \\        method: 'post',
-            \\        headers: { 'Content-Type': 'application/json' },
-            \\        body: JSON.stringify(graphQLParams),
-            \\      }).then(response => response.json());
-            \\    }
-            \\
-            \\    const defaultQuery = `# Welcome to ENSv2 GraphQL Playground!
-            \\#
-            \\# 🎯 Autocomplete Tips:
-            \\#   - Press Ctrl+Space anywhere to see suggestions
-            \\#   - Start typing a field name to get completions
-            \\#   - Hover over fields to see type information
-            \\#
-            \\# Try these example queries:
-            \\
-            \\# Query a domain
-            \\{
-            \\  domain(id: "test.eth") {
-            \\    name
-            \\    owner { id }
-            \\    resolver { address }
-            \\    expiryDate
-            \\    isMigrated
-            \\  }
-            \\}
-            \\
-            \\# Query all domains (first 10)
-            \\# {
-            \\#   domains(first: 10) {
-            \\#     name
-            \\#     owner { id }
-            \\#   }
-            \\# }
-            \\
-            \\# Query an account
-            \\# {
-            \\#   account(id: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045") {
-            \\#     id
-            \\#     domains { name }
-            \\#   }
-            \\# }
-            \\`;
-            \\
-            \\    // Render GraphiQL with autocomplete enabled
-            \\    ReactDOM.render(
-            \\      React.createElement(GraphiQL, {
-            \\        fetcher: graphQLFetcher,
-            \\        defaultQuery: defaultQuery,
-            \\      }),
-            \\      document.getElementById('graphiql')
-            \\    );
-            \\  </script>
-            \\</body>
-            \\</html>
-        ;
+        const html = @embedFile("graphiql.html");
 
         var response: std.ArrayList(u8) = .{};
         defer response.deinit(self.allocator);
@@ -803,7 +737,10 @@ pub const Server = struct {
     }
 
     fn handleGetWebhook(self: *Server, stream: std.net.Stream, webhook_id: u64) !void {
-        const webhook_opt = try self.database.getWebhook(webhook_id);
+        const webhook_db = self.webhook_database orelse {
+            return try self.sendJsonResponse(stream, 503, "{\"error\":\"Webhooks not enabled\"}");
+        };
+        const webhook_opt = try webhook_db.getWebhook(webhook_id);
 
         if (webhook_opt) |webhook| {
             var wh = webhook;
@@ -880,7 +817,9 @@ pub const Server = struct {
             const et_array = et_value.array;
             for (et_array.items) |et_item| {
                 const et_str = et_item.string;
-                if (std.meta.stringToEnum(models.EventType, et_str)) |et| {
+                // Accept the spec name ("NameRegistered") from the API surface. stringToEnum
+                // would match only the internal variant name ("name_registered") — wrong direction.
+                if (models.EventType.fromString(et_str)) |et| {
                     try event_types.append(self.allocator, et);
                 }
             }
@@ -942,7 +881,7 @@ pub const Server = struct {
             const et_array = et_value.array;
             for (et_array.items) |et_item| {
                 const et_str = et_item.string;
-                if (std.meta.stringToEnum(models.EventType, et_str)) |et| {
+                if (models.EventType.fromString(et_str)) |et| {
                     try event_types_list.append(self.allocator, et);
                 }
             }
