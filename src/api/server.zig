@@ -540,11 +540,25 @@ pub const Server = struct {
             \\  }
             \\}
             \\
-            \\# Query all domains (first 10)
+            \\# Bulk migration check (up to 1000 names per call)
             \\# {
-            \\#   domains(first: 10) {
+            \\#   domains(where: { name_in: ["rabbit.eth", "teacup.eth"], isMigrated: true }) {
             \\#     name
-            \\#     owner { id }
+            \\#     isMigrated
+            \\#   }
+            \\# }
+            \\
+            \\# Filtered paginated list with totalCount
+            \\# {
+            \\#   domainConnection(
+            \\#     first: 20
+            \\#     where: { name_ends_with: ".eth", isMigrated: false }
+            \\#     orderBy: "createdAt"
+            \\#     orderDirection: "desc"
+            \\#   ) {
+            \\#     totalCount
+            \\#     pageInfo { hasNextPage endCursor }
+            \\#     edges { cursor node { name owner { id } } }
             \\#   }
             \\# }
             \\

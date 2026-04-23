@@ -4,6 +4,7 @@
 /// - resolveDomainConnection: Cursor-based pagination for domains
 const std = @import("std");
 const common = @import("common.zig");
+const constants = @import("../../constants.zig");
 const db = common.db;
 const models = common.models;
 const Address = common.Address;
@@ -13,8 +14,6 @@ const builders = common.builders;
 const loaders = common.loaders;
 const namehash = common.namehash_fn;
 const NestedContext = common.NestedContext;
-
-const MAX_NAME_IN: usize = 1000;
 
 fn mapDomainOrderBy(order_by: ?[]const u8) db.NameSortField {
     const field_name = order_by orelse return .created_at;
@@ -64,7 +63,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
                         }
                     } else if (std.mem.eql(u8, filter_arg.name, "name_in")) {
                         if (filter_arg.value == .list) {
-                            if (filter_arg.value.list.len > MAX_NAME_IN) return error.TooManyNames;
+                            if (filter_arg.value.list.len > constants.Pagination.max_limit) return error.TooManyNames;
                             var names_list: std.ArrayList([]const u8) = .{};
                             defer names_list.deinit(allocator);
                             for (filter_arg.value.list) |item| {
@@ -398,7 +397,7 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
                     }
                 } else if (std.mem.eql(u8, filter_arg.name, "name_in")) {
                     if (filter_arg.value == .list) {
-                        if (filter_arg.value.list.len > MAX_NAME_IN) return error.TooManyNames;
+                        if (filter_arg.value.list.len > constants.Pagination.max_limit) return error.TooManyNames;
                         var names_list: std.ArrayList([]const u8) = .{};
                         defer names_list.deinit(allocator);
                         for (filter_arg.value.list) |item| {
