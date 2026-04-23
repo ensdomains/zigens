@@ -213,7 +213,7 @@ type Domain {
   """ENSIP-15 normalized name (null if normalization fails)"""
   normalizedName: String
 
-  """Whether the name passes ENSIP-15 normalization"""
+  """Whether the name passes ENSIP-15 normalization (computed at query time)"""
   isNormalized: Boolean!
 
   """Events associated with this domain"""
