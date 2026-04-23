@@ -381,6 +381,9 @@ input DomainFilter {
   """Exact name match"""
   name: String
 
+  """Filter by name in list (up to 1000 names)"""
+  name_in: [String!]
+
   """Partial name match (contains)"""
   name_contains: String
 
@@ -425,6 +428,9 @@ input DomainFilter {
 
   """Filter by expiry date less than or equal (Unix timestamp)"""
   expiry_lte: Int
+
+  """Filter by migration status"""
+  isMigrated: Boolean
 }
 
 """Filter criteria for querying registrations"""
