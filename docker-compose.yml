@@ -16,6 +16,8 @@ services:
     volumes:
       - ens-data:/app/data
       - webhook-data:/app/webhooks
+      # Optional: bind-mount a custom contracts.json (CI / fresh deploys)
+      # - ./config/contracts.json:/app/config/contracts.json:ro
     environment:
       - DATABASE_PATH=/app/data/ens.db
       - RAINBOW_PATH=/app/data/ens_rainbow.db
@@ -26,6 +28,9 @@ services:
       - POLL_INTERVAL=12
       - RATE_LIMIT_PER_SECOND=25
       - STATUS_PORT=3001
+      # Override hardcoded addresses. Unset = use NETWORK defaults.
+      # Baked-in presets: /app/config/contracts.sepolia.json, /app/config/contracts.mainnet.json
+      - CONTRACTS_PATH=${CONTRACTS_PATH:-}
       - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
       - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
       - WEBHOOK_MAX_RETRIES=${WEBHOOK_MAX_RETRIES:-3}

@@ -36,8 +36,17 @@ pub const Config = struct {
 
         const network = contracts.Network.fromString(env_mod.getEnv(&env_map, "NETWORK", "sepolia")) catch .sepolia;
 
-        const v1_contract_addrs = try contracts.getContractAddresses(network);
-        const v2_contract_addrs = try contracts.getContractAddresses(network);
+        // Optional override: if CONTRACTS_PATH points to a JSON file, load the full
+        // address set from it. Otherwise fall back to hardcoded per-network defaults.
+        const contracts_path = env_mod.getEnv(&env_map, "CONTRACTS_PATH", "");
+        const v1_contract_addrs = if (contracts_path.len > 0)
+            try contracts.loadFromJson(allocator, contracts_path)
+        else
+            try contracts.getContractAddresses(network);
+        const v2_contract_addrs = if (contracts_path.len > 0)
+            try contracts.loadFromJson(allocator, contracts_path)
+        else
+            try contracts.getContractAddresses(network);
 
         return Config{
             .allocator = allocator,

@@ -1,0 +1,31 @@
+{
+  "temporary_registrar": "0x0000000000000000000000000000000000000000",
+  "old_ens_registry": "0x0000000000000000000000000000000000000000",
+  "old_public_resolver": "0x0000000000000000000000000000000000000000",
+  "ens_registry": "0x17795c119b8155ab9d3357c77747ba509695d7cb",
+  "base_registrar": "0xb16870800de7444f6b2ebd885465412a5e581614",
+  "eth_registrar_controller": "0x99e517db3db5ec5424367b8b50cd11ddcb0008f1",
+  "public_resolver": "0x0e14ee0592da66bb4c8a8090066bc8a5af15f3e6",
+  "reverse_registrar": "0xf79f9970030fe60bd89d21591c7f2d80d7d21242",
+  "name_wrapper": "0xca7e6d0ddc5f373197bbe6fc2f09c2314399f028",
+
+  "root_registry": "0x3a3e15a5d27ff6f05c844313312f2e72096d3ed3",
+  "eth_registry": "0x796fff2e907449be8d5921bcc215b1b76d89d080",
+  "registry_datastore": "0x2a1d9588f3931fc7495867c82cd0d78cfb144945",
+  "eth_reverse_registrar": "0xa35e6c5dc06e820cc6716ca33dfcd203503fb1d3",
+
+  "l2_eth_registry": "0x796fff2e907449be8d5921bcc215b1b76d89d080",
+  "l2_eth_registrar": "0x68586418353b771cf2425ed14a07512aa880c532",
+  "l2_registry_datastore": "0x2a1d9588f3931fc7495867c82cd0d78cfb144945",
+
+  "migration_helper": "0x8fa8b82a70e400ba99423c8f76cc2cead2adc590",
+  "locked_migration_controller": "0x22cd7e6a89f5bf4510ef22b3dd4ef190d22f95c3",
+  "unlocked_migration_controller": "0x76ae358d9ad91651b78463ae609dadc9e7ce4402",
+
+  "v1_deployment_block": 4700000,
+  "l1_deployment_block": 9374806,
+  "l2_deployment_block": 9374806,
+  "temp_registrar_start_block": 0,
+  "v1_migration_block": 0,
+  "name_wrapper_deployment_block": 0
+}

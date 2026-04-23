@@ -67,6 +67,81 @@ pub fn getContractAddresses(network: Network) !ContractAddresses {
     };
 }
 
+const ContractAddressesJson = struct {
+    temporary_registrar: []const u8,
+    old_ens_registry: []const u8,
+    old_public_resolver: []const u8,
+    ens_registry: []const u8,
+    base_registrar: []const u8,
+    eth_registrar_controller: []const u8,
+    public_resolver: []const u8,
+    reverse_registrar: []const u8,
+    name_wrapper: []const u8,
+    root_registry: []const u8,
+    eth_registry: []const u8,
+    registry_datastore: []const u8,
+    eth_reverse_registrar: []const u8,
+    l2_eth_registry: []const u8,
+    l2_eth_registrar: []const u8,
+    l2_registry_datastore: []const u8,
+    migration_helper: []const u8,
+    locked_migration_controller: []const u8,
+    unlocked_migration_controller: []const u8,
+    v1_deployment_block: u64,
+    l1_deployment_block: u64,
+    l2_deployment_block: u64,
+    temp_registrar_start_block: u64,
+    v1_migration_block: u64,
+    name_wrapper_deployment_block: u64,
+};
+
+/// Load full contract address set from a JSON file. Used to override hardcoded
+/// network defaults for CI / fresh deployments. All fields required.
+pub fn loadFromJson(allocator: std.mem.Allocator, path: []const u8) !ContractAddresses {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    const contents = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(contents);
+
+    const parsed = try std.json.parseFromSlice(
+        ContractAddressesJson,
+        allocator,
+        contents,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+
+    const j = parsed.value;
+    return ContractAddresses{
+        .temporary_registrar = try Address.fromHex(j.temporary_registrar),
+        .old_ens_registry = try Address.fromHex(j.old_ens_registry),
+        .old_public_resolver = try Address.fromHex(j.old_public_resolver),
+        .ens_registry = try Address.fromHex(j.ens_registry),
+        .base_registrar = try Address.fromHex(j.base_registrar),
+        .eth_registrar_controller = try Address.fromHex(j.eth_registrar_controller),
+        .public_resolver = try Address.fromHex(j.public_resolver),
+        .reverse_registrar = try Address.fromHex(j.reverse_registrar),
+        .name_wrapper = try Address.fromHex(j.name_wrapper),
+        .root_registry = try Address.fromHex(j.root_registry),
+        .eth_registry = try Address.fromHex(j.eth_registry),
+        .registry_datastore = try Address.fromHex(j.registry_datastore),
+        .eth_reverse_registrar = try Address.fromHex(j.eth_reverse_registrar),
+        .l2_eth_registry = try Address.fromHex(j.l2_eth_registry),
+        .l2_eth_registrar = try Address.fromHex(j.l2_eth_registrar),
+        .l2_registry_datastore = try Address.fromHex(j.l2_registry_datastore),
+        .migration_helper = try Address.fromHex(j.migration_helper),
+        .locked_migration_controller = try Address.fromHex(j.locked_migration_controller),
+        .unlocked_migration_controller = try Address.fromHex(j.unlocked_migration_controller),
+        .v1_deployment_block = j.v1_deployment_block,
+        .l1_deployment_block = j.l1_deployment_block,
+        .l2_deployment_block = j.l2_deployment_block,
+        .temp_registrar_start_block = j.temp_registrar_start_block,
+        .v1_migration_block = j.v1_migration_block,
+        .name_wrapper_deployment_block = j.name_wrapper_deployment_block,
+    };
+}
+
 fn sepoliaAddresses() ContractAddresses {
     return .{
         // Temporary Registrar (not used on Sepolia testnet)

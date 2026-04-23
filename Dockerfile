@@ -77,6 +77,9 @@ COPY --from=builder /app/schema /app/schema
 # Copy GraphQL schema
 COPY --from=builder /app/schema.graphql /app/schema.graphql
 
+# Copy contract address presets (CONTRACTS_PATH can point at these or a bind-mounted file)
+COPY --from=builder /app/config /app/config
+
 # Copy rainbow build tools
 COPY --from=builder /app/tools/parse_rainbow.py /app/tools/parse_rainbow.py
 
@@ -86,7 +89,7 @@ COPY --from=builder /app/api-entrypoint.sh /app/api-entrypoint.sh
 COPY --from=builder /app/healthcheck.sh /app/healthcheck.sh
 
 # Create data directories and make scripts executable
-RUN mkdir -p /app/data /app/rainbow_data /app/webhooks && \
+RUN mkdir -p /app/data /app/rainbow_data /app/webhooks /app/config && \
     chmod +x /app/docker-entrypoint.sh /app/api-entrypoint.sh /app/healthcheck.sh && \
     chown -R ens:ens /app
 
@@ -102,6 +105,10 @@ ENV RAINBOW_PATH=/app/data/ens_rainbow.db
 ENV API_PORT=5655
 ENV STATUS_PORT=3001
 ENV DOWNLOAD_RAINBOW=true
+# Optional: path to a JSON file containing contract addresses.
+# When set, overrides the hardcoded per-network defaults. Mount via:
+#   -v /host/contracts.json:/app/config/contracts.json -e CONTRACTS_PATH=/app/config/contracts.json
+ENV CONTRACTS_PATH=""
 
 # Use entrypoint script to handle rainbow download
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

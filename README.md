@@ -160,6 +160,30 @@ WEBHOOK_DB_PATH=./data/webhooks.db
 | `GRAPHQL_MAX_COST` | Maximum query cost (DoS protection) | 1000 |
 | `RATE_LIMIT_PER_SECOND` | API rate limit per IP | 10 |
 | `WEBHOOKS_ENABLED` | Enable webhook system | false |
+| `CONTRACTS_PATH` | Path to JSON file overriding contract addresses | unset (use hardcoded per-`NETWORK` defaults) |
+
+### Overriding contract addresses
+
+Contract addresses come from hardcoded per-network tables in `src/contracts.zig`, selected by `NETWORK`. For fresh deployments or CI, set `CONTRACTS_PATH` to a JSON file instead — the whole address set is replaced and `NETWORK` is ignored for address lookup (still used for logs).
+
+Presets ship in `config/`:
+
+- `config/contracts.sepolia.json` — current Sepolia V2 deployment
+- `config/contracts.mainnet.json` — current Mainnet V1 deployment (V2 zeroed until deploy)
+- `config/contracts.example.json` — template for custom deployments
+
+```bash
+# Local (indexer reads addresses to filter events)
+CONTRACTS_PATH=config/contracts.sepolia.json ./zig-out/bin/ensv2-indexer-v2
+
+# Docker
+docker run \
+  -v $(pwd)/my-deploy.json:/app/config/contracts.json \
+  -e CONTRACTS_PATH=/app/config/contracts.json \
+  ...
+```
+
+All fields in the JSON are required. Missing fields or bad hex → startup error.
 
 ## Usage
 
