@@ -82,36 +82,91 @@ pub fn getBlockHash(db: *Database, chain: models.Chain, block_number: u64) !?Has
     return null;
 }
 
-/// Delete block hashes and events from a block onwards (for reorg handling)
+/// Rollback all derived state to the given block (for reorg handling).
+/// Deletes:
+///   - events and block_hashes after the block (insert-only tables)
+///   - rows in derived tables (names, registries, resolver_*, approvals, etc.) with created_block > block
+/// Does NOT roll back in-place updates to rows created at or before block_number
+/// (those will be re-derived when events are re-processed on re-sync from block+1).
 pub fn rollbackToBlock(db: *Database, chain: models.Chain, block_number: u64) !void {
     const chain_str = chain.toString();
+    const block_i64: i64 = @intCast(block_number);
 
-    // Delete events
-    {
-        const delete_events = "DELETE FROM events WHERE chain = ? AND block_number > ?";
-        var q = try Query.init(db, delete_events);
+    // Insert-only tables: delete anything after the block
+    const insert_only_tables = [_][]const u8{
+        "events",
+        "block_hashes",
+        "token_observers",
+    };
+
+    inline for (insert_only_tables) |table| {
+        const sql = "DELETE FROM " ++ table ++ " WHERE chain = ? AND block_number > ?";
+        var q = try Query.init(db, sql);
         defer q.deinit();
-
         try q.bindTextStatic(chain_str);
-        try q.bindInt64(@intCast(block_number));
+        try q.bindInt64(block_i64);
         try q.exec();
     }
 
-    // Delete block hashes
-    {
-        const delete_blocks = "DELETE FROM block_hashes WHERE chain = ? AND block_number > ?";
-        var q = try Query.init(db, delete_blocks);
-        defer q.deinit();
+    // Derived-state tables keyed by created_block: delete rows created after the block.
+    // Updates to rows created <= block_number will be re-derived when re-syncing.
+    const derived_tables_by_created_block = [_][]const u8{
+        "names",
+        "registries",
+    };
 
+    inline for (derived_tables_by_created_block) |table| {
+        const sql = "DELETE FROM " ++ table ++ " WHERE chain = ? AND created_block > ?";
+        var q = try Query.init(db, sql);
+        defer q.deinit();
         try q.bindTextStatic(chain_str);
-        try q.bindInt64(@intCast(block_number));
+        try q.bindInt64(block_i64);
+        try q.exec();
+    }
+
+    // orphaned_registrations uses block_number
+    {
+        const sql = "DELETE FROM orphaned_registrations WHERE chain = ? AND block_number > ?";
+        var q = try Query.init(db, sql);
+        defer q.deinit();
+        try q.bindTextStatic(chain_str);
+        try q.bindInt64(block_i64);
+        try q.exec();
+    }
+
+    // Resolver record and EAC tables: block_number with chain.
+    // Includes all resolver record tables (see deleteDataAfterBlock for canonical list).
+    // If a table is missing from the schema, Query.init (preparing the DELETE) will fail
+    // at the `try` boundary and bubble up — reorg rollback is not safe to continue on partial failure.
+    const resolver_record_tables = [_][]const u8{
+        "resolver_addresses",
+        "resolver_contenthashes",
+        "resolver_texts",
+        "resolver_aliases",
+        "resolver_pubkeys",
+        "resolver_abis",
+        "resolver_names",
+        "resolver_interfaces",
+        "resolver_versions",
+        "approvals",
+        "eac_roles",
+        "resolver_metadata",
+        "resolver_approvals",
+    };
+
+    inline for (resolver_record_tables) |table| {
+        const sql = "DELETE FROM " ++ table ++ " WHERE chain = ? AND block_number > ?";
+        var q = try Query.init(db, sql);
+        defer q.deinit();
+        try q.bindTextStatic(chain_str);
+        try q.bindInt64(block_i64);
         try q.exec();
     }
 
     // Update sync state
     try db.setSyncState(chain, block_number);
 
-    std.log.warn("Rolled back {s} chain to block {d}", .{ chain_str, block_number });
+    std.log.warn("Rolled back {s} chain to block {d} (derived state rolled back, in-place updates to pre-{d} rows will re-derive on re-sync)", .{ chain_str, block_number, block_number });
 }
 
 /// Cleanup old block hashes (keep last 1000 blocks for reorg detection)
@@ -327,8 +382,6 @@ pub fn deleteDataAfterBlock(db: *Database, block_number: u64) !void {
         .{ .name = "resolver_addresses", .block_col = "block_number" },
         .{ .name = "resolver_contenthashes", .block_col = "block_number" },
         .{ .name = "resolver_texts", .block_col = "block_number" },
-        .{ .name = "migrations", .block_col = "block_number" },
-        .{ .name = "renewal_syncs", .block_col = "block_number" },
         .{ .name = "token_observers", .block_col = "block_number" },
         .{ .name = "resolver_aliases", .block_col = "block_number" },
         .{ .name = "resolver_pubkeys", .block_col = "block_number" },
