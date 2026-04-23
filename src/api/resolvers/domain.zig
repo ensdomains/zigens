@@ -14,6 +14,8 @@ const loaders = common.loaders;
 const namehash = common.namehash_fn;
 const NestedContext = common.NestedContext;
 
+const MAX_NAME_IN: usize = 1000;
+
 fn mapDomainOrderBy(order_by: ?[]const u8) db.NameSortField {
     const field_name = order_by orelse return .created_at;
     if (std.mem.eql(u8, field_name, "name")) return .name;
@@ -33,6 +35,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
 
     // Parse filter if provided
     var filter_name: ?[]const u8 = null;
+    var filter_name_in: ?[][]const u8 = null;
     var filter_name_contains: ?[]const u8 = null;
     var filter_name_contains_nocase: ?[]const u8 = null;
     var filter_name_starts_with: ?[]const u8 = null;
@@ -58,6 +61,18 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
                     if (std.mem.eql(u8, filter_arg.name, "name")) {
                         if (filter_arg.value == .string) {
                             filter_name = filter_arg.value.string;
+                        }
+                    } else if (std.mem.eql(u8, filter_arg.name, "name_in")) {
+                        if (filter_arg.value == .list) {
+                            if (filter_arg.value.list.len > MAX_NAME_IN) return error.TooManyNames;
+                            var names_list: std.ArrayList([]const u8) = .{};
+                            defer names_list.deinit(allocator);
+                            for (filter_arg.value.list) |item| {
+                                if (item == .string) {
+                                    try names_list.append(allocator, item.string);
+                                }
+                            }
+                            filter_name_in = try names_list.toOwnedSlice(allocator);
                         }
                     } else if (std.mem.eql(u8, filter_arg.name, "name_contains")) {
                         if (filter_arg.value == .string) {
@@ -139,6 +154,8 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
         }
     }
 
+    defer if (filter_name_in) |names| allocator.free(names);
+
     // Parse orderBy and orderDirection
     var order_by: ?[]const u8 = null;
     var order_direction: []const u8 = "desc"; // default: newest first
@@ -197,7 +214,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
     }
 
     // Check if any filters are set
-    const has_filters = filter_name != null or filter_name_contains != null or
+    const has_filters = filter_name != null or filter_name_in != null or filter_name_contains != null or
         filter_name_contains_nocase != null or filter_name_starts_with != null or
         filter_name_ends_with != null or filter_owner != null or filter_owner_in != null or
         filter_resolved_address != null or filter_resolver != null or filter_has_subdomains != null or
@@ -219,6 +236,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
             .owner = filter_owner,
             .owner_in = filter_owner_in,
             .name = filter_name,
+            .name_in = filter_name_in,
             .name_contains = filter_name_contains,
             .name_contains_nocase = filter_name_contains_nocase,
             .name_starts_with = filter_name_starts_with,
@@ -355,6 +373,7 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
     var filter_owner: ?Address = null;
     var filter_owner_in: ?[]Address = null;
     var filter_name: ?[]const u8 = null;
+    var filter_name_in: ?[][]const u8 = null;
     var filter_name_contains: ?[]const u8 = null;
     var filter_name_contains_nocase: ?[]const u8 = null;
     var filter_name_starts_with: ?[]const u8 = null;
@@ -376,6 +395,18 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
                 if (std.mem.eql(u8, filter_arg.name, "name")) {
                     if (filter_arg.value == .string) {
                         filter_name = filter_arg.value.string;
+                    }
+                } else if (std.mem.eql(u8, filter_arg.name, "name_in")) {
+                    if (filter_arg.value == .list) {
+                        if (filter_arg.value.list.len > MAX_NAME_IN) return error.TooManyNames;
+                        var names_list: std.ArrayList([]const u8) = .{};
+                        defer names_list.deinit(allocator);
+                        for (filter_arg.value.list) |item| {
+                            if (item == .string) {
+                                try names_list.append(allocator, item.string);
+                            }
+                        }
+                        filter_name_in = try names_list.toOwnedSlice(allocator);
                     }
                 } else if (std.mem.eql(u8, filter_arg.name, "name_contains")) {
                     if (filter_arg.value == .string) {
@@ -456,11 +487,13 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         }
     }
     defer if (filter_owner_in) |owners| allocator.free(owners);
+    defer if (filter_name_in) |names| allocator.free(names);
 
     const name_filters = db.NameFilters{
         .owner = filter_owner,
         .owner_in = filter_owner_in,
         .name = filter_name,
+        .name_in = filter_name_in,
         .name_contains = filter_name_contains,
         .name_contains_nocase = filter_name_contains_nocase,
         .name_starts_with = filter_name_starts_with,
@@ -477,7 +510,7 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         .subdomain_count_lt = filter_subdomain_count_lt,
     };
 
-    const has_filters = filter_name != null or filter_name_contains != null or
+    const has_filters = filter_name != null or filter_name_in != null or filter_name_contains != null or
         filter_name_contains_nocase != null or filter_name_starts_with != null or
         filter_name_ends_with != null or filter_owner != null or filter_owner_in != null or
         filter_resolved_address != null or filter_resolver != null or filter_has_subdomains != null or
