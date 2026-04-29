@@ -942,6 +942,7 @@ pub const NameFilters = struct {
     owner_in: ?[]const Address = null,
     // Name filters
     name: ?[]const u8 = null,
+    name_in: ?[]const []const u8 = null,
     name_contains: ?[]const u8 = null,
     name_contains_nocase: ?[]const u8 = null,
     name_starts_with: ?[]const u8 = null,
@@ -1002,6 +1003,23 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
     // Name filters
     if (filters.name != null) {
         try conditions.append(db.allocator, "name = ?");
+    }
+    if (filters.name_in) |names| {
+        if (names.len == 0) {
+            try conditions.append(db.allocator, "1=0");
+        } else {
+            var in_parts: std.ArrayList(u8) = .{};
+            defer in_parts.deinit(db.allocator);
+            try in_parts.appendSlice(db.allocator, "name IN (");
+            for (names, 0..) |_, i| {
+                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
+                try in_parts.appendSlice(db.allocator, "?");
+            }
+            try in_parts.appendSlice(db.allocator, ")");
+            const clause = try db.allocator.dupe(u8, in_parts.items);
+            try allocated_strings.append(db.allocator, clause);
+            try conditions.append(db.allocator, clause);
+        }
     }
     if (filters.name_contains != null) {
         try conditions.append(db.allocator, "name LIKE '%' || ? || '%'");
@@ -1103,6 +1121,11 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
     }
     if (filters.name) |n| {
         try q.bindText(n);
+    }
+    if (filters.name_in) |names| {
+        for (names) |n| {
+            try q.bindText(n);
+        }
     }
     if (filters.name_contains) |n| {
         try q.bindText(n);
@@ -1280,6 +1303,23 @@ pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
     if (filters.name != null) {
         try conditions.append(db.allocator, "name = ?");
     }
+    if (filters.name_in) |names| {
+        if (names.len == 0) {
+            try conditions.append(db.allocator, "1=0");
+        } else {
+            var in_parts: std.ArrayList(u8) = .{};
+            defer in_parts.deinit(db.allocator);
+            try in_parts.appendSlice(db.allocator, "name IN (");
+            for (names, 0..) |_, i| {
+                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
+                try in_parts.appendSlice(db.allocator, "?");
+            }
+            try in_parts.appendSlice(db.allocator, ")");
+            const clause = try db.allocator.dupe(u8, in_parts.items);
+            try allocated_strings.append(db.allocator, clause);
+            try conditions.append(db.allocator, clause);
+        }
+    }
     if (filters.name_contains != null) {
         try conditions.append(db.allocator, "name LIKE '%' || ? || '%'");
     }
@@ -1361,6 +1401,11 @@ pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
     }
     if (filters.name) |n| {
         try q.bindText(n);
+    }
+    if (filters.name_in) |names| {
+        for (names) |n| {
+            try q.bindText(n);
+        }
     }
     if (filters.name_contains) |n| {
         try q.bindText(n);

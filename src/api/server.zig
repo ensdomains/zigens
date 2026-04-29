@@ -508,6 +508,10 @@ pub const Server = struct {
     }
 
     fn handleGraphQLPlayground(self: *Server, stream: std.net.Stream) !void {
+        // Playground asset extracted to graphiql.html (commit 5308c2d) so the
+        // page can be edited without recompiling. The staging branch's inline
+        // version included an example with `name_in` — that example is preserved
+        // as a section in the .html file so the merge keeps both branches' intent.
         const html = @embedFile("graphiql.html");
 
         var response: std.ArrayList(u8) = .{};

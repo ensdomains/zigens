@@ -2243,6 +2243,19 @@
               }
             },
             {
+              "name": "name_in",
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "SCALAR",
+                    "name": "String"
+                  }
+                }
+              }
+            },
+            {
               "name": "name_contains",
               "type": {
                 "kind": "SCALAR",
@@ -2351,6 +2364,13 @@
               "type": {
                 "kind": "SCALAR",
                 "name": "Int"
+              }
+            },
+            {
+              "name": "isMigrated",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Boolean"
               }
             }
           ]

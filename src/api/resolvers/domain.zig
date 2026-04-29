@@ -4,6 +4,7 @@
 /// - resolveDomainConnection: Cursor-based pagination for domains
 const std = @import("std");
 const common = @import("common.zig");
+const constants = @import("../../constants.zig");
 const db = common.db;
 const models = common.models;
 const Address = common.Address;
@@ -51,6 +52,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
 
     // Parse `where` filter
     var filter_name: ?[]const u8 = null;
+    var filter_name_in: ?[][]const u8 = null;
     var filter_name_contains: ?[]const u8 = null;
     var filter_name_contains_nocase: ?[]const u8 = null;
     var filter_name_starts_with: ?[]const u8 = null;
@@ -71,6 +73,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
     if (common.getObjectArg(field, "where")) |where_args| {
         for (where_args) |a| {
             // owner_in: list-of-Address — handled inline because it allocates.
+            // Surface invalid addresses as errors (matches matchAddressArg's behavior).
             if (std.mem.eql(u8, a.name, "owner_in") and a.value == .list) {
                 var addresses: std.ArrayList(Address) = .{};
                 defer addresses.deinit(allocator);
@@ -81,6 +84,21 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
                     }
                 }
                 filter_owner_in = try addresses.toOwnedSlice(allocator);
+                continue;
+            }
+
+            // name_in: list-of-string. Cap at MAX_FIRST so a query can't degenerate
+            // into thousands of namehash lookups via the filter.
+            if (std.mem.eql(u8, a.name, "name_in") and a.value == .list) {
+                if (a.value.list.len > constants.Pagination.max_limit) return error.TooManyNames;
+                var names_list: std.ArrayList([]const u8) = .{};
+                defer names_list.deinit(allocator);
+                for (a.value.list) |item| {
+                    if (item == .string) {
+                        try names_list.append(allocator, item.string);
+                    }
+                }
+                filter_name_in = try names_list.toOwnedSlice(allocator);
                 continue;
             }
 
@@ -102,6 +120,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
                 common.matchBoolArg(a, "isMigrated", &filter_migrated);
         }
     }
+    defer if (filter_name_in) |names| allocator.free(names);
 
     const order_by = parser.getStringArg(field, "orderBy", null);
     const order_dir_parsed = common.parseOrderDirection(field, db.OrderDir, .desc);
@@ -149,7 +168,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
     }
 
     // Check if any filters are set
-    const has_filters = filter_name != null or filter_name_contains != null or
+    const has_filters = filter_name != null or filter_name_in != null or filter_name_contains != null or
         filter_name_contains_nocase != null or filter_name_starts_with != null or
         filter_name_ends_with != null or filter_owner != null or filter_owner_in != null or
         filter_resolved_address != null or filter_resolver != null or filter_has_subdomains != null or
@@ -171,6 +190,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
             .owner = filter_owner,
             .owner_in = filter_owner_in,
             .name = filter_name,
+            .name_in = filter_name_in,
             .name_contains = filter_name_contains,
             .name_contains_nocase = filter_name_contains_nocase,
             .name_starts_with = filter_name_starts_with,
@@ -244,6 +264,7 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
     var filter_owner: ?Address = null;
     var filter_owner_in: ?[]Address = null;
     var filter_name: ?[]const u8 = null;
+    var filter_name_in: ?[][]const u8 = null;
     var filter_name_contains: ?[]const u8 = null;
     var filter_name_contains_nocase: ?[]const u8 = null;
     var filter_name_starts_with: ?[]const u8 = null;
@@ -274,6 +295,19 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
                 continue;
             }
 
+            if (std.mem.eql(u8, a.name, "name_in") and a.value == .list) {
+                if (a.value.list.len > constants.Pagination.max_limit) return error.TooManyNames;
+                var names_list: std.ArrayList([]const u8) = .{};
+                defer names_list.deinit(allocator);
+                for (a.value.list) |item| {
+                    if (item == .string) {
+                        try names_list.append(allocator, item.string);
+                    }
+                }
+                filter_name_in = try names_list.toOwnedSlice(allocator);
+                continue;
+            }
+
             _ = common.matchStringArg(a, "name", &filter_name) or
                 common.matchStringArg(a, "name_contains", &filter_name_contains) or
                 common.matchStringArg(a, "name_contains_nocase", &filter_name_contains_nocase) or
@@ -293,11 +327,13 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         }
     }
     defer if (filter_owner_in) |owners| allocator.free(owners);
+    defer if (filter_name_in) |names| allocator.free(names);
 
     const name_filters = db.NameFilters{
         .owner = filter_owner,
         .owner_in = filter_owner_in,
         .name = filter_name,
+        .name_in = filter_name_in,
         .name_contains = filter_name_contains,
         .name_contains_nocase = filter_name_contains_nocase,
         .name_starts_with = filter_name_starts_with,
@@ -314,7 +350,7 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         .subdomain_count_lt = filter_subdomain_count_lt,
     };
 
-    const has_filters = filter_name != null or filter_name_contains != null or
+    const has_filters = filter_name != null or filter_name_in != null or filter_name_contains != null or
         filter_name_contains_nocase != null or filter_name_starts_with != null or
         filter_name_ends_with != null or filter_owner != null or filter_owner_in != null or
         filter_resolved_address != null or filter_resolver != null or filter_has_subdomains != null or
