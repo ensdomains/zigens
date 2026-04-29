@@ -30,7 +30,10 @@ pub const FieldType = enum {
     bool_field,
     /// Optional boolean field
     optional_bool,
-    /// Custom function for complex fields (nested objects, computed values)
+    /// Custom writer that produces a scalar value (sub-selections invalid).
+    custom_scalar,
+    /// Custom writer that produces an object/list (sub-selections may be valid; the
+    /// writer is responsible for honoring them).
     custom,
 };
 
@@ -95,9 +98,16 @@ pub const FieldDef = struct {
         return .{ .name = name, .field_type = .optional_bool, .getter = getter, .custom_writer = null };
     }
 
-    /// Create a custom field with direct writer access
+    /// Create a custom field with direct writer access. Use this for fields whose JSON
+    /// shape is an object or list — the writer is expected to honor sub-selections itself.
     pub fn custom(name: []const u8, writer_fn: CustomWriter) FieldDef {
         return .{ .name = name, .field_type = .custom, .getter = null, .custom_writer = writer_fn };
+    }
+
+    /// Create a custom field whose value is scalar (e.g. a formatted string or number).
+    /// Sub-selections will be rejected at the entity-builder level.
+    pub fn customScalar(name: []const u8, writer_fn: CustomWriter) FieldDef {
+        return .{ .name = name, .field_type = .custom_scalar, .getter = null, .custom_writer = writer_fn };
     }
 };
 
@@ -154,8 +164,8 @@ fn writeFieldValue(
     allocator: std.mem.Allocator,
     def: FieldDef,
 ) !bool {
-    // Handle custom fields
-    if (def.field_type == .custom) {
+    // Handle custom fields (both scalar and object kinds dispatch through the writer)
+    if (def.field_type == .custom or def.field_type == .custom_scalar) {
         if (def.custom_writer) |custom_fn| {
             return try custom_fn(ctx, output_key, writer, allocator);
         }

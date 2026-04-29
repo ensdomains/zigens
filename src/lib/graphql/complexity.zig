@@ -7,6 +7,11 @@ pub const ComplexityLimits = struct {
     max_cost: u32 = 1000, // Maximum total query cost
     default_field_cost: u32 = 1, // Cost per field
     list_multiplier: u32 = 1, // Multiplier for list fields based on 'first' argument
+    /// Upper bound used when the analyzer can't read a `first:` literal — e.g.
+    /// the value is a variable reference and the variable has no default. Cost
+    /// must assume the worst case rather than 1, otherwise an attacker can
+    /// bypass cost analysis by parameterizing every page size.
+    max_pagination_assumption: u32 = 1000,
 };
 
 /// Complexity analysis result
@@ -31,16 +36,23 @@ pub const ComplexityAnalysis = struct {
     }
 };
 
-/// Query complexity analyzer
+/// Query complexity analyzer.
+/// Three behaviors are critical for correctness against adversarial queries:
+///   1. Fragments are expanded (named + inline) — otherwise `...Frag { deep }`
+///      bypasses depth and cost.
+///   2. `first: $var` is resolved to the variable's default value when present;
+///      when absent, treated as `max_pagination_assumption` (worst case) rather
+///      than 1.
+///   3. The pagination multiplier is NOT capped — `domains(first: 1000)` costs
+///      1000, not 100. This lets cost properly catch nested-list amplification.
 pub const ComplexityAnalyzer = struct {
     allocator: std.mem.Allocator,
     limits: ComplexityLimits,
+    fragments: []const parser.Fragment = &.{},
+    variables: []const parser.VariableDefinition = &.{},
 
     pub fn init(allocator: std.mem.Allocator, limits: ComplexityLimits) ComplexityAnalyzer {
-        return .{
-            .allocator = allocator,
-            .limits = limits,
-        };
+        return .{ .allocator = allocator, .limits = limits };
     }
 
     /// Analyze a GraphQL document for complexity
@@ -48,11 +60,15 @@ pub const ComplexityAnalyzer = struct {
         var max_depth: u32 = 0;
         var total_cost: u32 = 0;
 
+        // Bind document-level fragments for the duration of analysis.
+        self.fragments = document.fragments;
+        defer self.fragments = &.{};
+
         // Analyze each operation
         for (document.operations) |*operation| {
             const analysis = try self.analyzeOperation(operation);
             max_depth = @max(max_depth, analysis.depth);
-            total_cost += analysis.cost;
+            total_cost +|= analysis.cost; // saturating to avoid u32 wrap on adversarial input
         }
 
         return ComplexityAnalysis{
@@ -68,11 +84,15 @@ pub const ComplexityAnalyzer = struct {
         var max_depth: u32 = 0;
         var total_cost: u32 = 0;
 
-        // Analyze each root field
+        // Bind operation-level variable defs for `first: $var` resolution.
+        const prev_vars = self.variables;
+        self.variables = operation.variables;
+        defer self.variables = prev_vars;
+
         for (operation.fields) |*field| {
             const field_analysis = try self.analyzeField(field, 1);
             max_depth = @max(max_depth, field_analysis.depth);
-            total_cost += field_analysis.cost;
+            total_cost +|= field_analysis.cost;
         }
 
         return ComplexityAnalysis{
@@ -83,16 +103,46 @@ pub const ComplexityAnalyzer = struct {
         };
     }
 
-    /// Analyze a field recursively
+    /// Analyze a field recursively. Fragment spreads are expanded inline so
+    /// nested selections inside fragments contribute to depth & cost just like
+    /// inline selections.
     fn analyzeField(self: *ComplexityAnalyzer, field: *const parser.Field, current_depth: u32) error{OutOfMemory}!ComplexityAnalysis {
+        // Fragment spread: charge the spread location as 0 cost (it's a syntactic
+        // marker, not a real field) and recurse into the fragment's selections at
+        // the SAME depth. Without this, `query { ...Frag }` reports depth 1 + cost 0.
+        if (field.fragment_spread) |frag_name| {
+            for (self.fragments) |*frag| {
+                if (std.mem.eql(u8, frag.name, frag_name)) {
+                    var max_depth: u32 = current_depth;
+                    var total_cost: u32 = 0;
+                    for (frag.selections) |*sel| {
+                        const sub = try self.analyzeField(sel, current_depth);
+                        max_depth = @max(max_depth, sub.depth);
+                        total_cost +|= sub.cost;
+                    }
+                    return ComplexityAnalysis{
+                        .depth = max_depth,
+                        .cost = total_cost,
+                        .exceeded_depth = max_depth > self.limits.max_depth,
+                        .exceeded_cost = total_cost > self.limits.max_cost,
+                    };
+                }
+            }
+            // Unknown fragment — charge zero, mirroring executor's permissive behavior.
+            return ComplexityAnalysis{
+                .depth = current_depth,
+                .cost = 0,
+                .exceeded_depth = false,
+                .exceeded_cost = false,
+            };
+        }
+
         var field_cost: u32 = self.limits.default_field_cost;
         var max_depth: u32 = current_depth;
 
-        // Check for pagination multiplier
         const multiplier = self.getFieldMultiplier(field);
-        field_cost *= multiplier;
+        field_cost *|= multiplier;
 
-        // Analyze nested selections
         if (field.selections.len > 0) {
             var nested_cost: u32 = 0;
             var nested_max_depth: u32 = current_depth;
@@ -100,11 +150,10 @@ pub const ComplexityAnalyzer = struct {
             for (field.selections) |*selection| {
                 const nested_analysis = try self.analyzeField(selection, current_depth + 1);
                 nested_max_depth = @max(nested_max_depth, nested_analysis.depth);
-                nested_cost += nested_analysis.cost;
+                nested_cost +|= nested_analysis.cost;
             }
 
-            // Multiply nested cost by the field multiplier (e.g., if first=100, nested fields cost 100x)
-            field_cost += nested_cost * multiplier;
+            field_cost +|= nested_cost *| multiplier;
             max_depth = nested_max_depth;
         }
 
@@ -116,22 +165,42 @@ pub const ComplexityAnalyzer = struct {
         };
     }
 
-    /// Get the multiplier for a field based on pagination arguments
+    /// Get the multiplier for a field based on pagination arguments.
+    /// Resolves variables to their default value when present; falls back to
+    /// `max_pagination_assumption` for unresolvable variables (cannot allow an
+    /// attacker to bypass cost analysis by parameterizing every page size).
     fn getFieldMultiplier(self: *ComplexityAnalyzer, field: *const parser.Field) u32 {
-        _ = self;
-
-        // Look for 'first' or 'limit' arguments
         for (field.arguments) |arg| {
-            if (std.mem.eql(u8, arg.name, "first") or std.mem.eql(u8, arg.name, "limit")) {
-                if (arg.value == .int) {
-                    // Cap multiplier at 100 to prevent overflow
-                    const value = @as(u32, @intCast(@max(1, @min(100, arg.value.int))));
-                    return value;
-                }
+            if (!std.mem.eql(u8, arg.name, "first") and !std.mem.eql(u8, arg.name, "limit")) continue;
+
+            switch (arg.value) {
+                .int => |i| {
+                    if (i <= 0) return 1;
+                    const clamped: u32 = @intCast(@min(@as(i64, self.limits.max_pagination_assumption), i));
+                    return @max(1, clamped);
+                },
+                .variable => |var_name| {
+                    // Look up default in variable definitions.
+                    for (self.variables) |*vd| {
+                        if (!std.mem.eql(u8, vd.name, var_name)) continue;
+                        if (vd.default_value) |dv| switch (dv) {
+                            .int => |i| {
+                                if (i <= 0) return 1;
+                                const clamped: u32 = @intCast(@min(@as(i64, self.limits.max_pagination_assumption), i));
+                                return @max(1, clamped);
+                            },
+                            else => {},
+                        };
+                        // Variable with no default → assume the worst case so the
+                        // attacker can't hide behind `first: $n` to bypass cost.
+                        return self.limits.max_pagination_assumption;
+                    }
+                    // Variable referenced but not declared — also worst case.
+                    return self.limits.max_pagination_assumption;
+                },
+                else => {},
             }
         }
-
-        // Default multiplier is 1 (no pagination)
         return 1;
     }
 };

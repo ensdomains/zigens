@@ -16,8 +16,7 @@ fn mapRegistrationOrderBy(order_by: ?[]const u8) db.EventSortField {
     const field_name = order_by orelse return .block_number;
     if (std.mem.eql(u8, field_name, "registrationDate")) return .timestamp;
     if (std.mem.eql(u8, field_name, "name")) return .name;
-    // expiryDate lives in JSON, can't sort in SQL — keep default
-    if (std.mem.eql(u8, field_name, "expiryDate")) return .block_number;
+    if (std.mem.eql(u8, field_name, "expiryDate")) return .expiry;
     return .block_number;
 }
 
@@ -48,13 +47,15 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
     var filter_expiry_gte: ?i64 = null;
     var filter_expiry_lt: ?i64 = null;
     var filter_expiry_lte: ?i64 = null;
-    var filter_chain: ?models.Chain = null;
+    var filter_chain: ?models.Protocol = null;
 
     if (common.getObjectArg(field, "where")) |where_args| {
         for (where_args) |a| {
-            // chain: string → enum (special-cased)
-            if (std.mem.eql(u8, a.name, "chain") and a.value == .string) {
-                filter_chain = models.Chain.fromString(a.value.string) catch null;
+            // protocol: string → enum (special-cased)
+            // Surface invalid protocol as an error so a typo doesn't silently expand
+            // the result set across all chains.
+            if (std.mem.eql(u8, a.name, "protocol") and a.value == .string) {
+                filter_chain = models.Protocol.fromString(a.value.string) catch return error.InvalidProtocol;
                 continue;
             }
             // registrant_in: list-of-string — allocates
@@ -81,7 +82,7 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
 
     // Build registration filter
     const reg_filter = db.RegistrationFilterOptions{
-        .chain = filter_chain,
+        .protocol = filter_chain,
         .registrant = filter_registrant,
         .registrant_in = filter_registrant_in,
         .expiry_gt = filter_expiry_gt,
@@ -136,27 +137,33 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
     else
         base_dir;
 
-    // Convert the cursor (tx_hash-log_index) into a SKIP offset, matching the pattern
-    // used for domainConnection. Cursor refers to the last item already seen.
+    // Convert the cursor (tx_hash-log_index) into a SKIP offset. The count must apply the
+    // SAME filters as the row query — registration types AND any registrant/expiry filters
+    // — otherwise pagination skips too many rows. Build an EventFilterOptions that mirrors
+    // what `getRegistrations` builds internally.
     var skip: u32 = 0;
     if (params.cursor) |c| {
-        const decoded_opt = pagination.CursorCodec.decodeString(allocator, c) catch null;
-        if (decoded_opt) |decoded| {
-            defer allocator.free(decoded);
-            // Cursor format is "<tx_hash_hex>-<log_index>"
-            if (std.mem.lastIndexOfScalar(u8, decoded, '-')) |sep| {
-                const tx_hash = decoded[0..sep];
-                const log_index = std.fmt.parseInt(u32, decoded[sep + 1 ..], 10) catch 0;
-                // Registrations only include NameRegistered + LabelRegistered events — count
-                // must apply the same filter or the skip offset will be wildly off.
-                const reg_types = [_][]const u8{
-                    models.EventType.name_registered.toString(),
-                    models.EventType.label_registered.toString(),
-                };
-                const events_before = database.countEventsBeforeCursor(tx_hash, log_index, order_dir, &reg_types) catch 0;
-                skip = events_before +| 1; // +1 to skip past the cursor row itself
-            }
-        }
+        const decoded = try pagination.CursorCodec.decodeString(allocator, c);
+        defer allocator.free(decoded);
+        const sep = std.mem.lastIndexOfScalar(u8, decoded, '-') orelse return error.InvalidCursor;
+        const tx_hash = decoded[0..sep];
+        const log_index = std.fmt.parseInt(u32, decoded[sep + 1 ..], 10) catch return error.InvalidCursor;
+        const reg_types = [_][]const u8{
+            models.EventType.name_registered.toString(),
+            models.EventType.label_registered.toString(),
+        };
+        const cursor_filter = db.EventFilterOptions{
+            .event_types = &reg_types,
+            .protocol = filter_chain,
+            .data_json_owner = filter_registrant,
+            .data_json_owners = filter_registrant_in,
+            .expiry_gt = filter_expiry_gt,
+            .expiry_gte = filter_expiry_gte,
+            .expiry_lt = filter_expiry_lt,
+            .expiry_lte = filter_expiry_lte,
+        };
+        const events_before = database.countEventsBeforeCursor(tx_hash, log_index, order_dir, cursor_filter) catch 0;
+        skip = events_before +| 1; // +1 to skip past the cursor row itself
     }
 
     // Get registration events from database with filters applied at DB level
@@ -309,7 +316,7 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
     const allocator = ctx.allocator;
 
-    const page = common.parsePagination(field, 100);
+    const page = try common.parsePagination(field, 100);
     const first = page.first;
     const skip = page.skip;
 
@@ -320,12 +327,12 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
     var filter_expiry_gte: ?i64 = null;
     var filter_expiry_lt: ?i64 = null;
     var filter_expiry_lte: ?i64 = null;
-    var filter_chain: ?models.Chain = null;
+    var filter_chain: ?models.Protocol = null;
 
     if (common.getObjectArg(field, "where")) |where_args| {
         for (where_args) |a| {
-            if (std.mem.eql(u8, a.name, "chain") and a.value == .string) {
-                filter_chain = models.Chain.fromString(a.value.string) catch null;
+            if (std.mem.eql(u8, a.name, "protocol") and a.value == .string) {
+                filter_chain = models.Protocol.fromString(a.value.string) catch return error.InvalidProtocol;
                 continue;
             }
             if (std.mem.eql(u8, a.name, "registrant_in") and a.value == .list) {
@@ -353,16 +360,12 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
     const sort_field = mapRegistrationOrderBy(order_by);
     const order_dir = common.parseOrderDirection(field, db.EventOrderDir, .asc);
 
-    // For expiryDate sort, we need in-memory fallback since expiry is in JSON
-    const is_expiry_sort = if (order_by) |ob| std.mem.eql(u8, ob, "expiryDate") else false;
-
-    // All filters are pushed to the DB level
-    // For expiryDate sort, fetch all matching events for in-memory sort
-    // For other sorts, fetch enough items to cover skip + first for offset pagination
-    const fetch_limit: u32 = if (is_expiry_sort) 10000 else @intCast(first + skip);
+    // All sorts (including expiryDate) are now pushed to SQLite via EventSortField.expiry
+    // (uses json_extract). Fetch only `skip + first` rows; no in-memory sort.
+    const fetch_limit: u32 = @intCast(first + skip);
 
     const events_result = try database.getRegistrations(.{
-        .chain = filter_chain,
+        .protocol = filter_chain,
         .registrant = filter_registrant,
         .registrant_in = filter_registrant_in,
         .limit = fetch_limit,
@@ -380,68 +383,7 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
         allocator.free(events_result);
     }
 
-    // For expiryDate sort, apply in-memory sort since expiry is stored in JSON
-    if (is_expiry_sort) {
-        const FilteredEvent = struct {
-            event: *models.Event,
-            expiry: i64,
-        };
-
-        var filtered_events: std.ArrayList(FilteredEvent) = .{};
-        defer filtered_events.deinit(allocator);
-
-        for (events_result) |*event| {
-            if (event.name == null) continue;
-
-            var event_expiry: i64 = 0;
-            const parsed = std.json.parseFromSlice(std.json.Value, allocator, event.data, .{}) catch continue;
-            defer parsed.deinit();
-
-            if (parsed.value.object.get("expiration")) |expiration_val| {
-                if (expiration_val == .integer) {
-                    event_expiry = expiration_val.integer;
-                }
-            }
-
-            try filtered_events.append(allocator, .{
-                .event = event,
-                .expiry = event_expiry,
-            });
-        }
-
-        const ascending = order_dir == .asc;
-        std.mem.sort(FilteredEvent, filtered_events.items, ascending, struct {
-            fn lessThan(asc: bool, a: FilteredEvent, b: FilteredEvent) bool {
-                return if (asc) a.expiry < b.expiry else a.expiry > b.expiry;
-            }
-        }.lessThan);
-
-        // Build JSON from sorted events, applying skip
-        var json: std.ArrayList(u8) = .{};
-        defer json.deinit(allocator);
-
-        try json.appendSlice(allocator, "[");
-        const start_idx: usize = @min(@as(usize, @intCast(skip)), filtered_events.items.len);
-        const end_idx: usize = @min(start_idx + @as(usize, @intCast(first)), filtered_events.items.len);
-        for (filtered_events.items[start_idx..end_idx], 0..) |filtered, i| {
-            if (i > 0) try json.appendSlice(allocator, ",");
-
-            const reg_json = try builders.buildRegistrationJson(filtered.event, field.selections, .{
-                .database = database,
-                .depth = 0,
-                .allocator = allocator,
-                .loaders = ctx.loaders,
-            });
-            defer allocator.free(reg_json);
-            try json.appendSlice(allocator, reg_json);
-        }
-        try json.appendSlice(allocator, "]");
-
-        const result_json = try allocator.dupe(u8, json.items);
-        return parser.FieldResult{ .json = result_json };
-    }
-
-    // For non-expiryDate sorts, data is already sorted by SQL
+    // Data is sorted by SQL for all paths now
     // Build JSON, applying skip
     var json: std.ArrayList(u8) = .{};
     defer json.deinit(allocator);

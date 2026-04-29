@@ -45,11 +45,17 @@ pub const PaginationParams = struct {
 
         // Determine direction and limit
         const direction: Direction = if (last != null) .backward else .forward;
-        const raw_limit = if (first) |f| f else if (last) |l| l else @as(i64, @intCast(default_limit));
+        const explicit_limit: ?i64 = if (first) |f| f else last;
+        const raw_limit = explicit_limit orelse @as(i64, @intCast(default_limit));
 
-        // Validate and cap limit
+        // Validate and cap limit. If the caller explicitly asked for more than max_limit,
+        // surface that as an error rather than silently truncating — silent truncation
+        // hides query intent and produces deceptively-incomplete pages.
         if (raw_limit < 0) {
             return error.NegativeLimit;
+        }
+        if (explicit_limit) |e| {
+            if (@as(usize, @intCast(e)) > max_limit) return error.LimitExceeded;
         }
         const limit = @min(@as(usize, @intCast(raw_limit)), max_limit);
 
@@ -189,11 +195,14 @@ pub fn buildConnectionInt(
     total_count: ?usize,
 ) !Connection(T) {
     if (items.len == 0) {
+        // No edges, but `has_more` and the cursor still inform whether there's data
+        // beyond what was returned. With `first: 0` (or any limit that intentionally
+        // returns zero edges), pageInfo must still surface the existence of more rows.
         return Connection(T){
             .edges = &[_]Edge(T){},
             .page_info = PageInfo{
-                .has_next_page = false,
-                .has_previous_page = false,
+                .has_next_page = if (params.direction == .forward) has_more else (params.cursor != null),
+                .has_previous_page = if (params.direction == .backward) has_more else (params.cursor != null),
                 .start_cursor = null,
                 .end_cursor = null,
             },
@@ -246,11 +255,14 @@ pub fn buildConnectionString(
     total_count: ?usize,
 ) !Connection(T) {
     if (items.len == 0) {
+        // No edges, but `has_more` and the cursor still inform whether there's data
+        // beyond what was returned. With `first: 0` (or any limit that intentionally
+        // returns zero edges), pageInfo must still surface the existence of more rows.
         return Connection(T){
             .edges = &[_]Edge(T){},
             .page_info = PageInfo{
-                .has_next_page = false,
-                .has_previous_page = false,
+                .has_next_page = if (params.direction == .forward) has_more else (params.cursor != null),
+                .has_previous_page = if (params.direction == .backward) has_more else (params.cursor != null),
                 .start_cursor = null,
                 .end_cursor = null,
             },
@@ -324,9 +336,14 @@ test "PaginationParams.parse - forward pagination" {
     try std.testing.expectEqual(@as(?Cursor, null), params.cursor);
 }
 
-test "PaginationParams.parse - max limit cap" {
-    const params = try PaginationParams.parse(5000, null, null, null, 100, 1000);
-    try std.testing.expectEqual(@as(usize, 1000), params.limit); // Capped at max
+test "PaginationParams.parse - explicit first exceeding max errors" {
+    const result = PaginationParams.parse(5000, null, null, null, 100, 1000);
+    try std.testing.expectError(error.LimitExceeded, result);
+}
+
+test "PaginationParams.parse - explicit first at max passes" {
+    const params = try PaginationParams.parse(1000, null, null, null, 100, 1000);
+    try std.testing.expectEqual(@as(usize, 1000), params.limit);
 }
 
 test "PaginationParams.parse - invalid args" {

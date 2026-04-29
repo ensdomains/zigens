@@ -12,7 +12,25 @@ const pagination = common.pagination;
 const builders = @import("../builders/builders.zig");
 const loaders = common.loaders;
 const namehash = common.namehash_fn;
+const Hash = common.Hash;
 const NestedContext = builders.NestedContext;
+
+/// Resolve a domain id (either a name like "alice.eth" or a 32-byte namehash hex like
+/// "0x...64 hex chars") to a namehash. Mirrors the schema doc on `domain(id:)` which
+/// promises both forms work.
+fn resolveDomainId(allocator: std.mem.Allocator, id: []const u8) !Hash {
+    if (id.len == 66 and std.mem.startsWith(u8, id, "0x")) {
+        var all_hex = true;
+        for (id[2..]) |c| {
+            if (!std.ascii.isHex(c)) {
+                all_hex = false;
+                break;
+            }
+        }
+        if (all_hex) return Hash.fromHex(id);
+    }
+    return namehash(allocator, id);
+}
 
 fn mapDomainOrderBy(order_by: ?[]const u8) db.NameSortField {
     const field_name = order_by orelse return .created_at;
@@ -27,7 +45,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
     const allocator = ctx.allocator;
 
-    const page = common.parsePagination(field, 100);
+    const page = try common.parsePagination(field, 100);
     const first = page.first;
     const skip = page.skip;
 
@@ -58,9 +76,8 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
                 defer addresses.deinit(allocator);
                 for (a.value.list) |item| {
                     if (item == .string) {
-                        if (Address.fromHex(item.string)) |addr| {
-                            try addresses.append(allocator, addr);
-                        } else |_| {}
+                        const addr = Address.fromHex(item.string) catch return error.InvalidAddress;
+                        try addresses.append(allocator, addr);
                     }
                 }
                 filter_owner_in = try addresses.toOwnedSlice(allocator);
@@ -72,9 +89,9 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
                 common.matchStringArg(a, "name_contains_nocase", &filter_name_contains_nocase) or
                 common.matchStringArg(a, "name_starts_with", &filter_name_starts_with) or
                 common.matchStringArg(a, "name_ends_with", &filter_name_ends_with) or
-                common.matchAddressArg(a, "owner", &filter_owner) or
-                common.matchAddressArg(a, "resolvedAddress", &filter_resolved_address) or
-                common.matchAddressArg(a, "resolver", &filter_resolver) or
+                (try common.matchAddressArg(a, "owner", &filter_owner)) or
+                (try common.matchAddressArg(a, "resolvedAddress", &filter_resolved_address)) or
+                (try common.matchAddressArg(a, "resolver", &filter_resolver)) or
                 common.matchBoolArg(a, "hasSubdomains", &filter_has_subdomains) or
                 common.matchIntArg(a, "subdomainCount_gt", &filter_subdomain_count_gt) or
                 common.matchIntArg(a, "subdomainCount_lt", &filter_subdomain_count_lt) or
@@ -249,9 +266,8 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
                 defer addresses.deinit(allocator);
                 for (a.value.list) |item| {
                     if (item == .string) {
-                        if (Address.fromHex(item.string)) |addr| {
-                            try addresses.append(allocator, addr);
-                        } else |_| {}
+                        const addr = Address.fromHex(item.string) catch return error.InvalidAddress;
+                        try addresses.append(allocator, addr);
                     }
                 }
                 filter_owner_in = try addresses.toOwnedSlice(allocator);
@@ -263,9 +279,9 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
                 common.matchStringArg(a, "name_contains_nocase", &filter_name_contains_nocase) or
                 common.matchStringArg(a, "name_starts_with", &filter_name_starts_with) or
                 common.matchStringArg(a, "name_ends_with", &filter_name_ends_with) or
-                common.matchAddressArg(a, "owner", &filter_owner) or
-                common.matchAddressArg(a, "resolvedAddress", &filter_resolved_address) or
-                common.matchAddressArg(a, "resolver", &filter_resolver) or
+                (try common.matchAddressArg(a, "owner", &filter_owner)) or
+                (try common.matchAddressArg(a, "resolvedAddress", &filter_resolved_address)) or
+                (try common.matchAddressArg(a, "resolver", &filter_resolver)) or
                 common.matchBoolArg(a, "hasSubdomains", &filter_has_subdomains) or
                 common.matchIntArg(a, "subdomainCount_gt", &filter_subdomain_count_gt) or
                 common.matchIntArg(a, "subdomainCount_lt", &filter_subdomain_count_lt) or
@@ -358,14 +374,16 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
     // to and including it. This uses countRowsBeforeNamehash which does a (sort_field, namehash)
     // stable comparison to get the count of rows that sort BEFORE the cursor row, then +1 to
     // skip the cursor row itself.
+    //
+    // The same filters must be passed in — otherwise the offset is taken over the unfiltered
+    // superset and pagination skips too many rows (e.g. with isMigrated:true ~343 rows would
+    // be lost across pages because non-migrated rows still counted toward the offset).
     var skip: u32 = 0;
     if (params.cursor) |c| {
-        const cursor_namehash = pagination.CursorCodec.decodeString(allocator, c) catch null;
-        if (cursor_namehash) |nh| {
-            defer allocator.free(nh);
-            const rows_before = database.countRowsBeforeNamehash(nh, sort_field, order_dir) catch 0;
-            skip = rows_before +| 1; // +1 to skip past the cursor row itself
-        }
+        const cursor_namehash = try pagination.CursorCodec.decodeString(allocator, c);
+        defer allocator.free(cursor_namehash);
+        const rows_before = database.countRowsBeforeNamehash(cursor_namehash, sort_field, order_dir, name_filters) catch 0;
+        skip = rows_before +| 1; // +1 to skip past the cursor row itself
     }
 
     const names = if (has_filters)
@@ -518,8 +536,8 @@ pub fn resolveDomain(ctx: parser.ExecutionContext, field: *const parser.Field) !
         return parser.FieldResult{ .json = null_json };
     };
 
-    // Get name from database
-    const nh = try namehash(allocator, id);
+    // Get name from database — id may be either a name or a namehash hex string
+    const nh = try resolveDomainId(allocator, id);
     const name_opt = try database.getNameByNamehash(nh);
     if (name_opt == null) {
         const null_json = try allocator.dupe(u8, "null");

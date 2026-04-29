@@ -137,6 +137,18 @@ pub const GraphQLHandler = struct {
                 return try self.buildErrorResponseWithCode("Must provide operation name when query contains multiple operations", ErrorCode.VALIDATION_ERROR);
             } else if (err == error.InvalidContractAddress) {
                 return try self.buildErrorResponseWithCode("Invalid contractAddress: must be a valid Ethereum address (40 hex characters with 0x prefix)", ErrorCode.INVALID_ARGUMENT);
+            } else if (err == error.InvalidAddress) {
+                return try self.buildErrorResponseWithCode("Invalid address: must be 40 hex characters with 0x prefix", ErrorCode.INVALID_ARGUMENT);
+            } else if (err == error.InvalidNamehash) {
+                return try self.buildErrorResponseWithCode("Invalid namehash: must be 64 hex characters with 0x prefix", ErrorCode.INVALID_ARGUMENT);
+            } else if (err == error.NegativeLimit) {
+                return try self.buildErrorResponseWithCode("Pagination 'first'/'last' must be non-negative", ErrorCode.INVALID_ARGUMENT);
+            } else if (err == error.LimitExceeded) {
+                return try self.buildErrorResponseWithCode("Pagination 'first'/'last' exceeds the maximum allowed value", ErrorCode.INVALID_ARGUMENT);
+            } else if (err == error.InvalidCursor) {
+                return try self.buildErrorResponseWithCode("Invalid cursor: malformed or unparseable", ErrorCode.INVALID_ARGUMENT);
+            } else if (err == error.InvalidProtocol) {
+                return try self.buildErrorResponseWithCode("Invalid protocol: must be 'v1' or 'v2'", ErrorCode.INVALID_ARGUMENT);
             }
             return try self.buildErrorResponseWithCode("Query execution failed", ErrorCode.EXECUTION_ERROR);
         };
