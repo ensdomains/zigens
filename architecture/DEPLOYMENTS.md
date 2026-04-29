@@ -2,81 +2,69 @@ v1
 ┌────┬───────────────────────────────┬────────────────────────────────────────────┐
 │    │ name                          │ address                                    │
 ├────┼───────────────────────────────┼────────────────────────────────────────────┤
-│  0 │ ArbitrumReverseResolver       │ 0x18b9b7158c16194b6d4c4fde85de92b035a3ce77 │
-│  1 │ BaseRegistrarImplementation   │ 0xb16870800de7444f6b2ebd885465412a5e581614 │
-│  2 │ BaseReverseResolver           │ 0xf849bc9d818ac09a629ae981b03bcbcdca750e8f │
-│  3 │ BatchGatewayProvider          │ 0x245131a02e341965f5db5a1b34cecbff4bd18741 │
-│  4 │ DNSRegistrar                  │ 0xafb9671d00b5152ebd219100f3801d3de1b4d288 │
-│  5 │ DNSSECImpl                    │ 0x36f5a471cfa76b421fe9784778fd8cf35014eb11 │
-│  6 │ DefaultReverseRegistrar       │ 0xf7fca8d7b8b802d07a1011b69a5e39395197b730 │
-│  7 │ DefaultReverseResolver        │ 0xa238d3aca667210d272391a119125d38816af4b1 │
-│  8 │ DummyOracle                   │ 0xf8ce69ede3fcecff1800ffc6cd3d8cb0f988bce2 │
-│  9 │ ENSRegistry                   │ 0x17795c119b8155ab9d3357c77747ba509695d7cb │
-│ 10 │ ETHRegistrarController        │ 0x99e517db3db5ec5424367b8b50cd11ddcb0008f1 │
-│ 11 │ ExponentialPremiumPriceOracle │ 0x5507034404dabb1c393f10739ea9daaeef8e3ca6 │
-│ 12 │ ExtendedDNSResolver           │ 0xf313e9b9d28b81123791c9828ada55e7bd8db7e9 │
-│ 13 │ L2ReverseRegistrar            │ 0xf9b79ab5f6539846ad639eef6b60e145bf6e5cbe │
-│ 14 │ LegacyENSRegistry             │ 0x4355f1c6b5b59818dc56e336d1584df35d47ad86 │
-│ 15 │ LegacyETHRegistrarController  │ 0x25da9aa54dae4afa6534ba829c6288039d4f5ebb │
-│ 16 │ LegacyPublicResolver          │ 0x9c97031854a11e41289a33e2fa5749c468c08820 │
-│ 17 │ LineaReverseResolver          │ 0xc8e393f59be1ec4d44ea9190e6831d3c4a94dfa7 │
-│ 18 │ MigrationHelper               │ 0xe9633aedce1f88a2a1668849a468f0ce36af52b0 │
-│ 19 │ NameWrapper                   │ 0xca7e6d0ddc5f373197bbe6fc2f09c2314399f028 │
-│ 20 │ OffchainDNSResolver           │ 0x92c009a9e688e1a029d5dd8f2c92797f83089c42 │
-│ 21 │ OptimismReverseResolver       │ 0x05e889ba6c7a2399ea9ce4e9666f1e863b0f1728 │
-│ 22 │ OwnedResolver                 │ 0xb934fa8abfb962e4f76cdbc08e431407cca54abc │
-│ 23 │ P256SHA256Algorithm           │ 0x5b257dc086e967f0442cce42fd6a936b82b96baf │
-│ 24 │ PublicResolver                │ 0x0e14ee0592da66bb4c8a8090066bc8a5af15f3e6 │
-│ 25 │ RSASHA1Algorithm              │ 0x165743abe17911e9af0a8b93c92d1e99f80b21d1 │
-│ 26 │ RSASHA256Algorithm            │ 0x0e340a968c117cfd5d378d257e55ff3185db5b09 │
-│ 27 │ ReverseRegistrar              │ 0xf79f9970030fe60bd89d21591c7f2d80d7d21242 │
-│ 28 │ Root                          │ 0xaa1b138fe54609fcb2e176bd9bd4af162ece4b2f │
-│ 29 │ SHA1Digest                    │ 0xb6e57719b60459dd8fc8f3a60138d68744a6b49a │
-│ 30 │ SHA256Digest                  │ 0x6bf9035769c027efcc5504110a2487a80f4466a6 │
-│ 31 │ ScrollReverseResolver         │ 0xd854f312888d0a5d64b646932a2ed8e8bad8de87 │
-│ 32 │ SimplePublicSuffixList        │ 0x8d45a2135d60da40ef0536b0a4775738fec1e522 │
-│ 33 │ StaticBulkRenewal             │ 0xf4404c962f7b859f6df712bff1f2e11745a238f0 │
-│ 34 │ StaticMetadataService         │ 0xe46f8dc75162e3704cfcf31a918cb195e86513a9 │
-│ 35 │ UniversalResolver             │ 0x198827b2316e020c48b500fc3cebdbcaf58787ce │
-│ 36 │ WrappedETHRegistrarController │ 0x253553366Da8546fC250F225fe3d25d0C782303b │
+│  0 │ ArbitrumReverseResolver       │ 0x926f94D2aDC77C86Cb0050892097D49AADd02e8B │
+│  1 │ BaseRegistrarImplementation   │ 0x57f1887a8bf19b14fc0df6fd9b2acc9af147ea85 │
+│  2 │ BaseReverseResolver           │ 0xaF3b3f636bE80b6709F5Bd3A374d6ac0D0a7c7aA │
+│  3 │ BatchGatewayProvider          │ 0xE4e7245716d12D0F6AeA01DFe0E635C43D7D083c │
+│  4 │ DefaultReverseRegistrar       │ 0x4F382928805ba0e23B30cFB75fC9E848e82DFD47 │
+│  5 │ DefaultReverseResolver        │ 0x9DC60e7BD81cCc96774C55214fF389D42Ae5E9Ac │
+│  6 │ DNSRegistrar                  │ 0x5a07C75Ae469Bf3ee2657B588e8E6ABAC6741b4f │
+│  7 │ DNSSECImpl                    │ 0xe62E4b6cE018Ad6e916fcC24545e20a33b9d8653 │
+│  8 │ DummyAlgorithm                │ 0x2c21146873b5bce5b9a8a441124e01981d95a831 │
+│  9 │ DummyDigest                   │ 0x6BB46Ad53880e666C10441a5df81FdAf178E3014 │
+│ 10 │ DummyOracle                   │ 0x10E7e7D64d7dA687f7DcF8443Df58A0415329b15 │
+│ 11 │ ENSRegistry                   │ 0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e │
+│ 12 │ ETHRegistrarController        │ 0xfb3cE5D01e0f33f41DbB39035dB9745962F1f968 │
+│ 13 │ ExponentialPremiumPriceOracle │ 0x6810dbce73c67506f785a225f818b30d8f209aab │
+│ 14 │ ExtendedDNSResolver           │ 0xebD6b1881639E560BDB37f235DC34C88B9a16b6A │
+│ 15 │ LegacyENSRegistry             │ 0x94f523b8261B815b87EFfCf4d18E6aBeF18d6e4b │
+│ 16 │ LegacyETHRegistrarController  │ 0x7e02892cfc2Bfd53a75275451d73cF620e793fc0 │
+│ 17 │ LegacyPublicResolver          │ 0x0CeEC524b2807841739D3B5E161F5bf1430FFA48 │
+│ 18 │ LineaReverseResolver          │ 0x083dA1Dbc0F379ccda6AC81A934207c3D8a8a205 │
+│ 19 │ MigrationHelper               │ 0x6EAE7487659cCb3892248149a934f32dfB259485 │
+│ 20 │ NameWrapper                   │ 0x0635513f179D50A207757E05759CbD106d7dFcE8 │
+│ 21 │ OffchainDNSResolver           │ 0x179be112b24ad4cfc392ef8924dfa08c20ad8583 │
+│ 22 │ OptimismReverseResolver       │ 0xc9Ae189772BD48e01410AB3Be933637ee9D3AA5f │
+│ 23 │ OwnedResolver                 │ 0x15222A1C2Bf3A4c24eAd1634B8Ee399fd95c3aaf │
+│ 24 │ P256SHA256Algorithm           │ 0x034262be25dc0e304e04e111f2a6bf1dbf1e260f │
+│ 25 │ PublicResolver                │ 0xE99638b40E4Fff0129D56f03b55b6bbC4BBE49b5 │
+│ 26 │ ReverseRegistrar              │ 0xA0a1AbcDAe1a2a4A2EF8e9113Ff0e02DD81DC0C6 │
+│ 27 │ Root                          │ 0xDaaF96c344f63131acadD0Ea35170E7892d3dfBA │
+│ 28 │ RSASHA1Algorithm              │ 0x81d71df6921f04bbf5347eae737223073ba57646 │
+│ 29 │ RSASHA256Algorithm            │ 0xa1fdd748479064bc4386ff8af7ea14da8760172b │
+│ 30 │ ScrollReverseResolver         │ 0x9Fa59673e43F15bDB8722Fdaf5C2107574B99062 │
+│ 31 │ SHA1Digest                    │ 0x0e3656B31D7b1DD662cCf73C0547A73e5dD79B71 │
+│ 32 │ SHA256Digest                  │ 0x975E539780920aE80314B64A9aDf9996cbc71bA4 │
+│ 33 │ SimplePublicSuffixList        │ 0x378079741D25489F7c131968b3CEaf93614F02a7 │
+│ 34 │ StaticBulkRenewal             │ 0x6394b694a8C0DC716e447802E568F0Fb2c4E0965 │
+│ 35 │ StaticMetadataService         │ 0xb69D3FCB08042e50b6414a8AaE74c5227c318784 │
+│ 36 │ TestUnwrap                    │ 0xB17105547ED99c1509E34dBDcDb847e17118A070 │
+│ 37 │ TLDPublicSuffixList           │ 0x670CA7456Be604B5d5361a20B784Aecd23ac514b │
+│ 38 │ UniversalResolver             │ 0x3c85752a5d47DD09D677C645Ff2A938B38fbFEbA │
 └────┴───────────────────────────────┴────────────────────────────────────────────┘
-l1
+v2
 ┌────┬──────────────────────────────────┬────────────────────────────────────────────┐
 │    │ name                             │ address                                    │
 ├────┼──────────────────────────────────┼────────────────────────────────────────────┤
-│  0 │ DNSAliasResolver                 │ 0xa6d96e19888010417a5e50b0ad90b4ae62d88a4f │
-│  1 │ DNSSECGatewayProvider            │ 0xc2a8f4d7eb02f56e51112b928e6861c25c7d4d7d │
-│  2 │ DNSTLDResolver                   │ 0x4fb9fd77bfdd0a0e1b5f2a6d2337b52cb2de4f64 │
-│  3 │ DNSTXTResolver                   │ 0xed39c8345bbb1093cff5166a8b996f53246b7ba5 │
-│  4 │ DedicatedResolverImpl            │ 0x41c087ef4f96c71594a0c081537e2b714f040bda │
-│  5 │ ETHRegistry                      │ 0x37afa22dbdafa3e26541e1036b99c58a6be04f5e │
-│  6 │ ETHReverseRegistrar              │ 0xcbac6ee19b750c07e8454c031948c7a71a7ef88c │
-│  7 │ ETHReverseResolver               │ 0x01a552795cdb65c5f5f0392a9d1b7f419ac9acd8 │
-│  8 │ ETHSelfResolver                  │ 0x3d9f7234924D7ECF6cC5FA4a6D3b488C42696b71 │
-│  9 │ ETHTLDResolver                   │ 0xc689a240123da1be3c9b1069c963626a29709f65 │
-│ 10 │ L1BridgeController               │ 0x496a017dd794c8394b4877156c2ab6fb0936dfe4 │
-│ 11 │ MockL1Bridge                     │ 0x31cb430c2515b4d36804459ec4675f508aea83a6 │
-│ 12 │ RegistryDatastore                │ 0x2770e294aae7d0659b1d03113440aee47ef1e8f0 │
-│ 13 │ ReverseRegistry                  │ 0x05b51fc7b0feed9a45d5bba86dd86e4320a8ab78 │
-│ 14 │ RootRegistry                     │ 0x401c2a8c06c847e9378a857524237d2f63bab05e │
-│ 15 │ SimpleRegistryMetadata           │ 0x570c356a7e413ae5efa65014f41efb83b3c6040e │
-│ 16 │ UniversalResolverV2              │ 0x4d2afc61b84e3475ec19ad9392ee09e9a7b01226 │
-│ 17 │ UpgradableUniversalResolverProxy │ 0x4d2979044e9bca08a590829e0913583ceeaf68b2 │
-│ 18 │ VerifiableFactory                │ 0x0837b3dce0aa75b801f19c707d75a61ac994b7f7 │
+│  0 │ BatchRegistrar                   │ 0xa498a50aada7790f5d3efd594365e797c947eece │
+│  1 │ ENSV1Resolver                    │ 0x19c7daeb1828942debf60fb78ff70292300e7800 │
+│  2 │ ENSV2Resolver                    │ 0xcc8eff4ad952de82990264d5adb32fc9399ecb64 │
+│  3 │ ETHRegistrar                     │ 0x29e8a042ea34b7ee720c12b52720027b5e9049c6 │
+│  4 │ ETHRegistry                      │ 0x28356dacb84ee3ebdb007d1f5920b24c87e90d40 │
+│  5 │ HCAFactory                       │ 0x3ab718580b476d64fdd3ce6a9ab63491b15767d9 │
+│  6 │ LockedMigrationController        │ 0x806c44f027a6f6ee75ade3f6dbf1c6db496ffc67 │
+│  7 │ ManagedUniversalResolverProxy    │ 0x541660b410b477e78e95c5d92a7f350cf86db61b │
+│  8 │ MockDAI                          │ 0xa1ad79c31e9e8c4d2d0b73aaf0435a7a8a706170 │
+│  9 │ MockUSDC                         │ 0xc39c1eec68a9e3c08c4f6cbebbb0fbf7aa4be06b │
+│ 10 │ RootRegistry                     │ 0x45e6d4230064f9dd806330da9d92639f8665d9bf │
+│ 11 │ SimpleRegistryMetadata           │ 0x3b42d507e1b13ee164cab0fba4ea66f8a1b653f1 │
+│ 12 │ StandardRentPriceOracle          │ 0x8d10896a894b0b60c2f9533d57758b0da1abaab7 │
+│ 13 │ UniversalResolverV2              │ 0xf73ce79773306050b537946abb57c7cb995f58ab │
+│ 14 │ UnlockedMigrationController      │ 0xf9108e0797406c45ca43f103b176cbd902a12fba │
+│ 15 │ UpgradableUniversalResolverProxy │ 0xd307d60cfee6f2f74b6daafebf878437e353c1f6 │
+│ 16 │ VerifiableFactory                │ 0x04fd5ee60b015b6efd21a54d1e662d68868683c5 │
+│ 17 │ WrapperRegistryImpl              │ 0x58a2755c4d6afdf9a8717008a05f687c3a8cb494 │
 └────┴──────────────────────────────────┴────────────────────────────────────────────┘
-l2
-┌────┬─────────────────────────┬────────────────────────────────────────────┐
-│    │ name                    │ address                                    │
-├────┼─────────────────────────┼────────────────────────────────────────────┤
-│  0 │ DedicatedResolverImpl   │ 0x47c4055131c6fbeedb1357b6f4c7bf415d6c4b71 │
-│  1 │ ETHRegistrar            │ 0x774faadcd7e8c4b7441aa2927f10845fea083ea1 │
-│  2 │ ETHRegistry             │ 0x5fb63bbd34de21688c8aa8131be1c3b4a477109c │
-│  3 │ L2BridgeController      │ 0xb06d1a0432adb68816854c90a9d2f55bdf753b9c │
-│  4 │ MockDAI                 │ 0x6630589c2e6364a96bb7acf0d9d64ac9c1dd3528 │
-│  5 │ MockL2Bridge            │ 0x4912c2b3ee4b13390a66b688576add5d055fb83d │
-│  6 │ MockUSDC                │ 0x9028ab8e872af36c30c959a105cb86d1038412ae │
-│  7 │ RegistryDatastore       │ 0xed7c8d71a3c6e17a62393436456e65e77195d76e │
-│  8 │ SimpleRegistryMetadata  │ 0xdc11f7d1231ae44f5bf154b4612ff049f735beb0 │
-│  9 │ StandardRentPriceOracle │ 0xa93a3cd0d7075b2df67f5658a430db31ad918f8f │
-│ 10 │ VerifiableFactory       │ 0x3dc74e5cc345f1e4bf5e7e1c66ce6456659560d4 │
-└────┴─────────────────────────┴────────────────────────────────────────────┘
+
+RPC: Sepolia fork on Tenderly
+https://virtual.sepolia.us-east.rpc.tenderly.co/881ddb0f-475d-45ac-b93d-e1aca2841811
