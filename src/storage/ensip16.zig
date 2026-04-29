@@ -17,12 +17,12 @@ inline fn SQLITE_TRANSIENT() c.sqlite3_destructor_type {
 // ============================================================================
 
 /// Upsert resolver metadata (GraphQL endpoint for offchain data)
-pub fn upsertResolverMetadata(db: *Database, chain: models.Chain, resolver: Address, graphql_url: []const u8, block_number: u64, tx_hash: Hash) !void {
+pub fn upsertResolverMetadata(db: *Database, protocol: models.Protocol, resolver: Address, graphql_url: []const u8, block_number: u64, tx_hash: Hash) !void {
     const sql =
         \\INSERT INTO resolver_metadata
-        \\(chain, resolver, graphql_url, block_number, transaction_hash, timestamp)
+        \\(protocol, resolver, graphql_url, block_number, transaction_hash, timestamp)
         \\VALUES (?, ?, ?, ?, ?, ?)
-        \\ON CONFLICT(chain, resolver) DO UPDATE SET
+        \\ON CONFLICT(protocol, resolver) DO UPDATE SET
         \\  graphql_url = excluded.graphql_url,
         \\  block_number = excluded.block_number,
         \\  transaction_hash = excluded.transaction_hash,
@@ -40,7 +40,7 @@ pub fn upsertResolverMetadata(db: *Database, chain: models.Chain, resolver: Addr
     }
     defer _ = c.sqlite3_finalize(stmt);
 
-    const chain_str = chain.toString();
+    const protocol_str = protocol.toString();
     const resolver_hex = try resolver.toHex(db.allocator);
     defer db.allocator.free(resolver_hex);
     const tx_hash_hex = try tx_hash.toHex(db.allocator);
@@ -48,7 +48,7 @@ pub fn upsertResolverMetadata(db: *Database, chain: models.Chain, resolver: Addr
 
     const now = @as(i64, @intCast(std.time.timestamp()));
 
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
+    _ = c.sqlite3_bind_text(stmt, 1, protocol_str.ptr, @intCast(protocol_str.len), SQLITE_TRANSIENT());
     _ = c.sqlite3_bind_text(stmt, 2, resolver_hex.ptr, @intCast(resolver_hex.len), SQLITE_TRANSIENT());
     _ = c.sqlite3_bind_text(stmt, 3, graphql_url.ptr, @intCast(graphql_url.len), SQLITE_TRANSIENT());
     _ = c.sqlite3_bind_int64(stmt, 4, @intCast(block_number));
@@ -62,11 +62,11 @@ pub fn upsertResolverMetadata(db: *Database, chain: models.Chain, resolver: Addr
 }
 
 /// Get resolver metadata for a specific resolver
-pub fn getResolverMetadata(db: *Database, chain: models.Chain, resolver: Address) !?models.ResolverMetadata {
+pub fn getResolverMetadata(db: *Database, protocol: models.Protocol, resolver: Address) !?models.ResolverMetadata {
     const sql =
-        \\SELECT id, chain, resolver, graphql_url, block_number, transaction_hash, timestamp
+        \\SELECT id, protocol, resolver, graphql_url, block_number, transaction_hash, timestamp
         \\FROM resolver_metadata
-        \\WHERE chain = ? AND resolver = ?
+        \\WHERE protocol = ? AND resolver = ?
     ;
 
     const sql_z = try db.allocator.dupeZ(u8, sql);
@@ -80,22 +80,22 @@ pub fn getResolverMetadata(db: *Database, chain: models.Chain, resolver: Address
     }
     defer _ = c.sqlite3_finalize(stmt);
 
-    const chain_str = chain.toString();
+    const protocol_str = protocol.toString();
     const resolver_hex = try resolver.toHex(db.allocator);
     defer db.allocator.free(resolver_hex);
 
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
+    _ = c.sqlite3_bind_text(stmt, 1, protocol_str.ptr, @intCast(protocol_str.len), SQLITE_TRANSIENT());
     _ = c.sqlite3_bind_text(stmt, 2, resolver_hex.ptr, @intCast(resolver_hex.len), SQLITE_TRANSIENT());
 
     if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const chain_col = std.mem.span(c.sqlite3_column_text(stmt, 1));
+        const protocol_col = std.mem.span(c.sqlite3_column_text(stmt, 1));
         const resolver_col = std.mem.span(c.sqlite3_column_text(stmt, 2));
         const graphql_url_col = std.mem.span(c.sqlite3_column_text(stmt, 3));
         const tx_hash_col = std.mem.span(c.sqlite3_column_text(stmt, 5));
 
         return models.ResolverMetadata{
             .id = @intCast(c.sqlite3_column_int64(stmt, 0)),
-            .chain = try models.Chain.fromString(chain_col),
+            .protocol = try models.Protocol.fromString(protocol_col),
             .resolver = try Address.fromHex(resolver_col),
             .graphql_url = try db.allocator.dupe(u8, graphql_url_col),
             .block_number = @intCast(c.sqlite3_column_int64(stmt, 4)),
@@ -108,11 +108,11 @@ pub fn getResolverMetadata(db: *Database, chain: models.Chain, resolver: Address
 }
 
 /// Get all resolvers with offchain metadata
-pub fn getAllResolverMetadata(db: *Database, chain: models.Chain) ![]models.ResolverMetadata {
+pub fn getAllResolverMetadata(db: *Database, protocol: models.Protocol) ![]models.ResolverMetadata {
     const sql =
-        \\SELECT id, chain, resolver, graphql_url, block_number, transaction_hash, timestamp
+        \\SELECT id, protocol, resolver, graphql_url, block_number, transaction_hash, timestamp
         \\FROM resolver_metadata
-        \\WHERE chain = ?
+        \\WHERE protocol = ?
         \\ORDER BY timestamp DESC
     ;
 
@@ -127,8 +127,8 @@ pub fn getAllResolverMetadata(db: *Database, chain: models.Chain) ![]models.Reso
     }
     defer _ = c.sqlite3_finalize(stmt);
 
-    const chain_str = chain.toString();
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
+    const protocol_str = protocol.toString();
+    _ = c.sqlite3_bind_text(stmt, 1, protocol_str.ptr, @intCast(protocol_str.len), SQLITE_TRANSIENT());
 
     var result: std.ArrayList(models.ResolverMetadata) = .{};
     errdefer {
@@ -139,14 +139,14 @@ pub fn getAllResolverMetadata(db: *Database, chain: models.Chain) ![]models.Reso
     }
 
     while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const chain_col = std.mem.span(c.sqlite3_column_text(stmt, 1));
+        const protocol_col = std.mem.span(c.sqlite3_column_text(stmt, 1));
         const resolver_col = std.mem.span(c.sqlite3_column_text(stmt, 2));
         const graphql_url_col = std.mem.span(c.sqlite3_column_text(stmt, 3));
         const tx_hash_col = std.mem.span(c.sqlite3_column_text(stmt, 5));
 
         const metadata = models.ResolverMetadata{
             .id = @intCast(c.sqlite3_column_int64(stmt, 0)),
-            .chain = try models.Chain.fromString(chain_col),
+            .protocol = try models.Protocol.fromString(protocol_col),
             .resolver = try Address.fromHex(resolver_col),
             .graphql_url = try db.allocator.dupe(u8, graphql_url_col),
             .block_number = @intCast(c.sqlite3_column_int64(stmt, 4)),
@@ -165,12 +165,12 @@ pub fn getAllResolverMetadata(db: *Database, chain: models.Chain) ![]models.Reso
 // ============================================================================
 
 /// Insert or update resolver approval/delegation
-pub fn upsertResolverApproval(db: *Database, chain: models.Chain, resolver: Address, namehash: Hash, context: ?[]const u8, delegate: Address, approved: bool, block_number: u64, tx_hash: Hash, log_index: u32) !void {
+pub fn upsertResolverApproval(db: *Database, protocol: models.Protocol, resolver: Address, namehash: Hash, context: ?[]const u8, delegate: Address, approved: bool, block_number: u64, tx_hash: Hash, log_index: u32) !void {
     const sql =
         \\INSERT INTO resolver_approvals
-        \\(chain, resolver, namehash, context, delegate, approved, block_number, transaction_hash, log_index, timestamp)
+        \\(protocol, resolver, namehash, context, delegate, approved, block_number, transaction_hash, log_index, timestamp)
         \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        \\ON CONFLICT(chain, resolver, namehash, context, delegate) DO UPDATE SET
+        \\ON CONFLICT(protocol, resolver, namehash, context, delegate) DO UPDATE SET
         \\  approved = excluded.approved,
         \\  block_number = excluded.block_number,
         \\  transaction_hash = excluded.transaction_hash,
@@ -189,7 +189,7 @@ pub fn upsertResolverApproval(db: *Database, chain: models.Chain, resolver: Addr
     }
     defer _ = c.sqlite3_finalize(stmt);
 
-    const chain_str = chain.toString();
+    const protocol_str = protocol.toString();
     const resolver_hex = try resolver.toHex(db.allocator);
     defer db.allocator.free(resolver_hex);
     const namehash_hex = try namehash.toHex(db.allocator);
@@ -201,7 +201,7 @@ pub fn upsertResolverApproval(db: *Database, chain: models.Chain, resolver: Addr
 
     const now = @as(i64, @intCast(std.time.timestamp()));
 
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
+    _ = c.sqlite3_bind_text(stmt, 1, protocol_str.ptr, @intCast(protocol_str.len), SQLITE_TRANSIENT());
     _ = c.sqlite3_bind_text(stmt, 2, resolver_hex.ptr, @intCast(resolver_hex.len), SQLITE_TRANSIENT());
     _ = c.sqlite3_bind_text(stmt, 3, namehash_hex.ptr, @intCast(namehash_hex.len), SQLITE_TRANSIENT());
 
@@ -225,11 +225,11 @@ pub fn upsertResolverApproval(db: *Database, chain: models.Chain, resolver: Addr
 }
 
 /// Check if a delegate is approved for a name (with optional context)
-pub fn isApprovedFor(db: *Database, chain: models.Chain, resolver: Address, namehash: Hash, context: ?[]const u8, delegate: Address) !bool {
+pub fn isApprovedFor(db: *Database, protocol: models.Protocol, resolver: Address, namehash: Hash, context: ?[]const u8, delegate: Address) !bool {
     const sql =
         \\SELECT approved
         \\FROM resolver_approvals
-        \\WHERE chain = ? AND resolver = ? AND namehash = ? AND context IS ? AND delegate = ?
+        \\WHERE protocol = ? AND resolver = ? AND namehash = ? AND context IS ? AND delegate = ?
     ;
 
     const sql_z = try db.allocator.dupeZ(u8, sql);
@@ -243,7 +243,7 @@ pub fn isApprovedFor(db: *Database, chain: models.Chain, resolver: Address, name
     }
     defer _ = c.sqlite3_finalize(stmt);
 
-    const chain_str = chain.toString();
+    const protocol_str = protocol.toString();
     const resolver_hex = try resolver.toHex(db.allocator);
     defer db.allocator.free(resolver_hex);
     const namehash_hex = try namehash.toHex(db.allocator);
@@ -251,7 +251,7 @@ pub fn isApprovedFor(db: *Database, chain: models.Chain, resolver: Address, name
     const delegate_hex = try delegate.toHex(db.allocator);
     defer db.allocator.free(delegate_hex);
 
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
+    _ = c.sqlite3_bind_text(stmt, 1, protocol_str.ptr, @intCast(protocol_str.len), SQLITE_TRANSIENT());
     _ = c.sqlite3_bind_text(stmt, 2, resolver_hex.ptr, @intCast(resolver_hex.len), SQLITE_TRANSIENT());
     _ = c.sqlite3_bind_text(stmt, 3, namehash_hex.ptr, @intCast(namehash_hex.len), SQLITE_TRANSIENT());
 
@@ -271,11 +271,11 @@ pub fn isApprovedFor(db: *Database, chain: models.Chain, resolver: Address, name
 }
 
 /// Get all approvals for a specific name (with optional context filter)
-pub fn getApprovalsForName(db: *Database, chain: models.Chain, namehash: Hash, context: ?[]const u8) ![]models.ResolverApproval {
+pub fn getApprovalsForName(db: *Database, protocol: models.Protocol, namehash: Hash, context: ?[]const u8) ![]models.ResolverApproval {
     const sql =
-        \\SELECT id, chain, resolver, namehash, context, delegate, approved, block_number, transaction_hash, log_index, timestamp
+        \\SELECT id, protocol, resolver, namehash, context, delegate, approved, block_number, transaction_hash, log_index, timestamp
         \\FROM resolver_approvals
-        \\WHERE chain = ? AND namehash = ? AND (context IS ? OR ? IS NULL)
+        \\WHERE protocol = ? AND namehash = ? AND (context IS ? OR ? IS NULL)
         \\ORDER BY timestamp DESC
     ;
 
@@ -290,11 +290,11 @@ pub fn getApprovalsForName(db: *Database, chain: models.Chain, namehash: Hash, c
     }
     defer _ = c.sqlite3_finalize(stmt);
 
-    const chain_str = chain.toString();
+    const protocol_str = protocol.toString();
     const namehash_hex = try namehash.toHex(db.allocator);
     defer db.allocator.free(namehash_hex);
 
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
+    _ = c.sqlite3_bind_text(stmt, 1, protocol_str.ptr, @intCast(protocol_str.len), SQLITE_TRANSIENT());
     _ = c.sqlite3_bind_text(stmt, 2, namehash_hex.ptr, @intCast(namehash_hex.len), SQLITE_TRANSIENT());
 
     if (context) |ctx| {
@@ -314,7 +314,7 @@ pub fn getApprovalsForName(db: *Database, chain: models.Chain, namehash: Hash, c
     }
 
     while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const chain_col = std.mem.span(c.sqlite3_column_text(stmt, 1));
+        const protocol_col = std.mem.span(c.sqlite3_column_text(stmt, 1));
         const resolver_col = std.mem.span(c.sqlite3_column_text(stmt, 2));
         const namehash_col = std.mem.span(c.sqlite3_column_text(stmt, 3));
         const context_col_ptr = c.sqlite3_column_text(stmt, 4);
@@ -328,7 +328,7 @@ pub fn getApprovalsForName(db: *Database, chain: models.Chain, namehash: Hash, c
 
         const approval = models.ResolverApproval{
             .id = @intCast(c.sqlite3_column_int64(stmt, 0)),
-            .chain = try models.Chain.fromString(chain_col),
+            .protocol = try models.Protocol.fromString(protocol_col),
             .resolver = try Address.fromHex(resolver_col),
             .namehash = try Hash.fromHex(namehash_col),
             .context = context_val,
@@ -347,11 +347,11 @@ pub fn getApprovalsForName(db: *Database, chain: models.Chain, namehash: Hash, c
 }
 
 /// Get all approvals for a specific delegate
-pub fn getApprovalsForDelegate(db: *Database, chain: models.Chain, delegate: Address) ![]models.ResolverApproval {
+pub fn getApprovalsForDelegate(db: *Database, protocol: models.Protocol, delegate: Address) ![]models.ResolverApproval {
     const sql =
-        \\SELECT id, chain, resolver, namehash, context, delegate, approved, block_number, transaction_hash, log_index, timestamp
+        \\SELECT id, protocol, resolver, namehash, context, delegate, approved, block_number, transaction_hash, log_index, timestamp
         \\FROM resolver_approvals
-        \\WHERE chain = ? AND delegate = ? AND approved = 1
+        \\WHERE protocol = ? AND delegate = ? AND approved = 1
         \\ORDER BY timestamp DESC
     ;
 
@@ -366,11 +366,11 @@ pub fn getApprovalsForDelegate(db: *Database, chain: models.Chain, delegate: Add
     }
     defer _ = c.sqlite3_finalize(stmt);
 
-    const chain_str = chain.toString();
+    const protocol_str = protocol.toString();
     const delegate_hex = try delegate.toHex(db.allocator);
     defer db.allocator.free(delegate_hex);
 
-    _ = c.sqlite3_bind_text(stmt, 1, chain_str.ptr, @intCast(chain_str.len), SQLITE_TRANSIENT());
+    _ = c.sqlite3_bind_text(stmt, 1, protocol_str.ptr, @intCast(protocol_str.len), SQLITE_TRANSIENT());
     _ = c.sqlite3_bind_text(stmt, 2, delegate_hex.ptr, @intCast(delegate_hex.len), SQLITE_TRANSIENT());
 
     var result: std.ArrayList(models.ResolverApproval) = .{};
@@ -382,7 +382,7 @@ pub fn getApprovalsForDelegate(db: *Database, chain: models.Chain, delegate: Add
     }
 
     while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const chain_col = std.mem.span(c.sqlite3_column_text(stmt, 1));
+        const protocol_col = std.mem.span(c.sqlite3_column_text(stmt, 1));
         const resolver_col = std.mem.span(c.sqlite3_column_text(stmt, 2));
         const namehash_col = std.mem.span(c.sqlite3_column_text(stmt, 3));
         const context_col_ptr = c.sqlite3_column_text(stmt, 4);
@@ -396,7 +396,7 @@ pub fn getApprovalsForDelegate(db: *Database, chain: models.Chain, delegate: Add
 
         const approval = models.ResolverApproval{
             .id = @intCast(c.sqlite3_column_int64(stmt, 0)),
-            .chain = try models.Chain.fromString(chain_col),
+            .protocol = try models.Protocol.fromString(protocol_col),
             .resolver = try Address.fromHex(resolver_col),
             .namehash = try Hash.fromHex(namehash_col),
             .context = context_val,

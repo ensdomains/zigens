@@ -6,4 +6,4 @@
 -- This migration only applies to existing DBs (handled by migrate() in database.zig).
 -- The index is safe to re-create with IF NOT EXISTS.
 
-CREATE INDEX IF NOT EXISTS idx_eac_roles_contract ON eac_roles(chain, contract_address);
+CREATE INDEX IF NOT EXISTS idx_eac_roles_contract ON eac_roles(protocol, contract_address);

@@ -14,12 +14,15 @@ inline fn SQLITE_TRANSIENT() c.sqlite3_destructor_type {
 // WEBHOOK OPERATIONS (3 functions)
 // ============================================================================
 
-/// Insert a webhook
+/// Insert a webhook. The `webhook.secret` MUST be a non-empty hex-encoded HMAC key
+/// (callers should auto-generate via webhooks/manager.zig:generateWebhookSecret).
 pub fn insertWebhook(db: *Database, webhook: models.Webhook) !u64 {
+    if (webhook.secret.len == 0) return error.WebhookSecretRequired;
+
     const sql =
         \\INSERT INTO webhooks
-        \\(url, event_types, active, max_retries, created_at)
-        \\VALUES (?, ?, ?, ?, ?)
+        \\(url, secret, event_types, active, max_retries, created_at)
+        \\VALUES (?, ?, ?, ?, ?, ?)
     ;
 
     const sql_z = try db.allocator.dupeZ(u8, sql);
@@ -48,10 +51,11 @@ pub fn insertWebhook(db: *Database, webhook: models.Webhook) !u64 {
     const active: c_int = if (webhook.active) 1 else 0;
 
     _ = c.sqlite3_bind_text(stmt, 1, webhook.url.ptr, @intCast(webhook.url.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_text(stmt, 2, event_types_json.items.ptr, @intCast(event_types_json.items.len), SQLITE_TRANSIENT());
-    _ = c.sqlite3_bind_int(stmt, 3, active);
-    _ = c.sqlite3_bind_int(stmt, 4, @intCast(webhook.max_retries));
-    _ = c.sqlite3_bind_int64(stmt, 5, webhook.created_at);
+    _ = c.sqlite3_bind_text(stmt, 2, webhook.secret.ptr, @intCast(webhook.secret.len), SQLITE_TRANSIENT());
+    _ = c.sqlite3_bind_text(stmt, 3, event_types_json.items.ptr, @intCast(event_types_json.items.len), SQLITE_TRANSIENT());
+    _ = c.sqlite3_bind_int(stmt, 4, active);
+    _ = c.sqlite3_bind_int(stmt, 5, @intCast(webhook.max_retries));
+    _ = c.sqlite3_bind_int64(stmt, 6, webhook.created_at);
 
     if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
         std.log.err("Failed to insert webhook: {s}", .{c.sqlite3_errmsg(db.db)});
@@ -86,7 +90,7 @@ pub fn deleteWebhook(db: *Database, webhook_id: u64) !void {
 
 /// Get all webhooks
 pub fn getWebhooks(db: *Database) ![]models.Webhook {
-    const sql = "SELECT id, url, event_types, active, max_retries, created_at FROM webhooks";
+    const sql = "SELECT id, url, secret, event_types, active, max_retries, created_at FROM webhooks";
 
     const sql_z = try db.allocator.dupeZ(u8, sql);
     defer db.allocator.free(sql_z);
@@ -109,7 +113,8 @@ pub fn getWebhooks(db: *Database) ![]models.Webhook {
 
     while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
         const url_str = std.mem.span(c.sqlite3_column_text(stmt, 1));
-        const event_types_json = std.mem.span(c.sqlite3_column_text(stmt, 2));
+        const secret_str = std.mem.span(c.sqlite3_column_text(stmt, 2));
+        const event_types_json = std.mem.span(c.sqlite3_column_text(stmt, 3));
 
         // Parse event_types JSON array (simplified - just split by quotes)
         var event_types: std.ArrayList(models.EventType) = .{};
@@ -132,10 +137,11 @@ pub fn getWebhooks(db: *Database) ![]models.Webhook {
         const webhook = models.Webhook{
             .id = @intCast(c.sqlite3_column_int64(stmt, 0)),
             .url = try db.allocator.dupe(u8, url_str),
+            .secret = try db.allocator.dupe(u8, secret_str),
             .event_types = try event_types.toOwnedSlice(db.allocator),
-            .active = c.sqlite3_column_int(stmt, 3) != 0,
-            .max_retries = @intCast(c.sqlite3_column_int(stmt, 4)),
-            .created_at = c.sqlite3_column_int64(stmt, 5),
+            .active = c.sqlite3_column_int(stmt, 4) != 0,
+            .max_retries = @intCast(c.sqlite3_column_int(stmt, 5)),
+            .created_at = c.sqlite3_column_int64(stmt, 6),
         };
 
         try webhooks.append(db.allocator, webhook);
@@ -146,7 +152,7 @@ pub fn getWebhooks(db: *Database) ![]models.Webhook {
 
 /// Get a webhook by ID
 pub fn getWebhook(db: *Database, webhook_id: u64) !?models.Webhook {
-    const sql = "SELECT id, url, event_types, active, max_retries, created_at FROM webhooks WHERE id = ?";
+    const sql = "SELECT id, url, secret, event_types, active, max_retries, created_at FROM webhooks WHERE id = ?";
 
     const sql_z = try db.allocator.dupeZ(u8, sql);
     defer db.allocator.free(sql_z);
@@ -166,7 +172,8 @@ pub fn getWebhook(db: *Database, webhook_id: u64) !?models.Webhook {
     }
 
     const url_str = std.mem.span(c.sqlite3_column_text(stmt, 1));
-    const event_types_json = std.mem.span(c.sqlite3_column_text(stmt, 2));
+    const secret_str = std.mem.span(c.sqlite3_column_text(stmt, 2));
+    const event_types_json = std.mem.span(c.sqlite3_column_text(stmt, 3));
 
     // Parse event_types JSON array
     var event_types: std.ArrayList(models.EventType) = .{};
@@ -188,10 +195,11 @@ pub fn getWebhook(db: *Database, webhook_id: u64) !?models.Webhook {
     return models.Webhook{
         .id = @intCast(c.sqlite3_column_int64(stmt, 0)),
         .url = try db.allocator.dupe(u8, url_str),
+        .secret = try db.allocator.dupe(u8, secret_str),
         .event_types = try event_types.toOwnedSlice(db.allocator),
-        .active = c.sqlite3_column_int(stmt, 3) != 0,
-        .max_retries = @intCast(c.sqlite3_column_int(stmt, 4)),
-        .created_at = c.sqlite3_column_int64(stmt, 5),
+        .active = c.sqlite3_column_int(stmt, 4) != 0,
+        .max_retries = @intCast(c.sqlite3_column_int(stmt, 5)),
+        .created_at = c.sqlite3_column_int64(stmt, 6),
     };
 }
 
@@ -205,6 +213,7 @@ pub fn updateWebhook(db: *Database, webhook_id: u64, url: ?[]const u8, event_typ
             old_url = try db.allocator.dupe(u8, wh.url);
             // Free the webhook struct but keep old_url
             db.allocator.free(wh.url);
+            db.allocator.free(wh.secret);
             db.allocator.free(wh.event_types);
         }
     }

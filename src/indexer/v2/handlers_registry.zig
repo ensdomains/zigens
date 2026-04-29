@@ -11,7 +11,7 @@ const Indexer = @import("../indexer.zig").Indexer;
 const utils = @import("../utils.zig");
 const json_utils = @import("../../utils/json.zig");
 
-pub fn handleSubregistryUpdate(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleSubregistryUpdate(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     // Event: SubregistryUpdate(uint256 indexed id, address subregistry)
     // Note: The 'id' in SubregistryUpdate is the canonical_id (version=0), not the full token_id
     if (log.topics.len < 2) return error.InvalidTopicCount;
@@ -49,22 +49,22 @@ pub fn handleSubregistryUpdate(self: *Indexer, chain: models.Chain, log: rpc.Log
     // Insert the subregistry into the registries table so it will be monitored
     const registry = models.Registry{
         .address = subregistry_addr,
-        .chain = chain,
+        .protocol = protocol,
         .name = name_str,
         .namehash = namehash,
         .parent_registry = log.address, // The contract that emitted this event
         .created_block = log.block_number,
-        .created_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        .created_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     };
 
     try self.database.insertRegistry(registry);
     std.log.debug("  → Registered subregistry for monitoring: {any}", .{subregistry_addr});
 
     // Process any orphaned registrations that were waiting for this parent
-    const subreg_hex_for_orphans = try subregistry_addr.toHex(self.allocator);
-    defer self.allocator.free(subreg_hex_for_orphans);
+    var subreg_hex_for_orphans_buf: [42]u8 = undefined;
+    const subreg_hex_for_orphans = subregistry_addr.toHexBuf(&subreg_hex_for_orphans_buf);
 
-    const orphans = try self.database.getOrphanedRegistrations(chain, subreg_hex_for_orphans);
+    const orphans = try self.database.getOrphanedRegistrations(protocol, subreg_hex_for_orphans);
     defer {
         for (orphans) |*orphan| {
             var o = orphan.*;
@@ -78,11 +78,11 @@ pub fn handleSubregistryUpdate(self: *Indexer, chain: models.Chain, log: rpc.Log
 
         for (orphans) |orphan| {
             // Create the subdomain with correct parent
-            try self.processOrphanedRegistration(chain, orphan, name_str, namehash, subregistry_addr);
+            try self.processOrphanedRegistration(protocol, orphan, name_str, namehash, subregistry_addr);
         }
 
         // Delete processed orphans
-        try self.database.deleteOrphanedRegistrations(chain, subreg_hex_for_orphans);
+        try self.database.deleteOrphanedRegistrations(protocol, subreg_hex_for_orphans);
     }
 
     // Note: We intentionally do NOT update names.registry here.
@@ -91,10 +91,10 @@ pub fn handleSubregistryUpdate(self: *Indexer, chain: models.Chain, log: rpc.Log
     // tracked in the registries table via parent_registry.
 
     // Store event
-    const subreg_hex = try subregistry_addr.toHex(self.allocator);
-    defer self.allocator.free(subreg_hex);
-    const contract_hex = try log.address.toHex(self.allocator);
-    defer self.allocator.free(contract_hex);
+    var subreg_hex_buf: [42]u8 = undefined;
+    const subreg_hex = subregistry_addr.toHexBuf(&subreg_hex_buf);
+    var contract_hex_buf: [42]u8 = undefined;
+    const contract_hex = log.address.toHexBuf(&contract_hex_buf);
 
     // Escape name_str for safe JSON inclusion
     const escaped_name = try json_utils.escapeString(self.allocator, name_str);
@@ -109,13 +109,13 @@ pub fn handleSubregistryUpdate(self: *Indexer, chain: models.Chain, log: rpc.Log
 
     const event_name = try self.allocator.dupe(u8, name_str);
 
-    try utils.emitEvent(self, chain, log, .subregistry_update, event_name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .subregistry_update, event_name, namehash, event_data);
 }
 
 /// Process an orphaned registration now that we know its parent
 pub fn processOrphanedRegistration(
     self: *Indexer,
-    chain: models.Chain,
+    protocol: models.Protocol,
     orphan: db.Database.OrphanedRegistration,
     parent_name: []const u8,
     parent_namehash: Hash,
@@ -151,7 +151,7 @@ pub fn processOrphanedRegistration(
         .label_hash = label_hash,
         .parent_name = parent_name_dup,
         .parent_namehash = parent_namehash,
-        .chain = chain,
+        .protocol = protocol,
         .registry = subregistry_addr,
         .owner = orphan.owner,
         .registrant = orphan.owner,
@@ -164,10 +164,10 @@ pub fn processOrphanedRegistration(
         .registry_locked = false,
         .migrated = false,
         .created_block = orphan.block_number,
-        .created_at = self.getBlockTimestamp(chain, orphan.block_number, null),
-        .registered_at = self.getBlockTimestamp(chain, orphan.block_number, null),
+        .created_at = self.getBlockTimestamp(protocol, orphan.block_number, null),
+        .registered_at = self.getBlockTimestamp(protocol, orphan.block_number, null),
         .updated_block = orphan.block_number,
-        .updated_at = self.getBlockTimestamp(chain, orphan.block_number, null),
+        .updated_at = self.getBlockTimestamp(protocol, orphan.block_number, null),
         .is_wrapped = false,
         .wrapper_fuses = null,
         .wrapper_expiry = null,
@@ -178,10 +178,10 @@ pub fn processOrphanedRegistration(
     try self.database.insertName(name);
 
     // Store event
-    const owner_hex = try orphan.owner.toHex(self.allocator);
-    defer self.allocator.free(owner_hex);
-    const registry_hex = try subregistry_addr.toHex(self.allocator);
-    defer self.allocator.free(registry_hex);
+    var owner_hex_buf: [42]u8 = undefined;
+    const owner_hex = orphan.owner.toHexBuf(&owner_hex_buf);
+    var registry_hex_buf: [42]u8 = undefined;
+    const registry_hex = subregistry_addr.toHexBuf(&registry_hex_buf);
 
     const escaped_name = try json_utils.escapeString(self.allocator, full_name);
     defer self.allocator.free(escaped_name);
@@ -200,7 +200,7 @@ pub fn processOrphanedRegistration(
 
     const event = models.Event{
         .event_type = .name_registered,
-        .chain = chain,
+        .protocol = protocol,
         .block_number = orphan.block_number,
         .tx_hash = orphan.tx_hash,
         .log_index = orphan.log_index,
@@ -216,7 +216,7 @@ pub fn processOrphanedRegistration(
 
 /// Process any remaining orphaned registrations that now have valid parents
 /// Called after indexSubregistryEvents to handle orphans created during this batch
-pub fn processRemainingOrphans(self: *Indexer, chain: models.Chain) !void {
+pub fn processRemainingOrphans(self: *Indexer, protocol: models.Protocol) !void {
 
     // Query all orphaned registrations that now have a valid parent
     // A valid parent is one where the registry's created_block <= orphan's block_number
@@ -225,14 +225,14 @@ pub fn processRemainingOrphans(self: *Indexer, chain: models.Chain) !void {
         \\       o.block_number, o.tx_hash, o.log_index,
         \\       r.name as parent_name, r.namehash as parent_namehash, r.address as registry_addr
         \\FROM orphaned_registrations o
-        \\INNER JOIN registries r ON r.chain = o.chain AND r.address = o.subregistry_address
-        \\WHERE o.chain = ? AND r.created_block <= o.block_number
+        \\INNER JOIN registries r ON r.protocol = o.protocol AND r.address = o.subregistry_address
+        \\WHERE o.protocol = ? AND r.created_block <= o.block_number
         \\ORDER BY o.block_number ASC
     ;
 
-    var oq = try Query.init(self.database, sql);
+    var oq = try Query.initCached(self.database, sql);
     defer oq.deinit();
-    try oq.bindText(chain.toString());
+    try oq.bindText(protocol.toString());
 
     var processed_count: usize = 0;
     var processed_addresses = std.StringHashMap(void).init(self.allocator);
@@ -273,7 +273,7 @@ pub fn processRemainingOrphans(self: *Indexer, chain: models.Chain) !void {
 
         // Create orphan struct and process
         const orphan = db.Database.OrphanedRegistration{
-            .chain = chain,
+            .protocol = protocol,
             .subregistry_address = subregistry_addr_str,
             .token_id = token_id,
             .label = label,
@@ -284,7 +284,7 @@ pub fn processRemainingOrphans(self: *Indexer, chain: models.Chain) !void {
             .log_index = log_index,
         };
 
-        self.processOrphanedRegistration(chain, orphan, parent_name, parent_namehash, subregistry_addr) catch |err| {
+        self.processOrphanedRegistration(protocol, orphan, parent_name, parent_namehash, subregistry_addr) catch |err| {
             std.log.warn("Failed to process orphaned registration {s}: {}", .{ label, err });
             continue;
         };
@@ -304,12 +304,12 @@ pub fn processRemainingOrphans(self: *Indexer, chain: models.Chain) !void {
 
         var it = processed_addresses.keyIterator();
         while (it.next()) |addr| {
-            try self.database.deleteOrphanedRegistrations(chain, addr.*);
+            try self.database.deleteOrphanedRegistrations(protocol, addr.*);
         }
     }
 }
 
-pub fn handleResolverUpdate(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleResolverUpdate(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     // Event: ResolverUpdate(uint256 indexed id, address resolver)
     // Note: The 'id' in ResolverUpdate is the current token_id (including version bits),
     // NOT the canonical_id. We must strip version bits to look up the name.
@@ -330,7 +330,9 @@ pub fn handleResolverUpdate(self: *Indexer, chain: models.Chain, log: rpc.Log) !
     // (e.g., "tester.eth" and "tester.calendars.eth" share the same token_id)
     const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
 
-    // Skip if name doesn't exist yet (might be out of order event processing)
+    // With log-index ordering the parent LabelRegistered/NameRegistered is processed before
+    // its ResolverUpdate in the same batch, so this branch is defensive: it fires on reorg
+    // replay or when the registry hasn't been discovered yet (subregistry outside the known set).
     if (maybe_name == null) {
         std.log.warn("  → Skipping ResolverUpdate for unknown tokenId={d} in registry {any}", .{ token_id, log.address });
         return;
@@ -348,18 +350,19 @@ pub fn handleResolverUpdate(self: *Indexer, chain: models.Chain, log: rpc.Log) !
     // Update resolver in database
     try self.database.updateNameResolver(namehash, resolver_addr);
 
+    // Stack-buffer the resolver hex once and reuse for both registerResolver + the
+    // subsequent event JSON; avoids two separate heap allocs in this handler.
+    var resolver_hex_buf: [42]u8 = undefined;
+    const resolver_hex = resolver_addr.toHexBuf(&resolver_hex_buf);
+
     // Register resolver for record indexing (if not zero address)
     if (!resolver_addr.isZero()) {
-        const resolver_hex = try resolver_addr.toHex(self.allocator);
-        defer self.allocator.free(resolver_hex);
-        try self.database.registerResolver(chain, resolver_hex, log.block_number);
+        try self.database.registerResolver(protocol, resolver_hex, log.block_number);
     }
 
     // Store event
-    const resolver_hex = try resolver_addr.toHex(self.allocator);
-    defer self.allocator.free(resolver_hex);
-    const contract_hex = try log.address.toHex(self.allocator);
-    defer self.allocator.free(contract_hex);
+    var contract_hex_buf: [42]u8 = undefined;
+    const contract_hex = log.address.toHexBuf(&contract_hex_buf);
 
     // Escape name_str for safe JSON inclusion
     const escaped_name = try json_utils.escapeString(self.allocator, name_str);
@@ -374,10 +377,10 @@ pub fn handleResolverUpdate(self: *Indexer, chain: models.Chain, log: rpc.Log) !
 
     const event_name = try self.allocator.dupe(u8, name_str);
 
-    try utils.emitEvent(self, chain, log, .resolver_update, event_name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .resolver_update, event_name, namehash, event_data);
 }
 
-pub fn handleNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     // V2 Event: NameRegistered(uint256 indexed tokenId, string label, uint64 expiration, address registeredBy)
     if (log.topics.len < 2) return error.InvalidTopicCount;
 
@@ -412,31 +415,33 @@ pub fn handleNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !
 
     // Determine parent name based on registry address
     // If from main .eth registry, parent is "eth". Otherwise look up subregistry parent.
-    const eth_registry = self.getEthRegistry(chain);
+    const eth_registry = self.getEthRegistry(protocol);
     const is_main_registry = log.address.eql(eth_registry);
 
     var parent_name: []const u8 = "eth";
     var parent_name_allocated = false;
-    var parent_namehash: Hash = try @import("../../types/hash.zig").namehash(self.allocator, "eth");
+    var parent_namehash: Hash = self.eth_namehash;
 
     if (!is_main_registry) {
         // This is a subregistry - look up the parent name from registries table
         // We query for the parent that was active at this event's block number
         // (the most recent SubregistryUpdate before or at this block)
-        const registry_hex = try log.address.toHex(self.allocator);
-        defer self.allocator.free(registry_hex);
+        var registry_hex_buf: [42]u8 = undefined;
+        const registry_hex = log.address.toHexBuf(&registry_hex_buf);
 
-        // With multiple parents possible per address (due to address reuse),
-        // find the one that was set most recently BEFORE this event
-        var rq = try Query.init(self.database,
+        // A subregistry contract can be re-pointed to a different parent via setSubregistry
+        // (the "one subregistry per name" invariant is only a VerifiableFactory deployment
+        // practice, not a protocol guarantee). Take the most recent assignment and warn if
+        // more than one exists — see handleLabelRegistered for the matching logic.
+        var rq = try Query.initCached(self.database,
             \\SELECT name, namehash FROM registries
-            \\WHERE address = ? AND chain = ? AND created_block <= ?
+            \\WHERE address = ? AND protocol = ? AND created_block <= ?
             \\ORDER BY created_block DESC
-            \\LIMIT 1
+            \\LIMIT 2
         );
         defer rq.deinit();
         try rq.bindText(registry_hex);
-        try rq.bindText(chain.toString());
+        try rq.bindText(protocol.toString());
         try rq.bindInt64(@intCast(log.block_number));
 
         if (try rq.step()) {
@@ -448,6 +453,10 @@ pub fn handleNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !
             if (rq.getTextSlice(1)) |namehash_hex| {
                 parent_namehash = try Hash.fromHex(namehash_hex);
             }
+
+            if (try rq.step()) {
+                std.log.warn("Multi-parent subregistry detected: address={s} has >1 parent at block {d}; this breaks the current lookup assumption", .{ registry_hex, log.block_number });
+            }
         } else {
             // No parent found for this subregistry at this block
             // Store as orphaned registration - will be processed when parent claims subregistry
@@ -455,7 +464,7 @@ pub fn handleNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !
                 label_str, registry_hex, log.block_number,
             });
             try self.database.insertOrphanedRegistration(
-                chain,
+                protocol,
                 registry_hex,
                 token_id,
                 label_str,
@@ -499,7 +508,7 @@ pub fn handleNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !
         .label_hash = label_hash,
         .parent_name = parent_name_dup,
         .parent_namehash = parent_namehash,
-        .chain = chain,
+        .protocol = protocol,
         .registry = log.address, // Use the actual registry that emitted the event
         .owner = registered_by,
         .registrant = registered_by, // Original registrant from NameRegistered event
@@ -509,10 +518,13 @@ pub fn handleNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !
         .token_version = token_version,
         .expiry = @truncate(expiration),
         .registry_locked = false,
+        // V1→V2 migrations flow through handleLabelRegistered (indexed `sender` is checked
+        // against migration controllers there). V2 NameRegistered has no sender topic, so
+        // names created via this path are always fresh V2 registrations.
         .migrated = false,
         .created_block = log.block_number,
-        .created_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
-        .registered_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        .created_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        .registered_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
         .updated_block = log.block_number,
         .updated_at = std.time.timestamp(),
         .is_wrapped = false,
@@ -524,20 +536,27 @@ pub fn handleNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !
 
     try self.database.insertName(name);
 
-    // After inserting name, check if there are placeholder registries that need updating
-    // This happens when SubregistryUpdate was processed before NameRegistered in the same block
-    // The SubregistryUpdate creates a registry with name "canonicalId:{d}" as a placeholder
-    const placeholder_pattern = try std.fmt.allocPrint(self.allocator, "canonicalId:{d}", .{canonical_id});
-    defer self.allocator.free(placeholder_pattern);
-    _ = self.database.updateRegistryPlaceholderName(placeholder_pattern, full_name, namehash) catch |err| {
-        std.log.warn("Failed to update placeholder registry: {}", .{err});
+    // Log-index-ordered dispatch means SubregistryUpdated/ResolverUpdated for a newly-minted
+    // name can be processed before LabelRegistered/NameRegistered (the on-protocol tx emits them
+    // in that order). Those earlier handlers store placeholder rows keyed by canonicalId/tokenId;
+    // now that the real name is known, patch them.
+    // Stack buffers — u256 max is 78 decimal digits, prefix is "canonicalId:"/"tokenId:".
+    var canonical_buf: [96]u8 = undefined;
+    const canonical_placeholder = try std.fmt.bufPrint(&canonical_buf, "canonicalId:{d}", .{canonical_id});
+    _ = self.database.updateRegistryPlaceholderName(canonical_placeholder, full_name, namehash) catch |err| {
+        std.log.warn("Failed to patch canonicalId placeholder: {}", .{err});
+    };
+    var tokenid_buf: [96]u8 = undefined;
+    const tokenid_placeholder = try std.fmt.bufPrint(&tokenid_buf, "tokenId:{d}", .{token_id});
+    _ = self.database.updatePlaceholderEventsByName(tokenid_placeholder, full_name, namehash) catch |err| {
+        std.log.warn("Failed to patch tokenId placeholder: {}", .{err});
     };
 
     // Store event
-    const nh_hex = try namehash.toHex(self.allocator);
-    defer self.allocator.free(nh_hex);
-    const owner_hex = try registered_by.toHex(self.allocator);
-    defer self.allocator.free(owner_hex);
+    var nh_hex_buf: [66]u8 = undefined;
+    const nh_hex = namehash.toHexBuf(&nh_hex_buf);
+    var owner_hex_buf: [42]u8 = undefined;
+    const owner_hex = registered_by.toHexBuf(&owner_hex_buf);
 
     // Escape label_str for safe JSON inclusion
     const escaped_label = try json_utils.escapeString(self.allocator, label_str);
@@ -553,10 +572,10 @@ pub fn handleNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !
 
     const event_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
 
-    try utils.emitEvent(self, chain, log, .name_registered, event_name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .name_registered, event_name, namehash, event_data);
 }
 
-pub fn handleNameRenewed(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleNameRenewed(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     // V2 Event: NameRenewed(uint256 indexed tokenId, uint64 newExpiration, address renewedBy)
     if (log.topics.len < 2) return error.InvalidTopicCount;
 
@@ -598,10 +617,10 @@ pub fn handleNameRenewed(self: *Indexer, chain: models.Chain, log: rpc.Log) !voi
 
     const event_name = try self.allocator.dupe(u8, name_str);
 
-    try utils.emitEvent(self, chain, log, .name_renewed, event_name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .name_renewed, event_name, namehash, event_data);
 }
 
-pub fn handleTransfer(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleTransfer(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     // Event: TransferSingle(address indexed operator, address indexed from, address indexed to, uint256 id, uint256 value)
     if (log.topics.len < 4) return error.InvalidTopicCount;
 
@@ -631,18 +650,23 @@ pub fn handleTransfer(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
 
         try self.database.updateNameOwner(namehash_opt.?, to);
     } else {
-        std.log.debug("  → Skipping Transfer for unknown tokenId={d} in registry {any}", .{ id, log.address });
+        // With log-index ordering (utils.dispatchOrdered) a Transfer always arrives after its
+        // LabelRegistered/NameRegistered, so this branch should only fire on reorgs, backfill
+        // gaps, or genuinely orphaned transfers (non-ENS ERC1155 tokens slipping through the
+        // topic-only filter). The event is still emitted for audit; ownership just can't be
+        // applied without a known name.
+        std.log.warn("  → Transfer for unknown tokenId={d} in registry {any}; ownership not updated", .{ id, log.address });
     }
 
     defer if (name_str_opt) |n| self.allocator.free(n);
 
     // Store event
-    const operator_hex = try operator.toHex(self.allocator);
-    defer self.allocator.free(operator_hex);
-    const from_hex = try from.toHex(self.allocator);
-    defer self.allocator.free(from_hex);
-    const to_hex = try to.toHex(self.allocator);
-    defer self.allocator.free(to_hex);
+    var operator_hex_buf: [42]u8 = undefined;
+    const operator_hex = operator.toHexBuf(&operator_hex_buf);
+    var from_hex_buf: [42]u8 = undefined;
+    const from_hex = from.toHexBuf(&from_hex_buf);
+    var to_hex_buf: [42]u8 = undefined;
+    const to_hex = to.toHexBuf(&to_hex_buf);
 
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"operator\":\"{s}\",\"from\":\"{s}\",\"to\":\"{s}\",\"id\":{d},\"value\":{d}}}", .{
         operator_hex,
@@ -654,14 +678,14 @@ pub fn handleTransfer(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
 
     const event_name = if (name_str_opt) |n| try self.allocator.dupe(u8, n) else null;
 
-    try utils.emitEvent(self, chain, log, .transfer, event_name, namehash_opt, event_data);
+    try utils.emitEvent(self, protocol, log, .transfer, event_name, namehash_opt, event_data);
 }
 
 // =============================================================================
 // ETH Registrar Extended Event Handlers (L2 specific)
 // =============================================================================
 
-pub fn handleETHNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleETHNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     // IETHRegistrar.NameRegistered(uint256 indexed tokenId, string label, address owner, IRegistry subregistry, address resolver, uint64 duration, IERC20 paymentToken, bytes32 referrer, uint256 base, uint256 premium)
     if (log.topics.len < 2) return error.InvalidTopicCount;
 
@@ -696,7 +720,7 @@ pub fn handleETHNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log
     const label_hash = try @import("../../types/hash.zig").keccak256(self.allocator, label_str);
 
     // Calculate expiry from registration block timestamp + duration
-    const block_timestamp = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp);
+    const block_timestamp = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
     const expiry: u64 = @as(u64, @intCast(block_timestamp)) + @as(u64, @truncate(duration));
 
     // Extract canonical_id and version from token_id
@@ -719,9 +743,9 @@ pub fn handleETHNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log
         .label = label_dup,
         .label_hash = label_hash,
         .parent_name = parent_name_dup,
-        .parent_namehash = try @import("../../types/hash.zig").namehash(self.allocator, "eth"),
-        .chain = chain,
-        .registry = self.getEthRegistry(chain),
+        .parent_namehash = self.eth_namehash,
+        .protocol = protocol,
+        .registry = self.getEthRegistry(protocol),
         .owner = owner,
         .registrant = owner, // Original registrant from ETH Registrar
         .resolver = resolver,
@@ -732,8 +756,8 @@ pub fn handleETHNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log
         .registry_locked = false,
         .migrated = false,
         .created_block = log.block_number,
-        .created_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
-        .registered_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        .created_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        .registered_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
         .updated_block = log.block_number,
         .updated_at = std.time.timestamp(),
         .is_wrapped = false,
@@ -749,12 +773,12 @@ pub fn handleETHNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log
     if (!subregistry.isZero()) {
         const registry_entry = models.Registry{
             .address = subregistry,
-            .chain = chain,
+            .protocol = protocol,
             .name = full_name,
             .namehash = namehash,
-            .parent_registry = self.getEthRegistry(chain),
+            .parent_registry = self.getEthRegistry(protocol),
             .created_block = log.block_number,
-            .created_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+            .created_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
         };
         self.database.insertRegistry(registry_entry) catch |err| {
             std.log.warn("Failed to insert subregistry for {s}: {any}", .{ full_name, err });
@@ -766,7 +790,7 @@ pub fn handleETHNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log
     // but continue — the event is the source of truth and the `registrations` table can be
     // re-populated via the schema/021 backfill query on a later startup.
     self.database.insertRegistration(
-        chain,
+        protocol,
         namehash,
         label_str,
         "eth",
@@ -782,17 +806,17 @@ pub fn handleETHNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log
     };
 
     // Store event with payment details
-    const payment_token_hex = try payment_token.toHex(self.allocator);
-    defer self.allocator.free(payment_token_hex);
-    const referrer_hex = try referrer.toHex(self.allocator);
-    defer self.allocator.free(referrer_hex);
+    var payment_token_hex_buf: [42]u8 = undefined;
+    const payment_token_hex = payment_token.toHexBuf(&payment_token_hex_buf);
+    var referrer_hex_buf: [66]u8 = undefined;
+    const referrer_hex = referrer.toHexBuf(&referrer_hex_buf);
 
     // Escape label_str for safe JSON inclusion
     const escaped_label = try json_utils.escapeString(self.allocator, label_str);
     defer self.allocator.free(escaped_label);
 
-    const owner_hex = try owner.toHex(self.allocator);
-    defer self.allocator.free(owner_hex);
+    var owner_hex_buf: [42]u8 = undefined;
+    const owner_hex = owner.toHexBuf(&owner_hex_buf);
 
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"label\":\"{s}\",\"tokenId\":{d},\"owner\":\"{s}\",\"duration\":{d},\"paymentToken\":\"{s}\",\"referrer\":\"{s}\",\"basePrice\":{d},\"premium\":{d}}}", .{
         escaped_label,
@@ -807,10 +831,10 @@ pub fn handleETHNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log
 
     const event_name = try std.fmt.allocPrint(self.allocator, "{s}.eth", .{label_str});
 
-    try utils.emitEvent(self, chain, log, .name_registered, event_name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .name_registered, event_name, namehash, event_data);
 }
 
-pub fn handleETHNameRenewed(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleETHNameRenewed(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     // IETHRegistrar.NameRenewed(uint256 indexed tokenId, string label, uint64 duration, uint64 newExpiry, IERC20 paymentToken, bytes32 referrer, uint256 base)
     if (log.topics.len < 2) return error.InvalidTopicCount;
 
@@ -838,7 +862,7 @@ pub fn handleETHNameRenewed(self: *Indexer, chain: models.Chain, log: rpc.Log) !
     std.log.debug("ETHRegistrar.NameRenewed: {s} (tokenId={d}, canonicalId={d}, duration={d}, newExpiry={d}, base={d})", .{ label_str, token_id, canonical_id, duration, new_expiry, base_price });
 
     // Look up the name by token_id AND the .eth registry (NOT log.address, which is the registrar)
-    const eth_registry = self.getEthRegistry(chain);
+    const eth_registry = self.getEthRegistry(protocol);
     const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, eth_registry);
 
     // Update expiry using namehash (scoped to the correct name)
@@ -847,10 +871,10 @@ pub fn handleETHNameRenewed(self: *Indexer, chain: models.Chain, log: rpc.Log) !
     }
 
     // Store event with payment details
-    const payment_token_hex = try payment_token.toHex(self.allocator);
-    defer self.allocator.free(payment_token_hex);
-    const referrer_hex = try referrer.toHex(self.allocator);
-    defer self.allocator.free(referrer_hex);
+    var payment_token_hex_buf: [42]u8 = undefined;
+    const payment_token_hex = payment_token.toHexBuf(&payment_token_hex_buf);
+    var referrer_hex_buf: [66]u8 = undefined;
+    const referrer_hex = referrer.toHexBuf(&referrer_hex_buf);
 
     // Escape label_str for safe JSON inclusion
     const escaped_label = try json_utils.escapeString(self.allocator, label_str);
@@ -880,10 +904,10 @@ pub fn handleETHNameRenewed(self: *Indexer, chain: models.Chain, log: rpc.Log) !
 
     const event_name = try self.allocator.dupe(u8, name_str);
 
-    try utils.emitEvent(self, chain, log, .name_renewed, event_name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .name_renewed, event_name, namehash, event_data);
 }
 
-pub fn handleCommitmentMade(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleCommitmentMade(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     // CommitmentMade(bytes32 commitment)
     // Note: bytes32 is NOT indexed, so it's in the data field
     if (log.topics.len < 1) return error.InvalidTopicCount;
@@ -893,15 +917,15 @@ pub fn handleCommitmentMade(self: *Indexer, chain: models.Chain, log: rpc.Log) !
     std.log.debug("CommitmentMade: commitment={any}", .{commitment});
 
     // Store event
-    const commitment_hex = try commitment.toHex(self.allocator);
-    defer self.allocator.free(commitment_hex);
+    var commitment_hex_buf: [66]u8 = undefined;
+    const commitment_hex = commitment.toHexBuf(&commitment_hex_buf);
 
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"commitment\":\"{s}\"}}", .{commitment_hex});
 
-    try utils.emitEvent(self, chain, log, .commitment_made, null, null, event_data);
+    try utils.emitEvent(self, protocol, log, .commitment_made, null, null, event_data);
 }
 
-pub fn handleNameBurned(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleNameBurned(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     // NameBurned(uint256 indexed tokenId, address burnedBy)
     if (log.topics.len < 2) return error.InvalidTopicCount;
 
@@ -927,8 +951,8 @@ pub fn handleNameBurned(self: *Indexer, chain: models.Chain, log: rpc.Log) !void
     const namehash = if (maybe_name) |n| n.namehash else Hash.zero;
 
     // Store event
-    const burned_by_hex = try burned_by.toHex(self.allocator);
-    defer self.allocator.free(burned_by_hex);
+    var burned_by_hex_buf: [42]u8 = undefined;
+    const burned_by_hex = burned_by.toHexBuf(&burned_by_hex_buf);
 
     // Escape name_str for safe JSON inclusion
     const escaped_name = try json_utils.escapeString(self.allocator, name_str);
@@ -942,7 +966,7 @@ pub fn handleNameBurned(self: *Indexer, chain: models.Chain, log: rpc.Log) !void
 
     const event_name = try self.allocator.dupe(u8, name_str);
 
-    try utils.emitEvent(self, chain, log, .name_burned, event_name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .name_burned, event_name, namehash, event_data);
 
     // Delete the burned name using namehash (registry-safe: only deletes the exact name)
     // Cannot use canonical_id because it collides across registries (e.g., tester.eth and tester.calendars.eth)
@@ -954,7 +978,7 @@ pub fn handleNameBurned(self: *Indexer, chain: models.Chain, log: rpc.Log) !void
     }
 }
 
-pub fn handleTokenRegenerated(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleTokenRegenerated(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     // TokenRegenerated(uint256 oldTokenId, uint256 newTokenId)
     // Parameters may be indexed (in topics) or non-indexed (in data)
     var old_token_id: u256 = undefined;
@@ -999,7 +1023,7 @@ pub fn handleTokenRegenerated(self: *Indexer, chain: models.Chain, log: rpc.Log)
 
     const event_name = try self.allocator.dupe(u8, name_str);
 
-    try utils.emitEvent(self, chain, log, .token_regenerated, event_name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .token_regenerated, event_name, namehash, event_data);
 
     // Update token_id in database from old to new (registry-safe: only updates the exact name)
     // Cannot use old_token_id alone because it collides across registries
@@ -1023,7 +1047,7 @@ pub fn handleTokenRegenerated(self: *Indexer, chain: models.Chain, log: rpc.Log)
     }
 }
 
-pub fn handleTransferBatch(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleTransferBatch(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     // TransferBatch(address indexed operator, address indexed from, address indexed to, uint256[] ids, uint256[] values)
     if (log.topics.len < 4) return error.InvalidTopicCount;
 
@@ -1041,12 +1065,12 @@ pub fn handleTransferBatch(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
     std.log.debug("TransferBatch: operator={any}, from={any}, to={any}, count={d}", .{ operator, from, to, token_ids.len });
 
     // Store event
-    const operator_hex = try operator.toHex(self.allocator);
-    defer self.allocator.free(operator_hex);
-    const from_hex = try from.toHex(self.allocator);
-    defer self.allocator.free(from_hex);
-    const to_hex = try to.toHex(self.allocator);
-    defer self.allocator.free(to_hex);
+    var operator_hex_buf: [42]u8 = undefined;
+    const operator_hex = operator.toHexBuf(&operator_hex_buf);
+    var from_hex_buf: [42]u8 = undefined;
+    const from_hex = from.toHexBuf(&from_hex_buf);
+    var to_hex_buf: [42]u8 = undefined;
+    const to_hex = to.toHexBuf(&to_hex_buf);
 
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"operator\":\"{s}\",\"from\":\"{s}\",\"to\":\"{s}\",\"count\":{d}}}", .{
         operator_hex,
@@ -1055,35 +1079,25 @@ pub fn handleTransferBatch(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
         token_ids.len,
     });
 
-    try utils.emitEvent(self, chain, log, .transfer, null, null, event_data);
+    try utils.emitEvent(self, protocol, log, .transfer, null, null, event_data);
 
-    // Update ownership for each transferred token
+    // Update ownership for each transferred token (match handleTransfer semantics — propagate DB errors)
     for (token_ids) |token_id| {
-        // Only update if transferring to a non-zero address (not burning)
-        if (!to.isZero()) {
-            // Try to update the owner - if the name doesn't exist, skip it
-            const maybe_name = self.database.getNameByTokenIdAndRegistry(token_id, log.address) catch |err| {
-                std.log.warn("Failed to get name for tokenId={d} during batch transfer: {any}", .{ token_id, err });
-                continue;
-            };
+        if (to.isZero()) continue; // burn: no owner update
 
-            if (maybe_name) |name| {
-                // Store the namehash before cleanup
-                const namehash = name.namehash;
-                // Free the name record
-                var mutable_name = name;
-                mutable_name.deinit(self.allocator);
-
-                // Use the actual namehash from the retrieved name, not Hash.zero
-                self.database.updateNameOwner(namehash, to) catch |err| {
-                    std.log.warn("Failed to update owner for tokenId={d}: {any}", .{ token_id, err });
-                };
-            }
+        const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
+        if (maybe_name) |name| {
+            const namehash = name.namehash;
+            var mutable_name = name;
+            mutable_name.deinit(self.allocator);
+            try self.database.updateNameOwner(namehash, to);
+        } else {
+            std.log.debug("  → Skipping batch Transfer for unknown tokenId={d} in registry {any}", .{ token_id, log.address });
         }
     }
 }
 
-pub fn handleApproval(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleApproval(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     // Approval(address indexed owner, address indexed approved, uint256 indexed tokenId)
     if (log.topics.len < 4) return error.InvalidTopicCount;
 
@@ -1106,10 +1120,10 @@ pub fn handleApproval(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
     const namehash = if (maybe_name) |n| n.namehash else Hash.zero;
 
     // Store event
-    const owner_hex = try owner.toHex(self.allocator);
-    defer self.allocator.free(owner_hex);
-    const approved_hex = try approved.toHex(self.allocator);
-    defer self.allocator.free(approved_hex);
+    var owner_hex_buf: [42]u8 = undefined;
+    const owner_hex = owner.toHexBuf(&owner_hex_buf);
+    var approved_hex_buf: [42]u8 = undefined;
+    const approved_hex = approved.toHexBuf(&approved_hex_buf);
 
     // Escape name_str for safe JSON inclusion
     const escaped_name = try json_utils.escapeString(self.allocator, name_str);
@@ -1124,10 +1138,10 @@ pub fn handleApproval(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
 
     const event_name = try self.allocator.dupe(u8, name_str);
 
-    try utils.emitEvent(self, chain, log, .approval, event_name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .approval, event_name, namehash, event_data);
 
     // Store approval in database (registry-scoped to avoid cross-registry token_id collisions)
-    try self.database.insertApproval(chain, token_id, owner, approved, log.block_number, log.transaction_hash, log.address);
+    try self.database.insertApproval(protocol, token_id, owner, approved, log.block_number, log.transaction_hash, log.address);
     std.log.debug("Stored approval in database for tokenId={d}", .{token_id});
 }
 
@@ -1137,7 +1151,7 @@ pub fn handleApproval(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
 
 /// Handle EACRolesChanged event from registry contracts
 /// EACRolesChanged(uint256 indexed resource, address indexed account, uint256 oldRoleBitmap, uint256 newRoleBitmap)
-pub fn handleEACRolesChanged(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleEACRolesChanged(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     // Event: EACRolesChanged(uint256 indexed resource, address indexed account, uint256 oldRoleBitmap, uint256 newRoleBitmap)
     // topics[0] = event signature
     // topics[1] = resource (tokenId/namehash as uint256) - indexed
@@ -1178,8 +1192,8 @@ pub fn handleEACRolesChanged(self: *Indexer, chain: models.Chain, log: rpc.Log) 
     const new_bitmap_hex = try std.fmt.allocPrint(self.allocator, "0x{s}", .{new_bitmap_hex_chars});
     defer self.allocator.free(new_bitmap_hex);
 
-    const account_hex = try account.toHex(self.allocator);
-    defer self.allocator.free(account_hex);
+    var account_hex_buf: [42]u8 = undefined;
+    const account_hex = account.toHexBuf(&account_hex_buf);
 
     std.log.debug("EACRolesChanged: resource={s}, account={s}, oldBitmap={s}, newBitmap={s}", .{
         resource_hex,
@@ -1192,11 +1206,11 @@ pub fn handleEACRolesChanged(self: *Indexer, chain: models.Chain, log: rpc.Log) 
     // If newRoleBitmap is 0, all roles were revoked - delete the entry
     // Otherwise, upsert with the new bitmap
     if (new_role_bitmap == 0) {
-        try self.database.deleteEACRole(chain, resource_hex, account, log.address);
+        try self.database.deleteEACRole(protocol, resource_hex, account, log.address);
         std.log.debug("  → Deleted EAC role (all roles revoked)", .{});
     } else {
         try self.database.upsertEACRole(
-            chain,
+            protocol,
             resource_hex,
             account,
             new_bitmap_hex,
@@ -1231,12 +1245,12 @@ pub fn handleEACRolesChanged(self: *Indexer, chain: models.Chain, log: rpc.Log) 
     const event_name = if (name_str_opt) |n| try self.allocator.dupe(u8, n) else null;
     defer if (name_str_opt) |n| self.allocator.free(n);
 
-    try utils.emitEvent(self, chain, log, .eac_roles_changed, event_name, namehash_opt, event_data);
+    try utils.emitEvent(self, protocol, log, .eac_roles_changed, event_name, namehash_opt, event_data);
 }
 
 /// Handle LabelRegistered events from PermissionedRegistry
 /// Event: LabelRegistered(uint256 indexed tokenId, bytes32 indexed labelHash, string label, address owner, uint64 expiry, address indexed sender)
-pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleLabelRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     if (log.topics.len < 4) return error.InvalidTopicCount;
 
     const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
@@ -1259,34 +1273,36 @@ pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) 
     const expiry: u64 = @truncate(try abi.ABI.decodeUint256(log.data, 64));
 
     // Detect if this registration was triggered by a migration controller (V1→V2 migration)
-    const is_migration = self.isMigrationController(sender);
+    // and which kind. Locked migrations preserve V1 wrapper fuses; unlocked do not.
+    const migration_kind = self.getMigrationKind(sender);
+    const is_migration = migration_kind != .none;
 
-    std.log.debug("LabelRegistered: {s} (tokenId={d}, canonicalId={d}, owner={any}, expiry={d}, sender={any}, migrated={any})", .{ label_str, token_id, canonical_id, owner, expiry, sender, is_migration });
+    std.log.debug("LabelRegistered: {s} (tokenId={d}, canonicalId={d}, owner={any}, expiry={d}, sender={any}, migration_kind={any})", .{ label_str, token_id, canonical_id, owner, expiry, sender, migration_kind });
 
-    const eth_registry = self.getEthRegistry(chain);
+    const eth_registry = self.getEthRegistry(protocol);
     const is_main_registry = log.address.eql(eth_registry);
 
     var parent_name: []const u8 = "eth";
     var parent_name_allocated = false;
-    var parent_namehash: Hash = try @import("../../types/hash.zig").namehash(self.allocator, "eth");
+    var parent_namehash: Hash = self.eth_namehash;
 
     if (!is_main_registry) {
-        const registry_hex = try log.address.toHex(self.allocator);
-        defer self.allocator.free(registry_hex);
+        var registry_hex_buf: [42]u8 = undefined;
+        const registry_hex = log.address.toHexBuf(&registry_hex_buf);
 
         // V2 invariant: each subregistry contract is deployed for a single parent position
         // (VerifiableFactory deploys a fresh instance per name). If this invariant breaks
         // in a future deployment, we'd need path-based parent resolution. The query below
         // takes the most-recently-set parent, which is correct under the current invariant.
-        var rq = try Query.init(self.database,
+        var rq = try Query.initCached(self.database,
             \\SELECT name, namehash FROM registries
-            \\WHERE address = ? AND chain = ? AND created_block <= ?
+            \\WHERE address = ? AND protocol = ? AND created_block <= ?
             \\ORDER BY created_block DESC
             \\LIMIT 2
         );
         defer rq.deinit();
         try rq.bindText(registry_hex);
-        try rq.bindText(chain.toString());
+        try rq.bindText(protocol.toString());
         try rq.bindInt64(@intCast(log.block_number));
 
         if (try rq.step()) {
@@ -1306,7 +1322,7 @@ pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) 
                 label_str, registry_hex, log.block_number,
             });
             try self.database.insertOrphanedRegistration(
-                chain,
+                protocol,
                 registry_hex,
                 token_id,
                 label_str,
@@ -1333,7 +1349,39 @@ pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) 
     const parent_name_dup = try self.allocator.dupe(u8, parent_name);
     defer self.allocator.free(parent_name_dup);
 
-    const block_timestamp = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp);
+    const block_timestamp = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
+
+    // For migrations, look up the corresponding V1 row by namehash so we can
+    // (a) link via v1_label_hash, (b) carry over wrapper fuses for LOCKED
+    // migrations, (c) attest is_v1_name=true. The V1 namehash matches V2's
+    // namehash for a migrated name (same label, same parent), so we look up
+    // by the same namehash but in the V1 protocol scope.
+    var preserved_v1_label_hash_hex: ?[]u8 = null;
+    var preserved_fuses_buf: ?[]u8 = null;
+    var preserved_wrapper_expiry: ?i64 = null;
+    var preserved_is_wrapped: bool = false;
+    defer if (preserved_v1_label_hash_hex) |buf| self.allocator.free(buf);
+    defer if (preserved_fuses_buf) |buf| self.allocator.free(buf);
+    if (is_migration) {
+        if (self.database.getNameByNamehashAndProtocol(namehash_val, .v1) catch null) |v1_row| {
+            var v1_mut = v1_row;
+            defer v1_mut.deinit(self.allocator);
+            preserved_v1_label_hash_hex = try v1_mut.label_hash.toHex(self.allocator);
+            // Locked migrations preserve fuses + wrapper_expiry; unlocked do not.
+            if (migration_kind == .locked and v1_mut.is_wrapped) {
+                if (v1_mut.wrapper_fuses) |fuses_str| {
+                    preserved_fuses_buf = try self.allocator.dupe(u8, fuses_str);
+                }
+                preserved_wrapper_expiry = v1_mut.wrapper_expiry;
+                preserved_is_wrapped = true;
+            }
+        } else {
+            // V1 row not found. Expected when running V2-only (no V1 indexer on this DB);
+            // a real ordering bug would surface differently. Debug-level so a sync of N
+            // thousand migrations doesn't spam the operator log.
+            std.log.debug("Migration LabelRegistered for {s}: no V1 row found by namehash; v1_label_hash will be null", .{full_name});
+        }
+    }
 
     const name = models.Name{
         .name = name_dup,
@@ -1341,7 +1389,7 @@ pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) 
         .label_hash = label_hash,
         .parent_name = parent_name_dup,
         .parent_namehash = parent_namehash,
-        .chain = chain,
+        .protocol = protocol,
         .registry = log.address,
         .owner = owner,
         .registrant = owner,
@@ -1358,22 +1406,43 @@ pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) 
         .registered_at = block_timestamp,
         .updated_block = log.block_number,
         .updated_at = block_timestamp,
-        .is_wrapped = false,
-        .wrapper_fuses = null,
-        .wrapper_expiry = null,
-        .is_v1_name = false,
-        .v1_label_hash = null,
+        .is_wrapped = preserved_is_wrapped,
+        .wrapper_fuses = preserved_fuses_buf,
+        .wrapper_expiry = preserved_wrapper_expiry,
+        .is_v1_name = is_migration, // V1-origin only when migrated; pure V2 mints stay false
+        .v1_label_hash = preserved_v1_label_hash_hex,
     };
 
     try self.database.insertName(name);
 
     if (is_migration) {
-        std.log.info("Migration detected: {s} migrated from V1→V2 (sender={any})", .{ full_name, sender });
+        // Per-name migration log moved to debug — a Sepolia sync produces thousands of
+        // these and they drown out useful info. Aggregate counts (migrations
+        // detected, locked vs unlocked) are surfaced at the end of each batch via
+        // the existing progress log.
+        std.log.debug("Migration detected ({s}): {s} migrated from V1→V2", .{
+            if (migration_kind == .locked) "LOCKED" else "UNLOCKED",
+            full_name,
+        });
     }
+
+    // Log-index-ordered dispatch means SubregistryUpdated/ResolverUpdated for a newly-minted
+    // name can fire before LabelRegistered in the same tx. Those handlers stored placeholder
+    // rows keyed by canonicalId/tokenId; patch them now that the name is resolved.
+    const canonical_placeholder = try std.fmt.allocPrint(self.allocator, "canonicalId:{d}", .{canonical_id});
+    defer self.allocator.free(canonical_placeholder);
+    _ = self.database.updateRegistryPlaceholderName(canonical_placeholder, full_name, namehash_val) catch |err| {
+        std.log.warn("Failed to patch canonicalId placeholder: {}", .{err});
+    };
+    const tokenid_placeholder = try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{token_id});
+    defer self.allocator.free(tokenid_placeholder);
+    _ = self.database.updatePlaceholderEventsByName(tokenid_placeholder, full_name, namehash_val) catch |err| {
+        std.log.warn("Failed to patch tokenId placeholder: {}", .{err});
+    };
 
     // Best-effort; see handleETHNameRegistered for rationale.
     self.database.insertRegistration(
-        chain,
+        protocol,
         namehash_val,
         label_str,
         parent_name,
@@ -1388,12 +1457,12 @@ pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) 
         std.log.warn("insertRegistration failed for {s}: {}", .{ full_name, err });
     };
 
-    const owner_hex = try owner.toHex(self.allocator);
-    defer self.allocator.free(owner_hex);
-    const registry_hex = try log.address.toHex(self.allocator);
-    defer self.allocator.free(registry_hex);
-    const sender_hex = try sender.toHex(self.allocator);
-    defer self.allocator.free(sender_hex);
+    var owner_hex_buf: [42]u8 = undefined;
+    const owner_hex = owner.toHexBuf(&owner_hex_buf);
+    var registry_hex_buf: [42]u8 = undefined;
+    const registry_hex = log.address.toHexBuf(&registry_hex_buf);
+    var sender_hex_buf: [42]u8 = undefined;
+    const sender_hex = sender.toHexBuf(&sender_hex_buf);
 
     const escaped_name = try json_utils.escapeString(self.allocator, full_name);
     defer self.allocator.free(escaped_name);
@@ -1410,12 +1479,12 @@ pub fn handleLabelRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) 
 
     const event_name = try self.allocator.dupe(u8, full_name);
 
-    try utils.emitEvent(self, chain, log, .label_registered, event_name, namehash_val, event_data);
+    try utils.emitEvent(self, protocol, log, .label_registered, event_name, namehash_val, event_data);
 }
 
 /// Handle LabelReserved events from PermissionedRegistry (when owner == 0)
 /// Event: LabelReserved(uint256 indexed tokenId, bytes32 indexed labelHash, string label, uint64 expiry, address indexed sender)
-pub fn handleLabelReserved(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleLabelReserved(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     if (log.topics.len < 4) return error.InvalidTopicCount;
 
     const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
@@ -1436,28 +1505,28 @@ pub fn handleLabelReserved(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
 
     std.log.debug("LabelReserved: {s} (tokenId={d}, expiry={d}, sender={any})", .{ label_str, token_id, expiry, sender });
 
-    const eth_registry = self.getEthRegistry(chain);
+    const eth_registry = self.getEthRegistry(protocol);
     const is_main_registry = log.address.eql(eth_registry);
 
     var parent_name: []const u8 = "eth";
     var parent_name_allocated = false;
-    var parent_namehash: Hash = try @import("../../types/hash.zig").namehash(self.allocator, "eth");
+    var parent_namehash: Hash = self.eth_namehash;
 
     if (!is_main_registry) {
-        const registry_hex = try log.address.toHex(self.allocator);
-        defer self.allocator.free(registry_hex);
+        var registry_hex_buf: [42]u8 = undefined;
+        const registry_hex = log.address.toHexBuf(&registry_hex_buf);
 
         // V2 invariant: each subregistry contract is deployed for a single parent position.
         // Same LIMIT 2 + warning pattern as handleLabelRegistered.
-        var rq = try Query.init(self.database,
+        var rq = try Query.initCached(self.database,
             \\SELECT name, namehash FROM registries
-            \\WHERE address = ? AND chain = ? AND created_block <= ?
+            \\WHERE address = ? AND protocol = ? AND created_block <= ?
             \\ORDER BY created_block DESC
             \\LIMIT 2
         );
         defer rq.deinit();
         try rq.bindText(registry_hex);
-        try rq.bindText(chain.toString());
+        try rq.bindText(protocol.toString());
         try rq.bindInt64(@intCast(log.block_number));
 
         if (try rq.step()) {
@@ -1496,7 +1565,7 @@ pub fn handleLabelReserved(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
         .label_hash = label_hash,
         .parent_name = parent_name_dup,
         .parent_namehash = parent_namehash,
-        .chain = chain,
+        .protocol = protocol,
         .registry = log.address,
         .owner = Address.zero,
         .registrant = Address.zero,
@@ -1509,10 +1578,10 @@ pub fn handleLabelReserved(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
         .registry_locked = false,
         .migrated = false,
         .created_block = log.block_number,
-        .created_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
-        .registered_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        .created_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        .registered_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
         .updated_block = log.block_number,
-        .updated_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        .updated_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
         .is_wrapped = false,
         .wrapper_fuses = null,
         .wrapper_expiry = null,
@@ -1522,10 +1591,10 @@ pub fn handleLabelReserved(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
 
     try self.database.insertName(name);
 
-    const sender_hex = try sender.toHex(self.allocator);
-    defer self.allocator.free(sender_hex);
-    const registry_hex = try log.address.toHex(self.allocator);
-    defer self.allocator.free(registry_hex);
+    var sender_hex_buf: [42]u8 = undefined;
+    const sender_hex = sender.toHexBuf(&sender_hex_buf);
+    var registry_hex_buf: [42]u8 = undefined;
+    const registry_hex = log.address.toHexBuf(&registry_hex_buf);
 
     const escaped_name = try json_utils.escapeString(self.allocator, full_name);
     defer self.allocator.free(escaped_name);
@@ -1540,12 +1609,12 @@ pub fn handleLabelReserved(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
 
     const event_name = try self.allocator.dupe(u8, full_name);
 
-    try utils.emitEvent(self, chain, log, .label_reserved, event_name, namehash_val, event_data);
+    try utils.emitEvent(self, protocol, log, .label_reserved, event_name, namehash_val, event_data);
 }
 
 /// Handle LabelUnregistered events from PermissionedRegistry
 /// Event: LabelUnregistered(uint256 indexed tokenId, address indexed sender)
-pub fn handleLabelUnregistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleLabelUnregistered(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     if (log.topics.len < 3) return error.InvalidTopicCount;
 
     const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
@@ -1571,8 +1640,8 @@ pub fn handleLabelUnregistered(self: *Indexer, chain: models.Chain, log: rpc.Log
     }
     defer self.allocator.free(name_str);
 
-    const sender_hex = try sender.toHex(self.allocator);
-    defer self.allocator.free(sender_hex);
+    var sender_hex_buf: [42]u8 = undefined;
+    const sender_hex = sender.toHexBuf(&sender_hex_buf);
 
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"tokenId\":{d},\"sender\":\"{s}\"}}", .{
         token_id,
@@ -1581,12 +1650,12 @@ pub fn handleLabelUnregistered(self: *Indexer, chain: models.Chain, log: rpc.Log
 
     const event_name = try self.allocator.dupe(u8, name_str);
 
-    try utils.emitEvent(self, chain, log, .label_unregistered, event_name, namehash_opt, event_data);
+    try utils.emitEvent(self, protocol, log, .label_unregistered, event_name, namehash_opt, event_data);
 }
 
 /// Handle ExpiryUpdated events from PermissionedRegistry (replaces NameRenewed)
 /// Event: ExpiryUpdated(uint256 indexed tokenId, uint64 indexed newExpiry, address indexed sender)
-pub fn handleExpiryUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleExpiryUpdated(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     if (log.topics.len < 4) return error.InvalidTopicCount;
 
     const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
@@ -1611,12 +1680,15 @@ pub fn handleExpiryUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
         var name_copy = n;
         name_copy.deinit(self.allocator);
     } else {
+        // Defensive: with log-index ordering this should not happen for in-batch events.
+        // Reachable on reorg replay or orphaned subregistries not yet linked.
+        std.log.warn("ExpiryUpdated for unknown tokenId={d} in registry {any}; expiry not updated (event still recorded)", .{ token_id, log.address });
         name_str = try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{token_id});
     }
     defer self.allocator.free(name_str);
 
-    const sender_hex = try sender.toHex(self.allocator);
-    defer self.allocator.free(sender_hex);
+    var sender_hex_buf: [42]u8 = undefined;
+    const sender_hex = sender.toHexBuf(&sender_hex_buf);
 
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"tokenId\":{d},\"newExpiry\":{d},\"sender\":\"{s}\"}}", .{
         token_id,
@@ -1626,12 +1698,12 @@ pub fn handleExpiryUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
 
     const event_name = try self.allocator.dupe(u8, name_str);
 
-    try utils.emitEvent(self, chain, log, .expiry_updated, event_name, namehash_opt, event_data);
+    try utils.emitEvent(self, protocol, log, .expiry_updated, event_name, namehash_opt, event_data);
 }
 
 /// Handle ParentUpdated events from PermissionedRegistry
 /// Event: ParentUpdated(IRegistry indexed parent, string label, address indexed sender)
-pub fn handleParentUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleParentUpdated(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     if (log.topics.len < 3) return error.InvalidTopicCount;
 
     const parent_addr = try abi.ABI.decodeAddress(&log.topics[1].bytes, 0);
@@ -1642,10 +1714,10 @@ pub fn handleParentUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
 
     std.log.debug("ParentUpdated: parent={any}, label={s}, sender={any}", .{ parent_addr, label_str, sender });
 
-    const parent_hex = try parent_addr.toHex(self.allocator);
-    defer self.allocator.free(parent_hex);
-    const sender_hex = try sender.toHex(self.allocator);
-    defer self.allocator.free(sender_hex);
+    var parent_hex_buf: [42]u8 = undefined;
+    const parent_hex = parent_addr.toHexBuf(&parent_hex_buf);
+    var sender_hex_buf: [42]u8 = undefined;
+    const sender_hex = sender.toHexBuf(&sender_hex_buf);
 
     const escaped_label = try json_utils.escapeString(self.allocator, label_str);
     defer self.allocator.free(escaped_label);
@@ -1658,13 +1730,13 @@ pub fn handleParentUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
 
     const event_name = try self.allocator.dupe(u8, label_str);
 
-    try utils.emitEvent(self, chain, log, .parent_updated, event_name, null, event_data);
+    try utils.emitEvent(self, protocol, log, .parent_updated, event_name, null, event_data);
 }
 
 /// Handle SubregistryUpdated events from PermissionedRegistry (NEW signature)
 /// Event: SubregistryUpdated(uint256 indexed tokenId, IRegistry indexed subregistry, address indexed sender)
 /// Note: Different from SubregistryUpdate - uses indexed IRegistry instead of non-indexed address
-pub fn handleSubregistryUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleSubregistryUpdated(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     if (log.topics.len < 4) return error.InvalidTopicCount;
 
     const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
@@ -1694,22 +1766,22 @@ pub fn handleSubregistryUpdated(self: *Indexer, chain: models.Chain, log: rpc.Lo
 
     const registry = models.Registry{
         .address = subregistry_addr,
-        .chain = chain,
+        .protocol = protocol,
         .name = name_str,
         .namehash = namehash,
         .parent_registry = log.address,
         .created_block = log.block_number,
-        .created_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        .created_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     };
 
     try self.database.insertRegistry(registry);
 
-    const subreg_hex = try subregistry_addr.toHex(self.allocator);
-    defer self.allocator.free(subreg_hex);
-    const contract_hex = try log.address.toHex(self.allocator);
-    defer self.allocator.free(contract_hex);
-    const sender_hex = try sender.toHex(self.allocator);
-    defer self.allocator.free(sender_hex);
+    var subreg_hex_buf: [42]u8 = undefined;
+    const subreg_hex = subregistry_addr.toHexBuf(&subreg_hex_buf);
+    var contract_hex_buf: [42]u8 = undefined;
+    const contract_hex = log.address.toHexBuf(&contract_hex_buf);
+    var sender_hex_buf: [42]u8 = undefined;
+    const sender_hex = sender.toHexBuf(&sender_hex_buf);
 
     const escaped_name = try json_utils.escapeString(self.allocator, name_str);
     defer self.allocator.free(escaped_name);
@@ -1724,13 +1796,13 @@ pub fn handleSubregistryUpdated(self: *Indexer, chain: models.Chain, log: rpc.Lo
 
     const event_name = try self.allocator.dupe(u8, name_str);
 
-    try utils.emitEvent(self, chain, log, .subregistry_updated, event_name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .subregistry_updated, event_name, namehash, event_data);
 }
 
 /// Handle ResolverUpdated events from PermissionedRegistry (NEW signature)
 /// Event: ResolverUpdated(uint256 indexed tokenId, address indexed resolver, address indexed sender)
 /// Note: Different from ResolverUpdate - uses indexed address
-pub fn handleResolverUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleResolverUpdated(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     if (log.topics.len < 4) return error.InvalidTopicCount;
 
     const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
@@ -1742,9 +1814,9 @@ pub fn handleResolverUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) 
     std.log.debug("ResolverUpdated: tokenId={d}, resolver={any}, sender={any}", .{ token_id, resolver_addr, sender });
 
     // Register the resolver for record indexing
-    const resolver_hex = try resolver_addr.toHex(self.allocator);
-    defer self.allocator.free(resolver_hex);
-    try self.database.registerResolver(chain, resolver_hex, log.block_number);
+    var resolver_hex_buf: [42]u8 = undefined;
+    const resolver_hex = resolver_addr.toHexBuf(&resolver_hex_buf);
+    try self.database.registerResolver(protocol, resolver_hex, log.block_number);
 
     const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
 
@@ -1762,8 +1834,8 @@ pub fn handleResolverUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) 
     }
     defer self.allocator.free(name_str);
 
-    const sender_hex = try sender.toHex(self.allocator);
-    defer self.allocator.free(sender_hex);
+    var sender_hex_buf: [42]u8 = undefined;
+    const sender_hex = sender.toHexBuf(&sender_hex_buf);
 
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"tokenId\":{d},\"resolver\":\"{s}\",\"sender\":\"{s}\"}}", .{
         token_id,
@@ -1773,6 +1845,5 @@ pub fn handleResolverUpdated(self: *Indexer, chain: models.Chain, log: rpc.Log) 
 
     const event_name = try self.allocator.dupe(u8, name_str);
 
-    try utils.emitEvent(self, chain, log, .resolver_updated, event_name, namehash_opt, event_data);
+    try utils.emitEvent(self, protocol, log, .resolver_updated, event_name, namehash_opt, event_data);
 }
-

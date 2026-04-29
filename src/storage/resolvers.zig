@@ -16,14 +16,14 @@ pub fn storeResolverAddress(
     resolver: Address,
     coin_type: u64,
     address: []const u8,
-    chain: models.Chain,
+    protocol: models.Protocol,
     block_number: u64,
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
     const sql =
         \\INSERT OR REPLACE INTO resolver_addresses
-        \\  (namehash, resolver, coin_type, address, chain, block_number, transaction_hash, timestamp, context)
+        \\  (namehash, resolver, coin_type, address, protocol, block_number, transaction_hash, timestamp, context)
         \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
     ;
 
@@ -34,7 +34,7 @@ pub fn storeResolverAddress(
     try q.bindAddress(resolver);
     try q.bindInt64(@intCast(coin_type));
     try q.bindText(address);
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
     try q.bindInt64(timestamp);
@@ -48,14 +48,14 @@ pub fn storeResolverContentHash(
     namehash: Hash,
     resolver: Address,
     content_hash: []const u8,
-    chain: models.Chain,
+    protocol: models.Protocol,
     block_number: u64,
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
     const sql =
         \\INSERT OR REPLACE INTO resolver_contenthashes
-        \\  (namehash, resolver, contenthash, chain, block_number, transaction_hash, timestamp)
+        \\  (namehash, resolver, contenthash, protocol, block_number, transaction_hash, timestamp)
         \\VALUES (?, ?, ?, ?, ?, ?, ?)
     ;
 
@@ -65,7 +65,7 @@ pub fn storeResolverContentHash(
     try q.bindHash(namehash);
     try q.bindAddress(resolver);
     try q.bindText(content_hash);
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
     try q.bindInt64(timestamp);
@@ -80,14 +80,14 @@ pub fn storeResolverText(
     resolver: Address,
     key: []const u8,
     value: []const u8,
-    chain: models.Chain,
+    protocol: models.Protocol,
     block_number: u64,
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
     const sql =
         \\INSERT OR REPLACE INTO resolver_texts
-        \\  (namehash, resolver, key, value, chain, block_number, transaction_hash, timestamp)
+        \\  (namehash, resolver, key, value, protocol, block_number, transaction_hash, timestamp)
         \\VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ;
 
@@ -98,7 +98,7 @@ pub fn storeResolverText(
     try q.bindAddress(resolver);
     try q.bindText(key);
     try q.bindText(value);
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
     try q.bindInt64(timestamp);
@@ -157,7 +157,6 @@ pub fn getAddressRecords(db: *Database, resolver: Address, namehash: Hash) ![]Co
 }
 
 fn readCoinAddresses(db: *Database, q: *Query) ![]CoinAddress {
-
     var addresses: std.ArrayList(CoinAddress) = .{};
     errdefer {
         for (addresses.items) |*addr| {
@@ -257,33 +256,33 @@ pub fn getTextRecord(db: *Database, resolver: Address, namehash: Hash, key: []co
 
 /// Get resolvers to index for a block range
 /// Uses cache table for O(1) lookup, falls back to full scan on first run
-pub fn getResolversToIndex(db: *Database, chain: models.Chain, from_block: u64, to_block: u64) ![][]u8 {
+pub fn getResolversToIndex(db: *Database, protocol: models.Protocol, from_block: u64, to_block: u64) ![][]u8 {
     // First, discover any NEW resolvers from names table (only those set in this block range)
     const discover_sql =
         \\SELECT DISTINCT n.resolver
         \\FROM names n
-        \\LEFT JOIN known_resolvers kr ON kr.chain = n.chain AND kr.address = n.resolver
-        \\WHERE n.chain = ?
+        \\LEFT JOIN known_resolvers kr ON kr.protocol = n.protocol AND kr.address = n.resolver
+        \\WHERE n.protocol = ?
         \\  AND n.resolver != '0x0000000000000000000000000000000000000000'
         \\  AND n.created_block >= ?
         \\  AND n.created_block <= ?
         \\  AND kr.address IS NULL
     ;
 
-    const chain_str = chain.toString();
+    const protocol_str = protocol.toString();
 
     {
         var q = try Query.init(db, discover_sql);
         defer q.deinit();
 
-        try q.bindTextStatic(chain_str);
+        try q.bindTextStatic(protocol_str);
         try q.bindInt64(@intCast(from_block));
         try q.bindInt64(@intCast(to_block));
 
         // Register newly discovered resolvers
         while (try q.step()) {
             if (q.getTextSlice(0)) |addr_slice| {
-                try db.registerResolver(chain, addr_slice, from_block);
+                try db.registerResolver(protocol, addr_slice, from_block);
             }
         }
     }
@@ -291,14 +290,14 @@ pub fn getResolversToIndex(db: *Database, chain: models.Chain, from_block: u64, 
     // Now get ALL known resolvers from cache (very fast)
     const get_sql =
         \\SELECT address FROM known_resolvers
-        \\WHERE chain = ?
+        \\WHERE protocol = ?
         \\ORDER BY address
     ;
 
     var q2 = try Query.init(db, get_sql);
     defer q2.deinit();
 
-    try q2.bindTextStatic(chain_str);
+    try q2.bindTextStatic(protocol_str);
 
     var resolvers: std.ArrayList([]u8) = .{};
     errdefer {
@@ -332,19 +331,19 @@ pub const ResolverDiscoveryResult = struct {
 
 /// Get resolvers to index, also returning which ones were newly discovered in this block range.
 /// Newly discovered resolvers need their historical events backfilled.
-pub fn discoverAndGetResolvers(db: *Database, chain: models.Chain, from_block: u64, to_block: u64) !ResolverDiscoveryResult {
+pub fn discoverAndGetResolvers(db: *Database, protocol: models.Protocol, from_block: u64, to_block: u64) !ResolverDiscoveryResult {
     const discover_sql =
         \\SELECT DISTINCT n.resolver
         \\FROM names n
-        \\LEFT JOIN known_resolvers kr ON kr.chain = n.chain AND kr.address = n.resolver
-        \\WHERE n.chain = ?
+        \\LEFT JOIN known_resolvers kr ON kr.protocol = n.protocol AND kr.address = n.resolver
+        \\WHERE n.protocol = ?
         \\  AND n.resolver != '0x0000000000000000000000000000000000000000'
         \\  AND n.created_block >= ?
         \\  AND n.created_block <= ?
         \\  AND kr.address IS NULL
     ;
 
-    const chain_str = chain.toString();
+    const protocol_str = protocol.toString();
 
     var new_resolvers: std.ArrayList([]u8) = .{};
     errdefer {
@@ -356,13 +355,13 @@ pub fn discoverAndGetResolvers(db: *Database, chain: models.Chain, from_block: u
         var q = try Query.init(db, discover_sql);
         defer q.deinit();
 
-        try q.bindTextStatic(chain_str);
+        try q.bindTextStatic(protocol_str);
         try q.bindInt64(@intCast(from_block));
         try q.bindInt64(@intCast(to_block));
 
         while (try q.step()) {
             if (q.getTextSlice(0)) |addr_slice| {
-                try db.registerResolver(chain, addr_slice, from_block);
+                try db.registerResolver(protocol, addr_slice, from_block);
                 const copy = try db.allocator.dupe(u8, addr_slice);
                 try new_resolvers.append(db.allocator, copy);
             }
@@ -372,14 +371,14 @@ pub fn discoverAndGetResolvers(db: *Database, chain: models.Chain, from_block: u
     // Get ALL known resolvers from cache
     const get_sql =
         \\SELECT address FROM known_resolvers
-        \\WHERE chain = ?
+        \\WHERE protocol = ?
         \\ORDER BY address
     ;
 
     var q2 = try Query.init(db, get_sql);
     defer q2.deinit();
 
-    try q2.bindTextStatic(chain_str);
+    try q2.bindTextStatic(protocol_str);
 
     var resolvers: std.ArrayList([]u8) = .{};
     errdefer {
@@ -400,18 +399,18 @@ pub fn discoverAndGetResolvers(db: *Database, chain: models.Chain, from_block: u
 }
 
 /// Get all distinct resolver addresses set on domains owned by an account
-pub fn getResolversByOwner(db: *Database, chain: models.Chain, owner: Address) ![]models.Resolver {
+pub fn getResolversByOwner(db: *Database, protocol: models.Protocol, owner: Address) ![]models.Resolver {
     const sql =
         \\SELECT DISTINCT n.resolver, n.name, n.namehash, n.created_block, n.created_at
         \\FROM names n
-        \\WHERE n.chain = ? AND n.owner = ? AND n.resolver != '0x0000000000000000000000000000000000000000'
+        \\WHERE n.protocol = ? AND n.owner = ? AND n.resolver != '0x0000000000000000000000000000000000000000'
         \\ORDER BY n.created_at DESC
     ;
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindAddress(owner);
 
     var result: std.ArrayList(models.Resolver) = .{};
@@ -428,7 +427,7 @@ pub fn getResolversByOwner(db: *Database, chain: models.Chain, owner: Address) !
         const namehash_val = try q.getHash(2) orelse continue;
 
         const resolver = models.Resolver{
-            .chain = chain,
+            .protocol = protocol,
             .address = resolver_addr,
             .name = try db.allocator.dupe(u8, name_str),
             .namehash = namehash_val,
@@ -520,14 +519,14 @@ pub fn storeResolverAlias(
     resolver: Address,
     from_name: []const u8,
     to_name: []const u8,
-    chain: models.Chain,
+    protocol: models.Protocol,
     block_number: u64,
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
     const sql =
         \\INSERT OR REPLACE INTO resolver_aliases
-        \\  (resolver, from_name, to_name, chain, block_number, transaction_hash, timestamp)
+        \\  (resolver, from_name, to_name, protocol, block_number, transaction_hash, timestamp)
         \\VALUES (?, ?, ?, ?, ?, ?, ?)
     ;
 
@@ -537,7 +536,7 @@ pub fn storeResolverAlias(
     try q.bindAddress(resolver);
     try q.bindText(from_name);
     try q.bindText(to_name);
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
     try q.bindInt64(timestamp);
@@ -749,14 +748,14 @@ pub fn storeResolverPubkey(
     resolver: Address,
     x: []const u8,
     y: []const u8,
-    chain: models.Chain,
+    protocol: models.Protocol,
     block_number: u64,
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
     const sql =
         \\INSERT OR REPLACE INTO resolver_pubkeys
-        \\  (namehash, resolver, x, y, chain, block_number, transaction_hash, timestamp)
+        \\  (namehash, resolver, x, y, protocol, block_number, transaction_hash, timestamp)
         \\VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ;
 
@@ -767,7 +766,7 @@ pub fn storeResolverPubkey(
     try q.bindAddress(resolver);
     try q.bindText(x);
     try q.bindText(y);
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
     try q.bindInt64(timestamp);
@@ -780,14 +779,14 @@ pub fn storeResolverABI(
     namehash: Hash,
     resolver: Address,
     content_type: u64,
-    chain: models.Chain,
+    protocol: models.Protocol,
     block_number: u64,
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
     const sql =
         \\INSERT OR REPLACE INTO resolver_abis
-        \\  (namehash, resolver, content_type, chain, block_number, transaction_hash, timestamp)
+        \\  (namehash, resolver, content_type, protocol, block_number, transaction_hash, timestamp)
         \\VALUES (?, ?, ?, ?, ?, ?, ?)
     ;
 
@@ -797,7 +796,7 @@ pub fn storeResolverABI(
     try q.bindHash(namehash);
     try q.bindAddress(resolver);
     try q.bindInt64(@intCast(content_type));
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
     try q.bindInt64(timestamp);
@@ -810,14 +809,14 @@ pub fn storeResolverName(
     namehash: Hash,
     resolver: Address,
     name: []const u8,
-    chain: models.Chain,
+    protocol: models.Protocol,
     block_number: u64,
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
     const sql =
         \\INSERT OR REPLACE INTO resolver_names
-        \\  (namehash, resolver, name, chain, block_number, transaction_hash, timestamp)
+        \\  (namehash, resolver, name, protocol, block_number, transaction_hash, timestamp)
         \\VALUES (?, ?, ?, ?, ?, ?, ?)
     ;
 
@@ -827,7 +826,7 @@ pub fn storeResolverName(
     try q.bindHash(namehash);
     try q.bindAddress(resolver);
     try q.bindText(name);
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
     try q.bindInt64(timestamp);
@@ -841,14 +840,14 @@ pub fn storeResolverInterface(
     resolver: Address,
     interface_id: []const u8,
     implementer: []const u8,
-    chain: models.Chain,
+    protocol: models.Protocol,
     block_number: u64,
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
     const sql =
         \\INSERT OR REPLACE INTO resolver_interfaces
-        \\  (namehash, resolver, interface_id, implementer, chain, block_number, transaction_hash, timestamp)
+        \\  (namehash, resolver, interface_id, implementer, protocol, block_number, transaction_hash, timestamp)
         \\VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ;
 
@@ -859,7 +858,7 @@ pub fn storeResolverInterface(
     try q.bindAddress(resolver);
     try q.bindText(interface_id);
     try q.bindText(implementer);
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
     try q.bindInt64(timestamp);
@@ -872,14 +871,14 @@ pub fn storeResolverVersion(
     namehash: Hash,
     resolver: Address,
     version: u64,
-    chain: models.Chain,
+    protocol: models.Protocol,
     block_number: u64,
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
     const sql =
         \\INSERT OR REPLACE INTO resolver_versions
-        \\  (namehash, resolver, version, chain, block_number, transaction_hash, timestamp)
+        \\  (namehash, resolver, version, protocol, block_number, transaction_hash, timestamp)
         \\VALUES (?, ?, ?, ?, ?, ?, ?)
     ;
 
@@ -889,7 +888,7 @@ pub fn storeResolverVersion(
     try q.bindHash(namehash);
     try q.bindAddress(resolver);
     try q.bindInt64(@intCast(version));
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
     try q.bindInt64(timestamp);
@@ -949,7 +948,7 @@ pub fn getResolverRoleHolderCount(db: *Database, resolver: Address) !usize {
 /// Get all EAC role assignments for a resolver contract address
 pub fn getResolverRoles(db: *Database, resolver: Address) ![]models.EACRoleAssignment {
     const sql =
-        \\SELECT r.id, r.chain, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp, n.name
+        \\SELECT r.id, r.protocol, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp, n.name
         \\FROM eac_roles r
         \\LEFT JOIN names n ON r.resource = n.canonical_id AND r.contract_address = n.registry
         \\WHERE r.contract_address = ?
@@ -970,7 +969,7 @@ pub fn getResolverRoles(db: *Database, resolver: Address) ![]models.EACRoleAssig
     }
 
     while (try q.step()) {
-        const chain_col = q.getTextSlice(1) orelse continue;
+        const protocol_col = q.getTextSlice(1) orelse continue;
         const resource_col = q.getTextSlice(2) orelse continue;
         const account_col = q.getTextSlice(3) orelse continue;
         const role_bitmap_col = q.getTextSlice(4) orelse continue;
@@ -984,7 +983,7 @@ pub fn getResolverRoles(db: *Database, resolver: Address) ![]models.EACRoleAssig
 
         const role = models.EACRoleAssignment{
             .id = @intCast(q.getInt64(0)),
-            .chain = try models.Chain.fromString(chain_col),
+            .protocol = try models.Protocol.fromString(protocol_col),
             .resource = try db.allocator.dupe(u8, resource_col),
             .account = try Address.fromHex(account_col),
             .role_bitmap = try db.allocator.dupe(u8, role_bitmap_col),
@@ -998,4 +997,63 @@ pub fn getResolverRoles(db: *Database, resolver: Address) ![]models.EACRoleAssig
     }
 
     return roles.toOwnedSlice(db.allocator);
+}
+
+// ============================================================================
+// REVERSE RECORDS (V1 ReverseClaimed + V2 ETHReverseRegistrar)
+// ============================================================================
+
+/// Upsert the (protocol, address) → namehash reverse-claim binding. Each address
+/// can have at most one current reverse claim per protocol; later claims replace
+/// earlier ones (latest-write-wins, mirroring the contract's behavior).
+pub fn upsertReverseRecord(
+    db: *Database,
+    protocol: models.Protocol,
+    address: Address,
+    namehash: Hash,
+    block_number: u64,
+    tx_hash: Hash,
+    log_index: u32,
+    timestamp: i64,
+) !void {
+    var q = try Query.initCached(db,
+        \\INSERT INTO reverse_records
+        \\  (protocol, address, namehash, block_number, transaction_hash, log_index, timestamp)
+        \\VALUES (?, LOWER(?), ?, ?, ?, ?, ?)
+        \\ON CONFLICT(protocol, address) DO UPDATE SET
+        \\  namehash = excluded.namehash,
+        \\  block_number = excluded.block_number,
+        \\  transaction_hash = excluded.transaction_hash,
+        \\  log_index = excluded.log_index,
+        \\  timestamp = excluded.timestamp
+    );
+    defer q.deinit();
+
+    try q.bindTextStatic(protocol.toString());
+    try q.bindAddress(address);
+    try q.bindHash(namehash);
+    try q.bindInt64(@intCast(block_number));
+    try q.bindHash(tx_hash);
+    try q.bindInt(@intCast(log_index));
+    try q.bindInt64(timestamp);
+    try q.exec();
+}
+
+/// Look up the current reverse-claim namehash for an address on a given protocol.
+/// Returns null if the address has not claimed a reverse on this protocol.
+pub fn getReverseRecordNamehash(db: *Database, protocol: models.Protocol, address: Address) !?Hash {
+    var q = try Query.init(db,
+        \\SELECT namehash FROM reverse_records
+        \\WHERE protocol = ? AND address = LOWER(?)
+        \\LIMIT 1
+    );
+    defer q.deinit();
+
+    try q.bindTextStatic(protocol.toString());
+    try q.bindAddress(address);
+
+    if (try q.step()) {
+        if (q.getTextSlice(0)) |hex| return try Hash.fromHex(hex);
+    }
+    return null;
 }

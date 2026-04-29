@@ -8,17 +8,17 @@
 
 CREATE TABLE IF NOT EXISTS resolver_metadata (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  chain TEXT NOT NULL,
+  protocol TEXT NOT NULL,
   resolver TEXT NOT NULL,           -- Resolver contract address
   graphql_url TEXT NOT NULL,         -- Offchain GraphQL endpoint
   block_number INTEGER NOT NULL,
   transaction_hash TEXT NOT NULL,
   timestamp INTEGER NOT NULL,
-  UNIQUE(chain, resolver)
+  UNIQUE(protocol, resolver)
 );
 
-CREATE INDEX IF NOT EXISTS idx_resolver_metadata_chain ON resolver_metadata(chain);
-CREATE INDEX IF NOT EXISTS idx_resolver_metadata_resolver ON resolver_metadata(chain, resolver);
+CREATE INDEX IF NOT EXISTS idx_resolver_metadata_protocol ON resolver_metadata(protocol);
+CREATE INDEX IF NOT EXISTS idx_resolver_metadata_resolver ON resolver_metadata(protocol, resolver);
 
 -- ============================================================================
 -- RESOLVER APPROVALS (Delegation tracking for ENSIP-16)
@@ -26,7 +26,7 @@ CREATE INDEX IF NOT EXISTS idx_resolver_metadata_resolver ON resolver_metadata(c
 
 CREATE TABLE IF NOT EXISTS resolver_approvals (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  chain TEXT NOT NULL,
+  protocol TEXT NOT NULL,
   resolver TEXT NOT NULL,           -- Resolver contract address
   namehash TEXT NOT NULL,            -- Name being delegated
   context TEXT,                      -- Optional context for namespacing (typically owner address)
@@ -36,13 +36,13 @@ CREATE TABLE IF NOT EXISTS resolver_approvals (
   transaction_hash TEXT NOT NULL,
   log_index INTEGER NOT NULL,
   timestamp INTEGER NOT NULL,
-  UNIQUE(chain, resolver, namehash, context, delegate)
+  UNIQUE(protocol, resolver, namehash, context, delegate)
 );
 
-CREATE INDEX IF NOT EXISTS idx_resolver_approvals_chain ON resolver_approvals(chain);
-CREATE INDEX IF NOT EXISTS idx_resolver_approvals_namehash ON resolver_approvals(chain, namehash);
-CREATE INDEX IF NOT EXISTS idx_resolver_approvals_delegate ON resolver_approvals(chain, delegate);
-CREATE INDEX IF NOT EXISTS idx_resolver_approvals_context ON resolver_approvals(chain, context);
+CREATE INDEX IF NOT EXISTS idx_resolver_approvals_protocol ON resolver_approvals(protocol);
+CREATE INDEX IF NOT EXISTS idx_resolver_approvals_namehash ON resolver_approvals(protocol, namehash);
+CREATE INDEX IF NOT EXISTS idx_resolver_approvals_delegate ON resolver_approvals(protocol, delegate);
+CREATE INDEX IF NOT EXISTS idx_resolver_approvals_context ON resolver_approvals(protocol, context);
 
 -- ============================================================================
 -- UPDATE EXISTING TABLES: Add context field for namespacing
@@ -63,6 +63,6 @@ ALTER TABLE resolver_contenthashes ADD COLUMN context TEXT DEFAULT NULL;
 ALTER TABLE resolver_texts ADD COLUMN context TEXT DEFAULT NULL;
 
 -- Create new indexes for context-aware queries
-CREATE INDEX IF NOT EXISTS idx_resolver_addresses_context ON resolver_addresses(chain, namehash, context);
-CREATE INDEX IF NOT EXISTS idx_resolver_contenthashes_context ON resolver_contenthashes(chain, namehash, context);
-CREATE INDEX IF NOT EXISTS idx_resolver_texts_context ON resolver_texts(chain, namehash, context);
+CREATE INDEX IF NOT EXISTS idx_resolver_addresses_context ON resolver_addresses(protocol, namehash, context);
+CREATE INDEX IF NOT EXISTS idx_resolver_contenthashes_context ON resolver_contenthashes(protocol, namehash, context);
+CREATE INDEX IF NOT EXISTS idx_resolver_texts_context ON resolver_texts(protocol, namehash, context);

@@ -22,7 +22,7 @@ test "Database integration - full workflow" {
     // Test 1: Insert a registry
     const eth_registry = models.Registry{
         .address = try Address.fromHex("0x0000000000000000000000000000000000000001"),
-        .chain = .v2,
+        .protocol = .v2,
         .name = "eth",
         .namehash = try namehash(allocator, "eth"),
         .parent_registry = Address.zero,
@@ -43,7 +43,7 @@ test "Database integration - full workflow" {
             .label_hash = try keccak256(allocator, "alice"),
             .parent_name = try allocator.dupe(u8, "eth"),
             .parent_namehash = try namehash(allocator, "eth"),
-            .chain = .v2,
+            .protocol = .v2,
             .registry = try Address.fromHex("0x0000000000000000000000000000000000000001"),
             .owner = try Address.fromHex("0x0000000000000000000000000000000000000123"),
             .registrant = try Address.fromHex("0x0000000000000000000000000000000000000123"),
@@ -80,7 +80,7 @@ test "Database integration - full workflow" {
         var name = n;
         defer name.deinit(allocator);
         try testing.expectEqualStrings("alice.eth", name.name.?);
-        try testing.expect(name.chain == .v2);
+        try testing.expect(name.protocol == .v2);
         try testing.expect(name.migrated);
         std.debug.print("✓ Name retrieved successfully\n", .{});
     }
@@ -89,7 +89,7 @@ test "Database integration - full workflow" {
     {
         var event = models.Event{
             .event_type = .name_registered,
-            .chain = .v2,
+            .protocol = .v2,
             .block_number = 101,
             .tx_hash = try Hash.fromHex("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"),
             .log_index = 0,
@@ -190,20 +190,20 @@ test "Event type conversion" {
 }
 
 test "Chain type conversion" {
-    const l1 = models.Chain.v1;
-    const l2 = models.Chain.v2;
+    const l1 = models.Protocol.v1;
+    const l2 = models.Protocol.v2;
 
     try testing.expectEqualStrings("v1", l1.toString());
     try testing.expectEqualStrings("v2", l2.toString());
 
-    const l1_parsed = try models.Chain.fromString("v1");
-    const l2_parsed = try models.Chain.fromString("v2");
+    const l1_parsed = try models.Protocol.fromString("v1");
+    const l2_parsed = try models.Protocol.fromString("v2");
 
     try testing.expect(l1_parsed == .v1);
     try testing.expect(l2_parsed == .v2);
 
     std.debug.print("✓ Chain types converted correctly\n", .{});
-    std.debug.print("\n✅ All chain type tests passed!\n", .{});
+    std.debug.print("\n✅ All protocol type tests passed!\n", .{});
 }
 
 test "Multiple name insertions and queries" {
@@ -226,7 +226,7 @@ test "Multiple name insertions and queries" {
             .label_hash = try keccak256(allocator, name_str[0 .. name_str.len - 4]),
             .parent_name = try allocator.dupe(u8, "eth"),
             .parent_namehash = try namehash(allocator, "eth"),
-            .chain = .v2,
+            .protocol = .v2,
             .registry = try Address.fromHex("0x0000000000000000000000000000000000000001"),
             .owner = try Address.fromHex("0x0000000000000000000000000000000000000123"),
             .registrant = try Address.fromHex("0x0000000000000000000000000000000000000123"),
@@ -286,7 +286,7 @@ test "Name expiry checking" {
         .label_hash = try keccak256(allocator, "expired"),
         .parent_name = try allocator.dupe(u8, "eth"),
         .parent_namehash = try namehash(allocator, "eth"),
-        .chain = .v2,
+        .protocol = .v2,
         .registry = Address.zero,
         .owner = Address.zero,
         .registrant = Address.zero,
@@ -320,7 +320,7 @@ test "Name expiry checking" {
         .label_hash = try keccak256(allocator, "valid"),
         .parent_name = try allocator.dupe(u8, "eth"),
         .parent_namehash = try namehash(allocator, "eth"),
-        .chain = .v2,
+        .protocol = .v2,
         .registry = Address.zero,
         .owner = Address.zero,
         .registrant = Address.zero,
@@ -375,7 +375,7 @@ test "reorg rollback deletes derived state created after the block" {
         .label_hash = try keccak256(allocator, "late"),
         .parent_name = try allocator.dupe(u8, "eth"),
         .parent_namehash = try namehash(allocator, "eth"),
-        .chain = .v2,
+        .protocol = .v2,
         .registry = try Address.fromHex("0x0000000000000000000000000000000000000001"),
         .owner = try Address.fromHex("0x0000000000000000000000000000000000000aaa"),
         .registrant = try Address.fromHex("0x0000000000000000000000000000000000000aaa"),
@@ -408,7 +408,7 @@ test "reorg rollback deletes derived state created after the block" {
         .label_hash = try keccak256(allocator, "early"),
         .parent_name = try allocator.dupe(u8, "eth"),
         .parent_namehash = try namehash(allocator, "eth"),
-        .chain = .v2,
+        .protocol = .v2,
         .registry = try Address.fromHex("0x0000000000000000000000000000000000000001"),
         .owner = try Address.fromHex("0x0000000000000000000000000000000000000bbb"),
         .registrant = try Address.fromHex("0x0000000000000000000000000000000000000bbb"),
@@ -436,7 +436,7 @@ test "reorg rollback deletes derived state created after the block" {
     // Also seed an event after the reorg block
     const late_event = models.Event{
         .event_type = .name_registered,
-        .chain = .v2,
+        .protocol = .v2,
         .block_number = 200,
         .tx_hash = try Hash.fromHex("0x0000000000000000000000000000000000000000000000000000000000000abc"),
         .log_index = 0,
@@ -485,7 +485,7 @@ test "where.name filter combined with isMigrated respects both" {
         .label_hash = try keccak256(allocator, "foo"),
         .parent_name = try allocator.dupe(u8, "eth"),
         .parent_namehash = try namehash(allocator, "eth"),
-        .chain = .v2,
+        .protocol = .v2,
         .registry = try Address.fromHex("0x0000000000000000000000000000000000000001"),
         .owner = try Address.fromHex("0x0000000000000000000000000000000000000111"),
         .registrant = try Address.fromHex("0x0000000000000000000000000000000000000111"),

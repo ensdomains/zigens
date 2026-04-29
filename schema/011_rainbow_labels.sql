@@ -1,5 +1,5 @@
 -- Rainbow table for caching labelhash → label mappings
--- This table is populated automatically as we index the chain from:
+-- This table is populated automatically as we index the protocol from:
 --   1. V1 Controller NameRegistered events (contains label text)
 --   2. Transaction calldata decoding (setSubnodeOwner/setSubnodeRecord)
 --   3. Other wrapper patterns we can decode

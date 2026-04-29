@@ -12,7 +12,7 @@ const utils = @import("../utils.zig");
 /// Dynamically adjusts chunk size based on event density to optimize RPC calls
 pub fn indexV1EventsChunked(
     self: *Indexer,
-    chain: models.Chain,
+    protocol: models.Protocol,
     client: *rpc.Client,
     from_block: u64,
     to_block: u64,
@@ -55,7 +55,11 @@ pub fn indexV1EventsChunked(
             const chunk_end = @min(chunk_start + retry_chunk_size - 1, to_block);
             const blocks_in_chunk = chunk_end - chunk_start + 1;
 
-            std.log.info("Indexing V1 {s} events from blocks {d}-{d} (chunk_size={d}, predicted_density={d:.2} events/block)", .{
+            // Log the protocol the caller passed (v1 / v2) instead of a hardcoded "V1";
+            // V2 callers (e.g. the V2 reverse-registrar fetcher) reuse this chunked helper
+            // and previously produced confusing "Indexing V1 V2 Reverse Registrar …" lines.
+            std.log.info("Indexing {s} {s} events from blocks {d}-{d} (chunk_size={d}, predicted_density={d:.2} events/block)", .{
+                protocol.toString(),
                 contract_name,
                 chunk_start,
                 chunk_end,
@@ -114,15 +118,16 @@ pub fn indexV1EventsChunked(
                 total_events += logs.len;
 
                 if (logs.len > 0) {
-                    std.log.info("  Found {d} V1 {s} event{s}", .{
+                    std.log.info("  Found {d} {s} {s} event{s}", .{
                         logs.len,
+                        protocol.toString(),
                         event_cfg.name,
                         if (logs.len == 1) "" else "s",
                     });
                 }
 
                 for (logs) |log| {
-                    try event_cfg.handler(self, chain, log);
+                    try event_cfg.handler(self, protocol, log);
                 }
             }
 
@@ -177,12 +182,12 @@ pub fn indexV1EventsChunked(
 /// Uses topic0 OR matching to combine event types per contract, reducing ~18 RPC sub-requests to ~5
 /// Processing order: ETH Controller → Base Registrar → ENS Registry → Name Wrapper → Reverse Registrar
 /// (ETH Controller must be first because it provides label text that Base Registrar handlers need)
-pub fn indexAllV1Events(self: *Indexer, chain: models.Chain, client: *rpc.Client, from_block: u64, to_block: u64) !void {
-    if (chain != .v1) return; // V1 events only exist on mainnet L1
+pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64, to_block: u64) !void {
+    if (protocol != .v1) return; // V1 events only exist on mainnet L1
 
     // Index Temporary Registrar events FIRST (for pre-migration blocks only)
     // This function internally checks block ranges and only indexes before block 9380410
-    try indexTempRegistrarEvents(self, chain, client, from_block, to_block);
+    try indexTempRegistrarEvents(self, protocol, client, from_block, to_block);
 
     // Predictive adaptive chunk sizing
     const MIN_CHUNK_SIZE: u64 = constants.RpcBatching.min_chunk_size;
@@ -385,7 +390,7 @@ pub fn indexAllV1Events(self: *Indexer, chain: models.Chain, client: *rpc.Client
                 if (log.topics.len == 0) continue;
                 inline for (Indexer.V1_ETH_CONTROLLER_EVENTS) |cfg| {
                     if (log.topics[0].eql(cfg.event_hash)) {
-                        try cfg.handler(self, chain, log);
+                        try cfg.handler(self, protocol, log);
                         break;
                     }
                 }
@@ -400,7 +405,7 @@ pub fn indexAllV1Events(self: *Indexer, chain: models.Chain, client: *rpc.Client
                 if (log.topics.len == 0) continue;
                 inline for (Indexer.V1_BASE_REGISTRAR_EVENTS) |cfg| {
                     if (log.topics[0].eql(cfg.event_hash)) {
-                        try cfg.handler(self, chain, log);
+                        try cfg.handler(self, protocol, log);
                         break;
                     }
                 }
@@ -415,7 +420,7 @@ pub fn indexAllV1Events(self: *Indexer, chain: models.Chain, client: *rpc.Client
                 if (log.topics.len == 0) continue;
                 inline for (Indexer.V1_REGISTRY_EVENTS) |cfg| {
                     if (log.topics[0].eql(cfg.event_hash)) {
-                        try cfg.handler(self, chain, log);
+                        try cfg.handler(self, protocol, log);
                         break;
                     }
                 }
@@ -434,7 +439,7 @@ pub fn indexAllV1Events(self: *Indexer, chain: models.Chain, client: *rpc.Client
                     if (log.topics.len == 0) continue;
                     inline for (Indexer.V1_NAME_WRAPPER_EVENTS) |cfg| {
                         if (log.topics[0].eql(cfg.event_hash)) {
-                            try cfg.handler(self, chain, log);
+                            try cfg.handler(self, protocol, log);
                             break;
                         }
                     }
@@ -450,7 +455,7 @@ pub fn indexAllV1Events(self: *Indexer, chain: models.Chain, client: *rpc.Client
                 if (log.topics.len == 0) continue;
                 inline for (Indexer.V1_REVERSE_REGISTRAR_EVENTS) |cfg| {
                     if (log.topics[0].eql(cfg.event_hash)) {
-                        try cfg.handler(self, chain, log);
+                        try cfg.handler(self, protocol, log);
                         break;
                     }
                 }
@@ -538,8 +543,8 @@ pub fn indexAllV1Events(self: *Indexer, chain: models.Chain, client: *rpc.Client
 /// Temporary Registrar: AuctionStarted, NewBid, BidRevealed, HashRegistered, HashReleased, HashInvalidated
 /// Old ENS Registry (0x314159...): NewOwner, Transfer, NewResolver, NewTTL
 /// Active from May 2017 (block 3327417) to May 2019 (block 9380410)
-pub fn indexTempRegistrarEvents(self: *Indexer, chain: models.Chain, client: *rpc.Client, from_block: u64, to_block: u64) !void {
-    if (chain != .v1) return; // Temporary Registrar only exists on mainnet L1
+pub fn indexTempRegistrarEvents(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64, to_block: u64) !void {
+    if (protocol != .v1) return; // Temporary Registrar only exists on mainnet L1
 
     // V1 Permanent Registrar migration block (from contract config)
     const v1_migration_block = self.config.v1_contracts.v1_migration_block;
@@ -666,7 +671,7 @@ pub fn indexTempRegistrarEvents(self: *Indexer, chain: models.Chain, client: *rp
                 }
 
                 for (logs) |log| {
-                    try pair.config.handler(self, chain, log);
+                    try pair.config.handler(self, protocol, log);
                 }
             }
 
@@ -705,11 +710,11 @@ pub fn indexTempRegistrarEvents(self: *Indexer, chain: models.Chain, client: *rp
 
 /// Index V1 ENS Registry events (only on L1/mainnet)
 /// NewOwner, Transfer, NewResolver, NewTTL
-pub fn indexV1RegistryEvents(self: *Indexer, chain: models.Chain, client: *rpc.Client, from_block: u64, to_block: u64) !void {
-    if (chain != .v1) return; // V1 events only exist on mainnet L1
+pub fn indexV1RegistryEvents(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64, to_block: u64) !void {
+    if (protocol != .v1) return; // V1 events only exist on mainnet L1
     try indexV1EventsChunked(
         self,
-        chain,
+        protocol,
         client,
         from_block,
         to_block,
@@ -721,8 +726,8 @@ pub fn indexV1RegistryEvents(self: *Indexer, chain: models.Chain, client: *rpc.C
 
 /// Index V1 Name Wrapper events (only on L1/mainnet, from block 15628465)
 /// NameWrapped, NameUnwrapped, FusesSet, ExpiryExtended
-pub fn indexV1NameWrapperEvents(self: *Indexer, chain: models.Chain, client: *rpc.Client, from_block: u64, to_block: u64) !void {
-    if (chain != .v1) return; // V1 events only exist on mainnet L1
+pub fn indexV1NameWrapperEvents(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64, to_block: u64) !void {
+    if (protocol != .v1) return; // V1 events only exist on mainnet L1
 
     // Name Wrapper deployment block (from contract config)
     const name_wrapper_deployment = self.config.v1_contracts.name_wrapper_deployment_block;
@@ -733,7 +738,7 @@ pub fn indexV1NameWrapperEvents(self: *Indexer, chain: models.Chain, client: *rp
 
     try indexV1EventsChunked(
         self,
-        chain,
+        protocol,
         client,
         adjusted_from_block,
         to_block,
@@ -745,11 +750,11 @@ pub fn indexV1NameWrapperEvents(self: *Indexer, chain: models.Chain, client: *rp
 
 /// Index V1 Base Registrar events (only on L1/mainnet)
 /// ERC721 Transfer, NameRegistered, NameRenewed
-pub fn indexV1BaseRegistrarEvents(self: *Indexer, chain: models.Chain, client: *rpc.Client, from_block: u64, to_block: u64) !void {
-    if (chain != .v1) return; // V1 events only exist on mainnet L1
+pub fn indexV1BaseRegistrarEvents(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64, to_block: u64) !void {
+    if (protocol != .v1) return; // V1 events only exist on mainnet L1
     try indexV1EventsChunked(
         self,
-        chain,
+        protocol,
         client,
         from_block,
         to_block,
@@ -761,11 +766,11 @@ pub fn indexV1BaseRegistrarEvents(self: *Indexer, chain: models.Chain, client: *
 
 /// Index V1 Reverse Registrar events (only on L1/mainnet)
 /// ReverseClaimed
-pub fn indexV1ReverseRegistrarEvents(self: *Indexer, chain: models.Chain, client: *rpc.Client, from_block: u64, to_block: u64) !void {
-    if (chain != .v1) return; // V1 events only exist on mainnet L1
+pub fn indexV1ReverseRegistrarEvents(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64, to_block: u64) !void {
+    if (protocol != .v1) return; // V1 events only exist on mainnet L1
     try indexV1EventsChunked(
         self,
-        chain,
+        protocol,
         client,
         from_block,
         to_block,

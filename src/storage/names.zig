@@ -27,13 +27,13 @@ fn safeU64ToI64(val: u64) i64 {
 
 /// Standard SELECT columns for names table (27 columns)
 /// Column order: name(0), label(1), label_hash(2), parent_name(3), parent_namehash(4),
-///               chain(5), registry(6), owner(7), registrant(8), resolver(9),
+///               protocol(5), registry(6), owner(7), registrant(8), resolver(9),
 ///               token_id(10), canonical_id(11), token_version(12), namehash(13), expiry(14),
 ///               registry_locked(15), migrated(16), created_block(17), created_at(18),
 ///               registered_at(19), updated_block(20), updated_at(21), is_wrapped(22), wrapper_fuses(23),
 ///               wrapper_expiry(24), is_v1_name(25), v1_label_hash(26)
 const SQL_SELECT_NAMES =
-    \\SELECT name, label, label_hash, parent_name, parent_namehash, chain, registry,
+    \\SELECT name, label, label_hash, parent_name, parent_namehash, protocol, registry,
     \\       owner, registrant, resolver, token_id, canonical_id, token_version, namehash, expiry,
     \\       registry_locked, migrated, created_block, created_at, registered_at, updated_block, updated_at,
     \\       is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash
@@ -42,7 +42,7 @@ const SQL_SELECT_NAMES =
 
 /// Shorter SELECT for queries that don't need wrapper fields
 const SQL_SELECT_NAMES_SHORT =
-    \\SELECT name, label, label_hash, parent_name, parent_namehash, chain, registry,
+    \\SELECT name, label, label_hash, parent_name, parent_namehash, protocol, registry,
     \\       owner, registrant, resolver, token_id, canonical_id, token_version, namehash, expiry,
     \\       registry_locked, migrated, created_block, created_at, registered_at, updated_block, updated_at
     \\FROM names
@@ -63,6 +63,13 @@ fn formatU256Hex(allocator: std.mem.Allocator, value: u256) ![]u8 {
     return try std.fmt.allocPrint(allocator, "0x{x:0>64}", .{value});
 }
 
+/// Stack-buffer variant of `formatU256Hex` — writes "0x" + 64 hex chars (66 bytes)
+/// directly into a caller-provided fixed buffer. Avoids the per-call heap alloc on
+/// per-event hot paths (`insertName` token_id/canonical_id, token regen lookups).
+fn formatU256HexBuf(buf: *[66]u8, value: u256) []const u8 {
+    return std.fmt.bufPrint(buf, "0x{x:0>64}", .{value}) catch unreachable;
+}
+
 /// Parse a Name model from a Query result row
 /// Expects columns in SQL_SELECT_NAMES order (27 columns with wrapper fields)
 fn parseNameRow(q: *Query, allocator: std.mem.Allocator) !models.Name {
@@ -71,7 +78,7 @@ fn parseNameRow(q: *Query, allocator: std.mem.Allocator) !models.Name {
     const label_hash_str = q.getTextSlice(2) orelse "";
     const parent_name_str = q.getTextSlice(3) orelse "";
     const parent_hash_str = q.getTextSlice(4) orelse "";
-    const chain_str = q.getTextSlice(5) orelse models.Chain.v2.toString();
+    const protocol_str = q.getTextSlice(5) orelse models.Protocol.v2.toString();
     const registry_str = q.getTextSlice(6) orelse "";
     const owner_str = q.getTextSlice(7) orelse "";
     const registrant_str = q.getTextSlice(8);
@@ -97,7 +104,7 @@ fn parseNameRow(q: *Query, allocator: std.mem.Allocator) !models.Name {
         .label_hash = try Hash.fromHex(label_hash_str),
         .parent_name = try allocator.dupe(u8, parent_name_str),
         .parent_namehash = try Hash.fromHex(parent_hash_str),
-        .chain = try models.Chain.fromString(chain_str),
+        .protocol = try models.Protocol.fromString(protocol_str),
         .registry = try Address.fromHex(registry_str),
         .owner = try Address.fromHex(owner_str),
         .registrant = registrant,
@@ -129,7 +136,7 @@ fn parseNameRowShort(q: *Query, allocator: std.mem.Allocator) !models.Name {
     const label_hash_str = q.getTextSlice(2) orelse "";
     const parent_name_str = q.getTextSlice(3) orelse "";
     const parent_hash_str = q.getTextSlice(4) orelse "";
-    const chain_str = q.getTextSlice(5) orelse models.Chain.v2.toString();
+    const protocol_str = q.getTextSlice(5) orelse models.Protocol.v2.toString();
     const registry_str = q.getTextSlice(6) orelse "";
     const owner_str = q.getTextSlice(7) orelse "";
     const registrant_str = q.getTextSlice(8);
@@ -149,7 +156,7 @@ fn parseNameRowShort(q: *Query, allocator: std.mem.Allocator) !models.Name {
         .label_hash = try Hash.fromHex(label_hash_str),
         .parent_name = try allocator.dupe(u8, parent_name_str),
         .parent_namehash = try Hash.fromHex(parent_hash_str),
-        .chain = try models.Chain.fromString(chain_str),
+        .protocol = try models.Protocol.fromString(protocol_str),
         .registry = try Address.fromHex(registry_str),
         .owner = try Address.fromHex(owner_str),
         .registrant = registrant,
@@ -184,13 +191,13 @@ pub fn insertRegistry(db: *Database, registry: models.Registry) !void {
     // was first created, which is needed for correct temporal parent lookups.
     var q = try Query.init(db,
         \\INSERT OR IGNORE INTO registries
-        \\(address, chain, name, namehash, parent_registry, created_block, created_at)
+        \\(address, protocol, name, namehash, parent_registry, created_block, created_at)
         \\VALUES (?, ?, ?, ?, ?, ?, ?)
     );
     defer q.deinit();
 
     try q.bindAddress(registry.address);
-    try q.bindTextStatic(registry.chain.toString());
+    try q.bindTextStatic(registry.protocol.toString());
     try q.bindText(registry.name);
     try q.bindHash(registry.namehash);
     try q.bindAddress(registry.parent_registry);
@@ -199,21 +206,19 @@ pub fn insertRegistry(db: *Database, registry: models.Registry) !void {
     try q.exec();
 }
 
-/// Update a registry that was created with a canonicalId placeholder name to use the actual name
-/// Also updates any names that used this placeholder as their parent_name
+/// Update a registry that was created with a canonicalId placeholder name to use the actual name.
+/// Also updates names that used this placeholder as parent_name, and events stored with the
+/// placeholder in their name/namehash columns (see updatePlaceholderEventsByName for event payload
+/// handling — we only patch the indexed columns, not the raw JSON data blob).
 pub fn updateRegistryPlaceholderName(db: *Database, placeholder_name: []const u8, actual_name: []const u8, namehash: Hash) !u32 {
-    // First update the registry
     var reg_q = try Query.init(db, "UPDATE registries SET name = ?, namehash = ? WHERE name = ?");
     defer reg_q.deinit();
-
     try reg_q.bindText(actual_name);
     try reg_q.bindHash(namehash);
     try reg_q.bindText(placeholder_name);
     try reg_q.exec();
-
     const registry_changes = reg_q.changes();
 
-    // Now update any names that used this placeholder as parent_name
     var names_q = try Query.init(db,
         \\UPDATE names
         \\SET parent_name = ?,
@@ -222,42 +227,58 @@ pub fn updateRegistryPlaceholderName(db: *Database, placeholder_name: []const u8
         \\WHERE parent_name = ?
     );
     defer names_q.deinit();
-
     try names_q.bindText(actual_name);
     try names_q.bindHash(namehash);
     try names_q.bindText(actual_name);
     try names_q.bindText(placeholder_name);
     try names_q.exec();
-
     const names_changes = names_q.changes();
 
-    if (registry_changes > 0 or names_changes > 0) {
-        std.log.info("Updated placeholder '{s}' -> '{s}': {d} registries, {d} names", .{
-            placeholder_name, actual_name, registry_changes, names_changes,
+    const event_changes = try updatePlaceholderEventsByName(db, placeholder_name, actual_name, namehash);
+
+    if (registry_changes > 0 or names_changes > 0 or event_changes > 0) {
+        // Debug-level: this fires once per migrated/registered name during a sync,
+        // generating thousands of identical info lines on a fresh Sepolia reindex.
+        std.log.debug("Updated placeholder '{s}' -> '{s}': {d} registries, {d} names, {d} events", .{
+            placeholder_name, actual_name, registry_changes, names_changes, event_changes,
         });
     }
 
-    return registry_changes + names_changes;
+    return registry_changes + names_changes + event_changes;
 }
 
-pub fn getRegistriesByOwner(db: *Database, chain: models.Chain, owner: Address) ![]models.Registry {
+/// Patch events stored with a placeholder name (either "canonicalId:N" from SubregistryUpdated or
+/// "tokenId:N" from ResolverUpdated) once the name is known. Updates the top-level name/namehash
+/// columns only; the raw JSON data blob is left intact as a historical record of what the handler
+/// decoded at event-process time.
+pub fn updatePlaceholderEventsByName(db: *Database, placeholder_name: []const u8, actual_name: []const u8, namehash: Hash) !u32 {
+    var q = try Query.init(db, "UPDATE events SET name = ?, namehash = ? WHERE name = ?");
+    defer q.deinit();
+    try q.bindText(actual_name);
+    try q.bindHash(namehash);
+    try q.bindText(placeholder_name);
+    try q.exec();
+    return q.changes();
+}
+
+pub fn getRegistriesByOwner(db: *Database, protocol: models.Protocol, owner: Address) ![]models.Registry {
     // Join registries with names on namehash to find registries where the NAME is owned by the specified owner
     // This returns registries for names that the owner controls (not registries that the owner's names use as subregistries)
     // Only returns the LATEST (most recent) registry per name to avoid duplicates when subregistry is updated
     var q = try Query.init(db,
-        \\SELECT r.address, r.chain, r.name, r.namehash, r.parent_registry, r.created_block, r.created_at
+        \\SELECT r.address, r.protocol, r.name, r.namehash, r.parent_registry, r.created_block, r.created_at
         \\FROM registries r
-        \\JOIN names n ON r.namehash = n.namehash AND r.chain = n.chain
-        \\WHERE r.chain = ? AND n.owner = ?
+        \\JOIN names n ON r.namehash = n.namehash AND r.protocol = n.protocol
+        \\WHERE r.protocol = ? AND n.owner = ?
         \\AND r.created_block = (
         \\    SELECT MAX(r2.created_block)
         \\    FROM registries r2
-        \\    WHERE r2.namehash = r.namehash AND r2.chain = r.chain
+        \\    WHERE r2.namehash = r.namehash AND r2.protocol = r.protocol
         \\)
     );
     defer q.deinit();
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindAddress(owner);
 
     var registries: std.ArrayList(models.Registry) = .{};
@@ -270,14 +291,14 @@ pub fn getRegistriesByOwner(db: *Database, chain: models.Chain, owner: Address) 
 
     while (try q.step()) {
         const address_str = q.getTextSlice(0) orelse continue;
-        const chain_str = q.getTextSlice(1) orelse continue;
+        const protocol_str = q.getTextSlice(1) orelse continue;
         const name_str = q.getTextSlice(2) orelse "";
         const namehash_str = q.getTextSlice(3) orelse continue;
         const parent_str = q.getTextSlice(4) orelse continue;
 
         try registries.append(db.allocator, .{
             .address = try Address.fromHex(address_str),
-            .chain = try models.Chain.fromString(chain_str),
+            .protocol = try models.Protocol.fromString(protocol_str),
             .name = try db.allocator.dupe(u8, name_str),
             .namehash = try Hash.fromHex(namehash_str),
             .parent_registry = try Address.fromHex(parent_str),
@@ -296,12 +317,12 @@ pub fn getRegistriesByOwner(db: *Database, chain: models.Chain, owner: Address) 
 pub fn insertName(db: *Database, name: models.Name) !void {
     var q = try Query.initCached(db,
         \\INSERT INTO names
-        \\(namehash, name, label, label_hash, parent_name, parent_namehash, chain,
+        \\(namehash, name, label, label_hash, parent_name, parent_namehash, protocol,
         \\ registry, owner, registrant, resolver, token_id, canonical_id, token_version, expiry,
         \\ registry_locked, migrated, created_block, created_at, registered_at, updated_block, updated_at,
         \\ is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash)
         \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        \\ON CONFLICT(chain, namehash) DO UPDATE SET
+        \\ON CONFLICT(protocol, namehash) DO UPDATE SET
         \\ name = excluded.name,
         \\ label = excluded.label,
         \\ label_hash = excluded.label_hash,
@@ -328,11 +349,12 @@ pub fn insertName(db: *Database, name: models.Name) !void {
     );
     defer q.deinit();
 
-    // Format token IDs as hex strings
-    const token_id_hex = try formatU256Hex(db.allocator, name.token_id);
-    defer db.allocator.free(token_id_hex);
-    const canonical_id_hex = try formatU256Hex(db.allocator, name.canonical_id);
-    defer db.allocator.free(canonical_id_hex);
+    // Format token IDs as hex strings into stack buffers — both are exactly 66 chars
+    // ("0x" + 64 hex). Avoids two heap allocs per insertName call.
+    var token_id_buf: [66]u8 = undefined;
+    const token_id_hex = formatU256HexBuf(&token_id_buf, name.token_id);
+    var canonical_id_buf: [66]u8 = undefined;
+    const canonical_id_hex = formatU256HexBuf(&canonical_id_buf, name.canonical_id);
 
     try q.bindHash(name.namehash);
     try q.bindOptionalText(name.name);
@@ -340,7 +362,7 @@ pub fn insertName(db: *Database, name: models.Name) !void {
     try q.bindHash(name.label_hash);
     try q.bindOptionalText(name.parent_name);
     try q.bindHash(name.parent_namehash);
-    try q.bindTextStatic(name.chain.toString());
+    try q.bindTextStatic(name.protocol.toString());
     try q.bindAddress(name.registry);
     try q.bindAddress(name.owner);
     try q.bindAddress(name.registrant);
@@ -386,6 +408,20 @@ pub fn updateNameOwner(db: *Database, namehash: Hash, new_owner: Address) !void 
     try q.exec();
 }
 
+/// Mark a V1 name as migrated to V2, updating owner to the migration controller.
+/// Sets migrated=true so the API can distinguish live V1 names from those that
+/// have been transferred to a V1→V2 migration controller (which is functionally
+/// "no longer ownable on V1").
+pub fn markNameMigrated(db: *Database, namehash: Hash, controller: Address) !void {
+    var q = try Query.initCached(db, "UPDATE names SET owner = ?, migrated = 1, updated_at = ? WHERE namehash = ?");
+    defer q.deinit();
+
+    try q.bindAddressBuf(controller);
+    try q.bindInt64(std.time.timestamp());
+    try q.bindHashBuf(namehash);
+    try q.exec();
+}
+
 /// Update name resolver
 pub fn updateNameResolver(db: *Database, namehash: Hash, resolver: Address) !void {
     var q = try Query.initCached(db, "UPDATE names SET resolver = ?, updated_at = ? WHERE namehash = ?");
@@ -399,7 +435,7 @@ pub fn updateNameResolver(db: *Database, namehash: Hash, resolver: Address) !voi
 
 /// Delete a name by its namehash (registry-safe: only deletes the exact name)
 pub fn deleteNameByNamehash(db: *Database, namehash: Hash) !void {
-    var q = try Query.init(db, "DELETE FROM names WHERE namehash = ?");
+    var q = try Query.initCached(db, "DELETE FROM names WHERE namehash = ?");
     defer q.deinit();
 
     try q.bindHashBuf(namehash);
@@ -412,11 +448,11 @@ pub fn updateNameTokenIdByNamehash(db: *Database, namehash: Hash, new_token_id: 
     const token_id_utils = @import("../types/token_id.zig");
     const token_version = token_id_utils.getTokenVersion(new_token_id);
 
-    var q = try Query.init(db, "UPDATE names SET token_id = ?, token_version = ?, updated_at = ? WHERE namehash = ?");
+    var q = try Query.initCached(db, "UPDATE names SET token_id = ?, token_version = ?, updated_at = ? WHERE namehash = ?");
     defer q.deinit();
 
-    const new_token_id_hex = try formatU256Hex(db.allocator, new_token_id);
-    defer db.allocator.free(new_token_id_hex);
+    var new_token_id_buf: [66]u8 = undefined;
+    const new_token_id_hex = formatU256HexBuf(&new_token_id_buf, new_token_id);
 
     try q.bindText(new_token_id_hex);
     try q.bindInt64(@intCast(token_version));
@@ -427,14 +463,15 @@ pub fn updateNameTokenIdByNamehash(db: *Database, namehash: Hash, new_token_id: 
 
 /// Update wrapper state for a name
 pub fn updateNameWrapperState(db: *Database, namehash: Hash, fuses: u32, expiry: u64) !void {
-    var q = try Query.init(db,
+    var q = try Query.initCached(db,
         \\UPDATE names SET is_wrapped = 1, wrapper_fuses = ?, wrapper_expiry = ?,
         \\updated_at = ? WHERE namehash = ?
     );
     defer q.deinit();
 
-    const fuses_str = try std.fmt.allocPrint(db.allocator, "{d}", .{fuses});
-    defer db.allocator.free(fuses_str);
+    // u32 max = 10 decimal digits — stack buffer suffices, no heap alloc per event.
+    var fuses_buf: [16]u8 = undefined;
+    const fuses_str = try std.fmt.bufPrint(&fuses_buf, "{d}", .{fuses});
 
     try q.bindText(fuses_str);
     try q.bindInt64(safeU64ToI64(expiry));
@@ -445,7 +482,7 @@ pub fn updateNameWrapperState(db: *Database, namehash: Hash, fuses: u32, expiry:
 
 /// Clear wrapper state for a name (unwrap)
 pub fn updateNameUnwrapperState(db: *Database, namehash: Hash) !void {
-    var q = try Query.init(db,
+    var q = try Query.initCached(db,
         \\UPDATE names SET is_wrapped = 0, wrapper_fuses = NULL, wrapper_expiry = NULL,
         \\updated_at = ? WHERE namehash = ?
     );
@@ -458,13 +495,13 @@ pub fn updateNameUnwrapperState(db: *Database, namehash: Hash) !void {
 
 /// Update wrapper fuses only
 pub fn updateNameWrapperFuses(db: *Database, namehash: Hash, fuses: u32) !void {
-    var q = try Query.init(db,
+    var q = try Query.initCached(db,
         \\UPDATE names SET wrapper_fuses = ?, updated_at = ? WHERE namehash = ?
     );
     defer q.deinit();
 
-    const fuses_str = try std.fmt.allocPrint(db.allocator, "{d}", .{fuses});
-    defer db.allocator.free(fuses_str);
+    var fuses_buf: [16]u8 = undefined;
+    const fuses_str = try std.fmt.bufPrint(&fuses_buf, "{d}", .{fuses});
 
     try q.bindText(fuses_str);
     try q.bindInt64(std.time.timestamp());
@@ -474,7 +511,7 @@ pub fn updateNameWrapperFuses(db: *Database, namehash: Hash, fuses: u32) !void {
 
 /// Update wrapper expiry only
 pub fn updateNameWrapperExpiry(db: *Database, namehash: Hash, expiry: u64) !void {
-    var q = try Query.init(db,
+    var q = try Query.initCached(db,
         \\UPDATE names SET wrapper_expiry = ?, updated_at = ? WHERE namehash = ?
     );
     defer q.deinit();
@@ -487,7 +524,7 @@ pub fn updateNameWrapperExpiry(db: *Database, namehash: Hash, expiry: u64) !void
 
 /// Update label and name fields for a name record (used by label healing)
 pub fn updateNameLabel(database: *Database, namehash: Hash, label: []const u8, name: []const u8) !void {
-    var q = try Query.init(database,
+    var q = try Query.initCached(database,
         \\UPDATE names SET label = ?, name = ?
         \\WHERE namehash = ?
     );
@@ -501,7 +538,7 @@ pub fn updateNameLabel(database: *Database, namehash: Hash, label: []const u8, n
 
 /// Update creation date if the new block is earlier (for backfill scenarios)
 pub fn updateNameCreationDateIfEarlier(db: *Database, namehash: Hash, block_number: u64, created_at: i64) !void {
-    var q = try Query.init(db,
+    var q = try Query.initCached(db,
         \\UPDATE names SET created_block = ?, created_at = ?
         \\WHERE namehash = ? AND created_block > ?
     );
@@ -519,7 +556,7 @@ pub fn updateNameCreationDateIfEarlier(db: *Database, namehash: Hash, block_numb
 // ============================================================================
 
 pub fn getNameByNamehash(db: *Database, namehash: Hash) !?models.Name {
-    var q = try Query.init(db, SQL_SELECT_NAMES ++ " WHERE namehash = ?");
+    var q = try Query.initCached(db, SQL_SELECT_NAMES ++ " WHERE namehash = ?");
     defer q.deinit();
 
     try q.bindHash(namehash);
@@ -530,9 +567,42 @@ pub fn getNameByNamehash(db: *Database, namehash: Hash) !?models.Name {
     return null;
 }
 
+/// Get just the `name` column for a namehash, allocator-owned, or null if missing.
+/// Avoids the cost of fetching + duping a full 21-column Name row when callers only
+/// need the human-readable name string (reverse-resolution hot path in the indexer).
+pub fn getNameStringByNamehash(db: *Database, namehash: Hash, allocator: std.mem.Allocator) !?[]u8 {
+    var q = try Query.initCached(db, "SELECT name FROM names WHERE namehash = ? LIMIT 1");
+    defer q.deinit();
+
+    try q.bindHash(namehash);
+
+    if (try q.step()) {
+        if (q.getTextSlice(0)) |name| {
+            return try allocator.dupe(u8, name);
+        }
+    }
+    return null;
+}
+
+/// Get a name by namehash within a specific protocol scope. Used for migration
+/// path lookups where we need to find the V1 row by the same namehash a V2
+/// LabelRegistered event just produced.
+pub fn getNameByNamehashAndProtocol(db: *Database, namehash: Hash, protocol: models.Protocol) !?models.Name {
+    var q = try Query.initCached(db, SQL_SELECT_NAMES ++ " WHERE namehash = ? AND protocol = ?");
+    defer q.deinit();
+
+    try q.bindHash(namehash);
+    try q.bindTextStatic(protocol.toString());
+
+    if (try q.step()) {
+        return try parseNameRow(&q, db.allocator);
+    }
+    return null;
+}
+
 /// Get namehash by resolver address
 pub fn getNamehashByResolver(db: *Database, resolver: Address) !?Hash {
-    var q = try Query.init(db, "SELECT namehash FROM names WHERE resolver = ? LIMIT 1");
+    var q = try Query.initCached(db, "SELECT namehash FROM names WHERE resolver = ? LIMIT 1");
     defer q.deinit();
 
     try q.bindAddress(resolver);
@@ -548,13 +618,13 @@ pub fn getNamehashByResolver(db: *Database, resolver: Address) !?Hash {
 /// Strips to canonical_id (version-independent) for lookup, so this works with any
 /// version of the token_id and is resilient to TokenRegenerated events.
 pub fn getNameByTokenIdAndRegistry(db: *Database, token_id: u256, registry: Address) !?models.Name {
-    var q = try Query.init(db, SQL_SELECT_NAMES ++ " WHERE canonical_id = ? AND registry = ? LIMIT 1");
+    var q = try Query.initCached(db, SQL_SELECT_NAMES ++ " WHERE canonical_id = ? AND registry = ? LIMIT 1");
     defer q.deinit();
 
     const token_id_utils = @import("../types/token_id.zig");
     const canonical_id = token_id_utils.getCanonicalId(token_id);
-    const canonical_id_hex = try formatU256Hex(db.allocator, canonical_id);
-    defer db.allocator.free(canonical_id_hex);
+    var canonical_id_buf: [66]u8 = undefined;
+    const canonical_id_hex = formatU256HexBuf(&canonical_id_buf, canonical_id);
 
     try q.bindText(canonical_id_hex);
     try q.bindAddressBuf(registry);
@@ -573,7 +643,7 @@ pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Nam
         try db.allocator.dupe(u8, SQL_SELECT_NAMES_SHORT ++ " WHERE owner = ?");
     defer db.allocator.free(sql);
 
-    var q = try Query.init(db, sql);
+    var q = try Query.initCached(db, sql);
     defer q.deinit();
 
     try q.bindAddress(owner);
@@ -663,6 +733,86 @@ pub const NameSortField = enum {
     }
 };
 
+/// Append SQL WHERE conditions corresponding to a `NameFilters` value into `conditions`.
+/// Strings allocated for dynamic IN clauses are tracked in `allocated_strings` so the
+/// caller can free them after use. The condition list is kept in lockstep with `bindNameFilters`
+/// so binds happen in the same order they're appended here.
+fn appendNameFilterConditions(
+    db: *Database,
+    filters: NameFilters,
+    conditions: *std.ArrayList([]const u8),
+    allocated_strings: *std.ArrayList([]const u8),
+) !void {
+    if (filters.owner != null) {
+        try conditions.append(db.allocator, "owner = ?");
+    }
+    if (filters.owner_in) |owners| {
+        if (owners.len > 0) {
+            var in_parts: std.ArrayList(u8) = .{};
+            defer in_parts.deinit(db.allocator);
+            try in_parts.appendSlice(db.allocator, "owner IN (");
+            for (owners, 0..) |_, i| {
+                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
+                try in_parts.appendSlice(db.allocator, "?");
+            }
+            try in_parts.appendSlice(db.allocator, ")");
+            const clause = try db.allocator.dupe(u8, in_parts.items);
+            try allocated_strings.append(db.allocator, clause);
+            try conditions.append(db.allocator, clause);
+        }
+    }
+    if (filters.name != null) try conditions.append(db.allocator, "name = ?");
+    if (filters.name_contains != null) try conditions.append(db.allocator, "name LIKE '%' || ? || '%'");
+    if (filters.name_contains_nocase != null) try conditions.append(db.allocator, "LOWER(name) LIKE '%' || LOWER(?) || '%'");
+    if (filters.name_starts_with != null) try conditions.append(db.allocator, "name LIKE ? || '%'");
+    if (filters.name_ends_with != null) try conditions.append(db.allocator, "name LIKE '%' || ?");
+    if (filters.expiry_gt != null) try conditions.append(db.allocator, "expiry > ?");
+    if (filters.expiry_gte != null) try conditions.append(db.allocator, "expiry >= ?");
+    if (filters.expiry_lt != null) try conditions.append(db.allocator, "expiry < ?");
+    if (filters.expiry_lte != null) try conditions.append(db.allocator, "expiry <= ?");
+    if (filters.resolved_address != null) {
+        try conditions.append(db.allocator, "namehash IN (SELECT namehash FROM resolver_addresses WHERE address = ?)");
+    }
+    if (filters.resolver != null) try conditions.append(db.allocator, "resolver = ?");
+    if (filters.migrated) |m| {
+        try conditions.append(db.allocator, if (m) "migrated = 1" else "migrated = 0");
+    }
+    if (filters.has_subdomains) |has_subs| {
+        try conditions.append(db.allocator, if (has_subs)
+            "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) > 0"
+        else
+            "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) = 0");
+    }
+    if (filters.subdomain_count_gt != null) {
+        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) > ?");
+    }
+    if (filters.subdomain_count_lt != null) {
+        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) < ?");
+    }
+}
+
+/// Bind values for `NameFilters` in the same order `appendNameFilterConditions` appends them.
+fn bindNameFilters(q: *Query, filters: NameFilters) !void {
+    if (filters.owner) |o| try q.bindAddress(o);
+    if (filters.owner_in) |owners| {
+        for (owners) |o| try q.bindAddress(o);
+    }
+    if (filters.name) |n| try q.bindText(n);
+    if (filters.name_contains) |n| try q.bindText(n);
+    if (filters.name_contains_nocase) |n| try q.bindText(n);
+    if (filters.name_starts_with) |n| try q.bindText(n);
+    if (filters.name_ends_with) |n| try q.bindText(n);
+    if (filters.expiry_gt) |v| try q.bindInt64(v);
+    if (filters.expiry_gte) |v| try q.bindInt64(v);
+    if (filters.expiry_lt) |v| try q.bindInt64(v);
+    if (filters.expiry_lte) |v| try q.bindInt64(v);
+    if (filters.resolved_address) |addr| try q.bindAddress(addr);
+    if (filters.resolver) |addr| try q.bindAddress(addr);
+    // migrated, has_subdomains contribute no binds (literal SQL)
+    if (filters.subdomain_count_gt) |v| try q.bindInt64(v);
+    if (filters.subdomain_count_lt) |v| try q.bindInt64(v);
+}
+
 /// Count rows that come before the given namehash in the current sort order.
 /// Used to convert a cursor (namehash) to an offset for paginated queries.
 /// Returns 0 if the namehash isn't found (caller falls through to offset=0).
@@ -671,23 +821,49 @@ pub fn countRowsBeforeNamehash(
     cursor_namehash: []const u8,
     sort_field: NameSortField,
     order_dir: OrderDir,
+    filters: NameFilters,
 ) !u32 {
     const field = sort_field.toSql();
     // "before" means "would appear earlier in the result set" — depends on sort direction:
     //   DESC sort: row A is before row B if A.field > B.field OR (A.field == B.field AND A.namehash > B.namehash)
     //   ASC sort:  row A is before row B if A.field < B.field OR (A.field == B.field AND A.namehash < B.namehash)
     // Tiebreaker by namehash ensures a stable total order across the full result set.
+    //
+    // The filter conditions must match getFilteredNames'/getFilteredNameCount's WHERE clause —
+    // otherwise the offset count is taken over an unfiltered superset and pagination skips too
+    // many rows, producing partial results (e.g. isMigrated:true with ~9 pages would lose ~343
+    // rows because non-migrated rows count toward the offset).
+
+    var conditions: std.ArrayList([]const u8) = .{};
+    defer conditions.deinit(db.allocator);
+    var allocated_strings: std.ArrayList([]const u8) = .{};
+    defer {
+        for (allocated_strings.items) |s| db.allocator.free(s);
+        allocated_strings.deinit(db.allocator);
+    }
+    try appendNameFilterConditions(db, filters, &conditions, &allocated_strings);
+
+    var filter_clause: std.ArrayList(u8) = .{};
+    defer filter_clause.deinit(db.allocator);
+    if (conditions.items.len > 0) {
+        for (conditions.items) |cond| {
+            try filter_clause.appendSlice(db.allocator, " AND ");
+            try filter_clause.appendSlice(db.allocator, cond);
+        }
+    }
+
     const op = if (order_dir == .desc) ">" else "<";
     const sql = try std.fmt.allocPrint(
         db.allocator,
-        "SELECT COUNT(*) FROM names n WHERE EXISTS (SELECT 1 FROM names c WHERE c.namehash = ? AND (n.{s} {s} c.{s} OR (n.{s} = c.{s} AND n.namehash {s} c.namehash)))",
-        .{ field, op, field, field, field, op },
+        "SELECT COUNT(*) FROM names WHERE EXISTS (SELECT 1 FROM names c WHERE c.namehash = ? AND (names.{s} {s} c.{s} OR (names.{s} = c.{s} AND names.namehash {s} c.namehash))){s}",
+        .{ field, op, field, field, field, op, filter_clause.items },
     );
     defer db.allocator.free(sql);
 
-    var q = try Query.init(db, sql);
+    var q = try Query.initCached(db, sql);
     defer q.deinit();
     try q.bindText(cursor_namehash);
+    try bindNameFilters(&q, filters);
     if (!try q.step()) return 0;
     return @intCast(q.getInt64(0));
 }
@@ -704,7 +880,7 @@ fn parseNameRows(q: *Query, allocator: std.mem.Allocator) ![]models.Name {
 
     while (try q.step()) {
         // Column order: name(0), namehash(1), label(2), label_hash(3), parent_name(4), parent_namehash(5),
-        //               owner(6), resolver(7), registry(8), chain(9), token_id(10),
+        //               owner(6), resolver(7), registry(8), protocol(9), token_id(10),
         //               canonical_id(11), token_version(12), expiry(13), registry_locked(14),
         //               migrated(15), created_at(16), registered_at(17),
         //               created_block(18), updated_at(19), updated_block(20)
@@ -717,7 +893,7 @@ fn parseNameRows(q: *Query, allocator: std.mem.Allocator) ![]models.Name {
         const owner_str = q.getTextSlice(6) orelse "";
         const resolver_str = q.getTextSlice(7) orelse "";
         const registry_str = q.getTextSlice(8) orelse "";
-        const chain_str = q.getTextSlice(9) orelse models.Chain.v2.toString();
+        const protocol_str = q.getTextSlice(9) orelse models.Protocol.v2.toString();
         const token_id_str = q.getTextSlice(10) orelse "0x0";
         const canonical_id_str = q.getTextSlice(11) orelse "0x0";
 
@@ -732,7 +908,7 @@ fn parseNameRows(q: *Query, allocator: std.mem.Allocator) ![]models.Name {
             .registrant = try Address.fromHex(owner_str), // Fallback
             .resolver = try Address.fromHex(resolver_str),
             .registry = try Address.fromHex(registry_str),
-            .chain = try models.Chain.fromString(chain_str),
+            .protocol = try models.Protocol.fromString(protocol_str),
             .token_id = try parseU256Hex(token_id_str),
             .canonical_id = try parseU256Hex(canonical_id_str),
             .token_version = @intCast(q.getInt64(12)),
@@ -906,14 +1082,14 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
     // stable comparator. Without it, SQLite's tie-breaking is non-deterministic and pages
     // can duplicate or skip items.
     const sql = try std.fmt.allocPrint(db.allocator,
-        \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, chain,
+        \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, protocol,
         \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated,
         \\       created_at, registered_at, created_block, updated_at, updated_block
         \\FROM names {s}ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
     , .{ where_clause.items, sort_field.toSql(), order_str, order_str });
     defer db.allocator.free(sql);
 
-    var q = try Query.init(db, sql);
+    var q = try Query.initCached(db, sql);
     defer q.deinit();
 
     // Bind parameters in the same order as conditions were added
@@ -977,21 +1153,21 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
     // Secondary sort on namehash (same direction) — see countRowsBeforeNamehash for why.
     const sql = if (owner != null)
         try std.fmt.allocPrint(db.allocator,
-            \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, chain,
+            \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, protocol,
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated,
             \\       created_at, registered_at, created_block, updated_at, updated_block
             \\FROM names WHERE owner = ? ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
         , .{ sort_field.toSql(), order_str, order_str })
     else
         try std.fmt.allocPrint(db.allocator,
-            \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, chain,
+            \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, protocol,
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated,
             \\       created_at, registered_at, created_block, updated_at, updated_block
             \\FROM names ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
         , .{ sort_field.toSql(), order_str, order_str });
     defer db.allocator.free(sql);
 
-    var q = try Query.init(db, sql);
+    var q = try Query.initCached(db, sql);
     defer q.deinit();
 
     if (owner) |o| {
@@ -1010,7 +1186,7 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
 
     while (try q.step()) {
         // Column order: name(0), namehash(1), label(2), label_hash(3), parent_name(4), parent_namehash(5),
-        //               owner(6), resolver(7), registry(8), chain(9), token_id(10),
+        //               owner(6), resolver(7), registry(8), protocol(9), token_id(10),
         //               canonical_id(11), token_version(12), expiry(13), registry_locked(14),
         //               migrated(15), created_at(16), registered_at(17),
         //               created_block(18), updated_at(19), updated_block(20)
@@ -1023,7 +1199,7 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
         const owner_str = q.getTextSlice(6) orelse "";
         const resolver_str = q.getTextSlice(7) orelse "";
         const registry_str = q.getTextSlice(8) orelse "";
-        const chain_str = q.getTextSlice(9) orelse models.Chain.v2.toString();
+        const protocol_str = q.getTextSlice(9) orelse models.Protocol.v2.toString();
         const token_id_str = q.getTextSlice(10) orelse "0x0";
         const canonical_id_str = q.getTextSlice(11) orelse "0x0";
 
@@ -1038,7 +1214,7 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
             .registrant = try Address.fromHex(owner_str), // Fallback
             .resolver = try Address.fromHex(resolver_str),
             .registry = try Address.fromHex(registry_str),
-            .chain = try models.Chain.fromString(chain_str),
+            .protocol = try models.Protocol.fromString(protocol_str),
             .token_id = try parseU256Hex(token_id_str),
             .canonical_id = try parseU256Hex(canonical_id_str),
             .token_version = @intCast(q.getInt64(12)),
@@ -1171,7 +1347,7 @@ pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
     const sql = try std.fmt.allocPrint(db.allocator, "SELECT COUNT(*) FROM names {s}", .{where_clause.items});
     defer db.allocator.free(sql);
 
-    var q = try Query.init(db, sql);
+    var q = try Query.initCached(db, sql);
     defer q.deinit();
 
     // Bind parameters (same order as getFilteredNames)
