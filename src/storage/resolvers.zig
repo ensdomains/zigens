@@ -115,6 +115,70 @@ pub const CoinAddress = struct {
     }
 };
 
+/// Backfill `names.resolver` from a prior `ResolverUpdated` event for the same
+/// (protocol, namehash). Called from `handleLabelRegistered` to catch up state
+/// that the `ResolverUpdated` handler couldn't write because the name wasn't
+/// yet linked to its tokenId.
+///
+/// Why this is needed: on V2 a fresh registration emits events in the order
+/// `ResolverUpdated → LabelRegistered`. The first handler can't update
+/// `names.resolver` (no row to update yet) and only registers the resolver
+/// contract for record indexing. By the time `LabelRegistered` runs, the row
+/// exists but the resolver wire-up is lost.
+///
+/// Safety properties:
+///   - **Protocol-scoped**: V1 and V2 share the namehash space (UNIQUE
+///     constraint is `(protocol, namehash)`). Without protocol filtering a V2
+///     event could clobber a V1 row's resolver, or vice versa.
+///   - **Idempotent on retry**: `WHERE … resolver IS NULL OR resolver = 0x0…0`
+///     prevents overwriting an already-set value. Safe if `LabelRegistered`
+///     ever runs twice for the same name.
+///   - **No NULL writes**: `EXISTS` plus `json_extract … IS NOT NULL` ensure
+///     the SET subquery only fires when there's at least one event with a
+///     well-formed `resolver` field. Without this, malformed event data could
+///     blank out a row.
+///   - **Latest wins**: ordered by `(block_number, log_index) DESC` so multiple
+///     prior updates collapse to the most recent.
+///
+/// Relies on `updatePlaceholderEventsByName` having patched the event rows'
+/// `namehash` column before this is called (which `handleLabelRegistered`
+/// does in the line just above the call site).
+pub fn applyLatestResolverFromEvents(db: *Database, protocol: models.Protocol, namehash: Hash) !void {
+    var q = try Query.initCached(db,
+        \\UPDATE names
+        \\SET resolver = (
+        \\    SELECT json_extract(data, '$.resolver')
+        \\    FROM events
+        \\    WHERE event_type = 'ResolverUpdated'
+        \\      AND protocol = ?
+        \\      AND namehash = ?
+        \\      AND json_extract(data, '$.resolver') IS NOT NULL
+        \\    ORDER BY block_number DESC, log_index DESC
+        \\    LIMIT 1
+        \\),
+        \\    updated_at = ?
+        \\WHERE protocol = ?
+        \\  AND namehash = ?
+        \\  AND (resolver IS NULL OR resolver = '0x0000000000000000000000000000000000000000')
+        \\  AND EXISTS (
+        \\    SELECT 1 FROM events
+        \\    WHERE event_type = 'ResolverUpdated'
+        \\      AND protocol = ?
+        \\      AND namehash = ?
+        \\      AND json_extract(data, '$.resolver') IS NOT NULL
+        \\  )
+    );
+    defer q.deinit();
+    try q.bindTextStatic(protocol.toString());
+    try q.bindHashBuf(namehash);
+    try q.bindInt64(std.time.timestamp());
+    try q.bindTextStatic(protocol.toString());
+    try q.bindHashBuf(namehash);
+    try q.bindTextStatic(protocol.toString());
+    try q.bindHashBuf(namehash);
+    try q.exec();
+}
+
 /// Latest addr record for a given (resolver, namehash, coin_type).
 /// Scoped to the currently authoritative resolver so records set by a legacy
 /// resolver on a migrated name don't leak through.
