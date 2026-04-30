@@ -552,6 +552,16 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
         std.log.warn("Failed to patch tokenId placeholder: {}", .{err});
     };
 
+    // Catch up names.resolver from any ResolverUpdated event that fired before
+    // this LabelRegistered (chain emit order is ResolverUpdated → LabelRegistered
+    // for fresh registrations; the earlier handler couldn't write because the
+    // namehash wasn't linked yet). Must run AFTER updatePlaceholderEventsByName
+    // above — that's what gives the prior event row its real namehash so the
+    // catch-up's lookup-by-namehash actually finds it.
+    self.database.applyLatestResolverFromEvents(protocol, namehash) catch |err| {
+        std.log.warn("Failed to backfill resolver for {s}: {}", .{ full_name, err });
+    };
+
     // Store event
     var nh_hex_buf: [66]u8 = undefined;
     const nh_hex = namehash.toHexBuf(&nh_hex_buf);

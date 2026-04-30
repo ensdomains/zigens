@@ -681,6 +681,7 @@ pub const Database = struct {
     pub const upsertReverseRecord = resolvers.upsertReverseRecord;
     pub const getReverseRecordNamehash = resolvers.getReverseRecordNamehash;
     pub const updateNameResolver = names.updateNameResolver;
+    pub const applyLatestResolverFromEvents = resolvers.applyLatestResolverFromEvents;
     pub const getNameByTokenIdAndRegistry = names.getNameByTokenIdAndRegistry;
     pub const deleteNameByNamehash = names.deleteNameByNamehash;
     pub const updateNameTokenIdByNamehash = names.updateNameTokenIdByNamehash;
