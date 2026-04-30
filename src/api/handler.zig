@@ -114,7 +114,7 @@ pub const GraphQLHandler = struct {
             .max_cost = self.complexity_max_cost,
         };
         var analyzer = complexity.ComplexityAnalyzer.init(request_alloc, limits);
-        const analysis = try analyzer.analyzeDocument(&document);
+        const analysis = try analyzer.analyzeDocument(&document, variables);
 
         if (!analysis.isValid()) {
             // Error message allocated on GPA since it's returned to the caller
