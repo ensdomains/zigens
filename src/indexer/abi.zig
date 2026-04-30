@@ -521,7 +521,6 @@ pub const ABI = struct {
         const bytes_data = data[bytes_offset + 32 .. bytes_offset + 32 + length];
         return try allocator.dupe(u8, bytes_data);
     }
-
 };
 
 test "ABI decode uint256" {

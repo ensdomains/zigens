@@ -48,7 +48,7 @@ test "insertRegistry updates existing registry on conflict" {
 
     // Insert again with same address - should update, not fail
     try database.insertRegistry(models.Registry{
-        .chain = .v2,
+        .protocol = .v2,
         .address = registry_addr,
         .name = "eth-updated",
         .namehash = nh,
@@ -103,7 +103,7 @@ test "insertName with null optional fields" {
     const parent_nh = try namehash_fn(allocator, "eth");
 
     try database.insertName(models.Name{
-        .chain = .v2,
+        .protocol = .v2,
         .name = "minimal.eth",
         .namehash = nh,
         .label = "minimal",
@@ -248,7 +248,7 @@ test "insertName with expiry > i64::max stores as 0 (never expires)" {
     const huge_expiry: u64 = @as(u64, @intCast(std.math.maxInt(i64))) + 100;
 
     try database.insertName(models.Name{
-        .chain = .v2,
+        .protocol = .v2,
         .name = "hugeinsert.eth",
         .namehash = nh,
         .label = "hugeinsert",
@@ -359,7 +359,7 @@ test "updateNameExpiry via namehash clamps u64 > i64::max to 0" {
     const parent_nh = try namehash_fn(allocator, "eth");
 
     try database.insertName(models.Name{
-        .chain = .v2,
+        .protocol = .v2,
         .name = "canonical.eth",
         .namehash = nh,
         .label = "canonical",
@@ -400,7 +400,6 @@ test "updateNameExpiry via namehash clamps u64 > i64::max to 0" {
     try testing.expectEqual(@as(u64, 0), name.expiry);
     try testing.expect(!name.isExpired());
 }
-
 
 test "insertOrphanedRegistration with expiry > i64::max stores as 0 and reads back as 0" {
     const allocator = testing.allocator;
@@ -658,7 +657,7 @@ test "multiple names with same owner different chains" {
 
     // Insert on L2
     try database.insertName(models.Name{
-        .chain = .v2,
+        .protocol = .v2,
         .name = "multichain.eth",
         .namehash = nh,
         .label = "multichain",
@@ -689,7 +688,7 @@ test "multiple names with same owner different chains" {
 
     // Insert on L1
     try database.insertName(models.Name{
-        .chain = .v1,
+        .protocol = .v1,
         .name = "multichain.eth",
         .namehash = nh,
         .label = "multichain",
@@ -718,12 +717,110 @@ test "multiple names with same owner different chains" {
         .v1_label_hash = null,
     });
 
-    // Query all names for owner (getNamesByOwner doesn't filter by chain)
+    // Query all names for owner (getNamesByOwner doesn't filter by protocol)
     const all_names = try database.getNamesByOwner(helpers.TEST_OWNER_1, null);
     defer {
         for (all_names) |*n| n.deinit(allocator);
         allocator.free(all_names);
     }
-    // Both L1 and L2 names should be returned since function doesn't filter by chain
+    // Both L1 and L2 names should be returned since function doesn't filter by protocol
     try testing.expectEqual(@as(usize, 2), all_names.len);
+}
+
+// ============================================================================
+// T3 REGRESSION: re-registration must preserve created_at / created_block
+// ============================================================================
+//
+// On re-registration after expiry, the V2 LabelRegistered handler builds a fresh
+// Name struct with the current block's timestamp. The insertName SQL uses
+// ON CONFLICT(protocol, namehash) DO UPDATE SET — and the SET list intentionally
+// excludes created_at + created_block so they're preserved across the conflict.
+// This test pins that behavior so a future "fix" doesn't accidentally add them
+// to the SET list and silently start clobbering historical timestamps.
+
+test "insertName ON CONFLICT preserves created_at and created_block" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "preserve.eth");
+    const label_hash = try labelhash_fn(allocator, "preserve");
+    const parent_nh = try namehash_fn(allocator, "eth");
+
+    // First insert — first registration. created_at/created_block are the
+    // historical values we expect to survive the re-mint below.
+    try database.insertName(models.Name{
+        .protocol = .v2,
+        .name = "preserve.eth",
+        .namehash = nh,
+        .label = "preserve",
+        .label_hash = label_hash,
+        .parent_name = "eth",
+        .parent_namehash = parent_nh,
+        .registry = Address.zero,
+        .owner = helpers.TEST_OWNER_1,
+        .registrant = helpers.TEST_OWNER_1,
+        .resolver = Address.zero,
+        .token_id = 0x1111_0000_0000_0000,
+        .canonical_id = 0x1111_0000_0000_0000,
+        .token_version = 0,
+        .expiry = 1700_010_000,
+        .registry_locked = false,
+        .migrated = false,
+        .created_block = 9_000_000,
+        .created_at = 1700_000_000,
+        .registered_at = 1700_000_000,
+        .updated_block = 9_000_000,
+        .updated_at = 1700_000_000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    });
+
+    // Second insert — simulates re-registration after expiry. Same (protocol,
+    // namehash), but later block + later timestamp + new owner. ON CONFLICT
+    // should update everything in the SET list (including registered_at) but
+    // leave created_at and created_block at their original values.
+    try database.insertName(models.Name{
+        .protocol = .v2,
+        .name = "preserve.eth",
+        .namehash = nh,
+        .label = "preserve",
+        .label_hash = label_hash,
+        .parent_name = "eth",
+        .parent_namehash = parent_nh,
+        .registry = Address.zero,
+        .owner = helpers.TEST_OWNER_1,
+        .registrant = helpers.TEST_OWNER_1,
+        .resolver = Address.zero,
+        .token_id = 0x1111_0000_0000_0001, // new version bit
+        .canonical_id = 0x1111_0000_0000_0000,
+        .token_version = 1,
+        .expiry = 1800_010_000,
+        .registry_locked = false,
+        .migrated = false,
+        .created_block = 10_000_000, // new value — must be IGNORED on conflict
+        .created_at = 1800_000_000, // new value — must be IGNORED on conflict
+        .registered_at = 1800_000_000, // new value — must overwrite (current tenancy)
+        .updated_block = 10_000_000,
+        .updated_at = 1800_000_000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    });
+
+    // Read back and assert created_* preserved, registered_at advanced.
+    const stored = try database.getNameByNamehash(nh);
+    try testing.expect(stored != null);
+    var stored_mut = stored.?;
+    defer stored_mut.deinit(allocator);
+
+    try testing.expectEqual(@as(i64, 1700_000_000), stored_mut.created_at);
+    try testing.expectEqual(@as(u64, 9_000_000), stored_mut.created_block);
+    try testing.expectEqual(@as(i64, 1800_000_000), stored_mut.registered_at);
+    try testing.expectEqual(@as(u32, 1), stored_mut.token_version);
 }

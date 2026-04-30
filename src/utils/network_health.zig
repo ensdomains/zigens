@@ -48,27 +48,57 @@ pub const NetworkHealth = struct {
         }
     }
 
-    /// Quick check if connection is available (non-blocking)
+    /// Check if the RPC endpoint is actually serving requests.
+    ///
+    /// Sends a minimal JSON-RPC `eth_blockNumber` call rather than just opening a TCP
+    /// socket. A bare TCP connect succeeds whenever DNS resolves and the upstream
+    /// gateway/load-balancer accepts the SYN — even when the actual HTTPS/RPC layer
+    /// is broken. That false-positive caused the indexer to flap between
+    /// "network restored, continuing..." and "network error detected, waiting..."
+    /// because the TCP check passed but the next real RPC call still failed
+    /// (`error.WriteFailed`).
     fn checkConnection(self: *NetworkHealth) bool {
-        // Try a simple TCP connection to the RPC host
-        var client = std.http.Client{ .allocator = self.allocator };
-        defer client.deinit();
-
-        // Parse URL to get host and port
+        // 1) Cheap pre-flight: TCP-resolve the host. Bails fast on hard outages
+        //    (no DNS / no route to host) without paying for a full HTTPS handshake.
         const uri = std.Uri.parse(self.rpc_url) catch return false;
         const port: u16 = uri.port orelse if (std.mem.startsWith(u8, self.rpc_url, "https")) 443 else 80;
-
-        // Try to resolve and connect
         const host = uri.host orelse return false;
+
         const address_list = std.net.getAddressList(self.allocator, host.percent_encoded, port) catch return false;
         defer address_list.deinit();
-
         if (address_list.addrs.len == 0) return false;
 
-        // Try to connect to first address with short timeout
         const stream = std.net.tcpConnectToAddress(address_list.addrs[0]) catch return false;
         stream.close();
 
-        return true;
+        // 2) Real check: post a tiny JSON-RPC request and require a 2xx response with
+        //    a non-empty body. This exercises the same path the indexer's `eth_getLogs`
+        //    calls take, so a passing check actually predicts the next call will work.
+        var client = std.http.Client{ .allocator = self.allocator };
+        defer client.deinit();
+
+        const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_blockNumber\",\"params\":[]}";
+
+        var response_buf: std.Io.Writer.Allocating = .init(self.allocator);
+        defer response_buf.deinit();
+
+        const result = client.fetch(.{
+            .location = .{ .url = self.rpc_url },
+            .method = .POST,
+            .payload = body,
+            .extra_headers = &[_]std.http.Header{
+                .{ .name = "Content-Type", .value = "application/json" },
+            },
+            .response_writer = &response_buf.writer,
+            .keep_alive = false,
+        }) catch return false;
+
+        const status: u16 = @intFromEnum(result.status);
+        if (status < 200 or status >= 300) return false;
+        if (response_buf.written().len == 0) return false;
+
+        // No JSON parse — `"result":` substring is enough to distinguish a real RPC reply
+        // from a captive-portal "200 OK <html>" or a load-balancer error stub.
+        return std.mem.indexOf(u8, response_buf.written(), "\"result\":") != null;
     }
 };

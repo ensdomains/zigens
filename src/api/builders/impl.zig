@@ -94,24 +94,30 @@ pub fn buildEventJson(
 // REGISTRATION BUILDER
 // ============================================================================
 
-/// Registration nested field handler: expiryDate
+/// Registration nested field handler: expiryDate.
+///
+/// Resolution order MUST match the SQL `ORDER BY expiryDate` expression in
+/// `EventSortField.expiry.toSql()` — otherwise the displayed value disagrees
+/// with the sort key (rows appear out of order vs the field they're sorted by).
+/// Fallback chain (first hit wins):
+///   1. data.expiry        (V1 controller events emit absolute expiry)
+///   2. data.expiration    (legacy alt naming)
+///   3. timestamp + data.duration   (V2 LabelRegistered carries duration only)
+///   4. names.expiry        (resolve via the domain row as a last resort)
 fn registrationExpiryDateHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
     _ = field;
     const event: *const models.Event = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
-    // Try to parse duration from event.data JSON
-    const parsed = std.json.parseFromSlice(std.json.Value, nested_ctx.allocator, event.data, .{}) catch {
-        return try getExpiryFromDomain(event, database, nested_ctx.allocator);
-    };
-    defer parsed.deinit();
-
-    if (parsed.value.object.get("duration")) |duration_val| {
-        if (duration_val == .integer) {
-            const duration: i64 = duration_val.integer;
-            const expiry = event.timestamp + duration;
-            return try std.fmt.allocPrint(nested_ctx.allocator, "{d}", .{expiry});
-        }
+    if (json_utils.extractIntField(event.data, "expiry")) |expiry| {
+        return try std.fmt.allocPrint(nested_ctx.allocator, "{d}", .{expiry});
+    }
+    if (json_utils.extractIntField(event.data, "expiration")) |expiration| {
+        return try std.fmt.allocPrint(nested_ctx.allocator, "{d}", .{expiration});
+    }
+    if (json_utils.extractIntField(event.data, "duration")) |duration| {
+        const expiry = event.timestamp + duration;
+        return try std.fmt.allocPrint(nested_ctx.allocator, "{d}", .{expiry});
     }
 
     return try getExpiryFromDomain(event, database, nested_ctx.allocator);
@@ -136,30 +142,21 @@ fn registrationRegistrantHandler(ctx: *anyopaque, field: *const parser.Field, ne
     const event: *const models.Event = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
-    const parsed = std.json.parseFromSlice(std.json.Value, nested_ctx.allocator, event.data, .{}) catch {
+    // Targeted extract — flat key lookup, no allocation, no tree build per row.
+    const owner_str = json_utils.extractStringField(event.data, "owner") orelse {
         return try nested_ctx.allocator.dupe(u8, "null");
     };
-    defer parsed.deinit();
 
-    const owner_str = if (parsed.value.object.get("owner")) |owner_val|
-        if (owner_val == .string) owner_val.string else null
-    else
-        null;
+    const owner_addr = Address.fromHex(owner_str) catch {
+        return try nested_ctx.allocator.dupe(u8, "null");
+    };
 
-    if (owner_str) |owner| {
-        const owner_addr = Address.fromHex(owner) catch {
-            return try nested_ctx.allocator.dupe(u8, "null");
-        };
-
-        return try buildAccountJson(owner_addr, field.selections, .{
-            .database = database,
-            .depth = nested_ctx.depth + 1,
-            .allocator = nested_ctx.allocator,
-            .loaders = nested_ctx.loaders,
-        });
-    }
-
-    return try nested_ctx.allocator.dupe(u8, "null");
+    return try buildAccountJson(owner_addr, field.selections, .{
+        .database = database,
+        .depth = nested_ctx.depth + 1,
+        .allocator = nested_ctx.allocator,
+        .loaders = nested_ctx.loaders,
+    });
 }
 
 /// Registration entity configuration
@@ -202,7 +199,7 @@ fn accountDomainsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx
     const addr: *const Address = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
-    const page = api_common.parsePagination(field, 10);
+    const page = try api_common.parsePagination(field, 10);
 
     const domains = try database.getAllNames(addr.*, page.skip, page.first);
     defer {
@@ -235,7 +232,7 @@ fn accountRegistrationsHandler(ctx: *anyopaque, field: *const parser.Field, nest
     const addr: *const Address = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
-    const page = api_common.parsePagination(field, 10);
+    const page = try api_common.parsePagination(field, 10);
 
     const names = try database.getNamesByRegistrant(addr.*, page.skip, page.first);
     defer {
@@ -396,7 +393,9 @@ fn resolverContentHashHandler(ctx: *anyopaque, field: *const parser.Field, neste
 
 /// Resolver nested field handler: texts
 fn resolverTextsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
-    _ = field;
+    // Schema declares `texts: [String!]` — list of scalar keys. Sub-selections are not valid;
+    // surface the error rather than silently dropping them (clients sometimes try `texts { key value }`).
+    if (field.selections.len > 0) return error.SubSelectionOnScalar;
     const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
@@ -462,7 +461,8 @@ fn resolverPubkeyHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx
 
 /// Resolver nested field handler: abis (content types)
 fn resolverAbisHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
-    _ = field;
+    // Schema declares `abis: [Int!]` — list of scalar content types. Sub-selections invalid.
+    if (field.selections.len > 0) return error.SubSelectionOnScalar;
     const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
@@ -659,7 +659,7 @@ fn domainRegistrantHandler(ctx: *anyopaque, field: *const parser.Field, nested_c
 /// Domain nested field handler: resolvedAddress
 /// Returns the ETH address set by the domain's CURRENT resolver. For migrated V1 names,
 /// legacy V1 resolver records must not shadow the V2 resolver's state — we filter by
-/// the currently authoritative resolver to match on-chain semantics.
+/// the currently authoritative resolver to match on-protocol semantics.
 fn domainResolvedAddressHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
     const domain: *const models.Name = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
@@ -727,7 +727,7 @@ fn domainSubdomainsHandler(ctx: *anyopaque, field: *const parser.Field, nested_c
     const domain: *const models.Name = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
-    const page = api_common.parsePagination(field, 10);
+    const page = try api_common.parsePagination(field, 10);
 
     var json: std.ArrayList(u8) = .{};
     errdefer json.deinit(nested_ctx.allocator);
@@ -761,7 +761,7 @@ fn domainEventsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: 
     const domain: *const models.Name = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
-    const first_arg = api_common.parsePagination(field, 100).first;
+    const first_arg = (try api_common.parsePagination(field, 100)).first;
 
     const namehash_hex = try domain.namehash.toHex(nested_ctx.allocator);
     defer nested_ctx.allocator.free(namehash_hex);
@@ -787,7 +787,8 @@ fn domainEventsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: 
                 continue;
             }
             if (std.mem.eql(u8, a.name, "contractAddress") and a.value == .string) {
-                const addr = Address.fromHex(a.value.string) catch continue;
+                // Surface invalid input as an error — silent drop hides typos.
+                const addr = Address.fromHex(a.value.string) catch return error.InvalidContractAddress;
                 normalized_contract_address = try addr.toHex(nested_ctx.allocator);
                 filter_opts.contract_address = normalized_contract_address;
                 continue;
@@ -908,7 +909,7 @@ fn domainSubdomainConnectionHandler(ctx: *anyopaque, field: *const parser.Field,
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
     const allocator = nested_ctx.allocator;
 
-    const limit: u32 = @min(api_common.parsePagination(field, 10).first, 100);
+    const limit: u32 = @min((try api_common.parsePagination(field, 10)).first, 100);
 
     var json: std.ArrayList(u8) = .{};
     errdefer json.deinit(allocator);
@@ -998,7 +999,7 @@ fn domainEventsConnectionHandler(ctx: *anyopaque, field: *const parser.Field, ne
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
     const allocator = nested_ctx.allocator;
 
-    const limit: u32 = @min(api_common.parsePagination(field, 10).first, 100);
+    const limit: u32 = @min((try api_common.parsePagination(field, 10)).first, 100);
 
     // Check if totalCount is requested
     var wants_total_count = false;

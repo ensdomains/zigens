@@ -51,6 +51,10 @@ pub const WriteBuffer = struct {
         /// Individual wrapper field updates
         fuses_update: ?u32 = null,
         wrapper_expiry_update: ?u64 = null,
+        /// Set when a V1 token is transferred to a migration controller. Carries
+        /// the new owner (the controller address) so the flush can apply both
+        /// `owner=controller` and `migrated=true` in a single statement.
+        migrated_to: ?Address = null,
 
         const WrapperState = struct {
             fuses: u32,
@@ -136,6 +140,25 @@ pub const WriteBuffer = struct {
         } else {
             // Name exists in DB, record pending update
             gop.value_ptr.* = .{ .is_new = false, .owner = owner };
+        }
+    }
+
+    /// Buffer a V1→V2 migration: sets `owner=controller` and `migrated=true`.
+    /// If the name was INSERT'd this chunk (rare for migrations), updates the
+    /// buffered record in-place; otherwise records pending update.
+    pub fn markNameMigrated(self: *WriteBuffer, namehash: Hash, controller: Address) !void {
+        const key = namehash.bytes;
+        const gop = try self.names.getOrPut(key);
+
+        if (gop.found_existing) {
+            if (gop.value_ptr.is_new) {
+                gop.value_ptr.record.?.owner = controller;
+                gop.value_ptr.record.?.migrated = true;
+            } else {
+                gop.value_ptr.migrated_to = controller;
+            }
+        } else {
+            gop.value_ptr.* = .{ .is_new = false, .migrated_to = controller };
         }
     }
 
@@ -313,7 +336,11 @@ pub const WriteBuffer = struct {
                     try names_storage.updateNameWrapperState(db, namehash, ws.fuses, ws.expiry);
                 }
 
-                if (bn.owner) |owner| {
+                // Migration takes precedence over plain owner update — it sets
+                // both `owner` and `migrated=true` in one statement.
+                if (bn.migrated_to) |controller| {
+                    try names_storage.markNameMigrated(db, namehash, controller);
+                } else if (bn.owner) |owner| {
                     try names_storage.updateNameOwner(db, namehash, owner);
                 }
                 if (bn.expiry) |expiry| {

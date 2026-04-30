@@ -26,16 +26,25 @@ pub const Pagination = struct {
     skip: u32,
 };
 
-/// Parse `first` / `skip` from a GraphQL field. Clamps `first` to `[0, MAX_FIRST]`
-/// and `skip` to `[0, ∞)` so malicious or malformed inputs (e.g. `first: -1`)
-/// cannot cause `@intCast` panics or unbounded allocations downstream.
+/// Parse `first` / `skip` from a GraphQL field. Bounds:
+/// - `first`: explicitly-passed values exceeding MAX_FIRST return `error.LimitExceeded`
+///   so callers don't get deceptively-truncated pages. The default (when omitted)
+///   never errors. Negative values return `error.NegativeLimit`.
+/// - `skip`: clamped to `[0, ∞)` (negative values silently snap to 0).
 ///
 /// For Relay-style connection queries, use `lib/graphql/pagination.PaginationParams.parse`
 /// instead — this helper is for flat list queries that take `first`/`skip` directly.
-pub fn parsePagination(field: *const parser.Field, default_first: i64) Pagination {
-    const first_raw = parser.getIntArg(field, "first", default_first) orelse default_first;
+pub fn parsePagination(field: *const parser.Field, default_first: i64) !Pagination {
+    // Pass null default so we can distinguish "client passed first explicitly" from "use default".
+    // Only the explicit case errors on out-of-range — call sites legitimately pass large defaults.
+    const first_explicit = parser.getIntArg(field, "first", null);
+    const first_raw = first_explicit orelse default_first;
     const skip_raw = parser.getIntArg(field, "skip", DEFAULT_SKIP) orelse DEFAULT_SKIP;
-    const first_clamped = @min(@max(first_raw, 0), MAX_FIRST);
+    if (first_raw < 0) return error.NegativeLimit;
+    if (first_explicit) |e| {
+        if (e > MAX_FIRST) return error.LimitExceeded;
+    }
+    const first_clamped = @min(first_raw, MAX_FIRST);
     const skip_clamped = @max(skip_raw, 0);
     return .{
         .first = @intCast(first_clamped),
@@ -66,7 +75,7 @@ pub fn parseOrderDirection(field: *const parser.Field, comptime T: type, default
 // The matchXArg helpers fold the common "if name matches and value is right type,
 // assign to out" pattern into one line per filter field. Each returns `true` when
 // the arg *name* matched (whether or not the value type matched), so callers can
-// chain them with `or` to short-circuit further comparisons for the same arg.
+// protocol them with `or` to short-circuit further comparisons for the same arg.
 // A mismatched value type is silently ignored (same behavior as the inline version).
 
 /// Get the `[]Argument` backing a field's named object-argument, or null if absent/wrong-type.
@@ -101,13 +110,15 @@ pub fn matchBoolArg(arg: parser.Argument, name: []const u8, out: *?bool) bool {
     return true;
 }
 
-/// Match a filter arg and parse its string value as an Address. Invalid hex leaves `out` unchanged.
-pub fn matchAddressArg(arg: parser.Argument, name: []const u8, out: *?Address) bool {
+/// Match a filter arg and parse its string value as an Address.
+/// Returns true if the arg name matched (regardless of whether the value parsed).
+/// Returns `error.InvalidAddress` if the name matched and the value is a string but
+/// fails hex parsing — silent fallthrough (returning all rows when the filter was
+/// intended) is dangerous, so we surface it as an error.
+pub fn matchAddressArg(arg: parser.Argument, name: []const u8, out: *?Address) !bool {
     if (!std.mem.eql(u8, arg.name, name)) return false;
     if (arg.value == .string) {
-        if (Address.fromHex(arg.value.string)) |addr| {
-            out.* = addr;
-        } else |_| {}
+        out.* = Address.fromHex(arg.value.string) catch return error.InvalidAddress;
     }
     return true;
 }
@@ -129,18 +140,33 @@ fn makeField(args: []parser.Argument) parser.Field {
     };
 }
 
-test "parsePagination clamps negative first to 0 and huge first to MAX_FIRST" {
+test "parsePagination errors on negative first" {
     var args = [_]parser.Argument{
         .{ .name = "first", .value = .{ .int = -5 } },
     };
-    const p1 = parsePagination(&makeField(&args), 100);
-    try testing.expectEqual(@as(u32, 0), p1.first);
+    try testing.expectError(error.NegativeLimit, parsePagination(&makeField(&args), 100));
+}
 
-    var args2 = [_]parser.Argument{
+test "parsePagination errors when explicit first exceeds MAX_FIRST" {
+    var args = [_]parser.Argument{
         .{ .name = "first", .value = .{ .int = 999999 } },
     };
-    const p2 = parsePagination(&makeField(&args2), 100);
-    try testing.expectEqual(@as(u32, @intCast(MAX_FIRST)), p2.first);
+    try testing.expectError(error.LimitExceeded, parsePagination(&makeField(&args), 100));
+}
+
+test "parsePagination accepts default_first beyond MAX_FIRST without erroring" {
+    // Default is set by the call site, not the client — silently capped is fine.
+    var args = [_]parser.Argument{};
+    const p = try parsePagination(&makeField(&args), MAX_FIRST + 50);
+    try testing.expectEqual(@as(u32, @intCast(MAX_FIRST)), p.first);
+}
+
+test "parsePagination accepts valid first within range" {
+    var args = [_]parser.Argument{
+        .{ .name = "first", .value = .{ .int = 50 } },
+    };
+    const p = try parsePagination(&makeField(&args), 100);
+    try testing.expectEqual(@as(u32, 50), p.first);
 }
 
 test "matchStringArg assigns on name+type match, returns true on name match only" {
@@ -171,23 +197,33 @@ test "matchIntArg and matchBoolArg" {
     try testing.expect(b.?);
 }
 
-test "matchAddressArg parses valid hex and ignores invalid" {
+test "matchAddressArg parses valid hex" {
     var addr: ?Address = null;
-    try testing.expect(matchAddressArg(
+    try testing.expect(try matchAddressArg(
         .{ .name = "owner", .value = .{ .string = "0x1234567890abcdef1234567890abcdef12345678" } },
         "owner",
         &addr,
     ));
     try testing.expect(addr != null);
+}
 
-    // Invalid hex: arg name matches, returns true, but out stays null
-    var addr2: ?Address = null;
-    try testing.expect(matchAddressArg(
+test "matchAddressArg errors on invalid hex value" {
+    var addr: ?Address = null;
+    try testing.expectError(error.InvalidAddress, matchAddressArg(
         .{ .name = "owner", .value = .{ .string = "not-hex" } },
         "owner",
-        &addr2,
+        &addr,
     ));
-    try testing.expect(addr2 == null);
+}
+
+test "matchAddressArg returns false when name does not match" {
+    var addr: ?Address = null;
+    try testing.expect(!(try matchAddressArg(
+        .{ .name = "other", .value = .{ .string = "0x1234567890abcdef1234567890abcdef12345678" } },
+        "owner",
+        &addr,
+    )));
+    try testing.expect(addr == null);
 }
 
 test "getObjectArg returns inner object or null" {

@@ -17,13 +17,13 @@ fn safeU64ToI64(val: u64) i64 {
 // SYNC/MIGRATION OPERATIONS
 // ============================================================================
 
-pub fn getSyncState(db: *Database, chain: models.Chain) !?u64 {
-    const sql = "SELECT last_synced_block FROM sync_state WHERE chain = ?";
+pub fn getSyncState(db: *Database, protocol: models.Protocol) !?u64 {
+    const sql = "SELECT last_synced_block FROM sync_state WHERE protocol = ?";
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
 
     if (try q.step()) {
         return @intCast(q.getInt64(0));
@@ -31,33 +31,33 @@ pub fn getSyncState(db: *Database, chain: models.Chain) !?u64 {
     return null;
 }
 
-pub fn setSyncState(db: *Database, chain: models.Chain, block: u64) !void {
+pub fn setSyncState(db: *Database, protocol: models.Protocol, block: u64) !void {
     const sql =
-        \\INSERT OR REPLACE INTO sync_state (chain, last_synced_block, last_synced_at)
+        \\INSERT OR REPLACE INTO sync_state (protocol, last_synced_block, last_synced_at)
         \\VALUES (?, ?, ?)
     ;
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindInt64(@intCast(block));
     try q.bindInt64(std.time.timestamp());
 
     try q.exec();
 }
 
-pub fn storeBlockHash(db: *Database, chain: models.Chain, block_number: u64, block_hash: Hash, parent_hash: Hash) !void {
+pub fn storeBlockHash(db: *Database, protocol: models.Protocol, block_number: u64, block_hash: Hash, parent_hash: Hash) !void {
     const sql =
         \\INSERT OR REPLACE INTO block_hashes
-        \\(chain, block_number, block_hash, parent_hash, timestamp)
+        \\(protocol, block_number, block_hash, parent_hash, timestamp)
         \\VALUES (?, ?, ?, ?, ?)
     ;
 
     var q = try Query.initCached(db, sql);
     defer q.deinit();
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindInt64(@intCast(block_number));
     try q.bindHashBuf(block_hash);
     try q.bindHashBuf(parent_hash);
@@ -67,13 +67,13 @@ pub fn storeBlockHash(db: *Database, chain: models.Chain, block_number: u64, blo
 }
 
 /// Get stored block hash for reorg detection
-pub fn getBlockHash(db: *Database, chain: models.Chain, block_number: u64) !?Hash {
-    const sql = "SELECT block_hash FROM block_hashes WHERE chain = ? AND block_number = ?";
+pub fn getBlockHash(db: *Database, protocol: models.Protocol, block_number: u64) !?Hash {
+    const sql = "SELECT block_hash FROM block_hashes WHERE protocol = ? AND block_number = ?";
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindInt64(@intCast(block_number));
 
     if (try q.step()) {
@@ -88,8 +88,8 @@ pub fn getBlockHash(db: *Database, chain: models.Chain, block_number: u64) !?Has
 ///   - rows in derived tables (names, registries, resolver_*, approvals, etc.) with created_block > block
 /// Does NOT roll back in-place updates to rows created at or before block_number
 /// (those will be re-derived when events are re-processed on re-sync from block+1).
-pub fn rollbackToBlock(db: *Database, chain: models.Chain, block_number: u64) !void {
-    const chain_str = chain.toString();
+pub fn rollbackToBlock(db: *Database, protocol: models.Protocol, block_number: u64) !void {
+    const protocol_str = protocol.toString();
     const block_i64: i64 = @intCast(block_number);
 
     // Insert-only tables: delete anything after the block
@@ -100,10 +100,10 @@ pub fn rollbackToBlock(db: *Database, chain: models.Chain, block_number: u64) !v
     };
 
     inline for (insert_only_tables) |table| {
-        const sql = "DELETE FROM " ++ table ++ " WHERE chain = ? AND block_number > ?";
+        const sql = "DELETE FROM " ++ table ++ " WHERE protocol = ? AND block_number > ?";
         var q = try Query.init(db, sql);
         defer q.deinit();
-        try q.bindTextStatic(chain_str);
+        try q.bindTextStatic(protocol_str);
         try q.bindInt64(block_i64);
         try q.exec();
     }
@@ -116,25 +116,25 @@ pub fn rollbackToBlock(db: *Database, chain: models.Chain, block_number: u64) !v
     };
 
     inline for (derived_tables_by_created_block) |table| {
-        const sql = "DELETE FROM " ++ table ++ " WHERE chain = ? AND created_block > ?";
+        const sql = "DELETE FROM " ++ table ++ " WHERE protocol = ? AND created_block > ?";
         var q = try Query.init(db, sql);
         defer q.deinit();
-        try q.bindTextStatic(chain_str);
+        try q.bindTextStatic(protocol_str);
         try q.bindInt64(block_i64);
         try q.exec();
     }
 
     // orphaned_registrations uses block_number
     {
-        const sql = "DELETE FROM orphaned_registrations WHERE chain = ? AND block_number > ?";
+        const sql = "DELETE FROM orphaned_registrations WHERE protocol = ? AND block_number > ?";
         var q = try Query.init(db, sql);
         defer q.deinit();
-        try q.bindTextStatic(chain_str);
+        try q.bindTextStatic(protocol_str);
         try q.bindInt64(block_i64);
         try q.exec();
     }
 
-    // Resolver record and EAC tables: block_number with chain.
+    // Resolver record and EAC tables: block_number with protocol.
     // Includes all resolver record tables (see deleteDataAfterBlock for canonical list).
     // If a table is missing from the schema, Query.init (preparing the DELETE) will fail
     // at the `try` boundary and bubble up — reorg rollback is not safe to continue on partial failure.
@@ -155,32 +155,32 @@ pub fn rollbackToBlock(db: *Database, chain: models.Chain, block_number: u64) !v
     };
 
     inline for (resolver_record_tables) |table| {
-        const sql = "DELETE FROM " ++ table ++ " WHERE chain = ? AND block_number > ?";
+        const sql = "DELETE FROM " ++ table ++ " WHERE protocol = ? AND block_number > ?";
         var q = try Query.init(db, sql);
         defer q.deinit();
-        try q.bindTextStatic(chain_str);
+        try q.bindTextStatic(protocol_str);
         try q.bindInt64(block_i64);
         try q.exec();
     }
 
     // Update sync state
-    try db.setSyncState(chain, block_number);
+    try db.setSyncState(protocol, block_number);
 
-    std.log.warn("Rolled back {s} chain to block {d} (derived state rolled back, in-place updates to pre-{d} rows will re-derive on re-sync)", .{ chain_str, block_number, block_number });
+    std.log.warn("Rolled back {s} protocol to block {d} (derived state rolled back, in-place updates to pre-{d} rows will re-derive on re-sync)", .{ protocol_str, block_number, block_number });
 }
 
 /// Cleanup old block hashes (keep last 1000 blocks for reorg detection)
-pub fn pruneOldBlockHashes(db: *Database, chain: models.Chain, current_block: u64) !void {
+pub fn pruneOldBlockHashes(db: *Database, protocol: models.Protocol, current_block: u64) !void {
     const keep_blocks = 1000;
     if (current_block <= keep_blocks) return;
 
     const cutoff_block = current_block - keep_blocks;
-    const sql = "DELETE FROM block_hashes WHERE chain = ? AND block_number < ?";
+    const sql = "DELETE FROM block_hashes WHERE protocol = ? AND block_number < ?";
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindInt64(@intCast(cutoff_block));
     try q.exec();
 }
@@ -205,31 +205,31 @@ pub fn checkIntegrity(db: *Database) !bool {
 }
 
 /// Check if a subregistry is already known
-pub fn isSubregistryKnown(db: *Database, chain: models.Chain, address: []const u8) !bool {
-    const sql = "SELECT 1 FROM known_subregistries WHERE chain = ? AND address = ? LIMIT 1";
+pub fn isSubregistryKnown(db: *Database, protocol: models.Protocol, address: []const u8) !bool {
+    const sql = "SELECT 1 FROM known_subregistries WHERE protocol = ? AND address = ? LIMIT 1";
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindText(address);
 
     return try q.step();
 }
 
 /// Register or update a known subregistry
-pub fn registerSubregistry(db: *Database, chain: models.Chain, address: []const u8, block_number: u64) !void {
+pub fn registerSubregistry(db: *Database, protocol: models.Protocol, address: []const u8, block_number: u64) !void {
     const sql =
-        \\INSERT INTO known_subregistries (chain, address, first_seen_block, last_indexed_block)
+        \\INSERT INTO known_subregistries (protocol, address, first_seen_block, last_indexed_block)
         \\VALUES (?, ?, ?, ?)
-        \\ON CONFLICT(chain, address) DO UPDATE SET
+        \\ON CONFLICT(protocol, address) DO UPDATE SET
         \\  last_indexed_block = MAX(last_indexed_block, excluded.last_indexed_block)
     ;
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindText(address);
     try q.bindInt64(@intCast(block_number));
     try q.bindInt64(@intCast(block_number));
@@ -238,18 +238,18 @@ pub fn registerSubregistry(db: *Database, chain: models.Chain, address: []const 
 }
 
 /// Register or update a known resolver
-pub fn registerResolver(db: *Database, chain: models.Chain, address: []const u8, block_number: u64) !void {
+pub fn registerResolver(db: *Database, protocol: models.Protocol, address: []const u8, block_number: u64) !void {
     const sql =
-        \\INSERT INTO known_resolvers (chain, address, first_seen_block, last_indexed_block)
+        \\INSERT INTO known_resolvers (protocol, address, first_seen_block, last_indexed_block)
         \\VALUES (?, ?, ?, ?)
-        \\ON CONFLICT(chain, address) DO UPDATE SET
+        \\ON CONFLICT(protocol, address) DO UPDATE SET
         \\  last_indexed_block = MAX(last_indexed_block, excluded.last_indexed_block)
     ;
 
     var q = try Query.initCached(db, sql);
     defer q.deinit();
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindText(address);
     try q.bindInt64(@intCast(block_number));
     try q.bindInt64(@intCast(block_number));
@@ -272,15 +272,15 @@ pub const SubregistryDiscoveryResult = struct {
     }
 };
 
-pub fn discoverAndGetSubregistries(db: *Database, chain: models.Chain, main_registry: []const u8, from_block: u64, to_block: u64) !SubregistryDiscoveryResult {
-    const chain_str = chain.toString();
+pub fn discoverAndGetSubregistries(db: *Database, protocol: models.Protocol, main_registry: []const u8, from_block: u64, to_block: u64) !SubregistryDiscoveryResult {
+    const protocol_str = protocol.toString();
 
     // First, discover any NEW subregistries from registries table (only those registered in this block range)
     const discover_sql =
         \\SELECT DISTINCT r.address
         \\FROM registries r
-        \\LEFT JOIN known_subregistries ks ON ks.chain = r.chain AND ks.address = r.address
-        \\WHERE r.chain = ?
+        \\LEFT JOIN known_subregistries ks ON ks.protocol = r.protocol AND ks.address = r.address
+        \\WHERE r.protocol = ?
         \\  AND r.address != '0x0000000000000000000000000000000000000000'
         \\  AND r.address != ?
         \\  AND r.created_block >= ?
@@ -298,7 +298,7 @@ pub fn discoverAndGetSubregistries(db: *Database, chain: models.Chain, main_regi
         var q = try Query.init(db, discover_sql);
         defer q.deinit();
 
-        try q.bindTextStatic(chain_str);
+        try q.bindTextStatic(protocol_str);
         try q.bindText(main_registry);
         try q.bindInt64(@intCast(from_block));
         try q.bindInt64(@intCast(to_block));
@@ -306,7 +306,7 @@ pub fn discoverAndGetSubregistries(db: *Database, chain: models.Chain, main_regi
         // Register newly discovered subregistries and track them
         while (try q.step()) {
             if (q.getTextSlice(0)) |addr_slice| {
-                try db.registerSubregistry(chain, addr_slice, from_block);
+                try db.registerSubregistry(protocol, addr_slice, from_block);
                 const copy = try db.allocator.dupe(u8, addr_slice);
                 try new_subregistries.append(db.allocator, copy);
             }
@@ -316,14 +316,14 @@ pub fn discoverAndGetSubregistries(db: *Database, chain: models.Chain, main_regi
     // Now get ALL known subregistries from cache (very fast)
     const get_sql =
         \\SELECT address FROM known_subregistries
-        \\WHERE chain = ?
+        \\WHERE protocol = ?
         \\ORDER BY address
     ;
 
     var q2 = try Query.init(db, get_sql);
     defer q2.deinit();
 
-    try q2.bindTextStatic(chain_str);
+    try q2.bindTextStatic(protocol_str);
 
     var subregistries: std.ArrayList([]u8) = .{};
     errdefer {
@@ -346,10 +346,10 @@ pub fn discoverAndGetSubregistries(db: *Database, chain: models.Chain, main_regi
 }
 
 /// Insert a token observer event
-pub fn insertTokenObserver(db: *Database, chain: models.Chain, token_id: u256, observer: Address, block_number: u64, tx_hash: Hash, log_index: u32) !void {
+pub fn insertTokenObserver(db: *Database, protocol: models.Protocol, token_id: u256, observer: Address, block_number: u64, tx_hash: Hash, log_index: u32) !void {
     const sql =
         \\INSERT OR IGNORE INTO token_observers
-        \\(chain, token_id, observer, block_number, transaction_hash, log_index, timestamp)
+        \\(protocol, token_id, observer, block_number, transaction_hash, log_index, timestamp)
         \\VALUES (?, ?, ?, ?, ?, ?, ?)
     ;
 
@@ -359,7 +359,7 @@ pub fn insertTokenObserver(db: *Database, chain: models.Chain, token_id: u256, o
     const token_id_str = try std.fmt.allocPrint(db.allocator, "{d}", .{token_id});
     defer db.allocator.free(token_id_str);
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindText(token_id_str);
     try q.bindAddress(observer);
     try q.bindInt64(@intCast(block_number));
@@ -430,7 +430,7 @@ pub fn deleteDataAfterBlock(db: *Database, block_number: u64) !void {
 
 /// Orphaned registration data - NameRegistered events skipped due to no parent
 pub const OrphanedRegistration = struct {
-    chain: models.Chain,
+    protocol: models.Protocol,
     subregistry_address: []const u8,
     token_id: u256,
     label: []const u8,
@@ -449,7 +449,7 @@ pub const OrphanedRegistration = struct {
 /// Store an orphaned NameRegistered event for later processing
 pub fn insertOrphanedRegistration(
     db: *Database,
-    chain: models.Chain,
+    protocol: models.Protocol,
     subregistry_address: []const u8,
     token_id: u256,
     label: []const u8,
@@ -461,7 +461,7 @@ pub fn insertOrphanedRegistration(
 ) !void {
     const sql =
         \\INSERT OR IGNORE INTO orphaned_registrations
-        \\(chain, subregistry_address, token_id, label, expiry, owner, block_number, tx_hash, log_index, created_at)
+        \\(protocol, subregistry_address, token_id, label, expiry, owner, block_number, tx_hash, log_index, created_at)
         \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ;
 
@@ -471,7 +471,7 @@ pub fn insertOrphanedRegistration(
     const token_id_str = try std.fmt.allocPrint(db.allocator, "0x{x:0>64}", .{token_id});
     defer db.allocator.free(token_id_str);
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindText(subregistry_address);
     try q.bindText(token_id_str);
     try q.bindText(label);
@@ -486,18 +486,18 @@ pub fn insertOrphanedRegistration(
 }
 
 /// Get orphaned registrations for a subregistry address
-pub fn getOrphanedRegistrations(db: *Database, chain: models.Chain, subregistry_address: []const u8) ![]OrphanedRegistration {
+pub fn getOrphanedRegistrations(db: *Database, protocol: models.Protocol, subregistry_address: []const u8) ![]OrphanedRegistration {
     const sql =
-        \\SELECT chain, subregistry_address, token_id, label, expiry, owner, block_number, tx_hash, log_index
+        \\SELECT protocol, subregistry_address, token_id, label, expiry, owner, block_number, tx_hash, log_index
         \\FROM orphaned_registrations
-        \\WHERE chain = ? AND subregistry_address = ?
+        \\WHERE protocol = ? AND subregistry_address = ?
         \\ORDER BY block_number ASC
     ;
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindText(subregistry_address);
 
     var results: std.ArrayList(OrphanedRegistration) = .{};
@@ -509,7 +509,7 @@ pub fn getOrphanedRegistrations(db: *Database, chain: models.Chain, subregistry_
     }
 
     while (try q.step()) {
-        const chain_str = q.getTextSlice(0) orelse continue;
+        const protocol_str = q.getTextSlice(0) orelse continue;
         const addr_str = q.getTextSlice(1) orelse continue;
         const token_id_str = q.getTextSlice(2) orelse continue;
         const label_str = q.getTextSlice(3) orelse continue;
@@ -521,7 +521,7 @@ pub fn getOrphanedRegistrations(db: *Database, chain: models.Chain, subregistry_
         const token_id = std.fmt.parseInt(u256, token_id_clean, 16) catch continue;
 
         try results.append(db.allocator, .{
-            .chain = models.Chain.fromString(chain_str) catch continue,
+            .protocol = models.Protocol.fromString(protocol_str) catch continue,
             .subregistry_address = try db.allocator.dupe(u8, addr_str),
             .token_id = token_id,
             .label = try db.allocator.dupe(u8, label_str),
@@ -537,13 +537,13 @@ pub fn getOrphanedRegistrations(db: *Database, chain: models.Chain, subregistry_
 }
 
 /// Delete orphaned registrations after they've been processed
-pub fn deleteOrphanedRegistrations(db: *Database, chain: models.Chain, subregistry_address: []const u8) !void {
-    const sql = "DELETE FROM orphaned_registrations WHERE chain = ? AND subregistry_address = ?";
+pub fn deleteOrphanedRegistrations(db: *Database, protocol: models.Protocol, subregistry_address: []const u8) !void {
+    const sql = "DELETE FROM orphaned_registrations WHERE protocol = ? AND subregistry_address = ?";
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindText(subregistry_address);
 
     try q.exec();

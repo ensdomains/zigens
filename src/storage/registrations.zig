@@ -8,10 +8,10 @@ const models = @import("../types/models.zig");
 const events = @import("events.zig");
 
 /// Insert a registration into the `registrations` table.
-/// Idempotent on (chain, tx_hash, log_index) via UNIQUE constraint.
+/// Idempotent on (protocol, tx_hash, log_index) via UNIQUE constraint.
 pub fn insertRegistration(
     db: *Database,
-    chain: models.Chain,
+    protocol: models.Protocol,
     namehash: Hash,
     label: []const u8,
     parent_name: []const u8,
@@ -25,14 +25,14 @@ pub fn insertRegistration(
 ) !void {
     const sql =
         \\INSERT OR IGNORE INTO registrations
-        \\(chain, namehash, label, parent_name, registrant, registered_at, expiry, block_number, transaction_hash, log_index, event_type)
+        \\(protocol, namehash, label, parent_name, registrant, registered_at, expiry, block_number, transaction_hash, log_index, event_type)
         \\VALUES (?, ?, ?, ?, LOWER(?), ?, ?, ?, ?, ?, ?)
     ;
 
     var q = try db_module.Query.initCached(db, sql);
     defer q.deinit();
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindHash(namehash);
     try q.bindText(label);
     try q.bindText(parent_name);
@@ -72,7 +72,7 @@ pub fn insertRegistration(
 // ============================================================================
 
 pub const RegistrationFilterOptions = struct {
-    chain: ?models.Chain = null, // Filter by chain (l1 or l2)
+    protocol: ?models.Protocol = null, // Filter by protocol (l1 or l2)
     registrant: ?[]const u8 = null, // Filter by registrant (owner in event data JSON)
     registrant_in: ?[]const []const u8 = null, // Filter by registrant IN list
     limit: u32 = constants.Pagination.default_limit,
@@ -100,7 +100,7 @@ pub fn getRegistrations(database: *Database, filter: RegistrationFilterOptions) 
 
     const event_filter = events.EventFilterOptions{
         .event_types = &registration_event_types,
-        .chain = filter.chain,
+        .protocol = filter.protocol,
         .data_json_owner = filter.registrant,
         .data_json_owners = filter.registrant_in,
         .limit = filter.limit,
@@ -121,85 +121,28 @@ pub fn getRegistrations(database: *Database, filter: RegistrationFilterOptions) 
 // ============================================================================
 
 /// Get count of registrations with optional filters.
-/// Single unified query against the `registrations` table (indexed columns).
+/// Counts from the `events` table (filtered by NameRegistered/LabelRegistered) with the
+/// same WHERE clauses `getRegistrations` applies — guaranteeing count parity with the
+/// row query. The first-class `registrations` table introduced by schema/021 is not
+/// guaranteed to exist on existing DBs (the migration short-circuit in
+/// `loadSchemaFiles` skips schema files when `names` already exists), so counting from
+/// `events` is the only path that works on every deployment.
 pub fn getRegistrationCount(database: *Database, filter: RegistrationFilterOptions) !usize {
-    var sql_buf: [1024]u8 = undefined;
-    var sql_len: usize = 0;
+    const registration_event_types = [_][]const u8{
+        models.EventType.name_registered.toString(),
+        models.EventType.label_registered.toString(),
+    };
 
-    const base = "SELECT COUNT(*) FROM registrations WHERE 1=1";
-    @memcpy(sql_buf[sql_len..][0..base.len], base);
-    sql_len += base.len;
-
-    if (filter.chain != null) {
-        const cond = " AND chain = ?";
-        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
-        sql_len += cond.len;
-    }
-    if (filter.registrant != null) {
-        const cond = " AND registrant = LOWER(?)";
-        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
-        sql_len += cond.len;
-    }
-    if (filter.registrant_in != null and filter.registrant_in.?.len > 0) {
-        const prefix = " AND registrant IN (";
-        @memcpy(sql_buf[sql_len..][0..prefix.len], prefix);
-        sql_len += prefix.len;
-        for (filter.registrant_in.?, 0..) |_, i| {
-            if (i > 0) {
-                sql_buf[sql_len] = ',';
-                sql_len += 1;
-            }
-            const placeholder = "LOWER(?)";
-            @memcpy(sql_buf[sql_len..][0..placeholder.len], placeholder);
-            sql_len += placeholder.len;
-        }
-        sql_buf[sql_len] = ')';
-        sql_len += 1;
-    }
-    if (filter.expiry_gt != null) {
-        const cond = " AND expiry > ?";
-        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
-        sql_len += cond.len;
-    }
-    if (filter.expiry_gte != null) {
-        const cond = " AND expiry >= ?";
-        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
-        sql_len += cond.len;
-    }
-    if (filter.expiry_lt != null) {
-        const cond = " AND expiry < ?";
-        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
-        sql_len += cond.len;
-    }
-    if (filter.expiry_lte != null) {
-        const cond = " AND expiry <= ?";
-        @memcpy(sql_buf[sql_len..][0..cond.len], cond);
-        sql_len += cond.len;
-    }
-
-    var q = try db_module.Query.init(database, sql_buf[0..sql_len]);
-    defer q.deinit();
-
-    if (filter.chain) |ch| {
-        try q.bindTextStatic(ch.toString());
-    }
-    if (filter.registrant) |reg| {
-        try q.bindText(reg);
-    }
-    if (filter.registrant_in) |regs| {
-        for (regs) |reg| {
-            try q.bindText(reg);
-        }
-    }
-    if (filter.expiry_gt) |exp| try q.bindInt64(exp);
-    if (filter.expiry_gte) |exp| try q.bindInt64(exp);
-    if (filter.expiry_lt) |exp| try q.bindInt64(exp);
-    if (filter.expiry_lte) |exp| try q.bindInt64(exp);
-
-    if (try q.step()) {
-        return @intCast(q.getInt64(0));
-    }
-    return 0;
+    return events.getEventCount(database, .{
+        .event_types = &registration_event_types,
+        .protocol = filter.protocol,
+        .data_json_owner = filter.registrant,
+        .data_json_owners = filter.registrant_in,
+        .expiry_gt = filter.expiry_gt,
+        .expiry_gte = filter.expiry_gte,
+        .expiry_lt = filter.expiry_lt,
+        .expiry_lte = filter.expiry_lte,
+    });
 }
 
 /// Get total count of registrations (convenience wrapper with no filters)
@@ -215,4 +158,3 @@ test "getRegistrations filters by canonical contracts" {
     // This test would require a mock database setup
     // For now, we just verify the module compiles correctly
 }
-

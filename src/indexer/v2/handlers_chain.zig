@@ -6,7 +6,7 @@ const Indexer = @import("../indexer.zig").Indexer;
 
 /// Handle TokenObserverSet event
 /// TokenObserverSet(uint256 indexed tokenId, address observer)
-pub fn handleTokenObserverSet(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleTokenObserverSet(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     // topics[0] = event signature
     // topics[1] = indexed tokenId
     if (log.topics.len < 2) return error.InvalidTopicCount;
@@ -21,7 +21,7 @@ pub fn handleTokenObserverSet(self: *Indexer, chain: models.Chain, log: rpc.Log)
 
     // Store in database
     try self.database.insertTokenObserver(
-        chain,
+        protocol,
         token_id,
         observer,
         log.block_number,

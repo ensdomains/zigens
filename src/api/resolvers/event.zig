@@ -51,9 +51,15 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
             }
             if (std.mem.eql(u8, a.name, "contractAddress") and a.value == .string) {
                 // Normalize inline — needs allocation owned by the caller.
-                const addr = Address.fromHex(a.value.string) catch continue;
+                // Surface invalid input as an error rather than silently dropping the filter.
+                const addr = Address.fromHex(a.value.string) catch return error.InvalidContractAddress;
                 normalized_contract_address = try addr.toHex(allocator);
                 filter_opts.contract_address = normalized_contract_address;
+                continue;
+            }
+            if (std.mem.eql(u8, a.name, "protocol") and a.value == .string) {
+                // Surface invalid protocol as an error so a typo doesn't silently drop the filter.
+                filter_opts.protocol = models.Protocol.fromString(a.value.string) catch return error.InvalidProtocol;
                 continue;
             }
 
@@ -61,9 +67,13 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
                 common.matchStringArg(a, "domain", &filter_opts.domain) or
                 common.matchStringArg(a, "namehash", &filter_opts.namehash) or
                 common.matchIntArg(a, "blockNumber_gt", &filter_opts.block_number_gt) or
+                common.matchIntArg(a, "blockNumber_gte", &filter_opts.block_number_gte) or
                 common.matchIntArg(a, "blockNumber_lt", &filter_opts.block_number_lt) or
+                common.matchIntArg(a, "blockNumber_lte", &filter_opts.block_number_lte) or
                 common.matchIntArg(a, "timestamp_gt", &filter_opts.timestamp_gt) or
-                common.matchIntArg(a, "timestamp_lt", &filter_opts.timestamp_lt);
+                common.matchIntArg(a, "timestamp_gte", &filter_opts.timestamp_gte) or
+                common.matchIntArg(a, "timestamp_lt", &filter_opts.timestamp_lt) or
+                common.matchIntArg(a, "timestamp_lte", &filter_opts.timestamp_lte);
         }
     }
 
@@ -115,22 +125,18 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
     else
         user_dir;
 
-    // Convert cursor → skip offset (same pattern as registrationConnection).
-    // Cursor format is "<tx_hash_hex>-<log_index>".
+    // Convert cursor → skip offset. Cursor format: "<tx_hash_hex>-<log_index>". The count
+    // must apply the SAME filters as the row query (type, namehash, contractAddress, block
+    // range, …) — otherwise offset is taken over the unfiltered superset and pages drop rows.
     var skip: u32 = 0;
     if (params.cursor) |c| {
-        const decoded_opt = pagination.CursorCodec.decodeString(allocator, c) catch null;
-        if (decoded_opt) |decoded| {
-            defer allocator.free(decoded);
-            if (std.mem.lastIndexOfScalar(u8, decoded, '-')) |sep| {
-                const tx_hash = decoded[0..sep];
-                const log_index = std.fmt.parseInt(u32, decoded[sep + 1 ..], 10) catch 0;
-                // eventConnection doesn't pre-filter by event_type — pass null so all events count.
-                // TODO: if filter_opts.event_type / event_types is set, include here for accurate offset.
-                const events_before = database.countEventsBeforeCursor(tx_hash, log_index, order_dir, null) catch 0;
-                skip = events_before +| 1;
-            }
-        }
+        const decoded = try pagination.CursorCodec.decodeString(allocator, c);
+        defer allocator.free(decoded);
+        const sep = std.mem.lastIndexOfScalar(u8, decoded, '-') orelse return error.InvalidCursor;
+        const tx_hash = decoded[0..sep];
+        const log_index = std.fmt.parseInt(u32, decoded[sep + 1 ..], 10) catch return error.InvalidCursor;
+        const events_before = database.countEventsBeforeCursor(tx_hash, log_index, order_dir, filter_opts) catch 0;
+        skip = events_before +| 1;
     }
 
     // Apply filters and fetch
@@ -282,7 +288,7 @@ pub fn resolveEvents(ctx: parser.ExecutionContext, field: *const parser.Field) !
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
     const allocator = ctx.allocator;
 
-    const first = common.parsePagination(field, 100).first;
+    const first = (try common.parsePagination(field, 100)).first;
 
     // Parse EventFilter if provided
     var filter_opts = db.EventFilterOptions{
@@ -308,10 +314,13 @@ pub fn resolveEvents(ctx: parser.ExecutionContext, field: *const parser.Field) !
                 continue;
             }
             if (std.mem.eql(u8, a.name, "contractAddress") and a.value == .string) {
-                // NOTE: unlike the Connection variant, this query surfaces invalid addresses as errors.
                 const addr = Address.fromHex(a.value.string) catch return error.InvalidContractAddress;
                 normalized_contract_address = try addr.toHex(allocator);
                 filter_opts.contract_address = normalized_contract_address;
+                continue;
+            }
+            if (std.mem.eql(u8, a.name, "protocol") and a.value == .string) {
+                filter_opts.protocol = models.Protocol.fromString(a.value.string) catch return error.InvalidProtocol;
                 continue;
             }
 
@@ -319,9 +328,13 @@ pub fn resolveEvents(ctx: parser.ExecutionContext, field: *const parser.Field) !
                 common.matchStringArg(a, "domain", &filter_opts.domain) or
                 common.matchStringArg(a, "namehash", &filter_opts.namehash) or
                 common.matchIntArg(a, "blockNumber_gt", &filter_opts.block_number_gt) or
+                common.matchIntArg(a, "blockNumber_gte", &filter_opts.block_number_gte) or
                 common.matchIntArg(a, "blockNumber_lt", &filter_opts.block_number_lt) or
+                common.matchIntArg(a, "blockNumber_lte", &filter_opts.block_number_lte) or
                 common.matchIntArg(a, "timestamp_gt", &filter_opts.timestamp_gt) or
-                common.matchIntArg(a, "timestamp_lt", &filter_opts.timestamp_lt);
+                common.matchIntArg(a, "timestamp_gte", &filter_opts.timestamp_gte) or
+                common.matchIntArg(a, "timestamp_lt", &filter_opts.timestamp_lt) or
+                common.matchIntArg(a, "timestamp_lte", &filter_opts.timestamp_lte);
         }
     }
 

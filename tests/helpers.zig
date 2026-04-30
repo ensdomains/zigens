@@ -27,6 +27,7 @@ fn createWebhooksSchema(database: *Database) !void {
         \\CREATE TABLE IF NOT EXISTS webhooks (
         \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
         \\  url TEXT NOT NULL,
+        \\  secret TEXT NOT NULL,
         \\  event_types TEXT NOT NULL,
         \\  active INTEGER NOT NULL DEFAULT 1,
         \\  max_retries INTEGER NOT NULL DEFAULT 3,
@@ -37,8 +38,9 @@ fn createWebhooksSchema(database: *Database) !void {
         \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
         \\    webhook_id INTEGER NOT NULL,
         \\    webhook_url TEXT NOT NULL,
+        \\    webhook_secret TEXT NOT NULL DEFAULT '',
         \\    event_type TEXT NOT NULL,
-        \\    chain TEXT NOT NULL,
+        \\    protocol TEXT NOT NULL,
         \\    block_number INTEGER NOT NULL,
         \\    tx_hash TEXT NOT NULL,
         \\    contract_address TEXT NOT NULL,
@@ -66,13 +68,13 @@ pub fn destroyTestDatabase(allocator: std.mem.Allocator, database: *Database) vo
 /// Create a test registry in the database
 pub fn createTestRegistry(
     database: *Database,
-    chain: models.Chain,
+    protocol: models.Protocol,
     address_val: Address,
     name: []const u8,
     namehash_val: Hash,
 ) !void {
     try database.insertRegistry(models.Registry{
-        .chain = chain,
+        .protocol = protocol,
         .address = address_val,
         .name = name,
         .namehash = namehash_val,
@@ -110,7 +112,7 @@ pub fn createTestName(
     const label_hash = try lib.labelhash(allocator, label);
 
     try database.insertName(models.Name{
-        .chain = .v2,
+        .protocol = .v2,
         .name = name,
         .namehash = nh,
         .label = label,
@@ -154,7 +156,7 @@ pub fn createTestEvent(
     std.crypto.random.bytes(&tx_hash);
 
     try database.insertEvent(models.Event{
-        .chain = .v2,
+        .protocol = .v2,
         .event_type = event_type,
         .block_number = 1000,
         .tx_hash = Hash{ .bytes = tx_hash },

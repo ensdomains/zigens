@@ -12,7 +12,7 @@ const json_utils = @import("../../utils/json.zig");
 /// Handle legacy AddrChanged event (2017 Public Resolver)
 /// AddrChanged(bytes32 indexed node, address a)
 /// Stores as coinType=60 (ETH) to match modern AddressChanged format
-pub fn handleLegacyAddrChanged(self: *Indexer, chain: models.Chain, resolver: Address, log: rpc.Log) !void {
+pub fn handleLegacyAddrChanged(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
     // topics[0] = event signature
     // topics[1] = indexed node (namehash)
     if (log.topics.len < 2) return error.InvalidTopicCount;
@@ -39,7 +39,7 @@ pub fn handleLegacyAddrChanged(self: *Indexer, chain: models.Chain, resolver: Ad
         resolver,
         60, // ETH coin type
         addr_hex,
-        chain,
+        protocol,
         log.block_number,
         log.transaction_hash,
         std.time.timestamp(),
@@ -58,13 +58,13 @@ pub fn handleLegacyAddrChanged(self: *Indexer, chain: models.Chain, resolver: Ad
     });
 
     const domain_name = self.getNameFromNamehash(namehash);
-    try utils.emitEvent(self, chain, log, .address_changed, domain_name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .address_changed, domain_name, namehash, event_data);
 }
 
 /// Handle legacy ContentChanged event (2017 Public Resolver)
 /// ContentChanged(bytes32 indexed node, bytes32 hash)
 /// Stores as hex-encoded content hash to match modern ContentHashChanged format
-pub fn handleLegacyContentChanged(self: *Indexer, chain: models.Chain, resolver: Address, log: rpc.Log) !void {
+pub fn handleLegacyContentChanged(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
     // topics[0] = event signature
     // topics[1] = indexed node (namehash)
     if (log.topics.len < 2) return error.InvalidTopicCount;
@@ -94,7 +94,7 @@ pub fn handleLegacyContentChanged(self: *Indexer, chain: models.Chain, resolver:
         namehash,
         resolver,
         content_hash_hex,
-        chain,
+        protocol,
         log.block_number,
         log.transaction_hash,
         std.time.timestamp(),
@@ -113,12 +113,12 @@ pub fn handleLegacyContentChanged(self: *Indexer, chain: models.Chain, resolver:
     });
 
     const domain_name = self.getNameFromNamehash(namehash);
-    try utils.emitEvent(self, chain, log, .contenthash_changed, domain_name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .contenthash_changed, domain_name, namehash, event_data);
 }
 
 /// Handle AddressChanged event
 /// AddressChanged(bytes32 indexed node, uint256 coinType, bytes newAddress)
-pub fn handleAddressChanged(self: *Indexer, chain: models.Chain, resolver: Address, log: rpc.Log) !void {
+pub fn handleAddressChanged(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
     // topics[0] = event signature
     // topics[1] = indexed node (namehash)
     if (log.topics.len < 2) return error.InvalidTopicCount;
@@ -154,7 +154,7 @@ pub fn handleAddressChanged(self: *Indexer, chain: models.Chain, resolver: Addre
         resolver,
         @intCast(coin_type),
         address_hex,
-        chain,
+        protocol,
         log.block_number,
         log.transaction_hash,
         std.time.timestamp(),
@@ -176,12 +176,12 @@ pub fn handleAddressChanged(self: *Indexer, chain: models.Chain, resolver: Addre
     // Look up domain name from namehash
     const domain_name = self.getNameFromNamehash(namehash);
 
-    try utils.emitEvent(self, chain, log, .address_changed, domain_name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .address_changed, domain_name, namehash, event_data);
 }
 
 /// Handle ContentHashChanged event
 /// ContentHashChanged(bytes32 indexed node, bytes hash)
-pub fn handleContentHashChanged(self: *Indexer, chain: models.Chain, resolver: Address, log: rpc.Log) !void {
+pub fn handleContentHashChanged(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
     // topics[0] = event signature
     // topics[1] = indexed node (namehash)
     if (log.topics.len < 2) return error.InvalidTopicCount;
@@ -214,7 +214,7 @@ pub fn handleContentHashChanged(self: *Indexer, chain: models.Chain, resolver: A
         namehash,
         resolver,
         content_hash_hex,
-        chain,
+        protocol,
         log.block_number,
         log.transaction_hash,
         std.time.timestamp(),
@@ -235,12 +235,12 @@ pub fn handleContentHashChanged(self: *Indexer, chain: models.Chain, resolver: A
     // Look up domain name from namehash
     const domain_name = self.getNameFromNamehash(namehash);
 
-    try utils.emitEvent(self, chain, log, .contenthash_changed, domain_name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .contenthash_changed, domain_name, namehash, event_data);
 }
 
 /// Handle TextChanged event
 /// TextChanged(bytes32 indexed node, string indexed indexedKey, string key, string value)
-pub fn handleTextChanged(self: *Indexer, chain: models.Chain, resolver: Address, log: rpc.Log) !void {
+pub fn handleTextChanged(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
     // topics[0] = event signature
     // topics[1] = indexed node (namehash)
     // topics[2] = indexed key (hashed, not useful)
@@ -280,7 +280,7 @@ pub fn handleTextChanged(self: *Indexer, chain: models.Chain, resolver: Address,
         resolver,
         key,
         value,
-        chain,
+        protocol,
         log.block_number,
         log.transaction_hash,
         std.time.timestamp(),
@@ -308,12 +308,12 @@ pub fn handleTextChanged(self: *Indexer, chain: models.Chain, resolver: Address,
     // Look up domain name from namehash
     const domain_name = self.getNameFromNamehash(namehash);
 
-    try utils.emitEvent(self, chain, log, .text_changed, domain_name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .text_changed, domain_name, namehash, event_data);
 }
 
 /// Handle ABIChanged event
 /// ABIChanged(bytes32 indexed node, uint256 indexed contentType)
-pub fn handleABIChanged(self: *Indexer, chain: models.Chain, resolver: Address, log: rpc.Log) !void {
+pub fn handleABIChanged(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
     // topics[0] = event signature
     // topics[1] = indexed node (namehash)
     // topics[2] = indexed contentType
@@ -340,10 +340,10 @@ pub fn handleABIChanged(self: *Indexer, chain: models.Chain, resolver: Address, 
         namehash,
         resolver,
         @truncate(content_type),
-        chain,
+        protocol,
         log.block_number,
         log.transaction_hash,
-        self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     ) catch |err| {
         std.log.warn("Failed to store resolver ABI: {}", .{err});
     };
@@ -357,12 +357,12 @@ pub fn handleABIChanged(self: *Indexer, chain: models.Chain, resolver: Address, 
     // Look up domain name from namehash
     const domain_name = self.getNameFromNamehash(namehash);
 
-    try utils.emitEvent(self, chain, log, .abi_changed, domain_name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .abi_changed, domain_name, namehash, event_data);
 }
 
 /// Handle PubkeyChanged event
 /// PubkeyChanged(bytes32 indexed node, bytes32 x, bytes32 y)
-pub fn handlePubkeyChanged(self: *Indexer, chain: models.Chain, resolver: Address, log: rpc.Log) !void {
+pub fn handlePubkeyChanged(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
     // topics[0] = event signature
     // topics[1] = indexed node (namehash)
     var namehash = log.topics[1];
@@ -403,10 +403,10 @@ pub fn handlePubkeyChanged(self: *Indexer, chain: models.Chain, resolver: Addres
         resolver,
         x_hex,
         y_hex,
-        chain,
+        protocol,
         log.block_number,
         log.transaction_hash,
-        self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     ) catch |err| {
         std.log.warn("Failed to store resolver pubkey: {}", .{err});
     };
@@ -421,12 +421,12 @@ pub fn handlePubkeyChanged(self: *Indexer, chain: models.Chain, resolver: Addres
     // Look up domain name from namehash
     const domain_name = self.getNameFromNamehash(namehash);
 
-    try utils.emitEvent(self, chain, log, .pubkey_changed, domain_name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .pubkey_changed, domain_name, namehash, event_data);
 }
 
 /// Handle NameChanged event (reverse resolution)
 /// NameChanged(bytes32 indexed node, string name)
-pub fn handleNameChanged(self: *Indexer, chain: models.Chain, resolver: Address, log: rpc.Log) !void {
+pub fn handleNameChanged(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
     // topics[0] = event signature
     // topics[1] = indexed node (namehash)
     var namehash = log.topics[1];
@@ -465,10 +465,10 @@ pub fn handleNameChanged(self: *Indexer, chain: models.Chain, resolver: Address,
         namehash,
         resolver,
         name,
-        chain,
+        protocol,
         log.block_number,
         log.transaction_hash,
-        self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     ) catch |err| {
         std.log.warn("Failed to store resolver name: {}", .{err});
     };
@@ -482,12 +482,12 @@ pub fn handleNameChanged(self: *Indexer, chain: models.Chain, resolver: Address,
     // Look up domain name from namehash
     const domain_name = self.getNameFromNamehash(namehash);
 
-    try utils.emitEvent(self, chain, log, .name_changed, domain_name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .name_changed, domain_name, namehash, event_data);
 }
 
 /// Handle InterfaceChanged event
 /// InterfaceChanged(bytes32 indexed node, bytes4 indexed interfaceID, address implementer)
-pub fn handleInterfaceChanged(self: *Indexer, chain: models.Chain, resolver: Address, log: rpc.Log) !void {
+pub fn handleInterfaceChanged(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
     // topics[0] = event signature
     // topics[1] = indexed node (namehash)
     // topics[2] = indexed interfaceID (bytes4 padded to bytes32)
@@ -532,10 +532,10 @@ pub fn handleInterfaceChanged(self: *Indexer, chain: models.Chain, resolver: Add
         resolver,
         interface_id_hex,
         implementer_hex,
-        chain,
+        protocol,
         log.block_number,
         log.transaction_hash,
-        self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     ) catch |err| {
         std.log.warn("Failed to store resolver interface: {}", .{err});
     };
@@ -550,13 +550,13 @@ pub fn handleInterfaceChanged(self: *Indexer, chain: models.Chain, resolver: Add
     // Look up domain name from namehash
     const domain_name = self.getNameFromNamehash(namehash);
 
-    try utils.emitEvent(self, chain, log, .interface_changed, domain_name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .interface_changed, domain_name, namehash, event_data);
 }
 
 /// Handle VersionChanged event (OwnedResolver)
 /// VersionChanged(bytes32 indexed node, uint64 newVersion)
 /// Clears all resolver records for the given namehash
-pub fn handleVersionChanged(self: *Indexer, chain: models.Chain, resolver: Address, log: rpc.Log) !void {
+pub fn handleVersionChanged(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
     // topics[0] = event signature
     // topics[1] = indexed node (namehash)
     // data = newVersion (uint64, padded to 32 bytes)
@@ -608,10 +608,10 @@ pub fn handleVersionChanged(self: *Indexer, chain: models.Chain, resolver: Addre
         namehash,
         resolver,
         new_version,
-        chain,
+        protocol,
         log.block_number,
         log.transaction_hash,
-        self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     ) catch |err| {
         std.log.warn("Failed to store resolver version: {}", .{err});
     };
@@ -630,12 +630,12 @@ pub fn handleVersionChanged(self: *Indexer, chain: models.Chain, resolver: Addre
 
     const domain_name = self.getNameFromNamehash(namehash);
 
-    try utils.emitEvent(self, chain, log, .version_changed, domain_name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .version_changed, domain_name, namehash, event_data);
 }
 
 /// Handle AliasChanged event (OwnedResolver)
 /// AliasChanged(bytes indexed indexedFromName, bytes indexed indexedToName, bytes fromName, bytes toName)
-pub fn handleAliasChanged(self: *Indexer, chain: models.Chain, resolver: Address, log: rpc.Log) !void {
+pub fn handleAliasChanged(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
     // topics[0] = event signature
     // topics[1] = keccak256(fromName) — indexed bytes are hashed, not directly useful
     // topics[2] = keccak256(toName) — indexed bytes are hashed, not directly useful
@@ -693,10 +693,10 @@ pub fn handleAliasChanged(self: *Indexer, chain: models.Chain, resolver: Address
             resolver,
             from_name,
             to_name,
-            chain,
+            protocol,
             log.block_number,
             log.transaction_hash,
-            self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
         ) catch |err| {
             std.log.warn("Failed to store resolver alias: {}", .{err});
         };
@@ -723,14 +723,14 @@ pub fn handleAliasChanged(self: *Indexer, chain: models.Chain, resolver: Address
         escaped_to,
     });
 
-    try utils.emitEvent(self, chain, log, .alias_changed, null, null, event_data);
+    try utils.emitEvent(self, protocol, log, .alias_changed, null, null, event_data);
 }
 
 /// Wrapper for EACRolesChanged from resolver contracts
 /// Adapts ResolverEventConfig signature to call the existing RegistryEventConfig handler
-pub fn handleResolverEACRolesChanged(self: *Indexer, chain: models.Chain, _resolver: Address, log: rpc.Log) !void {
+pub fn handleResolverEACRolesChanged(self: *Indexer, protocol: models.Protocol, _resolver: Address, log: rpc.Log) !void {
     _ = _resolver;
-    try Indexer.handleEACRolesChanged(self, chain, log);
+    try Indexer.handleEACRolesChanged(self, protocol, log);
 }
 
 /// Decode DNS wire format to human-readable domain name

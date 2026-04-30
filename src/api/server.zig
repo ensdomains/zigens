@@ -7,7 +7,8 @@ const graphql = @import("handler.zig");
 const json_utils = @import("../utils/json.zig");
 const url_utils = @import("../utils/url.zig");
 const validation = @import("../utils/validation.zig");
-const RateLimiter = @import("../rate_limiter.zig").RateLimiter;
+const PerIpRateLimiter = @import("../rate_limiter.zig").PerIpRateLimiter;
+const webhook_manager = @import("../webhooks/manager.zig");
 
 /// Simple JSON API Server for ENSv2 Indexer
 /// Provides REST endpoints and GraphQL for querying indexed data
@@ -18,7 +19,7 @@ pub const Server = struct {
     port: u16,
     server: ?std.net.Server,
     graphql_handler: graphql.GraphQLHandler,
-    rate_limiter: RateLimiter,
+    rate_limiter: PerIpRateLimiter,
     webhook_admin_username: ?[]const u8, // Optional - if set with password, requires Basic Auth
     webhook_admin_password: ?[]const u8, // Optional - if set, requires Basic Auth for webhook endpoints
 
@@ -31,8 +32,9 @@ pub const Server = struct {
             webhook_db.?.* = webhook_db_value;
         }
 
-        // Initialize rate limiter with configurable requests per second
-        // Default burst capacity is 2x the per-second rate
+        // Per-IP rate limiter with configurable requests/sec.
+        // Burst capacity = 2x the per-second rate; the map is bounded at 100k IPs
+        // (rotating-IP attacks beyond that get refused new buckets, see PerIpRateLimiter).
         const rate_limit = if (rate_limit_per_second > 0) rate_limit_per_second else 100;
 
         return .{
@@ -42,7 +44,7 @@ pub const Server = struct {
             .port = port,
             .server = null,
             .graphql_handler = try graphql.GraphQLHandler.init(allocator, database, complexity_max_depth, complexity_max_cost, metrics_enabled),
-            .rate_limiter = RateLimiter.init(rate_limit * 2, rate_limit),
+            .rate_limiter = PerIpRateLimiter.init(allocator, rate_limit * 2, rate_limit, 100_000),
             .webhook_admin_username = webhook_admin_username,
             .webhook_admin_password = webhook_admin_password,
         };
@@ -50,6 +52,7 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         self.graphql_handler.deinit();
+        self.rate_limiter.deinit();
         if (self.webhook_database) |webhook_db| {
             webhook_db.deinit();
             self.allocator.destroy(webhook_db);
@@ -93,8 +96,11 @@ pub const Server = struct {
     }
 
     fn handleConnection(self: *Server, connection: std.net.Server.Connection) !void {
-        // Check rate limit before processing request
-        if (!self.rate_limiter.tryAcquire()) {
+        // Check per-IP rate limit before processing request.
+        // Note: connection.address is the direct peer; if running behind a trusted
+        // reverse proxy, use X-Forwarded-For (not yet wired — every visible client
+        // would share the proxy's IP otherwise).
+        if (!self.rate_limiter.tryAcquireFor(connection.address)) {
             try self.sendRateLimited(connection.stream);
             return;
         }
@@ -312,13 +318,13 @@ pub const Server = struct {
             defer self.allocator.free(name_escaped);
 
             const writer = response_buf.writer(self.allocator);
-            try writer.print("{{\"name\":\"{s}\",\"namehash\":\"{s}\",\"owner\":\"{s}\",\"resolver\":\"{s}\",\"registry\":\"{s}\",\"chain\":\"{s}\",\"expiry\":{d},\"registry_locked\":{},\"migrated\":{},\"created_at\":{d},\"updated_at\":{d}}}", .{
+            try writer.print("{{\"name\":\"{s}\",\"namehash\":\"{s}\",\"owner\":\"{s}\",\"resolver\":\"{s}\",\"registry\":\"{s}\",\"protocol\":\"{s}\",\"expiry\":{d},\"registry_locked\":{},\"migrated\":{},\"created_at\":{d},\"updated_at\":{d}}}", .{
                 name_escaped,
                 namehash_hex,
                 owner_hex,
                 resolver_hex,
                 registry_hex,
-                record_copy.chain.toString(),
+                record_copy.protocol.toString(),
                 record_copy.expiry,
                 record_copy.registry_locked,
                 record_copy.migrated,
@@ -502,6 +508,10 @@ pub const Server = struct {
     }
 
     fn handleGraphQLPlayground(self: *Server, stream: std.net.Stream) !void {
+        // Playground asset extracted to graphiql.html (commit 5308c2d) so the
+        // page can be edited without recompiling. The staging branch's inline
+        // version included an example with `name_in` — that example is preserved
+        // as a section in the .html file so the merge keeps both branches' intent.
         const html = @embedFile("graphiql.html");
 
         var response: std.ArrayList(u8) = .{};
@@ -828,10 +838,16 @@ pub const Server = struct {
         const active = if (obj.get("active")) |a| a.bool else true;
         const max_retries = if (obj.get("max_retries")) |mr| @as(u32, @intCast(mr.integer)) else 3;
 
+        // Generate a fresh HMAC secret for this webhook. This is the ONLY time the
+        // secret is returned to the caller — it's not retrievable later.
+        const secret = try webhook_manager.generateWebhookSecret(self.allocator);
+        defer self.allocator.free(secret);
+
         // Create webhook
         const webhook = models.Webhook{
             .id = 0, // Will be set by database
             .url = url.string,
+            .secret = secret,
             .event_types = try event_types.toOwnedSlice(self.allocator),
             .active = active,
             .max_retries = max_retries,
@@ -840,7 +856,11 @@ pub const Server = struct {
 
         const webhook_id = try self.webhook_database.?.insertWebhook(webhook);
 
-        const response = try std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"message\":\"Webhook created\"}}", .{webhook_id});
+        const response = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"id\":{d},\"secret\":\"{s}\",\"message\":\"Webhook created. Store the secret — it is NOT retrievable later. Verify deliveries by computing HMAC-SHA256(secret, \\\"<X-Webhook-Timestamp>.<body>\\\") and comparing to X-Webhook-Signature.\"}}",
+            .{ webhook_id, secret },
+        );
         defer self.allocator.free(response);
 
         try self.sendJsonResponse(stream, 201, response);

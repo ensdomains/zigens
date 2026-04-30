@@ -9,7 +9,8 @@
 CREATE TABLE IF NOT EXISTS webhooks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   url TEXT NOT NULL,
-  event_types TEXT NOT NULL,  -- JSON array of event types to subscribe to
+  secret TEXT NOT NULL,        -- per-webhook HMAC-SHA256 key, hex-encoded; auto-generated on insert
+  event_types TEXT NOT NULL,   -- JSON array of event types to subscribe to
   active INTEGER NOT NULL DEFAULT 1,
   max_retries INTEGER NOT NULL DEFAULT 3,
   created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
@@ -26,9 +27,10 @@ CREATE INDEX IF NOT EXISTS idx_webhooks_active ON webhooks(active);
 CREATE TABLE IF NOT EXISTS webhook_queue (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     webhook_id INTEGER NOT NULL,
-    webhook_url TEXT NOT NULL,  -- Denormalized for faster worker processing
+    webhook_url TEXT NOT NULL,    -- Denormalized for faster worker processing
+    webhook_secret TEXT NOT NULL DEFAULT '',  -- Denormalized HMAC key, captured at enqueue time
     event_type TEXT NOT NULL,
-    chain TEXT NOT NULL,
+    protocol TEXT NOT NULL,
     block_number INTEGER NOT NULL,
     tx_hash TEXT NOT NULL,
     contract_address TEXT NOT NULL,

@@ -336,8 +336,8 @@ type Registration {
   """Account that registered the domain"""
   registrant: Account!
 
-  """Chain where registration occurred (l1 or l2)"""
-  chain: String!
+  """Chain where registration occurred (v1 or v2)"""
+  protocol: String!
 }
 
 """An event emitted by ENS contracts"""
@@ -369,8 +369,8 @@ type Event {
   """Domain associated with this event (if applicable)"""
   domain: Domain
 
-  """Chain where event occurred (l1 or l2)"""
-  chain: String!
+  """Chain where event occurred (v1 or v2)"""
+  protocol: String!
 
   """Event-specific data as JSON (e.g., key/value for TextChanged, address for AddressChanged)"""
   data: String
@@ -380,6 +380,9 @@ type Event {
 input DomainFilter {
   """Exact name match"""
   name: String
+
+  """Filter by name in list (up to 1000 names)"""
+  name_in: [String!]
 
   """Partial name match (contains)"""
   name_contains: String
@@ -425,6 +428,9 @@ input DomainFilter {
 
   """Filter by expiry date less than or equal (Unix timestamp)"""
   expiry_lte: Int
+
+  """Filter by migration status"""
+  isMigrated: Boolean
 }
 
 """Filter criteria for querying registrations"""
@@ -447,8 +453,8 @@ input RegistrationFilter {
   """Filter by expiry date less than or equal"""
   expiryDate_lte: Int
 
-  """Filter by chain (l1 or l2)"""
-  chain: String
+  """Filter by protocol (v1 or v2)"""
+  protocol: String
 }
 
 """Filter criteria for querying events"""
@@ -471,14 +477,29 @@ input EventFilter {
   """Filter by block number greater than"""
   blockNumber_gt: Int
 
+  """Filter by block number greater than or equal"""
+  blockNumber_gte: Int
+
   """Filter by block number less than"""
   blockNumber_lt: Int
+
+  """Filter by block number less than or equal"""
+  blockNumber_lte: Int
 
   """Filter by timestamp greater than"""
   timestamp_gt: Int
 
+  """Filter by timestamp greater than or equal"""
+  timestamp_gte: Int
+
   """Filter by timestamp less than"""
   timestamp_lt: Int
+
+  """Filter by timestamp less than or equal"""
+  timestamp_lte: Int
+
+  """Filter by protocol (v1 or v2)"""
+  protocol: String
 }
 
 """EAC (Enhanced Access Control) role assignment"""

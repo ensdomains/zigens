@@ -12,11 +12,11 @@ const Hash = @import("../types/hash.zig").Hash;
 // ============================================================================
 
 /// Parse a single event row from query results
-/// Column order: event_type(0), chain(1), block_number(2), tx_hash(3), log_index(4),
+/// Column order: event_type(0), protocol(1), block_number(2), tx_hash(3), log_index(4),
 ///               contract_address(5), name(6), namehash(7), data(8), timestamp(9)
 fn parseEventRow(q: *Query, allocator: std.mem.Allocator) !models.Event {
     const event_type_str = q.getTextSlice(0) orelse models.EventType.transfer.toString();
-    const chain_str = q.getTextSlice(1) orelse models.Chain.v2.toString();
+    const protocol_str = q.getTextSlice(1) orelse models.Protocol.v2.toString();
     const tx_hash_str = q.getTextSlice(3) orelse return error.MissingTxHash;
     const contract_addr_str = q.getTextSlice(5) orelse return error.MissingContractAddress;
     const data_str = q.getTextSlice(8) orelse "{}";
@@ -37,7 +37,7 @@ fn parseEventRow(q: *Query, allocator: std.mem.Allocator) !models.Event {
 
     return models.Event{
         .event_type = models.EventType.fromString(event_type_str) orelse .transfer,
-        .chain = try models.Chain.fromString(chain_str),
+        .protocol = try models.Protocol.fromString(protocol_str),
         .block_number = @intCast(q.getInt64(2)),
         .tx_hash = try Hash.fromHex(tx_hash_str),
         .log_index = @intCast(q.getInt(4)),
@@ -56,7 +56,7 @@ fn parseEventRow(q: *Query, allocator: std.mem.Allocator) !models.Event {
 pub fn insertEvent(db: *Database, event: models.Event) !void {
     const sql =
         \\INSERT OR IGNORE INTO events
-        \\(event_type, chain, block_number, tx_hash, log_index, contract_address,
+        \\(event_type, protocol, block_number, tx_hash, log_index, contract_address,
         \\ name, namehash, data, timestamp)
         \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ;
@@ -64,11 +64,11 @@ pub fn insertEvent(db: *Database, event: models.Event) !void {
     var q = try Query.initCached(db, sql);
     defer q.deinit();
 
-    // Bind event type and chain as static text
+    // Bind event type and protocol as static text
     const event_type_str = event.event_type.toString();
-    const chain_str = event.chain.toString();
+    const protocol_str = event.protocol.toString();
     try q.bindTextStatic(event_type_str);
-    try q.bindTextStatic(chain_str);
+    try q.bindTextStatic(protocol_str);
     try q.bindInt64(@intCast(event.block_number));
     try q.bindHashBuf(event.tx_hash);
     try q.bindInt(@intCast(event.log_index));
@@ -92,38 +92,44 @@ pub const EventSortField = enum {
     block_number,
     timestamp,
     name,
+    /// Sort by the JSON-encoded expiry. Uses the same COALESCE expression as
+    /// the expiry_* filters so ordering and filtering are consistent. Lets
+    /// SQLite handle the sort instead of the resolver pulling 10k rows and
+    /// sorting in memory.
+    expiry,
 
     pub fn toSql(self: EventSortField) []const u8 {
         return switch (self) {
             .block_number => "block_number",
             .timestamp => "timestamp",
             .name => "name",
+            .expiry => "COALESCE(CAST(json_extract(data, '$.expiry') AS INTEGER), CAST(json_extract(data, '$.expiration') AS INTEGER), timestamp + CAST(json_extract(data, '$.duration') AS INTEGER))",
         };
     }
 };
 
-pub fn getRecentEvents(db: *Database, chain: ?models.Chain, event_type: ?models.EventType, limit: u32) ![]models.Event {
-    return getRecentEventsWithOrder(db, chain, event_type, limit, .desc);
+pub fn getRecentEvents(db: *Database, protocol: ?models.Protocol, event_type: ?models.EventType, limit: u32) ![]models.Event {
+    return getRecentEventsWithOrder(db, protocol, event_type, limit, .desc);
 }
 
 /// Get recent events with configurable order direction (for backward pagination support)
-pub fn getRecentEventsWithOrder(db: *Database, chain: ?models.Chain, event_type: ?models.EventType, limit: u32, order_dir: OrderDir) ![]models.Event {
+pub fn getRecentEventsWithOrder(db: *Database, protocol: ?models.Protocol, event_type: ?models.EventType, limit: u32, order_dir: OrderDir) ![]models.Event {
     var sql_buf: [512]u8 = undefined;
     var sql_len: usize = 0;
 
-    const base_sql = "SELECT event_type, chain, block_number, tx_hash, log_index, contract_address, name, namehash, data, timestamp FROM events";
+    const base_sql = "SELECT event_type, protocol, block_number, tx_hash, log_index, contract_address, name, namehash, data, timestamp FROM events";
     @memcpy(sql_buf[sql_len..][0..base_sql.len], base_sql);
     sql_len += base_sql.len;
 
-    if (chain != null or event_type != null) {
+    if (protocol != null or event_type != null) {
         const where_sql = " WHERE ";
         @memcpy(sql_buf[sql_len..][0..where_sql.len], where_sql);
         sql_len += where_sql.len;
 
-        if (chain != null) {
-            const chain_filter = "chain = ?";
-            @memcpy(sql_buf[sql_len..][0..chain_filter.len], chain_filter);
-            sql_len += chain_filter.len;
+        if (protocol != null) {
+            const protocol_filter = "protocol = ?";
+            @memcpy(sql_buf[sql_len..][0..protocol_filter.len], protocol_filter);
+            sql_len += protocol_filter.len;
 
             if (event_type != null) {
                 const and_sql = " AND ";
@@ -149,11 +155,11 @@ pub fn getRecentEventsWithOrder(db: *Database, chain: ?models.Chain, event_type:
     const limit_str = try std.fmt.bufPrint(sql_buf[sql_len..], "{d}", .{limit});
     sql_len += limit_str.len;
 
-    var q = try Query.init(db, sql_buf[0..sql_len]);
+    var q = try Query.initCached(db, sql_buf[0..sql_len]);
     defer q.deinit();
 
     // Bind parameters
-    if (chain) |ch| {
+    if (protocol) |ch| {
         try q.bindTextStatic(ch.toString());
     }
     if (event_type) |et| {
@@ -180,15 +186,19 @@ pub fn getRecentEventsWithOrder(db: *Database, chain: ?models.Chain, event_type:
 pub const EventFilterOptions = struct {
     event_type: ?[]const u8 = null,
     event_types: ?[]const []const u8 = null,
-    chain: ?models.Chain = null,
+    protocol: ?models.Protocol = null,
     domain: ?[]const u8 = null,
     contract_address: ?[]const u8 = null,
     contract_addresses: ?[]const []const u8 = null,
     namehash: ?[]const u8 = null,
     block_number_gt: ?i64 = null,
+    block_number_gte: ?i64 = null,
     block_number_lt: ?i64 = null,
+    block_number_lte: ?i64 = null,
     timestamp_gt: ?i64 = null,
+    timestamp_gte: ?i64 = null,
     timestamp_lt: ?i64 = null,
+    timestamp_lte: ?i64 = null,
     data_json_owner: ?[]const u8 = null,
     data_json_owners: ?[]const []const u8 = null,
     // Expiry filters - uses json_extract(data, '$.expiration')
@@ -202,13 +212,115 @@ pub const EventFilterOptions = struct {
     sort_field: EventSortField = .block_number,
 };
 
+/// Append the WHERE conditions (no leading AND/WHERE) corresponding to `filter` into
+/// `conditions`. Dynamic IN-clause strings are tracked in `allocated_clauses` so the
+/// caller can free them after use. Kept in lockstep with `bindEventFilters`.
+fn appendEventFilterConditions(
+    db: *Database,
+    filter: EventFilterOptions,
+    conditions: *std.ArrayList([]const u8),
+    allocated_clauses: *std.ArrayList([]const u8),
+) !void {
+    if (filter.protocol != null) try conditions.append(db.allocator, "protocol = ?");
+    if (filter.event_type != null) try conditions.append(db.allocator, "event_type = ?");
+    if (filter.event_types != null and filter.event_types.?.len > 0) {
+        var in_parts: std.ArrayList(u8) = .{};
+        defer in_parts.deinit(db.allocator);
+        try in_parts.appendSlice(db.allocator, "event_type IN (");
+        for (filter.event_types.?, 0..) |_, i| {
+            if (i > 0) try in_parts.append(db.allocator, ',');
+            try in_parts.append(db.allocator, '?');
+        }
+        try in_parts.append(db.allocator, ')');
+        const clause = try db.allocator.dupe(u8, in_parts.items);
+        try allocated_clauses.append(db.allocator, clause);
+        try conditions.append(db.allocator, clause);
+    }
+    if (filter.domain != null) try conditions.append(db.allocator, "name = ?");
+    if (filter.contract_address != null) try conditions.append(db.allocator, "contract_address = ?");
+    if (filter.contract_addresses != null and filter.contract_addresses.?.len > 0) {
+        var in_parts: std.ArrayList(u8) = .{};
+        defer in_parts.deinit(db.allocator);
+        try in_parts.appendSlice(db.allocator, "contract_address IN (");
+        for (filter.contract_addresses.?, 0..) |_, i| {
+            if (i > 0) try in_parts.append(db.allocator, ',');
+            try in_parts.append(db.allocator, '?');
+        }
+        try in_parts.append(db.allocator, ')');
+        const clause = try db.allocator.dupe(u8, in_parts.items);
+        try allocated_clauses.append(db.allocator, clause);
+        try conditions.append(db.allocator, clause);
+    }
+    if (filter.namehash != null) try conditions.append(db.allocator, "namehash = ?");
+    if (filter.block_number_gt != null) try conditions.append(db.allocator, "block_number > ?");
+    if (filter.block_number_gte != null) try conditions.append(db.allocator, "block_number >= ?");
+    if (filter.block_number_lt != null) try conditions.append(db.allocator, "block_number < ?");
+    if (filter.block_number_lte != null) try conditions.append(db.allocator, "block_number <= ?");
+    if (filter.timestamp_gt != null) try conditions.append(db.allocator, "timestamp > ?");
+    if (filter.timestamp_gte != null) try conditions.append(db.allocator, "timestamp >= ?");
+    if (filter.timestamp_lt != null) try conditions.append(db.allocator, "timestamp < ?");
+    if (filter.timestamp_lte != null) try conditions.append(db.allocator, "timestamp <= ?");
+    if (filter.data_json_owner != null) {
+        try conditions.append(db.allocator, "LOWER(json_extract(data, '$.owner')) = LOWER(?)");
+    }
+    if (filter.data_json_owners != null and filter.data_json_owners.?.len > 0) {
+        var in_parts: std.ArrayList(u8) = .{};
+        defer in_parts.deinit(db.allocator);
+        try in_parts.appendSlice(db.allocator, "LOWER(json_extract(data, '$.owner')) IN (");
+        for (filter.data_json_owners.?, 0..) |_, i| {
+            if (i > 0) try in_parts.append(db.allocator, ',');
+            try in_parts.appendSlice(db.allocator, "LOWER(?)");
+        }
+        try in_parts.append(db.allocator, ')');
+        const clause = try db.allocator.dupe(u8, in_parts.items);
+        try allocated_clauses.append(db.allocator, clause);
+        try conditions.append(db.allocator, clause);
+    }
+    // Registration-style expiry filter (V2: data.$.expiry; V1: timestamp + data.$.duration)
+    const expiry_expr = "COALESCE(CAST(json_extract(data, '$.expiry') AS INTEGER), timestamp + CAST(json_extract(data, '$.duration') AS INTEGER))";
+    if (filter.expiry_gt != null) try conditions.append(db.allocator, expiry_expr ++ " > ?");
+    if (filter.expiry_gte != null) try conditions.append(db.allocator, expiry_expr ++ " >= ?");
+    if (filter.expiry_lt != null) try conditions.append(db.allocator, expiry_expr ++ " < ?");
+    if (filter.expiry_lte != null) try conditions.append(db.allocator, expiry_expr ++ " <= ?");
+}
+
+/// Bind values for `filter` in the same order `appendEventFilterConditions` appends them.
+fn bindEventFilters(q: *Query, filter: EventFilterOptions) !void {
+    if (filter.protocol) |c| try q.bindTextStatic(c.toString());
+    if (filter.event_type) |t| try q.bindText(t);
+    if (filter.event_types) |types| {
+        for (types) |t| try q.bindText(t);
+    }
+    if (filter.domain) |d| try q.bindText(d);
+    if (filter.contract_address) |a| try q.bindText(a);
+    if (filter.contract_addresses) |addrs| {
+        for (addrs) |a| try q.bindText(a);
+    }
+    if (filter.namehash) |nh| try q.bindText(nh);
+    if (filter.block_number_gt) |v| try q.bindInt64(v);
+    if (filter.block_number_gte) |v| try q.bindInt64(v);
+    if (filter.block_number_lt) |v| try q.bindInt64(v);
+    if (filter.block_number_lte) |v| try q.bindInt64(v);
+    if (filter.timestamp_gt) |v| try q.bindInt64(v);
+    if (filter.timestamp_gte) |v| try q.bindInt64(v);
+    if (filter.timestamp_lt) |v| try q.bindInt64(v);
+    if (filter.timestamp_lte) |v| try q.bindInt64(v);
+    if (filter.data_json_owner) |o| try q.bindText(o);
+    if (filter.data_json_owners) |owners| {
+        for (owners) |o| try q.bindText(o);
+    }
+    if (filter.expiry_gt) |v| try q.bindInt64(v);
+    if (filter.expiry_gte) |v| try q.bindInt64(v);
+    if (filter.expiry_lt) |v| try q.bindInt64(v);
+    if (filter.expiry_lte) |v| try q.bindInt64(v);
+}
+
 /// Count events that sort BEFORE the event identified by (tx_hash, log_index)
 /// in the events table's canonical (block_number, log_index) order. Used to
 /// convert a cursor to a skip offset for paginated queries on registrations/events.
 ///
-/// `event_types` optionally restricts the count to rows matching those event_type values
-/// — critical for getting the right offset when the outer query filters by event_type
-/// (e.g. registrationConnection only counts NameRegistered/LabelRegistered).
+/// `filter` must match the filter applied to the row-fetch query — without it the offset
+/// is computed over the unfiltered superset and pagination skips too many rows.
 ///
 /// Returns 0 if the cursor's event can't be found (caller should fall through to offset=0).
 pub fn countEventsBeforeCursor(
@@ -216,7 +328,7 @@ pub fn countEventsBeforeCursor(
     tx_hash: []const u8,
     log_index: u32,
     order_dir: OrderDir,
-    event_types: ?[]const []const u8,
+    filter: EventFilterOptions,
 ) !u32 {
     // First resolve the cursor event's block_number.
     var lookup = try Query.init(db, "SELECT block_number FROM events WHERE tx_hash = ? AND log_index = ? LIMIT 1");
@@ -226,9 +338,11 @@ pub fn countEventsBeforeCursor(
     if (!try lookup.step()) return 0;
     const cursor_block = lookup.getInt64(0);
 
-    // Build SQL: cursor-based position filter + optional event_type IN (...) filter.
-    // DESC (newest first): "before" = higher (block_number, log_index)
-    // ASC  (oldest first): "before" = lower  (block_number, log_index)
+    // Build SQL: cursor-based position predicate AND every filter that the row query applies.
+    // Without the filters, the offset is computed over the unfiltered superset and pagination
+    // skips too many rows (e.g. with blockNumber_gte/lte bounds, ~60% of edges were missing
+    // before this fix). DESC (newest first): "before" = higher (block_number, log_index);
+    // ASC: "before" = lower.
     var sql_buf: std.ArrayList(u8) = .{};
     defer sql_buf.deinit(db.allocator);
 
@@ -238,25 +352,25 @@ pub fn countEventsBeforeCursor(
         "SELECT COUNT(*) FROM events WHERE (block_number < ? OR (block_number = ? AND log_index < ?))";
     try sql_buf.appendSlice(db.allocator, base);
 
-    if (event_types) |types| {
-        if (types.len > 0) {
-            try sql_buf.appendSlice(db.allocator, " AND event_type IN (");
-            for (types, 0..) |_, i| {
-                if (i > 0) try sql_buf.append(db.allocator, ',');
-                try sql_buf.append(db.allocator, '?');
-            }
-            try sql_buf.append(db.allocator, ')');
-        }
+    var conditions: std.ArrayList([]const u8) = .{};
+    defer conditions.deinit(db.allocator);
+    var allocated_clauses: std.ArrayList([]const u8) = .{};
+    defer {
+        for (allocated_clauses.items) |s| db.allocator.free(s);
+        allocated_clauses.deinit(db.allocator);
+    }
+    try appendEventFilterConditions(db, filter, &conditions, &allocated_clauses);
+    for (conditions.items) |cond| {
+        try sql_buf.appendSlice(db.allocator, " AND ");
+        try sql_buf.appendSlice(db.allocator, cond);
     }
 
-    var q = try Query.init(db, sql_buf.items);
+    var q = try Query.initCached(db, sql_buf.items);
     defer q.deinit();
     try q.bindInt64(cursor_block);
     try q.bindInt64(cursor_block);
     try q.bindInt(@intCast(log_index));
-    if (event_types) |types| {
-        for (types) |t| try q.bindText(t);
-    }
+    try bindEventFilters(&q, filter);
     if (!try q.step()) return 0;
     return @intCast(q.getInt64(0));
 }
@@ -266,7 +380,7 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     var sql_buf: [2048]u8 = undefined;
     var sql_len: usize = 0;
 
-    const base_sql = "SELECT event_type, chain, block_number, tx_hash, log_index, contract_address, name, namehash, data, timestamp FROM events";
+    const base_sql = "SELECT event_type, protocol, block_number, tx_hash, log_index, contract_address, name, namehash, data, timestamp FROM events";
     @memcpy(sql_buf[sql_len..][0..base_sql.len], base_sql);
     sql_len += base_sql.len;
 
@@ -283,8 +397,8 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     }
 
     // Build WHERE conditions
-    if (filter.chain != null) {
-        try conditions.append(db.allocator, "chain = ?");
+    if (filter.protocol != null) {
+        try conditions.append(db.allocator, "protocol = ?");
     }
     if (filter.event_type != null) {
         try conditions.append(db.allocator, "event_type = ?");
@@ -341,14 +455,26 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     if (filter.block_number_gt != null) {
         try conditions.append(db.allocator, "block_number > ?");
     }
+    if (filter.block_number_gte != null) {
+        try conditions.append(db.allocator, "block_number >= ?");
+    }
     if (filter.block_number_lt != null) {
         try conditions.append(db.allocator, "block_number < ?");
+    }
+    if (filter.block_number_lte != null) {
+        try conditions.append(db.allocator, "block_number <= ?");
     }
     if (filter.timestamp_gt != null) {
         try conditions.append(db.allocator, "timestamp > ?");
     }
+    if (filter.timestamp_gte != null) {
+        try conditions.append(db.allocator, "timestamp >= ?");
+    }
     if (filter.timestamp_lt != null) {
         try conditions.append(db.allocator, "timestamp < ?");
+    }
+    if (filter.timestamp_lte != null) {
+        try conditions.append(db.allocator, "timestamp <= ?");
     }
     if (filter.data_json_owner != null) {
         try conditions.append(db.allocator, "LOWER(json_extract(data, '$.owner')) = LOWER(?)");
@@ -444,11 +570,11 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
         sql_len += offset_str.len;
     }
 
-    var q = try Query.init(db, sql_buf[0..sql_len]);
+    var q = try Query.initCached(db, sql_buf[0..sql_len]);
     defer q.deinit();
 
     // Bind parameters in the order they were added to conditions
-    if (filter.chain) |ch| {
+    if (filter.protocol) |ch| {
         try q.bindTextStatic(ch.toString());
     }
     if (filter.event_type) |et| {
@@ -476,13 +602,25 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     if (filter.block_number_gt) |bn| {
         try q.bindInt64(bn);
     }
+    if (filter.block_number_gte) |bn| {
+        try q.bindInt64(bn);
+    }
     if (filter.block_number_lt) |bn| {
+        try q.bindInt64(bn);
+    }
+    if (filter.block_number_lte) |bn| {
         try q.bindInt64(bn);
     }
     if (filter.timestamp_gt) |ts| {
         try q.bindInt64(ts);
     }
+    if (filter.timestamp_gte) |ts| {
+        try q.bindInt64(ts);
+    }
     if (filter.timestamp_lt) |ts| {
+        try q.bindInt64(ts);
+    }
+    if (filter.timestamp_lte) |ts| {
         try q.bindInt64(ts);
     }
     if (filter.data_json_owner) |owner| {
@@ -544,7 +682,7 @@ pub fn getEventsByDomain(db: *Database, domain_name: []const u8, limit: u32) ![]
 pub fn updateApprovalTokenId(db: *Database, old_token_id: []const u8, new_token_id: []const u8, registry: Address) !void {
     const sql = "UPDATE approvals SET token_id = ? WHERE token_id = ? AND registry = ?";
 
-    var q = try Query.init(db, sql);
+    var q = try Query.initCached(db, sql);
     defer q.deinit();
 
     try q.bindText(new_token_id);
@@ -554,20 +692,20 @@ pub fn updateApprovalTokenId(db: *Database, old_token_id: []const u8, new_token_
     try q.exec();
 }
 
-pub fn insertApproval(db: *Database, chain: models.Chain, token_id: u256, owner: Address, approved: Address, block_number: u64, tx_hash: Hash, registry: Address) !void {
+pub fn insertApproval(db: *Database, protocol: models.Protocol, token_id: u256, owner: Address, approved: Address, block_number: u64, tx_hash: Hash, registry: Address) !void {
     const sql =
         \\INSERT OR REPLACE INTO approvals
-        \\(chain, token_id, owner, approved, block_number, tx_hash, timestamp, registry)
+        \\(protocol, token_id, owner, approved, block_number, tx_hash, timestamp, registry)
         \\VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ;
 
-    var q = try Query.init(db, sql);
+    var q = try Query.initCached(db, sql);
     defer q.deinit();
 
     const token_id_str = try std.fmt.allocPrint(db.allocator, "{d}", .{token_id});
     defer db.allocator.free(token_id_str);
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindText(token_id_str);
     try q.bindAddress(owner);
     try q.bindAddress(approved);
@@ -610,8 +748,8 @@ pub fn getEventCount(db: *Database, filter: EventFilterOptions) !usize {
     }
 
     // Build WHERE conditions (same order as getEventsFiltered)
-    if (filter.chain != null) {
-        try conditions.append(db.allocator, "chain = ?");
+    if (filter.protocol != null) {
+        try conditions.append(db.allocator, "protocol = ?");
     }
     if (filter.event_type != null) {
         try conditions.append(db.allocator, "event_type = ?");
@@ -668,14 +806,26 @@ pub fn getEventCount(db: *Database, filter: EventFilterOptions) !usize {
     if (filter.block_number_gt != null) {
         try conditions.append(db.allocator, "block_number > ?");
     }
+    if (filter.block_number_gte != null) {
+        try conditions.append(db.allocator, "block_number >= ?");
+    }
     if (filter.block_number_lt != null) {
         try conditions.append(db.allocator, "block_number < ?");
+    }
+    if (filter.block_number_lte != null) {
+        try conditions.append(db.allocator, "block_number <= ?");
     }
     if (filter.timestamp_gt != null) {
         try conditions.append(db.allocator, "timestamp > ?");
     }
+    if (filter.timestamp_gte != null) {
+        try conditions.append(db.allocator, "timestamp >= ?");
+    }
     if (filter.timestamp_lt != null) {
         try conditions.append(db.allocator, "timestamp < ?");
+    }
+    if (filter.timestamp_lte != null) {
+        try conditions.append(db.allocator, "timestamp <= ?");
     }
     if (filter.data_json_owner != null) {
         try conditions.append(db.allocator, "LOWER(json_extract(data, '$.owner')) = LOWER(?)");
@@ -732,11 +882,11 @@ pub fn getEventCount(db: *Database, filter: EventFilterOptions) !usize {
         }
     }
 
-    var q = try Query.init(db, sql_buf[0..sql_len]);
+    var q = try Query.initCached(db, sql_buf[0..sql_len]);
     defer q.deinit();
 
     // Bind parameters (same order as getEventsFiltered)
-    if (filter.chain) |ch| {
+    if (filter.protocol) |ch| {
         try q.bindTextStatic(ch.toString());
     }
     if (filter.event_type) |et| {
@@ -764,13 +914,25 @@ pub fn getEventCount(db: *Database, filter: EventFilterOptions) !usize {
     if (filter.block_number_gt) |bn| {
         try q.bindInt64(bn);
     }
+    if (filter.block_number_gte) |bn| {
+        try q.bindInt64(bn);
+    }
     if (filter.block_number_lt) |bn| {
+        try q.bindInt64(bn);
+    }
+    if (filter.block_number_lte) |bn| {
         try q.bindInt64(bn);
     }
     if (filter.timestamp_gt) |ts| {
         try q.bindInt64(ts);
     }
+    if (filter.timestamp_gte) |ts| {
+        try q.bindInt64(ts);
+    }
     if (filter.timestamp_lt) |ts| {
+        try q.bindInt64(ts);
+    }
+    if (filter.timestamp_lte) |ts| {
         try q.bindInt64(ts);
     }
     if (filter.data_json_owner) |owner| {
@@ -849,7 +1011,7 @@ fn createTestEvent(
 
     return models.Event{
         .event_type = event_type,
-        .chain = .v2,
+        .protocol = .v2,
         .block_number = block_number,
         .tx_hash = Hash{ .bytes = tx_hash_bytes },
         .log_index = 0,

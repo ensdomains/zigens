@@ -19,11 +19,9 @@ pub fn resolveAccount(ctx: parser.ExecutionContext, field: *const parser.Field) 
         return parser.FieldResult{ .json = null_json };
     };
 
-    // Parse the address
-    const address = Address.fromHex(id) catch {
-        const null_json = try allocator.dupe(u8, "null");
-        return parser.FieldResult{ .json = null_json };
-    };
+    // Parse the address — surface invalid input as an error so typos are visible
+    // (rather than masquerading as "no such account").
+    const address = Address.fromHex(id) catch return error.InvalidAddress;
 
     // Build account object with all requested fields (domains, registrations, etc.)
     const account_json = try builders.buildAccountJson(address, field.selections, .{
