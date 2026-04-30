@@ -29,7 +29,7 @@ test "normal query passes complexity check" {
         .max_cost = 1000,
     };
     var analyzer = complexity.ComplexityAnalyzer.init(allocator, limits);
-    const analysis = try analyzer.analyzeDocument(&document);
+    const analysis = try analyzer.analyzeDocument(&document, null);
 
     // Should be within limits
     try testing.expect(analysis.isValid());
@@ -67,7 +67,7 @@ test "expensive nested query is rejected" {
         .max_cost = 1000,
     };
     var analyzer = complexity.ComplexityAnalyzer.init(allocator, limits);
-    const analysis = try analyzer.analyzeDocument(&document);
+    const analysis = try analyzer.analyzeDocument(&document, null);
 
     // Should exceed cost limit
     try testing.expect(!analysis.isValid());
@@ -105,7 +105,7 @@ test "query with moderate pagination is allowed" {
         .max_cost = 1000,
     };
     var analyzer = complexity.ComplexityAnalyzer.init(allocator, limits);
-    const analysis = try analyzer.analyzeDocument(&document);
+    const analysis = try analyzer.analyzeDocument(&document, null);
 
     // Should be within limits
     try testing.expect(analysis.isValid());
@@ -132,7 +132,7 @@ test "query with no pagination has low cost" {
 
     const limits = complexity.ComplexityLimits{};
     var analyzer = complexity.ComplexityAnalyzer.init(allocator, limits);
-    const analysis = try analyzer.analyzeDocument(&document);
+    const analysis = try analyzer.analyzeDocument(&document, null);
 
     // Should be very cheap
     try testing.expect(analysis.isValid());
@@ -157,7 +157,7 @@ test "multiple root fields sum complexity" {
 
     const limits = complexity.ComplexityLimits{};
     var analyzer = complexity.ComplexityAnalyzer.init(allocator, limits);
-    const analysis = try analyzer.analyzeDocument(&document);
+    const analysis = try analyzer.analyzeDocument(&document, null);
 
     // Should sum all operations
     try testing.expect(analysis.isValid());
@@ -186,7 +186,7 @@ test "complexity limits can be customized" {
         .max_cost = 100,
     };
     var strict_analyzer = complexity.ComplexityAnalyzer.init(allocator, strict_limits);
-    const strict_analysis = try strict_analyzer.analyzeDocument(&document);
+    const strict_analysis = try strict_analyzer.analyzeDocument(&document, null);
 
     // Should fail with strict limits
     try testing.expect(!strict_analysis.isValid());
@@ -197,7 +197,7 @@ test "complexity limits can be customized" {
         .max_cost = 10000,
     };
     var lenient_analyzer = complexity.ComplexityAnalyzer.init(allocator, lenient_limits);
-    const lenient_analysis = try lenient_analyzer.analyzeDocument(&document);
+    const lenient_analysis = try lenient_analyzer.analyzeDocument(&document, null);
 
     // Should pass with lenient limits
     try testing.expect(lenient_analysis.isValid());
@@ -221,7 +221,7 @@ test "variables do not affect complexity calculation" {
 
     const limits = complexity.ComplexityLimits{};
     var analyzer = complexity.ComplexityAnalyzer.init(allocator, limits);
-    const analysis = try analyzer.analyzeDocument(&document);
+    const analysis = try analyzer.analyzeDocument(&document, null);
 
     // Variables are not resolved during complexity analysis
     // So the multiplier will be 1 (default)
@@ -297,7 +297,7 @@ test "pagination argument caps at 100" {
 
     const limits = complexity.ComplexityLimits{};
     var analyzer = complexity.ComplexityAnalyzer.init(allocator, limits);
-    const analysis = try analyzer.analyzeDocument(&document);
+    const analysis = try analyzer.analyzeDocument(&document, null);
 
     // Multiplier should be capped at 100, not 10000
     // So cost should be reasonable (100 × 2 fields = 200)

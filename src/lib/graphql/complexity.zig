@@ -37,26 +37,39 @@ pub const ComplexityAnalysis = struct {
 };
 
 /// Query complexity analyzer.
-/// Three behaviors are critical for correctness against adversarial queries:
+/// Four behaviors are critical for correctness against adversarial queries:
 ///   1. Fragments are expanded (named + inline) — otherwise `...Frag { deep }`
 ///      bypasses depth and cost.
-///   2. `first: $var` is resolved to the variable's default value when present;
-///      when absent, treated as `max_pagination_assumption` (worst case) rather
-///      than 1.
+///   2. `first: $var` resolution order: runtime variable value (if request
+///      supplied one) → declared default → `max_pagination_assumption` (worst
+///      case). Reading the runtime value is what makes `first: 6` actually
+///      cost 6× and not 1000×.
 ///   3. The pagination multiplier is NOT capped — `domains(first: 1000)` costs
 ///      1000, not 100. This lets cost properly catch nested-list amplification.
+///   4. Each request is analyzed against its OWN variables. The same query
+///      string with different runtime values gets different costs, which is
+///      the point: benign clients with small `first` pay small cost, adversarial
+///      clients with large `first` pay large cost.
 pub const ComplexityAnalyzer = struct {
     allocator: std.mem.Allocator,
     limits: ComplexityLimits,
     fragments: []const parser.Fragment = &.{},
     variables: []const parser.VariableDefinition = &.{},
+    /// Runtime variables JSON from the request body (the `variables` field of
+    /// the GraphQL POST). When present, used to refine the multiplier for
+    /// `first: $var` instead of falling back to worst-case.
+    runtime_variables: ?std.json.Value = null,
 
     pub fn init(allocator: std.mem.Allocator, limits: ComplexityLimits) ComplexityAnalyzer {
         return .{ .allocator = allocator, .limits = limits };
     }
 
-    /// Analyze a GraphQL document for complexity
-    pub fn analyzeDocument(self: *ComplexityAnalyzer, document: *const parser.Document) !ComplexityAnalysis {
+    /// Analyze a GraphQL document for complexity. Pass the request's runtime
+    /// variables (or null if none) so `first: $var` resolves to the actual
+    /// value the client sent rather than the declared default / worst case.
+    pub fn analyzeDocument(self: *ComplexityAnalyzer, document: *const parser.Document, runtime_variables: ?std.json.Value) !ComplexityAnalysis {
+        self.runtime_variables = runtime_variables;
+        defer self.runtime_variables = null;
         var max_depth: u32 = 0;
         var total_cost: u32 = 0;
 
@@ -166,42 +179,66 @@ pub const ComplexityAnalyzer = struct {
     }
 
     /// Get the multiplier for a field based on pagination arguments.
-    /// Resolves variables to their default value when present; falls back to
-    /// `max_pagination_assumption` for unresolvable variables (cannot allow an
-    /// attacker to bypass cost analysis by parameterizing every page size).
+    /// Resolution order for `first: $var`:
+    ///   1. Runtime variable value from the request body (the actual `first`
+    ///      the client sent — `first: 6` truly costs 6×).
+    ///   2. Declared default in the operation's variable definitions.
+    ///   3. `max_pagination_assumption` worst case.
+    /// Without (1), a query parameterized as `first: $n` would always cost the
+    /// worst case even when the client sends `n: 6`, blocking legitimate use.
+    /// With (1), each request is analyzed against its own values: small `first`
+    /// pays small cost, large `first` pays large cost. The worst case still
+    /// applies when no runtime value is supplied.
     fn getFieldMultiplier(self: *ComplexityAnalyzer, field: *const parser.Field) u32 {
         for (field.arguments) |arg| {
             if (!std.mem.eql(u8, arg.name, "first") and !std.mem.eql(u8, arg.name, "limit")) continue;
 
             switch (arg.value) {
-                .int => |i| {
-                    if (i <= 0) return 1;
-                    const clamped: u32 = @intCast(@min(@as(i64, self.limits.max_pagination_assumption), i));
-                    return @max(1, clamped);
-                },
+                .int => |i| return self.clampMultiplier(i),
                 .variable => |var_name| {
-                    // Look up default in variable definitions.
+                    // 1) Runtime value from the request body, if provided.
+                    if (self.runtimeIntVar(var_name)) |v| return self.clampMultiplier(v);
+
+                    // 2) Declared default on the operation.
                     for (self.variables) |*vd| {
                         if (!std.mem.eql(u8, vd.name, var_name)) continue;
                         if (vd.default_value) |dv| switch (dv) {
-                            .int => |i| {
-                                if (i <= 0) return 1;
-                                const clamped: u32 = @intCast(@min(@as(i64, self.limits.max_pagination_assumption), i));
-                                return @max(1, clamped);
-                            },
+                            .int => |i| return self.clampMultiplier(i),
                             else => {},
                         };
-                        // Variable with no default → assume the worst case so the
-                        // attacker can't hide behind `first: $n` to bypass cost.
-                        return self.limits.max_pagination_assumption;
+                        break;
                     }
-                    // Variable referenced but not declared — also worst case.
+
+                    // 3) No runtime value, no default → worst case so an attacker
+                    //    can't hide behind `first: $n` to bypass cost analysis.
                     return self.limits.max_pagination_assumption;
                 },
                 else => {},
             }
         }
         return 1;
+    }
+
+    fn clampMultiplier(self: *const ComplexityAnalyzer, raw: i64) u32 {
+        if (raw <= 0) return 1;
+        const clamped: u32 = @intCast(@min(@as(i64, self.limits.max_pagination_assumption), raw));
+        return @max(1, clamped);
+    }
+
+    /// Look up a variable's runtime int value from the request's variables JSON.
+    /// Accepts both JSON integers and numeric strings (some clients send
+    /// `"first": "10"`). Returns null when the variable isn't present, isn't
+    /// numeric, or no runtime variables were provided.
+    fn runtimeIntVar(self: *const ComplexityAnalyzer, name: []const u8) ?i64 {
+        const root = self.runtime_variables orelse return null;
+        if (root != .object) return null;
+        const v = root.object.get(name) orelse return null;
+        return switch (v) {
+            .integer => |i| i,
+            .float => |f| @intFromFloat(f),
+            .string => |s| std.fmt.parseInt(i64, s, 10) catch null,
+            else => null,
+        };
     }
 };
 
@@ -229,7 +266,7 @@ test "simple query within limits" {
     const limits = ComplexityLimits{};
     var analyzer = ComplexityAnalyzer.init(allocator, limits);
 
-    const analysis = try analyzer.analyzeDocument(&document);
+    const analysis = try analyzer.analyzeDocument(&document, null);
 
     // Depth should be 2 (query -> domains -> name)
     try testing.expectEqual(@as(u32, 2), analysis.depth);
@@ -281,7 +318,7 @@ test "deeply nested query exceeds depth limit" {
     const limits = ComplexityLimits{ .max_depth = 10 };
     var analyzer = ComplexityAnalyzer.init(allocator, limits);
 
-    const analysis = try analyzer.analyzeDocument(&document);
+    const analysis = try analyzer.analyzeDocument(&document, null);
 
     // Should exceed depth limit
     try testing.expect(analysis.exceeded_depth);
@@ -312,7 +349,7 @@ test "expensive list query exceeds cost limit" {
     const limits = ComplexityLimits{ .max_cost = 100 };
     var analyzer = ComplexityAnalyzer.init(allocator, limits);
 
-    const analysis = try analyzer.analyzeDocument(&document);
+    const analysis = try analyzer.analyzeDocument(&document, null);
 
     // Should exceed cost limit due to nested lists
     try testing.expect(analysis.exceeded_cost);
@@ -336,7 +373,7 @@ test "query with multiple operations sums complexity" {
     const limits = ComplexityLimits{};
     var analyzer = ComplexityAnalyzer.init(allocator, limits);
 
-    const analysis = try analyzer.analyzeDocument(&document);
+    const analysis = try analyzer.analyzeDocument(&document, null);
 
     // Cost should include both operations
     try testing.expect(analysis.cost > 10); // More than single operation
@@ -362,9 +399,61 @@ test "query without pagination has low cost" {
     const limits = ComplexityLimits{};
     var analyzer = ComplexityAnalyzer.init(allocator, limits);
 
-    const analysis = try analyzer.analyzeDocument(&document);
+    const analysis = try analyzer.analyzeDocument(&document, null);
 
     // Should have low cost (no pagination multipliers)
     try testing.expect(analysis.cost < 10);
     try testing.expect(analysis.isValid());
+}
+
+test "first: $var resolves to runtime value when provided" {
+    const allocator = testing.allocator;
+
+    // Same query the user's domains() shape: variable-driven `first`,
+    // moderately complex selection (~7 leaves) where worst-case multiplier
+    // would blow the budget but real `first: 6` should pass easily.
+    const query =
+        \\query Domains($first: Int) {
+        \\  domains(first: $first) {
+        \\    id name owner { id } resolver { address }
+        \\  }
+        \\}
+    ;
+
+    var p = try parser.Parser.init(allocator, query);
+    var document = try p.parseDocument();
+    defer document.deinit(allocator);
+
+    const limits = ComplexityLimits{ .max_cost = 1000 };
+
+    // Without runtime variables: worst-case multiplier kicks in, cost explodes.
+    {
+        var analyzer = ComplexityAnalyzer.init(allocator, limits);
+        const analysis = try analyzer.analyzeDocument(&document, null);
+        try testing.expect(analysis.exceeded_cost);
+    }
+
+    // With runtime `first: 6`: multiplier is 6, query fits comfortably.
+    {
+        const vars_json = "{\"first\": 6}";
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, vars_json, .{});
+        defer parsed.deinit();
+
+        var analyzer = ComplexityAnalyzer.init(allocator, limits);
+        const analysis = try analyzer.analyzeDocument(&document, parsed.value);
+        try testing.expect(!analysis.exceeded_cost);
+        try testing.expect(analysis.cost < 100);
+    }
+
+    // With runtime `first: 9999`: still clamped to max_pagination_assumption,
+    // adversarial parameterization can't bypass cost analysis.
+    {
+        const vars_json = "{\"first\": 9999}";
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, vars_json, .{});
+        defer parsed.deinit();
+
+        var analyzer = ComplexityAnalyzer.init(allocator, limits);
+        const analysis = try analyzer.analyzeDocument(&document, parsed.value);
+        try testing.expect(analysis.exceeded_cost);
+    }
 }
