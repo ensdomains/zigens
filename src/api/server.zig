@@ -7,7 +7,8 @@ const graphql = @import("handler.zig");
 const json_utils = @import("../utils/json.zig");
 const url_utils = @import("../utils/url.zig");
 const validation = @import("../utils/validation.zig");
-const RateLimiter = @import("../rate_limiter.zig").RateLimiter;
+const PerIpRateLimiter = @import("../rate_limiter.zig").PerIpRateLimiter;
+const webhook_manager = @import("../webhooks/manager.zig");
 
 /// Simple JSON API Server for ENSv2 Indexer
 /// Provides REST endpoints and GraphQL for querying indexed data
@@ -18,7 +19,7 @@ pub const Server = struct {
     port: u16,
     server: ?std.net.Server,
     graphql_handler: graphql.GraphQLHandler,
-    rate_limiter: RateLimiter,
+    rate_limiter: PerIpRateLimiter,
     webhook_admin_username: ?[]const u8, // Optional - if set with password, requires Basic Auth
     webhook_admin_password: ?[]const u8, // Optional - if set, requires Basic Auth for webhook endpoints
 
@@ -31,8 +32,9 @@ pub const Server = struct {
             webhook_db.?.* = webhook_db_value;
         }
 
-        // Initialize rate limiter with configurable requests per second
-        // Default burst capacity is 2x the per-second rate
+        // Per-IP rate limiter with configurable requests/sec.
+        // Burst capacity = 2x the per-second rate; the map is bounded at 100k IPs
+        // (rotating-IP attacks beyond that get refused new buckets, see PerIpRateLimiter).
         const rate_limit = if (rate_limit_per_second > 0) rate_limit_per_second else 100;
 
         return .{
@@ -42,7 +44,7 @@ pub const Server = struct {
             .port = port,
             .server = null,
             .graphql_handler = try graphql.GraphQLHandler.init(allocator, database, complexity_max_depth, complexity_max_cost, metrics_enabled),
-            .rate_limiter = RateLimiter.init(rate_limit * 2, rate_limit),
+            .rate_limiter = PerIpRateLimiter.init(allocator, rate_limit * 2, rate_limit, 100_000),
             .webhook_admin_username = webhook_admin_username,
             .webhook_admin_password = webhook_admin_password,
         };
@@ -50,6 +52,7 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         self.graphql_handler.deinit();
+        self.rate_limiter.deinit();
         if (self.webhook_database) |webhook_db| {
             webhook_db.deinit();
             self.allocator.destroy(webhook_db);
@@ -93,8 +96,11 @@ pub const Server = struct {
     }
 
     fn handleConnection(self: *Server, connection: std.net.Server.Connection) !void {
-        // Check rate limit before processing request
-        if (!self.rate_limiter.tryAcquire()) {
+        // Check per-IP rate limit before processing request.
+        // Note: connection.address is the direct peer; if running behind a trusted
+        // reverse proxy, use X-Forwarded-For (not yet wired — every visible client
+        // would share the proxy's IP otherwise).
+        if (!self.rate_limiter.tryAcquireFor(connection.address)) {
             try self.sendRateLimited(connection.stream);
             return;
         }
@@ -312,13 +318,13 @@ pub const Server = struct {
             defer self.allocator.free(name_escaped);
 
             const writer = response_buf.writer(self.allocator);
-            try writer.print("{{\"name\":\"{s}\",\"namehash\":\"{s}\",\"owner\":\"{s}\",\"resolver\":\"{s}\",\"registry\":\"{s}\",\"chain\":\"{s}\",\"expiry\":{d},\"registry_locked\":{},\"migrated\":{},\"created_at\":{d},\"updated_at\":{d}}}", .{
+            try writer.print("{{\"name\":\"{s}\",\"namehash\":\"{s}\",\"owner\":\"{s}\",\"resolver\":\"{s}\",\"registry\":\"{s}\",\"protocol\":\"{s}\",\"expiry\":{d},\"registry_locked\":{},\"migrated\":{},\"created_at\":{d},\"updated_at\":{d}}}", .{
                 name_escaped,
                 namehash_hex,
                 owner_hex,
                 resolver_hex,
                 registry_hex,
-                record_copy.chain.toString(),
+                record_copy.protocol.toString(),
                 record_copy.expiry,
                 record_copy.registry_locked,
                 record_copy.migrated,
@@ -457,10 +463,19 @@ pub const Server = struct {
         };
         defer parsed.deinit();
 
+        // Body must be a JSON object. Null, arrays, primitives, etc. would panic on .object access.
+        if (parsed.value != .object) {
+            return try self.sendBadRequest(stream, "Request body must be a JSON object");
+        }
+
         const query_value = parsed.value.object.get("query") orelse {
             return try self.sendBadRequest(stream, "Query field required");
         };
 
+        // Query must be a string. Integer/null/etc. would panic on .string access.
+        if (query_value != .string) {
+            return try self.sendBadRequest(stream, "`query` field must be a string");
+        }
         const query = query_value.string;
 
         // SECURITY: Validate GraphQL query length to prevent DoS attacks
@@ -493,96 +508,11 @@ pub const Server = struct {
     }
 
     fn handleGraphQLPlayground(self: *Server, stream: std.net.Stream) !void {
-        // Return GraphiQL - Interactive GraphQL IDE with autocomplete enabled
-        const html =
-            \\<!DOCTYPE html>
-            \\<html>
-            \\<head>
-            \\  <title>ENSv2 GraphQL Playground</title>
-            \\  <style>
-            \\    body { height: 100%; margin: 0; width: 100%; overflow: hidden; }
-            \\    #graphiql { height: 100vh; }
-            \\  </style>
-            \\  <script crossorigin src="https://unpkg.com/react@17/umd/react.production.min.js"></script>
-            \\  <script crossorigin src="https://unpkg.com/react-dom@17/umd/react-dom.production.min.js"></script>
-            \\  <link rel="stylesheet" href="https://unpkg.com/graphiql@2.4.7/graphiql.min.css" />
-            \\</head>
-            \\<body>
-            \\  <div id="graphiql">Loading GraphQL Playground...</div>
-            \\  <script src="https://unpkg.com/graphiql@2.4.7/graphiql.min.js" crossorigin></script>
-            \\  <script>
-            \\    // Custom fetcher function for GraphQL queries
-            \\    function graphQLFetcher(graphQLParams) {
-            \\      return fetch('/graphql', {
-            \\        method: 'post',
-            \\        headers: { 'Content-Type': 'application/json' },
-            \\        body: JSON.stringify(graphQLParams),
-            \\      }).then(response => response.json());
-            \\    }
-            \\
-            \\    const defaultQuery = `# Welcome to ENSv2 GraphQL Playground!
-            \\#
-            \\# 🎯 Autocomplete Tips:
-            \\#   - Press Ctrl+Space anywhere to see suggestions
-            \\#   - Start typing a field name to get completions
-            \\#   - Hover over fields to see type information
-            \\#
-            \\# Try these example queries:
-            \\
-            \\# Query a domain
-            \\{
-            \\  domain(id: "test.eth") {
-            \\    name
-            \\    owner { id }
-            \\    resolver { address }
-            \\    expiryDate
-            \\    isMigrated
-            \\  }
-            \\}
-            \\
-            \\# Bulk migration check (up to 1000 names per call)
-            \\# {
-            \\#   domains(where: { name_in: ["rabbit.eth", "teacup.eth"], isMigrated: true }) {
-            \\#     name
-            \\#     isMigrated
-            \\#   }
-            \\# }
-            \\
-            \\# Filtered paginated list with totalCount
-            \\# {
-            \\#   domainConnection(
-            \\#     first: 20
-            \\#     where: { name_ends_with: ".eth", isMigrated: false }
-            \\#     orderBy: "createdAt"
-            \\#     orderDirection: "desc"
-            \\#   ) {
-            \\#     totalCount
-            \\#     pageInfo { hasNextPage endCursor }
-            \\#     edges { cursor node { name owner { id } } }
-            \\#   }
-            \\# }
-            \\
-            \\# Query an account
-            \\# {
-            \\#   account(id: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045") {
-            \\#     id
-            \\#     domains { name }
-            \\#   }
-            \\# }
-            \\`;
-            \\
-            \\    // Render GraphiQL with autocomplete enabled
-            \\    ReactDOM.render(
-            \\      React.createElement(GraphiQL, {
-            \\        fetcher: graphQLFetcher,
-            \\        defaultQuery: defaultQuery,
-            \\      }),
-            \\      document.getElementById('graphiql')
-            \\    );
-            \\  </script>
-            \\</body>
-            \\</html>
-        ;
+        // Playground asset extracted to graphiql.html (commit 5308c2d) so the
+        // page can be edited without recompiling. The staging branch's inline
+        // version included an example with `name_in` — that example is preserved
+        // as a section in the .html file so the merge keeps both branches' intent.
+        const html = @embedFile("graphiql.html");
 
         var response: std.ArrayList(u8) = .{};
         defer response.deinit(self.allocator);
@@ -817,7 +747,10 @@ pub const Server = struct {
     }
 
     fn handleGetWebhook(self: *Server, stream: std.net.Stream, webhook_id: u64) !void {
-        const webhook_opt = try self.database.getWebhook(webhook_id);
+        const webhook_db = self.webhook_database orelse {
+            return try self.sendJsonResponse(stream, 503, "{\"error\":\"Webhooks not enabled\"}");
+        };
+        const webhook_opt = try webhook_db.getWebhook(webhook_id);
 
         if (webhook_opt) |webhook| {
             var wh = webhook;
@@ -894,7 +827,9 @@ pub const Server = struct {
             const et_array = et_value.array;
             for (et_array.items) |et_item| {
                 const et_str = et_item.string;
-                if (std.meta.stringToEnum(models.EventType, et_str)) |et| {
+                // Accept the spec name ("NameRegistered") from the API surface. stringToEnum
+                // would match only the internal variant name ("name_registered") — wrong direction.
+                if (models.EventType.fromString(et_str)) |et| {
                     try event_types.append(self.allocator, et);
                 }
             }
@@ -903,10 +838,16 @@ pub const Server = struct {
         const active = if (obj.get("active")) |a| a.bool else true;
         const max_retries = if (obj.get("max_retries")) |mr| @as(u32, @intCast(mr.integer)) else 3;
 
+        // Generate a fresh HMAC secret for this webhook. This is the ONLY time the
+        // secret is returned to the caller — it's not retrievable later.
+        const secret = try webhook_manager.generateWebhookSecret(self.allocator);
+        defer self.allocator.free(secret);
+
         // Create webhook
         const webhook = models.Webhook{
             .id = 0, // Will be set by database
             .url = url.string,
+            .secret = secret,
             .event_types = try event_types.toOwnedSlice(self.allocator),
             .active = active,
             .max_retries = max_retries,
@@ -915,7 +856,11 @@ pub const Server = struct {
 
         const webhook_id = try self.webhook_database.?.insertWebhook(webhook);
 
-        const response = try std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"message\":\"Webhook created\"}}", .{webhook_id});
+        const response = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"id\":{d},\"secret\":\"{s}\",\"message\":\"Webhook created. Store the secret — it is NOT retrievable later. Verify deliveries by computing HMAC-SHA256(secret, \\\"<X-Webhook-Timestamp>.<body>\\\") and comparing to X-Webhook-Signature.\"}}",
+            .{ webhook_id, secret },
+        );
         defer self.allocator.free(response);
 
         try self.sendJsonResponse(stream, 201, response);
@@ -956,7 +901,7 @@ pub const Server = struct {
             const et_array = et_value.array;
             for (et_array.items) |et_item| {
                 const et_str = et_item.string;
-                if (std.meta.stringToEnum(models.EventType, et_str)) |et| {
+                if (models.EventType.fromString(et_str)) |et| {
                     try event_types_list.append(self.allocator, et);
                 }
             }

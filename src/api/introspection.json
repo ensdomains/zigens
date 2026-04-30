@@ -1605,7 +1605,7 @@
               }
             },
             {
-              "name": "chain",
+              "name": "protocol",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -1713,7 +1713,7 @@
               }
             },
             {
-              "name": "chain",
+              "name": "protocol",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -2428,7 +2428,7 @@
               }
             },
             {
-              "name": "chain",
+              "name": "protocol",
               "type": {
                 "kind": "SCALAR",
                 "name": "String"
@@ -2489,7 +2489,21 @@
               }
             },
             {
+              "name": "blockNumber_gte",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
               "name": "blockNumber_lt",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "blockNumber_lte",
               "type": {
                 "kind": "SCALAR",
                 "name": "Int"
@@ -2503,10 +2517,31 @@
               }
             },
             {
+              "name": "timestamp_gte",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
               "name": "timestamp_lt",
               "type": {
                 "kind": "SCALAR",
                 "name": "Int"
+              }
+            },
+            {
+              "name": "timestamp_lte",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "protocol",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
               }
             }
           ]

@@ -57,13 +57,13 @@ CREATE INDEX IF NOT EXISTS ...
 ### 2. Performance Indexes
 Create indexes for:
 - Foreign keys
-- Frequently filtered columns (chain, block_number)
+- Frequently filtered columns (protocol, block_number)
 - Join columns (namehash, token_id)
 
 ### 3. UNIQUE Constraints
 Use UNIQUE constraints to prevent duplicates:
 ```sql
-UNIQUE(chain, transaction_hash, log_index)
+UNIQUE(protocol, transaction_hash, log_index)
 ```
 
 ### 4. Timestamps

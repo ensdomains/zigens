@@ -6,7 +6,7 @@ const db = common.db;
 const models = common.models;
 const Address = common.Address;
 const parser = common.parser;
-const builders = common.builders;
+const builders = @import("../builders/builders.zig");
 
 /// Resolver for account query
 pub fn resolveAccount(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
@@ -19,11 +19,9 @@ pub fn resolveAccount(ctx: parser.ExecutionContext, field: *const parser.Field) 
         return parser.FieldResult{ .json = null_json };
     };
 
-    // Parse the address
-    const address = Address.fromHex(id) catch {
-        const null_json = try allocator.dupe(u8, "null");
-        return parser.FieldResult{ .json = null_json };
-    };
+    // Parse the address — surface invalid input as an error so typos are visible
+    // (rather than masquerading as "no such account").
+    const address = Address.fromHex(id) catch return error.InvalidAddress;
 
     // Build account object with all requested fields (domains, registrations, etc.)
     const account_json = try builders.buildAccountJson(address, field.selections, .{

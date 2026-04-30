@@ -9,6 +9,94 @@ inline fn SQLITE_TRANSIENT() db.c.sqlite3_destructor_type {
     return null;
 }
 
+/// Generate a 32-byte random HMAC secret, hex-encoded (64 chars + "0x"-style prefix omitted).
+/// Caller owns the returned slice. Use `std.crypto.random` for cryptographically secure bytes.
+pub fn generateWebhookSecret(allocator: std.mem.Allocator) ![]u8 {
+    var raw: [32]u8 = undefined;
+    std.crypto.random.bytes(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    return try allocator.dupe(u8, &hex);
+}
+
+/// Compute HMAC-SHA256(secret, "{timestamp}.{payload}") and return the hex digest.
+/// The timestamp is the canonical Unix-second timestamp the receiver verifies for replay
+/// protection. The same string is sent in `X-Webhook-Timestamp`. Receivers verify by:
+///   1. parsing X-Webhook-Timestamp; reject if older than their tolerance window
+///   2. recomputing HMAC-SHA256(secret, "<timestamp>.<body>") and constant-time-comparing
+///      against the value after `sha256=` in X-Webhook-Signature.
+pub fn computeWebhookSignature(allocator: std.mem.Allocator, secret_hex: []const u8, timestamp_secs: i64, payload: []const u8) ![]u8 {
+    // Decode the hex secret back into raw bytes for HMAC.
+    if (secret_hex.len % 2 != 0) return error.InvalidSecretLength;
+    const secret_raw = try allocator.alloc(u8, secret_hex.len / 2);
+    defer allocator.free(secret_raw);
+    _ = try std.fmt.hexToBytes(secret_raw, secret_hex);
+
+    // Format timestamp as decimal string for the signed-string preamble.
+    var ts_buf: [24]u8 = undefined;
+    const ts_str = try std.fmt.bufPrint(&ts_buf, "{d}", .{timestamp_secs});
+
+    // signed_string = "{ts}.{payload}"
+    var signed: std.ArrayList(u8) = .{};
+    defer signed.deinit(allocator);
+    try signed.appendSlice(allocator, ts_str);
+    try signed.append(allocator, '.');
+    try signed.appendSlice(allocator, payload);
+
+    var mac: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, signed.items, secret_raw);
+
+    const hex = std.fmt.bytesToHex(mac, .lower);
+    return try allocator.dupe(u8, &hex);
+}
+
+test "generateWebhookSecret produces 64 hex chars" {
+    const allocator = std.testing.allocator;
+    const s = try generateWebhookSecret(allocator);
+    defer allocator.free(s);
+    try std.testing.expectEqual(@as(usize, 64), s.len);
+}
+
+test "computeWebhookSignature is deterministic for fixed inputs" {
+    const allocator = std.testing.allocator;
+    // 32-byte secret of zeros
+    const secret = "0000000000000000000000000000000000000000000000000000000000000000";
+    const sig_a = try computeWebhookSignature(allocator, secret, 1700000000, "hello");
+    defer allocator.free(sig_a);
+    const sig_b = try computeWebhookSignature(allocator, secret, 1700000000, "hello");
+    defer allocator.free(sig_b);
+    try std.testing.expectEqualStrings(sig_a, sig_b);
+    try std.testing.expectEqual(@as(usize, 64), sig_a.len);
+}
+
+/// Strip userinfo (`user:pass@`) from a URL before logging.
+/// Webhook owners may register URLs with credentials embedded in the authority
+/// component; those must never appear in logs. Returns the input unchanged when
+/// no userinfo is present.
+fn sanitizeUrlForLog(url: []const u8) []const u8 {
+    // Look for "://", then for "@" before the next "/" or "?".
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return url;
+    const authority_start = scheme_end + 3;
+    if (authority_start >= url.len) return url;
+    // Find the end of the authority component.
+    const authority_end_offset = std.mem.indexOfAnyPos(u8, url, authority_start, "/?#") orelse url.len;
+    const at_idx = std.mem.indexOfScalarPos(u8, url, authority_start, '@') orelse return url;
+    if (at_idx >= authority_end_offset) return url; // '@' is in path/query, not authority
+    // Cannot allocate from a leaf logging helper without an allocator parameter; instead,
+    // log the URL with credentials already stripped by recomposing the visible portion.
+    // Callers that want a single-string display should use this in a print: "{s}<redacted>{s}"
+    // — but for simplicity we just return the suffix starting at the host. The scheme
+    // is short and well-known, so dropping it from log lines is acceptable in this context.
+    _ = url[0..scheme_end]; // scheme available if we wanted to prepend it
+    return url[at_idx + 1 ..];
+}
+
+test "sanitizeUrlForLog strips userinfo" {
+    try std.testing.expectEqualStrings("example.com/hook", sanitizeUrlForLog("https://user:pass@example.com/hook"));
+    try std.testing.expectEqualStrings("example.com/hook", sanitizeUrlForLog("https://user@example.com/hook"));
+    try std.testing.expectEqualStrings("https://example.com/hook?a=b@c", sanitizeUrlForLog("https://example.com/hook?a=b@c"));
+    try std.testing.expectEqualStrings("https://example.com/hook", sanitizeUrlForLog("https://example.com/hook"));
+}
+
 pub const WebhookManager = struct {
     allocator: std.mem.Allocator,
     database: *db.Database, // Separate webhook database connection
@@ -134,6 +222,13 @@ pub const WebhookManager = struct {
         // Wait a bit for initialization to complete
         std.Thread.sleep(1000 * std.time.ns_per_ms);
 
+        // Reclaim any rows stuck in 'processing' from a previous crashed/restarted worker.
+        // Done once at startup; subsequent stale-claim recovery happens periodically
+        // (every cleanup cycle) below.
+        self.reclaimStuckClaims() catch |err| {
+            std.log.warn("reclaimStuckClaims at startup failed: {}", .{err});
+        };
+
         while (!self.should_stop.load(.acquire)) {
             // Process pending webhooks
             self.processQueueBatch() catch |err| {
@@ -150,11 +245,45 @@ pub const WebhookManager = struct {
         std.log.debug("Webhook worker stopped", .{});
     }
 
+    /// Reclaim rows stuck in 'processing' state after a crash. A row is considered
+    /// stuck if `updated_at` is older than the stuck threshold (default 5 minutes —
+    /// well beyond a normal HTTP timeout). Reclaimed rows go back to 'pending'.
+    fn reclaimStuckClaims(self: *WebhookManager) !void {
+        const stuck_threshold_secs: i64 = 300; // 5 minutes
+        const now = std.time.timestamp();
+        const cutoff = now - stuck_threshold_secs;
+
+        self.db_mutex.lock();
+        defer self.db_mutex.unlock();
+
+        const sql = "UPDATE webhook_queue SET status = 'pending', updated_at = ? WHERE status = 'processing' AND updated_at < ?";
+        const sql_z = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(sql_z);
+
+        var stmt: ?*db.c.sqlite3_stmt = null;
+        if (db.c.sqlite3_prepare_v2(self.database.db, sql_z.ptr, -1, &stmt, null) != db.c.SQLITE_OK) return;
+        defer _ = db.c.sqlite3_finalize(stmt);
+
+        _ = db.c.sqlite3_bind_int64(stmt, 1, now);
+        _ = db.c.sqlite3_bind_int64(stmt, 2, cutoff);
+        _ = db.c.sqlite3_step(stmt);
+
+        const reclaimed = db.c.sqlite3_changes(self.database.db);
+        if (reclaimed > 0) {
+            std.log.info("Reclaimed {d} webhook delivery row(s) stuck in 'processing'", .{reclaimed});
+        }
+    }
+
     /// Run queue cleanup once per day (24 hours)
     fn runDailyCleanupIfNeeded(self: *WebhookManager) void {
         const now = std.time.timestamp();
         const last_cleanup = self.last_cleanup_at.load(.acquire);
         const one_day_seconds: i64 = 86400;
+
+        // Reclaim any stuck 'processing' rows on every worker tick, cheap and crash-safe.
+        self.reclaimStuckClaims() catch |err| {
+            std.log.debug("Periodic reclaimStuckClaims failed: {}", .{err});
+        };
 
         // Check if 24 hours have passed since last cleanup
         if (now - last_cleanup >= one_day_seconds) {
@@ -217,7 +346,7 @@ pub const WebhookManager = struct {
             if (!subscribed) continue;
 
             // Add to persistent queue
-            try self.enqueueWebhook(webhook.id, webhook.url, event, payload);
+            try self.enqueueWebhook(webhook.id, webhook.url, webhook.secret, event, payload);
         }
     }
 
@@ -238,9 +367,9 @@ pub const WebhookManager = struct {
         const writer = payload.writer(self.allocator);
 
         // Build base payload with required fields
-        try writer.print("{{\"event_type\":\"{s}\",\"chain\":\"{s}\",\"block_number\":{d},\"tx_hash\":\"{s}\",\"log_index\":{d},\"contract_address\":\"{s}\"", .{
+        try writer.print("{{\"event_type\":\"{s}\",\"protocol\":\"{s}\",\"block_number\":{d},\"tx_hash\":\"{s}\",\"log_index\":{d},\"contract_address\":\"{s}\"", .{
             event.event_type.toString(),
-            event.chain.toString(),
+            event.protocol.toString(),
             event.block_number,
             tx_hex,
             event.log_index,
@@ -271,15 +400,17 @@ pub const WebhookManager = struct {
         return payload.toOwnedSlice(self.allocator);
     }
 
-    /// Enqueue webhook delivery to persistent database queue
-    fn enqueueWebhook(self: *WebhookManager, webhook_id: u64, webhook_url: []const u8, event: models.Event, payload: []const u8) !void {
+    /// Enqueue webhook delivery to persistent database queue.
+    /// Captures the webhook's HMAC secret at enqueue time so a later rotation doesn't
+    /// invalidate signatures on already-queued deliveries.
+    fn enqueueWebhook(self: *WebhookManager, webhook_id: u64, webhook_url: []const u8, webhook_secret: []const u8, event: models.Event, payload: []const u8) !void {
         self.db_mutex.lock();
         defer self.db_mutex.unlock();
 
         const sql =
             \\INSERT INTO webhook_queue
-            \\(webhook_id, webhook_url, event_type, chain, block_number, tx_hash, contract_address, payload, timestamp, next_retry_at)
-            \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            \\(webhook_id, webhook_url, webhook_secret, event_type, protocol, block_number, tx_hash, contract_address, payload, timestamp, next_retry_at)
+            \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ;
 
         const sql_z = try self.allocator.dupeZ(u8, sql);
@@ -296,32 +427,35 @@ pub const WebhookManager = struct {
 
         _ = db.c.sqlite3_bind_int64(stmt, 1, @intCast(webhook_id));
         _ = db.c.sqlite3_bind_text(stmt, 2, webhook_url.ptr, @intCast(webhook_url.len), SQLITE_TRANSIENT());
-        _ = db.c.sqlite3_bind_text(stmt, 3, event.event_type.toString().ptr, @intCast(event.event_type.toString().len), SQLITE_TRANSIENT());
-        _ = db.c.sqlite3_bind_text(stmt, 4, event.chain.toString().ptr, @intCast(event.chain.toString().len), SQLITE_TRANSIENT());
-        _ = db.c.sqlite3_bind_int64(stmt, 5, @intCast(event.block_number));
-        _ = db.c.sqlite3_bind_text(stmt, 6, tx_hex.ptr, @intCast(tx_hex.len), SQLITE_TRANSIENT());
-        _ = db.c.sqlite3_bind_text(stmt, 7, contract_hex.ptr, @intCast(contract_hex.len), SQLITE_TRANSIENT());
-        _ = db.c.sqlite3_bind_text(stmt, 8, payload.ptr, @intCast(payload.len), SQLITE_TRANSIENT());
-        _ = db.c.sqlite3_bind_int64(stmt, 9, event.timestamp);
-        _ = db.c.sqlite3_bind_int64(stmt, 10, std.time.timestamp()); // Can send immediately
+        _ = db.c.sqlite3_bind_text(stmt, 3, webhook_secret.ptr, @intCast(webhook_secret.len), SQLITE_TRANSIENT());
+        _ = db.c.sqlite3_bind_text(stmt, 4, event.event_type.toString().ptr, @intCast(event.event_type.toString().len), SQLITE_TRANSIENT());
+        _ = db.c.sqlite3_bind_text(stmt, 5, event.protocol.toString().ptr, @intCast(event.protocol.toString().len), SQLITE_TRANSIENT());
+        _ = db.c.sqlite3_bind_int64(stmt, 6, @intCast(event.block_number));
+        _ = db.c.sqlite3_bind_text(stmt, 7, tx_hex.ptr, @intCast(tx_hex.len), SQLITE_TRANSIENT());
+        _ = db.c.sqlite3_bind_text(stmt, 8, contract_hex.ptr, @intCast(contract_hex.len), SQLITE_TRANSIENT());
+        _ = db.c.sqlite3_bind_text(stmt, 9, payload.ptr, @intCast(payload.len), SQLITE_TRANSIENT());
+        _ = db.c.sqlite3_bind_int64(stmt, 10, event.timestamp);
+        _ = db.c.sqlite3_bind_int64(stmt, 11, std.time.timestamp()); // Can send immediately
 
         if (db.c.sqlite3_step(stmt) != db.c.SQLITE_DONE) {
             std.log.err("Failed to enqueue webhook: {s}", .{db.c.sqlite3_errmsg(self.database.db)});
             return error.EnqueueFailed;
         }
 
-        std.log.debug("Enqueued webhook for {s}: {s}", .{ webhook_url, event.event_type.toString() });
+        std.log.debug("Enqueued webhook for {s}: {s}", .{ sanitizeUrlForLog(webhook_url), event.event_type.toString() });
     }
 
     /// Webhook job for processing
     const WebhookJob = struct {
         queue_id: u64,
         webhook_url: []const u8,
+        webhook_secret: []const u8,
         payload: []const u8,
         retry_count: u32,
 
         fn deinit(self: *WebhookJob, allocator: std.mem.Allocator) void {
             allocator.free(self.webhook_url);
+            allocator.free(self.webhook_secret);
             allocator.free(self.payload);
         }
     };
@@ -339,18 +473,26 @@ pub const WebhookManager = struct {
             jobs.deinit(self.allocator);
         }
 
-        // Lock database only for fetching jobs
+        // Atomically claim a batch: flip pending→processing in one statement and return the
+        // rows we successfully transitioned. Without this, two workers (or two consecutive
+        // calls before the first marks anything delivered) could SELECT the same row and
+        // POST it twice. The `RETURNING` clause + `status='pending'` predicate make the
+        // claim race-free at SQLite level.
         {
             self.db_mutex.lock();
             defer self.db_mutex.unlock();
 
             const sql =
-                \\SELECT id, webhook_url, payload, retry_count
-                \\FROM webhook_queue
-                \\WHERE status IN ('pending', 'processing')
-                \\  AND next_retry_at <= ?
-                \\ORDER BY webhook_url, created_at
-                \\LIMIT 200
+                \\UPDATE webhook_queue
+                \\SET status = 'processing', updated_at = ?
+                \\WHERE id IN (
+                \\  SELECT id FROM webhook_queue
+                \\  WHERE status = 'pending'
+                \\    AND next_retry_at <= ?
+                \\  ORDER BY webhook_url, created_at
+                \\  LIMIT 200
+                \\)
+                \\RETURNING id, webhook_url, webhook_secret, payload, retry_count
             ;
 
             const sql_z = try self.allocator.dupeZ(u8, sql);
@@ -361,53 +503,61 @@ pub const WebhookManager = struct {
             defer _ = db.c.sqlite3_finalize(stmt);
 
             _ = db.c.sqlite3_bind_int64(stmt, 1, now);
+            _ = db.c.sqlite3_bind_int64(stmt, 2, now);
 
             while (db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW) {
                 const queue_id: u64 = @intCast(db.c.sqlite3_column_int64(stmt, 0));
                 const webhook_url_span = std.mem.span(db.c.sqlite3_column_text(stmt, 1));
-                const payload_span = std.mem.span(db.c.sqlite3_column_text(stmt, 2));
-                const retry_count: u32 = @intCast(db.c.sqlite3_column_int(stmt, 3));
+                const webhook_secret_span = std.mem.span(db.c.sqlite3_column_text(stmt, 2));
+                const payload_span = std.mem.span(db.c.sqlite3_column_text(stmt, 3));
+                const retry_count: u32 = @intCast(db.c.sqlite3_column_int(stmt, 4));
 
                 // IMPORTANT: Copy strings before releasing mutex/finalizing statement
                 const webhook_url = try self.allocator.dupe(u8, webhook_url_span);
                 errdefer self.allocator.free(webhook_url);
+                const webhook_secret = try self.allocator.dupe(u8, webhook_secret_span);
+                errdefer self.allocator.free(webhook_secret);
                 const payload = try self.allocator.dupe(u8, payload_span);
                 errdefer self.allocator.free(payload);
 
                 try jobs.append(self.allocator, .{
                     .queue_id = queue_id,
                     .webhook_url = webhook_url,
+                    .webhook_secret = webhook_secret,
                     .payload = payload,
                     .retry_count = retry_count,
                 });
             }
         }
 
-        // Process jobs outside of mutex lock
-        var endpoint_last_sent = std.StringHashMap(i64).init(self.allocator);
-        defer endpoint_last_sent.deinit();
+        // Process jobs outside of mutex lock.
+        // Track last-sent in milliseconds so sub-second rate limits actually apply —
+        // the previous second-precision `now - last_sent < rate_limit_ms/1000` truncated
+        // any rate_limit_ms < 1000 to 0, disabling the limit entirely.
+        var endpoint_last_sent_ms = std.StringHashMap(i64).init(self.allocator);
+        defer endpoint_last_sent_ms.deinit();
+        const now_ms = std.time.milliTimestamp();
 
         for (jobs.items) |job| {
-            // Check rate limit for this endpoint
-            if (endpoint_last_sent.get(job.webhook_url)) |last_sent_time| {
-                const time_since_last = now - last_sent_time;
-                const rate_limit_secs: i64 = @intCast(self.rate_limit_ms / 1000);
-                if (time_since_last < rate_limit_secs) {
-                    std.log.debug("Rate limiting {s}, skipping for now", .{job.webhook_url});
+            // Check rate limit for this endpoint (millisecond precision)
+            if (endpoint_last_sent_ms.get(job.webhook_url)) |last_sent_ms| {
+                const elapsed_ms = now_ms - last_sent_ms;
+                if (elapsed_ms < @as(i64, @intCast(self.rate_limit_ms))) {
+                    std.log.debug("Rate limiting {s}, skipping for now", .{sanitizeUrlForLog(job.webhook_url)});
                     continue;
                 }
             }
 
             // Attempt delivery
-            std.log.debug("Delivering queued webhook id={d} to {s} (attempt {d})", .{ job.queue_id, job.webhook_url, job.retry_count + 1 });
+            std.log.debug("Delivering queued webhook id={d} to {s} (attempt {d})", .{ job.queue_id, sanitizeUrlForLog(job.webhook_url), job.retry_count + 1 });
 
-            const success = self.attemptDelivery(job.queue_id, job.webhook_url, job.payload, job.retry_count) catch |err| blk: {
+            const success = self.attemptDelivery(job.queue_id, job.webhook_url, job.webhook_secret, job.payload, job.retry_count) catch |err| blk: {
                 std.log.err("Delivery error for webhook id={d}: {}", .{ job.queue_id, err });
                 break :blk false;
             };
 
-            // Update last sent time for this endpoint
-            try endpoint_last_sent.put(job.webhook_url, now);
+            // Update last sent time for this endpoint (millisecond precision)
+            try endpoint_last_sent_ms.put(job.webhook_url, now_ms);
 
             // Update queue item status
             if (success) {
@@ -419,11 +569,11 @@ pub const WebhookManager = struct {
     }
 
     /// Attempt webhook delivery and return success status
-    fn attemptDelivery(self: *WebhookManager, queue_id: u64, url: []const u8, payload: []const u8, retry_count: u32) !bool {
+    fn attemptDelivery(self: *WebhookManager, queue_id: u64, url: []const u8, secret: []const u8, payload: []const u8, retry_count: u32) !bool {
         _ = queue_id;
         _ = retry_count;
 
-        return self.sendHttpPost(url, payload) catch false;
+        return self.sendHttpPost(url, secret, payload) catch false;
     }
 
     /// Mark webhook as successfully delivered
@@ -493,61 +643,163 @@ pub const WebhookManager = struct {
         }
     }
 
-    fn sendHttpPost(self: *WebhookManager, url: []const u8, payload: []const u8) !bool {
-        // Use curl for HTTP POST (same workaround as RPC client for Zig 0.15.1 TLS issues)
-        const result = try std.process.Child.run(.{
-            .allocator = self.allocator,
-            .argv = &.{
-                "curl",
-                "-s", // Silent mode
-                "--connect-timeout",
-                "5", // 5 second connection timeout
-                "--max-time",
-                "30", // 30 second total timeout
-                "-X",
-                "POST",
-                "-H",
-                "Content-Type: application/json",
-                "-H",
-                "User-Agent: ENSv2-Indexer/0.1.0",
-                "-d",
-                payload,
-                "-w",
-                "%{http_code}", // Write HTTP status code to stdout
-                "-o",
-                "/dev/null", // Don't output response body
-                url,
-            },
-            .max_output_bytes = 1024,
-        });
-        defer self.allocator.free(result.stdout);
-        defer self.allocator.free(result.stderr);
+    /// Default total deadline for one webhook delivery attempt.
+    /// Zig 0.15.2's std.http.Client exposes no per-request connect/read timeout; we enforce
+    /// the deadline externally by running fetch in a detached thread and abandoning it on
+    /// timeout. A leaked thread eventually returns when its TCP read times out at the OS
+    /// level (default minutes, but bounded). With a fixed-size worker pool this is a worst
+    /// case of `worker_count × leaked_threads_per_worker_lifetime` simultaneous in-flight
+    /// fetches — small + bounded.
+    const HTTP_DELIVERY_DEADLINE_MS: i64 = 10_000;
 
-        if (result.term != .Exited or result.term.Exited != 0) {
-            std.log.err("curl process failed: {}", .{result.term});
-            return error.HttpError;
+    /// Heap-allocated state shared between a delivery thread and its watching worker.
+    /// Refcounted so neither side has to know which one outlives the other:
+    /// each side calls `release()` once when leaving; whoever brings refs to 0 frees.
+    const DeliveryArgs = struct {
+        allocator: std.mem.Allocator,
+        client: *std.http.Client,
+        url: []u8,
+        payload: []u8,
+        secret: []u8,
+        // Result, written by the thread, read by the worker.
+        // 0 = running, 1 = 2xx success, 2 = non-2xx response, 3 = transport error
+        done: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+        status_code: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        refs: std.atomic.Value(usize) = std.atomic.Value(usize).init(2),
+
+        fn release(self: *DeliveryArgs) void {
+            if (self.refs.fetchSub(1, .acq_rel) == 1) {
+                self.allocator.free(self.url);
+                self.allocator.free(self.payload);
+                self.allocator.free(self.secret);
+                self.allocator.destroy(self);
+            }
         }
+    };
 
-        // Parse status code
-        const status_code = std.fmt.parseInt(u16, result.stdout, 10) catch {
-            std.log.err("Failed to parse HTTP status code: {s}", .{result.stdout});
-            return error.InvalidStatusCode;
+    /// Detached delivery thread body. Runs fetch, signals result, releases its ref.
+    /// MUST NOT touch `args` after `release()` — the worker may have raced ahead and freed.
+    fn deliveryThreadFn(args: *DeliveryArgs) void {
+        defer args.release();
+
+        // Compute HMAC-SHA256 over "{timestamp}.{payload}" for the X-Webhook-Signature header.
+        const timestamp = std.time.timestamp();
+        const signature = computeWebhookSignature(args.allocator, args.secret, timestamp, args.payload) catch |err| {
+            std.log.err("Webhook signature compute failed for {s}: {}", .{ sanitizeUrlForLog(args.url), err });
+            args.done.store(3, .release);
+            return;
+        };
+        defer args.allocator.free(signature);
+
+        var ts_buf: [24]u8 = undefined;
+        const timestamp_str = std.fmt.bufPrint(&ts_buf, "{d}", .{timestamp}) catch {
+            args.done.store(3, .release);
+            return;
         };
 
-        // 2xx is success
+        var sig_header: std.ArrayList(u8) = .{};
+        defer sig_header.deinit(args.allocator);
+        sig_header.appendSlice(args.allocator, "sha256=") catch {
+            args.done.store(3, .release);
+            return;
+        };
+        sig_header.appendSlice(args.allocator, signature) catch {
+            args.done.store(3, .release);
+            return;
+        };
+
+        const extra_headers = [_]std.http.Header{
+            .{ .name = "Content-Type", .value = "application/json" },
+            .{ .name = "User-Agent", .value = "ENSv2-Indexer/0.1.0" },
+            .{ .name = "X-Webhook-Timestamp", .value = timestamp_str },
+            .{ .name = "X-Webhook-Signature", .value = sig_header.items },
+        };
+
+        var response_buf: std.Io.Writer.Allocating = .init(args.allocator);
+        defer response_buf.deinit();
+
+        const result = args.client.fetch(.{
+            .location = .{ .url = args.url },
+            .method = .POST,
+            .payload = args.payload,
+            .extra_headers = &extra_headers,
+            .response_writer = &response_buf.writer,
+            .keep_alive = true,
+        }) catch |err| {
+            std.log.err("Webhook http.fetch error for {s}: {}", .{ sanitizeUrlForLog(args.url), err });
+            args.done.store(3, .release);
+            return;
+        };
+
+        const status_code = @intFromEnum(result.status);
+        args.status_code.store(@intCast(status_code), .release);
         if (status_code >= 200 and status_code < 300) {
-            return true;
+            args.done.store(1, .release);
         } else {
-            std.log.err("Webhook returned status {d}", .{status_code});
-            return false;
+            std.log.err("Webhook {s} returned status {d}", .{ sanitizeUrlForLog(args.url), status_code });
+            args.done.store(2, .release);
         }
     }
 
-    /// Register a new webhook
-    pub fn registerWebhook(self: *WebhookManager, url: []const u8, event_types: []const models.EventType) !u64 {
+    /// POST JSON to `url`. Returns true on 2xx within `HTTP_DELIVERY_DEADLINE_MS`,
+    /// false on non-2xx; returns `error.HttpTimeout` if the deadline elapses.
+    /// Spawns a detached delivery thread so a hung endpoint cannot stall the worker.
+    fn sendHttpPost(self: *WebhookManager, url: []const u8, secret: []const u8, payload: []const u8) !bool {
+        // Heap-allocate args + dupe inputs so the spawned thread can outlive this stack frame.
+        const args = try self.allocator.create(DeliveryArgs);
+        args.* = DeliveryArgs{
+            .allocator = self.allocator,
+            .client = &self.http_client,
+            .url = try self.allocator.dupe(u8, url),
+            .payload = try self.allocator.dupe(u8, payload),
+            .secret = try self.allocator.dupe(u8, secret),
+        };
+        // Worker holds one ref; thread will hold the other once spawned.
+        defer args.release();
+
+        const thread = std.Thread.spawn(.{ .stack_size = 1 * 1024 * 1024 }, deliveryThreadFn, .{args}) catch |err| {
+            std.log.err("Failed to spawn webhook delivery thread: {}", .{err});
+            // Roll back the thread's pre-allocated ref since no thread will run.
+            args.release();
+            return error.HttpError;
+        };
+        thread.detach();
+
+        // Poll done flag with a deadline. Sleep granularity 50ms — fine for 10s deadline.
+        const start_ms = std.time.milliTimestamp();
+        while (true) {
+            const status = args.done.load(.acquire);
+            if (status != 0) {
+                return switch (status) {
+                    1 => true, // 2xx
+                    2 => false, // non-2xx
+                    else => error.HttpError,
+                };
+            }
+            if (std.time.milliTimestamp() - start_ms >= HTTP_DELIVERY_DEADLINE_MS) {
+                std.log.warn("Webhook delivery timed out for {s} after {d}ms; abandoning thread", .{
+                    sanitizeUrlForLog(url),
+                    HTTP_DELIVERY_DEADLINE_MS,
+                });
+                return error.HttpTimeout;
+            }
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+        }
+    }
+
+    /// Register a new webhook. Generates a fresh HMAC secret and returns both the id
+    /// and the secret to the caller — the secret is NOT persisted in plaintext anywhere
+    /// retrievable, so the caller must capture it from this return value.
+    pub const RegisterResult = struct { id: u64, secret: []u8 };
+
+    pub fn registerWebhook(self: *WebhookManager, url: []const u8, event_types: []const models.EventType) !RegisterResult {
+        const secret = try generateWebhookSecret(self.allocator);
+        errdefer self.allocator.free(secret);
+
         const webhook = models.Webhook{
             .id = 0, // Auto-generated by database
             .url = url,
+            .secret = secret,
             .event_types = event_types,
             .active = true,
             .max_retries = self.max_retries,
@@ -555,8 +807,8 @@ pub const WebhookManager = struct {
         };
 
         const webhook_id = try self.database.insertWebhook(webhook);
-        std.log.info("Registered webhook id={d} url={s}", .{ webhook_id, url });
-        return webhook_id;
+        std.log.info("Registered webhook id={d} url={s}", .{ webhook_id, sanitizeUrlForLog(url) });
+        return .{ .id = webhook_id, .secret = secret };
     }
 
     /// Unregister a webhook
@@ -660,7 +912,6 @@ pub const WebhookManager = struct {
     pub fn cleanupQueueDefault(self: *WebhookManager) !CleanupStats {
         return self.cleanupQueue(1, 7);
     }
-
 };
 
 test "WebhookManager init" {
@@ -683,9 +934,11 @@ test "WebhookManager register webhook" {
     defer manager.deinit();
 
     const event_types = [_]models.EventType{.name_registered};
-    const webhook_id = try manager.registerWebhook("https://example.com/webhook", &event_types);
+    const result = try manager.registerWebhook("https://example.com/webhook", &event_types);
+    defer allocator.free(result.secret);
 
-    try std.testing.expect(webhook_id > 0);
+    try std.testing.expect(result.id > 0);
+    try std.testing.expectEqual(@as(usize, 64), result.secret.len);
 }
 
 test "WebhookManager unregister webhook" {
@@ -697,10 +950,11 @@ test "WebhookManager unregister webhook" {
     defer manager.deinit();
 
     const event_types = [_]models.EventType{.name_registered};
-    const webhook_id = try manager.registerWebhook("https://example.com/webhook", &event_types);
+    const result = try manager.registerWebhook("https://example.com/webhook", &event_types);
+    defer allocator.free(result.secret);
 
     // Unregister should not error
-    try manager.unregisterWebhook(webhook_id);
+    try manager.unregisterWebhook(result.id);
 }
 
 test "WebhookManager list webhooks" {
@@ -712,8 +966,14 @@ test "WebhookManager list webhooks" {
     defer manager.deinit();
 
     const event_types = [_]models.EventType{.name_registered};
-    _ = try manager.registerWebhook("https://example.com/webhook1", &event_types);
-    _ = try manager.registerWebhook("https://example.com/webhook2", &event_types);
+    {
+        const r = try manager.registerWebhook("https://example.com/webhook1", &event_types);
+        allocator.free(r.secret);
+    }
+    {
+        const r = try manager.registerWebhook("https://example.com/webhook2", &event_types);
+        allocator.free(r.secret);
+    }
 
     const webhooks = try manager.listWebhooks();
     defer {

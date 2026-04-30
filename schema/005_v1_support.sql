@@ -47,7 +47,7 @@ CREATE INDEX IF NOT EXISTS idx_v1_labels_namehash ON v1_labels(namehash);
 
 CREATE TABLE IF NOT EXISTS name_history (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  chain TEXT NOT NULL,
+  protocol TEXT NOT NULL,
   namehash TEXT NOT NULL,               -- The name that changed
   name TEXT NOT NULL,                   -- Human-readable name
   change_type TEXT NOT NULL,            -- "ownership" | "resolver" | "expiry" | "wrapper" | "creation" | "migration"
@@ -57,11 +57,11 @@ CREATE TABLE IF NOT EXISTS name_history (
   tx_hash TEXT NOT NULL,
   log_index INTEGER NOT NULL,
   timestamp INTEGER NOT NULL,
-  UNIQUE(chain, namehash, change_type, block_number, log_index)
+  UNIQUE(protocol, namehash, change_type, block_number, log_index)
 );
 
 CREATE INDEX IF NOT EXISTS idx_name_history_namehash ON name_history(namehash);
-CREATE INDEX IF NOT EXISTS idx_name_history_chain_name ON name_history(chain, name);
+CREATE INDEX IF NOT EXISTS idx_name_history_protocol_name ON name_history(protocol, name);
 CREATE INDEX IF NOT EXISTS idx_name_history_change_type ON name_history(change_type);
-CREATE INDEX IF NOT EXISTS idx_name_history_block ON name_history(chain, block_number);
+CREATE INDEX IF NOT EXISTS idx_name_history_block ON name_history(protocol, block_number);
 CREATE INDEX IF NOT EXISTS idx_name_history_timestamp ON name_history(timestamp);

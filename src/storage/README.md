@@ -35,7 +35,7 @@ The `database.zig` file contains 45 functions organized into categories:
 - `storeBlockHash()`, `getBlockHash()`, `rollbackToBlock()`, `pruneOldBlockHashes()` - Block tracking
 - `registerSubregistry()`, `registerResolver()` - Cache management
 - `getSubregistriesToIndex()`, `getResolversToIndex()` - Index queries
-- `insertMigration()`, `insertRenewalSync()`, `insertTokenObserver()` - Bridge events
+- `insertTokenObserver()` - V2 Registry TokenObserverSet events
 - `deleteDataAfterBlock()` - Cleanup
 - `checkIntegrity()` - Validation
 

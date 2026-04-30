@@ -13,24 +13,25 @@ const Address = common.Address;
 const Hash = common.Hash;
 const parser = common.parser;
 const pagination = common.pagination;
-const builders = common.builders;
-const escapeJsonString = common.escapeJsonString;
+const builders = @import("../builders/builders.zig");
+const json_utils = common.json_utils;
 
-/// Parse chain argument from field (defaults to v2)
-fn parseChainArg(field: *const parser.Field) models.Chain {
-    const chain_str = parser.getStringArg(field, "chain", null) orelse models.Chain.v2.toString();
-    if (std.mem.eql(u8, chain_str, models.Chain.v1.toString())) {
-        return .v1;
-    }
-    return .v2; // Default to V2
+/// Parse protocol argument from field (defaults to v2).
+/// Surfaces invalid protocol values as `error.InvalidProtocol` rather than silently
+/// falling back to v2 — a typo would otherwise mask the user's intended filter.
+fn parseProtocolArg(field: *const parser.Field) !models.Protocol {
+    const protocol_str = parser.getStringArg(field, "protocol", null) orelse return .v2;
+    if (std.mem.eql(u8, protocol_str, models.Protocol.v1.toString())) return .v1;
+    if (std.mem.eql(u8, protocol_str, models.Protocol.v2.toString())) return .v2;
+    return error.InvalidProtocol;
 }
 
 pub fn resolveRoles(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
     const allocator = ctx.allocator;
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
 
-    // Get chain argument (default: l2)
-    const chain = parseChainArg(field);
+    // Get protocol argument (default: l2)
+    const protocol = try parseProtocolArg(field);
 
     // Get optional arguments
     const resource_arg = parser.getStringArg(field, "resource", null);
@@ -38,14 +39,10 @@ pub fn resolveRoles(ctx: parser.ExecutionContext, field: *const parser.Field) !p
 
     // Determine which database method to call based on arguments
     const roles = if (resource_arg) |resource|
-        try database.getRolesByResource(chain, resource)
+        try database.getRolesByResource(protocol, resource)
     else if (account_arg) |account_str| blk: {
-        const account_addr = Address.fromHex(account_str) catch {
-            // Invalid address, return empty array
-            const json = try allocator.dupe(u8, "[]");
-            return parser.FieldResult{ .json = json };
-        };
-        break :blk try database.getRolesByAccount(chain, account_addr);
+        const account_addr = Address.fromHex(account_str) catch return error.InvalidAddress;
+        break :blk try database.getRolesByAccount(protocol, account_addr);
     } else try allocator.alloc(models.EACRoleAssignment, 0); // Requires resource or account filter
 
     defer {
@@ -80,8 +77,8 @@ pub fn resolveRolesConnection(ctx: parser.ExecutionContext, field: *const parser
     const allocator = ctx.allocator;
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
 
-    // Get chain argument (default: l2)
-    const chain = parseChainArg(field);
+    // Get protocol argument (default: l2)
+    const protocol = try parseProtocolArg(field);
 
     // Parse pagination arguments
     const first = parser.getIntArg(field, "first", null);
@@ -102,16 +99,36 @@ pub fn resolveRolesConnection(ctx: parser.ExecutionContext, field: *const parser
     const resource_arg = parser.getStringArg(field, "resource", null);
     const account_arg = parser.getStringArg(field, "account", null);
 
-    // Parse account address if provided
+    // Parse account address if provided.
+    // Surface invalid input as an error rather than silently dropping the filter —
+    // otherwise a typo expands the result set to ALL roles, masquerading as real data.
     var account_addr: ?Address = null;
     if (account_arg) |account_str| {
-        account_addr = Address.fromHex(account_str) catch null;
+        account_addr = Address.fromHex(account_str) catch return error.InvalidAddress;
     }
 
-    // Decode cursor if present
+    // Decode cursor if present — fail loud on malformed cursor instead of silently
+    // restarting from the first page.
     var cursor_id: ?i64 = null;
     if (params.cursor) |cursor| {
-        cursor_id = pagination.CursorCodec.decodeInt(allocator, cursor) catch null;
+        cursor_id = try pagination.CursorCodec.decodeInt(allocator, cursor);
+    }
+
+    // Check which top-level fields are requested (for totalCount-only fast path)
+    var wants_edges = false;
+    var wants_page_info = false;
+    var wants_total_count = false;
+    for (field.selections) |*sel| {
+        if (std.mem.eql(u8, sel.name, "edges")) wants_edges = true;
+        if (std.mem.eql(u8, sel.name, "pageInfo")) wants_page_info = true;
+        if (std.mem.eql(u8, sel.name, "totalCount")) wants_total_count = true;
+    }
+
+    // Fast path: only totalCount requested — skip row fetching entirely
+    if (wants_total_count and !wants_edges and !wants_page_info) {
+        const count = try database.getTotalRoleCount(protocol, resource_arg, account_addr);
+        const result = try std.fmt.allocPrint(allocator, "{{\"totalCount\":{d}}}", .{count});
+        return parser.FieldResult{ .json = result };
     }
 
     // Extract node selections from query
@@ -131,7 +148,7 @@ pub fn resolveRolesConnection(ctx: parser.ExecutionContext, field: *const parser
     // Fetch one extra item to determine hasNextPage/hasPreviousPage
     const fetch_limit: u32 = @intCast(params.limit + 1);
 
-    const roles = try database.getRolesWithPagination(chain, .{
+    const roles = try database.getRolesWithPagination(protocol, .{
         .resource = resource_arg,
         .account = account_addr,
         .limit = fetch_limit,
@@ -156,16 +173,9 @@ pub fn resolveRolesConnection(ctx: parser.ExecutionContext, field: *const parser
 
     const items_slice = roles[0..actual_items];
 
-    // Only compute total count when requested in the GraphQL selection
-    var wants_total_count = false;
-    for (field.selections) |*sel| {
-        if (std.mem.eql(u8, sel.name, "totalCount")) {
-            wants_total_count = true;
-            break;
-        }
-    }
+    // Only compute total count when requested (reuse wants_total_count from earlier scan)
     const total_count: ?usize = if (wants_total_count)
-        try database.getTotalRoleCount(chain, resource_arg, account_addr)
+        try database.getTotalRoleCount(protocol, resource_arg, account_addr)
     else
         null;
 
@@ -240,8 +250,8 @@ pub fn resolveResolvers(ctx: parser.ExecutionContext, field: *const parser.Field
     const allocator = ctx.allocator;
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
 
-    // Get chain argument (default: l2)
-    const chain = parseChainArg(field);
+    // Get protocol argument (default: l2)
+    const protocol = try parseProtocolArg(field);
 
     // Get required account argument
     const account_arg = parser.getStringArg(field, "account", null) orelse {
@@ -249,13 +259,9 @@ pub fn resolveResolvers(ctx: parser.ExecutionContext, field: *const parser.Field
         return parser.FieldResult{ .json = json };
     };
 
-    const account_addr = Address.fromHex(account_arg) catch {
-        // Invalid address, return empty array
-        const json = try allocator.dupe(u8, "[]");
-        return parser.FieldResult{ .json = json };
-    };
+    const account_addr = Address.fromHex(account_arg) catch return error.InvalidAddress;
 
-    const resolvers = try database.getResolversByOwner(chain, account_addr);
+    const resolvers = try database.getResolversByOwner(protocol, account_addr);
     defer {
         for (resolvers) |*resolver| {
             resolver.deinit(allocator);
@@ -284,8 +290,8 @@ pub fn resolveRegistries(ctx: parser.ExecutionContext, field: *const parser.Fiel
     const allocator = ctx.allocator;
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
 
-    // Get chain argument (default: l2)
-    const chain = parseChainArg(field);
+    // Get protocol argument (default: l2)
+    const protocol = try parseProtocolArg(field);
 
     // Get required owner argument
     const owner_arg = parser.getStringArg(field, "owner", null) orelse {
@@ -293,13 +299,9 @@ pub fn resolveRegistries(ctx: parser.ExecutionContext, field: *const parser.Fiel
         return parser.FieldResult{ .json = json };
     };
 
-    const owner_addr = Address.fromHex(owner_arg) catch {
-        // Invalid address, return empty array
-        const json = try allocator.dupe(u8, "[]");
-        return parser.FieldResult{ .json = json };
-    };
+    const owner_addr = Address.fromHex(owner_arg) catch return error.InvalidAddress;
 
-    const registries = try database.getRegistriesByOwner(chain, owner_addr);
+    const registries = try database.getRegistriesByOwner(protocol, owner_addr);
     defer {
         for (registries) |*registry| {
             registry.deinit(allocator);
@@ -332,8 +334,8 @@ pub fn resolveMetadata(ctx: parser.ExecutionContext, field: *const parser.Field)
     const allocator = ctx.allocator;
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
 
-    // Get chain argument (default: l2)
-    const chain = parseChainArg(field);
+    // Get protocol argument (default: l2)
+    const protocol = try parseProtocolArg(field);
 
     // Get required resolver argument
     const resolver_arg = parser.getStringArg(field, "resolver", null) orelse {
@@ -341,13 +343,9 @@ pub fn resolveMetadata(ctx: parser.ExecutionContext, field: *const parser.Field)
         return parser.FieldResult{ .json = json };
     };
 
-    const resolver_addr = Address.fromHex(resolver_arg) catch {
-        // Invalid address, return null
-        const json = try allocator.dupe(u8, "null");
-        return parser.FieldResult{ .json = json };
-    };
+    const resolver_addr = Address.fromHex(resolver_arg) catch return error.InvalidAddress;
 
-    const metadata_opt = try database.getResolverMetadata(chain, resolver_addr);
+    const metadata_opt = try database.getResolverMetadata(protocol, resolver_addr);
     if (metadata_opt) |metadata| {
         var metadata_mut = metadata;
         defer metadata_mut.deinit(allocator);
@@ -369,8 +367,8 @@ pub fn resolveApprovals(ctx: parser.ExecutionContext, field: *const parser.Field
     const allocator = ctx.allocator;
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
 
-    // Get chain argument (default: l2)
-    const chain = parseChainArg(field);
+    // Get protocol argument (default: l2)
+    const protocol = try parseProtocolArg(field);
 
     // Get optional arguments
     const namehash_arg = parser.getStringArg(field, "namehash", null);
@@ -378,19 +376,11 @@ pub fn resolveApprovals(ctx: parser.ExecutionContext, field: *const parser.Field
 
     // Determine which database method to call based on arguments
     const approvals = if (namehash_arg) |namehash_str| blk: {
-        const namehash_hash = Hash.fromHex(namehash_str) catch {
-            // Invalid hash, return empty array
-            const json = try allocator.dupe(u8, "[]");
-            return parser.FieldResult{ .json = json };
-        };
-        break :blk try database.getApprovalsForName(chain, namehash_hash, null);
+        const namehash_hash = Hash.fromHex(namehash_str) catch return error.InvalidNamehash;
+        break :blk try database.getApprovalsForName(protocol, namehash_hash, null);
     } else if (delegate_arg) |delegate_str| blk: {
-        const delegate_addr = Address.fromHex(delegate_str) catch {
-            // Invalid address, return empty array
-            const json = try allocator.dupe(u8, "[]");
-            return parser.FieldResult{ .json = json };
-        };
-        break :blk try database.getApprovalsForDelegate(chain, delegate_addr);
+        const delegate_addr = Address.fromHex(delegate_str) catch return error.InvalidAddress;
+        break :blk try database.getApprovalsForDelegate(protocol, delegate_addr);
     } else try allocator.alloc(models.ResolverApproval, 0); // No arguments, return empty
 
     defer {
@@ -430,10 +420,7 @@ pub fn resolveResolver(ctx: parser.ExecutionContext, field: *const parser.Field)
         return parser.FieldResult{ .json = json };
     };
 
-    const resolver_addr = Address.fromHex(id_arg) catch {
-        const json = try allocator.dupe(u8, "null");
-        return parser.FieldResult{ .json = json };
-    };
+    const resolver_addr = Address.fromHex(id_arg) catch return error.InvalidAddress;
 
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
     const json = try buildResolverJson(resolver_addr, field.selections, database, allocator, ctx.loaders);
@@ -532,7 +519,7 @@ fn buildResolverJson(
                 for (sel.selections) |subfield| {
                     if (std.mem.eql(u8, subfield.name, "fromName")) {
                         if (!first_sub) try json.appendSlice(allocator, ",");
-                        const escaped = try escapeJsonString(allocator, record.from_name);
+                        const escaped = try json_utils.escapeString(allocator, record.from_name);
                         defer allocator.free(escaped);
                         const val = try std.fmt.allocPrint(allocator, "\"fromName\":\"{s}\"", .{escaped});
                         defer allocator.free(val);
@@ -540,7 +527,7 @@ fn buildResolverJson(
                         first_sub = false;
                     } else if (std.mem.eql(u8, subfield.name, "toName")) {
                         if (!first_sub) try json.appendSlice(allocator, ",");
-                        const escaped = try escapeJsonString(allocator, record.to_name);
+                        const escaped = try json_utils.escapeString(allocator, record.to_name);
                         defer allocator.free(escaped);
                         const val = try std.fmt.allocPrint(allocator, "\"toName\":\"{s}\"", .{escaped});
                         defer allocator.free(val);
@@ -549,9 +536,9 @@ fn buildResolverJson(
                     }
                 }
                 if (first_sub) {
-                    const escaped_from = try escapeJsonString(allocator, record.from_name);
+                    const escaped_from = try json_utils.escapeString(allocator, record.from_name);
                     defer allocator.free(escaped_from);
-                    const escaped_to = try escapeJsonString(allocator, record.to_name);
+                    const escaped_to = try json_utils.escapeString(allocator, record.to_name);
                     defer allocator.free(escaped_to);
                     const val = try std.fmt.allocPrint(allocator, "\"fromName\":\"{s}\",\"toName\":\"{s}\"", .{ escaped_from, escaped_to });
                     defer allocator.free(val);
@@ -675,7 +662,7 @@ fn handleEACRoleField(ctx: *anyopaque, output_key: []const u8, field_name: []con
         try writer.print("\"{s}\":\"{d}\"", .{ output_key, role.id });
         return true;
     } else if (std.mem.eql(u8, field_name, "resource")) {
-        const escaped = try escapeJsonString(allocator, role.resource);
+        const escaped = try json_utils.escapeString(allocator, role.resource);
         defer allocator.free(escaped);
         try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         return true;
@@ -685,7 +672,7 @@ fn handleEACRoleField(ctx: *anyopaque, output_key: []const u8, field_name: []con
         try writer.print("\"{s}\":\"{s}\"", .{ output_key, account_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "roleBitmap")) {
-        const escaped = try escapeJsonString(allocator, role.role_bitmap);
+        const escaped = try json_utils.escapeString(allocator, role.role_bitmap);
         defer allocator.free(escaped);
         try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         return true;
@@ -702,7 +689,7 @@ fn handleEACRoleField(ctx: *anyopaque, output_key: []const u8, field_name: []con
         return true;
     } else if (std.mem.eql(u8, field_name, "name")) {
         if (role.name) |name| {
-            const escaped = try escapeJsonString(allocator, name);
+            const escaped = try json_utils.escapeString(allocator, name);
             defer allocator.free(escaped);
             try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         } else {
@@ -723,7 +710,7 @@ fn handleRegistryField(ctx: *anyopaque, output_key: []const u8, field_name: []co
         try writer.print("\"{s}\":\"{s}\"", .{ output_key, addr_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "name")) {
-        const escaped = try escapeJsonString(allocator, registry.name);
+        const escaped = try json_utils.escapeString(allocator, registry.name);
         defer allocator.free(escaped);
         try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         return true;
@@ -760,7 +747,7 @@ fn handleResolverMetadataField(ctx: *anyopaque, output_key: []const u8, field_na
         try writer.print("\"{s}\":\"{s}\"", .{ output_key, resolver_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "graphqlUrl")) {
-        const escaped = try escapeJsonString(allocator, metadata.graphql_url);
+        const escaped = try json_utils.escapeString(allocator, metadata.graphql_url);
         defer allocator.free(escaped);
         try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         return true;
@@ -798,7 +785,7 @@ fn handleResolverApprovalField(ctx: *anyopaque, output_key: []const u8, field_na
         return true;
     } else if (std.mem.eql(u8, field_name, "context")) {
         if (approval.context) |ctx_str| {
-            const escaped = try escapeJsonString(allocator, ctx_str);
+            const escaped = try json_utils.escapeString(allocator, ctx_str);
             defer allocator.free(escaped);
             try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
         } else {

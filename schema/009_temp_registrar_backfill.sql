@@ -4,7 +4,7 @@
 
 CREATE TABLE IF NOT EXISTS temp_pre_migration_names (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  chain TEXT NOT NULL,
+  protocol TEXT NOT NULL,
   namehash TEXT NOT NULL,
   label_hash TEXT NOT NULL,
   parent_node TEXT NOT NULL,
@@ -13,11 +13,11 @@ CREATE TABLE IF NOT EXISTS temp_pre_migration_names (
   tx_hash TEXT NOT NULL,
   log_index INTEGER NOT NULL,
   created_at INTEGER NOT NULL,
-  UNIQUE(chain, namehash)
+  UNIQUE(protocol, namehash)
 );
 
 CREATE INDEX IF NOT EXISTS idx_temp_pre_migration_label_hash ON temp_pre_migration_names(label_hash);
-CREATE INDEX IF NOT EXISTS idx_temp_pre_migration_chain ON temp_pre_migration_names(chain);
+CREATE INDEX IF NOT EXISTS idx_temp_pre_migration_protocol ON temp_pre_migration_names(protocol);
 
 -- Track backfill status
 CREATE TABLE IF NOT EXISTS backfill_status (

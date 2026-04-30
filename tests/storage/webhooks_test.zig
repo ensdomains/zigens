@@ -21,6 +21,7 @@ test "insertWebhook creates webhook with event_types JSON" {
     const webhook = models.Webhook{
         .id = 0, // Will be assigned
         .url = "https://example.com/webhook",
+        .secret = "0000000000000000000000000000000000000000000000000000000000000000",
         .event_types = &event_types,
         .active = true,
         .max_retries = 3,
@@ -51,6 +52,7 @@ test "insertWebhook with empty event_types" {
     const webhook = models.Webhook{
         .id = 0,
         .url = "https://example.com/empty",
+        .secret = "0000000000000000000000000000000000000000000000000000000000000000",
         .event_types = empty_types,
         .active = true,
         .max_retries = 5,
@@ -81,6 +83,7 @@ test "getWebhook returns webhook by id" {
     const webhook = models.Webhook{
         .id = 0,
         .url = "https://example.com/get",
+        .secret = "0000000000000000000000000000000000000000000000000000000000000000",
         .event_types = &event_types,
         .active = true,
         .max_retries = 3,
@@ -117,6 +120,7 @@ test "getWebhooks returns all webhooks" {
     _ = try webhooks.insertWebhook(database, models.Webhook{
         .id = 0,
         .url = "https://example.com/1",
+        .secret = "0000000000000000000000000000000000000000000000000000000000000000",
         .event_types = &event_types,
         .active = true,
         .max_retries = 3,
@@ -126,6 +130,7 @@ test "getWebhooks returns all webhooks" {
     _ = try webhooks.insertWebhook(database, models.Webhook{
         .id = 0,
         .url = "https://example.com/2",
+        .secret = "0000000000000000000000000000000000000000000000000000000000000000",
         .event_types = &event_types,
         .active = false,
         .max_retries = 5,
@@ -154,6 +159,7 @@ test "updateWebhook updates URL" {
     const id = try webhooks.insertWebhook(database, models.Webhook{
         .id = 0,
         .url = "https://old.example.com",
+        .secret = "0000000000000000000000000000000000000000000000000000000000000000",
         .event_types = &event_types,
         .active = true,
         .max_retries = 3,
@@ -181,6 +187,7 @@ test "updateWebhook updates event_types" {
     const id = try webhooks.insertWebhook(database, models.Webhook{
         .id = 0,
         .url = "https://example.com/types",
+        .secret = "0000000000000000000000000000000000000000000000000000000000000000",
         .event_types = &old_types,
         .active = true,
         .max_retries = 3,
@@ -209,6 +216,7 @@ test "updateWebhook updates active status" {
     const id = try webhooks.insertWebhook(database, models.Webhook{
         .id = 0,
         .url = "https://example.com/active",
+        .secret = "0000000000000000000000000000000000000000000000000000000000000000",
         .event_types = &event_types,
         .active = true,
         .max_retries = 3,
@@ -240,6 +248,7 @@ test "deleteWebhook removes webhook" {
     const id = try webhooks.insertWebhook(database, models.Webhook{
         .id = 0,
         .url = "https://example.com/delete",
+        .secret = "0000000000000000000000000000000000000000000000000000000000000000",
         .event_types = &event_types,
         .active = true,
         .max_retries = 3,

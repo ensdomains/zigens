@@ -1,63 +1,26 @@
 -- ENSv2 Indexer Database Schema
--- Migration 002: Bridge and Cross-Chain Events
--- Added: 2025-01-XX for bridge event tracking
+-- Migration 002: V2 token observers
+-- Originally created to track cross-protocol bridge events alongside token observers.
+-- The bridge-related tables (migrations, renewal_syncs) were removed in 2026-04;
+-- `token_observers` remains because it tracks the V2 Registry's TokenObserverSet
+-- event and is not bridging. Filename kept to preserve migration ordering.
 
 -- ============================================================================
--- MIGRATIONS (Cross-chain name migrations)
--- ============================================================================
-
-CREATE TABLE IF NOT EXISTS migrations (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  chain TEXT NOT NULL,
-  token_id TEXT NOT NULL,
-  direction TEXT NOT NULL,  -- 'to_l1' or 'to_l2'
-  dns_encoded_name TEXT NOT NULL,
-  block_number INTEGER NOT NULL,
-  transaction_hash TEXT NOT NULL,
-  log_index INTEGER NOT NULL,
-  timestamp INTEGER NOT NULL,
-  UNIQUE(chain, transaction_hash, log_index)
-);
-
-CREATE INDEX IF NOT EXISTS idx_migrations_token_id ON migrations(chain, token_id);
-CREATE INDEX IF NOT EXISTS idx_migrations_block ON migrations(chain, block_number);
-CREATE INDEX IF NOT EXISTS idx_migrations_direction ON migrations(direction);
-
--- ============================================================================
--- RENEWAL SYNCS (Cross-chain renewal synchronization)
--- ============================================================================
-
-CREATE TABLE IF NOT EXISTS renewal_syncs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  chain TEXT NOT NULL,
-  token_id TEXT NOT NULL,
-  new_expiry INTEGER NOT NULL,
-  block_number INTEGER NOT NULL,
-  transaction_hash TEXT NOT NULL,
-  log_index INTEGER NOT NULL,
-  timestamp INTEGER NOT NULL,
-  UNIQUE(chain, transaction_hash, log_index)
-);
-
-CREATE INDEX IF NOT EXISTS idx_renewal_syncs_token_id ON renewal_syncs(chain, token_id);
-CREATE INDEX IF NOT EXISTS idx_renewal_syncs_block ON renewal_syncs(chain, block_number);
-
--- ============================================================================
--- TOKEN OBSERVERS (Observer assignments for tokens)
+-- TOKEN OBSERVERS (V2 Registry TokenObserverSet event)
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS token_observers (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  chain TEXT NOT NULL,
+  protocol TEXT NOT NULL,
   token_id TEXT NOT NULL,
   observer TEXT NOT NULL,
   block_number INTEGER NOT NULL,
   transaction_hash TEXT NOT NULL,
   log_index INTEGER NOT NULL,
   timestamp INTEGER NOT NULL,
-  UNIQUE(chain, transaction_hash, log_index)
+  UNIQUE(protocol, transaction_hash, log_index)
 );
 
-CREATE INDEX IF NOT EXISTS idx_token_observers_token_id ON token_observers(chain, token_id);
-CREATE INDEX IF NOT EXISTS idx_token_observers_block ON token_observers(chain, block_number);
+CREATE INDEX IF NOT EXISTS idx_token_observers_token_id ON token_observers(protocol, token_id);
+CREATE INDEX IF NOT EXISTS idx_token_observers_block ON token_observers(protocol, block_number);
 CREATE INDEX IF NOT EXISTS idx_token_observers_observer ON token_observers(observer);

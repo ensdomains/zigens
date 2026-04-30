@@ -11,12 +11,12 @@ const Hash = @import("../types/hash.zig").Hash;
 // ============================================================================
 
 /// Insert or update EAC role assignment
-pub fn upsertEACRole(db: *Database, chain: models.Chain, resource: []const u8, account: Address, role_bitmap: []const u8, block_number: u64, tx_hash: Hash, log_index: u32, contract_address: Address) !void {
+pub fn upsertEACRole(db: *Database, protocol: models.Protocol, resource: []const u8, account: Address, role_bitmap: []const u8, block_number: u64, tx_hash: Hash, log_index: u32, contract_address: Address) !void {
     const sql =
         \\INSERT INTO eac_roles
-        \\(chain, resource, account, role_bitmap, block_number, transaction_hash, log_index, timestamp, contract_address)
+        \\(protocol, resource, account, role_bitmap, block_number, transaction_hash, log_index, timestamp, contract_address)
         \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        \\ON CONFLICT(chain, resource, account, contract_address) DO UPDATE SET
+        \\ON CONFLICT(protocol, resource, account, contract_address) DO UPDATE SET
         \\  role_bitmap = excluded.role_bitmap,
         \\  block_number = excluded.block_number,
         \\  transaction_hash = excluded.transaction_hash,
@@ -27,7 +27,7 @@ pub fn upsertEACRole(db: *Database, chain: models.Chain, resource: []const u8, a
     var q = try Query.init(db, sql);
     defer q.deinit();
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindText(resource);
     try q.bindAddress(account);
     try q.bindText(role_bitmap);
@@ -41,10 +41,10 @@ pub fn upsertEACRole(db: *Database, chain: models.Chain, resource: []const u8, a
 }
 
 /// Parse EACRoleAssignment from query results
-/// Column order: id(0), chain(1), resource(2), account(3), role_bitmap(4),
+/// Column order: id(0), protocol(1), resource(2), account(3), role_bitmap(4),
 ///               block_number(5), transaction_hash(6), log_index(7), timestamp(8), name(9)
 fn parseEACRoleRow(q: *Query, allocator: std.mem.Allocator) !models.EACRoleAssignment {
-    const chain_col = q.getTextSlice(1) orelse return error.MissingChain;
+    const protocol_col = q.getTextSlice(1) orelse return error.MissingProtocol;
     const resource_col = q.getTextSlice(2) orelse return error.MissingResource;
     const account_col = q.getTextSlice(3) orelse return error.MissingAccount;
     const role_bitmap_col = q.getTextSlice(4) orelse return error.MissingRoleBitmap;
@@ -59,7 +59,7 @@ fn parseEACRoleRow(q: *Query, allocator: std.mem.Allocator) !models.EACRoleAssig
 
     return models.EACRoleAssignment{
         .id = @intCast(q.getInt64(0)),
-        .chain = try models.Chain.fromString(chain_col),
+        .protocol = try models.Protocol.fromString(protocol_col),
         .resource = try allocator.dupe(u8, resource_col),
         .account = try Address.fromHex(account_col),
         .role_bitmap = try allocator.dupe(u8, role_bitmap_col),
@@ -71,20 +71,29 @@ fn parseEACRoleRow(q: *Query, allocator: std.mem.Allocator) !models.EACRoleAssig
     };
 }
 
-/// Get all role assignments for a resource
-pub fn getRolesByResource(db: *Database, chain: models.Chain, resource: []const u8) ![]models.EACRoleAssignment {
+/// Get all role assignments for a resource.
+/// Resolves the human-readable name via two paths:
+///   1. Registry EAC (today's primary path): `contract_address` matches a registry row,
+///      resource = token's canonical_id — joins to `names` by (canonical_id, registry).
+///   2. Resolver EAC (future-proofing): if/when resolver contracts emit `EACRolesChanged`
+///      where `resource = namehash`, the resolvers JOIN resolves to a name. No handler
+///      currently stores roles in this shape; the JOIN is a no-op on current data.
+pub fn getRolesByResource(db: *Database, protocol: models.Protocol, resource: []const u8) ![]models.EACRoleAssignment {
     const sql =
-        \\SELECT r.id, r.chain, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp, n.name
+        \\SELECT r.id, r.protocol, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp,
+        \\       COALESCE(reg_name.name, resolver_name.name) AS name
         \\FROM eac_roles r
-        \\LEFT JOIN names n ON r.resource = n.canonical_id AND r.contract_address = n.registry
-        \\WHERE r.chain = ? AND r.resource = ?
+        \\LEFT JOIN names reg_name ON r.resource = reg_name.canonical_id AND r.contract_address = reg_name.registry
+        \\LEFT JOIN resolvers res ON r.contract_address = res.address AND r.resource = res.namehash AND res.protocol = r.protocol
+        \\LEFT JOIN names resolver_name ON res.namehash = resolver_name.namehash AND resolver_name.protocol = r.protocol
+        \\WHERE r.protocol = ? AND r.resource = ?
         \\ORDER BY r.timestamp DESC
     ;
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindText(resource);
 
     var roles: std.ArrayList(models.EACRoleAssignment) = .{};
@@ -103,20 +112,24 @@ pub fn getRolesByResource(db: *Database, chain: models.Chain, resource: []const 
     return roles.toOwnedSlice(db.allocator);
 }
 
-/// Get all role assignments for an account
-pub fn getRolesByAccount(db: *Database, chain: models.Chain, account: Address) ![]models.EACRoleAssignment {
+/// Get all role assignments for an account.
+/// Resolves name via registry or resolver paths (see getRolesByResource).
+pub fn getRolesByAccount(db: *Database, protocol: models.Protocol, account: Address) ![]models.EACRoleAssignment {
     const sql =
-        \\SELECT r.id, r.chain, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp, n.name
+        \\SELECT r.id, r.protocol, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp,
+        \\       COALESCE(reg_name.name, resolver_name.name) AS name
         \\FROM eac_roles r
-        \\LEFT JOIN names n ON r.resource = n.canonical_id AND r.contract_address = n.registry
-        \\WHERE r.chain = ? AND r.account = ?
+        \\LEFT JOIN names reg_name ON r.resource = reg_name.canonical_id AND r.contract_address = reg_name.registry
+        \\LEFT JOIN resolvers res ON r.contract_address = res.address AND r.resource = res.namehash AND res.protocol = r.protocol
+        \\LEFT JOIN names resolver_name ON res.namehash = resolver_name.namehash AND resolver_name.protocol = r.protocol
+        \\WHERE r.protocol = ? AND r.account = ?
         \\ORDER BY r.timestamp DESC
     ;
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindAddress(account);
 
     var roles: std.ArrayList(models.EACRoleAssignment) = .{};
@@ -145,16 +158,19 @@ pub const RolePaginationOptions = struct {
 };
 
 /// Get roles with pagination support
-pub fn getRolesWithPagination(db: *Database, chain: models.Chain, options: RolePaginationOptions) ![]models.EACRoleAssignment {
+pub fn getRolesWithPagination(db: *Database, protocol: models.Protocol, options: RolePaginationOptions) ![]models.EACRoleAssignment {
     // Build SQL dynamically based on filters
     var sql_buf: [1024]u8 = undefined;
     var sql_len: usize = 0;
 
     const base =
-        \\SELECT r.id, r.chain, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp, n.name
+        \\SELECT r.id, r.protocol, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp,
+        \\       COALESCE(reg_name.name, resolver_name.name) AS name
         \\FROM eac_roles r
-        \\LEFT JOIN names n ON r.resource = n.canonical_id AND r.contract_address = n.registry
-        \\WHERE r.chain = ?
+        \\LEFT JOIN names reg_name ON r.resource = reg_name.canonical_id AND r.contract_address = reg_name.registry
+        \\LEFT JOIN resolvers res ON r.contract_address = res.address AND r.resource = res.namehash AND res.protocol = r.protocol
+        \\LEFT JOIN names resolver_name ON res.namehash = resolver_name.namehash AND resolver_name.protocol = r.protocol
+        \\WHERE r.protocol = ?
     ;
     @memcpy(sql_buf[sql_len .. sql_len + base.len], base);
     sql_len += base.len;
@@ -195,7 +211,7 @@ pub fn getRolesWithPagination(db: *Database, chain: models.Chain, options: RoleP
     var q = try Query.init(db, sql_buf[0..sql_len]);
     defer q.deinit();
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
 
     if (options.resource) |resource| {
         try q.bindText(resource);
@@ -228,11 +244,11 @@ pub fn getRolesWithPagination(db: *Database, chain: models.Chain, options: RoleP
 }
 
 /// Get total count of roles with optional filters
-pub fn getTotalRoleCount(db: *Database, chain: models.Chain, resource: ?[]const u8, account: ?Address) !usize {
+pub fn getTotalRoleCount(db: *Database, protocol: models.Protocol, resource: ?[]const u8, account: ?Address) !usize {
     var sql_buf: [512]u8 = undefined;
     var sql_len: usize = 0;
 
-    const base = "SELECT COUNT(*) FROM eac_roles WHERE chain = ?";
+    const base = "SELECT COUNT(*) FROM eac_roles WHERE protocol = ?";
     @memcpy(sql_buf[sql_len .. sql_len + base.len], base);
     sql_len += base.len;
 
@@ -251,7 +267,7 @@ pub fn getTotalRoleCount(db: *Database, chain: models.Chain, resource: ?[]const 
     var q = try Query.init(db, sql_buf[0..sql_len]);
     defer q.deinit();
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
 
     if (resource) |res| {
         try q.bindText(res);
@@ -268,13 +284,13 @@ pub fn getTotalRoleCount(db: *Database, chain: models.Chain, resource: ?[]const 
 }
 
 /// Delete role assignment (when all roles revoked)
-pub fn deleteEACRole(db: *Database, chain: models.Chain, resource: []const u8, account: Address, contract_address: Address) !void {
-    const sql = "DELETE FROM eac_roles WHERE chain = ? AND resource = ? AND account = ? AND contract_address = ?";
+pub fn deleteEACRole(db: *Database, protocol: models.Protocol, resource: []const u8, account: Address, contract_address: Address) !void {
+    const sql = "DELETE FROM eac_roles WHERE protocol = ? AND resource = ? AND account = ? AND contract_address = ?";
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
-    try q.bindTextStatic(chain.toString());
+    try q.bindTextStatic(protocol.toString());
     try q.bindText(resource);
     try q.bindAddress(account);
     try q.bindAddress(contract_address);

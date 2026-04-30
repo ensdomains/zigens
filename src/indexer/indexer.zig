@@ -53,6 +53,9 @@ pub const Indexer = struct {
     write_buffer: WriteBuffer,
     // Rainbow table for resolving labelhashes to labels (optional)
     rainbow: ?Rainbow = null,
+    // Cached namehash("eth") — constant value used by every V2 LabelRegistered/
+    // NameRegistered/LabelReserved handler. Two keccak rounds saved per event.
+    eth_namehash: Hash,
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.Config, database: *db.Database, end_block: ?u64) !Indexer {
         // Create ONE shared HTTP client
@@ -82,13 +85,13 @@ pub const Indexer = struct {
             // Get current block from database (resume point) or use start_block
             const current_block = try database.getSyncState(.v1) orelse cfg.start_block;
 
-            // Fetch target block from chain if not specified
+            // Fetch target block from protocol if not specified
             const target_block = if (end_block) |eb| eb else blk: {
                 const current = v1_client.getBlockNumber() catch |err| {
                     std.log.warn("Failed to fetch current block number from RPC: {any}. Using start_block as fallback.", .{err});
                     break :blk cfg.start_block;
                 };
-                std.log.info("Fetched current block from chain: {d}", .{current});
+                std.log.info("Fetched current block from protocol: {d}", .{current});
                 break :blk current;
             };
 
@@ -139,11 +142,12 @@ pub const Indexer = struct {
             .v1_label_cache = std.StringHashMap([]const u8).init(allocator),
             .write_buffer = WriteBuffer.init(allocator),
             .rainbow = rainbow,
+            .eth_namehash = try @import("../types/hash.zig").namehash(allocator, "eth"),
         };
     }
 
-    /// Initialize indexer for a single chain (V1 or V2 only)
-    pub fn initSingleChain(allocator: std.mem.Allocator, cfg: config.Config, database: *db.Database, chain: models.Chain, end_block: ?u64) !Indexer {
+    /// Initialize indexer for a single protocol (V1 or V2 only)
+    pub fn initSingleProtocol(allocator: std.mem.Allocator, cfg: config.Config, database: *db.Database, protocol: models.Protocol, end_block: ?u64) !Indexer {
         const http_client = try allocator.create(std.http.Client);
         http_client.* = std.http.Client{ .allocator = allocator };
         errdefer {
@@ -168,16 +172,19 @@ pub const Indexer = struct {
 
         if (cfg.status_port) |port| {
             // Get current block from database (resume point) or use appropriate deployment block
-            const deployment_block = if (chain == .v1) cfg.v1_contracts.l1_deployment_block else cfg.v2_contracts.l2_deployment_block;
-            const current_block = try database.getSyncState(chain) orelse deployment_block;
+            const deployment_block = switch (protocol) {
+                .v1 => cfg.v1_contracts.v1_deployment_block,
+                .v2 => cfg.v2_contracts.v2_deployment_block,
+            };
+            const current_block = try database.getSyncState(protocol) orelse deployment_block;
 
-            // Fetch target block from chain if not specified
+            // Fetch target block from protocol if not specified
             const target_block = if (end_block) |eb| eb else blk: {
                 const current = client.getBlockNumber() catch |err| {
                     std.log.warn("Failed to fetch current block number from RPC: {any}. Using deployment block as fallback.", .{err});
                     break :blk deployment_block;
                 };
-                std.log.info("Fetched current block from chain: {d}", .{current});
+                std.log.info("Fetched current block from protocol: {d}", .{current});
                 break :blk current;
             };
 
@@ -228,6 +235,7 @@ pub const Indexer = struct {
             .v1_label_cache = std.StringHashMap([]const u8).init(allocator),
             .write_buffer = WriteBuffer.init(allocator),
             .rainbow = rainbow,
+            .eth_namehash = try @import("../types/hash.zig").namehash(allocator, "eth"),
         };
     }
 
@@ -348,7 +356,7 @@ pub const Indexer = struct {
 
     /// Get block timestamp, using log's timestamp if available, then cache, then RPC fallback
     /// If known_timestamp is provided (from RPC provider's blockTimestamp field), use it directly
-    pub fn getBlockTimestamp(self: *Indexer, chain: models.Chain, block_number: u64, known_timestamp: ?u64) i64 {
+    pub fn getBlockTimestamp(self: *Indexer, protocol: models.Protocol, block_number: u64, known_timestamp: ?u64) i64 {
         // If provider included timestamp in log response, use it directly (fastest path)
         if (known_timestamp) |ts| {
             const timestamp: i64 = @intCast(ts);
@@ -363,7 +371,7 @@ pub const Indexer = struct {
         }
 
         // Fetch from RPC (slowest path)
-        const client = self.getClient(chain);
+        const client = self.getClient(protocol);
         const block = client.getBlockByNumber(block_number, false) catch |err| {
             std.log.warn("Failed to fetch block {d} timestamp: {}, using current time", .{ block_number, err });
             return std.time.timestamp();
@@ -384,50 +392,49 @@ pub const Indexer = struct {
         self.block_timestamp_cache.clearRetainingCapacity();
     }
 
-    /// Look up domain name from namehash (returns null if not found)
+    /// Look up domain name from namehash (returns null if not found).
+    /// Uses the narrow `getNameStringByNamehash` query — fetches only the `name`
+    /// column instead of the full 21-column Name row, since the caller only needs
+    /// the string. Saves per-event allocation/dupe overhead during reverse resolution.
     pub fn getNameFromNamehash(self: *Indexer, namehash: Hash) ?[]const u8 {
-        const name_record = self.database.getNameByNamehash(namehash) catch return null;
-        if (name_record) |record| {
-            // The name field is optional - if not set, return null
-            if (record.name) |name| {
-                // Duplicate the name so the record can be cleaned up
-                const name_copy = self.allocator.dupe(u8, name) catch return null;
-                var mutable_record = record;
-                mutable_record.deinit(self.allocator);
-                return name_copy;
-            }
-            var mutable_record = record;
-            mutable_record.deinit(self.allocator);
-        }
-        return null;
+        return self.database.getNameStringByNamehash(namehash, self.allocator) catch null;
     }
 
-    // Helper methods to eliminate chain-specific conditionals
-    pub inline fn getEthRegistry(self: *Indexer, chain: models.Chain) Address {
-        return if (chain == .v1) self.config.v1_contracts.eth_registry else self.config.v2_contracts.l2_eth_registry;
+    // Helper methods to eliminate protocol-specific conditionals
+    pub inline fn getEthRegistry(self: *Indexer, protocol: models.Protocol) Address {
+        // Both V1 and V2 indexers use the same V2 ETH registry address (Sepolia aliases
+        // L1-side and L2-side to one deployment; mainnet has no V2 yet — zero address).
+        _ = protocol;
+        return self.config.v2_contracts.eth_registry;
     }
 
-    pub inline fn getDatastore(self: *Indexer, chain: models.Chain) Address {
-        return if (chain == .v1) self.config.v1_contracts.registry_datastore else self.config.v2_contracts.l2_registry_datastore;
+    /// Migration kind: which V1→V2 controller (if any) handled the transfer.
+    /// Locked vs unlocked matters: locked migrations preserve wrapper fuses;
+    /// unlocked do not. Callers must distinguish to populate `wrapper_fuses` /
+    /// `wrapper_expiry` on the new V2 row.
+    pub const MigrationKind = enum { none, locked, unlocked };
+
+    pub inline fn getMigrationKind(self: *Indexer, addr: Address) MigrationKind {
+        const contracts = self.config.v1_contracts; // same struct backs v1 and v2 config
+        if (!contracts.locked_migration_controller.isZero() and addr.eql(contracts.locked_migration_controller)) return .locked;
+        if (!contracts.unlocked_migration_controller.isZero() and addr.eql(contracts.unlocked_migration_controller)) return .unlocked;
+        return .none;
     }
 
-    /// Check if an address is one of the migration controllers (V1→V2).
-    /// Used to detect that a LabelRegistered event was triggered by migration.
+    /// Boolean wrapper kept for call sites that only need yes/no.
     pub inline fn isMigrationController(self: *Indexer, addr: Address) bool {
-        const contracts = self.config.v1_contracts; // same for v1/v2 config
-        return (!contracts.locked_migration_controller.isZero() and addr.eql(contracts.locked_migration_controller)) or
-            (!contracts.unlocked_migration_controller.isZero() and addr.eql(contracts.unlocked_migration_controller));
+        return self.getMigrationKind(addr) != .none;
     }
 
-    pub inline fn getClient(self: *Indexer, chain: models.Chain) *rpc.Client {
-        _ = chain;
+    pub inline fn getClient(self: *Indexer, protocol: models.Protocol) *rpc.Client {
+        _ = protocol;
         return self.v1_client;
     }
 
     // Event configuration tables for declarative event indexing
     pub const RegistryEventConfig = struct {
         event_hash: Hash,
-        handler: *const fn (*Indexer, models.Chain, rpc.Log) anyerror!void,
+        handler: *const fn (*Indexer, models.Protocol, rpc.Log) anyerror!void,
         name: []const u8,
     };
 
@@ -477,7 +484,7 @@ pub const Indexer = struct {
     // Resolver events have different handler signature (include resolver address)
     pub const ResolverEventConfig = struct {
         event_hash: Hash,
-        handler: *const fn (*Indexer, models.Chain, Address, rpc.Log) anyerror!void,
+        handler: *const fn (*Indexer, models.Protocol, Address, rpc.Log) anyerror!void,
         name: []const u8,
     };
 
@@ -536,6 +543,13 @@ pub const Indexer = struct {
 
     // Reverse Registrar events (0xa58E81fe9b61B5c3fE2AFD33CF304c454AbFc7Cb)
     pub const V1_REVERSE_REGISTRAR_EVENTS = [_]RegistryEventConfig{
+        .{ .event_hash = abi.EventSignatures.reverse_claimed_hash, .handler = handleV1ReverseClaimed, .name = "ReverseClaimed" },
+    };
+
+    // V2 ETH Reverse Registrar events (V2 contract on the V2 chain).
+    // Same `ReverseClaimed(address,bytes32)` shape as V1 — handler is protocol-agnostic
+    // (writes to reverse_records with the protocol passed in).
+    pub const V2_REVERSE_REGISTRAR_EVENTS = [_]RegistryEventConfig{
         .{ .event_hash = abi.EventSignatures.reverse_claimed_hash, .handler = handleV1ReverseClaimed, .name = "ReverseClaimed" },
     };
 
@@ -604,10 +618,10 @@ pub const Indexer = struct {
 
         while (!self.should_stop.load(.acquire)) {
             // Index V1 first (SQLite doesn't support concurrent writes from different threads)
-            try self.indexChain(.v1, self.v1_client);
+            try self.indexProtocol(.v1, self.v1_client);
 
             // Then index V2
-            try self.indexChain(.v2, self.v1_client);
+            try self.indexProtocol(.v2, self.v1_client);
 
             // After first successful sync of both chains, recreate indexes and start webhook workers
             if (!self.initial_sync_complete.load(.acquire)) {
@@ -633,11 +647,11 @@ pub const Indexer = struct {
         self.should_stop.store(true, .release);
     }
 
-    /// Start indexing a single chain (for separate process architecture)
-    pub fn startSingleChain(self: *Indexer, chain: models.Chain) !void {
-        std.log.info("Single-chain indexer starting for {s}...", .{chain.toString()});
+    /// Start indexing a single protocol (for separate process architecture)
+    pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
+        std.log.info("Single-protocol indexer starting for {s}...", .{protocol.toString()});
 
-        const client = self.getClient(chain);
+        const client = self.getClient(protocol);
         var network_health = &self.v1_network_health;
 
         // Drop non-essential indexes for faster bulk inserts during initial sync
@@ -648,7 +662,7 @@ pub const Indexer = struct {
         }
 
         while (!self.should_stop.load(.acquire)) {
-            if (self.indexChain(chain, client)) |_| {
+            if (self.indexProtocol(protocol, client)) |_| {
                 // Success - after first successful sync, recreate indexes and start webhook workers
                 if (!self.initial_sync_complete.load(.acquire)) {
                     // Recreate all indexes before marking sync complete
@@ -663,7 +677,7 @@ pub const Indexer = struct {
                     }
 
                     // Backfill pre-migration names after initial sync completes
-                    if (chain == .v1) {
+                    if (protocol == .v1) {
                         std.log.info("Running pre-migration names backfill...", .{});
                         self.backfillPreMigrationNames() catch |err| {
                             std.log.err("Failed to backfill pre-migration names: {}", .{err});
@@ -686,17 +700,17 @@ pub const Indexer = struct {
             } else |err| {
                 // Handle errors gracefully based on type
                 switch (err) {
-                    error.HttpError, error.NetworkUnreachable, error.ConnectionRefused, error.ConnectionTimedOut, error.ConnectionResetByPeer => {
+                    error.HttpError, error.NetworkUnreachable, error.ConnectionRefused, error.ConnectionTimedOut, error.ConnectionResetByPeer, error.WriteFailed, error.BrokenPipe, error.EndOfStream, error.UnexpectedReadFailure => {
                         // Network error - wait for connection to be restored
-                        std.log.warn("{s} network error detected: {}, waiting for connection...", .{ chain.toString(), err });
+                        std.log.warn("{s} network error detected: {}, waiting for connection...", .{ protocol.toString(), err });
                         network_health.waitForHealthy();
-                        std.log.info("{s} network restored, continuing...", .{chain.toString()});
+                        std.log.info("{s} network restored, continuing...", .{protocol.toString()});
                         // No sleep - continue immediately after network is back
                         continue;
                     },
                     else => {
                         // Other errors (database, parsing, etc) - log and wait briefly
-                        std.log.err("{s} indexing error: {}", .{ chain.toString(), err });
+                        std.log.err("{s} indexing error: {}", .{ protocol.toString(), err });
                         std.Thread.sleep(constants.Timing.error_recovery_delay_ms * std.time.ns_per_ms); // Wait 5s for non-network errors
                     },
                 }
@@ -706,56 +720,52 @@ pub const Indexer = struct {
             std.Thread.sleep(self.config.poll_interval * std.time.ns_per_s);
         }
 
-        std.log.info("{s} indexer stopped.", .{chain.toString()});
+        std.log.info("{s} indexer stopped.", .{protocol.toString()});
     }
 
-    fn indexChain(self: *Indexer, chain: models.Chain, client: *rpc.Client) !void {
-        // Use chain-specific deployment block as fallback for fresh databases
-        const deployment_block = switch (chain) {
-            .v1 => self.config.v1_contracts.l1_deployment_block,
-            .v2 => self.config.v2_contracts.l2_deployment_block,
+    /// True if the stored hash for `block_number` still matches the protocol, or no hash is stored.
+    /// On RPC failure, returns true (skip the reorg check this round) rather than aborting the
+    /// whole sync — reorgs are rare, transient network errors are not, and the next iteration
+    /// will catch a real reorg.
+    fn verifyStoredBlockHash(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, block_number: u64) !bool {
+        const stored = try self.database.getBlockHash(protocol, block_number) orelse return true;
+        const actual = client.getBlockByNumber(block_number, false) catch |err| {
+            std.log.warn("Skipping reorg check for block {d} ({}): assuming hash unchanged this round", .{ block_number, err });
+            return true;
+        };
+        return std.mem.eql(u8, &stored.bytes, &actual.hash.bytes);
+    }
+
+    /// Walk back from `from_block` until a block whose stored hash matches the protocol is found,
+    /// then roll the database back to that block. Returns the block number rolled back to.
+    fn rollbackToLastValidBlock(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64) !u64 {
+        var rollback_to = from_block;
+        while (rollback_to > self.config.start_block) : (rollback_to -= 1) {
+            const stored = try self.database.getBlockHash(protocol, rollback_to);
+            if (stored == null) break; // past stored history — treat as safe
+            const actual = client.getBlockByNumber(rollback_to, false) catch break;
+            if (std.mem.eql(u8, &stored.?.bytes, &actual.hash.bytes)) break;
+        }
+        std.log.warn("Rolling back {s} to block {d}", .{ protocol.toString(), rollback_to });
+        try self.database.rollbackToBlock(protocol, rollback_to);
+        return rollback_to;
+    }
+
+    fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Client) !void {
+        // Use protocol-specific deployment block as fallback for fresh databases
+        const deployment_block = switch (protocol) {
+            .v1 => self.config.v1_contracts.v1_deployment_block,
+            .v2 => self.config.v2_contracts.v2_deployment_block,
         };
 
         // Get last synced block from database (resumability)
-        var last_synced = try self.database.getSyncState(chain) orelse deployment_block;
+        var last_synced = try self.database.getSyncState(protocol) orelse deployment_block;
 
-        // REORG DETECTION: Check if we need to roll back
+        // Entry reorg check: if the last-committed block no longer matches protocol, roll back.
         if (last_synced > deployment_block) {
-            const stored_hash = try self.database.getBlockHash(chain, last_synced);
-
-            if (stored_hash) |expected_hash| {
-                // Fetch current block hash from RPC
-                const actual_block = client.getBlockByNumber(last_synced, false) catch |err| {
-                    std.log.warn("Failed to fetch block {d} for reorg check: {}", .{ last_synced, err });
-                    return err;
-                };
-
-                // Compare hashes - if mismatch, we have a reorg!
-                if (!std.mem.eql(u8, &expected_hash.bytes, &actual_block.hash.bytes)) {
-                    std.log.err("REORG DETECTED at block {d} on {s}!", .{ last_synced, chain.toString() });
-                    std.log.err("Block hash mismatch detected - rolling back", .{});
-
-                    // Find the last valid block by going backwards
-                    var rollback_to = last_synced - 1;
-                    while (rollback_to > self.config.start_block) : (rollback_to -= 1) {
-                        const check_hash = try self.database.getBlockHash(chain, rollback_to);
-                        if (check_hash == null) {
-                            // No stored hash, assume this is safe
-                            break;
-                        }
-
-                        const check_block = client.getBlockByNumber(rollback_to, false) catch break;
-
-                        if (std.mem.eql(u8, &check_hash.?.bytes, &check_block.hash.bytes)) {
-                            // Found matching block
-                            break;
-                        }
-                    }
-
-                    std.log.warn("Rolling back {s} to block {d}", .{ chain.toString(), rollback_to });
-                    try self.database.rollbackToBlock(chain, rollback_to);
-                    last_synced = rollback_to;
-                }
+            if (!try self.verifyStoredBlockHash(protocol, client, last_synced)) {
+                std.log.err("REORG DETECTED at block {d} on {s} (entry check)", .{ last_synced, protocol.toString() });
+                last_synced = try self.rollbackToLastValidBlock(protocol, client, last_synced - 1);
             }
         }
 
@@ -763,7 +773,7 @@ pub const Indexer = struct {
         const current_block = try client.getBlockNumber();
         const target_block = if (self.end_block) |eb| @min(eb, current_block) else current_block;
 
-        // Update status target_block to reflect latest chain block
+        // Update status target_block to reflect latest protocol block
         if (self.indexer_status) |status| {
             status.target_block = target_block;
         }
@@ -782,7 +792,7 @@ pub const Indexer = struct {
         }
 
         const total_blocks = target_block - last_synced;
-        std.log.info("Indexing {s} from block {d} to {d} ({d} blocks)", .{ chain.toString(), last_synced + 1, target_block, total_blocks });
+        std.log.info("Indexing {s} from block {d} to {d} ({d} blocks)", .{ protocol.toString(), last_synced + 1, target_block, total_blocks });
 
         // Index in batches with adaptive batch sizing
         // Starts at configured size, halves on RPC response size errors, grows back on success
@@ -798,6 +808,17 @@ pub const Indexer = struct {
             // Rate limit RPC calls to avoid hitting provider limits
             self.rate_limiter.acquire();
 
+            // Mid-sync reorg guard: once we've committed at least one batch this call, verify
+            // the previous batch's end block still matches protocol before starting the next.
+            // Protects long catch-up passes that would otherwise only notice reorgs at restart.
+            if (from_block > last_synced + 1) {
+                if (!try self.verifyStoredBlockHash(protocol, client, from_block - 1)) {
+                    std.log.err("REORG DETECTED at block {d} on {s} (mid-sync)", .{ from_block - 1, protocol.toString() });
+                    _ = try self.rollbackToLastValidBlock(protocol, client, from_block - 2);
+                    return; // outer loop re-enters indexProtocol, refreshing target_block and resuming
+                }
+            }
+
             // Reset block hash tracking for this batch
             self.resetBlockHashTracking();
 
@@ -805,10 +826,10 @@ pub const Indexer = struct {
             try self.database.beginTransaction();
 
             // Try indexing - on RPC response size errors, rollback, halve batch, retry
-            self.indexBlockRange(chain, client, from_block, to_block) catch |err| {
+            self.indexBlockRange(protocol, client, from_block, to_block) catch |err| {
                 self.database.rollbackTransaction();
 
-                if ((err == error.RpcError or err == error.StdoutStreamTooLong) and current_batch_size > ABSOLUTE_MIN_BATCH) {
+                if ((err == error.RpcError or err == error.StreamTooLong) and current_batch_size > ABSOLUTE_MIN_BATCH) {
                     current_batch_size = @max(ABSOLUTE_MIN_BATCH, current_batch_size / 2);
                     std.log.warn("RPC response too large for blocks {d}-{d}! Reducing batch size to {d} blocks and retrying", .{ from_block, to_block, current_batch_size });
                     continue; // Retry same from_block with smaller batch
@@ -837,14 +858,14 @@ pub const Indexer = struct {
             // Use block hash from processed logs if available (avoids extra RPC call)
             // Fall back to getBlockByNumber only when no logs were processed in this range
             if (self.last_seen_block_hash != null and self.last_seen_block_number == to_block) {
-                try self.database.storeBlockHash(chain, to_block, self.last_seen_block_hash.?, Hash.zero);
+                try self.database.storeBlockHash(protocol, to_block, self.last_seen_block_hash.?, Hash.zero);
             } else {
                 const block_info = try client.getBlockByNumber(to_block, false);
-                try self.database.storeBlockHash(chain, to_block, block_info.hash, block_info.parent_hash);
+                try self.database.storeBlockHash(protocol, to_block, block_info.hash, block_info.parent_hash);
             }
 
             // Update sync state
-            try self.database.setSyncState(chain, to_block);
+            try self.database.setSyncState(protocol, to_block);
             try self.database.commitTransaction();
 
             // Update status if tracking is enabled
@@ -856,11 +877,11 @@ pub const Indexer = struct {
 
             // Periodic checkpoint and memory cleanup
             if (self.blocks_since_checkpoint >= self.config.checkpoint_interval) {
-                std.log.info("Checkpoint: synced {s} to block {d}", .{ chain.toString(), to_block });
+                std.log.info("Checkpoint: synced {s} to block {d}", .{ protocol.toString(), to_block });
                 self.blocks_since_checkpoint = 0;
 
                 // Prune old block hashes (keep last 1000 blocks)
-                try self.database.pruneOldBlockHashes(chain, to_block);
+                try self.database.pruneOldBlockHashes(protocol, to_block);
 
                 // Clear block timestamp cache to prevent memory growth
                 self.clearBlockTimestampCache();
@@ -872,30 +893,32 @@ pub const Indexer = struct {
             from_block = to_block + 1;
         }
 
-        std.log.info("Synced {s} to block {d}", .{ chain.toString(), target_block });
+        std.log.info("Synced {s} to block {d}", .{ protocol.toString(), target_block });
     }
 
-    fn indexBlockRange(self: *Indexer, chain: models.Chain, client: *rpc.Client, from_block: u64, to_block: u64) !void {
+    fn indexBlockRange(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64, to_block: u64) !void {
         // IMPORTANT: Process events in dependency order:
         // 1. First create names (NameRegistered, NewSubname)
         // 2. Then modify names (SubregistryUpdate, ResolverUpdate, Transfer)
         // 3. Then process data dependent on names existing (resolver records)
 
-        // Block range constants from contract config (chain-specific)
+        // Block range constants from contract config (protocol-specific)
         const v1_contracts = self.config.v1_contracts;
         const temp_registrar_start = v1_contracts.temp_registrar_start_block;
 
         // === V1 EVENTS (ENS V1 - Mainnet V1 only) ===
         // Only index V1 events if the block range overlaps with V1 deployment period
         // Skip if entire range is before temp registrar start OR if V2 is deployed and range is entirely after V2
-        const v2_deployment = if (chain == .v1) v1_contracts.l1_deployment_block else self.config.v2_contracts.l2_deployment_block;
+        // V2 deployment block is the same regardless of which protocol (protocol) we're indexing —
+        // this gate asks "are we still in the V1 era?".
+        const v2_deployment = self.config.v2_contracts.v2_deployment_block;
         const should_index_v1 = (temp_registrar_start > 0) and (to_block >= temp_registrar_start) and
             (v2_deployment == 0 or from_block < v2_deployment + 10);
 
         if (should_index_v1) {
             // EFFICIENT: Index all V1 events together per chunk (Registry, Name Wrapper, Base Registrar, Reverse Registrar)
             // This processes each chunk ONCE for all contracts, instead of reprocessing chunks per contract
-            try self.indexAllV1Events(chain, client, from_block, to_block);
+            try self.indexAllV1Events(protocol, client, from_block, to_block);
         }
 
         // === V2 EVENTS (ENS V2) ===
@@ -905,31 +928,34 @@ pub const Indexer = struct {
         if (should_index_v2) {
             // Phase 1: Fetch EthRegistry + ETHRegistrar + Datastore events in a single batch RPC call
             // (1 HTTP request instead of 3, eliminates ~100ms of inter-batch sleeps)
-            try self.indexPhase1V2Events(chain, client, from_block, to_block);
+            try self.indexPhase1V2Events(protocol, client, from_block, to_block);
 
             // Phase 2: Subregistry events (depends on Phase 1 discovering subregistries)
-            try self.indexSubregistryEvents(chain, client, from_block, to_block);
-            try self.processRemainingOrphans(chain);
+            try self.indexSubregistryEvents(protocol, client, from_block, to_block);
+            try self.processRemainingOrphans(protocol);
 
             // Phase 3: Transfer + Observer events (depends on names existing)
             // Note: V1→V2 migration is detected in handleLabelRegistered via sender address
-            try self.indexTransferEvents(chain, client, from_block, to_block);
-            try self.indexTokenObserverEvents(chain, client, from_block, to_block);
+            try self.indexTransferEvents(protocol, client, from_block, to_block);
+            try self.indexTokenObserverEvents(protocol, client, from_block, to_block);
 
             // Phase 4: Resolver events (depends on names + resolvers being set)
-            try self.indexResolverEvents(chain, client, from_block, to_block);
+            try self.indexResolverEvents(protocol, client, from_block, to_block);
+
+            // Phase 5: V2 reverse registrar events. Independent of names — populates
+            // the reverse_records table so primary-name lookups don't have to scan
+            // the events feed.
+            try self.indexV2ReverseRegistrarEvents(protocol, client, from_block, to_block);
         }
     }
 
     // V2 event fetchers (extracted to event_fetchers.zig)
     pub const indexPhase1V2Events = event_fetchers.indexPhase1V2Events;
-    pub const indexDatastoreEvents = event_fetchers.indexDatastoreEvents;
-    pub const indexEthRegistryEvents = event_fetchers.indexEthRegistryEvents;
-    pub const indexETHRegistrarEvents = event_fetchers.indexETHRegistrarEvents;
     pub const indexSubregistryEvents = event_fetchers.indexSubregistryEvents;
     pub const indexTransferEvents = event_fetchers.indexTransferEvents;
     pub const indexTokenObserverEvents = event_fetchers.indexTokenObserverEvents;
     pub const indexResolverEvents = event_fetchers.indexResolverEvents;
+    pub const indexV2ReverseRegistrarEvents = event_fetchers.indexV2ReverseRegistrarEvents;
 
     // V2 registry handlers (extracted to handlers_v2_registry.zig)
     pub const handleSubregistryUpdate = handlers_v2_registry.handleSubregistryUpdate;
@@ -970,7 +996,7 @@ pub const Indexer = struct {
     pub const decodeDnsWireFormat = handlers_v2_resolver.decodeDnsWireFormat;
     pub const handleResolverEACRolesChanged = handlers_v2_resolver.handleResolverEACRolesChanged;
 
-    // V2 chain sync handlers (extracted to handlers_v2_chain.zig)
+    // V2 protocol sync handlers (extracted to handlers_v2_chain.zig)
     pub const handleTokenObserverSet = handlers_v2_chain.handleTokenObserverSet;
 
     // V1 event handlers (extracted to handlers_v1.zig)

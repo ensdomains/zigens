@@ -8,16 +8,15 @@ const models = common.models;
 const Address = common.Address;
 const parser = common.parser;
 const pagination = common.pagination;
-const builders = common.builders;
+const builders = @import("../builders/builders.zig");
 const loaders = common.loaders;
-const NestedContext = common.NestedContext;
+const NestedContext = builders.NestedContext;
 
 fn mapRegistrationOrderBy(order_by: ?[]const u8) db.EventSortField {
     const field_name = order_by orelse return .block_number;
     if (std.mem.eql(u8, field_name, "registrationDate")) return .timestamp;
     if (std.mem.eql(u8, field_name, "name")) return .name;
-    // expiryDate lives in JSON, can't sort in SQL — keep default
-    if (std.mem.eql(u8, field_name, "expiryDate")) return .block_number;
+    if (std.mem.eql(u8, field_name, "expiryDate")) return .expiry;
     return .block_number;
 }
 
@@ -48,58 +47,42 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
     var filter_expiry_gte: ?i64 = null;
     var filter_expiry_lt: ?i64 = null;
     var filter_expiry_lte: ?i64 = null;
-    var filter_chain: ?models.Chain = null;
+    var filter_chain: ?models.Protocol = null;
 
-    for (field.arguments) |arg| {
-        if (std.mem.eql(u8, arg.name, "where")) {
-            if (arg.value == .object) {
-                for (arg.value.object) |filter_arg| {
-                    if (std.mem.eql(u8, filter_arg.name, "registrant")) {
-                        if (filter_arg.value == .string) {
-                            filter_registrant = filter_arg.value.string;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "chain")) {
-                        if (filter_arg.value == .string) {
-                            filter_chain = models.Chain.fromString(filter_arg.value.string) catch null;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "expiryDate_gt")) {
-                        if (filter_arg.value == .int) {
-                            filter_expiry_gt = filter_arg.value.int;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "expiryDate_lt")) {
-                        if (filter_arg.value == .int) {
-                            filter_expiry_lt = filter_arg.value.int;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "expiryDate_gte")) {
-                        if (filter_arg.value == .int) {
-                            filter_expiry_gte = filter_arg.value.int;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "expiryDate_lte")) {
-                        if (filter_arg.value == .int) {
-                            filter_expiry_lte = filter_arg.value.int;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "registrant_in")) {
-                        if (filter_arg.value == .list) {
-                            var addresses: std.ArrayList([]const u8) = .{};
-                            defer addresses.deinit(allocator);
-                            for (filter_arg.value.list) |item| {
-                                if (item == .string) {
-                                    try addresses.append(allocator, item.string);
-                                }
-                            }
-                            filter_registrant_in = try addresses.toOwnedSlice(allocator);
-                        }
+    if (common.getObjectArg(field, "where")) |where_args| {
+        for (where_args) |a| {
+            // protocol: string → enum (special-cased)
+            // Surface invalid protocol as an error so a typo doesn't silently expand
+            // the result set across all chains.
+            if (std.mem.eql(u8, a.name, "protocol") and a.value == .string) {
+                filter_chain = models.Protocol.fromString(a.value.string) catch return error.InvalidProtocol;
+                continue;
+            }
+            // registrant_in: list-of-string — allocates
+            if (std.mem.eql(u8, a.name, "registrant_in") and a.value == .list) {
+                var addresses: std.ArrayList([]const u8) = .{};
+                defer addresses.deinit(allocator);
+                for (a.value.list) |item| {
+                    if (item == .string) {
+                        try addresses.append(allocator, item.string);
                     }
                 }
+                filter_registrant_in = try addresses.toOwnedSlice(allocator);
+                continue;
             }
-            break;
+
+            _ = common.matchStringArg(a, "registrant", &filter_registrant) or
+                common.matchIntArg(a, "expiryDate_gt", &filter_expiry_gt) or
+                common.matchIntArg(a, "expiryDate_gte", &filter_expiry_gte) or
+                common.matchIntArg(a, "expiryDate_lt", &filter_expiry_lt) or
+                common.matchIntArg(a, "expiryDate_lte", &filter_expiry_lte);
         }
     }
     defer if (filter_registrant_in) |regs| allocator.free(regs);
 
     // Build registration filter
     const reg_filter = db.RegistrationFilterOptions{
-        .chain = filter_chain,
+        .protocol = filter_chain,
         .registrant = filter_registrant,
         .registrant_in = filter_registrant_in,
         .expiry_gt = filter_expiry_gt,
@@ -107,6 +90,23 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
         .expiry_lt = filter_expiry_lt,
         .expiry_lte = filter_expiry_lte,
     };
+
+    // Check which top-level fields are requested (for totalCount-only fast path)
+    var wants_edges = false;
+    var wants_page_info = false;
+    var wants_total_count = false;
+    for (field.selections) |*sel| {
+        if (std.mem.eql(u8, sel.name, "edges")) wants_edges = true;
+        if (std.mem.eql(u8, sel.name, "pageInfo")) wants_page_info = true;
+        if (std.mem.eql(u8, sel.name, "totalCount")) wants_total_count = true;
+    }
+
+    // Fast path: only totalCount requested — skip row fetching entirely
+    if (wants_total_count and !wants_edges and !wants_page_info) {
+        const count = try database.getRegistrationCount(reg_filter);
+        const result = try std.fmt.allocPrint(allocator, "{{\"totalCount\":{d}}}", .{count});
+        return parser.FieldResult{ .json = result };
+    }
 
     // Extract node selections from query
     var node_selections: []const parser.Field = &[_]parser.Field{};
@@ -122,34 +122,54 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
         }
     }
 
-    // Parse orderBy and orderDirection for connection
-    var order_by: ?[]const u8 = null;
-    var order_direction: ?[]const u8 = null;
-    for (field.arguments) |arg| {
-        if (std.mem.eql(u8, arg.name, "orderBy")) {
-            if (arg.value == .string) order_by = arg.value.string;
-        } else if (std.mem.eql(u8, arg.name, "orderDirection")) {
-            if (arg.value == .string) order_direction = arg.value.string;
-        }
-    }
+    const order_by = parser.getStringArg(field, "orderBy", null);
     const sort_field = mapRegistrationOrderBy(order_by);
 
-    // Default order: desc (newest first) when no orderDirection specified, matching original behavior
-    const order_dir_str = order_direction orelse "desc";
+    // Default order: desc (newest first) when no orderDirection specified
+    const base_dir = common.parseOrderDirection(field, db.EventOrderDir, .desc);
 
     // Fetch one extra item to determine hasNextPage/hasPreviousPage
     const fetch_limit = params.limit + 1;
 
     // Combine pagination direction with user-requested order
-    const base_dir: db.EventOrderDir = if (std.mem.eql(u8, order_dir_str, "desc")) .desc else .asc;
     const order_dir: db.EventOrderDir = if (params.direction == .backward)
         (if (base_dir == .desc) .asc else .desc)
     else
         base_dir;
 
+    // Convert the cursor (tx_hash-log_index) into a SKIP offset. The count must apply the
+    // SAME filters as the row query — registration types AND any registrant/expiry filters
+    // — otherwise pagination skips too many rows. Build an EventFilterOptions that mirrors
+    // what `getRegistrations` builds internally.
+    var skip: u32 = 0;
+    if (params.cursor) |c| {
+        const decoded = try pagination.CursorCodec.decodeString(allocator, c);
+        defer allocator.free(decoded);
+        const sep = std.mem.lastIndexOfScalar(u8, decoded, '-') orelse return error.InvalidCursor;
+        const tx_hash = decoded[0..sep];
+        const log_index = std.fmt.parseInt(u32, decoded[sep + 1 ..], 10) catch return error.InvalidCursor;
+        const reg_types = [_][]const u8{
+            models.EventType.name_registered.toString(),
+            models.EventType.label_registered.toString(),
+        };
+        const cursor_filter = db.EventFilterOptions{
+            .event_types = &reg_types,
+            .protocol = filter_chain,
+            .data_json_owner = filter_registrant,
+            .data_json_owners = filter_registrant_in,
+            .expiry_gt = filter_expiry_gt,
+            .expiry_gte = filter_expiry_gte,
+            .expiry_lt = filter_expiry_lt,
+            .expiry_lte = filter_expiry_lte,
+        };
+        const events_before = database.countEventsBeforeCursor(tx_hash, log_index, order_dir, cursor_filter) catch 0;
+        skip = events_before +| 1; // +1 to skip past the cursor row itself
+    }
+
     // Get registration events from database with filters applied at DB level
     var fetch_filter = reg_filter;
     fetch_filter.limit = @intCast(fetch_limit);
+    fetch_filter.skip = skip;
     fetch_filter.order_dir = order_dir;
     fetch_filter.sort_field = sort_field;
 
@@ -161,7 +181,9 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
         allocator.free(events);
     }
 
-    // Determine actual items to return
+    // We fetched `params.limit + 1` to detect a trailing page; if we actually got
+    // more than `limit`, there's more data in the pagination direction.
+    const has_more = events.len > params.limit;
     const actual_items = @min(events.len, params.limit);
 
     // For backward pagination, reverse the results to maintain proper edge order
@@ -212,14 +234,7 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
         };
     }
 
-    // Only compute total count when requested in the GraphQL selection
-    var wants_total_count = false;
-    for (field.selections) |*sel| {
-        if (std.mem.eql(u8, sel.name, "totalCount")) {
-            wants_total_count = true;
-            break;
-        }
-    }
+    // Only compute total count when requested (reuse wants_total_count from earlier scan)
     const total_count: ?usize = if (wants_total_count)
         try database.getRegistrationCount(reg_filter)
     else
@@ -231,6 +246,7 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
         allocator,
         wrapper_items,
         params,
+        has_more,
         getId,
         total_count,
     );
@@ -300,9 +316,9 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
     const allocator = ctx.allocator;
 
-    // Extract arguments
-    const first = parser.getIntArg(field, "first", 100) orelse 100;
-    const skip = parser.getIntArg(field, "skip", 0) orelse 0;
+    const page = try common.parsePagination(field, 100);
+    const first = page.first;
+    const skip = page.skip;
 
     // Parse filter if provided
     var filter_registrant: ?[]const u8 = null;
@@ -311,86 +327,45 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
     var filter_expiry_gte: ?i64 = null;
     var filter_expiry_lt: ?i64 = null;
     var filter_expiry_lte: ?i64 = null;
-    var filter_chain: ?models.Chain = null;
+    var filter_chain: ?models.Protocol = null;
 
-    // Look for "where" argument
-    for (field.arguments) |arg| {
-        if (std.mem.eql(u8, arg.name, "where")) {
-            if (arg.value == .object) {
-                for (arg.value.object) |filter_arg| {
-                    if (std.mem.eql(u8, filter_arg.name, "registrant")) {
-                        if (filter_arg.value == .string) {
-                            filter_registrant = filter_arg.value.string;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "chain")) {
-                        if (filter_arg.value == .string) {
-                            filter_chain = models.Chain.fromString(filter_arg.value.string) catch null;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "expiryDate_gt")) {
-                        if (filter_arg.value == .int) {
-                            filter_expiry_gt = filter_arg.value.int;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "expiryDate_lt")) {
-                        if (filter_arg.value == .int) {
-                            filter_expiry_lt = filter_arg.value.int;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "registrant_in")) {
-                        if (filter_arg.value == .list) {
-                            var addresses: std.ArrayList([]const u8) = .{};
-                            defer addresses.deinit(allocator);
-                            for (filter_arg.value.list) |item| {
-                                if (item == .string) {
-                                    try addresses.append(allocator, item.string);
-                                }
-                            }
-                            filter_registrant_in = try addresses.toOwnedSlice(allocator);
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "expiryDate_gte")) {
-                        if (filter_arg.value == .int) {
-                            filter_expiry_gte = filter_arg.value.int;
-                        }
-                    } else if (std.mem.eql(u8, filter_arg.name, "expiryDate_lte")) {
-                        if (filter_arg.value == .int) {
-                            filter_expiry_lte = filter_arg.value.int;
-                        }
+    if (common.getObjectArg(field, "where")) |where_args| {
+        for (where_args) |a| {
+            if (std.mem.eql(u8, a.name, "protocol") and a.value == .string) {
+                filter_chain = models.Protocol.fromString(a.value.string) catch return error.InvalidProtocol;
+                continue;
+            }
+            if (std.mem.eql(u8, a.name, "registrant_in") and a.value == .list) {
+                var addresses: std.ArrayList([]const u8) = .{};
+                defer addresses.deinit(allocator);
+                for (a.value.list) |item| {
+                    if (item == .string) {
+                        try addresses.append(allocator, item.string);
                     }
                 }
+                filter_registrant_in = try addresses.toOwnedSlice(allocator);
+                continue;
             }
-            break;
+
+            _ = common.matchStringArg(a, "registrant", &filter_registrant) or
+                common.matchIntArg(a, "expiryDate_gt", &filter_expiry_gt) or
+                common.matchIntArg(a, "expiryDate_gte", &filter_expiry_gte) or
+                common.matchIntArg(a, "expiryDate_lt", &filter_expiry_lt) or
+                common.matchIntArg(a, "expiryDate_lte", &filter_expiry_lte);
         }
     }
     defer if (filter_registrant_in) |regs| allocator.free(regs);
 
-    // Parse orderBy and orderDirection
-    var order_by: ?[]const u8 = null;
-    var order_direction: []const u8 = "asc"; // default
-
-    for (field.arguments) |arg| {
-        if (std.mem.eql(u8, arg.name, "orderBy")) {
-            if (arg.value == .string) {
-                order_by = arg.value.string;
-            }
-        } else if (std.mem.eql(u8, arg.name, "orderDirection")) {
-            if (arg.value == .string) {
-                order_direction = arg.value.string;
-            }
-        }
-    }
-
-    // Map GraphQL orderBy to SQL sort field
+    const order_by = parser.getStringArg(field, "orderBy", null);
     const sort_field = mapRegistrationOrderBy(order_by);
-    const order_dir: db.EventOrderDir = if (std.mem.eql(u8, order_direction, "desc")) .desc else .asc;
+    const order_dir = common.parseOrderDirection(field, db.EventOrderDir, .asc);
 
-    // For expiryDate sort, we need in-memory fallback since expiry is in JSON
-    const is_expiry_sort = if (order_by) |ob| std.mem.eql(u8, ob, "expiryDate") else false;
-
-    // All filters are pushed to the DB level
-    // For expiryDate sort, fetch all matching events for in-memory sort
-    // For other sorts, fetch enough items to cover skip + first for offset pagination
-    const fetch_limit: u32 = if (is_expiry_sort) 10000 else @intCast(first + skip);
+    // All sorts (including expiryDate) are now pushed to SQLite via EventSortField.expiry
+    // (uses json_extract). Fetch only `skip + first` rows; no in-memory sort.
+    const fetch_limit: u32 = @intCast(first + skip);
 
     const events_result = try database.getRegistrations(.{
-        .chain = filter_chain,
+        .protocol = filter_chain,
         .registrant = filter_registrant,
         .registrant_in = filter_registrant_in,
         .limit = fetch_limit,
@@ -408,68 +383,7 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
         allocator.free(events_result);
     }
 
-    // For expiryDate sort, apply in-memory sort since expiry is stored in JSON
-    if (is_expiry_sort) {
-        const FilteredEvent = struct {
-            event: *models.Event,
-            expiry: i64,
-        };
-
-        var filtered_events: std.ArrayList(FilteredEvent) = .{};
-        defer filtered_events.deinit(allocator);
-
-        for (events_result) |*event| {
-            if (event.name == null) continue;
-
-            var event_expiry: i64 = 0;
-            const parsed = std.json.parseFromSlice(std.json.Value, allocator, event.data, .{}) catch continue;
-            defer parsed.deinit();
-
-            if (parsed.value.object.get("expiration")) |expiration_val| {
-                if (expiration_val == .integer) {
-                    event_expiry = expiration_val.integer;
-                }
-            }
-
-            try filtered_events.append(allocator, .{
-                .event = event,
-                .expiry = event_expiry,
-            });
-        }
-
-        const ascending = std.mem.eql(u8, order_direction, "asc");
-        std.mem.sort(FilteredEvent, filtered_events.items, ascending, struct {
-            fn lessThan(asc: bool, a: FilteredEvent, b: FilteredEvent) bool {
-                return if (asc) a.expiry < b.expiry else a.expiry > b.expiry;
-            }
-        }.lessThan);
-
-        // Build JSON from sorted events, applying skip
-        var json: std.ArrayList(u8) = .{};
-        defer json.deinit(allocator);
-
-        try json.appendSlice(allocator, "[");
-        const start_idx: usize = @min(@as(usize, @intCast(skip)), filtered_events.items.len);
-        const end_idx: usize = @min(start_idx + @as(usize, @intCast(first)), filtered_events.items.len);
-        for (filtered_events.items[start_idx..end_idx], 0..) |filtered, i| {
-            if (i > 0) try json.appendSlice(allocator, ",");
-
-            const reg_json = try builders.buildRegistrationJson(filtered.event, field.selections, .{
-                .database = database,
-                .depth = 0,
-                .allocator = allocator,
-                .loaders = ctx.loaders,
-            });
-            defer allocator.free(reg_json);
-            try json.appendSlice(allocator, reg_json);
-        }
-        try json.appendSlice(allocator, "]");
-
-        const result_json = try allocator.dupe(u8, json.items);
-        return parser.FieldResult{ .json = result_json };
-    }
-
-    // For non-expiryDate sorts, data is already sorted by SQL
+    // Data is sorted by SQL for all paths now
     // Build JSON, applying skip
     var json: std.ArrayList(u8) = .{};
     defer json.deinit(allocator);

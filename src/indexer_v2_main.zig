@@ -30,7 +30,7 @@ pub fn main() !void {
     std.log.info("ENSv2 Indexer starting...", .{});
     std.log.info("Network: {s}", .{cfg.network.toString()});
     std.log.info("RPC: [CONFIGURED]", .{});
-    std.log.info("V2 Deployment block: {d}", .{cfg.v2_contracts.l2_deployment_block});
+    std.log.info("V2 Deployment block: {d}", .{cfg.v2_contracts.v2_deployment_block});
     std.log.info("Batch size: {d}", .{cfg.batch_size});
     std.log.info("Rate limit: {d} req/s", .{cfg.rate_limit_per_second});
 
@@ -50,13 +50,13 @@ pub fn main() !void {
     std.log.info("Database integrity check passed", .{});
 
     // Initialize indexer with only V2 client
-    var idx = try indexer.Indexer.initSingleChain(allocator, cfg, &database, .v2, null);
+    var idx = try indexer.Indexer.initSingleProtocol(allocator, cfg, &database, .v2, null);
     defer idx.deinit();
 
     std.log.info("V2 Indexer started - indexing blocks...", .{});
 
     // Run indexer
-    try idx.startSingleChain(.v2);
+    try idx.startSingleProtocol(.v2);
 }
 
 test {

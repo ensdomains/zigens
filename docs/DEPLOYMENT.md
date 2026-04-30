@@ -201,7 +201,7 @@ VALUES (
 ```json
 {
   "event_type": "NameRegistered",
-  "chain": "l2",
+  "chain": "v2",
   "block_number": 12345678,
   "tx_hash": "0x...",
   "contract_address": "0x...",

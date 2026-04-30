@@ -8,8 +8,8 @@ const Indexer = @import("../indexer.zig").Indexer;
 
 /// Handle Temporary Registrar HashRegistered event
 /// HashRegistered(bytes32 indexed hash, address indexed owner, uint256 value, uint256 registrationDate)
-pub fn handleTempHashRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
-    _ = chain;
+pub fn handleTempHashRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
+    _ = protocol;
 
     // Validate topics
     if (log.topics.len < 3) {
@@ -72,8 +72,8 @@ pub fn handleTempHashRegistered(self: *Indexer, chain: models.Chain, log: rpc.Lo
 
 /// Handle Temporary Registrar AuctionStarted event
 /// AuctionStarted(bytes32 indexed hash, uint256 registrationDate)
-pub fn handleTempAuctionStarted(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
-    _ = chain;
+pub fn handleTempAuctionStarted(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
+    _ = protocol;
 
     if (log.topics.len < 2) {
         std.log.warn("Temp AuctionStarted event has unexpected topic count: {d}, skipping", .{log.topics.len});
@@ -114,8 +114,8 @@ pub fn handleTempAuctionStarted(self: *Indexer, chain: models.Chain, log: rpc.Lo
 
 /// Handle Temporary Registrar NewBid event
 /// NewBid(bytes32 indexed hash, address indexed bidder, uint256 deposit)
-pub fn handleTempNewBid(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
-    _ = chain;
+pub fn handleTempNewBid(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
+    _ = protocol;
 
     if (log.topics.len < 3) {
         std.log.warn("Temp NewBid event has unexpected topic count: {d}, skipping", .{log.topics.len});
@@ -173,8 +173,8 @@ pub fn handleTempNewBid(self: *Indexer, chain: models.Chain, log: rpc.Log) !void
 
 /// Handle Temporary Registrar BidRevealed event
 /// BidRevealed(bytes32 indexed hash, address indexed owner, uint256 value, uint8 status)
-pub fn handleTempBidRevealed(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
-    _ = chain;
+pub fn handleTempBidRevealed(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
+    _ = protocol;
 
     if (log.topics.len < 3) {
         std.log.warn("Temp BidRevealed event has unexpected topic count: {d}, skipping", .{log.topics.len});
@@ -229,8 +229,8 @@ pub fn handleTempBidRevealed(self: *Indexer, chain: models.Chain, log: rpc.Log) 
 
 /// Handle Temporary Registrar HashReleased event
 /// HashReleased(bytes32 indexed hash, uint256 value)
-pub fn handleTempHashReleased(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
-    _ = chain;
+pub fn handleTempHashReleased(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
+    _ = protocol;
 
     if (log.topics.len < 2) {
         std.log.warn("Temp HashReleased event has unexpected topic count: {d}, skipping", .{log.topics.len});
@@ -275,8 +275,8 @@ pub fn handleTempHashReleased(self: *Indexer, chain: models.Chain, log: rpc.Log)
 
 /// Handle Temporary Registrar HashInvalidated event
 /// HashInvalidated(bytes32 indexed hash, string indexed name, uint256 value, uint256 registrationDate)
-pub fn handleTempHashInvalidated(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
-    _ = chain;
+pub fn handleTempHashInvalidated(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
+    _ = protocol;
 
     if (log.topics.len < 3) {
         std.log.warn("Temp HashInvalidated event has unexpected topic count: {d}, skipping", .{log.topics.len});

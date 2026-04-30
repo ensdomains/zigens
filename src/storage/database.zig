@@ -365,7 +365,7 @@ pub const Database = struct {
                 try self.exec(
                     \\CREATE TABLE IF NOT EXISTS eac_roles_new (
                     \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    \\  chain TEXT NOT NULL,
+                    \\  protocol TEXT NOT NULL,
                     \\  resource TEXT NOT NULL,
                     \\  account TEXT NOT NULL,
                     \\  role_bitmap TEXT NOT NULL,
@@ -374,23 +374,23 @@ pub const Database = struct {
                     \\  log_index INTEGER NOT NULL,
                     \\  timestamp INTEGER NOT NULL,
                     \\  contract_address TEXT NOT NULL DEFAULT '',
-                    \\  UNIQUE(chain, resource, account, contract_address)
+                    \\  UNIQUE(protocol, resource, account, contract_address)
                     \\)
                 );
-                try self.exec("INSERT OR IGNORE INTO eac_roles_new SELECT id, chain, resource, account, role_bitmap, block_number, transaction_hash, log_index, timestamp, contract_address FROM eac_roles");
+                try self.exec("INSERT OR IGNORE INTO eac_roles_new SELECT id, protocol, resource, account, role_bitmap, block_number, transaction_hash, log_index, timestamp, contract_address FROM eac_roles");
                 try self.exec("DROP TABLE eac_roles");
                 try self.exec("ALTER TABLE eac_roles_new RENAME TO eac_roles");
-                try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_chain ON eac_roles(chain)");
-                try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_resource ON eac_roles(chain, resource)");
-                try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_account ON eac_roles(chain, account)");
-                try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_block ON eac_roles(chain, block_number)");
-                try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_contract ON eac_roles(chain, contract_address)");
+                try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_protocol ON eac_roles(protocol)");
+                try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_resource ON eac_roles(protocol, resource)");
+                try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_account ON eac_roles(protocol, account)");
+                try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_block ON eac_roles(protocol, block_number)");
+                try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_contract ON eac_roles(protocol, contract_address)");
 
                 // Recreate approvals with registry in unique constraint
                 try self.exec(
                     \\CREATE TABLE IF NOT EXISTS approvals_new (
                     \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    \\  chain TEXT NOT NULL,
+                    \\  protocol TEXT NOT NULL,
                     \\  token_id TEXT NOT NULL,
                     \\  owner TEXT NOT NULL,
                     \\  approved TEXT NOT NULL,
@@ -398,13 +398,13 @@ pub const Database = struct {
                     \\  tx_hash TEXT NOT NULL,
                     \\  timestamp INTEGER NOT NULL,
                     \\  registry TEXT NOT NULL DEFAULT '',
-                    \\  UNIQUE(chain, token_id, registry)
+                    \\  UNIQUE(protocol, token_id, registry)
                     \\)
                 );
-                try self.exec("INSERT OR IGNORE INTO approvals_new SELECT id, chain, token_id, owner, approved, block_number, tx_hash, timestamp, '' FROM approvals");
+                try self.exec("INSERT OR IGNORE INTO approvals_new SELECT id, protocol, token_id, owner, approved, block_number, tx_hash, timestamp, '' FROM approvals");
                 try self.exec("DROP TABLE approvals");
                 try self.exec("ALTER TABLE approvals_new RENAME TO approvals");
-                try self.exec("CREATE INDEX IF NOT EXISTS idx_approvals_chain ON approvals(chain)");
+                try self.exec("CREATE INDEX IF NOT EXISTS idx_approvals_protocol ON approvals(protocol)");
                 try self.exec("CREATE INDEX IF NOT EXISTS idx_approvals_token_id ON approvals(token_id)");
                 try self.exec("CREATE INDEX IF NOT EXISTS idx_approvals_owner ON approvals(owner)");
 
@@ -428,17 +428,17 @@ pub const Database = struct {
         std.log.info("Dropping non-essential indexes for bulk sync...", .{});
 
         // Events table: drop all 8 indexes (none needed during sync)
-        try self.exec("DROP INDEX IF EXISTS idx_events_chain");
+        try self.exec("DROP INDEX IF EXISTS idx_events_protocol");
         try self.exec("DROP INDEX IF EXISTS idx_events_type");
         try self.exec("DROP INDEX IF EXISTS idx_events_block");
         try self.exec("DROP INDEX IF EXISTS idx_events_name");
         try self.exec("DROP INDEX IF EXISTS idx_events_namehash");
         try self.exec("DROP INDEX IF EXISTS idx_events_contract_address");
-        try self.exec("DROP INDEX IF EXISTS idx_events_chain_type_block");
+        try self.exec("DROP INDEX IF EXISTS idx_events_protocol_type_block");
         try self.exec("DROP INDEX IF EXISTS idx_events_block_log");
 
         // Names table: drop 13 of 16 indexes (keep namehash, token_id, canonical_id)
-        try self.exec("DROP INDEX IF EXISTS idx_names_chain");
+        try self.exec("DROP INDEX IF EXISTS idx_names_protocol");
         try self.exec("DROP INDEX IF EXISTS idx_names_name");
         try self.exec("DROP INDEX IF EXISTS idx_names_label");
         try self.exec("DROP INDEX IF EXISTS idx_names_owner");
@@ -454,7 +454,7 @@ pub const Database = struct {
         try self.exec("DROP INDEX IF EXISTS idx_names_wrapper_expiry");
 
         // Resolvers table: drop all 2 indexes (write-only during sync)
-        try self.exec("DROP INDEX IF EXISTS idx_resolvers_chain");
+        try self.exec("DROP INDEX IF EXISTS idx_resolvers_protocol");
         try self.exec("DROP INDEX IF EXISTS idx_resolvers_namehash");
 
         // Resolver addresses: drop all 3 indexes
@@ -481,27 +481,27 @@ pub const Database = struct {
         try self.exec("DROP INDEX IF EXISTS idx_resolver_interfaces_namehash");
 
         // Resolver metadata & approvals (ENSIP-16): drop all 6
-        try self.exec("DROP INDEX IF EXISTS idx_resolver_metadata_chain");
+        try self.exec("DROP INDEX IF EXISTS idx_resolver_metadata_protocol");
         try self.exec("DROP INDEX IF EXISTS idx_resolver_metadata_resolver");
-        try self.exec("DROP INDEX IF EXISTS idx_resolver_approvals_chain");
+        try self.exec("DROP INDEX IF EXISTS idx_resolver_approvals_protocol");
         try self.exec("DROP INDEX IF EXISTS idx_resolver_approvals_namehash");
         try self.exec("DROP INDEX IF EXISTS idx_resolver_approvals_delegate");
         try self.exec("DROP INDEX IF EXISTS idx_resolver_approvals_context");
 
         // Approvals table: drop all 3 indexes
-        try self.exec("DROP INDEX IF EXISTS idx_approvals_chain");
+        try self.exec("DROP INDEX IF EXISTS idx_approvals_protocol");
         try self.exec("DROP INDEX IF EXISTS idx_approvals_token_id");
         try self.exec("DROP INDEX IF EXISTS idx_approvals_owner");
 
         // Name history: drop all 5 indexes
         try self.exec("DROP INDEX IF EXISTS idx_name_history_namehash");
-        try self.exec("DROP INDEX IF EXISTS idx_name_history_chain_name");
+        try self.exec("DROP INDEX IF EXISTS idx_name_history_protocol_name");
         try self.exec("DROP INDEX IF EXISTS idx_name_history_change_type");
         try self.exec("DROP INDEX IF EXISTS idx_name_history_block");
         try self.exec("DROP INDEX IF EXISTS idx_name_history_timestamp");
 
         // EAC roles: drop all 5 indexes
-        try self.exec("DROP INDEX IF EXISTS idx_eac_roles_chain");
+        try self.exec("DROP INDEX IF EXISTS idx_eac_roles_protocol");
         try self.exec("DROP INDEX IF EXISTS idx_eac_roles_resource");
         try self.exec("DROP INDEX IF EXISTS idx_eac_roles_account");
         try self.exec("DROP INDEX IF EXISTS idx_eac_roles_block");
@@ -524,14 +524,9 @@ pub const Database = struct {
         try self.exec("DROP INDEX IF EXISTS idx_temp_invalidations_name");
         try self.exec("DROP INDEX IF EXISTS idx_temp_invalidations_block");
         try self.exec("DROP INDEX IF EXISTS idx_temp_pre_migration_label_hash");
-        try self.exec("DROP INDEX IF EXISTS idx_temp_pre_migration_chain");
+        try self.exec("DROP INDEX IF EXISTS idx_temp_pre_migration_protocol");
 
-        // Bridge events: drop all 8 indexes
-        try self.exec("DROP INDEX IF EXISTS idx_migrations_token_id");
-        try self.exec("DROP INDEX IF EXISTS idx_migrations_block");
-        try self.exec("DROP INDEX IF EXISTS idx_migrations_direction");
-        try self.exec("DROP INDEX IF EXISTS idx_renewal_syncs_token_id");
-        try self.exec("DROP INDEX IF EXISTS idx_renewal_syncs_block");
+        // Token observers (V2 Registry) indexes
         try self.exec("DROP INDEX IF EXISTS idx_token_observers_token_id");
         try self.exec("DROP INDEX IF EXISTS idx_token_observers_block");
         try self.exec("DROP INDEX IF EXISTS idx_token_observers_observer");
@@ -553,24 +548,24 @@ pub const Database = struct {
         std.log.info("Recreating indexes after bulk sync...", .{});
 
         // Events table indexes (8)
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_events_chain ON events(chain)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_events_protocol ON events(protocol)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_events_block ON events(block_number)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_events_name ON events(name)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_events_namehash ON events(namehash)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_events_contract_address ON events(contract_address)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_events_chain_type_block ON events(chain, event_type, block_number)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_events_protocol_type_block ON events(protocol, event_type, block_number)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_events_block_log ON events(block_number, log_index)");
 
         // Names table indexes (14)
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_names_chain ON names(chain)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_names_protocol ON names(protocol)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_names_name ON names(name)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_names_label ON names(label)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_names_owner ON names(owner)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_names_expiry ON names(expiry)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_names_registry ON names(chain, registry)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_names_resolver ON names(chain, resolver)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_names_created_block ON names(chain, created_block)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_names_registry ON names(protocol, registry)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_names_resolver ON names(protocol, resolver)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_names_created_block ON names(protocol, created_block)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_names_registrant ON names(registrant)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_names_v1_label_hash ON names(v1_label_hash)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_names_parent_namehash ON names(parent_namehash)");
@@ -579,24 +574,24 @@ pub const Database = struct {
         try self.exec("CREATE INDEX IF NOT EXISTS idx_names_wrapper_expiry ON names(wrapper_expiry)");
 
         // Resolvers table indexes (2)
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_resolvers_chain ON resolvers(chain)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_resolvers_protocol ON resolvers(protocol)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_resolvers_namehash ON resolvers(namehash)");
 
         // Resolver addresses indexes (3)
         try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_addresses_namehash ON resolver_addresses(namehash)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_addresses_resolver ON resolver_addresses(resolver)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_addresses_context ON resolver_addresses(chain, namehash, context)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_addresses_context ON resolver_addresses(protocol, namehash, context)");
 
         // Resolver contenthashes indexes (3)
         try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_contenthashes_namehash ON resolver_contenthashes(namehash)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_contenthashes_resolver ON resolver_contenthashes(resolver)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_contenthashes_context ON resolver_contenthashes(chain, namehash, context)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_contenthashes_context ON resolver_contenthashes(protocol, namehash, context)");
 
         // Resolver texts indexes (4)
         try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_texts_namehash ON resolver_texts(namehash)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_texts_resolver ON resolver_texts(resolver)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_texts_key ON resolver_texts(key)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_texts_context ON resolver_texts(chain, namehash, context)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_texts_context ON resolver_texts(protocol, namehash, context)");
 
         // Resolver records indexes (5)
         try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_aliases_resolver ON resolver_aliases(resolver)");
@@ -606,31 +601,31 @@ pub const Database = struct {
         try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_interfaces_namehash ON resolver_interfaces(namehash)");
 
         // Resolver metadata & approvals (ENSIP-16) indexes (6)
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_metadata_chain ON resolver_metadata(chain)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_metadata_resolver ON resolver_metadata(chain, resolver)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_approvals_chain ON resolver_approvals(chain)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_approvals_namehash ON resolver_approvals(chain, namehash)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_approvals_delegate ON resolver_approvals(chain, delegate)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_approvals_context ON resolver_approvals(chain, context)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_metadata_protocol ON resolver_metadata(protocol)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_metadata_resolver ON resolver_metadata(protocol, resolver)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_approvals_protocol ON resolver_approvals(protocol)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_approvals_namehash ON resolver_approvals(protocol, namehash)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_approvals_delegate ON resolver_approvals(protocol, delegate)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_approvals_context ON resolver_approvals(protocol, context)");
 
         // Approvals table indexes (3)
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_approvals_chain ON approvals(chain)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_approvals_protocol ON approvals(protocol)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_approvals_token_id ON approvals(token_id)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_approvals_owner ON approvals(owner)");
 
         // Name history indexes (5)
         try self.exec("CREATE INDEX IF NOT EXISTS idx_name_history_namehash ON name_history(namehash)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_name_history_chain_name ON name_history(chain, name)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_name_history_protocol_name ON name_history(protocol, name)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_name_history_change_type ON name_history(change_type)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_name_history_block ON name_history(chain, block_number)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_name_history_block ON name_history(protocol, block_number)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_name_history_timestamp ON name_history(timestamp)");
 
         // EAC roles indexes (5)
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_chain ON eac_roles(chain)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_resource ON eac_roles(chain, resource)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_account ON eac_roles(chain, account)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_block ON eac_roles(chain, block_number)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_contract ON eac_roles(chain, contract_address)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_protocol ON eac_roles(protocol)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_resource ON eac_roles(protocol, resource)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_account ON eac_roles(protocol, account)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_block ON eac_roles(protocol, block_number)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_contract ON eac_roles(protocol, contract_address)");
 
         // Temporary registrar indexes (17)
         try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_auctions_status ON temp_auctions(status)");
@@ -649,16 +644,11 @@ pub const Database = struct {
         try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_invalidations_name ON temp_invalidations(name)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_invalidations_block ON temp_invalidations(invalidation_block)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_pre_migration_label_hash ON temp_pre_migration_names(label_hash)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_pre_migration_chain ON temp_pre_migration_names(chain)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_pre_migration_protocol ON temp_pre_migration_names(protocol)");
 
-        // Bridge events indexes (8)
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_migrations_token_id ON migrations(chain, token_id)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_migrations_block ON migrations(chain, block_number)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_migrations_direction ON migrations(direction)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_renewal_syncs_token_id ON renewal_syncs(chain, token_id)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_renewal_syncs_block ON renewal_syncs(chain, block_number)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_token_observers_token_id ON token_observers(chain, token_id)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_token_observers_block ON token_observers(chain, block_number)");
+        // Token observers (V2 Registry) indexes
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_token_observers_token_id ON token_observers(protocol, token_id)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_token_observers_block ON token_observers(protocol, block_number)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_token_observers_observer ON token_observers(observer)");
 
         // Rainbow labels & unknown labels indexes (5)
@@ -682,9 +672,14 @@ pub const Database = struct {
     pub const insertRegistry = names.insertRegistry;
     pub const insertName = names.insertName;
     pub const getNameByNamehash = names.getNameByNamehash;
+    pub const getNameStringByNamehash = names.getNameStringByNamehash;
+    pub const getNameByNamehashAndProtocol = names.getNameByNamehashAndProtocol;
     pub const getNamehashByResolver = names.getNamehashByResolver;
     pub const updateNameExpiry = names.updateNameExpiry;
     pub const updateNameOwner = names.updateNameOwner;
+    pub const markNameMigrated = names.markNameMigrated;
+    pub const upsertReverseRecord = resolvers.upsertReverseRecord;
+    pub const getReverseRecordNamehash = resolvers.getReverseRecordNamehash;
     pub const updateNameResolver = names.updateNameResolver;
     pub const getNameByTokenIdAndRegistry = names.getNameByTokenIdAndRegistry;
     pub const deleteNameByNamehash = names.deleteNameByNamehash;
@@ -694,6 +689,7 @@ pub const Database = struct {
     pub const getAllNames = names.getAllNames;
     pub const getAllNamesWithOrder = names.getAllNamesWithOrder;
     pub const getFilteredNames = names.getFilteredNames;
+    pub const countRowsBeforeNamehash = names.countRowsBeforeNamehash;
     pub const OrderDir = names.OrderDir;
     pub const NameSortField = names.NameSortField;
     pub const NameFilters = names.NameFilters;
@@ -703,6 +699,7 @@ pub const Database = struct {
     pub const batchCountDirectSubdomains = names.batchCountDirectSubdomains;
     pub const getSubdomains = names.getSubdomains;
     pub const updateRegistryPlaceholderName = names.updateRegistryPlaceholderName;
+    pub const updatePlaceholderEventsByName = names.updatePlaceholderEventsByName;
     pub const getTotalNameCount = names.getTotalNameCount;
     pub const getFilteredNameCount = names.getFilteredNameCount;
 
@@ -710,12 +707,12 @@ pub const Database = struct {
     pub const storeResolverAddress = resolvers.storeResolverAddress;
     pub const storeResolverContentHash = resolvers.storeResolverContentHash;
     pub const storeResolverText = resolvers.storeResolverText;
-    pub const getResolverAddress = resolvers.getResolverAddress;
-    pub const getResolverContentHash = resolvers.getResolverContentHash;
-    pub const getResolverTextKeys = resolvers.getResolverTextKeys;
-    pub const getResolverText = resolvers.getResolverText;
-    pub const getResolverTextKeysByResolver = resolvers.getResolverTextKeysByResolver;
-    pub const getResolverTextByResolver = resolvers.getResolverTextByResolver;
+    pub const getAddressRecord = resolvers.getAddressRecord;
+    pub const getAddressRecords = resolvers.getAddressRecords;
+    pub const countEventsBeforeCursor = events.countEventsBeforeCursor;
+    pub const getContentHashRecord = resolvers.getContentHashRecord;
+    pub const getTextRecordKeys = resolvers.getTextRecordKeys;
+    pub const getTextRecord = resolvers.getTextRecord;
     pub const getResolversToIndex = resolvers.getResolversToIndex;
     pub const getResolversByOwner = resolvers.getResolversByOwner;
     pub const deleteResolverAddresses = resolvers.deleteResolverAddresses;
@@ -735,12 +732,12 @@ pub const Database = struct {
     pub const storeResolverInterface = resolvers.storeResolverInterface;
     pub const storeResolverVersion = resolvers.storeResolverVersion;
     pub const PubkeyRecord = resolvers.PubkeyRecord;
-    pub const getResolverPubkey = resolvers.getResolverPubkey;
-    pub const getResolverAbiContentTypes = resolvers.getResolverAbiContentTypes;
-    pub const getResolverReverseName = resolvers.getResolverReverseName;
+    pub const getPubkeyRecord = resolvers.getPubkeyRecord;
+    pub const getAbiContentTypes = resolvers.getAbiContentTypes;
+    pub const getReverseNameRecord = resolvers.getReverseNameRecord;
     pub const InterfaceRecord = resolvers.InterfaceRecord;
-    pub const getResolverInterfaces = resolvers.getResolverInterfaces;
-    pub const getResolverVersion = resolvers.getResolverVersion;
+    pub const getInterfaceRecords = resolvers.getInterfaceRecords;
+    pub const getNodeRecordVersion = resolvers.getNodeRecordVersion;
     pub const getResolverNodeCount = resolvers.getResolverNodeCount;
     pub const getResolverAliasCount = resolvers.getResolverAliasCount;
     pub const getResolverRoleHolderCount = resolvers.getResolverRoleHolderCount;
@@ -821,5 +818,6 @@ pub const Database = struct {
     pub const RegistrationFilterOptions = registrations.RegistrationFilterOptions;
     pub const getRegistrations = registrations.getRegistrations;
     pub const getRegistrationCount = registrations.getRegistrationCount;
+    pub const insertRegistration = registrations.insertRegistration;
     pub const getTotalRegistrationCount = registrations.getTotalRegistrationCount;
 };

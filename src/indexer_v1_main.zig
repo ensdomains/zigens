@@ -103,7 +103,7 @@ pub fn main() !void {
     }
 
     // Initialize indexer with only V1 client
-    var idx = try indexer.Indexer.initSingleChain(allocator, cfg, &database, .v1, cfg.end_block);
+    var idx = try indexer.Indexer.initSingleProtocol(allocator, cfg, &database, .v1, cfg.end_block);
     defer idx.deinit();
 
     switch (mode) {
@@ -124,7 +124,7 @@ pub fn main() !void {
             std.log.info("Rate limit: {d} req/s", .{cfg.rate_limit_per_second});
 
             std.log.info("V1 Indexer started - indexing blocks...", .{});
-            try idx.startSingleChain(.v1);
+            try idx.startSingleProtocol(.v1);
         },
     }
 }

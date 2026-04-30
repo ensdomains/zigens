@@ -16,7 +16,7 @@ const v1_names = @import("../../utils/v1_names.zig");
 /// Handle V1 ENS Registry NewOwner event
 /// NewOwner(bytes32 indexed node, bytes32 indexed label, address owner)
 /// This event is emitted when a subdomain is created
-pub fn handleV1NewOwner(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     if (log.topics.len < 3) return error.InvalidTopicCount;
     if (log.data.len < 32) return error.InsufficientData;
 
@@ -64,12 +64,12 @@ pub fn handleV1NewOwner(self: *Indexer, chain: models.Chain, log: rpc.Log) !void
 
         var q = try Query.initCached(self.database,
             \\INSERT OR IGNORE INTO temp_pre_migration_names
-            \\(chain, namehash, label_hash, parent_node, owner, block_number, tx_hash, log_index, created_at)
+            \\(protocol, namehash, label_hash, parent_node, owner, block_number, tx_hash, log_index, created_at)
             \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         );
         defer q.deinit();
 
-        try q.bindTextStatic(@tagName(chain));
+        try q.bindTextStatic(@tagName(protocol));
         try q.bindTextStatic(subdomain_hex);
         try q.bindTextStatic(labelhash_hex);
         try q.bindTextStatic(parent_hex);
@@ -171,8 +171,14 @@ pub fn handleV1NewOwner(self: *Indexer, chain: models.Chain, log: rpc.Log) !void
         const label_copy = try self.allocator.dupe(u8, label_str);
         const parent_copy = if (parent_name_str) |pn| try self.allocator.dupe(u8, pn) else null;
 
+        // V1 names have no version bits — use the namehash as canonical_id so each
+        // V1 row has a unique identifier. The previous code wrote canonical_id=0
+        // for every V1 subdomain, making canonical_id-based lookups ambiguous
+        // (any of N V1 names matched).
+        const v1_canonical_id = std.mem.readInt(u256, &subdomain_namehash.bytes, .big);
+
         var name = models.Name{
-            .chain = chain,
+            .protocol = protocol,
             .name = name_copy,
             .namehash = subdomain_namehash,
             .label = label_copy,
@@ -184,7 +190,7 @@ pub fn handleV1NewOwner(self: *Indexer, chain: models.Chain, log: rpc.Log) !void
             .registrant = owner,
             .resolver = Address.zero,
             .token_id = 0,
-            .canonical_id = 0,
+            .canonical_id = v1_canonical_id,
             .token_version = 0,
             .expiry = 0,
             .registry_locked = false,
@@ -227,12 +233,12 @@ pub fn handleV1NewOwner(self: *Indexer, chain: models.Chain, log: rpc.Log) !void
         parent_hex, labelhash_hex, subdomain_hex, owner_hex,
     });
 
-    try utils.emitEvent(self, chain, log, .transfer, null, subdomain_namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .transfer, null, subdomain_namehash, event_data);
 }
 
 /// Handle V1 ENS Registry Transfer event
 /// Transfer(bytes32 indexed node, address owner)
-pub fn handleV1RegistryTransfer(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleV1RegistryTransfer(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     if (log.topics.len < 2) return error.InvalidTopicCount;
     if (log.data.len < 32) return error.InsufficientData;
 
@@ -250,12 +256,12 @@ pub fn handleV1RegistryTransfer(self: *Indexer, chain: models.Chain, log: rpc.Lo
         node_hex, owner_hex,
     });
 
-    try utils.emitEvent(self, chain, log, .transfer, null, node, event_data);
+    try utils.emitEvent(self, protocol, log, .transfer, null, node, event_data);
 }
 
 /// Handle V1 ENS Registry NewResolver event
 /// NewResolver(bytes32 indexed node, address resolver)
-pub fn handleV1NewResolver(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleV1NewResolver(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     if (log.topics.len < 2) return error.InvalidTopicCount;
     if (log.data.len < 32) return error.InsufficientData;
 
@@ -274,18 +280,18 @@ pub fn handleV1NewResolver(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
     } else {
         try names_storage.updateNameResolver(self.database, node, resolver);
     }
-    try self.database.registerResolver(chain, resolver_hex, log.block_number);
+    try self.database.registerResolver(protocol, resolver_hex, log.block_number);
 
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"node\":\"{s}\",\"resolver\":\"{s}\"}}", .{
         node_hex, resolver_hex,
     });
 
-    try utils.emitEvent(self, chain, log, .resolver_update, null, node, event_data);
+    try utils.emitEvent(self, protocol, log, .resolver_update, null, node, event_data);
 }
 
 /// Handle V1 ENS Registry NewTTL event
 /// NewTTL(bytes32 indexed node, uint64 ttl)
-pub fn handleV1NewTTL(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleV1NewTTL(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     if (log.topics.len < 2) return error.InvalidTopicCount;
     if (log.data.len < 32) return error.InsufficientData;
 
@@ -299,12 +305,12 @@ pub fn handleV1NewTTL(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
     std.log.debug("V1 NewTTL: node={s} ttl={d}", .{ node_hex, ttl });
 
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"node\":\"{s}\",\"ttl\":{d}}}", .{ node_hex, ttl });
-    try utils.emitEvent(self, chain, log, .resolver_update, null, node, event_data);
+    try utils.emitEvent(self, protocol, log, .resolver_update, null, node, event_data);
 }
 
 /// Handle V1 Name Wrapper NameWrapped event
 /// NameWrapped(bytes32 indexed node, bytes name, address owner, uint32 fuses, uint64 expiry)
-pub fn handleV1NameWrapped(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleV1NameWrapped(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     // topics[0] = event signature
     // topics[1] = indexed node (namehash)
     if (log.topics.len < 2) return error.InvalidTopicCount;
@@ -352,12 +358,12 @@ pub fn handleV1NameWrapped(self: *Indexer, chain: models.Chain, log: rpc.Log) !v
         node_hex, owner_hex, fuses, expiry,
     });
 
-    try utils.emitEvent(self, chain, log, .transfer, null, node, event_data);
+    try utils.emitEvent(self, protocol, log, .transfer, null, node, event_data);
 }
 
 /// Handle V1 Name Wrapper NameUnwrapped event
 /// NameUnwrapped(bytes32 indexed node, address owner)
-pub fn handleV1NameUnwrapped(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleV1NameUnwrapped(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     // topics[0] = event signature
     // topics[1] = indexed node (namehash)
     if (log.topics.len < 2) return error.InvalidTopicCount;
@@ -387,12 +393,12 @@ pub fn handleV1NameUnwrapped(self: *Indexer, chain: models.Chain, log: rpc.Log) 
         node_hex, owner_hex,
     });
 
-    try utils.emitEvent(self, chain, log, .transfer, null, node, event_data);
+    try utils.emitEvent(self, protocol, log, .transfer, null, node, event_data);
 }
 
 /// Handle V1 Name Wrapper FusesSet event
 /// FusesSet(bytes32 indexed node, uint32 fuses)
-pub fn handleV1FusesSet(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleV1FusesSet(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     // topics[0] = event signature
     // topics[1] = indexed node (namehash)
     if (log.topics.len < 2) return error.InvalidTopicCount;
@@ -424,12 +430,12 @@ pub fn handleV1FusesSet(self: *Indexer, chain: models.Chain, log: rpc.Log) !void
         fuses,
     });
 
-    try utils.emitEvent(self, chain, log, .resolver_update, null, node, event_data);
+    try utils.emitEvent(self, protocol, log, .resolver_update, null, node, event_data);
 }
 
 /// Handle V1 Name Wrapper ExpiryExtended event
 /// ExpiryExtended(bytes32 indexed node, uint64 expiry)
-pub fn handleV1ExpiryExtended(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleV1ExpiryExtended(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     // topics[0] = event signature
     // topics[1] = indexed node (namehash)
     if (log.topics.len < 2) return error.InvalidTopicCount;
@@ -461,12 +467,12 @@ pub fn handleV1ExpiryExtended(self: *Indexer, chain: models.Chain, log: rpc.Log)
         expiry,
     });
 
-    try utils.emitEvent(self, chain, log, .name_renewed, null, node, event_data);
+    try utils.emitEvent(self, protocol, log, .name_renewed, null, node, event_data);
 }
 
 /// Handle V1 Base Registrar ERC721 Transfer event
 /// Transfer(address indexed from, address indexed to, uint256 indexed tokenId)
-pub fn handleV1ERC721Transfer(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleV1ERC721Transfer(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
 
     // names_storage imported at top level
 
@@ -495,38 +501,66 @@ pub fn handleV1ERC721Transfer(self: *Indexer, chain: models.Chain, log: rpc.Log)
     const token_id_hex = try utils.tokenIdToHex(self.allocator, token_id);
     defer self.allocator.free(token_id_hex);
 
+    // Detect V1 → V2 migration: a transfer to one of the V2 migration controllers
+    // signals the V1 token is being migrated. We need to mark the V1 row migrated
+    // (so the API can distinguish live V1 names from migrated ones) and emit a
+    // distinct NameMigrated event so consumers don't conflate it with an ordinary
+    // ownership transfer.
+    const migration_kind = self.getMigrationKind(to);
+
     // Look up the label from cache (falls back to DB on miss)
     if (try self.getCachedV1Label(token_id_hex)) |label| {
         // Compute the namehash for this name
         const namehash = v1_names.computeEthNamehash(label);
 
-        // Update the name's owner
-        if (self.write_buffer.active) {
-            try self.write_buffer.updateNameOwner(namehash, to);
+        if (migration_kind != .none) {
+            // V1→V2 migration: mark the V1 row as migrated and update owner to the
+            // controller. Don't lose the prior owner — it's emitted in the event.
+            if (self.write_buffer.active) {
+                try self.write_buffer.markNameMigrated(namehash, to);
+            } else {
+                try names_storage.markNameMigrated(self.database, namehash, to);
+            }
+            // Debug-level: a Sepolia sync produces thousands of these.
+            std.log.debug("V1 → V2 migration detected: {s}.eth → {s} controller (to={s})", .{
+                label,
+                if (migration_kind == .locked) "LOCKED" else "UNLOCKED",
+                to_hex,
+            });
         } else {
-            try names_storage.updateNameOwner(self.database, namehash, to);
+            // Update the name's owner (normal transfer)
+            if (self.write_buffer.active) {
+                try self.write_buffer.updateNameOwner(namehash, to);
+            } else {
+                try names_storage.updateNameOwner(self.database, namehash, to);
+            }
+            std.log.debug("Updated V1 name ownership: {s}.eth -> {s}", .{ label, to_hex });
         }
-
-        std.log.debug("Updated V1 name ownership: {s}.eth -> {s}", .{ label, to_hex });
     } else {
         // This is expected - not all transfers correspond to known names
         // (e.g., the name might have been registered before we started indexing)
         std.log.debug("V1 Transfer for unknown tokenId {s}, event stored but name not updated", .{token_id_hex});
     }
 
-    // Store event
-    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"from\":\"{s}\",\"to\":\"{s}\",\"tokenId\":\"{d}\"}}", .{
+    // Store event — use NameMigrated for migration transfers, plain Transfer otherwise.
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"from\":\"{s}\",\"to\":\"{s}\",\"tokenId\":\"{d}\"{s}}}", .{
         from_hex,
         to_hex,
         token_id,
+        switch (migration_kind) {
+            .locked => ",\"migrationKind\":\"locked\"",
+            .unlocked => ",\"migrationKind\":\"unlocked\"",
+            .none => "",
+        },
     });
 
-    try utils.emitEvent(self, chain, log, .transfer, null, null, event_data);
+    const ev_type: models.EventType = if (migration_kind != .none) .name_migrated else .transfer;
+    try utils.emitEvent(self, protocol, log, ev_type, null, null, event_data);
 }
 
 /// Handle V1 Base Registrar NameRegistered event
 /// NameRegistered(uint256 indexed id, address indexed owner, uint256 expires)
-pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
 
     // names_storage imported at top level
 
@@ -594,7 +628,7 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, chain: models.Chain, 
             .label_hash = label_hash,
             .parent_name = "eth",
             .parent_namehash = eth_node,
-            .chain = chain,
+            .protocol = protocol,
             .registry = self.config.v1_contracts.ens_registry, // ENS Registry, not Base Registrar!
             .owner = owner,
             .registrant = owner, // Original registrant from V1 NameRegistered
@@ -606,8 +640,8 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, chain: models.Chain, 
             .registry_locked = false, // V1 names don't have registry locking
             .migrated = false, // This is a native V1 name
             .created_block = log.block_number,
-            .created_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
-            .registered_at = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+            .created_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+            .registered_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
             .updated_block = log.block_number,
             .updated_at = std.time.timestamp(),
             .is_wrapped = false, // Not wrapped initially
@@ -631,7 +665,7 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, chain: models.Chain, 
             expires,
         });
 
-        try utils.emitEvent(self, chain, log, .name_registered, full_name, namehash, event_data);
+        try utils.emitEvent(self, protocol, log, .name_registered, full_name, namehash, event_data);
     } else {
         // Label not found yet - might come in a later ETH Controller event
         std.log.warn("V1 BaseRegistrar NameRegistered: tokenID {s} label not found (will store event only)", .{token_id_hex});
@@ -643,13 +677,13 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, chain: models.Chain, 
             expires,
         });
 
-        try utils.emitEvent(self, chain, log, .name_registered, null, null, event_data);
+        try utils.emitEvent(self, protocol, log, .name_registered, null, null, event_data);
     }
 }
 
 /// Handle V1 Base Registrar NameRenewed event
 /// NameRenewed(uint256 indexed id, uint256 expires)
-pub fn handleV1BaseRegistrarNameRenewed(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleV1BaseRegistrarNameRenewed(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
 
     // names_storage imported at top level
 
@@ -699,13 +733,13 @@ pub fn handleV1BaseRegistrarNameRenewed(self: *Indexer, chain: models.Chain, log
         expires,
     });
 
-    try utils.emitEvent(self, chain, log, .name_renewed, null, null, event_data);
+    try utils.emitEvent(self, protocol, log, .name_renewed, null, null, event_data);
 }
 
 /// Handle V1 Base Registrar ControllerAdded event
 /// ControllerAdded(address indexed controller)
-pub fn handleV1ControllerAdded(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
-    _ = chain; // Controller events are operational only, not stored as user-facing events
+pub fn handleV1ControllerAdded(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
+    _ = protocol; // Controller events are operational only, not stored as user-facing events
     const v1_controllers = @import("../../storage/v1_controllers.zig");
 
     // topics[0] = event signature
@@ -733,8 +767,8 @@ pub fn handleV1ControllerAdded(self: *Indexer, chain: models.Chain, log: rpc.Log
 
 /// Handle V1 Base Registrar ControllerRemoved event
 /// ControllerRemoved(address indexed controller)
-pub fn handleV1ControllerRemoved(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
-    _ = chain; // Controller events are operational only, not stored as user-facing events
+pub fn handleV1ControllerRemoved(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
+    _ = protocol; // Controller events are operational only, not stored as user-facing events
     const v1_controllers = @import("../../storage/v1_controllers.zig");
 
     // topics[0] = event signature
@@ -762,7 +796,7 @@ pub fn handleV1ControllerRemoved(self: *Indexer, chain: models.Chain, log: rpc.L
 
 /// Handle V1 ETH Registrar Controller NameRegistered event
 /// NameRegistered(string name, bytes32 indexed label, address indexed owner, uint256 baseCost, uint256 premium, uint256 expires)
-pub fn handleV1ETHControllerNameRegistered(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleV1ETHControllerNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
 
     // topics[0] = event signature
     // topics[1] = indexed label (bytes32)
@@ -830,12 +864,12 @@ pub fn handleV1ETHControllerNameRegistered(self: *Indexer, chain: models.Chain, 
         .{ name, label_hash_hex, owner_hex, cost, expires },
     );
 
-    try utils.emitEvent(self, chain, log, .name_registered, name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .name_registered, name, namehash, event_data);
 }
 
 /// Handle V1 ETH Registrar Controller NameRenewed event
 /// NameRenewed(string name, bytes32 indexed label, uint256 cost, uint256 expires)
-pub fn handleV1ETHControllerNameRenewed(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleV1ETHControllerNameRenewed(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
 
     // topics[0] = event signature
     // topics[1] = indexed label (bytes32)
@@ -895,12 +929,12 @@ pub fn handleV1ETHControllerNameRenewed(self: *Indexer, chain: models.Chain, log
         .{ name, label_hash_hex, cost, expires },
     );
 
-    try utils.emitEvent(self, chain, log, .name_renewed, name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, .name_renewed, name, namehash, event_data);
 }
 
 /// Handle V1 Reverse Registrar ReverseClaimed event
 /// ReverseClaimed(address indexed addr, bytes32 indexed node)
-pub fn handleV1ReverseClaimed(self: *Indexer, chain: models.Chain, log: rpc.Log) !void {
+pub fn handleV1ReverseClaimed(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     // topics[0] = event signature
     // topics[1] = indexed addr
     // topics[2] = indexed node
@@ -916,13 +950,30 @@ pub fn handleV1ReverseClaimed(self: *Indexer, chain: models.Chain, log: rpc.Log)
 
     std.log.debug("V1 ReverseClaimed: addr={s} node={s}", .{ addr_hex, node_hex });
 
+    // Persist the address → reverse-node binding so primary-name lookups can be
+    // answered by a point query rather than scanning the events feed. Note: this
+    // does NOT prove forward resolution; consumers must round-trip via the
+    // resolver's addr() to verify primary-name claims (per ENSIP-3).
+    const block_timestamp = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
+    self.database.upsertReverseRecord(
+        protocol,
+        addr,
+        node,
+        log.block_number,
+        log.transaction_hash,
+        log.log_index,
+        block_timestamp,
+    ) catch |err| {
+        std.log.warn("Failed to upsert V1 reverse record for {s}: {}", .{ addr_hex, err });
+    };
+
     // Store event
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"address\":\"{s}\",\"node\":\"{s}\"}}", .{
         addr_hex,
         node_hex,
     });
 
-    try utils.emitEvent(self, chain, log, .transfer, null, node, event_data);
+    try utils.emitEvent(self, protocol, log, .transfer, null, node, event_data);
 }
 
 // ============================================================================
@@ -935,7 +986,7 @@ pub fn handleV1ReverseClaimed(self: *Indexer, chain: models.Chain, log: rpc.Log)
 /// DNS wire format: [len][label_bytes][len][label_bytes]...[0x00]
 /// Example: \x03sub\x07vitalik\x03eth\x00 → labels: ["sub", "vitalik", "eth"]
 ///
-/// We walk the label chain and for each label, check if the corresponding name
+/// We walk the label protocol and for each label, check if the corresponding name
 /// record has an unresolved "[labelhash]" label. If so, heal it with the plaintext.
 fn healLabelsFromDNSName(self: *Indexer, name_bytes: []const u8, wrapped_node: Hash, block_number: u64) !void {
     _ = block_number;
@@ -970,7 +1021,7 @@ fn healLabelsFromDNSName(self: *Indexer, name_bytes: []const u8, wrapped_node: H
         }
     }
 
-    // Walk the label chain and heal parent names too
+    // Walk the label protocol and heal parent names too
     // For "sub.vitalik.eth", we check: sub.vitalik.eth, vitalik.eth, eth
     // Rebuild namehashes from root (eth → vitalik.eth → sub.vitalik.eth)
     if (labels.len < 2) return;

@@ -1018,8 +1018,13 @@ test "pagination: backward with last and before" {
     try testing.expectEqualStrings("cursor", params.cursor.?);
 }
 
-test "pagination: limit capped at max" {
-    const params = try pagination.PaginationParams.parse(5000, null, null, null, 100, 1000);
+test "pagination: explicit first beyond max errors" {
+    const result = pagination.PaginationParams.parse(5000, null, null, null, 100, 1000);
+    try testing.expectError(error.LimitExceeded, result);
+}
+
+test "pagination: explicit first at max passes" {
+    const params = try pagination.PaginationParams.parse(1000, null, null, null, 100, 1000);
     try testing.expectEqual(@as(usize, 1000), params.limit);
 }
 

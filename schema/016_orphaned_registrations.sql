@@ -4,7 +4,7 @@
 
 CREATE TABLE IF NOT EXISTS orphaned_registrations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  chain TEXT NOT NULL,
+  protocol TEXT NOT NULL,
   subregistry_address TEXT NOT NULL,
   token_id TEXT NOT NULL,
   label TEXT NOT NULL,
@@ -14,8 +14,8 @@ CREATE TABLE IF NOT EXISTS orphaned_registrations (
   tx_hash TEXT NOT NULL,
   log_index INTEGER NOT NULL,
   created_at INTEGER NOT NULL,
-  UNIQUE(chain, tx_hash, log_index)
+  UNIQUE(protocol, tx_hash, log_index)
 );
 
-CREATE INDEX IF NOT EXISTS idx_orphaned_subregistry ON orphaned_registrations(chain, subregistry_address);
+CREATE INDEX IF NOT EXISTS idx_orphaned_subregistry ON orphaned_registrations(protocol, subregistry_address);
 CREATE INDEX IF NOT EXISTS idx_orphaned_block ON orphaned_registrations(block_number);

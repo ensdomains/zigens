@@ -93,7 +93,7 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
 
         // Create the name entry
         var name = models.Name{
-            .chain = .v1,
+            .protocol = .v1,
             .name = full_name,
             .namehash = namehash,
             .label = label_copy,
@@ -158,11 +158,11 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
         history: {
             var hq = Query.init(self.database,
                 \\INSERT OR IGNORE INTO name_history
-                \\(chain, namehash, name, change_type, old_value, new_value, block_number, tx_hash, log_index, timestamp)
+                \\(protocol, namehash, name, change_type, old_value, new_value, block_number, tx_hash, log_index, timestamp)
                 \\VALUES (?, ?, ?, 'migration', NULL, 'Migrated from temporary registrar', ?, ?, 0, ?)
             ) catch break :history;
             defer hq.deinit();
-            hq.bindText("l1") catch break :history;
+            hq.bindText("v1") catch break :history;
             hq.bindText(namehash_hex) catch break :history;
             hq.bindText(full_name) catch break :history;
             hq.bindInt64(@intCast(block_number)) catch break :history;
@@ -269,7 +269,7 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
                 \\SELECT json_extract(data, '$.owner'), json_extract(data, '$.expires'),
                 \\       timestamp, block_number
                 \\FROM events
-                \\WHERE namehash = ? AND event_type = 'name_registered' AND chain = 'v1'
+                \\WHERE namehash = ? AND event_type = 'name_registered' AND protocol = 'v1'
                 \\ORDER BY block_number ASC
                 \\LIMIT 1
             ) catch {
@@ -307,7 +307,7 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
         const v1_label_hash = try self.allocator.dupe(u8, token_id_str);
 
         var name = models.Name{
-            .chain = .v1,
+            .protocol = .v1,
             .name = full_name,
             .namehash = stored_namehash,
             .label = label_copy,

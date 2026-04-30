@@ -10,12 +10,6 @@ const metrics_mod = @import("../lib/graphql/metrics.zig");
 // Import ENS-specific resolvers
 const resolvers = @import("resolvers/resolvers.zig");
 
-/// Helper to escape JSON strings using std.json (RFC 8259 compliant)
-/// This is now a thin wrapper around json_utils which uses Zig's professional-grade std.json
-fn escapeJsonString(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
-    return json_utils.escapeString(allocator, s);
-}
-
 /// GraphQL query handler for ENSv2 Indexer
 /// Provides subgraph-compatible GraphQL API
 pub const GraphQLHandler = struct {
@@ -143,6 +137,20 @@ pub const GraphQLHandler = struct {
                 return try self.buildErrorResponseWithCode("Must provide operation name when query contains multiple operations", ErrorCode.VALIDATION_ERROR);
             } else if (err == error.InvalidContractAddress) {
                 return try self.buildErrorResponseWithCode("Invalid contractAddress: must be a valid Ethereum address (40 hex characters with 0x prefix)", ErrorCode.INVALID_ARGUMENT);
+            } else if (err == error.InvalidAddress) {
+                return try self.buildErrorResponseWithCode("Invalid address: must be 40 hex characters with 0x prefix", ErrorCode.INVALID_ARGUMENT);
+            } else if (err == error.InvalidNamehash) {
+                return try self.buildErrorResponseWithCode("Invalid namehash: must be 64 hex characters with 0x prefix", ErrorCode.INVALID_ARGUMENT);
+            } else if (err == error.NegativeLimit) {
+                return try self.buildErrorResponseWithCode("Pagination 'first'/'last' must be non-negative", ErrorCode.INVALID_ARGUMENT);
+            } else if (err == error.LimitExceeded) {
+                return try self.buildErrorResponseWithCode("Pagination 'first'/'last' exceeds the maximum allowed value", ErrorCode.INVALID_ARGUMENT);
+            } else if (err == error.InvalidCursor) {
+                return try self.buildErrorResponseWithCode("Invalid cursor: malformed or unparseable", ErrorCode.INVALID_ARGUMENT);
+            } else if (err == error.InvalidProtocol) {
+                return try self.buildErrorResponseWithCode("Invalid protocol: must be 'v1' or 'v2'", ErrorCode.INVALID_ARGUMENT);
+            } else if (err == error.TooManyNames) {
+                return try self.buildErrorResponseWithCode("name_in: too many names (cap is 1000 per query)", ErrorCode.INVALID_ARGUMENT);
             }
             return try self.buildErrorResponseWithCode("Query execution failed", ErrorCode.EXECUTION_ERROR);
         };
@@ -150,12 +158,6 @@ pub const GraphQLHandler = struct {
         // Record successful query with timing
         const duration_us = timer.elapsedMicroseconds();
         self.metrics.recordQuery(duration_us, analysis.depth, analysis.cost);
-
-        // Log DataLoader cache statistics
-        const stats = loader_context.getAllStats();
-        const hit_rate = stats.resolver_address.hitRate();
-        const avg_batch = stats.resolver_address.avgBatchSize();
-        std.log.debug("DataLoader stats - Resolver addresses: {d} cached, {d} hits, {d} misses, hit rate: {d:.2}%, {d} batches, avg batch size: {d:.2}", .{ stats.resolver_address.entries, stats.resolver_address.cache_hits, stats.resolver_address.cache_misses, hit_rate * 100, stats.resolver_address.batch_loads, avg_batch });
 
         // Dupe result from arena to GPA for the caller (arena is freed on return)
         return try self.allocator.dupe(u8, result);
@@ -277,7 +279,7 @@ pub const GraphQLHandler = struct {
         var response: std.ArrayList(u8) = .{};
         errdefer response.deinit(self.allocator);
 
-        const message_escaped = try escapeJsonString(self.allocator, message);
+        const message_escaped = try json_utils.escapeString(self.allocator, message);
         defer self.allocator.free(message_escaped);
 
         const writer = response.writer(self.allocator);
@@ -302,7 +304,7 @@ pub const GraphQLHandler = struct {
             try writer.writeAll(",\"path\":[");
             for (p, 0..) |segment, i| {
                 if (i > 0) try writer.writeAll(",");
-                const escaped_segment = try escapeJsonString(self.allocator, segment);
+                const escaped_segment = try json_utils.escapeString(self.allocator, segment);
                 defer self.allocator.free(escaped_segment);
                 try writer.print("\"{s}\"", .{escaped_segment});
             }

@@ -80,9 +80,35 @@ pub fn buildEntityJson(
     try writer.writeAll("{");
     var first = true;
 
+    // GraphQL §5.3.2: fields with the same response name (alias or name) are merged.
+    // Per-row dedup of output_key. A small stack-backed slice of seen keys is faster
+    // than initializing+deiniting a StringHashMap for every entity row in a list query
+    // — typical selection size is well under MAX_SEEN_KEYS, and string equality on a
+    // short list dominates HashMap setup cost at this scale.
+    const MAX_SEEN_KEYS = 64;
+    var seen_keys_buf: [MAX_SEEN_KEYS][]const u8 = undefined;
+    var seen_keys_len: usize = 0;
+
     for (selections) |*field| {
         // Use alias if provided, otherwise use field name (GraphQL spec compliance)
         const output_key = field.alias orelse field.name;
+
+        // Dedup via linear scan. selections.len is bounded by GraphQL complexity
+        // limits; a HashMap would amortize better at thousands of fields, which we
+        // never see (cap is ~50 cost on a single field's children).
+        var already_seen = false;
+        var k: usize = 0;
+        while (k < seen_keys_len) : (k += 1) {
+            if (std.mem.eql(u8, seen_keys_buf[k], output_key)) {
+                already_seen = true;
+                break;
+            }
+        }
+        if (already_seen) continue;
+        if (seen_keys_len < MAX_SEEN_KEYS) {
+            seen_keys_buf[seen_keys_len] = output_key;
+            seen_keys_len += 1;
+        }
 
         // Handle __typename introspection field
         if (std.mem.eql(u8, field.name, "__typename")) {
@@ -108,6 +134,20 @@ pub fn buildEntityJson(
             }
         }
         if (handled_nested) continue;
+
+        // GraphQL §5.3.3: a sub-selection (`field { foo }`) is only valid for object/list types.
+        // If the field maps to a scalar FieldDef, sub-selections are an error per spec — silent
+        // tolerance hides client mistakes (e.g. `texts { key value }` against a `[String!]` field
+        // or `name { foo }` on a String field).
+        if (field.selections.len > 0) {
+            for (config.field_defs) |def| {
+                if (std.mem.eql(u8, def.name, field.name) and def.field_type != .custom) {
+                    // FieldDef.custom = object/list writer (sub-selections honored by writer).
+                    // All other types (including custom_scalar) are scalars and must reject sub-selections.
+                    return error.SubSelectionOnScalar;
+                }
+            }
+        }
 
         // Try scalar field from field definitions
         var field_buffer: std.ArrayList(u8) = .{};
@@ -135,7 +175,9 @@ pub fn buildEntityJson(
     }
 
     try writer.writeAll("}");
-    return try allocator.dupe(u8, json.items);
+    // toOwnedSlice transfers the backing buffer directly to the caller — saves the
+    // dupe-then-free round trip vs `allocator.dupe(u8, json.items)`.
+    return try json.toOwnedSlice(allocator);
 }
 
 /// Build JSON array for a list of entities
@@ -167,7 +209,7 @@ pub fn buildEntityArrayJson(
     }
 
     try writer.writeAll("]");
-    return try allocator.dupe(u8, json.items);
+    return try json.toOwnedSlice(allocator);
 }
 
 // ============================================================================

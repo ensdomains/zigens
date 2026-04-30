@@ -2,22 +2,23 @@ const std = @import("std");
 const Address = @import("address.zig").Address;
 const Hash = @import("hash.zig").Hash;
 
-/// Chain identifier
-pub const Chain = enum {
+/// ENS protocol version (v1 = legacy ENS; v2 = ENSv2). Distinguishes which name
+/// system a row belongs to in the unified DB. Not a blockchain identifier.
+pub const Protocol = enum {
     v1,
     v2,
 
-    pub fn toString(self: Chain) []const u8 {
+    pub fn toString(self: Protocol) []const u8 {
         return switch (self) {
             .v1 => "v1",
             .v2 => "v2",
         };
     }
 
-    pub fn fromString(s: []const u8) !Chain {
+    pub fn fromString(s: []const u8) !Protocol {
         if (std.mem.eql(u8, s, "v1")) return .v1;
         if (std.mem.eql(u8, s, "v2")) return .v2;
-        return error.InvalidChain;
+        return error.InvalidProtocol;
     }
 };
 
@@ -26,7 +27,7 @@ pub const Registry = struct {
     /// Address of the registry contract
     address: Address,
     /// Chain where this registry exists
-    chain: Chain,
+    protocol: Protocol,
     /// Name this registry is responsible for (e.g., "eth", "alice.eth")
     name: []const u8,
     /// Namehash of the name
@@ -58,7 +59,7 @@ pub const Name = struct {
     /// Parent namehash
     parent_namehash: Hash,
     /// Chain where this name is registered
-    chain: Chain,
+    protocol: Protocol,
     /// Registry contract managing this name
     registry: Address,
     /// Current owner address
@@ -127,7 +128,7 @@ pub const Resolver = struct {
     /// Resolver address
     address: Address,
     /// Chain where this resolver exists
-    chain: Chain,
+    protocol: Protocol,
     /// Name this resolver is set for
     name: []const u8,
     /// Namehash
@@ -189,6 +190,11 @@ pub const EventType = enum {
     version_changed,
     alias_changed,
 
+    // V1 → V2 migration: emitted on the V1 row when a token transfers to a
+    // MigrationController. Distinct from `name_registered`/`label_registered`
+    // so consumers can filter on "migration" specifically (vs first-time mint).
+    name_migrated,
+
     pub fn toString(self: EventType) []const u8 {
         return switch (self) {
             .new_subname => "NewSubname",
@@ -220,6 +226,7 @@ pub const EventType = enum {
             .eac_roles_changed => "EACRolesChanged",
             .version_changed => "VersionChanged",
             .alias_changed => "AliasChanged",
+            .name_migrated => "NameMigrated",
         };
     }
 
@@ -253,6 +260,7 @@ pub const EventType = enum {
         if (std.mem.eql(u8, s, "LabelUnregistered")) return .label_unregistered;
         if (std.mem.eql(u8, s, "ExpiryUpdated")) return .expiry_updated;
         if (std.mem.eql(u8, s, "ParentUpdated")) return .parent_updated;
+        if (std.mem.eql(u8, s, "NameMigrated")) return .name_migrated;
         return null;
     }
 };
@@ -262,7 +270,7 @@ pub const Event = struct {
     /// Event type
     event_type: EventType,
     /// Chain where event occurred
-    chain: Chain,
+    protocol: Protocol,
     /// Block number
     block_number: u64,
     /// Transaction hash
@@ -292,6 +300,9 @@ pub const Webhook = struct {
     id: u64,
     /// URL to send events to
     url: []const u8,
+    /// Per-webhook HMAC-SHA256 secret (hex-encoded). Returned to the registrant once
+    /// at creation time so they can verify incoming `X-Webhook-Signature` headers.
+    secret: []const u8,
     /// Event types to listen for (empty = all)
     event_types: []const EventType,
     /// Whether this webhook is active
@@ -303,10 +314,10 @@ pub const Webhook = struct {
 
     pub fn deinit(self: *Webhook, allocator: std.mem.Allocator) void {
         allocator.free(self.url);
+        allocator.free(self.secret);
         allocator.free(self.event_types);
     }
 };
-
 
 /// EAC (Enhanced Access Control) role types
 /// Each role is a nybble (4 bits) in the role bitmap
@@ -339,7 +350,7 @@ pub const EACRoleAssignment = struct {
     /// Record ID
     id: u64,
     /// Chain
-    chain: Chain,
+    protocol: Protocol,
     /// Resource (token ID or resource identifier) as hex string
     resource: []const u8,
     /// Account that has the role
@@ -369,7 +380,7 @@ pub const ResolverMetadata = struct {
     /// Record ID
     id: u64,
     /// Chain
-    chain: Chain,
+    protocol: Protocol,
     /// Resolver contract address
     resolver: Address,
     /// GraphQL endpoint URL for offchain data
@@ -391,7 +402,7 @@ pub const ResolverApproval = struct {
     /// Record ID
     id: u64,
     /// Chain
-    chain: Chain,
+    protocol: Protocol,
     /// Resolver contract address
     resolver: Address,
     /// Namehash of the name being delegated

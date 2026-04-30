@@ -144,6 +144,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/indexer_main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
+            },
         }),
     });
     unit_tests.linkLibC();
@@ -231,6 +234,39 @@ pub fn build(b: *std.Build) void {
     const run_filter_tests = b.addRunArtifact(filter_tests);
     const filter_test_step = b.step("test-filters", "Run filter logic unit tests");
     filter_test_step.dependOn(&run_filter_tests.step);
+
+    // lib/graphql/json_writer inline tests (self-contained within lib/graphql)
+    const json_writer_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lib/graphql/json_writer.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_json_writer_tests = b.addRunArtifact(json_writer_tests);
+    const json_writer_test_step = b.step("test-json-writer", "Run JSON writer helper tests");
+    json_writer_test_step.dependOn(&run_json_writer_tests.step);
+
+    // API module inline tests (rooted at api_main so cross-directory imports resolve).
+    // Covers src/api/common.zig, src/api/loaders.zig, and any other `test` blocks
+    // transitively reachable from the API entry point.
+    const api_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/api_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
+            },
+        }),
+    });
+    api_tests.linkLibC();
+    api_tests.linkSystemLibrary("sqlite3");
+    const run_api_tests = b.addRunArtifact(api_tests);
+    run_api_tests.setCwd(b.path("."));
+    const api_test_step = b.step("test-api", "Run api-module inline tests");
+    api_test_step.dependOn(&run_api_tests.step);
+
 
     // Event filtering tests
     const events_tests = b.addTest(.{
@@ -399,6 +435,8 @@ pub fn build(b: *std.Build) void {
 
     // Make the default test command run all tests
     test_step.dependOn(&run_filter_tests.step);
+    test_step.dependOn(&run_json_writer_tests.step);
+    test_step.dependOn(&run_api_tests.step);
     test_step.dependOn(&run_events_tests.step);
     test_step.dependOn(&run_apollo_tests.step);
     test_step.dependOn(&run_variables_tests.step);
