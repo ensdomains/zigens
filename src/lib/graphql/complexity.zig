@@ -4,7 +4,7 @@ const parser = @import("parser.zig");
 /// Query complexity limits configuration
 pub const ComplexityLimits = struct {
     max_depth: u32 = 10, // Maximum nesting depth
-    max_cost: u32 = 1000, // Maximum total query cost
+    max_cost: u32 = 10000, // Maximum total query
     default_field_cost: u32 = 1, // Cost per field
     list_multiplier: u32 = 1, // Multiplier for list fields based on 'first' argument
     /// Upper bound used when the analyzer can't read a `first:` literal — e.g.
