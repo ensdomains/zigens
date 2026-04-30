@@ -226,16 +226,21 @@ pub const Client = struct {
                 const body_preview_len = @min(response_buf.written().len, 512);
                 const body_preview = response_buf.written()[0..body_preview_len];
 
-                // 4xx = permanent client error (request too big, malformed, etc.). Do not retry —
-                // signal to the caller so adaptive-chunking can halve the range and try again.
-                if (status_code >= 400 and status_code < 500) {
+                // 4xx = permanent client error (request too big, malformed, etc.) — caller's
+                // adaptive chunking can halve the range and retry. EXCEPT 408 (Request Timeout)
+                // and 429 (Too Many Requests), which are explicitly transient per HTTP spec:
+                // 408 means "server timed out waiting; resend the request", 429 is rate-limit
+                // and resolves on backoff. Treating either as permanent aborts indexing on a
+                // hiccup that retry would have absorbed (observed at deployment startup with
+                // some RPC providers returning 408 under load).
+                if (status_code >= 400 and status_code < 500 and status_code != 408 and status_code != 429) {
                     std.log.warn("HTTP {d} from RPC (permanent; not retrying). Body: {s}", .{ status_code, body_preview });
                     return error.RpcError;
                 }
 
-                // 5xx or other: transient, retry with backoff
+                // 5xx, 408, 429, and other transient: retry with backoff
                 last_error = error.HttpError;
-                std.log.warn("HTTP {d} from RPC. Body: {s}", .{ status_code, body_preview });
+                std.log.warn("HTTP {d} from RPC (transient; retrying). Body: {s}", .{ status_code, body_preview });
                 continue;
             }
 
