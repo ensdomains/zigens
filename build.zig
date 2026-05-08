@@ -10,6 +10,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // StrobeLabs/eth.zig — Ethereum primitives, ABI codecs, RPC.
+    // We're migrating off the hand-written src/indexer/abi.zig (and eventually
+    // src/rpc/client.zig) onto this. The old code is kept for fallback while
+    // the migration is in progress.
+    const eth_dep = b.dependency("eth", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const eth_module = eth_dep.module("eth");
+
     // Create GraphQL library module for use by test files
     const graphql_lib_mod = b.createModule(.{
         .root_source_file = b.path("src/lib/graphql/graphql.zig"),
@@ -26,6 +36,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
+                .{ .name = "eth", .module = eth_module },
             },
         }),
     });
@@ -42,6 +53,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
+                .{ .name = "eth", .module = eth_module },
             },
         }),
     });
@@ -58,6 +70,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
+                .{ .name = "eth", .module = eth_module },
             },
         }),
     });
@@ -146,6 +159,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
+                .{ .name = "eth", .module = eth_module },
             },
         }),
     });
@@ -162,6 +176,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "eth", .module = eth_module },
+        },
     });
 
     // Integration tests

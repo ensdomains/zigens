@@ -1,6 +1,7 @@
 const std = @import("std");
 const models = @import("../../types/models.zig");
-const abi = @import("../abi.zig");
+// ABI decoding migrated to eth.zig-backed shim. Old `../abi.zig` kept for fallback.
+const abi = @import("../abi_eth.zig");
 const rpc = @import("../../rpc/client.zig");
 const db = @import("../../storage/database.zig");
 const Query = db.Query;
@@ -25,9 +26,15 @@ pub fn handleTempHashRegistered(self: *Indexer, protocol: models.Protocol, log: 
     const label_hash = log.topics[1];
     const owner = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
 
-    // Decode non-indexed parameters (from data)
-    const value = try abi.ABI.decodeUint256(log.data, 0);
-    const registration_date = try abi.ABI.decodeUint256(log.data, 32);
+    // Non-indexed payload: (uint256 value, uint256 registrationDate)
+    const data_values = try abi.decodeValues(
+        log.data,
+        &.{ .uint256, .uint256 },
+        self.allocator,
+    );
+    defer abi.freeValues(data_values, self.allocator);
+    const value = data_values[0].uint256;
+    const registration_date = data_values[1].uint256;
 
     // Convert to hex strings for database
     const label_hash_hex = try label_hash.toHex(self.allocator);
@@ -85,7 +92,10 @@ pub fn handleTempAuctionStarted(self: *Indexer, protocol: models.Protocol, log: 
     }
 
     const label_hash = log.topics[1];
-    const registration_date = try abi.ABI.decodeUint256(log.data, 0);
+    // Non-indexed payload: (uint256 registrationDate)
+    const data_values = try abi.decodeValues(log.data, &.{.uint256}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const registration_date = data_values[0].uint256;
 
     const label_hash_hex = try label_hash.toHex(self.allocator);
     defer self.allocator.free(label_hash_hex);
@@ -128,7 +138,10 @@ pub fn handleTempNewBid(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
 
     const label_hash = log.topics[1];
     const bidder = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
-    const deposit = try abi.ABI.decodeUint256(log.data, 0);
+    // Non-indexed payload: (uint256 deposit)
+    const data_values = try abi.decodeValues(log.data, &.{.uint256}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const deposit = data_values[0].uint256;
 
     const label_hash_hex = try label_hash.toHex(self.allocator);
     defer self.allocator.free(label_hash_hex);
@@ -187,8 +200,15 @@ pub fn handleTempBidRevealed(self: *Indexer, protocol: models.Protocol, log: rpc
 
     const label_hash = log.topics[1];
     const bidder = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
-    const value = try abi.ABI.decodeUint256(log.data, 0);
-    const status = try abi.ABI.decodeUint256(log.data, 32);
+    // Non-indexed payload: (uint256 value, uint8 status)
+    const data_values = try abi.decodeValues(
+        log.data,
+        &.{ .uint256, .uint8 },
+        self.allocator,
+    );
+    defer abi.freeValues(data_values, self.allocator);
+    const value = data_values[0].uint256;
+    const status = data_values[1].uint256;
 
     const label_hash_hex = try label_hash.toHex(self.allocator);
     defer self.allocator.free(label_hash_hex);
@@ -242,7 +262,10 @@ pub fn handleTempHashReleased(self: *Indexer, protocol: models.Protocol, log: rp
     }
 
     const label_hash = log.topics[1];
-    const value = try abi.ABI.decodeUint256(log.data, 0);
+    // Non-indexed payload: (uint256 value)
+    const data_values = try abi.decodeValues(log.data, &.{.uint256}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const value = data_values[0].uint256;
 
     const label_hash_hex = try label_hash.toHex(self.allocator);
     defer self.allocator.free(label_hash_hex);
@@ -288,10 +311,17 @@ pub fn handleTempHashInvalidated(self: *Indexer, protocol: models.Protocol, log:
     }
 
     const label_hash = log.topics[1];
-    // Note: name is indexed but as a string, so it's hashed in topics[2]
-    // We need to decode the actual name from data
-    const value = try abi.ABI.decodeUint256(log.data, 0);
-    const registration_date = try abi.ABI.decodeUint256(log.data, 32);
+    // Note: `name` is declared indexed (string) so its hash sits in topics[2];
+    // the actual string is NOT in the canonical non-indexed payload.
+    // Non-indexed payload: (uint256 value, uint256 registrationDate)
+    const data_values = try abi.decodeValues(
+        log.data,
+        &.{ .uint256, .uint256 },
+        self.allocator,
+    );
+    defer abi.freeValues(data_values, self.allocator);
+    const value = data_values[0].uint256;
+    const registration_date = data_values[1].uint256;
 
     const label_hash_hex = try label_hash.toHex(self.allocator);
     defer self.allocator.free(label_hash_hex);
@@ -308,7 +338,9 @@ pub fn handleTempHashInvalidated(self: *Indexer, protocol: models.Protocol, log:
         registration_date,
     });
 
-    // Try to decode name from data (it's after the two uint256 values)
+    // Defensive: some non-canonical contract variants emit a trailing string
+    // past the canonical (uint256, uint256) payload. Stays on the primitive
+    // path because it reads bytes outside the declared schema.
     const name = if (log.data.len > 64) blk: {
         break :blk abi.ABI.decodeString(self.allocator, log.data, 64) catch "unknown";
     } else "unknown";

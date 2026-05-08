@@ -137,10 +137,9 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
     else
         base_dir;
 
-    // Convert the cursor (tx_hash-log_index) into a SKIP offset. The count must apply the
-    // SAME filters as the row query — registration types AND any registrant/expiry filters
-    // — otherwise pagination skips too many rows. Build an EventFilterOptions that mirrors
-    // what `getRegistrations` builds internally.
+    // Convert the cursor (tx_hash-log_index) into a SKIP offset. The count must
+    // apply the SAME filters as the row query so pagination doesn't skip too
+    // many rows. Reuses `reg_filter` directly (single source of truth).
     var skip: u32 = 0;
     if (params.cursor) |c| {
         const decoded = try pagination.CursorCodec.decodeString(allocator, c);
@@ -148,22 +147,8 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
         const sep = std.mem.lastIndexOfScalar(u8, decoded, '-') orelse return error.InvalidCursor;
         const tx_hash = decoded[0..sep];
         const log_index = std.fmt.parseInt(u32, decoded[sep + 1 ..], 10) catch return error.InvalidCursor;
-        const reg_types = [_][]const u8{
-            models.EventType.name_registered.toString(),
-            models.EventType.label_registered.toString(),
-        };
-        const cursor_filter = db.EventFilterOptions{
-            .event_types = &reg_types,
-            .protocol = filter_chain,
-            .data_json_owner = filter_registrant,
-            .data_json_owners = filter_registrant_in,
-            .expiry_gt = filter_expiry_gt,
-            .expiry_gte = filter_expiry_gte,
-            .expiry_lt = filter_expiry_lt,
-            .expiry_lte = filter_expiry_lte,
-        };
-        const events_before = database.countEventsBeforeCursor(tx_hash, log_index, order_dir, cursor_filter) catch 0;
-        skip = events_before +| 1; // +1 to skip past the cursor row itself
+        const rows_before = database.countRegistrationsBeforeCursor(tx_hash, log_index, order_dir, reg_filter) catch 0;
+        skip = rows_before +| 1; // +1 to skip past the cursor row itself
     }
 
     // Get registration events from database with filters applied at DB level

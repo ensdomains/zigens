@@ -2,7 +2,10 @@ const std = @import("std");
 const config = @import("../config.zig");
 const constants = @import("../constants.zig");
 const models = @import("../types/models.zig");
-const abi = @import("abi.zig");
+// ABI decoding migrated to eth.zig-backed shim. EventSignatures is re-exported
+// from the shim, so this file's `abi.EventSignatures.*` references still work.
+// Old `abi.zig` kept for fallback.
+const abi = @import("abi_eth.zig");
 const rpc = @import("../rpc/client.zig");
 const Hash = @import("../types/hash.zig").Hash;
 const Address = @import("../types/address.zig").Address;
@@ -247,6 +250,9 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
                 // Process logs from this chunk
                 transfer_total_fetched += logs.len;
                 for (logs) |log| {
+                    // Hot-path filter: schema-driven decode would allocate per
+                    // log just to read one uint256. Primitive shim path is
+                    // still eth.zig-backed (eth.uint256.fromBigEndianBytes).
                     if (log.data.len >= 32) {
                         const token_id = abi.ABI.decodeUint256(log.data, 0) catch continue;
                         if (token_id < (1 << 64)) {
@@ -282,6 +288,8 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
 
             for (logs) |log| {
                 // Quick filter 1: Check token ID entropy
+                // Hot-path: primitive shim (eth.uint256.fromBigEndianBytes) on
+                // purpose — schema-driven would allocate per log.
                 if (log.data.len >= 32) {
                     const token_id = abi.ABI.decodeUint256(log.data, 0) catch continue;
                     if (token_id < (1 << 64)) {

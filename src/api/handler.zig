@@ -151,6 +151,17 @@ pub const GraphQLHandler = struct {
                 return try self.buildErrorResponseWithCode("Invalid protocol: must be 'v1' or 'v2'", ErrorCode.INVALID_ARGUMENT);
             } else if (err == error.TooManyNames) {
                 return try self.buildErrorResponseWithCode("name_in: too many names (cap is 1000 per query)", ErrorCode.INVALID_ARGUMENT);
+            } else if (err == error.SubSelectionOnScalar) {
+                // Common porting mistake from the ENS subgraph, which exposes
+                // `texts { key value }`. Our schema declares `texts: [String!]`
+                // (keys only) and `text(key:): String` for value lookup; same
+                // for `abis: [Int!]`. Tell the client what's actually wrong.
+                return try self.buildErrorResponseWithCode(
+                    "A scalar or list-of-scalar field cannot have a subselection. " ++
+                        "Note: `texts: [String!]` returns keys only — call `text(key: \"...\")` " ++
+                        "for values; `abis: [Int!]` returns content-type IDs.",
+                    ErrorCode.VALIDATION_ERROR,
+                );
             }
             return try self.buildErrorResponseWithCode("Query execution failed", ErrorCode.EXECUTION_ERROR);
         };

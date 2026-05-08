@@ -814,11 +814,12 @@ pub const Database = struct {
     pub const getApprovalsForDelegate = ensip16.getApprovalsForDelegate;
 
     // Registrations module
-    // These functions query registration events with proper contract filtering
-    // to avoid duplicates from non-authoritative contracts
+    // Registrations read directly from the dedicated `registrations` table
+    // (schema/021), not derived from `events`. Single canonical writer per
+    // (protocol, namehash) — see registrations.zig for the full rationale.
     pub const RegistrationFilterOptions = registrations.RegistrationFilterOptions;
     pub const getRegistrations = registrations.getRegistrations;
     pub const getRegistrationCount = registrations.getRegistrationCount;
     pub const insertRegistration = registrations.insertRegistration;
-    pub const getTotalRegistrationCount = registrations.getTotalRegistrationCount;
+    pub const countRegistrationsBeforeCursor = registrations.countRegistrationsBeforeCursor;
 };

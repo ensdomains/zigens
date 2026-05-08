@@ -1,7 +1,8 @@
 const std = @import("std");
 const constants = @import("../../constants.zig");
 const models = @import("../../types/models.zig");
-const abi = @import("../abi.zig");
+// ABI decoding migrated to eth.zig-backed shim. Old `../abi.zig` kept for fallback.
+const abi = @import("../abi_eth.zig");
 const rpc = @import("../../rpc/client.zig");
 const db = @import("../../storage/database.zig");
 const Hash = @import("../../types/hash.zig").Hash;
@@ -22,7 +23,10 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
 
     const parent_node = log.topics[1];
     const labelhash = log.topics[2];
-    const owner = try abi.ABI.decodeAddress(log.data, 0);
+    // Non-indexed payload: (address owner)
+    const data_values = try abi.decodeValues(log.data, &.{.address}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const owner = Address{ .bytes = data_values[0].address };
 
     // Stack-based hex conversions (no heap allocation)
     var parent_buf: [66]u8 = undefined;
@@ -243,7 +247,10 @@ pub fn handleV1RegistryTransfer(self: *Indexer, protocol: models.Protocol, log: 
     if (log.data.len < 32) return error.InsufficientData;
 
     const node = log.topics[1];
-    const owner = try abi.ABI.decodeAddress(log.data, 0);
+    // Non-indexed payload: (address owner)
+    const data_values = try abi.decodeValues(log.data, &.{.address}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const owner = Address{ .bytes = data_values[0].address };
 
     var node_buf: [66]u8 = undefined;
     const node_hex = node.toHexBuf(&node_buf);
@@ -266,7 +273,10 @@ pub fn handleV1NewResolver(self: *Indexer, protocol: models.Protocol, log: rpc.L
     if (log.data.len < 32) return error.InsufficientData;
 
     const node = log.topics[1];
-    const resolver = try abi.ABI.decodeAddress(log.data, 0);
+    // Non-indexed payload: (address resolver)
+    const data_values = try abi.decodeValues(log.data, &.{.address}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const resolver = Address{ .bytes = data_values[0].address };
 
     var node_buf: [66]u8 = undefined;
     const node_hex = node.toHexBuf(&node_buf);
@@ -296,8 +306,10 @@ pub fn handleV1NewTTL(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !
     if (log.data.len < 32) return error.InsufficientData;
 
     const node = log.topics[1];
-    const ttl_u256 = try abi.ABI.decodeUint256(log.data, 0);
-    const ttl: u64 = @intCast(ttl_u256);
+    // Non-indexed payload: (uint64 ttl)
+    const data_values = try abi.decodeValues(log.data, &.{.uint64}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const ttl: u64 = @truncate(data_values[0].uint256);
 
     var node_buf: [66]u8 = undefined;
     const node_hex = node.toHexBuf(&node_buf);
@@ -318,20 +330,17 @@ pub fn handleV1NameWrapped(self: *Indexer, protocol: models.Protocol, log: rpc.L
 
     const node = log.topics[1];
 
-    // Decode name (bytes - dynamic length)
-    const name_bytes = try abi.ABI.decodeBytes(self.allocator, log.data, 0);
-    defer self.allocator.free(name_bytes);
-
-    // Decode owner address (word 1, offset 32)
-    const owner = try abi.ABI.decodeAddress(log.data, 32);
-
-    // Decode fuses (uint32, word 2, offset 64)
-    const fuses_u256 = try abi.ABI.decodeUint256(log.data, 64);
-    const fuses: u32 = @intCast(fuses_u256);
-
-    // Decode expiry (uint64, word 3, offset 96)
-    const expiry_u256 = try abi.ABI.decodeUint256(log.data, 96);
-    const expiry: u64 = @truncate(expiry_u256);
+    // Non-indexed payload: (bytes name, address owner, uint32 fuses, uint64 expiry)
+    const data_values = try abi.decodeValues(
+        log.data,
+        &.{ .bytes, .address, .uint32, .uint64 },
+        self.allocator,
+    );
+    defer abi.freeValues(data_values, self.allocator);
+    const name_bytes = data_values[0].bytes;
+    const owner = Address{ .bytes = data_values[1].address };
+    const fuses: u32 = @truncate(data_values[2].uint256);
+    const expiry: u64 = @truncate(data_values[3].uint256);
 
     var node_buf: [66]u8 = undefined;
     const node_hex = node.toHexBuf(&node_buf);
@@ -371,8 +380,10 @@ pub fn handleV1NameUnwrapped(self: *Indexer, protocol: models.Protocol, log: rpc
 
     const node = log.topics[1];
 
-    // Decode owner address from data
-    const owner = try abi.ABI.decodeAddress(log.data, 0);
+    // Non-indexed payload: (address owner)
+    const data_values = try abi.decodeValues(log.data, &.{.address}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const owner = Address{ .bytes = data_values[0].address };
 
     var node_buf: [66]u8 = undefined;
     const node_hex = node.toHexBuf(&node_buf);
@@ -406,9 +417,10 @@ pub fn handleV1FusesSet(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
 
     const node = log.topics[1];
 
-    // Decode fuses from data (uint32, but padded to 32 bytes)
-    const fuses_u256 = try abi.ABI.decodeUint256(log.data, 0);
-    const fuses: u32 = @intCast(fuses_u256);
+    // Non-indexed payload: (uint32 fuses)
+    const data_values = try abi.decodeValues(log.data, &.{.uint32}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const fuses: u32 = @truncate(data_values[0].uint256);
 
     var node_buf: [66]u8 = undefined;
     const node_hex = node.toHexBuf(&node_buf);
@@ -443,9 +455,10 @@ pub fn handleV1ExpiryExtended(self: *Indexer, protocol: models.Protocol, log: rp
 
     const node = log.topics[1];
 
-    // Decode expiry from data (uint64, but padded to 32 bytes)
-    const expiry_u256 = try abi.ABI.decodeUint256(log.data, 0);
-    const expiry: u64 = @truncate(expiry_u256);
+    // Non-indexed payload: (uint64 expiry)
+    const data_values = try abi.decodeValues(log.data, &.{.uint64}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const expiry: u64 = @truncate(data_values[0].uint256);
 
     var node_buf: [66]u8 = undefined;
     const node_hex = node.toHexBuf(&node_buf);
@@ -579,8 +592,10 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, protocol: models.Prot
     const token_id = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
     const owner = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
 
-    // Decode expires from data
-    const expires = try abi.ABI.decodeUint256(log.data, 0);
+    // Non-indexed payload: (uint256 expires)
+    const data_values = try abi.decodeValues(log.data, &.{.uint256}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const expires = data_values[0].uint256;
 
     var owner_buf: [42]u8 = undefined;
     const owner_hex = owner.toHexBuf(&owner_buf);
@@ -657,6 +672,25 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, protocol: models.Prot
             try names_storage.insertName(self.database, name_record);
         }
 
+        // Canonical V1 registration row. V1 has only this one event type per
+        // registration (no LabelRegistered analog), so we always write here.
+        const expiry_u64: u64 = @truncate(expires);
+        self.database.insertRegistration(
+            protocol,
+            namehash,
+            label,
+            "eth",
+            owner,
+            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+            if (expiry_u64 == 0) null else expiry_u64,
+            log.block_number,
+            log.transaction_hash,
+            log.log_index,
+            .name_registered,
+        ) catch |err| {
+            std.log.warn("insertRegistration failed for {s}: {}", .{ full_name, err });
+        };
+
         // Store event with name and namehash
         const event_data = try std.fmt.allocPrint(self.allocator, "{{\"id\":\"{s}\",\"name\":\"{s}\",\"owner\":\"{s}\",\"expires\":{d}}}", .{
             token_id_hex,
@@ -694,8 +728,10 @@ pub fn handleV1BaseRegistrarNameRenewed(self: *Indexer, protocol: models.Protoco
 
     const token_id = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
 
-    // Decode expires from data
-    const expires = try abi.ABI.decodeUint256(log.data, 0);
+    // Non-indexed payload: (uint256 expires)
+    const data_values = try abi.decodeValues(log.data, &.{.uint256}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const expires = data_values[0].uint256;
 
     std.log.debug("V1 BaseRegistrar NameRenewed: id={d} expires={d}", .{ token_id, expires });
 
@@ -809,21 +845,22 @@ pub fn handleV1ETHControllerNameRegistered(self: *Indexer, protocol: models.Prot
     const label_hash = log.topics[1];
     const owner = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
 
-    // Decode data: name (string), cost (uint256), expires (uint256)
-    // Note: V1 Controller has only 2 non-indexed parameters (cost, expires), NOT 3
-    // Note: name ownership is transferred to the Event struct, so don't free it here
-    // name is a dynamic type, so it starts with an offset pointer
-    const name = try abi.ABI.decodeString(self.allocator, log.data, 0);
-
-    // cost, expires are after the string data
-    // Skip to second word for cost (after string offset pointer and string data)
-    var offset: usize = 32; // Skip string offset
-    const str_len_offset = try abi.ABI.decodeUint256(log.data, 0);
-    offset = @intCast(str_len_offset + 32 + ((name.len + 31) / 32) * 32); // String length + padded string data
-
-    const cost = if (offset < log.data.len) try abi.ABI.decodeUint256(log.data, offset) else 0;
-    offset += 32;
-    const expires = if (offset < log.data.len) try abi.ABI.decodeUint256(log.data, offset) else 0;
+    // Non-indexed payload: (string name, uint256 cost, uint256 expires).
+    // Schema-driven decode replaces a previous manual offset walk over the
+    // string tail. (V1 Controller emits 2 non-indexed uints — base+expires —
+    // not 3 like the newer baseCost/premium/expires variant.)
+    const data_values = try abi.decodeValues(
+        log.data,
+        &.{ .string, .uint256, .uint256 },
+        self.allocator,
+    );
+    defer abi.freeValues(data_values, self.allocator);
+    const name_borrow = data_values[0].string;
+    const cost = data_values[1].uint256;
+    const expires = data_values[2].uint256;
+    // emitEvent takes ownership of the name; dupe out of the borrowed slice.
+    const name = try self.allocator.dupe(u8, name_borrow);
+    errdefer self.allocator.free(name);
 
     var owner_buf: [42]u8 = undefined;
     const owner_hex = owner.toHexBuf(&owner_buf);
@@ -880,18 +917,21 @@ pub fn handleV1ETHControllerNameRenewed(self: *Indexer, protocol: models.Protoco
 
     const label_hash = log.topics[1];
 
-    // Decode data: name (string), cost (uint256), expires (uint256)
-    // Note: name ownership is transferred to the Event struct, so don't free it here
-    const name = try abi.ABI.decodeString(self.allocator, log.data, 0);
-
-    // cost and expires are after the string data
-    var offset: usize = 32; // Skip string offset
-    const str_len_offset = try abi.ABI.decodeUint256(log.data, 0);
-    offset = @intCast(str_len_offset + 32 + ((name.len + 31) / 32) * 32);
-
-    const cost = if (offset < log.data.len) try abi.ABI.decodeUint256(log.data, offset) else 0;
-    offset += 32;
-    const expires = if (offset < log.data.len) try abi.ABI.decodeUint256(log.data, offset) else 0;
+    // Non-indexed payload: (string name, uint256 cost, uint256 expires).
+    // Schema-driven decode replaces a previous manual offset walk over the
+    // string tail.
+    const data_values = try abi.decodeValues(
+        log.data,
+        &.{ .string, .uint256, .uint256 },
+        self.allocator,
+    );
+    defer abi.freeValues(data_values, self.allocator);
+    const name_borrow = data_values[0].string;
+    const cost = data_values[1].uint256;
+    const expires = data_values[2].uint256;
+    // emitEvent takes ownership of the name; dupe out of the borrowed slice.
+    const name = try self.allocator.dupe(u8, name_borrow);
+    errdefer self.allocator.free(name);
 
     var label_hash_buf: [66]u8 = undefined;
     const label_hash_hex = label_hash.toHexBuf(&label_hash_buf);

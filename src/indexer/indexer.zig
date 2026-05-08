@@ -4,7 +4,9 @@ const constants = @import("../constants.zig");
 const db = @import("../storage/database.zig");
 const rpc = @import("../rpc/client.zig");
 const models = @import("../types/models.zig");
-const abi = @import("abi.zig");
+// EventSignatures consumed via the eth.zig-backed shim (re-exports them).
+// Old `abi.zig` kept for fallback.
+const abi = @import("abi_eth.zig");
 const Hash = @import("../types/hash.zig").Hash;
 const Address = @import("../types/address.zig").Address;
 const webhooks = @import("../webhooks/manager.zig");
@@ -701,11 +703,19 @@ pub const Indexer = struct {
                 // Handle errors gracefully based on type
                 switch (err) {
                     error.HttpError, error.NetworkUnreachable, error.ConnectionRefused, error.ConnectionTimedOut, error.ConnectionResetByPeer, error.WriteFailed, error.BrokenPipe, error.EndOfStream, error.UnexpectedReadFailure => {
-                        // Network error - wait for connection to be restored
+                        // Network error - wait for connection to be restored.
                         std.log.warn("{s} network error detected: {}, waiting for connection...", .{ protocol.toString(), err });
                         network_health.waitForHealthy();
                         std.log.info("{s} network restored, continuing...", .{protocol.toString()});
-                        // No sleep - continue immediately after network is back
+                        // 1s breather before retry. Bounds log volume during a
+                        // sustained outage and prevents the tight spin we'd
+                        // otherwise hit when `network_health.waitForHealthy()`
+                        // (which uses a fresh http.Client) reports healthy
+                        // while the indexer's pooled client is still failing.
+                        // Inner `executeHttpRequest` retries already cover
+                        // transient TLS/socket recovery, so anything beyond
+                        // 1s is redundant.
+                        std.Thread.sleep(std.time.ns_per_s);
                         continue;
                     },
                     else => {

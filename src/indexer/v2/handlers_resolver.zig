@@ -1,6 +1,8 @@
 const std = @import("std");
 const models = @import("../../types/models.zig");
-const abi = @import("../abi.zig");
+// ABI decoding migrated to eth.zig-backed shim. Old `../abi.zig` kept for
+// fallback. This file uses no EventSignatures, so the swap is wholesale.
+const abi = @import("../abi_eth.zig");
 const rpc = @import("../../rpc/client.zig");
 const Hash = @import("../../types/hash.zig").Hash;
 const Address = @import("../../types/address.zig").Address;
@@ -18,8 +20,10 @@ pub fn handleLegacyAddrChanged(self: *Indexer, protocol: models.Protocol, resolv
     if (log.topics.len < 2) return error.InvalidTopicCount;
     var namehash = log.topics[1];
 
-    // Decode address from data (20 bytes, left-padded to 32)
-    const addr = try abi.ABI.decodeAddress(log.data, 0);
+    // Non-indexed payload: (address a)
+    const data_values = try abi.decodeValues(log.data, &.{.address}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const addr = Address{ .bytes = data_values[0].address };
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "AddrChanged")) return;
 
@@ -70,8 +74,10 @@ pub fn handleLegacyContentChanged(self: *Indexer, protocol: models.Protocol, res
     if (log.topics.len < 2) return error.InvalidTopicCount;
     var namehash = log.topics[1];
 
-    // Decode bytes32 content hash from data
-    const content_hash = try abi.ABI.decodeBytes32(log.data, 0);
+    // Non-indexed payload: (bytes32 hash)
+    const data_values = try abi.decodeValues(log.data, &.{.bytes32}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const content_hash = Hash{ .bytes = data_values[0].fixed_bytes.data };
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "ContentChanged")) return;
 
@@ -124,10 +130,11 @@ pub fn handleAddressChanged(self: *Indexer, protocol: models.Protocol, resolver:
     if (log.topics.len < 2) return error.InvalidTopicCount;
     var namehash = log.topics[1];
 
-    // Decode coin type and address from data
-    const coin_type = try abi.ABI.decodeUint256(log.data, 0);
-    const address_bytes = try abi.ABI.decodeBytes(self.allocator, log.data, 32);
-    defer self.allocator.free(address_bytes);
+    // Non-indexed payload: (uint256 coinType, bytes newAddress)
+    const data_values = try abi.decodeValues(log.data, &.{ .uint256, .bytes }, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const coin_type = data_values[0].uint256;
+    const address_bytes = data_values[1].bytes;
 
     // Convert address bytes to hex string
     var address_hex = try self.allocator.alloc(u8, 2 + address_bytes.len * 2);
@@ -187,9 +194,10 @@ pub fn handleContentHashChanged(self: *Indexer, protocol: models.Protocol, resol
     if (log.topics.len < 2) return error.InvalidTopicCount;
     var namehash = log.topics[1];
 
-    // Decode content hash from data
-    const content_hash_bytes = try abi.ABI.decodeBytes(self.allocator, log.data, 0);
-    defer self.allocator.free(content_hash_bytes);
+    // Non-indexed payload: (bytes hash)
+    const data_values = try abi.decodeValues(log.data, &.{.bytes}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const content_hash_bytes = data_values[0].bytes;
 
     // Convert to hex string
     var content_hash_hex = try self.allocator.alloc(u8, 2 + content_hash_bytes.len * 2);
@@ -247,12 +255,11 @@ pub fn handleTextChanged(self: *Indexer, protocol: models.Protocol, resolver: Ad
     if (log.topics.len < 2) return error.InvalidTopicCount;
     var namehash = log.topics[1];
 
-    // Decode key and value from data
-    const key = try abi.ABI.decodeString(self.allocator, log.data, 0);
-    defer self.allocator.free(key);
-
-    const value = try abi.ABI.decodeString(self.allocator, log.data, 32);
-    defer self.allocator.free(value);
+    // Non-indexed payload: (string key, string value)
+    const data_values = try abi.decodeValues(log.data, &.{ .string, .string }, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const key = data_values[0].string;
+    const value = data_values[1].string;
 
     // Validate key and value are valid UTF-8 and contain no dangerous control characters
     unicode.validateString(key) catch |err| {
@@ -369,11 +376,11 @@ pub fn handlePubkeyChanged(self: *Indexer, protocol: models.Protocol, resolver: 
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "PubkeyChanged")) return;
 
-    // Data contains x and y coordinates (each 32 bytes)
-    if (log.data.len < 64) return error.InsufficientData;
-
-    const x = try abi.ABI.decodeBytes32(log.data, 0);
-    const y = try abi.ABI.decodeBytes32(log.data, 32);
+    // Non-indexed payload: (bytes32 x, bytes32 y)
+    const data_values = try abi.decodeValues(log.data, &.{ .bytes32, .bytes32 }, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const x = Hash{ .bytes = data_values[0].fixed_bytes.data };
+    const y = Hash{ .bytes = data_values[1].fixed_bytes.data };
 
     const nh_hex_log = try namehash.toHex(self.allocator);
     defer self.allocator.free(nh_hex_log);
@@ -433,9 +440,10 @@ pub fn handleNameChanged(self: *Indexer, protocol: models.Protocol, resolver: Ad
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "NameChanged")) return;
 
-    // Decode name from data
-    const name = try abi.ABI.decodeString(self.allocator, log.data, 0);
-    defer self.allocator.free(name);
+    // Non-indexed payload: (string name)
+    const data_values = try abi.decodeValues(log.data, &.{.string}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const name = data_values[0].string;
 
     // Validate name is valid UTF-8
     unicode.validateString(name) catch |err| {
@@ -498,8 +506,10 @@ pub fn handleInterfaceChanged(self: *Indexer, protocol: models.Protocol, resolve
     // Interface ID is a bytes4, left-aligned (right-padded) in the 32-byte topic
     const interface_id_bytes = log.topics[2].bytes[0..4];
 
-    // Decode implementer address from data
-    const implementer = try abi.ABI.decodeAddress(log.data, 0);
+    // Non-indexed payload: (address implementer)
+    const data_values = try abi.decodeValues(log.data, &.{.address}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const implementer = Address{ .bytes = data_values[0].address };
 
     // Convert interface ID to hex string
     var interface_id_hex = try self.allocator.alloc(u8, 10); // "0x" + 8 hex chars
@@ -564,11 +574,13 @@ pub fn handleVersionChanged(self: *Indexer, protocol: models.Protocol, resolver:
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "VersionChanged")) return;
 
-    // Decode newVersion from data (uint64 encoded as uint256)
+    // Non-indexed payload: (uint64 newVersion)
     var new_version: u64 = 0;
     if (log.data.len >= 32) {
-        const version_u256 = abi.ABI.decodeUint256(log.data, 0) catch 0;
-        new_version = @truncate(version_u256);
+        if (abi.decodeValues(log.data, &.{.uint64}, self.allocator)) |values| {
+            defer abi.freeValues(values, self.allocator);
+            new_version = @truncate(values[0].uint256);
+        } else |_| {}
     }
 
     const nh_hex_log = try namehash.toHex(self.allocator);
@@ -641,19 +653,14 @@ pub fn handleAliasChanged(self: *Indexer, protocol: models.Protocol, resolver: A
     // topics[2] = keccak256(toName) — indexed bytes are hashed, not directly useful
     // data = ABI-encoded (bytes fromName, bytes toName)
 
-    // Decode fromName (first dynamic bytes in data)
-    const from_dns_bytes = abi.ABI.decodeBytes(self.allocator, log.data, 0) catch |err| {
-        std.log.warn("AliasChanged: failed to decode fromName bytes: {}", .{err});
+    // Non-indexed payload: (bytes fromName, bytes toName)
+    const data_values = abi.decodeValues(log.data, &.{ .bytes, .bytes }, self.allocator) catch |err| {
+        std.log.warn("AliasChanged: failed to decode payload: {}", .{err});
         return;
     };
-    defer self.allocator.free(from_dns_bytes);
-
-    // Decode toName (second dynamic bytes in data)
-    const to_dns_bytes = abi.ABI.decodeBytes(self.allocator, log.data, 32) catch |err| {
-        std.log.warn("AliasChanged: failed to decode toName bytes: {}", .{err});
-        return;
-    };
-    defer self.allocator.free(to_dns_bytes);
+    defer abi.freeValues(data_values, self.allocator);
+    const from_dns_bytes = data_values[0].bytes;
+    const to_dns_bytes = data_values[1].bytes;
 
     // Decode DNS wire format to human-readable names
     const from_name = decodeDnsWireFormat(self.allocator, from_dns_bytes) catch |err| {
