@@ -10,13 +10,16 @@
         {
           "kind": "OBJECT",
           "name": "Query",
+          "description": null,
           "interfaces": [],
           "fields": [
             {
               "name": "domain",
+              "description": "Get a single domain by name or namehash",
               "args": [
                 {
                   "name": "id",
+                  "description": null,
                   "type": {
                     "kind": "NON_NULL",
                     "ofType": {
@@ -29,13 +32,17 @@
               "type": {
                 "kind": "OBJECT",
                 "name": "Domain"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "domains",
+              "description": "Get multiple domains with pagination and filtering (legacy offset-based)",
               "args": [
                 {
                   "name": "first",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "Int"
@@ -43,6 +50,7 @@
                 },
                 {
                   "name": "skip",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "Int"
@@ -50,6 +58,7 @@
                 },
                 {
                   "name": "where",
+                  "description": null,
                   "type": {
                     "kind": "INPUT_OBJECT",
                     "name": "DomainFilter"
@@ -57,6 +66,7 @@
                 },
                 {
                   "name": "orderBy",
+                  "description": null,
                   "type": {
                     "kind": "ENUM",
                     "name": "Domain_orderBy"
@@ -64,6 +74,7 @@
                 },
                 {
                   "name": "orderDirection",
+                  "description": null,
                   "type": {
                     "kind": "ENUM",
                     "name": "OrderDirection"
@@ -82,13 +93,17 @@
                     }
                   }
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "domainConnection",
+              "description": "Get multiple domains with cursor-based pagination (recommended)",
               "args": [
                 {
                   "name": "first",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "Int"
@@ -96,6 +111,7 @@
                 },
                 {
                   "name": "after",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "String"
@@ -103,6 +119,7 @@
                 },
                 {
                   "name": "last",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "Int"
@@ -110,6 +127,7 @@
                 },
                 {
                   "name": "before",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "String"
@@ -117,6 +135,7 @@
                 },
                 {
                   "name": "where",
+                  "description": null,
                   "type": {
                     "kind": "INPUT_OBJECT",
                     "name": "DomainFilter"
@@ -124,6 +143,7 @@
                 },
                 {
                   "name": "orderBy",
+                  "description": null,
                   "type": {
                     "kind": "ENUM",
                     "name": "Domain_orderBy"
@@ -131,6 +151,7 @@
                 },
                 {
                   "name": "orderDirection",
+                  "description": null,
                   "type": {
                     "kind": "ENUM",
                     "name": "OrderDirection"
@@ -143,13 +164,17 @@
                   "kind": "OBJECT",
                   "name": "DomainConnection"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "account",
+              "description": "Get account information by address",
               "args": [
                 {
                   "name": "id",
+                  "description": null,
                   "type": {
                     "kind": "NON_NULL",
                     "ofType": {
@@ -162,13 +187,17 @@
               "type": {
                 "kind": "OBJECT",
                 "name": "Account"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "registrations",
+              "description": "Get domain registrations with pagination (legacy offset-based)",
               "args": [
                 {
                   "name": "first",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "Int"
@@ -176,6 +205,7 @@
                 },
                 {
                   "name": "skip",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "Int"
@@ -183,6 +213,7 @@
                 },
                 {
                   "name": "where",
+                  "description": null,
                   "type": {
                     "kind": "INPUT_OBJECT",
                     "name": "RegistrationFilter"
@@ -190,6 +221,7 @@
                 },
                 {
                   "name": "orderBy",
+                  "description": null,
                   "type": {
                     "kind": "ENUM",
                     "name": "Registration_orderBy"
@@ -197,6 +229,7 @@
                 },
                 {
                   "name": "orderDirection",
+                  "description": null,
                   "type": {
                     "kind": "ENUM",
                     "name": "OrderDirection"
@@ -215,13 +248,17 @@
                     }
                   }
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "registrationConnection",
+              "description": "Get domain registrations with cursor-based pagination (recommended)",
               "args": [
                 {
                   "name": "first",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "Int"
@@ -229,6 +266,7 @@
                 },
                 {
                   "name": "after",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "String"
@@ -236,6 +274,7 @@
                 },
                 {
                   "name": "last",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "Int"
@@ -243,6 +282,7 @@
                 },
                 {
                   "name": "before",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "String"
@@ -250,6 +290,7 @@
                 },
                 {
                   "name": "where",
+                  "description": null,
                   "type": {
                     "kind": "INPUT_OBJECT",
                     "name": "RegistrationFilter"
@@ -257,6 +298,7 @@
                 },
                 {
                   "name": "orderBy",
+                  "description": null,
                   "type": {
                     "kind": "ENUM",
                     "name": "Registration_orderBy"
@@ -264,6 +306,7 @@
                 },
                 {
                   "name": "orderDirection",
+                  "description": null,
                   "type": {
                     "kind": "ENUM",
                     "name": "OrderDirection"
@@ -276,13 +319,17 @@
                   "kind": "OBJECT",
                   "name": "RegistrationConnection"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "events",
+              "description": "Get events with pagination (legacy offset-based)",
               "args": [
                 {
                   "name": "first",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "Int"
@@ -290,6 +337,7 @@
                 },
                 {
                   "name": "skip",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "Int"
@@ -297,6 +345,7 @@
                 },
                 {
                   "name": "where",
+                  "description": null,
                   "type": {
                     "kind": "INPUT_OBJECT",
                     "name": "EventFilter"
@@ -304,6 +353,7 @@
                 },
                 {
                   "name": "orderBy",
+                  "description": null,
                   "type": {
                     "kind": "ENUM",
                     "name": "Event_orderBy"
@@ -311,6 +361,7 @@
                 },
                 {
                   "name": "orderDirection",
+                  "description": null,
                   "type": {
                     "kind": "ENUM",
                     "name": "OrderDirection"
@@ -329,13 +380,17 @@
                     }
                   }
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "eventConnection",
+              "description": "Get events with cursor-based pagination (recommended)",
               "args": [
                 {
                   "name": "first",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "Int"
@@ -343,6 +398,7 @@
                 },
                 {
                   "name": "after",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "String"
@@ -350,6 +406,7 @@
                 },
                 {
                   "name": "last",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "Int"
@@ -357,6 +414,7 @@
                 },
                 {
                   "name": "before",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "String"
@@ -364,6 +422,7 @@
                 },
                 {
                   "name": "where",
+                  "description": null,
                   "type": {
                     "kind": "INPUT_OBJECT",
                     "name": "EventFilter"
@@ -371,6 +430,7 @@
                 },
                 {
                   "name": "orderBy",
+                  "description": null,
                   "type": {
                     "kind": "ENUM",
                     "name": "Event_orderBy"
@@ -378,6 +438,7 @@
                 },
                 {
                   "name": "orderDirection",
+                  "description": null,
                   "type": {
                     "kind": "ENUM",
                     "name": "OrderDirection"
@@ -390,13 +451,17 @@
                   "kind": "OBJECT",
                   "name": "EventConnection"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "roles",
+              "description": "Get EAC role assignments",
               "args": [
                 {
                   "name": "resource",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "String"
@@ -404,6 +469,7 @@
                 },
                 {
                   "name": "account",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "String"
@@ -422,13 +488,17 @@
                     }
                   }
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "roleConnection",
+              "description": "Get EAC role assignments with cursor-based pagination (recommended)",
               "args": [
                 {
                   "name": "first",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "Int"
@@ -436,6 +506,7 @@
                 },
                 {
                   "name": "after",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "String"
@@ -443,6 +514,7 @@
                 },
                 {
                   "name": "last",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "Int"
@@ -450,6 +522,7 @@
                 },
                 {
                   "name": "before",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "String"
@@ -457,6 +530,7 @@
                 },
                 {
                   "name": "resource",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "String"
@@ -464,6 +538,7 @@
                 },
                 {
                   "name": "account",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "String"
@@ -476,13 +551,17 @@
                   "kind": "OBJECT",
                   "name": "EACRoleAssignmentConnection"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "resolvers",
+              "description": "Get dedicated resolvers for an account",
               "args": [
                 {
                   "name": "account",
+                  "description": null,
                   "type": {
                     "kind": "NON_NULL",
                     "ofType": {
@@ -504,13 +583,17 @@
                     }
                   }
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "registries",
+              "description": "Get registries owned by an account",
               "args": [
                 {
                   "name": "owner",
+                  "description": null,
                   "type": {
                     "kind": "NON_NULL",
                     "ofType": {
@@ -532,13 +615,17 @@
                     }
                   }
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "metadata",
+              "description": "Get ENSIP-16 resolver metadata (offchain GraphQL endpoint)",
               "args": [
                 {
                   "name": "resolver",
+                  "description": null,
                   "type": {
                     "kind": "NON_NULL",
                     "ofType": {
@@ -551,13 +638,17 @@
               "type": {
                 "kind": "OBJECT",
                 "name": "ResolverMetadata"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "approvals",
+              "description": "Get ENSIP-16 resolver approvals/delegations",
               "args": [
                 {
                   "name": "namehash",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "String"
@@ -565,6 +656,7 @@
                 },
                 {
                   "name": "delegate",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "String"
@@ -583,13 +675,17 @@
                     }
                   }
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "resolver",
+              "description": "Get resolver information by contract address",
               "args": [
                 {
                   "name": "id",
+                  "description": null,
                   "type": {
                     "kind": "NON_NULL",
                     "ofType": {
@@ -602,17 +698,21 @@
               "type": {
                 "kind": "OBJECT",
                 "name": "ResolverDetail"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             }
           ]
         },
         {
           "kind": "OBJECT",
           "name": "PageInfo",
+          "description": "Information about pagination in a connection\nFollows the Relay Cursor Connections Specification",
           "interfaces": [],
           "fields": [
             {
               "name": "hasNextPage",
+              "description": "When paginating forwards, are there more items?",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -620,10 +720,13 @@
                   "kind": "SCALAR",
                   "name": "Boolean"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "hasPreviousPage",
+              "description": "When paginating backwards, are there more items?",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -631,33 +734,43 @@
                   "kind": "SCALAR",
                   "name": "Boolean"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "startCursor",
+              "description": "When paginating backwards, the cursor to continue",
               "args": [],
               "type": {
                 "kind": "SCALAR",
                 "name": "String"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "endCursor",
+              "description": "When paginating forwards, the cursor to continue",
               "args": [],
               "type": {
                 "kind": "SCALAR",
                 "name": "String"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             }
           ]
         },
         {
           "kind": "OBJECT",
           "name": "DomainEdge",
+          "description": "An edge in a Domain connection",
           "interfaces": [],
           "fields": [
             {
               "name": "cursor",
+              "description": "A cursor for use in pagination",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -665,10 +778,13 @@
                   "kind": "SCALAR",
                   "name": "String"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "node",
+              "description": "The item at the end of the edge",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -676,17 +792,21 @@
                   "kind": "OBJECT",
                   "name": "Domain"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             }
           ]
         },
         {
           "kind": "OBJECT",
           "name": "DomainConnection",
+          "description": "A connection to a list of Domains",
           "interfaces": [],
           "fields": [
             {
               "name": "pageInfo",
+              "description": "Information to aid in pagination",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -694,10 +814,13 @@
                   "kind": "OBJECT",
                   "name": "PageInfo"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "edges",
+              "description": "A list of edges",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -711,25 +834,32 @@
                     }
                   }
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "totalCount",
+              "description": "Total count of items (may be expensive to compute)",
               "args": [],
               "type": {
                 "kind": "SCALAR",
                 "name": "Int"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             }
           ]
         },
         {
           "kind": "OBJECT",
           "name": "RegistrationEdge",
+          "description": "An edge in a Registration connection",
           "interfaces": [],
           "fields": [
             {
               "name": "cursor",
+              "description": "A cursor for use in pagination",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -737,10 +867,13 @@
                   "kind": "SCALAR",
                   "name": "String"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "node",
+              "description": "The item at the end of the edge",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -748,17 +881,21 @@
                   "kind": "OBJECT",
                   "name": "Registration"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             }
           ]
         },
         {
           "kind": "OBJECT",
           "name": "RegistrationConnection",
+          "description": "A connection to a list of Registrations",
           "interfaces": [],
           "fields": [
             {
               "name": "pageInfo",
+              "description": "Information to aid in pagination",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -766,10 +903,13 @@
                   "kind": "OBJECT",
                   "name": "PageInfo"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "edges",
+              "description": "A list of edges",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -783,25 +923,32 @@
                     }
                   }
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "totalCount",
+              "description": "Total count of items (may be expensive to compute)",
               "args": [],
               "type": {
                 "kind": "SCALAR",
                 "name": "Int"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             }
           ]
         },
         {
           "kind": "OBJECT",
           "name": "EventEdge",
+          "description": "An edge in an Event connection",
           "interfaces": [],
           "fields": [
             {
               "name": "cursor",
+              "description": "A cursor for use in pagination",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -809,10 +956,13 @@
                   "kind": "SCALAR",
                   "name": "String"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "node",
+              "description": "The item at the end of the edge",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -820,17 +970,21 @@
                   "kind": "OBJECT",
                   "name": "Event"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             }
           ]
         },
         {
           "kind": "OBJECT",
           "name": "EventConnection",
+          "description": "A connection to a list of Events",
           "interfaces": [],
           "fields": [
             {
               "name": "pageInfo",
+              "description": "Information to aid in pagination",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -838,10 +992,13 @@
                   "kind": "OBJECT",
                   "name": "PageInfo"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "edges",
+              "description": "A list of edges",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -855,25 +1012,32 @@
                     }
                   }
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "totalCount",
+              "description": "Total count of items (may be expensive to compute)",
               "args": [],
               "type": {
                 "kind": "SCALAR",
                 "name": "Int"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             }
           ]
         },
         {
           "kind": "OBJECT",
           "name": "EACRoleAssignmentEdge",
+          "description": "An edge in an EACRoleAssignment connection",
           "interfaces": [],
           "fields": [
             {
               "name": "cursor",
+              "description": "A cursor for use in pagination",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -881,10 +1045,13 @@
                   "kind": "SCALAR",
                   "name": "String"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "node",
+              "description": "The item at the end of the edge",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -892,17 +1059,21 @@
                   "kind": "OBJECT",
                   "name": "EACRoleAssignment"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             }
           ]
         },
         {
           "kind": "OBJECT",
           "name": "EACRoleAssignmentConnection",
+          "description": "A connection to a list of EACRoleAssignments",
           "interfaces": [],
           "fields": [
             {
               "name": "pageInfo",
+              "description": "Information to aid in pagination",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -910,10 +1081,13 @@
                   "kind": "OBJECT",
                   "name": "PageInfo"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "edges",
+              "description": "A list of edges",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -927,25 +1101,32 @@
                     }
                   }
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "totalCount",
+              "description": "Total count of items (may be expensive to compute)",
               "args": [],
               "type": {
                 "kind": "SCALAR",
                 "name": "Int"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             }
           ]
         },
         {
           "kind": "OBJECT",
           "name": "Domain",
+          "description": "An ENS domain name",
           "interfaces": [],
           "fields": [
             {
               "name": "id",
+              "description": "Domain identifier (name or namehash)",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -953,42 +1134,57 @@
                   "kind": "SCALAR",
                   "name": "String"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "name",
+              "description": "Full domain name (e.g., 'vitalik.eth')",
               "args": [],
               "type": {
                 "kind": "SCALAR",
                 "name": "String"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "labelName",
+              "description": "Label only (e.g., 'vitalik' for 'vitalik.eth')",
               "args": [],
               "type": {
                 "kind": "SCALAR",
                 "name": "String"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "labelhash",
+              "description": "Keccak256 hash of the label",
               "args": [],
               "type": {
                 "kind": "SCALAR",
                 "name": "String"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "parent",
+              "description": "Parent domain",
               "args": [],
               "type": {
                 "kind": "OBJECT",
                 "name": "Domain"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "subdomains",
+              "description": "Subdomains of this domain",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -1002,18 +1198,24 @@
                     }
                   }
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "resolvedAddress",
+              "description": "Address this domain resolves to",
               "args": [],
               "type": {
                 "kind": "OBJECT",
                 "name": "Account"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "owner",
+              "description": "Current owner of the domain",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -1021,26 +1223,35 @@
                   "kind": "OBJECT",
                   "name": "Account"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "resolver",
+              "description": "Resolver contract for this domain",
               "args": [],
               "type": {
                 "kind": "OBJECT",
                 "name": "Resolver"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "ttl",
+              "description": "Time-to-live for DNS records",
               "args": [],
               "type": {
                 "kind": "SCALAR",
                 "name": "Int"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "isMigrated",
+              "description": "Whether this domain has been migrated to V2",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -1048,10 +1259,13 @@
                   "kind": "SCALAR",
                   "name": "Boolean"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "createdAt",
+              "description": "Timestamp when domain was created",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -1059,66 +1273,90 @@
                   "kind": "SCALAR",
                   "name": "Int"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "registrationDate",
+              "description": "Timestamp when domain was registered",
               "args": [],
               "type": {
                 "kind": "SCALAR",
                 "name": "Int"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "registrant",
+              "description": "Original registrant of the domain",
               "args": [],
               "type": {
                 "kind": "OBJECT",
                 "name": "Account"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "expiryDate",
+              "description": "Timestamp when domain expires",
               "args": [],
               "type": {
                 "kind": "SCALAR",
                 "name": "Int"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "tokenId",
+              "description": "ERC-721 token ID for this domain",
               "args": [],
               "type": {
                 "kind": "SCALAR",
                 "name": "String"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "canonicalId",
+              "description": "Canonical token ID (without version bits)",
               "args": [],
               "type": {
                 "kind": "SCALAR",
                 "name": "String"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "tokenVersion",
+              "description": "Token version number",
               "args": [],
               "type": {
                 "kind": "SCALAR",
                 "name": "Int"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "normalizedName",
+              "description": "ENSIP-15 normalized name (null if normalization fails)",
               "args": [],
               "type": {
                 "kind": "SCALAR",
                 "name": "String"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "isNormalized",
+              "description": "Whether the name passes ENSIP-15 normalization (computed at query time)",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -1126,13 +1364,17 @@
                   "kind": "SCALAR",
                   "name": "Boolean"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "events",
+              "description": "Events associated with this domain",
               "args": [
                 {
                   "name": "first",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "Int"
@@ -1140,6 +1382,7 @@
                 },
                 {
                   "name": "where",
+                  "description": null,
                   "type": {
                     "kind": "INPUT_OBJECT",
                     "name": "EventFilter"
@@ -1158,10 +1401,13 @@
                     }
                   }
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "subdomainsCount",
+              "description": "Count of direct subdomains (one level only)",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -1169,10 +1415,13 @@
                   "kind": "SCALAR",
                   "name": "Int"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "eventsCount",
+              "description": "Count of events associated with this domain",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -1180,17 +1429,21 @@
                   "kind": "SCALAR",
                   "name": "Int"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             }
           ]
         },
         {
           "kind": "OBJECT",
           "name": "Account",
+          "description": "An Ethereum account (address)",
           "interfaces": [],
           "fields": [
             {
               "name": "id",
+              "description": "Ethereum address",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -1198,10 +1451,13 @@
                   "kind": "SCALAR",
                   "name": "String"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "domains",
+              "description": "Domains owned by this account",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -1215,13 +1471,17 @@
                     }
                   }
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "registrations",
+              "description": "Registrations made by this account",
               "args": [
                 {
                   "name": "first",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "Int"
@@ -1229,6 +1489,7 @@
                 },
                 {
                   "name": "skip",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "Int"
@@ -1247,17 +1508,21 @@
                     }
                   }
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             }
           ]
         },
         {
           "kind": "OBJECT",
           "name": "CoinAddress",
+          "description": "A coin address record with coin type (SLIP-44)",
           "interfaces": [],
           "fields": [
             {
               "name": "coinType",
+              "description": "SLIP-44 coin type (e.g., 60 for ETH, 0 for BTC, 501 for SOL)",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -1265,10 +1530,13 @@
                   "kind": "SCALAR",
                   "name": "Int"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "address",
+              "description": "Address value for this coin type",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -1276,17 +1544,21 @@
                   "kind": "SCALAR",
                   "name": "String"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             }
           ]
         },
         {
           "kind": "OBJECT",
           "name": "Pubkey",
+          "description": "A public key record (secp256k1 coordinates)",
           "interfaces": [],
           "fields": [
             {
               "name": "x",
+              "description": "X coordinate (hex string)",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -1294,10 +1566,13 @@
                   "kind": "SCALAR",
                   "name": "String"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "y",
+              "description": "Y coordinate (hex string)",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -1305,17 +1580,21 @@
                   "kind": "SCALAR",
                   "name": "String"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             }
           ]
         },
         {
           "kind": "OBJECT",
           "name": "InterfaceRecord",
+          "description": "An interface implementation record",
           "interfaces": [],
           "fields": [
             {
               "name": "interfaceId",
+              "description": "Interface ID (EIP-165 selector, hex string)",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -1323,10 +1602,13 @@
                   "kind": "SCALAR",
                   "name": "String"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "implementer",
+              "description": "Implementer contract address",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -1334,17 +1616,21 @@
                   "kind": "SCALAR",
                   "name": "String"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             }
           ]
         },
         {
           "kind": "OBJECT",
           "name": "Alias",
+          "description": "A resolver alias mapping (from OwnedResolver)",
           "interfaces": [],
           "fields": [
             {
               "name": "fromName",
+              "description": "Source DNS name",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -1352,10 +1638,13 @@
                   "kind": "SCALAR",
                   "name": "String"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "toName",
+              "description": "Destination DNS name",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -1363,17 +1652,21 @@
                   "kind": "SCALAR",
                   "name": "String"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             }
           ]
         },
         {
           "kind": "OBJECT",
           "name": "Resolver",
+          "description": "A resolver contract for an ENS domain",
           "interfaces": [],
           "fields": [
             {
               "name": "id",
+              "description": "Resolver contract address",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -1381,10 +1674,13 @@
                   "kind": "SCALAR",
                   "name": "String"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "address",
+              "description": "Resolver contract address (same as id)",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -1392,13 +1688,17 @@
                   "kind": "SCALAR",
                   "name": "String"
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "addr",
+              "description": "Address record for a specific coin type (default: 60 for ETH)",
               "args": [
                 {
                   "name": "coinType",
+                  "description": null,
                   "type": {
                     "kind": "SCALAR",
                     "name": "Int"
@@ -1408,10 +1708,13 @@
               "type": {
                 "kind": "SCALAR",
                 "name": "String"
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "addresses",
+              "description": "All set addresses across all coin types",
               "args": [],
               "type": {
                 "kind": "LIST",
@@ -1422,11 +1725,628 @@
                     "name": "CoinAddress"
                   }
                 }
-              }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             },
             {
               "name": "contentHash",
+              "description": "Content hash (IPFS, Arweave, etc.)",
               "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "texts",
+              "description": "All text-record keys set on this resolver/name. This is a list of scalar\n  strings (the keys only), NOT a list of {key, value} entities \u2014 the ENS\n  subgraph's `texts` field has the same name but a different shape, so a\n  subgraph-style `texts { key value }` selection will fail. To read values,\n  call `text(key: \"...\")` per key.",
+              "args": [],
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "SCALAR",
+                    "name": "String"
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "text",
+              "description": "Get a specific text record value by key (returns null if unset).",
+              "args": [
+                {
+                  "name": "key",
+                  "description": null,
+                  "type": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "SCALAR",
+                      "name": "String"
+                    }
+                  }
+                }
+              ],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "pubkey",
+              "description": "Public key record (secp256k1 x/y coordinates)",
+              "args": [],
+              "type": {
+                "kind": "OBJECT",
+                "name": "Pubkey"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "abis",
+              "description": "ABI content types set on this resolver. List of scalar integers (the\n  contentType bitmasks only), not a list of entities \u2014 `abis { ... }` with\n  a subselection will fail.",
+              "args": [],
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "reverseName",
+              "description": "Reverse name record (from NameChanged events)",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "interfaces",
+              "description": "Interface implementations set on this resolver",
+              "args": [],
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "OBJECT",
+                    "name": "InterfaceRecord"
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "aliases",
+              "description": "Aliases set on this resolver (from AliasChanged events)",
+              "args": [],
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "OBJECT",
+                    "name": "Alias"
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "version",
+              "description": "Current version counter (from VersionChanged events)",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "Registration",
+          "description": "A domain registration record",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "id",
+              "description": "Registration identifier",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "name",
+              "description": "Name of the registered domain",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "domain",
+              "description": "The domain that was registered",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "OBJECT",
+                  "name": "Domain"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "registrationDate",
+              "description": "Timestamp when domain was registered",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "expiryDate",
+              "description": "Timestamp when domain expires",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "registrant",
+              "description": "Account that registered the domain",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "OBJECT",
+                  "name": "Account"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "protocol",
+              "description": "Chain where registration occurred (v1 or v2)",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "Event",
+          "description": "An event emitted by ENS contracts",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "id",
+              "description": "Event identifier",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "type",
+              "description": "Type of event",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "blockNumber",
+              "description": "Block number where event occurred",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "transactionHash",
+              "description": "Transaction hash",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "timestamp",
+              "description": "Timestamp when event occurred",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "contractAddress",
+              "description": "Contract address that emitted the event",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "name",
+              "description": "Name affected by this event",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "namehash",
+              "description": "Namehash of the name",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "domain",
+              "description": "Domain associated with this event (if applicable)",
+              "args": [],
+              "type": {
+                "kind": "OBJECT",
+                "name": "Domain"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "protocol",
+              "description": "Chain where event occurred (v1 or v2)",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "data",
+              "description": "Event-specific data as JSON (e.g., key/value for TextChanged, address for AddressChanged)",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "INPUT_OBJECT",
+          "name": "DomainFilter",
+          "description": "Filter criteria for querying domains",
+          "inputFields": [
+            {
+              "name": "name",
+              "description": "Exact name match",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "name_in",
+              "description": "Filter by name in list (up to 1000 names)",
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "SCALAR",
+                    "name": "String"
+                  }
+                }
+              }
+            },
+            {
+              "name": "name_contains",
+              "description": "Partial name match (contains)",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "name_contains_nocase",
+              "description": "Case-insensitive partial name match",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "name_starts_with",
+              "description": "Name starts with prefix",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "name_ends_with",
+              "description": "Name ends with suffix",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "owner",
+              "description": "Filter by owner address",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "owner_in",
+              "description": "Filter by owner address in list",
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "SCALAR",
+                    "name": "String"
+                  }
+                }
+              }
+            },
+            {
+              "name": "resolvedAddress",
+              "description": "Filter by resolved address",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "resolver",
+              "description": "Filter by resolver contract address",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "hasSubdomains",
+              "description": "Filter by whether domain has direct subdomains (one level only)",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Boolean"
+              }
+            },
+            {
+              "name": "subdomainCount_gt",
+              "description": "Filter by direct subdomain count greater than (one level only)",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "subdomainCount_lt",
+              "description": "Filter by direct subdomain count less than (one level only)",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "expiry_gt",
+              "description": "Filter by expiry date greater than (Unix timestamp)",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "expiry_gte",
+              "description": "Filter by expiry date greater than or equal (Unix timestamp)",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "expiry_lt",
+              "description": "Filter by expiry date less than (Unix timestamp)",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "expiry_lte",
+              "description": "Filter by expiry date less than or equal (Unix timestamp)",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "isMigrated",
+              "description": "Filter by migration status",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Boolean"
+              }
+            }
+          ]
+        },
+        {
+          "kind": "INPUT_OBJECT",
+          "name": "RegistrationFilter",
+          "description": "Filter criteria for querying registrations",
+          "inputFields": [
+            {
+              "name": "registrant",
+              "description": "Filter by registrant address",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "registrant_in",
+              "description": "Filter by registrant address in list",
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "SCALAR",
+                    "name": "String"
+                  }
+                }
+              }
+            },
+            {
+              "name": "expiryDate_gt",
+              "description": "Filter by expiry date greater than",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "expiryDate_gte",
+              "description": "Filter by expiry date greater than or equal",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "expiryDate_lt",
+              "description": "Filter by expiry date less than",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "expiryDate_lte",
+              "description": "Filter by expiry date less than or equal",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "protocol",
+              "description": "Filter by protocol (v1 or v2)",
               "type": {
                 "kind": "SCALAR",
                 "name": "String"
@@ -1435,8 +2355,837 @@
           ]
         },
         {
+          "kind": "INPUT_OBJECT",
+          "name": "EventFilter",
+          "description": "Filter criteria for querying events",
+          "inputFields": [
+            {
+              "name": "type",
+              "description": "Filter by event type (e.g., 'Transfer', 'NameRegistered', 'TextChanged')",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "type_in",
+              "description": "Filter by event type in list",
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "SCALAR",
+                    "name": "String"
+                  }
+                }
+              }
+            },
+            {
+              "name": "domain",
+              "description": "Filter by domain name",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "contractAddress",
+              "description": "Filter by contract address",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "namehash",
+              "description": "Filter by namehash",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "blockNumber_gt",
+              "description": "Filter by block number greater than",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "blockNumber_gte",
+              "description": "Filter by block number greater than or equal",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "blockNumber_lt",
+              "description": "Filter by block number less than",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "blockNumber_lte",
+              "description": "Filter by block number less than or equal",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "timestamp_gt",
+              "description": "Filter by timestamp greater than",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "timestamp_gte",
+              "description": "Filter by timestamp greater than or equal",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "timestamp_lt",
+              "description": "Filter by timestamp less than",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "timestamp_lte",
+              "description": "Filter by timestamp less than or equal",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "protocol",
+              "description": "Filter by protocol (v1 or v2)",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "EACRoleAssignment",
+          "description": "EAC (Enhanced Access Control) role assignment",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "id",
+              "description": "Assignment identifier",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "resource",
+              "description": "Resource (token ID) this role applies to",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "account",
+              "description": "Account that has the role",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "roleBitmap",
+              "description": "Role bitmap (hex string)",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "blockNumber",
+              "description": "Block number when assigned",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "transactionHash",
+              "description": "Transaction hash",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "timestamp",
+              "description": "Timestamp when assigned",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "name",
+              "description": "Domain name this role applies to (null for global roles)",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "ResolverDetail",
+          "description": "Detailed resolver information with statistics",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "id",
+              "description": "Resolver contract address",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "address",
+              "description": "Resolver contract address",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "nodeCount",
+              "description": "Number of domains using this resolver",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "aliasCount",
+              "description": "Number of aliases defined on this resolver",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "roleHolderCount",
+              "description": "Number of distinct role holders on this resolver",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "nodes",
+              "description": "Domains using this resolver (limited)",
+              "args": [
+                {
+                  "name": "first",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Domain"
+                    }
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "aliases",
+              "description": "Aliases defined on this resolver",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Alias"
+                    }
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "roles",
+              "description": "EAC role assignments on this resolver",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "EACRoleAssignment"
+                    }
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "events",
+              "description": "Events emitted by this resolver contract",
+              "args": [
+                {
+                  "name": "first",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Event"
+                    }
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "RegistryInfo",
+          "description": "Registry information",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "address",
+              "description": "Registry contract address",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "name",
+              "description": "Name this registry manages",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "namehash",
+              "description": "Namehash of the name",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "parentRegistry",
+              "description": "Parent registry address",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "createdBlock",
+              "description": "Block when registry was created",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "createdAt",
+              "description": "Timestamp when registry was created",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "ResolverMetadata",
+          "description": "ENSIP-16 resolver metadata (offchain data endpoint)",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "id",
+              "description": "Metadata identifier",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "resolver",
+              "description": "Resolver contract address",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "graphqlUrl",
+              "description": "GraphQL endpoint URL for offchain data",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "blockNumber",
+              "description": "Block when metadata was set",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "transactionHash",
+              "description": "Transaction hash",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "timestamp",
+              "description": "Timestamp when metadata was set",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "ResolverApproval",
+          "description": "ENSIP-16 resolver approval/delegation",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "id",
+              "description": "Approval identifier",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "resolver",
+              "description": "Resolver contract address",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "namehash",
+              "description": "Namehash being delegated",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "context",
+              "description": "Optional context for namespacing (typically owner address)",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "delegate",
+              "description": "Delegate address",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "approved",
+              "description": "Whether approved (true) or revoked (false)",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Boolean"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "blockNumber",
+              "description": "Block when approval was set",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "transactionHash",
+              "description": "Transaction hash",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "logIndex",
+              "description": "Log index",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "timestamp",
+              "description": "Timestamp when approval was set",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "ENUM",
+          "name": "OrderDirection",
+          "description": "Order direction for sorting",
+          "enumValues": [
+            {
+              "name": "asc",
+              "description": null,
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "desc",
+              "description": null,
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "ENUM",
+          "name": "Domain_orderBy",
+          "description": "Fields to order Domain results by",
+          "enumValues": [
+            {
+              "name": "id",
+              "description": null,
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "name",
+              "description": null,
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "createdAt",
+              "description": null,
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "expiryDate",
+              "description": null,
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "registrationDate",
+              "description": null,
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "ENUM",
+          "name": "Event_orderBy",
+          "description": "Fields to order Event results by",
+          "enumValues": [
+            {
+              "name": "blockNumber",
+              "description": null,
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "timestamp",
+              "description": null,
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "name",
+              "description": null,
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
           "kind": "ENUM",
           "name": "Registration_orderBy",
+          "description": "Fields to order Registration results by",
           "enumValues": [
             {
               "name": "id",
@@ -1466,7 +3215,15 @@
         },
         {
           "kind": "SCALAR",
-          "name": "String"
+          "name": "Boolean"
+        },
+        {
+          "kind": "SCALAR",
+          "name": "Float"
+        },
+        {
+          "kind": "SCALAR",
+          "name": "ID"
         },
         {
           "kind": "SCALAR",
@@ -1474,7 +3231,7 @@
         },
         {
           "kind": "SCALAR",
-          "name": "Boolean"
+          "name": "String"
         }
       ],
       "directives": []
