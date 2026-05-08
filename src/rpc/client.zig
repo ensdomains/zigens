@@ -123,6 +123,32 @@ pub const Transaction = struct {
     }
 };
 
+/// Walk an http.Client's idle-connection pool and destroy every entry.
+///
+/// Workaround for Zig 0.15.2: std.http.Client.ConnectionPool.resize is broken
+/// (Client.zig:167 calls `popped.data.close()` but the popped value is a
+/// `*DoublyLinkedList.Node` with no `data` field; the function fails to
+/// compile when invoked). We replicate what resize(0) was meant to do — lock
+/// the pool mutex, pop every node from `free`, recover the parent Connection
+/// via @fieldParentPtr, and call Connection.destroy() (which closes the
+/// socket and frees the per-connection allocation).
+///
+/// Touches stdlib internals (the ConnectionPool struct fields and
+/// Connection.pool_node are public, but reaching into them is brittle).
+/// Safe-ish: only the indexer thread writes to this pool, and the API
+/// server has its own http.Client.
+fn drainIdleHttpConnections(http_client: *std.http.Client) void {
+    const pool = &http_client.connection_pool;
+    pool.mutex.lock();
+    defer pool.mutex.unlock();
+
+    while (pool.free.popFirst()) |node| {
+        pool.free_len -= 1;
+        const conn: *std.http.Client.Connection = @alignCast(@fieldParentPtr("pool_node", node));
+        conn.destroy();
+    }
+}
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     rpc_url: []const u8,
@@ -210,9 +236,44 @@ pub const Client = struct {
                 .response_writer = &response_buf.writer,
                 .keep_alive = true,
             }) catch |err| {
-                if (err == error.StreamTooLong or err == error.WriteFailed) {
-                    std.log.debug("Response too large or write failed: {}", .{err});
+                if (err == error.StreamTooLong) {
+                    // Response exceeds buffer — not a transient failure; the
+                    // caller's adaptive chunking should shrink the request.
+                    std.log.debug("Response too large: {}", .{err});
                     return err;
+                }
+                // Zig 0.15.2's std.http.Client does NOT evict pooled connections
+                // when fetch fails — Request.deinit() looks at reader.state to
+                // decide closing, and several failure modes leave state in a
+                // shape that makes the dead socket get returned to the free
+                // pool. Next fetch picks the dead socket and fails the same
+                // way. We can't use ConnectionPool.resize either — it's itself
+                // broken in 0.15.2 (Client.zig:167 calls `popped.data.close()`
+                // but DoublyLinkedList.Node has no `data` field; doesn't
+                // compile when invoked).
+                //
+                // Workaround: on ANY transient fetch error, walk the free pool
+                // and destroy every idle connection so the next attempt opens
+                // a fresh socket. We've observed `ReadFailed` and `WriteFailed`
+                // both arise from stale pooled connections (different TCP
+                // states at the time of reuse); draining on either keeps the
+                // pool healthy. After heavy initial sync the pool may hold
+                // several stale connections; one drain + one retry typically
+                // restores forward progress.
+                //
+                // Remove this whole block once Zig fixes the pool eviction
+                // or we move to 0.16 (which rewrites http.Client on std.Io).
+                if (err == error.WriteFailed or
+                    err == error.ReadFailed or
+                    err == error.UnexpectedReadFailure or
+                    err == error.EndOfStream or
+                    err == error.BrokenPipe or
+                    err == error.ConnectionResetByPeer)
+                {
+                    drainIdleHttpConnections(self.http_client);
+                    last_error = err;
+                    std.log.warn("http.fetch {} (likely stale pooled connection); evicted free pool, retrying", .{err});
+                    continue;
                 }
                 last_error = err;
                 std.log.warn("http.fetch error: {}", .{err});

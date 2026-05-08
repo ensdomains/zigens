@@ -1,7 +1,29 @@
-const std = @import("std");
+// ============================================================================
+// Event signatures and their compile-time keccak-256 hashes.
+//
+// Single source of truth for which on-chain events the indexer cares about.
+// `abi_eth.zig` re-exports `EventSignatures` so handler files can reach the
+// hashes via `abi.EventSignatures.<name>_hash` (used as `topics[0]` matchers
+// in the dispatcher hot loop).
+//
+// Why these hashes live here and not in eth.zig:
+//   * The signature *strings* are project-specific knowledge — every indexer
+//     cares about a different set of events. A library can't enumerate them
+//     for us.
+//   * The *hashes* are computed at comptime via `keccak.eventSignature`, which
+//     produces static [32]u8 constants baked into the binary. eth.zig's
+//     keccak is a C library (XKCP) and runtime-only; using it would force
+//     lazy initialization of every signature for no correctness benefit.
+//
+// Historical: this file used to also contain an `ABI` struct with hand-rolled
+// decoders (decodeUint256/decodeAddress/decodeString/...). All handlers were
+// migrated to `abi_eth.zig` (eth.zig-backed schema-driven decode) and the
+// dead struct + its tests were removed once the new path was verified end-
+// to-end on real on-chain data.
+// ============================================================================
+
 const Hash = @import("../types/hash.zig").Hash;
 const keccak = @import("../utils/keccak.zig");
-const constants = @import("../constants.zig");
 
 /// Compute event signature hash at compile time
 inline fn eventHash(comptime sig: []const u8) Hash {
@@ -339,310 +361,4 @@ pub const EventSignatures = struct {
     pub const token_observer_set_hash: Hash = eventHash(token_observer_set);
 };
 
-/// ABI encoding/decoding utilities
-pub const ABI = struct {
-    /// Maximum allowed string length (1 MB) to prevent DoS attacks
-    pub const MAX_STRING_LENGTH: usize = 1024 * 1024;
 
-    /// Maximum allowed array length to prevent DoS attacks
-    pub const MAX_ARRAY_LENGTH: usize = constants.Validation.max_abi_array_length;
-
-    /// Maximum allowed bytes length (1 MB) to prevent DoS attacks
-    pub const MAX_BYTES_LENGTH: usize = 1024 * 1024;
-
-    /// Decode uint256 from bytes
-    pub fn decodeUint256(data: []const u8, offset: usize) !u256 {
-        if (offset + 32 > data.len) {
-            return error.DataTooShort;
-        }
-
-        var result: u256 = 0;
-        var i: usize = 0;
-        while (i < 32) : (i += 1) {
-            result = (result << 8) | data[offset + i];
-        }
-
-        return result;
-    }
-
-    /// Decode address from bytes (20 bytes, padded to 32)
-    pub fn decodeAddress(data: []const u8, offset: usize) !@import("../types/address.zig").Address {
-        if (offset + 32 > data.len) {
-            return error.DataTooShort;
-        }
-
-        var addr = @import("../types/address.zig").Address{ .bytes = undefined };
-        @memcpy(&addr.bytes, data[offset + 12 .. offset + 32]);
-
-        return addr;
-    }
-
-    /// Decode bytes32 from bytes
-    pub fn decodeBytes32(data: []const u8, offset: usize) !Hash {
-        if (offset + 32 > data.len) {
-            return error.DataTooShort;
-        }
-
-        var hash = Hash{ .bytes = undefined };
-        @memcpy(&hash.bytes, data[offset .. offset + 32]);
-
-        return hash;
-    }
-
-    /// Decode string from bytes
-    pub fn decodeString(allocator: std.mem.Allocator, data: []const u8, offset: usize) ![]u8 {
-        if (offset + 32 > data.len) {
-            return error.DataTooShort;
-        }
-
-        // First 32 bytes is the offset to the string data
-        const str_offset_bytes = data[offset .. offset + 32];
-        var str_offset: usize = 0;
-        for (str_offset_bytes) |byte| {
-            str_offset = (str_offset << 8) | byte;
-        }
-
-        // At the string offset, first 32 bytes is the length
-        if (str_offset + 32 > data.len) {
-            return error.InvalidStringOffset;
-        }
-
-        const length_bytes = data[str_offset .. str_offset + 32];
-        var length: usize = 0;
-        for (length_bytes) |byte| {
-            length = (length << 8) | byte;
-        }
-
-        // Validate string length to prevent DoS attacks
-        if (length > MAX_STRING_LENGTH) {
-            return error.StringTooLong;
-        }
-
-        // Then comes the actual string data
-        if (str_offset + 32 + length > data.len) {
-            return error.InvalidStringLength;
-        }
-
-        const str_data = data[str_offset + 32 .. str_offset + 32 + length];
-        return try allocator.dupe(u8, str_data);
-    }
-
-    /// Decode dynamic uint256 array from ABI-encoded data
-    /// Returns array length and offset to array data
-    pub fn decodeUint256ArrayInfo(data: []const u8, offset: usize) !struct { length: usize, data_offset: usize } {
-        if (offset + 32 > data.len) {
-            return error.InsufficientData;
-        }
-
-        // First 32 bytes at offset is the offset to the array data
-        const array_offset_bytes = data[offset .. offset + 32];
-        var array_offset: usize = 0;
-        for (array_offset_bytes) |byte| {
-            array_offset = (array_offset << 8) | byte;
-        }
-
-        // At the array offset, first 32 bytes is the length
-        if (array_offset + 32 > data.len) {
-            return error.InvalidArrayOffset;
-        }
-
-        const length_bytes = data[array_offset .. array_offset + 32];
-        var length: usize = 0;
-        for (length_bytes) |byte| {
-            length = (length << 8) | byte;
-        }
-
-        // Validate array length to prevent DoS attacks
-        if (length > MAX_ARRAY_LENGTH) {
-            return error.ArrayTooLong;
-        }
-
-        return .{
-            .length = length,
-            .data_offset = array_offset + 32,
-        };
-    }
-
-    /// Decode dynamic uint256 array from ABI-encoded data
-    pub fn decodeUint256Array(allocator: std.mem.Allocator, data: []const u8, offset: usize) ![]u256 {
-        const info = try decodeUint256ArrayInfo(data, offset);
-
-        // Each element is 32 bytes
-        const array_data_end = info.data_offset + (info.length * 32);
-        if (array_data_end > data.len) {
-            return error.ArrayDataTooShort;
-        }
-
-        var result = try allocator.alloc(u256, info.length);
-        errdefer allocator.free(result);
-
-        for (0..info.length) |i| {
-            const elem_offset = info.data_offset + (i * 32);
-            result[i] = try decodeUint256(data, elem_offset);
-        }
-
-        return result;
-    }
-
-    /// Decode dynamic bytes from ABI-encoded data
-    pub fn decodeBytes(allocator: std.mem.Allocator, data: []const u8, offset: usize) ![]u8 {
-        if (offset + 32 > data.len) {
-            return error.DataTooShort;
-        }
-
-        // First 32 bytes is the offset to the bytes data
-        const bytes_offset_bytes = data[offset .. offset + 32];
-        var bytes_offset: usize = 0;
-        for (bytes_offset_bytes) |byte| {
-            bytes_offset = (bytes_offset << 8) | byte;
-        }
-
-        // At the bytes offset, first 32 bytes is the length
-        if (bytes_offset + 32 > data.len) {
-            return error.InvalidBytesOffset;
-        }
-
-        const length_bytes = data[bytes_offset .. bytes_offset + 32];
-        var length: usize = 0;
-        for (length_bytes) |byte| {
-            length = (length << 8) | byte;
-        }
-
-        // Validate bytes length to prevent DoS attacks
-        if (length > MAX_BYTES_LENGTH) {
-            return error.BytesTooLong;
-        }
-
-        // Then comes the actual bytes data
-        if (bytes_offset + 32 + length > data.len) {
-            return error.InvalidBytesLength;
-        }
-
-        const bytes_data = data[bytes_offset + 32 .. bytes_offset + 32 + length];
-        return try allocator.dupe(u8, bytes_data);
-    }
-};
-
-test "ABI decode uint256" {
-    const data = [_]u8{0} ** 31 ++ [_]u8{42};
-    const value = try ABI.decodeUint256(&data, 0);
-    try std.testing.expectEqual(@as(u256, 42), value);
-}
-
-test "ABI decode address" {
-    var data = [_]u8{0} ** 32;
-    data[31] = 1;
-
-    const addr = try ABI.decodeAddress(&data, 0);
-    try std.testing.expectEqual(@as(u8, 1), addr.bytes[19]);
-}
-
-test "ABI decodeString rejects string exceeding MAX_STRING_LENGTH" {
-    const allocator = std.testing.allocator;
-
-    // Create data with string length > MAX_STRING_LENGTH (1 MB)
-    // Structure: [offset(32), length(32)]
-    const offset: u32 = 32;
-    const too_long: usize = ABI.MAX_STRING_LENGTH + 1;
-
-    var data = try allocator.alloc(u8, 64);
-    defer allocator.free(data);
-
-    // Offset pointer (points to position 32 where length is stored)
-    @memset(data[0..32], 0);
-    data[31] = @intCast(offset);
-
-    // String length = MAX_STRING_LENGTH + 1 (big-endian encoding)
-    @memset(data[32..64], 0);
-    // Store the length in big-endian format in the last 8 bytes
-    var i: usize = 0;
-    while (i < 8) : (i += 1) {
-        const shift: u6 = @intCast(56 - i * 8);
-        data[56 + i] = @intCast((too_long >> shift) & 0xFF);
-    }
-
-    const result = ABI.decodeString(allocator, data, 0);
-    try std.testing.expectError(error.StringTooLong, result);
-}
-
-test "ABI decodeBytes rejects bytes exceeding MAX_BYTES_LENGTH" {
-    const allocator = std.testing.allocator;
-
-    // Create data with bytes length > MAX_BYTES_LENGTH (1 MB)
-    const offset: u32 = 32;
-    const too_long: usize = ABI.MAX_BYTES_LENGTH + 1;
-
-    var data = try allocator.alloc(u8, 64);
-    defer allocator.free(data);
-
-    // Offset pointer
-    @memset(data[0..32], 0);
-    data[31] = @intCast(offset);
-
-    // Bytes length = MAX_BYTES_LENGTH + 1 (big-endian encoding)
-    @memset(data[32..64], 0);
-    var i: usize = 0;
-    while (i < 8) : (i += 1) {
-        const shift: u6 = @intCast(56 - i * 8);
-        data[56 + i] = @intCast((too_long >> shift) & 0xFF);
-    }
-
-    const result = ABI.decodeBytes(allocator, data, 0);
-    try std.testing.expectError(error.BytesTooLong, result);
-}
-
-test "ABI decodeUint256Array rejects array exceeding MAX_ARRAY_LENGTH" {
-    const allocator = std.testing.allocator;
-
-    // Create data with array length > MAX_ARRAY_LENGTH (10,000)
-    const offset: u32 = 32;
-    const too_long: usize = ABI.MAX_ARRAY_LENGTH + 1;
-
-    var data = try allocator.alloc(u8, 64);
-    defer allocator.free(data);
-
-    // Offset pointer
-    @memset(data[0..32], 0);
-    data[31] = @intCast(offset);
-
-    // Array length = MAX_ARRAY_LENGTH + 1 (big-endian encoding)
-    @memset(data[32..64], 0);
-    var i: usize = 0;
-    while (i < 8) : (i += 1) {
-        const shift: u6 = @intCast(56 - i * 8);
-        data[56 + i] = @intCast((too_long >> shift) & 0xFF);
-    }
-
-    const result = ABI.decodeUint256Array(allocator, data, 0);
-    try std.testing.expectError(error.ArrayTooLong, result);
-}
-
-test "ABI decodeString accepts string at MAX_STRING_LENGTH" {
-    const allocator = std.testing.allocator;
-
-    // Create minimal valid data structure for max length string
-    const offset: u32 = 32;
-    const length: u32 = 1000; // Use smaller test size for speed
-
-    var data = try allocator.alloc(u8, offset + 32 + length);
-    defer allocator.free(data);
-
-    // Offset pointer
-    @memset(data[0..32], 0);
-    data[31] = @intCast(offset);
-
-    // String length
-    @memset(data[offset .. offset + 32], 0);
-    data[offset + 28] = @intCast((length >> 24) & 0xFF);
-    data[offset + 29] = @intCast((length >> 16) & 0xFF);
-    data[offset + 30] = @intCast((length >> 8) & 0xFF);
-    data[offset + 31] = @intCast(length & 0xFF);
-
-    // String data (fill with 'a')
-    @memset(data[offset + 32 ..], 'a');
-
-    const result = try ABI.decodeString(allocator, data, 0);
-    defer allocator.free(result);
-
-    try std.testing.expectEqual(length, result.len);
-}

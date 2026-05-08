@@ -1,6 +1,9 @@
 const std = @import("std");
 const models = @import("../../types/models.zig");
-const abi = @import("../abi.zig");
+// ABI decoding migrated from hand-rolled `../abi.zig` to eth.zig-backed
+// `../abi_eth.zig`. The old module is kept for fallback. EventSignatures still
+// lives in abi.zig and is imported separately where needed.
+const abi = @import("../abi_eth.zig");
 const rpc = @import("../../rpc/client.zig");
 const db = @import("../../storage/database.zig");
 const Query = db.Query;
@@ -24,8 +27,10 @@ pub fn handleSubregistryUpdate(self: *Indexer, protocol: models.Protocol, log: r
     const token_id_utils = @import("../../types/token_id.zig");
     const canonical_id = token_id_utils.getCanonicalId(token_id);
 
-    // data = subregistry address
-    const subregistry_addr = try abi.ABI.decodeAddress(log.data, 0);
+    // Non-indexed payload: (address subregistry)
+    const data_values = try abi.decodeValues(log.data, &.{.address}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const subregistry_addr = Address{ .bytes = data_values[0].address };
 
     std.log.debug("SubregistryUpdate: tokenId={d}, canonicalId={d}, subregistry={any}, contract={any}", .{ token_id, canonical_id, subregistry_addr, log.address });
 
@@ -321,8 +326,10 @@ pub fn handleResolverUpdate(self: *Indexer, protocol: models.Protocol, log: rpc.
     const token_id_utils_local = @import("../../types/token_id.zig");
     const canonical_id = token_id_utils_local.getCanonicalId(token_id);
 
-    // data = resolver address
-    const resolver_addr = try abi.ABI.decodeAddress(log.data, 0);
+    // Non-indexed payload: (address resolver)
+    const data_values = try abi.decodeValues(log.data, &.{.address}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const resolver_addr = Address{ .bytes = data_values[0].address };
 
     std.log.debug("ResolverUpdate: tokenId={d}, canonicalId={d}, resolver={any}, contract={any}", .{ token_id, canonical_id, resolver_addr, log.address });
 
@@ -389,27 +396,21 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
     const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
     const token_id: u256 = token_id_raw;
 
-    // Data contains: string label, uint64 expiration, address registeredBy
-    // String is at offset 0 (as offset pointer)
-    // We need to decode the dynamic data
-    const label_str = try abi.ABI.decodeString(self.allocator, log.data, 0);
-    defer self.allocator.free(label_str);
+    // Non-indexed payload: (string label, uint64 expiration, address registeredBy)
+    const data_values = try abi.decodeValues(
+        log.data,
+        &.{ .string, .uint64, .address },
+        self.allocator,
+    );
+    defer abi.freeValues(data_values, self.allocator);
+    const label_str = data_values[0].string;
+    const expiration: u256 = data_values[1].uint256;
+    const registered_by = Address{ .bytes = data_values[2].address };
 
-    // Validate label is valid UTF-8 and contains no control characters
     unicode.validateName(label_str) catch |err| {
         std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
         return;
     };
-
-    // After the string offset (32 bytes) comes uint64 expiration (padded to 32 bytes)
-    // and then address registeredBy (padded to 32 bytes)
-    // But since string is dynamic, we need to skip to after the actual string data
-    // For simplicity, let's decode from the known structure
-
-    // In ABI encoding: [offset_to_string, expiration, registeredBy, string_length, string_data]
-    // offset_to_string is at 0x00, expiration at 0x20, registeredBy at 0x40
-    const expiration = try abi.ABI.decodeUint256(log.data, 32); // uint64 but padded to uint256
-    const registered_by = try abi.ABI.decodeAddress(log.data, 64);
 
     std.log.debug("NameRegistered: {s} (tokenId={d}, expiration={d}, registeredBy={any})", .{ label_str, token_id, expiration, registered_by });
 
@@ -596,9 +597,15 @@ pub fn handleNameRenewed(self: *Indexer, protocol: models.Protocol, log: rpc.Log
     const token_id_utils_renew = @import("../../types/token_id.zig");
     const canonical_id = token_id_utils_renew.getCanonicalId(token_id);
 
-    // Data contains: uint64 newExpiration, address renewedBy (both padded to 32 bytes)
-    const new_expiration = try abi.ABI.decodeUint256(log.data, 0); // uint64 but padded
-    const renewed_by = try abi.ABI.decodeAddress(log.data, 32);
+    // Non-indexed payload: (uint64 newExpiration, address renewedBy)
+    const data_values = try abi.decodeValues(
+        log.data,
+        &.{ .uint64, .address },
+        self.allocator,
+    );
+    defer abi.freeValues(data_values, self.allocator);
+    const new_expiration: u256 = data_values[0].uint256;
+    const renewed_by = Address{ .bytes = data_values[1].address };
 
     std.log.debug("NameRenewed: tokenId={d}, canonicalId={d}, newExpiration={d}, renewedBy={any}", .{ token_id, canonical_id, new_expiration, renewed_by });
 
@@ -638,8 +645,15 @@ pub fn handleTransfer(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !
     const from = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
     const to = try abi.ABI.decodeAddress(&log.topics[3].bytes, 0);
 
-    const id = try abi.ABI.decodeUint256(log.data, 0);
-    const value = try abi.ABI.decodeUint256(log.data, 32);
+    // Non-indexed payload: (uint256 id, uint256 value)
+    const data_values = try abi.decodeValues(
+        log.data,
+        &.{ .uint256, .uint256 },
+        self.allocator,
+    );
+    defer abi.freeValues(data_values, self.allocator);
+    const id = data_values[0].uint256;
+    const value = data_values[1].uint256;
 
     std.log.debug("Transfer: from={any}, to={any}, id={d}, value={d}", .{ from, to, id, value });
 
@@ -702,24 +716,29 @@ pub fn handleETHNameRegistered(self: *Indexer, protocol: models.Protocol, log: r
     const token_id_raw = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
     const token_id: u256 = token_id_raw;
 
-    // Data: [offset_to_label, owner, subregistry, resolver, duration, paymentToken, referrer, base, premium, label_length, label_data]
-    const label_str = try abi.ABI.decodeString(self.allocator, log.data, 0);
-    defer self.allocator.free(label_str);
+    // Non-indexed payload: (string label, address owner, address subregistry,
+    // address resolver, uint64 duration, address paymentToken, bytes32 referrer,
+    // uint256 base, uint256 premium)
+    const data_values = try abi.decodeValues(
+        log.data,
+        &.{ .string, .address, .address, .address, .uint64, .address, .bytes32, .uint256, .uint256 },
+        self.allocator,
+    );
+    defer abi.freeValues(data_values, self.allocator);
+    const label_str = data_values[0].string;
+    const owner = Address{ .bytes = data_values[1].address };
+    const subregistry = Address{ .bytes = data_values[2].address };
+    const resolver = Address{ .bytes = data_values[3].address };
+    const duration: u256 = data_values[4].uint256;
+    const payment_token = Address{ .bytes = data_values[5].address };
+    const referrer = Hash{ .bytes = data_values[6].fixed_bytes.data };
+    const base_price = data_values[7].uint256;
+    const premium = data_values[8].uint256;
 
-    // Validate label is valid UTF-8 and contains no control characters
     unicode.validateName(label_str) catch |err| {
         std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
         return;
     };
-
-    const owner = try abi.ABI.decodeAddress(log.data, 32);
-    const subregistry = try abi.ABI.decodeAddress(log.data, 64);
-    const resolver = try abi.ABI.decodeAddress(log.data, 96);
-    const duration = try abi.ABI.decodeUint256(log.data, 128); // uint64 padded
-    const payment_token = try abi.ABI.decodeAddress(log.data, 160);
-    const referrer = try abi.ABI.decodeBytes32(log.data, 192);
-    const base_price = try abi.ABI.decodeUint256(log.data, 224);
-    const premium = try abi.ABI.decodeUint256(log.data, 256);
 
     std.log.debug("ETHRegistrar.NameRegistered: {s} (tokenId={d}, owner={any}, duration={d}, base={d}, premium={d})", .{ label_str, token_id, owner, duration, base_price, premium });
 
@@ -796,24 +815,14 @@ pub fn handleETHNameRegistered(self: *Indexer, protocol: models.Protocol, log: r
         std.log.debug("  → Registered subregistry {any} for {s}", .{ subregistry, full_name });
     }
 
-    // Best-effort registration insert. If this fails (disk full, constraint, etc.), log a warning
-    // but continue — the event is the source of truth and the `registrations` table can be
-    // re-populated via the schema/021 backfill query on a later startup.
-    self.database.insertRegistration(
-        protocol,
-        namehash,
-        label_str,
-        "eth",
-        owner,
-        block_timestamp,
-        if (expiry == 0) null else expiry,
-        log.block_number,
-        log.transaction_hash,
-        log.log_index,
-        .name_registered,
-    ) catch |err| {
-        std.log.warn("insertRegistration failed for {s}.eth: {}", .{ label_str, err });
-    };
+    // Intentionally NOT writing to the `registrations` table here. On V2, every
+    // fresh `.eth` registration emits TWO events in the same tx: this
+    // `IETHRegistrar.NameRegistered` (carrying payment details) AND the
+    // `PermissionedRegistry.LabelRegistered` (the canonical "label exists"
+    // signal). Writing both would produce 2 rows per name. The
+    // LabelRegistered handler (handleLabelRegistered) is the single canonical
+    // writer for the registrations table; payment details remain queryable
+    // via the `events` table for callers that want them.
 
     // Store event with payment details
     var payment_token_hex_buf: [42]u8 = undefined;
@@ -853,21 +862,25 @@ pub fn handleETHNameRenewed(self: *Indexer, protocol: models.Protocol, log: rpc.
     const token_id_utils_eth_renew = @import("../../types/token_id.zig");
     const canonical_id = token_id_utils_eth_renew.getCanonicalId(token_id);
 
-    // Data: [offset_to_label, duration, newExpiry, paymentToken, referrer, base, label_length, label_data]
-    const label_str = try abi.ABI.decodeString(self.allocator, log.data, 0);
-    defer self.allocator.free(label_str);
+    // Non-indexed payload: (string label, uint64 duration, uint64 newExpiry,
+    // address paymentToken, bytes32 referrer, uint256 base)
+    const data_values = try abi.decodeValues(
+        log.data,
+        &.{ .string, .uint64, .uint64, .address, .bytes32, .uint256 },
+        self.allocator,
+    );
+    defer abi.freeValues(data_values, self.allocator);
+    const label_str = data_values[0].string;
+    const duration: u256 = data_values[1].uint256;
+    const new_expiry: u256 = data_values[2].uint256;
+    const payment_token = Address{ .bytes = data_values[3].address };
+    const referrer = Hash{ .bytes = data_values[4].fixed_bytes.data };
+    const base_price = data_values[5].uint256;
 
-    // Validate label is valid UTF-8 and contains no control characters
     unicode.validateName(label_str) catch |err| {
         std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
         return;
     };
-
-    const duration = try abi.ABI.decodeUint256(log.data, 32); // uint64 padded
-    const new_expiry = try abi.ABI.decodeUint256(log.data, 64); // uint64 padded
-    const payment_token = try abi.ABI.decodeAddress(log.data, 96);
-    const referrer = try abi.ABI.decodeBytes32(log.data, 128);
-    const base_price = try abi.ABI.decodeUint256(log.data, 160);
 
     std.log.debug("ETHRegistrar.NameRenewed: {s} (tokenId={d}, canonicalId={d}, duration={d}, newExpiry={d}, base={d})", .{ label_str, token_id, canonical_id, duration, new_expiry, base_price });
 
@@ -922,7 +935,10 @@ pub fn handleCommitmentMade(self: *Indexer, protocol: models.Protocol, log: rpc.
     // Note: bytes32 is NOT indexed, so it's in the data field
     if (log.topics.len < 1) return error.InvalidTopicCount;
 
-    const commitment = try abi.ABI.decodeBytes32(log.data, 0);
+    // Non-indexed payload: (bytes32 commitment)
+    const data_values = try abi.decodeValues(log.data, &.{.bytes32}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const commitment = Hash{ .bytes = data_values[0].fixed_bytes.data };
 
     std.log.debug("CommitmentMade: commitment={any}", .{commitment});
 
@@ -944,8 +960,10 @@ pub fn handleNameBurned(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
     const token_id_utils_burn = @import("../../types/token_id.zig");
     const canonical_id = token_id_utils_burn.getCanonicalId(token_id);
 
-    // Data contains: address burnedBy
-    const burned_by = try abi.ABI.decodeAddress(log.data, 0);
+    // Non-indexed payload: (address burnedBy)
+    const data_values = try abi.decodeValues(log.data, &.{.address}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const burned_by = Address{ .bytes = data_values[0].address };
 
     std.log.debug("NameBurned: tokenId={d}, canonicalId={d}, burnedBy={any}", .{ token_id, canonical_id, burned_by });
 
@@ -999,9 +1017,15 @@ pub fn handleTokenRegenerated(self: *Indexer, protocol: models.Protocol, log: rp
         old_token_id = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
         new_token_id = try abi.ABI.decodeUint256(&log.topics[2].bytes, 0);
     } else if (log.data.len >= 64) {
-        // Parameters are in data (non-indexed)
-        old_token_id = try abi.ABI.decodeUint256(log.data, 0);
-        new_token_id = try abi.ABI.decodeUint256(log.data, 32);
+        // Non-indexed payload: (uint256 oldTokenId, uint256 newTokenId)
+        const data_values = try abi.decodeValues(
+            log.data,
+            &.{ .uint256, .uint256 },
+            self.allocator,
+        );
+        defer abi.freeValues(data_values, self.allocator);
+        old_token_id = data_values[0].uint256;
+        new_token_id = data_values[1].uint256;
     } else {
         std.log.warn("TokenRegenerated event with unexpected format: topics={d}, data_len={d}", .{ log.topics.len, log.data.len });
         return;
@@ -1065,7 +1089,11 @@ pub fn handleTransferBatch(self: *Indexer, protocol: models.Protocol, log: rpc.L
     const from = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
     const to = try abi.ABI.decodeAddress(&log.topics[3].bytes, 0);
 
-    // Data contains two arrays: ids (offset 0) and values (offset 32)
+    // Non-indexed payload: (uint256[] ids, uint256[] values)
+    // Stays on the primitive shim path: eth.zig's decodeValues takes a flat
+    // []AbiType and lacks an in-band way to express the element type of a
+    // dynamic_array. The primitive decodeUint256Array still routes through
+    // eth.uint256.fromBigEndianBytes, so the math is the same.
     const token_ids = try abi.ABI.decodeUint256Array(self.allocator, log.data, 0);
     defer self.allocator.free(token_ids);
 
@@ -1173,9 +1201,15 @@ pub fn handleEACRolesChanged(self: *Indexer, protocol: models.Protocol, log: rpc
     const resource_uint = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
     const account = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
 
-    // Decode non-indexed parameters from data
-    const old_role_bitmap = try abi.ABI.decodeUint256(log.data, 0);
-    const new_role_bitmap = try abi.ABI.decodeUint256(log.data, 32);
+    // Non-indexed payload: (uint256 oldRoleBitmap, uint256 newRoleBitmap)
+    const data_values = try abi.decodeValues(
+        log.data,
+        &.{ .uint256, .uint256 },
+        self.allocator,
+    );
+    defer abi.freeValues(data_values, self.allocator);
+    const old_role_bitmap = data_values[0].uint256;
+    const new_role_bitmap = data_values[1].uint256;
 
     // Strip to canonical_id (clear lower 32 version bits) so the resource is stable
     // across TokenRegenerated events. Works whether the contract emits token_id or canonical_id.
@@ -1271,16 +1305,23 @@ pub fn handleLabelRegistered(self: *Indexer, protocol: models.Protocol, log: rpc
     const label_hash = Hash{ .bytes = log.topics[2].bytes };
     const sender = try abi.ABI.decodeAddress(&log.topics[3].bytes, 0);
 
-    const label_str = try abi.ABI.decodeString(self.allocator, log.data, 0);
-    defer self.allocator.free(label_str);
+    // Non-indexed payload: (string label, address owner, uint64 expiry).
+    // Decoded as a single schema-driven call through eth.zig's tested codec.
+    const data_values = try abi.decodeValues(
+        log.data,
+        &.{ .string, .address, .uint64 },
+        self.allocator,
+    );
+    defer abi.freeValues(data_values, self.allocator);
+
+    const label_str = data_values[0].string;
+    const owner = Address{ .bytes = data_values[1].address };
+    const expiry: u64 = @truncate(data_values[2].uint256);
 
     unicode.validateName(label_str) catch |err| {
         std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
         return;
     };
-
-    const owner = try abi.ABI.decodeAddress(log.data, 32);
-    const expiry: u64 = @truncate(try abi.ABI.decodeUint256(log.data, 64));
 
     // Detect if this registration was triggered by a migration controller (V1→V2 migration)
     // and which kind. Locked migrations preserve V1 wrapper fuses; unlocked do not.
@@ -1503,15 +1544,20 @@ pub fn handleLabelReserved(self: *Indexer, protocol: models.Protocol, log: rpc.L
     const label_hash = Hash{ .bytes = log.topics[2].bytes };
     const sender = try abi.ABI.decodeAddress(&log.topics[3].bytes, 0);
 
-    const label_str = try abi.ABI.decodeString(self.allocator, log.data, 0);
-    defer self.allocator.free(label_str);
+    // Non-indexed payload: (string label, uint64 expiry)
+    const data_values = try abi.decodeValues(
+        log.data,
+        &.{ .string, .uint64 },
+        self.allocator,
+    );
+    defer abi.freeValues(data_values, self.allocator);
+    const label_str = data_values[0].string;
+    const expiry: u64 = @truncate(data_values[1].uint256);
 
     unicode.validateName(label_str) catch |err| {
         std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
         return;
     };
-
-    const expiry: u64 = @truncate(try abi.ABI.decodeUint256(log.data, 32));
 
     std.log.debug("LabelReserved: {s} (tokenId={d}, expiry={d}, sender={any})", .{ label_str, token_id, expiry, sender });
 
@@ -1719,8 +1765,10 @@ pub fn handleParentUpdated(self: *Indexer, protocol: models.Protocol, log: rpc.L
     const parent_addr = try abi.ABI.decodeAddress(&log.topics[1].bytes, 0);
     const sender = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
 
-    const label_str = try abi.ABI.decodeString(self.allocator, log.data, 0);
-    defer self.allocator.free(label_str);
+    // Non-indexed payload: (string label)
+    const data_values = try abi.decodeValues(log.data, &.{.string}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const label_str = data_values[0].string;
 
     std.log.debug("ParentUpdated: parent={any}, label={s}, sender={any}", .{ parent_addr, label_str, sender });
 
