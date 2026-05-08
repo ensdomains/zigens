@@ -46,25 +46,25 @@ v2
 ┌────┬──────────────────────────────────┬────────────────────────────────────────────┐
 │    │ name                             │ address                                    │
 ├────┼──────────────────────────────────┼────────────────────────────────────────────┤
-│  0 │ BatchRegistrar                   │ 0xa498a50aada7790f5d3efd594365e797c947eece │
-│  1 │ ENSV1Resolver                    │ 0x19c7daeb1828942debf60fb78ff70292300e7800 │
-│  2 │ ENSV2Resolver                    │ 0xcc8eff4ad952de82990264d5adb32fc9399ecb64 │
-│  3 │ ETHRegistrar                     │ 0x29e8a042ea34b7ee720c12b52720027b5e9049c6 │
-│  4 │ ETHRegistry                      │ 0x28356dacb84ee3ebdb007d1f5920b24c87e90d40 │
-│  5 │ HCAFactory                       │ 0x3ab718580b476d64fdd3ce6a9ab63491b15767d9 │
-│  6 │ LockedMigrationController        │ 0x806c44f027a6f6ee75ade3f6dbf1c6db496ffc67 │
-│  7 │ ManagedUniversalResolverProxy    │ 0x541660b410b477e78e95c5d92a7f350cf86db61b │
-│  8 │ MockDAI                          │ 0xa1ad79c31e9e8c4d2d0b73aaf0435a7a8a706170 │
-│  9 │ MockUSDC                         │ 0xc39c1eec68a9e3c08c4f6cbebbb0fbf7aa4be06b │
-│ 10 │ RootRegistry                     │ 0x45e6d4230064f9dd806330da9d92639f8665d9bf │
-│ 11 │ SimpleRegistryMetadata           │ 0x3b42d507e1b13ee164cab0fba4ea66f8a1b653f1 │
-│ 12 │ StandardRentPriceOracle          │ 0x8d10896a894b0b60c2f9533d57758b0da1abaab7 │
-│ 13 │ UniversalResolverV2              │ 0xf73ce79773306050b537946abb57c7cb995f58ab │
-│ 14 │ UnlockedMigrationController      │ 0xf9108e0797406c45ca43f103b176cbd902a12fba │
-│ 15 │ UpgradableUniversalResolverProxy │ 0xd307d60cfee6f2f74b6daafebf878437e353c1f6 │
-│ 16 │ VerifiableFactory                │ 0x04fd5ee60b015b6efd21a54d1e662d68868683c5 │
-│ 17 │ WrapperRegistryImpl              │ 0x58a2755c4d6afdf9a8717008a05f687c3a8cb494 │
+│  0 │ BatchRegistrar                   │ 0x63736415c705949705ce65ae24db033eaf76c4dc │
+│  1 │ ENSV1Resolver                    │ 0x3d1e322c24a2bd94046e1ba04d097d9b7519420f │
+│  2 │ ENSV2Resolver                    │ 0x078a7ae41974a74c62233bca5590c86218aa1f1e │
+│  3 │ ETHRegistrar                     │ 0x26e5e80e8f36607ef401443fb34eea363c86e8f7 │
+│  4 │ ETHRegistry                      │ 0x31a2bb5d933557cce1b3129993193896d074db92 │
+│  5 │ HCAFactory                       │ 0xb6fb46e1458915dd828633d91e1df8e4c3f2d4dd │
+│  6 │ LockedMigrationController        │ 0x7ca1ded4d929ebd8b09e24c2da8e909014abecd8 │
+│  7 │ ManagedUniversalResolverProxy    │ 0x162168f07321fe17f1a388df265e5c96a9f5061a │
+│  8 │ MockDAI                          │ 0xb21412bb6816601dd840b93a5d19a8fe671cb74e │
+│  9 │ MockUSDC                         │ 0xf2942507cb33422a800ff9aa4cb05522a5e1d9e6 │
+│ 10 │ RootRegistry                     │ 0xfd43dc00ab0d0e247a2827d15dddfc5bd9646a29 │
+│ 11 │ SimpleRegistryMetadata           │ 0xd309105793dbb2ed39f3d3418cbde80852decd1a │
+│ 12 │ StandardRentPriceOracle          │ 0x20a494e8a6ce80826477dd1d468337b990d71795 │
+│ 13 │ UniversalResolverV2              │ 0xf9c120ad88e5512437ae9518f6c86145318531de │
+│ 14 │ UnlockedMigrationController      │ 0x5587003f8eeee1bc236d48ab39059cbfd99207d7 │
+│ 15 │ UpgradableUniversalResolverProxy │ 0xeeeeeeee14d718c2b47d9923deab1335e144eeee │
+│ 16 │ VerifiableFactory                │ 0x26997c9d0f3dcbae3f78c69e621a3926ee30bb98 │
+│ 17 │ WrapperRegistryImpl              │ 0xb5778cf6cc9586d9ce740039c84dfb1802f307bc │
 └────┴──────────────────────────────────┴────────────────────────────────────────────┘
 
 RPC: Sepolia fork on Tenderly
-https://virtual.sepolia.us-east.rpc.tenderly.co/881ddb0f-475d-45ac-b93d-e1aca2841811
+https://virtual.sepolia.us-east.rpc.tenderly.co/5861d235-a772-47a3-8772-4f6a3f2ea4b5
