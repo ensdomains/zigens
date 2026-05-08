@@ -707,15 +707,15 @@ pub const Indexer = struct {
                         std.log.warn("{s} network error detected: {}, waiting for connection...", .{ protocol.toString(), err });
                         network_health.waitForHealthy();
                         std.log.info("{s} network restored, continuing...", .{protocol.toString()});
-                        // Sleep before retry. The healthcheck uses a fresh
-                        // http.Client and may pass before the indexer's pooled
-                        // client has been able to reopen connections (see
-                        // drainIdleHttpConnections in src/rpc/client.zig). A
-                        // short sleep prevents a tight log-flood loop when
-                        // the underlying RPC keeps rejecting writes — gives
-                        // OS-level TCP state and any upstream rate-limiting
-                        // a chance to clear.
-                        std.Thread.sleep(2 * std.time.ns_per_s);
+                        // 1s breather before retry. Bounds log volume during a
+                        // sustained outage and prevents the tight spin we'd
+                        // otherwise hit when `network_health.waitForHealthy()`
+                        // (which uses a fresh http.Client) reports healthy
+                        // while the indexer's pooled client is still failing.
+                        // Inner `executeHttpRequest` retries already cover
+                        // transient TLS/socket recovery, so anything beyond
+                        // 1s is redundant.
+                        std.Thread.sleep(std.time.ns_per_s);
                         continue;
                     },
                     else => {
