@@ -291,16 +291,26 @@ type Resolver {
   """Content hash (IPFS, Arweave, etc.)"""
   contentHash: String
 
-  """Text record keys"""
+  """
+  All text-record keys set on this resolver/name. This is a list of scalar
+  strings (the keys only), NOT a list of {key, value} entities — the ENS
+  subgraph's `texts` field has the same name but a different shape, so a
+  subgraph-style `texts { key value }` selection will fail. To read values,
+  call `text(key: "...")` per key.
+  """
   texts: [String!]
 
-  """Get a specific text record value by key"""
+  """Get a specific text record value by key (returns null if unset)."""
   text(key: String!): String
 
   """Public key record (secp256k1 x/y coordinates)"""
   pubkey: Pubkey
 
-  """ABI content types set on this resolver"""
+  """
+  ABI content types set on this resolver. List of scalar integers (the
+  contentType bitmasks only), not a list of entities — `abis { ... }` with
+  a subselection will fail.
+  """
   abis: [Int!]
 
   """Reverse name record (from NameChanged events)"""
