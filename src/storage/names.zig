@@ -25,26 +25,31 @@ fn safeU64ToI64(val: u64) i64 {
 // CONSTANTS
 // ============================================================================
 
-/// Standard SELECT columns for names table (27 columns)
+/// Standard SELECT columns for names table (29 columns)
 /// Column order: name(0), label(1), label_hash(2), parent_name(3), parent_namehash(4),
 ///               protocol(5), registry(6), owner(7), registrant(8), resolver(9),
 ///               token_id(10), canonical_id(11), token_version(12), namehash(13), expiry(14),
 ///               registry_locked(15), migrated(16), created_block(17), created_at(18),
 ///               registered_at(19), updated_block(20), updated_at(21), is_wrapped(22), wrapper_fuses(23),
-///               wrapper_expiry(24), is_v1_name(25), v1_label_hash(26)
+///               wrapper_expiry(24), is_v1_name(25), v1_label_hash(26),
+///               is_reachable(27), unreachable_since(28)
 const SQL_SELECT_NAMES =
     \\SELECT name, label, label_hash, parent_name, parent_namehash, protocol, registry,
     \\       owner, registrant, resolver, token_id, canonical_id, token_version, namehash, expiry,
     \\       registry_locked, migrated, created_block, created_at, registered_at, updated_block, updated_at,
-    \\       is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash
+    \\       is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash,
+    \\       is_reachable, unreachable_since
     \\FROM names
 ;
 
-/// Shorter SELECT for queries that don't need wrapper fields
+/// Shorter SELECT for queries that don't need wrapper fields (24 columns).
+/// Still includes is_reachable/unreachable_since so callers can honor
+/// reachability filtering and serialize the flag.
 const SQL_SELECT_NAMES_SHORT =
     \\SELECT name, label, label_hash, parent_name, parent_namehash, protocol, registry,
     \\       owner, registrant, resolver, token_id, canonical_id, token_version, namehash, expiry,
-    \\       registry_locked, migrated, created_block, created_at, registered_at, updated_block, updated_at
+    \\       registry_locked, migrated, created_block, created_at, registered_at, updated_block, updated_at,
+    \\       is_reachable, unreachable_since
     \\FROM names
 ;
 
@@ -126,6 +131,8 @@ fn parseNameRow(q: *Query, allocator: std.mem.Allocator) !models.Name {
         .wrapper_expiry = wrapper_expiry,
         .is_v1_name = q.getBool(25),
         .v1_label_hash = v1_label_hash,
+        .is_reachable = q.getBool(27),
+        .unreachable_since = q.getOptionalInt64(28),
     };
 }
 
@@ -178,6 +185,8 @@ fn parseNameRowShort(q: *Query, allocator: std.mem.Allocator) !models.Name {
         .wrapper_expiry = null,
         .is_v1_name = false,
         .v1_label_hash = null,
+        .is_reachable = q.getBool(22),
+        .unreachable_since = q.getOptionalInt64(23),
     };
 }
 
@@ -320,8 +329,9 @@ pub fn insertName(db: *Database, name: models.Name) !void {
         \\(namehash, name, label, label_hash, parent_name, parent_namehash, protocol,
         \\ registry, owner, registrant, resolver, token_id, canonical_id, token_version, expiry,
         \\ registry_locked, migrated, created_block, created_at, registered_at, updated_block, updated_at,
-        \\ is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        \\ is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash,
+        \\ is_reachable, unreachable_since)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         \\ON CONFLICT(protocol, namehash) DO UPDATE SET
         \\ name = excluded.name,
         \\ label = excluded.label,
@@ -345,7 +355,9 @@ pub fn insertName(db: *Database, name: models.Name) !void {
         \\ wrapper_fuses = excluded.wrapper_fuses,
         \\ wrapper_expiry = excluded.wrapper_expiry,
         \\ is_v1_name = excluded.is_v1_name,
-        \\ v1_label_hash = excluded.v1_label_hash
+        \\ v1_label_hash = excluded.v1_label_hash,
+        \\ is_reachable = excluded.is_reachable,
+        \\ unreachable_since = excluded.unreachable_since
     );
     defer q.deinit();
 
@@ -383,6 +395,8 @@ pub fn insertName(db: *Database, name: models.Name) !void {
     try q.bindOptionalInt64(name.wrapper_expiry);
     try q.bindInt(if (name.is_v1_name) 1 else 0);
     try q.bindOptionalText(name.v1_label_hash);
+    try q.bindInt(if (name.is_reachable) 1 else 0);
+    try q.bindOptionalInt64(name.unreachable_since);
     try q.exec();
 }
 
@@ -635,12 +649,13 @@ pub fn getNameByTokenIdAndRegistry(db: *Database, token_id: u256, registry: Addr
     return null;
 }
 
-/// Get all names owned by an address
+/// Get all names owned by an address. Unreachable rows (orphaned by a
+/// subregistry repoint or LabelUnregistered) are filtered out.
 pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Name {
     const sql = if (limit) |l|
-        try std.fmt.allocPrint(db.allocator, SQL_SELECT_NAMES_SHORT ++ " WHERE owner = ? LIMIT {d}", .{l})
+        try std.fmt.allocPrint(db.allocator, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND owner = ? LIMIT {d}", .{l})
     else
-        try db.allocator.dupe(u8, SQL_SELECT_NAMES_SHORT ++ " WHERE owner = ?");
+        try db.allocator.dupe(u8, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND owner = ?");
     defer db.allocator.free(sql);
 
     var q = try Query.initCached(db, sql);
@@ -663,9 +678,9 @@ pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Nam
     return names.toOwnedSlice(db.allocator);
 }
 
-/// Get names by resolver address
+/// Get names by resolver address. Unreachable rows are filtered out.
 pub fn getNamesByResolver(db: *Database, resolver: Address, limit: u32) ![]models.Name {
-    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE resolver = ? ORDER BY created_at DESC LIMIT ?");
+    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND resolver = ? ORDER BY created_at DESC LIMIT ?");
     defer q.deinit();
 
     try q.bindAddress(resolver);
@@ -686,9 +701,9 @@ pub fn getNamesByResolver(db: *Database, resolver: Address, limit: u32) ![]model
     return names.toOwnedSlice(db.allocator);
 }
 
-/// Get names by registrant address
+/// Get names by registrant address. Unreachable rows are filtered out.
 pub fn getNamesByRegistrant(db: *Database, registrant: Address, skip: u32, limit: u32) ![]models.Name {
-    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE registrant = ? ORDER BY created_at DESC LIMIT ? OFFSET ?");
+    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND registrant = ? ORDER BY created_at DESC LIMIT ? OFFSET ?");
     defer q.deinit();
 
     try q.bindAddress(registrant);
@@ -743,6 +758,9 @@ fn appendNameFilterConditions(
     conditions: *std.ArrayList([]const u8),
     allocated_strings: *std.ArrayList([]const u8),
 ) !void {
+    if (!filters.include_unreachable) {
+        try conditions.append(db.allocator, "is_reachable = 1");
+    }
     if (filters.owner != null) {
         try conditions.append(db.allocator, "owner = ?");
     }
@@ -779,15 +797,15 @@ fn appendNameFilterConditions(
     }
     if (filters.has_subdomains) |has_subs| {
         try conditions.append(db.allocator, if (has_subs)
-            "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) > 0"
+            "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) > 0"
         else
-            "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) = 0");
+            "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) = 0");
     }
     if (filters.subdomain_count_gt != null) {
-        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) > ?");
+        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) > ?");
     }
     if (filters.subdomain_count_lt != null) {
-        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) < ?");
+        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) < ?");
     }
 }
 
@@ -883,7 +901,8 @@ fn parseNameRows(q: *Query, allocator: std.mem.Allocator) ![]models.Name {
         //               owner(6), resolver(7), registry(8), protocol(9), token_id(10),
         //               canonical_id(11), token_version(12), expiry(13), registry_locked(14),
         //               migrated(15), created_at(16), registered_at(17),
-        //               created_block(18), updated_at(19), updated_block(20)
+        //               created_block(18), updated_at(19), updated_block(20),
+        //               is_reachable(21), unreachable_since(22)
         const name_str = q.getTextSlice(0) orelse "";
         const namehash_str = q.getTextSlice(1) orelse "";
         const label_str = q.getTextSlice(2) orelse "";
@@ -925,6 +944,8 @@ fn parseNameRows(q: *Query, allocator: std.mem.Allocator) ![]models.Name {
             .wrapper_expiry = null,
             .is_v1_name = false,
             .v1_label_hash = null,
+            .is_reachable = q.getBool(21),
+            .unreachable_since = q.getOptionalInt64(22),
         });
     }
 
@@ -962,6 +983,10 @@ pub const NameFilters = struct {
     has_subdomains: ?bool = null,
     subdomain_count_gt: ?i64 = null,
     subdomain_count_lt: ?i64 = null,
+    /// When false (default), only `is_reachable = 1` rows are returned.
+    /// Set to true to include rows orphaned by ancestor subregistry repoints
+    /// (for audit/debug). See `registry_entries.zig` for invalidation logic.
+    include_unreachable: bool = false,
 };
 
 /// Get names with filters pushed down to DB query
@@ -977,6 +1002,12 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
     defer {
         for (allocated_strings.items) |s| db.allocator.free(s);
         allocated_strings.deinit(db.allocator);
+    }
+
+    // Reachability filter: default-on, hides orphans from subregistry repoints.
+    // Caller passes `include_unreachable = true` to disable for audit queries.
+    if (!filters.include_unreachable) {
+        try conditions.append(db.allocator, "is_reachable = 1");
     }
 
     // Owner filters
@@ -1070,16 +1101,16 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
     // Subdomain count filters (using subquery)
     if (filters.has_subdomains) |has_subs| {
         if (has_subs) {
-            try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) > 0");
+            try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) > 0");
         } else {
-            try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) = 0");
+            try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) = 0");
         }
     }
     if (filters.subdomain_count_gt != null) {
-        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) > ?");
+        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) > ?");
     }
     if (filters.subdomain_count_lt != null) {
-        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) < ?");
+        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) < ?");
     }
 
     // Build WHERE clause
@@ -1102,7 +1133,8 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
     const sql = try std.fmt.allocPrint(db.allocator,
         \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, protocol,
         \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated,
-        \\       created_at, registered_at, created_block, updated_at, updated_block
+        \\       created_at, registered_at, created_block, updated_at, updated_block,
+        \\       is_reachable, unreachable_since
         \\FROM names {s}ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
     , .{ where_clause.items, sort_field.toSql(), order_str, order_str });
     defer db.allocator.free(sql);
@@ -1174,19 +1206,24 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
 pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u32, order_dir: OrderDir, sort_field: NameSortField) ![]models.Name {
     const order_str = if (order_dir == .desc) "DESC" else "ASC";
     // Secondary sort on namehash (same direction) — see countRowsBeforeNamehash for why.
+    // is_reachable = 1 filter is applied by default; unreachable rows are
+    // hidden from the legacy unfiltered listing. Use `getFilteredNames` with
+    // `include_unreachable = true` to override.
     const sql = if (owner != null)
         try std.fmt.allocPrint(db.allocator,
             \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, protocol,
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated,
-            \\       created_at, registered_at, created_block, updated_at, updated_block
-            \\FROM names WHERE owner = ? ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
+            \\       created_at, registered_at, created_block, updated_at, updated_block,
+            \\       is_reachable, unreachable_since
+            \\FROM names WHERE is_reachable = 1 AND owner = ? ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
         , .{ sort_field.toSql(), order_str, order_str })
     else
         try std.fmt.allocPrint(db.allocator,
             \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, protocol,
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated,
-            \\       created_at, registered_at, created_block, updated_at, updated_block
-            \\FROM names ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
+            \\       created_at, registered_at, created_block, updated_at, updated_block,
+            \\       is_reachable, unreachable_since
+            \\FROM names WHERE is_reachable = 1 ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
         , .{ sort_field.toSql(), order_str, order_str });
     defer db.allocator.free(sql);
 
@@ -1254,6 +1291,8 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
             .wrapper_expiry = null,
             .is_v1_name = false,
             .v1_label_hash = null,
+            .is_reachable = q.getBool(21),
+            .unreachable_since = q.getOptionalInt64(22),
         });
     }
 
@@ -1282,6 +1321,9 @@ pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
     }
 
     // Build WHERE conditions (same order as getFilteredNames)
+    if (!filters.include_unreachable) {
+        try conditions.append(db.allocator, "is_reachable = 1");
+    }
     if (filters.owner != null) {
         try conditions.append(db.allocator, "owner = ?");
     }
@@ -1359,16 +1401,16 @@ pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
     }
     if (filters.has_subdomains) |has_subs| {
         if (has_subs) {
-            try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) > 0");
+            try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) > 0");
         } else {
-            try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) = 0");
+            try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) = 0");
         }
     }
     if (filters.subdomain_count_gt != null) {
-        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) > ?");
+        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) > ?");
     }
     if (filters.subdomain_count_lt != null) {
-        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name) < ?");
+        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) < ?");
     }
 
     // Build SQL
@@ -1455,9 +1497,10 @@ pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
 // SUBDOMAIN OPERATIONS
 // ============================================================================
 
-/// Count direct subdomains of a name
+/// Count direct subdomains of a name. Unreachable subdomains (orphaned by
+/// a subregistry repoint) are excluded to match `getSubdomains` semantics.
 pub fn countDirectSubdomains(db: *Database, parent_name: []const u8) !u32 {
-    var q = try Query.init(db, "SELECT COUNT(*) FROM names WHERE parent_name = ?");
+    var q = try Query.init(db, "SELECT COUNT(*) FROM names WHERE is_reachable = 1 AND parent_name = ?");
     defer q.deinit();
 
     try q.bindText(parent_name);
@@ -1468,9 +1511,9 @@ pub fn countDirectSubdomains(db: *Database, parent_name: []const u8) !u32 {
     return 0;
 }
 
-/// Check if a name has any direct subdomains
+/// Check if a name has any direct subdomains (reachable only).
 pub fn hasDirectSubdomains(db: *Database, parent_name: []const u8) !bool {
-    var q = try Query.init(db, "SELECT 1 FROM names WHERE parent_name = ? LIMIT 1");
+    var q = try Query.init(db, "SELECT 1 FROM names WHERE is_reachable = 1 AND parent_name = ? LIMIT 1");
     defer q.deinit();
 
     try q.bindText(parent_name);
@@ -1497,7 +1540,7 @@ pub fn batchCountDirectSubdomains(db: *Database, allocator: std.mem.Allocator, p
     var sql_buf: std.ArrayList(u8) = .{};
     defer sql_buf.deinit(allocator);
 
-    try sql_buf.appendSlice(allocator, "SELECT parent_name, COUNT(*) FROM names WHERE parent_name IN (");
+    try sql_buf.appendSlice(allocator, "SELECT parent_name, COUNT(*) FROM names WHERE is_reachable = 1 AND parent_name IN (");
     for (parent_names, 0..) |_, i| {
         if (i > 0) try sql_buf.appendSlice(allocator, ", ");
         try sql_buf.appendSlice(allocator, "?");
@@ -1534,9 +1577,11 @@ pub fn batchCountDirectSubdomains(db: *Database, allocator: std.mem.Allocator, p
     return counts;
 }
 
-/// Get direct subdomains of a name with pagination
+/// Get direct subdomains of a name with pagination. Unreachable rows
+/// (orphans of a subregistry repoint) are filtered out — callers that
+/// need them must query `getFilteredNames` with `include_unreachable`.
 pub fn getSubdomains(db: *Database, parent_name_arg: []const u8, skip: u32, limit: u32) ![]models.Name {
-    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE parent_name = ? ORDER BY name LIMIT ? OFFSET ?");
+    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND parent_name = ? ORDER BY name LIMIT ? OFFSET ?");
     defer q.deinit();
 
     try q.bindText(parent_name_arg);

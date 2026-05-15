@@ -823,6 +823,19 @@ fn getDomainExpiry(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue {
     return FieldValue{ .none = {} };
 }
 
+/// Get domain isReachable
+fn getDomainIsReachable(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue {
+    const name = getNameCtx(ctx);
+    return FieldValue{ .bool_val = name.is_reachable };
+}
+
+/// Get domain unreachableSince (null when reachable)
+fn getDomainUnreachableSince(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue {
+    const name = getNameCtx(ctx);
+    if (name.unreachable_since) |ts| return FieldValue{ .int = ts };
+    return FieldValue{ .none = {} };
+}
+
 /// Domain build field definitions - scalar fields only
 /// Nested fields (owner, registrant, resolver, etc.) are handled via NestedFieldDef
 pub const DomainBuildFields = [_]FieldDef{
@@ -835,6 +848,8 @@ pub const DomainBuildFields = [_]FieldDef{
     FieldDef.string("canonicalId", getDomainCanonicalId),
     FieldDef.int("tokenVersion", getDomainTokenVersion),
     FieldDef.boolean("isMigrated", getDomainIsMigrated),
+    FieldDef.boolean("isReachable", getDomainIsReachable),
+    FieldDef.int("unreachableSince", getDomainUnreachableSince),
     FieldDef.int("createdAt", getDomainCreatedAt),
     FieldDef.int("registrationDate", getDomainRegistrationDate),
 };

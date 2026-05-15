@@ -189,6 +189,20 @@ type Domain {
   """Whether this domain has been migrated to V2"""
   isMigrated: Boolean!
 
+  """
+  Whether this domain is reachable via canonical top-down resolution.
+  False when an ancestor label's subregistry pointer has moved away from
+  the subregistry contract that originally minted this domain (orphaned
+  subtree), when the domain has been LabelUnregistered, or when an
+  ancestor expiry has passed. Default GraphQL queries filter
+  `isReachable: true` — pass `where: { includeUnreachable: true }` to
+  include orphans.
+  """
+  isReachable: Boolean!
+
+  """Timestamp when this domain first became unreachable (null while reachable)"""
+  unreachableSince: Int
+
   """Timestamp when domain was created"""
   createdAt: Int!
 
@@ -431,6 +445,13 @@ input DomainFilter {
 
   """Filter by migration status"""
   isMigrated: Boolean
+
+  """
+  Include domains that are unreachable via canonical resolution
+  (orphaned by subregistry repoints, label unregistration, or expired
+  ancestors). Default false — set true for audit / debug queries.
+  """
+  includeUnreachable: Boolean
 }
 
 """Filter criteria for querying registrations"""

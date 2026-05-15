@@ -16,11 +16,7 @@ pub fn handleSubregistryUpdate(self: *Indexer, protocol: models.Protocol, log: r
     // Note: The 'id' in SubregistryUpdate is the canonical_id (version=0), not the full token_id
     if (log.topics.len < 2) return error.InvalidTopicCount;
 
-    // topics[0] = event signature
-    // topics[1] = indexed id (canonical ID - note: this is NOT the full token_id)
-    // SubregistryUpdate event uses tokenId in topics[1], which may include version bits
     const token_id = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
-    // Extract canonical_id (upper bits without version) for consistent lookups
     const token_id_utils = @import("../../types/token_id.zig");
     const canonical_id = token_id_utils.getCanonicalId(token_id);
 
@@ -29,87 +25,15 @@ pub fn handleSubregistryUpdate(self: *Indexer, protocol: models.Protocol, log: r
 
     std.log.debug("SubregistryUpdate: tokenId={d}, canonicalId={d}, subregistry={any}, contract={any}", .{ token_id, canonical_id, subregistry_addr, log.address });
 
-    // Skip if subregistry is zero address (unsetting subregistry)
-    if (subregistry_addr.isZero()) {
-        std.log.debug("  → Skipping zero address subregistry", .{});
-        return;
-    }
-
-    // Look up the name by token_id AND registry to avoid cross-registry collisions
-    const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
-    const name_str = if (maybe_name) |n| blk: {
-        var name_copy = n;
-        defer name_copy.deinit(self.allocator);
-        break :blk try self.allocator.dupe(u8, name_copy.name orelse "[unknown]");
-    } else try std.fmt.allocPrint(self.allocator, "canonicalId:{d}", .{canonical_id});
-    defer self.allocator.free(name_str);
-
-    const namehash = if (maybe_name) |n| n.namehash else Hash.zero;
-
-    // Insert the subregistry into the registries table so it will be monitored
-    const registry = models.Registry{
-        .address = subregistry_addr,
-        .protocol = protocol,
-        .name = name_str,
-        .namehash = namehash,
-        .parent_registry = log.address, // The contract that emitted this event
-        .created_block = log.block_number,
-        .created_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-    };
-
-    try self.database.insertRegistry(registry);
-    std.log.debug("  → Registered subregistry for monitoring: {any}", .{subregistry_addr});
-
-    // Process any orphaned registrations that were waiting for this parent
-    var subreg_hex_for_orphans_buf: [42]u8 = undefined;
-    const subreg_hex_for_orphans = subregistry_addr.toHexBuf(&subreg_hex_for_orphans_buf);
-
-    const orphans = try self.database.getOrphanedRegistrations(protocol, subreg_hex_for_orphans);
-    defer {
-        for (orphans) |*orphan| {
-            var o = orphan.*;
-            o.deinit(self.allocator);
-        }
-        self.allocator.free(orphans);
-    }
-
-    if (orphans.len > 0) {
-        std.log.info("  → Processing {d} orphaned registration(s) for subregistry {s}", .{ orphans.len, subreg_hex_for_orphans });
-
-        for (orphans) |orphan| {
-            // Create the subdomain with correct parent
-            try self.processOrphanedRegistration(protocol, orphan, name_str, namehash, subregistry_addr);
-        }
-
-        // Delete processed orphans
-        try self.database.deleteOrphanedRegistrations(protocol, subreg_hex_for_orphans);
-    }
-
-    // Note: We intentionally do NOT update names.registry here.
-    // names.registry should always point to the registry where the name was registered,
-    // not the subregistry set for its subdomains. The subregistry relationship is
-    // tracked in the registries table via parent_registry.
-
-    // Store event
-    var subreg_hex_buf: [42]u8 = undefined;
-    const subreg_hex = subregistry_addr.toHexBuf(&subreg_hex_buf);
-    var contract_hex_buf: [42]u8 = undefined;
-    const contract_hex = log.address.toHexBuf(&contract_hex_buf);
-
-    // Escape name_str for safe JSON inclusion
-    const escaped_name = try json_utils.escapeString(self.allocator, name_str);
-    defer self.allocator.free(escaped_name);
-
-    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\",\"canonicalId\":{d},\"subregistry\":\"{s}\",\"registry\":\"{s}\"}}", .{
-        escaped_name,
-        canonical_id,
-        subreg_hex,
-        contract_hex,
-    });
-
-    const event_name = try self.allocator.dupe(u8, name_str);
-
-    try utils.emitEvent(self, protocol, log, .subregistry_update, event_name, namehash, event_data);
+    try processSubregistryPointerChange(
+        self,
+        protocol,
+        log,
+        token_id,
+        subregistry_addr,
+        null,
+        .subregistry_update,
+    );
 }
 
 /// Process an orphaned registration now that we know its parent
@@ -1624,6 +1548,12 @@ pub fn handleLabelReserved(self: *Indexer, protocol: models.Protocol, log: rpc.L
 
 /// Handle LabelUnregistered events from PermissionedRegistry
 /// Event: LabelUnregistered(uint256 indexed tokenId, address indexed sender)
+///
+/// On-chain, this sets `entry.expiry = block.timestamp` which makes
+/// `getSubregistry(label)` return zero — the same canonical effect as
+/// `setSubregistry(label, 0)`. So we must cascade-invalidate descendants
+/// of the entry's current subregistry, then soft-delete the label itself
+/// (rather than hard-delete) so future re-registration can reactivate it.
 pub fn handleLabelUnregistered(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     if (log.topics.len < 3) return error.InvalidTopicCount;
 
@@ -1634,13 +1564,57 @@ pub fn handleLabelUnregistered(self: *Indexer, protocol: models.Protocol, log: r
 
     std.log.debug("LabelUnregistered: tokenId={d}, sender={any}", .{ token_id, sender });
 
+    const block_timestamp = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
+
+    // Cascade-invalidate descendants of the entry's current subregistry.
+    const prev_subregistry = try self.database.getRegistryEntrySubregistry(
+        protocol,
+        log.address,
+        token_id,
+    );
+    if (!prev_subregistry.isZero()) {
+        const subtree = try self.database.collectSubregistrySubtree(
+            self.allocator,
+            protocol,
+            prev_subregistry,
+        );
+        defer self.allocator.free(subtree);
+        if (subtree.len > 0) {
+            const affected = try self.database.setRegistriesReachability(
+                protocol,
+                subtree,
+                false,
+                log.block_number,
+                block_timestamp,
+            );
+            std.log.info(
+                "LabelUnregistered: cleared {any} from {any}; invalidated {d} descendant name(s) across {d} subregistries",
+                .{ log.address, prev_subregistry, affected, subtree.len },
+            );
+        }
+        // Clear the entry's subregistry pointer in the mirror — on-chain the
+        // expiry guard makes getSubregistry return zero, our mirror should
+        // reflect that.
+        _ = try self.database.upsertRegistryEntrySubregistry(
+            protocol,
+            log.address,
+            token_id,
+            Address.zero,
+            log.block_number,
+            block_timestamp,
+        );
+    }
+
     const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
 
     var name_str: []const u8 = undefined;
     var namehash_opt: ?Hash = null;
 
     if (maybe_name) |n| {
-        try self.database.deleteNameByNamehash(n.namehash);
+        // Soft-delete: set is_reachable = 0 so a future re-register can
+        // reactivate this row instead of losing history. Hard-delete would
+        // drop createdAt / registrationDate / events linkage.
+        try self.database.markNameUnreachableByNamehash(n.namehash, log.block_number, block_timestamp);
         name_str = try self.allocator.dupe(u8, n.name orelse "[unknown]");
         namehash_opt = n.namehash;
         var name_copy = n;
@@ -1759,9 +1733,107 @@ pub fn handleSubregistryUpdated(self: *Indexer, protocol: models.Protocol, log: 
 
     std.log.debug("SubregistryUpdated: tokenId={d}, canonicalId={d}, subregistry={any}, sender={any}", .{ token_id, canonical_id, subregistry_addr, sender });
 
-    if (subregistry_addr.isZero()) {
-        std.log.debug("  → Skipping zero address subregistry", .{});
-        return;
+    try processSubregistryPointerChange(
+        self,
+        protocol,
+        log,
+        token_id,
+        subregistry_addr,
+        sender,
+        .subregistry_updated,
+    );
+}
+
+/// Shared implementation for SubregistryUpdate / SubregistryUpdated.
+///
+/// The canonical resolution path on-chain reads
+/// `parent.getSubregistry(label)` top-down from the root. When the parent
+/// repoints (or unsets) its subregistry pointer for a label, every Domain
+/// under the previous subregistry's subtree becomes unreachable from the
+/// canonical resolver — even though those Domain rows still exist in the
+/// previous subregistry contract's storage.
+///
+/// This function:
+/// 1. Reads the previous subregistry pointer from the `registry_entries`
+///    mirror (Address.zero if no prior entry — the initial-pointer case,
+///    which fires from `_register` in the same tx as `LabelRegistered`).
+/// 2. Upserts the new pointer into the mirror.
+/// 3. If `prev != 0 && prev != new`: BFS the descendant tree under `prev`
+///    via `registry_entries.subregistry` edges, then bulk-mark every
+///    `names` row whose source `registry` is in that set as unreachable.
+/// 4. If `new != 0`: BFS the new subtree and reactivate any descendants
+///    that were previously soft-deleted (re-link case).
+/// 5. Registers the new subregistry for monitoring and processes any
+///    orphaned registrations waiting for this parent linkage.
+fn processSubregistryPointerChange(
+    self: *Indexer,
+    protocol: models.Protocol,
+    log: rpc.Log,
+    token_id: u256,
+    new_subregistry: Address,
+    sender_opt: ?Address,
+    event_type: models.EventType,
+) !void {
+    const token_id_utils = @import("../../types/token_id.zig");
+    const canonical_id = token_id_utils.getCanonicalId(token_id);
+
+    const block_timestamp = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
+
+    const prev_subregistry = try self.database.upsertRegistryEntrySubregistry(
+        protocol,
+        log.address,
+        token_id,
+        new_subregistry,
+        log.block_number,
+        block_timestamp,
+    );
+
+    // Repoint or clear: invalidate the previous subtree. The initial-pointer
+    // case (prev=0, e.g. fired from `_register` paired with LabelRegistered)
+    // falls through silently.
+    if (!prev_subregistry.isZero() and !prev_subregistry.eql(new_subregistry)) {
+        const orphaned_tree = try self.database.collectSubregistrySubtree(
+            self.allocator,
+            protocol,
+            prev_subregistry,
+        );
+        defer self.allocator.free(orphaned_tree);
+
+        if (orphaned_tree.len > 0) {
+            const affected = try self.database.setRegistriesReachability(
+                protocol,
+                orphaned_tree,
+                false,
+                log.block_number,
+                block_timestamp,
+            );
+            std.log.info(
+                "SubregistryUpdated: repoint of {any} canonicalId={d} from {any} → {any} invalidated {d} descendant name(s) across {d} subregistries",
+                .{ log.address, canonical_id, prev_subregistry, new_subregistry, affected, orphaned_tree.len },
+            );
+        }
+    }
+
+    // Re-link: if `new_subregistry` was previously orphaned, restore it. For
+    // a brand-new pointer the subtree is just `[new_subregistry]` and this
+    // is a no-op against currently-reachable rows.
+    if (!new_subregistry.isZero()) {
+        const new_tree = try self.database.collectSubregistrySubtree(
+            self.allocator,
+            protocol,
+            new_subregistry,
+        );
+        defer self.allocator.free(new_tree);
+
+        if (new_tree.len > 0) {
+            _ = try self.database.setRegistriesReachability(
+                protocol,
+                new_tree,
+                true,
+                log.block_number,
+                block_timestamp,
+            );
+        }
     }
 
     const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
@@ -1774,39 +1846,65 @@ pub fn handleSubregistryUpdated(self: *Indexer, protocol: models.Protocol, log: 
 
     const namehash = if (maybe_name) |n| n.namehash else Hash.zero;
 
-    const registry = models.Registry{
-        .address = subregistry_addr,
-        .protocol = protocol,
-        .name = name_str,
-        .namehash = namehash,
-        .parent_registry = log.address,
-        .created_block = log.block_number,
-        .created_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-    };
+    if (!new_subregistry.isZero()) {
+        const registry = models.Registry{
+            .address = new_subregistry,
+            .protocol = protocol,
+            .name = name_str,
+            .namehash = namehash,
+            .parent_registry = log.address,
+            .created_block = log.block_number,
+            .created_at = block_timestamp,
+        };
+        try self.database.insertRegistry(registry);
 
-    try self.database.insertRegistry(registry);
+        // Process orphaned registrations waiting on this parent linkage.
+        var subreg_hex_for_orphans_buf: [42]u8 = undefined;
+        const subreg_hex_for_orphans = new_subregistry.toHexBuf(&subreg_hex_for_orphans_buf);
+        const orphans = try self.database.getOrphanedRegistrations(protocol, subreg_hex_for_orphans);
+        defer {
+            for (orphans) |*orphan| {
+                var o = orphan.*;
+                o.deinit(self.allocator);
+            }
+            self.allocator.free(orphans);
+        }
+        if (orphans.len > 0) {
+            for (orphans) |orphan| {
+                try self.processOrphanedRegistration(protocol, orphan, name_str, namehash, new_subregistry);
+            }
+            try self.database.deleteOrphanedRegistrations(protocol, subreg_hex_for_orphans);
+        }
+    }
 
     var subreg_hex_buf: [42]u8 = undefined;
-    const subreg_hex = subregistry_addr.toHexBuf(&subreg_hex_buf);
+    const subreg_hex = new_subregistry.toHexBuf(&subreg_hex_buf);
     var contract_hex_buf: [42]u8 = undefined;
     const contract_hex = log.address.toHexBuf(&contract_hex_buf);
-    var sender_hex_buf: [42]u8 = undefined;
-    const sender_hex = sender.toHexBuf(&sender_hex_buf);
 
     const escaped_name = try json_utils.escapeString(self.allocator, name_str);
     defer self.allocator.free(escaped_name);
 
-    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\",\"canonicalId\":{d},\"subregistry\":\"{s}\",\"registry\":\"{s}\",\"sender\":\"{s}\"}}", .{
+    const event_data = if (sender_opt) |sender| blk: {
+        var sender_hex_buf: [42]u8 = undefined;
+        const sender_hex = sender.toHexBuf(&sender_hex_buf);
+        break :blk try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\",\"canonicalId\":{d},\"subregistry\":\"{s}\",\"registry\":\"{s}\",\"sender\":\"{s}\"}}", .{
+            escaped_name,
+            canonical_id,
+            subreg_hex,
+            contract_hex,
+            sender_hex,
+        });
+    } else try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\",\"canonicalId\":{d},\"subregistry\":\"{s}\",\"registry\":\"{s}\"}}", .{
         escaped_name,
         canonical_id,
         subreg_hex,
         contract_hex,
-        sender_hex,
     });
 
     const event_name = try self.allocator.dupe(u8, name_str);
 
-    try utils.emitEvent(self, protocol, log, .subregistry_updated, event_name, namehash, event_data);
+    try utils.emitEvent(self, protocol, log, event_type, event_name, namehash, event_data);
 }
 
 /// Handle ResolverUpdated events from PermissionedRegistry (NEW signature)
