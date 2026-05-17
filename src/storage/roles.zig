@@ -152,6 +152,9 @@ pub fn getRolesByAccount(db: *Database, protocol: models.Protocol, account: Addr
 pub const RolePaginationOptions = struct {
     resource: ?[]const u8 = null,
     account: ?Address = null,
+    /// Filter by the contract that emitted the role event (e.g., to scope
+    /// a query to a single registry's roles regardless of resource).
+    contract_address: ?Address = null,
     limit: u32 = 100,
     cursor_id: ?i64 = null, // For cursor-based pagination (ID to start after)
     direction: enum { forward, backward } = .forward,
@@ -183,6 +186,12 @@ pub fn getRolesWithPagination(db: *Database, protocol: models.Protocol, options:
 
     if (options.account != null) {
         const clause = " AND r.account = ?";
+        @memcpy(sql_buf[sql_len .. sql_len + clause.len], clause);
+        sql_len += clause.len;
+    }
+
+    if (options.contract_address != null) {
+        const clause = " AND r.contract_address = ?";
         @memcpy(sql_buf[sql_len .. sql_len + clause.len], clause);
         sql_len += clause.len;
     }
@@ -221,6 +230,10 @@ pub fn getRolesWithPagination(db: *Database, protocol: models.Protocol, options:
         try q.bindAddress(account);
     }
 
+    if (options.contract_address) |contract| {
+        try q.bindAddress(contract);
+    }
+
     if (options.cursor_id) |cursor_id| {
         try q.bindInt64(cursor_id);
     }
@@ -245,6 +258,22 @@ pub fn getRolesWithPagination(db: *Database, protocol: models.Protocol, options:
 
 /// Get total count of roles with optional filters
 pub fn getTotalRoleCount(db: *Database, protocol: models.Protocol, resource: ?[]const u8, account: ?Address) !usize {
+    return getRoleCountFiltered(db, .{
+        .protocol = protocol,
+        .resource = resource,
+        .account = account,
+    });
+}
+
+pub const RoleCountFilters = struct {
+    protocol: models.Protocol,
+    resource: ?[]const u8 = null,
+    account: ?Address = null,
+    contract_address: ?Address = null,
+};
+
+/// Count roles matching all provided filters. Used by Registry.roleCount.
+pub fn getRoleCountFiltered(db: *Database, filters: RoleCountFilters) !usize {
     var sql_buf: [512]u8 = undefined;
     var sql_len: usize = 0;
 
@@ -252,14 +281,18 @@ pub fn getTotalRoleCount(db: *Database, protocol: models.Protocol, resource: ?[]
     @memcpy(sql_buf[sql_len .. sql_len + base.len], base);
     sql_len += base.len;
 
-    if (resource != null) {
+    if (filters.resource != null) {
         const clause = " AND resource = ?";
         @memcpy(sql_buf[sql_len .. sql_len + clause.len], clause);
         sql_len += clause.len;
     }
-
-    if (account != null) {
+    if (filters.account != null) {
         const clause = " AND account = ?";
+        @memcpy(sql_buf[sql_len .. sql_len + clause.len], clause);
+        sql_len += clause.len;
+    }
+    if (filters.contract_address != null) {
+        const clause = " AND contract_address = ?";
         @memcpy(sql_buf[sql_len .. sql_len + clause.len], clause);
         sql_len += clause.len;
     }
@@ -267,19 +300,12 @@ pub fn getTotalRoleCount(db: *Database, protocol: models.Protocol, resource: ?[]
     var q = try Query.init(db, sql_buf[0..sql_len]);
     defer q.deinit();
 
-    try q.bindTextStatic(protocol.toString());
+    try q.bindTextStatic(filters.protocol.toString());
+    if (filters.resource) |res| try q.bindText(res);
+    if (filters.account) |acc| try q.bindAddress(acc);
+    if (filters.contract_address) |addr| try q.bindAddress(addr);
 
-    if (resource) |res| {
-        try q.bindText(res);
-    }
-
-    if (account) |acc| {
-        try q.bindAddress(acc);
-    }
-
-    if (try q.step()) {
-        return @intCast(q.getInt64(0));
-    }
+    if (try q.step()) return @intCast(q.getInt64(0));
     return 0;
 }
 

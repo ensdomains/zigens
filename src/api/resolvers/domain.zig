@@ -33,7 +33,7 @@ fn resolveDomainId(allocator: std.mem.Allocator, id: []const u8) !Hash {
     return namehash(allocator, id);
 }
 
-fn mapDomainOrderBy(order_by: ?[]const u8) db.NameSortField {
+pub fn mapDomainOrderBy(order_by: ?[]const u8) db.NameSortField {
     const field_name = order_by orelse return .created_at;
     if (std.mem.eql(u8, field_name, "name")) return .name;
     if (std.mem.eql(u8, field_name, "createdAt")) return .created_at;

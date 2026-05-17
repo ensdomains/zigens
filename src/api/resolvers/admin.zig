@@ -15,6 +15,7 @@ const parser = common.parser;
 const pagination = common.pagination;
 const builders = @import("../builders/builders.zig");
 const json_utils = common.json_utils;
+const domain_resolvers = @import("domain.zig");
 
 /// Parse protocol argument from field (defaults to v2).
 /// Surfaces invalid protocol values as `error.InvalidProtocol` rather than silently
@@ -309,24 +310,43 @@ pub fn resolveRegistries(ctx: parser.ExecutionContext, field: *const parser.Fiel
         allocator.free(registries);
     }
 
-    // Build JSON array
     var json: std.ArrayList(u8) = .{};
     defer json.deinit(allocator);
     try json.appendSlice(allocator, "[");
 
     for (registries, 0..) |*registry, i| {
         if (i > 0) try json.appendSlice(allocator, ",");
-        const handler = FieldHandler{
-            .handleFn = handleRegistryField,
-            .context = @ptrCast(@constCast(registry)),
-        };
-        const registry_json = try buildJsonWithFields(allocator, field.selections, handler);
+        const registry_json = try buildRegistryInfoJson(allocator, database, registry, field.selections, ctx);
         defer allocator.free(registry_json);
         try json.appendSlice(allocator, registry_json);
     }
 
     try json.appendSlice(allocator, "]");
     return parser.FieldResult{ .json = try allocator.dupe(u8, json.items) };
+}
+
+/// Resolver for the single-registry lookup. Mirrors `domain(id:)` for use as
+/// the Registry-view page's entry point.
+pub fn resolveRegistry(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
+    const allocator = ctx.allocator;
+    const database: *db.Database = @ptrCast(@alignCast(ctx.database));
+
+    const protocol = try parseProtocolArg(field);
+
+    const address_arg = parser.getStringArg(field, "address", null) orelse {
+        return parser.FieldResult{ .json = try allocator.dupe(u8, "null") };
+    };
+    const address = Address.fromHex(address_arg) catch return error.InvalidAddress;
+
+    const registry_opt = try database.getRegistry(protocol, address);
+    if (registry_opt == null) {
+        return parser.FieldResult{ .json = try allocator.dupe(u8, "null") };
+    }
+    var registry = registry_opt.?;
+    defer registry.deinit(allocator);
+
+    const json = try buildRegistryInfoJson(allocator, database, &registry, field.selections, ctx);
+    return parser.FieldResult{ .json = json };
 }
 
 /// Resolver for metadata query
@@ -732,6 +752,743 @@ fn handleRegistryField(ctx: *anyopaque, output_key: []const u8, field_name: []co
         return true;
     }
     return false;
+}
+
+// ============================================================================
+// RegistryInfo JSON builder — handles scalar AND nested fields (owner, labels,
+// labelCount, events, eventCount, roles, roleCount).
+//
+// We don't go through the generic `FieldHandler`/`buildJsonWithFields` path
+// because that handler only sees field NAMES, not the full Field (args + sub-
+// selections). Nested fields like `labels(first: 50)` need both, so we walk
+// `selections` directly.
+// ============================================================================
+
+/// Hex form of the EAC "ALL roles" bitmap and the root resource (resource=0x0).
+/// Matches `script/deploy-constants.ts:FLAGS.ALL` in contracts-v2.
+const REG_ROOT_RESOURCE_HEX: []const u8 = "0x0000000000000000000000000000000000000000000000000000000000000000";
+const REG_ROLE_BITMAP_ALL_HEX: []const u8 = "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+/// Cap on `first` for nested list fields. Mirrors the per-query pagination cap
+/// so a single registry lookup can't fan out to an unbounded scan.
+const REG_NESTED_DEFAULT_LIMIT: u32 = 100;
+const REG_NESTED_MAX_LIMIT: u32 = 1000;
+
+fn nestedLimit(field: *const parser.Field) u32 {
+    const requested = parser.getIntArg(field, "first", @intCast(REG_NESTED_DEFAULT_LIMIT)) orelse @as(i64, REG_NESTED_DEFAULT_LIMIT);
+    const clamped: i64 = @max(0, @min(@as(i64, REG_NESTED_MAX_LIMIT), requested));
+    return @intCast(clamped);
+}
+
+fn nestedSkip(field: *const parser.Field) u32 {
+    const requested = parser.getIntArg(field, "skip", 0) orelse @as(i64, 0);
+    const clamped: i64 = @max(0, requested);
+    return @intCast(clamped);
+}
+
+/// Build a Registry JSON object handling each requested field. Nested fields
+/// run their own DB queries; scalar fields use `handleRegistryField` for
+/// formatting (so the scalar logic stays in one place).
+fn buildRegistryInfoJson(
+    allocator: std.mem.Allocator,
+    database: *db.Database,
+    registry: *const models.Registry,
+    selections: []const parser.Field,
+    ctx: parser.ExecutionContext,
+) anyerror![]u8 {
+    var json: std.ArrayList(u8) = .{};
+    defer json.deinit(allocator);
+    try json.appendSlice(allocator, "{");
+
+    var first = true;
+    for (selections) |*sel| {
+        const output_key = sel.alias orelse sel.name;
+
+        var field_buf: std.ArrayList(u8) = .{};
+        defer field_buf.deinit(allocator);
+
+        const handled = try writeRegistryField(allocator, database, registry, sel, output_key, field_buf.writer(allocator), ctx);
+        if (!handled) continue;
+
+        if (!first) try json.appendSlice(allocator, ",");
+        try json.appendSlice(allocator, field_buf.items);
+        first = false;
+    }
+
+    try json.appendSlice(allocator, "}");
+    return try allocator.dupe(u8, json.items);
+}
+
+/// Write one Registry field. Returns true if the field is known (so the
+/// caller writes the comma), false to skip unknown fields silently.
+fn writeRegistryField(
+    allocator: std.mem.Allocator,
+    database: *db.Database,
+    registry: *const models.Registry,
+    sel: *const parser.Field,
+    output_key: []const u8,
+    writer: std.ArrayList(u8).Writer,
+    ctx: parser.ExecutionContext,
+) anyerror!bool {
+    // Scalar fields: delegate to the existing handler.
+    if (try handleRegistryField(@ptrCast(@constCast(registry)), output_key, sel.name, writer, allocator)) {
+        return true;
+    }
+
+    if (std.mem.eql(u8, sel.name, "owner")) {
+        try writeRegistryOwner(allocator, database, registry, sel, output_key, writer, ctx);
+        return true;
+    }
+    if (std.mem.eql(u8, sel.name, "labels")) {
+        try writeRegistryLabels(allocator, database, registry, sel, output_key, writer, ctx);
+        return true;
+    }
+    if (std.mem.eql(u8, sel.name, "labelConnection")) {
+        try writeRegistryLabelConnection(allocator, database, registry, sel, output_key, writer, ctx);
+        return true;
+    }
+    if (std.mem.eql(u8, sel.name, "labelCount")) {
+        const count = try database.getFilteredNameCount(.{
+            .registry = registry.address,
+        });
+        try writer.print("\"{s}\":{d}", .{ output_key, count });
+        return true;
+    }
+    if (std.mem.eql(u8, sel.name, "events")) {
+        try writeRegistryEvents(allocator, database, registry, sel, output_key, writer, ctx);
+        return true;
+    }
+    if (std.mem.eql(u8, sel.name, "eventConnection")) {
+        try writeRegistryEventConnection(allocator, database, registry, sel, output_key, writer, ctx);
+        return true;
+    }
+    if (std.mem.eql(u8, sel.name, "eventCount")) {
+        const addr_hex = try registry.address.toHex(allocator);
+        defer allocator.free(addr_hex);
+        const count = try database.getEventCount(.{
+            .protocol = registry.protocol,
+            .contract_address = addr_hex,
+        });
+        try writer.print("\"{s}\":{d}", .{ output_key, count });
+        return true;
+    }
+    if (std.mem.eql(u8, sel.name, "roles")) {
+        try writeRegistryRoles(allocator, database, registry, sel, output_key, writer);
+        return true;
+    }
+    if (std.mem.eql(u8, sel.name, "roleConnection")) {
+        try writeRegistryRoleConnection(allocator, database, registry, sel, output_key, writer);
+        return true;
+    }
+    if (std.mem.eql(u8, sel.name, "roleCount")) {
+        const count = try database.getRoleCountFiltered(.{
+            .protocol = registry.protocol,
+            .contract_address = registry.address,
+        });
+        try writer.print("\"{s}\":{d}", .{ output_key, count });
+        return true;
+    }
+
+    return false;
+}
+
+/// `owner` = the account holding the FULL root-role bitmap on this registry.
+/// Resolves to null if no such role has been granted.
+fn writeRegistryOwner(
+    allocator: std.mem.Allocator,
+    database: *db.Database,
+    registry: *const models.Registry,
+    sel: *const parser.Field,
+    output_key: []const u8,
+    writer: std.ArrayList(u8).Writer,
+    ctx: parser.ExecutionContext,
+) !void {
+    // Query all root-resource roles on this contract, then pick the most
+    // recently granted holder of the full bitmap. The contract-address
+    // filter narrows by registry; the resource filter (root context) is
+    // applied client-side because the helper currently only filters
+    // resource as a single string match (which works since root is 0x0…0).
+    const opts = db.RolePaginationOptions{
+        .resource = REG_ROOT_RESOURCE_HEX,
+        .contract_address = registry.address,
+        .limit = REG_NESTED_MAX_LIMIT,
+    };
+    const role_rows = try database.getRolesWithPagination(registry.protocol, opts);
+    defer {
+        for (role_rows) |*r| {
+            var role_mut = r.*;
+            role_mut.deinit(allocator);
+        }
+        allocator.free(role_rows);
+    }
+
+    var owner_addr: ?Address = null;
+    for (role_rows) |*r| {
+        if (std.mem.eql(u8, r.role_bitmap, REG_ROLE_BITMAP_ALL_HEX)) {
+            owner_addr = r.account; // rows come back DESC by id; first match is newest
+            break;
+        }
+    }
+
+    if (owner_addr) |addr| {
+        try writer.print("\"{s}\":", .{output_key});
+        const account_json = try builders.buildAccountJson(addr, sel.selections, .{
+            .database = database,
+            .depth = 0,
+            .allocator = allocator,
+            .loaders = ctx.loaders,
+        });
+        defer allocator.free(account_json);
+        try writer.writeAll(account_json);
+    } else {
+        try writer.print("\"{s}\":null", .{output_key});
+    }
+}
+
+/// Layer `where: DomainFilter` from `sel` onto `filters`. Shared by both the
+/// offset-based labels field and the cursor-based labelConnection so the two
+/// expose the same filter surface.
+fn applyLabelsWhere(sel: *const parser.Field, filters: *db.NameFilters) !void {
+    const where_args = common.getObjectArg(sel, "where") orelse return;
+    for (where_args) |a| {
+        _ = common.matchStringArg(a, "name", &filters.name) or
+            common.matchStringArg(a, "name_contains", &filters.name_contains) or
+            common.matchStringArg(a, "name_contains_nocase", &filters.name_contains_nocase) or
+            common.matchStringArg(a, "name_starts_with", &filters.name_starts_with) or
+            common.matchStringArg(a, "name_ends_with", &filters.name_ends_with) or
+            (try common.matchAddressArg(a, "owner", &filters.owner)) or
+            common.matchIntArg(a, "expiry_gt", &filters.expiry_gt) or
+            common.matchIntArg(a, "expiry_gte", &filters.expiry_gte) or
+            common.matchIntArg(a, "expiry_lt", &filters.expiry_lt) or
+            common.matchIntArg(a, "expiry_lte", &filters.expiry_lte) or
+            common.matchBoolArg(a, "isMigrated", &filters.migrated);
+    }
+}
+
+/// Layer `where: EventFilter` from `sel` onto `filter`. Shared by the offset
+/// and connection variants so they accept the same filter shape.
+fn applyEventsWhere(sel: *const parser.Field, filter: *db.EventFilterOptions) void {
+    const where_args = common.getObjectArg(sel, "where") orelse return;
+    for (where_args) |a| {
+        _ = common.matchStringArg(a, "type", &filter.event_type) or
+            common.matchStringArg(a, "domain", &filter.domain) or
+            common.matchStringArg(a, "namehash", &filter.namehash) or
+            common.matchIntArg(a, "blockNumber_gt", &filter.block_number_gt) or
+            common.matchIntArg(a, "blockNumber_gte", &filter.block_number_gte) or
+            common.matchIntArg(a, "blockNumber_lt", &filter.block_number_lt) or
+            common.matchIntArg(a, "blockNumber_lte", &filter.block_number_lte) or
+            common.matchIntArg(a, "timestamp_gt", &filter.timestamp_gt) or
+            common.matchIntArg(a, "timestamp_gte", &filter.timestamp_gte) or
+            common.matchIntArg(a, "timestamp_lt", &filter.timestamp_lt) or
+            common.matchIntArg(a, "timestamp_lte", &filter.timestamp_lte);
+    }
+}
+
+/// `labels` = names whose `registry` column matches this contract address.
+/// Reuses `getFilteredNames` so caller-supplied `where` filters compose with
+/// the registry pin.
+fn writeRegistryLabels(
+    allocator: std.mem.Allocator,
+    database: *db.Database,
+    registry: *const models.Registry,
+    sel: *const parser.Field,
+    output_key: []const u8,
+    writer: std.ArrayList(u8).Writer,
+    ctx: parser.ExecutionContext,
+) !void {
+    var filters = db.NameFilters{ .registry = registry.address };
+    try applyLabelsWhere(sel, &filters);
+
+    const limit = nestedLimit(sel);
+    const skip = nestedSkip(sel);
+    const sort_field = domain_resolvers.mapDomainOrderBy(parser.getStringArg(sel, "orderBy", null));
+    const order_dir = common.parseOrderDirection(sel, db.OrderDir, .desc);
+
+    const names = try database.getFilteredNames(filters, skip, limit, order_dir, sort_field);
+    defer {
+        for (names) |*n| {
+            var name_mut = n.*;
+            name_mut.deinit(allocator);
+        }
+        allocator.free(names);
+    }
+
+    try writer.print("\"{s}\":[", .{output_key});
+    for (names, 0..) |*name, i| {
+        if (i > 0) try writer.writeAll(",");
+        const dom_json = try builders.buildDomainJson(name, sel.selections, .{
+            .database = database,
+            .depth = 0,
+            .allocator = allocator,
+            .loaders = ctx.loaders,
+        });
+        defer allocator.free(dom_json);
+        try writer.writeAll(dom_json);
+    }
+    try writer.writeAll("]");
+}
+
+/// `events` = events emitted by this registry contract (history tab).
+fn writeRegistryEvents(
+    allocator: std.mem.Allocator,
+    database: *db.Database,
+    registry: *const models.Registry,
+    sel: *const parser.Field,
+    output_key: []const u8,
+    writer: std.ArrayList(u8).Writer,
+    ctx: parser.ExecutionContext,
+) !void {
+    const addr_hex = try registry.address.toHex(allocator);
+    defer allocator.free(addr_hex);
+
+    var filter = db.EventFilterOptions{
+        .protocol = registry.protocol,
+        .contract_address = addr_hex,
+        .limit = nestedLimit(sel),
+        .skip = nestedSkip(sel),
+    };
+    applyEventsWhere(sel, &filter);
+
+    const events = try database.getEventsFiltered(filter);
+    defer {
+        for (events) |*e| {
+            var ev_mut = e.*;
+            ev_mut.deinit(allocator);
+        }
+        allocator.free(events);
+    }
+
+    try writer.print("\"{s}\":[", .{output_key});
+    for (events, 0..) |*event, i| {
+        if (i > 0) try writer.writeAll(",");
+        const ev_json = try builders.buildEventJson(event, sel.selections, .{
+            .database = database,
+            .depth = 0,
+            .allocator = allocator,
+            .loaders = ctx.loaders,
+        });
+        defer allocator.free(ev_json);
+        try writer.writeAll(ev_json);
+    }
+    try writer.writeAll("]");
+}
+
+/// `roles` = EAC role assignments on this registry contract. Filter by
+/// account optionally.
+fn writeRegistryRoles(
+    allocator: std.mem.Allocator,
+    database: *db.Database,
+    registry: *const models.Registry,
+    sel: *const parser.Field,
+    output_key: []const u8,
+    writer: std.ArrayList(u8).Writer,
+) !void {
+    var opts = db.RolePaginationOptions{
+        .contract_address = registry.address,
+        .limit = nestedLimit(sel),
+    };
+    if (parser.getStringArg(sel, "account", null)) |acc_str| {
+        opts.account = Address.fromHex(acc_str) catch return error.InvalidAddress;
+    }
+
+    const roles_list = try database.getRolesWithPagination(registry.protocol, opts);
+    defer {
+        for (roles_list) |*r| {
+            var role_mut = r.*;
+            role_mut.deinit(allocator);
+        }
+        allocator.free(roles_list);
+    }
+
+    try writer.print("\"{s}\":[", .{output_key});
+    for (roles_list, 0..) |*role, i| {
+        if (i > 0) try writer.writeAll(",");
+        const handler = FieldHandler{
+            .handleFn = handleEACRoleField,
+            .context = @ptrCast(@constCast(role)),
+        };
+        const role_json = try buildJsonWithFields(allocator, sel.selections, handler);
+        defer allocator.free(role_json);
+        try writer.writeAll(role_json);
+    }
+    try writer.writeAll("]");
+}
+
+// ============================================================================
+// Registry connection variants (Relay cursor pagination).
+//
+// These mirror the top-level *Connection resolvers but pin the registry-side
+// filters (registry address / contract_address) so the connection is scoped
+// to one Registry contract. Cursor format matches the top-level field for the
+// same underlying type, so cursors are interchangeable across contexts.
+// ============================================================================
+
+/// Parse first/after/last/before from a nested selection.
+fn parseConnectionParams(sel: *const parser.Field) !pagination.PaginationParams {
+    const first = parser.getIntArg(sel, "first", null);
+    const after = parser.getStringArg(sel, "after", null);
+    const last = parser.getIntArg(sel, "last", null);
+    const before = parser.getStringArg(sel, "before", null);
+    return pagination.PaginationParams.parse(
+        first,
+        after,
+        last,
+        before,
+        REG_NESTED_DEFAULT_LIMIT,
+        REG_NESTED_MAX_LIMIT,
+    );
+}
+
+/// Inspect a connection selection for which top-level fields the client wants.
+const ConnectionWants = struct { edges: bool, page_info: bool, total_count: bool };
+fn detectConnectionWants(sel: *const parser.Field) ConnectionWants {
+    var w = ConnectionWants{ .edges = false, .page_info = false, .total_count = false };
+    for (sel.selections) |*s| {
+        if (std.mem.eql(u8, s.name, "edges")) w.edges = true;
+        if (std.mem.eql(u8, s.name, "pageInfo")) w.page_info = true;
+        if (std.mem.eql(u8, s.name, "totalCount")) w.total_count = true;
+    }
+    return w;
+}
+
+/// Find `edges { node { ... } }` selections; returns an empty slice if not present.
+fn findNodeSelections(sel: *const parser.Field) []const parser.Field {
+    for (sel.selections) |*s| {
+        if (std.mem.eql(u8, s.name, "edges")) {
+            for (s.selections) |*e| {
+                if (std.mem.eql(u8, e.name, "node")) return e.selections;
+            }
+            break;
+        }
+    }
+    return &[_]parser.Field{};
+}
+
+/// Write the `pageInfo` block of a connection. Cursors are passed pre-encoded
+/// so this helper is agnostic to int vs. string cursor flavors.
+fn writeConnectionPageInfo(
+    writer: std.ArrayList(u8).Writer,
+    params: pagination.PaginationParams,
+    has_more: bool,
+    start_cursor: ?[]const u8,
+    end_cursor: ?[]const u8,
+) !void {
+    try writer.writeAll("\"pageInfo\":{\"hasNextPage\":");
+    try writer.writeAll(if (params.direction == .forward and has_more) "true" else "false");
+    try writer.writeAll(",\"hasPreviousPage\":");
+    try writer.writeAll(if (params.direction == .backward and has_more) "true" else if (params.cursor != null) "true" else "false");
+
+    if (start_cursor) |c| {
+        try writer.print(",\"startCursor\":\"{s}\"", .{c});
+    } else {
+        try writer.writeAll(",\"startCursor\":null");
+    }
+    if (end_cursor) |c| {
+        try writer.print(",\"endCursor\":\"{s}\"", .{c});
+    } else {
+        try writer.writeAll(",\"endCursor\":null");
+    }
+    try writer.writeAll("}");
+}
+
+fn writeRegistryLabelConnection(
+    allocator: std.mem.Allocator,
+    database: *db.Database,
+    registry: *const models.Registry,
+    sel: *const parser.Field,
+    output_key: []const u8,
+    writer: std.ArrayList(u8).Writer,
+    ctx: parser.ExecutionContext,
+) !void {
+    const params = try parseConnectionParams(sel);
+    const wants = detectConnectionWants(sel);
+
+    var filters = db.NameFilters{ .registry = registry.address };
+    try applyLabelsWhere(sel, &filters);
+
+    try writer.print("\"{s}\":{{", .{output_key});
+
+    if (wants.total_count and !wants.edges and !wants.page_info) {
+        const count = try database.getFilteredNameCount(filters);
+        try writer.print("\"totalCount\":{d}}}", .{count});
+        return;
+    }
+
+    const sort_field = domain_resolvers.mapDomainOrderBy(parser.getStringArg(sel, "orderBy", null));
+    const base_dir = common.parseOrderDirection(sel, db.OrderDir, .desc);
+    const order_dir: db.OrderDir = if (params.direction == .backward)
+        (if (base_dir == .desc) .asc else .desc)
+    else
+        base_dir;
+
+    var skip: u32 = 0;
+    if (params.cursor) |c| {
+        const cursor_namehash = try pagination.CursorCodec.decodeString(allocator, c);
+        defer allocator.free(cursor_namehash);
+        const rows_before = database.countRowsBeforeNamehash(cursor_namehash, sort_field, order_dir, filters) catch 0;
+        skip = rows_before +| 1;
+    }
+
+    const fetch_limit: u32 = @intCast(params.limit + 1);
+    const names = try database.getFilteredNames(filters, skip, fetch_limit, order_dir, sort_field);
+    defer {
+        for (names) |*n| {
+            var nn = n.*;
+            nn.deinit(allocator);
+        }
+        allocator.free(names);
+    }
+
+    const has_more = names.len > params.limit;
+    const actual = @min(names.len, params.limit);
+    if (params.direction == .backward and actual > 1) std.mem.reverse(models.Name, names[0..actual]);
+    const items = names[0..actual];
+
+    // Pre-encode cursors per edge (kept for re-use in pageInfo).
+    var edge_cursors = try allocator.alloc([]const u8, items.len);
+    defer {
+        for (edge_cursors) |c| allocator.free(c);
+        allocator.free(edge_cursors);
+    }
+    for (items, 0..) |*name, i| {
+        const id_hex = try name.namehash.toHex(allocator);
+        defer allocator.free(id_hex);
+        edge_cursors[i] = try pagination.CursorCodec.encodeString(allocator, id_hex);
+    }
+
+    const start_cursor: ?[]const u8 = if (edge_cursors.len > 0) edge_cursors[0] else null;
+    const end_cursor: ?[]const u8 = if (edge_cursors.len > 0) edge_cursors[edge_cursors.len - 1] else null;
+    try writeConnectionPageInfo(writer, params, has_more, start_cursor, end_cursor);
+
+    try writer.writeAll(",\"edges\":[");
+    const node_selections = findNodeSelections(sel);
+    for (items, 0..) |*name, i| {
+        if (i > 0) try writer.writeAll(",");
+        try writer.print("{{\"cursor\":\"{s}\",\"node\":", .{edge_cursors[i]});
+        const dom_json = try builders.buildDomainJson(name, node_selections, .{
+            .database = database,
+            .depth = 0,
+            .allocator = allocator,
+            .loaders = ctx.loaders,
+        });
+        defer allocator.free(dom_json);
+        try writer.writeAll(dom_json);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]");
+
+    if (wants.total_count) {
+        const count = try database.getFilteredNameCount(filters);
+        try writer.print(",\"totalCount\":{d}", .{count});
+    }
+    try writer.writeAll("}");
+}
+
+fn writeRegistryEventConnection(
+    allocator: std.mem.Allocator,
+    database: *db.Database,
+    registry: *const models.Registry,
+    sel: *const parser.Field,
+    output_key: []const u8,
+    writer: std.ArrayList(u8).Writer,
+    ctx: parser.ExecutionContext,
+) !void {
+    const params = try parseConnectionParams(sel);
+    const wants = detectConnectionWants(sel);
+
+    const addr_hex = try registry.address.toHex(allocator);
+    defer allocator.free(addr_hex);
+
+    var filter = db.EventFilterOptions{
+        .protocol = registry.protocol,
+        .contract_address = addr_hex,
+    };
+    applyEventsWhere(sel, &filter);
+
+    if (parser.getStringArg(sel, "orderBy", null)) |o| {
+        if (std.mem.eql(u8, o, "blockNumber")) filter.sort_field = .block_number;
+        if (std.mem.eql(u8, o, "timestamp")) filter.sort_field = .timestamp;
+        if (std.mem.eql(u8, o, "name")) filter.sort_field = .name;
+    }
+    filter.order_dir = common.parseOrderDirection(sel, db.EventOrderDir, filter.order_dir);
+
+    try writer.print("\"{s}\":{{", .{output_key});
+
+    if (wants.total_count and !wants.edges and !wants.page_info) {
+        const count = try database.getEventCount(filter);
+        try writer.print("\"totalCount\":{d}}}", .{count});
+        return;
+    }
+
+    const user_dir = filter.order_dir;
+    const order_dir: db.EventOrderDir = if (params.direction == .backward)
+        (if (user_dir == .desc) .asc else .desc)
+    else
+        user_dir;
+
+    var skip: u32 = 0;
+    if (params.cursor) |c| {
+        const decoded = try pagination.CursorCodec.decodeString(allocator, c);
+        defer allocator.free(decoded);
+        const sep = std.mem.lastIndexOfScalar(u8, decoded, '-') orelse return error.InvalidCursor;
+        const tx_hash = decoded[0..sep];
+        const log_index = std.fmt.parseInt(u32, decoded[sep + 1 ..], 10) catch return error.InvalidCursor;
+        const before = database.countEventsBeforeCursor(tx_hash, log_index, order_dir, filter) catch 0;
+        skip = before +| 1;
+    }
+
+    var fetch_filter = filter;
+    fetch_filter.limit = @intCast(params.limit + 1);
+    fetch_filter.skip = skip;
+    fetch_filter.order_dir = order_dir;
+
+    const events = try database.getEventsFiltered(fetch_filter);
+    defer {
+        for (events) |*e| {
+            var em = e.*;
+            em.deinit(allocator);
+        }
+        allocator.free(events);
+    }
+
+    const has_more = events.len > params.limit;
+    const actual = @min(events.len, params.limit);
+    if (params.direction == .backward and actual > 1) std.mem.reverse(models.Event, events[0..actual]);
+    const items = events[0..actual];
+
+    // Encode cursors once per edge (reused in pageInfo and edge JSON).
+    var edge_cursors = try allocator.alloc([]const u8, items.len);
+    defer {
+        for (edge_cursors) |c| allocator.free(c);
+        allocator.free(edge_cursors);
+    }
+    for (items, 0..) |*e, i| {
+        const tx = try e.tx_hash.toHex(allocator);
+        defer allocator.free(tx);
+        const id = try std.fmt.allocPrint(allocator, "{s}-{d}", .{ tx, e.log_index });
+        defer allocator.free(id);
+        edge_cursors[i] = try pagination.CursorCodec.encodeString(allocator, id);
+    }
+
+    const start_cursor: ?[]const u8 = if (edge_cursors.len > 0) edge_cursors[0] else null;
+    const end_cursor: ?[]const u8 = if (edge_cursors.len > 0) edge_cursors[edge_cursors.len - 1] else null;
+    try writeConnectionPageInfo(writer, params, has_more, start_cursor, end_cursor);
+
+    try writer.writeAll(",\"edges\":[");
+    const node_selections = findNodeSelections(sel);
+    for (items, 0..) |*evt, i| {
+        if (i > 0) try writer.writeAll(",");
+        try writer.print("{{\"cursor\":\"{s}\",\"node\":", .{edge_cursors[i]});
+        const ev_json = try builders.buildEventJson(evt, node_selections, .{
+            .database = database,
+            .depth = 0,
+            .allocator = allocator,
+            .loaders = ctx.loaders,
+        });
+        defer allocator.free(ev_json);
+        try writer.writeAll(ev_json);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]");
+
+    if (wants.total_count) {
+        const count = try database.getEventCount(filter);
+        try writer.print(",\"totalCount\":{d}", .{count});
+    }
+    try writer.writeAll("}");
+}
+
+fn writeRegistryRoleConnection(
+    allocator: std.mem.Allocator,
+    database: *db.Database,
+    registry: *const models.Registry,
+    sel: *const parser.Field,
+    output_key: []const u8,
+    writer: std.ArrayList(u8).Writer,
+) !void {
+    const params = try parseConnectionParams(sel);
+    const wants = detectConnectionWants(sel);
+
+    var account_addr: ?Address = null;
+    if (parser.getStringArg(sel, "account", null)) |acc| {
+        account_addr = Address.fromHex(acc) catch return error.InvalidAddress;
+    }
+
+    try writer.print("\"{s}\":{{", .{output_key});
+
+    const count_filter = db.RoleCountFilters{
+        .protocol = registry.protocol,
+        .account = account_addr,
+        .contract_address = registry.address,
+    };
+
+    if (wants.total_count and !wants.edges and !wants.page_info) {
+        const count = try database.getRoleCountFiltered(count_filter);
+        try writer.print("\"totalCount\":{d}}}", .{count});
+        return;
+    }
+
+    var cursor_id: ?i64 = null;
+    if (params.cursor) |c| {
+        cursor_id = try pagination.CursorCodec.decodeInt(allocator, c);
+    }
+
+    const fetch_limit: u32 = @intCast(params.limit + 1);
+    const role_rows = try database.getRolesWithPagination(registry.protocol, .{
+        .account = account_addr,
+        .contract_address = registry.address,
+        .limit = fetch_limit,
+        .cursor_id = cursor_id,
+        .direction = if (params.direction == .backward) .backward else .forward,
+    });
+    defer {
+        for (role_rows) |*r| {
+            var rm = r.*;
+            rm.deinit(allocator);
+        }
+        allocator.free(role_rows);
+    }
+
+    const has_more = role_rows.len > params.limit;
+    const actual = @min(role_rows.len, params.limit);
+    if (params.direction == .backward and actual > 1) std.mem.reverse(models.EACRoleAssignment, role_rows[0..actual]);
+    const items = role_rows[0..actual];
+
+    // Encode cursors once per edge (int-flavored; reused in pageInfo + edges).
+    var edge_cursors = try allocator.alloc([]const u8, items.len);
+    defer {
+        for (edge_cursors) |c| allocator.free(c);
+        allocator.free(edge_cursors);
+    }
+    for (items, 0..) |*role, i| {
+        edge_cursors[i] = try pagination.CursorCodec.encodeInt(allocator, @intCast(role.id));
+    }
+
+    const start_cursor: ?[]const u8 = if (edge_cursors.len > 0) edge_cursors[0] else null;
+    const end_cursor: ?[]const u8 = if (edge_cursors.len > 0) edge_cursors[edge_cursors.len - 1] else null;
+    try writeConnectionPageInfo(writer, params, has_more, start_cursor, end_cursor);
+
+    try writer.writeAll(",\"edges\":[");
+    const node_selections = findNodeSelections(sel);
+    for (items, 0..) |*role, i| {
+        if (i > 0) try writer.writeAll(",");
+        try writer.print("{{\"cursor\":\"{s}\",\"node\":", .{edge_cursors[i]});
+        const handler = FieldHandler{
+            .handleFn = handleEACRoleField,
+            .context = @ptrCast(@constCast(role)),
+        };
+        const role_json = try buildJsonWithFields(allocator, node_selections, handler);
+        defer allocator.free(role_json);
+        try writer.writeAll(role_json);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]");
+
+    if (wants.total_count) {
+        const count = try database.getRoleCountFiltered(count_filter);
+        try writer.print(",\"totalCount\":{d}", .{count});
+    }
+    try writer.writeAll("}");
 }
 
 /// Resolver Metadata field handler
