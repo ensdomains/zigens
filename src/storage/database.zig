@@ -27,6 +27,8 @@ pub const EventFilterOptions = events.EventFilterOptions;
 const webhooks = @import("webhooks.zig");
 const transactions = @import("transactions.zig");
 const roles = @import("roles.zig");
+pub const RolePaginationOptions = roles.RolePaginationOptions;
+pub const RoleCountFilters = roles.RoleCountFilters;
 const ensip16 = @import("ensip16.zig");
 const registrations = @import("registrations.zig");
 pub const RegistrationFilterOptions = registrations.RegistrationFilterOptions;
@@ -695,6 +697,7 @@ pub const Database = struct {
     pub const NameSortField = names.NameSortField;
     pub const NameFilters = names.NameFilters;
     pub const getRegistriesByOwner = names.getRegistriesByOwner;
+    pub const getRegistry = names.getRegistry;
     pub const countDirectSubdomains = names.countDirectSubdomains;
     pub const hasDirectSubdomains = names.hasDirectSubdomains;
     pub const batchCountDirectSubdomains = names.batchCountDirectSubdomains;
@@ -803,6 +806,8 @@ pub const Database = struct {
     pub const RolePaginationOptions = roles.RolePaginationOptions;
     pub const getRolesWithPagination = roles.getRolesWithPagination;
     pub const getTotalRoleCount = roles.getTotalRoleCount;
+    pub const getRoleCountFiltered = roles.getRoleCountFiltered;
+    pub const RoleCountFilters = roles.RoleCountFilters;
 
     // ENSIP-16 module (7 functions)
     pub const upsertResolverMetadata = ensip16.upsertResolverMetadata;

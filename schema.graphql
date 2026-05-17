@@ -38,6 +38,9 @@ type Query {
   """Get registries owned by an account"""
   registries(owner: String!): [RegistryInfo!]!
 
+  """Look up a single registry contract by its address (Registry view entry point)."""
+  registry(address: String!): RegistryInfo
+
   """Get ENSIP-16 resolver metadata (offchain GraphQL endpoint)"""
   metadata(resolver: String!): ResolverMetadata
 
@@ -589,6 +592,41 @@ type RegistryInfo {
 
   """Timestamp when registry was created"""
   createdAt: Int!
+
+  """
+  Registry admin (the account holding the full root-role bitmap on this
+  contract, i.e. resource=0x0 / role_bitmap=0x111…111). Returns the most
+  recently granted admin if multiple, or null if no root role has been
+  granted yet.
+  """
+  owner: Account
+
+  """Names whose subregistry is this contract (the labels under this registry, legacy offset-based)."""
+  labels(first: Int, skip: Int, where: DomainFilter, orderBy: Domain_orderBy, orderDirection: OrderDirection): [Domain!]!
+
+  """Cursor-based labels for this registry (recommended)."""
+  labelConnection(first: Int, after: String, last: Int, before: String, where: DomainFilter, orderBy: Domain_orderBy, orderDirection: OrderDirection): DomainConnection!
+
+  """Total label count for this registry."""
+  labelCount: Int!
+
+  """Events emitted by this registry contract (legacy offset-based)."""
+  events(first: Int, skip: Int, where: EventFilter): [Event!]!
+
+  """Cursor-based events emitted by this registry contract (recommended)."""
+  eventConnection(first: Int, after: String, last: Int, before: String, where: EventFilter, orderBy: Event_orderBy, orderDirection: OrderDirection): EventConnection!
+
+  """Total event count emitted by this registry contract."""
+  eventCount: Int!
+
+  """EAC role assignments on this registry (legacy offset-based)."""
+  roles(first: Int, skip: Int, account: String): [EACRoleAssignment!]!
+
+  """Cursor-based EAC role assignments on this registry (recommended)."""
+  roleConnection(first: Int, after: String, last: Int, before: String, account: String): EACRoleAssignmentConnection!
+
+  """Total role-assignment count on this registry."""
+  roleCount: Int!
 }
 
 """ENSIP-16 resolver metadata (offchain data endpoint)"""
