@@ -1,0 +1,372 @@
+/// Tests for the on-chain Entry mirror + reachability cascade introduced in
+/// migration 025 to fix orphaned descendants on subregistry repoint.
+///
+/// These exercise the storage layer directly (`upsertSubregistry`,
+/// `collectSubtreeRooted`, `setRegistriesReachability`) — i.e. the primitives
+/// the V2 SubregistryUpdated handler uses to invalidate Domain rows when a
+/// parent label repoints its subregistry pointer. Driver-level handler tests
+/// would require RPC log fixtures; these isolate the invariants that matter
+/// for the bug fix.
+const std = @import("std");
+const testing = std.testing;
+const lib = @import("lib");
+const helpers = @import("helpers");
+const Database = lib.Database;
+const Address = lib.Address;
+const Hash = lib.Hash;
+const models = lib.models;
+
+const ETH_REGISTRY = Address{ .bytes = [_]u8{0xE7} ** 20 };
+const SUB_A = Address{ .bytes = [_]u8{0xAA} ** 20 };
+const SUB_B = Address{ .bytes = [_]u8{0xBB} ** 20 };
+const SUB_A1 = Address{ .bytes = [_]u8{0xA1} ** 20 };
+const OWNER_1 = helpers.TEST_OWNER_1;
+
+const FRESH_CANONICAL_ID: u256 = 0xF1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1_00000000;
+const ONE_CANONICAL_ID: u256 = 0x0101010101010101010101010101010101010101010101010101010101_000000;
+
+/// Build a Name record under a given subregistry for use as a "descendant of A".
+/// `parent_name` is plain text ("fresh.eth"); the full name is built as
+/// `<label>.<parent_name>`.
+fn insertChildName(
+    allocator: std.mem.Allocator,
+    database: *Database,
+    label: []const u8,
+    parent_name: []const u8,
+    subregistry: Address,
+    owner: Address,
+    token_id: u256,
+) !Hash {
+    const full_name = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ label, parent_name });
+    defer allocator.free(full_name);
+
+    const nh = try lib.namehash(allocator, full_name);
+    const parent_nh = try lib.namehash(allocator, parent_name);
+    const label_hash = try lib.labelhash(allocator, label);
+
+    try database.insertName(models.Name{
+        .name = full_name,
+        .namehash = nh,
+        .label = label,
+        .label_hash = label_hash,
+        .parent_name = parent_name,
+        .parent_namehash = parent_nh,
+        .protocol = .v2,
+        .registry = subregistry,
+        .owner = owner,
+        .registrant = owner,
+        .resolver = Address.zero,
+        .token_id = token_id,
+        .canonical_id = token_id & ~@as(u256, 0xFFFFFFFF),
+        .token_version = @intCast(token_id & 0xFFFFFFFF),
+        .expiry = 0,
+        .registry_locked = false,
+        .migrated = false,
+        .created_block = 1000,
+        .created_at = 1700000000,
+        .registered_at = 1700000000,
+        .updated_block = 1000,
+        .updated_at = 1700000000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    });
+    return nh;
+}
+
+test "upsertSubregistry returns prev=0 on initial pointer set (paired with LabelRegistered _register call)" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // Initial SubregistryUpdated fired from `_register` with no prior entry:
+    // prev should be Address.zero, signaling "not a repoint, do not cascade".
+    const prev = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_A, 1000, 1700000000);
+    try testing.expect(prev.isZero());
+
+    // Sanity: read-back matches.
+    const stored = try database.getRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID);
+    try testing.expect(stored.eql(SUB_A));
+}
+
+test "upsertSubregistry returns prev=A on repoint A → B" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_A, 1000, 1700000000);
+
+    const prev = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_B, 1001, 1700000600);
+    try testing.expect(prev.eql(SUB_A));
+
+    const stored = try database.getRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID);
+    try testing.expect(stored.eql(SUB_B));
+}
+
+test "collectSubtreeRooted returns only the root when no descendants are tracked" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const subtree = try database.collectSubregistrySubtree(allocator, .v2, SUB_A);
+    defer allocator.free(subtree);
+    try testing.expectEqual(@as(usize, 1), subtree.len);
+    try testing.expect(subtree[0].eql(SUB_A));
+}
+
+test "collectSubtreeRooted walks multi-level subregistry chains A → A1" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // .eth → fresh entry points to A
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_A, 1000, 1700000000);
+    // A → "1" entry points to A1
+    _ = try database.upsertRegistryEntrySubregistry(.v2, SUB_A, ONE_CANONICAL_ID, SUB_A1, 1001, 1700000060);
+
+    const subtree = try database.collectSubregistrySubtree(allocator, .v2, SUB_A);
+    defer allocator.free(subtree);
+
+    try testing.expectEqual(@as(usize, 2), subtree.len);
+    // Root first, then descendant (BFS order)
+    try testing.expect(subtree[0].eql(SUB_A));
+    try testing.expect(subtree[1].eql(SUB_A1));
+}
+
+test "scenario 1: register foo on A while fresh→A; foo is reachable" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_A, 1000, 1700000000);
+    const foo_nh = try insertChildName(allocator, database, "foo", "fresh.eth", SUB_A, OWNER_1, 0x1100);
+
+    const found = try database.getNameByNamehash(foo_nh);
+    try testing.expect(found != null);
+    var n = found.?;
+    defer n.deinit(allocator);
+    try testing.expect(n.is_reachable);
+    try testing.expect(n.registry.eql(SUB_A));
+}
+
+test "scenario 2: setSubregistry(fresh, B) where B != A marks foo.fresh.eth unreachable" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_A, 1000, 1700000000);
+    const foo_nh = try insertChildName(allocator, database, "foo", "fresh.eth", SUB_A, OWNER_1, 0x1100);
+
+    // Repoint
+    const prev = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_B, 1002, 1700000120);
+    try testing.expect(prev.eql(SUB_A));
+
+    // Handler logic: collect A's subtree (just [A] here) and invalidate.
+    const subtree = try database.collectSubregistrySubtree(allocator, .v2, SUB_A);
+    defer allocator.free(subtree);
+    _ = try database.setRegistriesReachability(.v2, subtree, false, 1002, 1700000120);
+
+    const found = try database.getNameByNamehash(foo_nh);
+    try testing.expect(found != null);
+    var n = found.?;
+    defer n.deinit(allocator);
+    try testing.expect(!n.is_reachable);
+    try testing.expect(n.unreachable_since != null);
+    try testing.expectEqual(@as(i64, 1700000120), n.unreachable_since.?);
+}
+
+test "scenario 3: setSubregistry(fresh, A) again reactivates foo.fresh.eth" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_A, 1000, 1700000000);
+    const foo_nh = try insertChildName(allocator, database, "foo", "fresh.eth", SUB_A, OWNER_1, 0x1100);
+
+    // Repoint to B, invalidate.
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_B, 1002, 1700000120);
+    {
+        const subtree = try database.collectSubregistrySubtree(allocator, .v2, SUB_A);
+        defer allocator.free(subtree);
+        _ = try database.setRegistriesReachability(.v2, subtree, false, 1002, 1700000120);
+    }
+
+    // Re-point back to A, reactivate.
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_A, 1003, 1700000240);
+    {
+        const subtree = try database.collectSubregistrySubtree(allocator, .v2, SUB_A);
+        defer allocator.free(subtree);
+        _ = try database.setRegistriesReachability(.v2, subtree, true, 1003, 1700000240);
+    }
+
+    const found = try database.getNameByNamehash(foo_nh);
+    try testing.expect(found != null);
+    var n = found.?;
+    defer n.deinit(allocator);
+    try testing.expect(n.is_reachable);
+    try testing.expect(n.unreachable_since == null);
+}
+
+test "scenario 5: foo on A (orphaned) and bar on B (reachable) coexist with different reachability" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // fresh.eth → A; register foo under A.
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_A, 1000, 1700000000);
+    const foo_nh = try insertChildName(allocator, database, "foo", "fresh.eth", SUB_A, OWNER_1, 0x1100);
+
+    // Repoint fresh to B and invalidate A's subtree.
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_B, 1002, 1700000120);
+    {
+        const subtree = try database.collectSubregistrySubtree(allocator, .v2, SUB_A);
+        defer allocator.free(subtree);
+        _ = try database.setRegistriesReachability(.v2, subtree, false, 1002, 1700000120);
+    }
+
+    // Register bar under B (the new active subregistry).
+    const bar_nh = try insertChildName(allocator, database, "bar", "fresh.eth", SUB_B, OWNER_1, 0x2200);
+
+    const foo = try database.getNameByNamehash(foo_nh);
+    try testing.expect(foo != null);
+    var f = foo.?;
+    defer f.deinit(allocator);
+    try testing.expect(!f.is_reachable);
+
+    const bar = try database.getNameByNamehash(bar_nh);
+    try testing.expect(bar != null);
+    var b = bar.?;
+    defer b.deinit(allocator);
+    try testing.expect(b.is_reachable);
+}
+
+test "scenario 6: multi-level A→A1, repoint fresh to B invalidates both 1.fresh.eth and bar.1.fresh.eth" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // fresh.eth → A; A's "1" entry → A1.
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_A, 1000, 1700000000);
+    _ = try database.upsertRegistryEntrySubregistry(.v2, SUB_A, ONE_CANONICAL_ID, SUB_A1, 1001, 1700000060);
+
+    const one_nh = try insertChildName(allocator, database, "1", "fresh.eth", SUB_A, OWNER_1, 0x1100);
+    const bar_nh = try insertChildName(allocator, database, "bar", "1.fresh.eth", SUB_A1, OWNER_1, 0x2200);
+
+    // Repoint fresh to B and cascade.
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_B, 1002, 1700000120);
+    const subtree = try database.collectSubregistrySubtree(allocator, .v2, SUB_A);
+    defer allocator.free(subtree);
+    try testing.expectEqual(@as(usize, 2), subtree.len);
+    _ = try database.setRegistriesReachability(.v2, subtree, false, 1002, 1700000120);
+
+    const one = try database.getNameByNamehash(one_nh);
+    try testing.expect(one != null);
+    var o = one.?;
+    defer o.deinit(allocator);
+    try testing.expect(!o.is_reachable);
+
+    const bar = try database.getNameByNamehash(bar_nh);
+    try testing.expect(bar != null);
+    var b = bar.?;
+    defer b.deinit(allocator);
+    try testing.expect(!b.is_reachable);
+}
+
+test "scenario 9: initial SubregistryUpdated (prev=0) does not flip anything" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // Pre-existing name with is_reachable=true (would be created earlier in the same tx
+    // by LabelRegistered) — must not be invalidated by the initial pointer set.
+    const fresh_nh = try insertChildName(allocator, database, "fresh", "eth", ETH_REGISTRY, OWNER_1, FRESH_CANONICAL_ID);
+
+    // Initial pointer set: prev should be 0, so handler skips cascade.
+    const prev = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_A, 1000, 1700000000);
+    try testing.expect(prev.isZero());
+
+    const stored = try database.getNameByNamehash(fresh_nh);
+    try testing.expect(stored != null);
+    var n = stored.?;
+    defer n.deinit(allocator);
+    try testing.expect(n.is_reachable);
+}
+
+test "default getFilteredNames hides unreachable names; includeUnreachable surfaces them" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_A, 1000, 1700000000);
+    _ = try insertChildName(allocator, database, "foo", "fresh.eth", SUB_A, OWNER_1, 0x1100);
+
+    // Default — both reachable.
+    {
+        const found = try database.getFilteredNames(.{ .name_ends_with = ".fresh.eth" }, 0, 50, .desc, .created_at);
+        defer {
+            for (found) |*n| n.deinit(allocator);
+            allocator.free(found);
+        }
+        try testing.expectEqual(@as(usize, 1), found.len);
+    }
+
+    // Repoint → invalidate.
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_B, 1002, 1700000120);
+    const subtree = try database.collectSubregistrySubtree(allocator, .v2, SUB_A);
+    defer allocator.free(subtree);
+    _ = try database.setRegistriesReachability(.v2, subtree, false, 1002, 1700000120);
+
+    // Default — foo hidden.
+    {
+        const found = try database.getFilteredNames(.{ .name_ends_with = ".fresh.eth" }, 0, 50, .desc, .created_at);
+        defer {
+            for (found) |*n| n.deinit(allocator);
+            allocator.free(found);
+        }
+        try testing.expectEqual(@as(usize, 0), found.len);
+    }
+
+    // includeUnreachable — foo visible, marked unreachable.
+    {
+        const found = try database.getFilteredNames(.{ .name_ends_with = ".fresh.eth", .include_unreachable = true }, 0, 50, .desc, .created_at);
+        defer {
+            for (found) |*n| n.deinit(allocator);
+            allocator.free(found);
+        }
+        try testing.expectEqual(@as(usize, 1), found.len);
+        try testing.expect(!found[0].is_reachable);
+    }
+}
+
+test "getSubdomains excludes unreachable rows by default" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_A, 1000, 1700000000);
+    _ = try insertChildName(allocator, database, "foo", "fresh.eth", SUB_A, OWNER_1, 0x1100);
+    _ = try insertChildName(allocator, database, "bar", "fresh.eth", SUB_A, OWNER_1, 0x2200);
+
+    {
+        const subs = try database.getSubdomains("fresh.eth", 0, 50);
+        defer {
+            for (subs) |*n| n.deinit(allocator);
+            allocator.free(subs);
+        }
+        try testing.expectEqual(@as(usize, 2), subs.len);
+    }
+
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_B, 1002, 1700000120);
+    const subtree = try database.collectSubregistrySubtree(allocator, .v2, SUB_A);
+    defer allocator.free(subtree);
+    _ = try database.setRegistriesReachability(.v2, subtree, false, 1002, 1700000120);
+
+    const subs = try database.getSubdomains("fresh.eth", 0, 50);
+    defer {
+        for (subs) |*n| n.deinit(allocator);
+        allocator.free(subs);
+    }
+    try testing.expectEqual(@as(usize, 0), subs.len);
+}

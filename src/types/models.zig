@@ -103,6 +103,14 @@ pub const Name = struct {
     is_v1_name: bool,
     /// V1 label hash (for V1 names - keccak256 of the label)
     v1_label_hash: ?[]const u8,
+    /// Canonical-resolution reachability flag. Set to false when an ancestor
+    /// label's `setSubregistry` repoints away from this name's source registry
+    /// (or its expiry passes / LabelUnregistered fires). Default-filtered out
+    /// of GraphQL queries unless `includeUnreachable: true` is passed.
+    is_reachable: bool = true,
+    /// Timestamp (seconds) when this name first became unreachable. Null
+    /// while `is_reachable = true`.
+    unreachable_since: ?i64 = null,
 
     pub fn deinit(self: *Name, allocator: std.mem.Allocator) void {
         if (self.name) |n| allocator.free(n);

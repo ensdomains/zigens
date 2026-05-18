@@ -1051,6 +1051,25 @@
               }
             },
             {
+              "name": "isReachable",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Boolean"
+                }
+              }
+            },
+            {
+              "name": "unreachableSince",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
               "name": "createdAt",
               "args": [],
               "type": {
@@ -2368,6 +2387,13 @@
             },
             {
               "name": "isMigrated",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Boolean"
+              }
+            },
+            {
+              "name": "includeUnreachable",
               "type": {
                 "kind": "SCALAR",
                 "name": "Boolean"

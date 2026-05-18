@@ -426,12 +426,31 @@ pub fn build(b: *std.Build) void {
     const run_storage_webhooks_tests = b.addRunArtifact(storage_webhooks_tests);
     run_storage_webhooks_tests.setCwd(b.path("."));
 
+    // Storage tests - registry_entries (on-chain Entry mirror + reachability cascade)
+    const storage_registry_entries_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/storage/registry_entries_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "helpers", .module = helpers_mod },
+                .{ .name = "lib", .module = lib_mod },
+            },
+        }),
+    });
+    storage_registry_entries_tests.linkLibC();
+    storage_registry_entries_tests.linkSystemLibrary("sqlite3");
+
+    const run_storage_registry_entries_tests = b.addRunArtifact(storage_registry_entries_tests);
+    run_storage_registry_entries_tests.setCwd(b.path("."));
+
     // Storage test step
     const storage_test_step = b.step("test-storage", "Run storage module tests");
     storage_test_step.dependOn(&run_storage_names_tests.step);
     storage_test_step.dependOn(&run_storage_resolvers_tests.step);
     storage_test_step.dependOn(&run_storage_roles_tests.step);
     storage_test_step.dependOn(&run_storage_webhooks_tests.step);
+    storage_test_step.dependOn(&run_storage_registry_entries_tests.step);
 
     // Make the default test command run all tests
     test_step.dependOn(&run_filter_tests.step);
@@ -445,4 +464,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_storage_resolvers_tests.step);
     test_step.dependOn(&run_storage_roles_tests.step);
     test_step.dependOn(&run_storage_webhooks_tests.step);
+    test_step.dependOn(&run_storage_registry_entries_tests.step);
 }
