@@ -14,6 +14,7 @@ const Hash = @import("../types/hash.zig").Hash;
 // Import all module functions
 const names = @import("names.zig");
 const resolvers = @import("resolvers.zig");
+const registry_entries = @import("registry_entries.zig");
 
 // Re-export types for use by other modules
 pub const OrderDir = names.OrderDir;
@@ -411,6 +412,29 @@ pub const Database = struct {
                 std.log.info("Migration 020 completed: registry-scoped constraints applied", .{});
             }
         }
+
+        // Migration 025: Reachability columns on names + registry_entries mirror.
+        // Idempotent: ALTER TABLE ... ADD COLUMN errors are swallowed by exec()
+        // when the column already exists (see exec at :217-232). The CREATE
+        // statements use IF NOT EXISTS so re-running is safe.
+        try self.exec("ALTER TABLE names ADD COLUMN is_reachable INTEGER NOT NULL DEFAULT 1");
+        try self.exec("ALTER TABLE names ADD COLUMN unreachable_since INTEGER");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_names_is_reachable ON names(protocol, is_reachable)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_names_registry_reachable ON names(protocol, registry, is_reachable)");
+        try self.exec(
+            \\CREATE TABLE IF NOT EXISTS registry_entries (
+            \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\  protocol TEXT NOT NULL,
+            \\  parent_registry TEXT NOT NULL,
+            \\  canonical_id TEXT NOT NULL,
+            \\  subregistry TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000',
+            \\  updated_block INTEGER NOT NULL,
+            \\  updated_at INTEGER NOT NULL,
+            \\  UNIQUE(protocol, parent_registry, canonical_id)
+            \\)
+        );
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_registry_entries_subregistry ON registry_entries(protocol, subregistry)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_registry_entries_parent ON registry_entries(protocol, parent_registry)");
     }
 
     // ========================================================================
@@ -822,4 +846,11 @@ pub const Database = struct {
     pub const getRegistrationCount = registrations.getRegistrationCount;
     pub const insertRegistration = registrations.insertRegistration;
     pub const countRegistrationsBeforeCursor = registrations.countRegistrationsBeforeCursor;
+
+    // Registry entries module — on-chain Entry mirror & reachability cascade
+    pub const upsertRegistryEntrySubregistry = registry_entries.upsertSubregistry;
+    pub const getRegistryEntrySubregistry = registry_entries.getSubregistry;
+    pub const collectSubregistrySubtree = registry_entries.collectSubtreeRooted;
+    pub const setRegistriesReachability = registry_entries.setRegistriesReachability;
+    pub const markNameUnreachableByNamehash = registry_entries.markNameUnreachableByNamehash;
 };

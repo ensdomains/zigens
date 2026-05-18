@@ -273,9 +273,19 @@ pub const SubregistryDiscoveryResult = struct {
 };
 
 pub fn discoverAndGetSubregistries(db: *Database, protocol: models.Protocol, main_registry: []const u8, from_block: u64, to_block: u64) !SubregistryDiscoveryResult {
+    _ = to_block;
     const protocol_str = protocol.toString();
 
-    // First, discover any NEW subregistries from registries table (only those registered in this block range)
+    // Discover any subregistry recorded in the registries table that is not
+    // yet in known_subregistries. We intentionally do not filter by
+    // created_block: subregistries registered in a previous batch via a
+    // nested SubregistryUpdated (4LD and deeper, where Phase 2 events from
+    // a freshly-discovered 3LD subregistry register a further subregistry
+    // *after* Phase 2 discovery already ran) would otherwise never be
+    // picked up — their created_block would fall outside both the batch
+    // that inserted them (discovery ran too early) and all subsequent
+    // batches (window doesn't cover prior blocks). The LEFT JOIN keeps the
+    // common case O(0) once steady state is reached.
     const discover_sql =
         \\SELECT DISTINCT r.address
         \\FROM registries r
@@ -283,8 +293,6 @@ pub fn discoverAndGetSubregistries(db: *Database, protocol: models.Protocol, mai
         \\WHERE r.protocol = ?
         \\  AND r.address != '0x0000000000000000000000000000000000000000'
         \\  AND r.address != ?
-        \\  AND r.created_block >= ?
-        \\  AND r.created_block <= ?
         \\  AND ks.address IS NULL
     ;
 
@@ -300,8 +308,6 @@ pub fn discoverAndGetSubregistries(db: *Database, protocol: models.Protocol, mai
 
         try q.bindTextStatic(protocol_str);
         try q.bindText(main_registry);
-        try q.bindInt64(@intCast(from_block));
-        try q.bindInt64(@intCast(to_block));
 
         // Register newly discovered subregistries and track them
         while (try q.step()) {

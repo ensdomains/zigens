@@ -1264,6 +1264,31 @@
               "deprecationReason": null
             },
             {
+              "name": "isReachable",
+              "description": "Whether this domain is reachable via canonical top-down resolution.\n  False when an ancestor label's subregistry pointer has moved away from\n  the subregistry contract that originally minted this domain (orphaned\n  subtree), when the domain has been LabelUnregistered, or when an\n  ancestor expiry has passed. Default GraphQL queries filter\n  `isReachable: true` \u2014 pass `where: { includeUnreachable: true }` to\n  include orphans.",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Boolean"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "unreachableSince",
+              "description": "Timestamp when this domain first became unreachable (null while reachable)",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
               "name": "createdAt",
               "description": "Timestamp when domain was created",
               "args": [],
@@ -2278,6 +2303,14 @@
             {
               "name": "isMigrated",
               "description": "Filter by migration status",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Boolean"
+              }
+            },
+            {
+              "name": "includeUnreachable",
+              "description": "Include domains that are unreachable via canonical resolution\n  (orphaned by subregistry repoints, label unregistration, or expired\n  ancestors). Default false \u2014 set true for audit / debug queries.",
               "type": {
                 "kind": "SCALAR",
                 "name": "Boolean"
