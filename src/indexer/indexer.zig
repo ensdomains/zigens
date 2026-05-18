@@ -608,8 +608,47 @@ pub const Indexer = struct {
         }
     }
 
+    /// Seed the canonical V2 root + eth registries into the `registries` table.
+    /// These are deployed pre-indexing and never produce a SubregistryUpdate that
+    /// would insert them, so `registry(address:)` lookups for the main eth
+    /// registry return null on a fresh database without this bootstrap.
+    /// Uses INSERT OR IGNORE under the hood, so repeated calls are no-ops.
+    fn seedV2Registries(self: *Indexer) !void {
+        const eth_addr = self.config.v2_contracts.eth_registry;
+        const root_addr = self.config.v2_contracts.root_registry;
+        if (eth_addr.isZero()) return; // V2 not deployed on this network
+
+        const deploy_block = self.config.v2_contracts.v2_deployment_block;
+
+        if (!root_addr.isZero()) {
+            try self.database.insertRegistry(.{
+                .address = root_addr,
+                .protocol = .v2,
+                .name = "",
+                .namehash = Hash.zero,
+                .parent_registry = Address.zero,
+                .created_block = deploy_block,
+                .created_at = 0,
+            });
+        }
+
+        try self.database.insertRegistry(.{
+            .address = eth_addr,
+            .protocol = .v2,
+            .name = "eth",
+            .namehash = self.eth_namehash,
+            .parent_registry = if (root_addr.isZero()) Address.zero else root_addr,
+            .created_block = deploy_block,
+            .created_at = 0,
+        });
+    }
+
     pub fn start(self: *Indexer) !void {
         std.log.info("Indexer starting...", .{});
+
+        self.seedV2Registries() catch |err| {
+            std.log.warn("Failed to seed V2 registries (non-fatal): {}", .{err});
+        };
 
         // Drop non-essential indexes for faster bulk inserts during initial sync
         if (!self.initial_sync_complete.load(.acquire)) {
@@ -652,6 +691,12 @@ pub const Indexer = struct {
     /// Start indexing a single protocol (for separate process architecture)
     pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
         std.log.info("Single-protocol indexer starting for {s}...", .{protocol.toString()});
+
+        if (protocol == .v2) {
+            self.seedV2Registries() catch |err| {
+                std.log.warn("Failed to seed V2 registries (non-fatal): {}", .{err});
+            };
+        }
 
         const client = self.getClient(protocol);
         var network_health = &self.v1_network_health;

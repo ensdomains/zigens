@@ -319,6 +319,43 @@ pub fn getRegistriesByOwner(db: *Database, protocol: models.Protocol, owner: Add
     return registries.toOwnedSlice(db.allocator);
 }
 
+/// Look up a single registry contract by its address. Returns the most-recently
+/// created row when the same contract is referenced from multiple `created_block`
+/// entries (which can happen on V2 since `INSERT OR IGNORE` keeps the first
+/// SubregistryUpdate per registry but the table is keyed by
+/// `UNIQUE(protocol, address, namehash)`).
+pub fn getRegistry(db: *Database, protocol: models.Protocol, address: Address) !?models.Registry {
+    var q = try Query.init(db,
+        \\SELECT r.address, r.protocol, r.name, r.namehash, r.parent_registry, r.created_block, r.created_at
+        \\FROM registries r
+        \\WHERE r.protocol = ? AND r.address = ?
+        \\ORDER BY r.created_block DESC
+        \\LIMIT 1
+    );
+    defer q.deinit();
+
+    try q.bindTextStatic(protocol.toString());
+    try q.bindAddress(address);
+
+    if (!try q.step()) return null;
+
+    const address_str = q.getTextSlice(0) orelse return null;
+    const protocol_str = q.getTextSlice(1) orelse return null;
+    const name_str = q.getTextSlice(2) orelse "";
+    const namehash_str = q.getTextSlice(3) orelse return null;
+    const parent_str = q.getTextSlice(4) orelse return null;
+
+    return .{
+        .address = try Address.fromHex(address_str),
+        .protocol = try models.Protocol.fromString(protocol_str),
+        .name = try db.allocator.dupe(u8, name_str),
+        .namehash = try Hash.fromHex(namehash_str),
+        .parent_registry = try Address.fromHex(parent_str),
+        .created_block = @intCast(q.getInt64(5)),
+        .created_at = q.getInt64(6),
+    };
+}
+
 // ============================================================================
 // NAME INSERT/UPDATE OPERATIONS
 // ============================================================================
@@ -792,6 +829,7 @@ fn appendNameFilterConditions(
         try conditions.append(db.allocator, "namehash IN (SELECT namehash FROM resolver_addresses WHERE address = ?)");
     }
     if (filters.resolver != null) try conditions.append(db.allocator, "resolver = ?");
+    if (filters.registry != null) try conditions.append(db.allocator, "registry = ?");
     if (filters.migrated) |m| {
         try conditions.append(db.allocator, if (m) "migrated = 1" else "migrated = 0");
     }
@@ -826,6 +864,7 @@ fn bindNameFilters(q: *Query, filters: NameFilters) !void {
     if (filters.expiry_lte) |v| try q.bindInt64(v);
     if (filters.resolved_address) |addr| try q.bindAddress(addr);
     if (filters.resolver) |addr| try q.bindAddress(addr);
+    if (filters.registry) |addr| try q.bindAddress(addr);
     // migrated, has_subdomains contribute no binds (literal SQL)
     if (filters.subdomain_count_gt) |v| try q.bindInt64(v);
     if (filters.subdomain_count_lt) |v| try q.bindInt64(v);
@@ -977,6 +1016,8 @@ pub const NameFilters = struct {
     resolved_address: ?Address = null,
     // Resolver contract address filter
     resolver: ?Address = null,
+    // Registry contract address filter (the contract that owns this name's label)
+    registry: ?Address = null,
     // Migration filter
     migrated: ?bool = null,
     // Subdomain filters (requires subquery)
@@ -1089,6 +1130,11 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
         try conditions.append(db.allocator, "resolver = ?");
     }
 
+    // Registry contract address filter
+    if (filters.registry != null) {
+        try conditions.append(db.allocator, "registry = ?");
+    }
+
     // Migration filter
     if (filters.migrated) |m| {
         if (m) {
@@ -1187,6 +1233,9 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
         try q.bindAddress(addr);
     }
     if (filters.resolver) |addr| {
+        try q.bindAddress(addr);
+    }
+    if (filters.registry) |addr| {
         try q.bindAddress(addr);
     }
     // has_subdomains doesn't need binding (no ?)
@@ -1392,6 +1441,9 @@ pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
     if (filters.resolver != null) {
         try conditions.append(db.allocator, "resolver = ?");
     }
+    if (filters.registry != null) {
+        try conditions.append(db.allocator, "registry = ?");
+    }
     if (filters.migrated) |m| {
         if (m) {
             try conditions.append(db.allocator, "migrated = 1");
@@ -1477,6 +1529,9 @@ pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
         try q.bindAddress(addr);
     }
     if (filters.resolver) |addr| {
+        try q.bindAddress(addr);
+    }
+    if (filters.registry) |addr| {
         try q.bindAddress(addr);
     }
     // has_subdomains doesn't need binding (no ?)
