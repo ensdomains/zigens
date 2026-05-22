@@ -10,6 +10,192 @@ const Hash = @import("../types/hash.zig").Hash;
 // RESOLVER OPERATIONS
 // ============================================================================
 
+// ----------------------------------------------------------------------------
+// Resolver entity table (subgraph parity)
+// ----------------------------------------------------------------------------
+// One row per (protocol, namehash, resolver_address) binding ever observed on
+// a NewResolver-style event. The same name can produce multiple Resolver rows
+// over time if its resolver contract changes — each row records when that
+// specific binding was first set.
+//
+// The subgraph encodes IDs as `{chainId}-{address}-{node}`. Our (protocol,
+// address, namehash) triple is the same shape; the encoding lives in the
+// query layer, not the storage layer.
+
+pub fn upsertResolverEntity(
+    db: *Database,
+    protocol: models.Protocol,
+    resolver_address: []const u8,
+    namehash: []const u8,
+    name: []const u8,
+    block_number: u64,
+    timestamp: i64,
+) !void {
+    if (resolver_address.len == 0 or namehash.len == 0) return;
+    const sql =
+        \\INSERT OR IGNORE INTO resolvers
+        \\  (protocol, address, name, namehash, set_block, set_at)
+        \\VALUES (?, ?, ?, ?, ?, ?)
+    ;
+    var q = try Query.initCached(db, sql);
+    defer q.deinit();
+    try q.bindTextStatic(protocol.toString());
+    try q.bindText(resolver_address);
+    try q.bindText(name);
+    try q.bindText(namehash);
+    try q.bindInt64(@intCast(block_number));
+    try q.bindInt64(timestamp);
+    try q.exec();
+}
+
+pub fn getResolverEntityCount(db: *Database) !u64 {
+    var q = try Query.init(db, "SELECT COUNT(*) FROM resolvers");
+    defer q.deinit();
+    if (!(try q.step())) return 0;
+    return @intCast(q.getInt64(0));
+}
+
+pub const ResolverEntity = struct {
+    protocol: []const u8,
+    address: []const u8,
+    name: []const u8,
+    namehash: []const u8,
+    set_block: u64,
+    set_at: i64,
+
+    pub fn deinit(self: *ResolverEntity, allocator: std.mem.Allocator) void {
+        allocator.free(self.protocol);
+        allocator.free(self.address);
+        allocator.free(self.name);
+        allocator.free(self.namehash);
+    }
+};
+
+pub const ResolverEntityFilters = struct {
+    /// Exact match on the resolver contract address (lowercase 0x-hex).
+    address: ?[]const u8 = null,
+    address_in: ?[]const []const u8 = null,
+    /// Exact match on the bound namehash.
+    namehash: ?[]const u8 = null,
+    /// Restrict to one protocol; null = both.
+    protocol: ?[]const u8 = null,
+};
+
+pub const ResolverEntitySortField = enum {
+    set_block,
+    address,
+
+    pub fn toSql(self: ResolverEntitySortField) []const u8 {
+        return switch (self) {
+            .set_block => "set_block",
+            .address => "address",
+        };
+    }
+};
+
+pub fn getFilteredResolverEntities(
+    db: *Database,
+    filters: ResolverEntityFilters,
+    skip: u32,
+    limit: u32,
+    order_dir: db_module.OrderDir,
+    sort_field: ResolverEntitySortField,
+) ![]ResolverEntity {
+    var conditions: std.ArrayList([]const u8) = .{};
+    defer conditions.deinit(db.allocator);
+    var allocated: std.ArrayList([]const u8) = .{};
+    defer {
+        for (allocated.items) |s| db.allocator.free(s);
+        allocated.deinit(db.allocator);
+    }
+
+    if (filters.address != null) try conditions.append(db.allocator, "address = ?");
+    if (filters.namehash != null) try conditions.append(db.allocator, "namehash = ?");
+    if (filters.protocol != null) try conditions.append(db.allocator, "protocol = ?");
+    if (filters.address_in) |addrs| {
+        if (addrs.len == 0) {
+            try conditions.append(db.allocator, "1=0");
+        } else {
+            var in_parts: std.ArrayList(u8) = .{};
+            defer in_parts.deinit(db.allocator);
+            try in_parts.appendSlice(db.allocator, "address IN (");
+            for (addrs, 0..) |_, i| {
+                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
+                try in_parts.appendSlice(db.allocator, "?");
+            }
+            try in_parts.appendSlice(db.allocator, ")");
+            const clause = try db.allocator.dupe(u8, in_parts.items);
+            try allocated.append(db.allocator, clause);
+            try conditions.append(db.allocator, clause);
+        }
+    }
+
+    var sql_buf: std.ArrayList(u8) = .{};
+    defer sql_buf.deinit(db.allocator);
+    try sql_buf.appendSlice(db.allocator, "SELECT protocol, address, name, namehash, set_block, set_at FROM resolvers");
+    if (conditions.items.len > 0) {
+        try sql_buf.appendSlice(db.allocator, " WHERE ");
+        for (conditions.items, 0..) |c, i| {
+            if (i > 0) try sql_buf.appendSlice(db.allocator, " AND ");
+            try sql_buf.appendSlice(db.allocator, c);
+        }
+    }
+    try sql_buf.appendSlice(db.allocator, " ORDER BY ");
+    try sql_buf.appendSlice(db.allocator, sort_field.toSql());
+    try sql_buf.appendSlice(db.allocator, if (order_dir == .desc) " DESC" else " ASC");
+    try sql_buf.appendSlice(db.allocator, ", namehash ASC LIMIT ? OFFSET ?");
+
+    var q = try Query.init(db, sql_buf.items);
+    defer q.deinit();
+    if (filters.address) |a| try q.bindText(a);
+    if (filters.namehash) |n| try q.bindText(n);
+    if (filters.protocol) |p| try q.bindText(p);
+    if (filters.address_in) |addrs| {
+        for (addrs) |a| try q.bindText(a);
+    }
+    try q.bindInt64(@intCast(limit));
+    try q.bindInt64(@intCast(skip));
+
+    var results: std.ArrayList(ResolverEntity) = .{};
+    defer results.deinit(db.allocator);
+    while (try q.step()) {
+        try results.append(db.allocator, .{
+            .protocol = try db.allocator.dupe(u8, q.getTextSlice(0) orelse ""),
+            .address = try db.allocator.dupe(u8, q.getTextSlice(1) orelse ""),
+            .name = try db.allocator.dupe(u8, q.getTextSlice(2) orelse ""),
+            .namehash = try db.allocator.dupe(u8, q.getTextSlice(3) orelse ""),
+            .set_block = @intCast(q.getInt64(4)),
+            .set_at = q.getInt64(5),
+        });
+    }
+    return try results.toOwnedSlice(db.allocator);
+}
+
+// Backfill `resolvers` rows from existing `names.resolver` bindings. Idempotent
+// (INSERT OR IGNORE preserves any previously inserted rows). Used once after
+// the writer is added to event handlers, so historical data isn't lost.
+pub fn backfillResolverEntitiesFromNames(db: *Database) !u64 {
+    const seed_block_sql = "SELECT COALESCE(MIN(last_synced_block), 0) FROM sync_state";
+    var seed_q = try Query.init(db, seed_block_sql);
+    defer seed_q.deinit();
+    const seed_block: i64 = if (try seed_q.step()) seed_q.getInt64(0) else 0;
+
+    const sql =
+        \\INSERT OR IGNORE INTO resolvers (protocol, address, name, namehash, set_block, set_at)
+        \\SELECT n.protocol, n.resolver, n.name, n.namehash, ?, COALESCE(n.created_at, 0)
+        \\FROM names n
+        \\WHERE n.resolver IS NOT NULL
+        \\  AND n.resolver != ''
+        \\  AND n.resolver != '0x0000000000000000000000000000000000000000'
+    ;
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+    try q.bindInt64(seed_block);
+    try q.exec();
+    return try getResolverEntityCount(db);
+}
+
+
 pub fn storeResolverAddress(
     db: *Database,
     namehash: Hash,
@@ -201,6 +387,30 @@ pub fn getAddressRecord(db: *Database, resolver: Address, namehash: Hash, coin_t
         return try q.getText(0);
     }
     return null;
+}
+
+/// Distinct coin types currently set for (resolver, namehash). Returned as
+/// u64 to safely cover ENSIP-11 L2 chain IDs (`0x80000000 | chainId`). Caller
+/// frees the returned slice.
+pub fn getCoinTypes(db: *Database, resolver: Address, namehash: Hash) ![]u64 {
+    const sql =
+        \\SELECT DISTINCT coin_type FROM resolver_addresses
+        \\WHERE resolver = ? AND namehash = ?
+        \\ORDER BY coin_type
+    ;
+
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+
+    try q.bindAddress(resolver);
+    try q.bindHash(namehash);
+
+    var list: std.ArrayList(u64) = .{};
+    errdefer list.deinit(db.allocator);
+    while (try q.step()) {
+        try list.append(db.allocator, @intCast(q.getInt64(0)));
+    }
+    return list.toOwnedSlice(db.allocator);
 }
 
 /// All multi-coin addr records for a given (resolver, namehash).
@@ -509,27 +719,30 @@ pub fn getResolversByOwner(db: *Database, protocol: models.Protocol, owner: Addr
 // DELETE OPERATIONS (for VersionChanged record clearing)
 // ============================================================================
 
-pub fn deleteResolverAddresses(db: *Database, namehash: Hash) !void {
-    const sql = "DELETE FROM resolver_addresses WHERE namehash = ?";
+pub fn deleteResolverAddresses(db: *Database, namehash: Hash, resolver: Address) !void {
+    const sql = "DELETE FROM resolver_addresses WHERE namehash = ? AND resolver = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
     try q.bindHash(namehash);
+    try q.bindAddress(resolver);
     try q.exec();
 }
 
-pub fn deleteResolverContentHash(db: *Database, namehash: Hash) !void {
-    const sql = "DELETE FROM resolver_contenthashes WHERE namehash = ?";
+pub fn deleteResolverContentHash(db: *Database, namehash: Hash, resolver: Address) !void {
+    const sql = "DELETE FROM resolver_contenthashes WHERE namehash = ? AND resolver = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
     try q.bindHash(namehash);
+    try q.bindAddress(resolver);
     try q.exec();
 }
 
-pub fn deleteResolverTexts(db: *Database, namehash: Hash) !void {
-    const sql = "DELETE FROM resolver_texts WHERE namehash = ?";
+pub fn deleteResolverTexts(db: *Database, namehash: Hash, resolver: Address) !void {
+    const sql = "DELETE FROM resolver_texts WHERE namehash = ? AND resolver = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
     try q.bindHash(namehash);
+    try q.bindAddress(resolver);
     try q.exec();
 }
 
@@ -542,41 +755,196 @@ pub fn deleteResolverAlias(db: *Database, resolver: Address, from_name: []const 
     try q.exec();
 }
 
-pub fn deleteResolverPubkeys(db: *Database, namehash: Hash) !void {
-    const sql = "DELETE FROM resolver_pubkeys WHERE namehash = ?";
+pub fn deleteResolverPubkeys(db: *Database, namehash: Hash, resolver: Address) !void {
+    const sql = "DELETE FROM resolver_pubkeys WHERE namehash = ? AND resolver = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
     try q.bindHash(namehash);
+    try q.bindAddress(resolver);
     try q.exec();
 }
 
-pub fn deleteResolverAbis(db: *Database, namehash: Hash) !void {
-    const sql = "DELETE FROM resolver_abis WHERE namehash = ?";
+pub fn deleteResolverAbis(db: *Database, namehash: Hash, resolver: Address) !void {
+    const sql = "DELETE FROM resolver_abis WHERE namehash = ? AND resolver = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
     try q.bindHash(namehash);
+    try q.bindAddress(resolver);
     try q.exec();
 }
 
-pub fn deleteResolverNames(db: *Database, namehash: Hash) !void {
-    const sql = "DELETE FROM resolver_names WHERE namehash = ?";
+pub fn deleteResolverNames(db: *Database, namehash: Hash, resolver: Address) !void {
+    const sql = "DELETE FROM resolver_names WHERE namehash = ? AND resolver = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
     try q.bindHash(namehash);
+    try q.bindAddress(resolver);
     try q.exec();
 }
 
-pub fn deleteResolverInterfaces(db: *Database, namehash: Hash) !void {
-    const sql = "DELETE FROM resolver_interfaces WHERE namehash = ?";
+pub fn deleteResolverInterfaces(db: *Database, namehash: Hash, resolver: Address) !void {
+    const sql = "DELETE FROM resolver_interfaces WHERE namehash = ? AND resolver = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
     try q.bindHash(namehash);
+    try q.bindAddress(resolver);
     try q.exec();
 }
 
 // ============================================================================
 // STORE OPERATIONS (for new record types)
 // ============================================================================
+
+/// Delete a single resolver text record (key-scoped).
+/// Used when `TextChanged` carries an empty value (treated as a clear).
+pub fn deleteResolverText(
+    db: *Database,
+    protocol: models.Protocol,
+    namehash: Hash,
+    resolver: Address,
+    key: []const u8,
+) !void {
+    const sql =
+        \\DELETE FROM resolver_texts
+        \\WHERE protocol = ? AND namehash = ? AND resolver = ? AND key = ?
+    ;
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+    try q.bindTextStatic(protocol.toString());
+    try q.bindHash(namehash);
+    try q.bindAddress(resolver);
+    try q.bindText(key);
+    try q.exec();
+}
+
+/// Store an `AuthorisationChanged(node, owner, target, isAuthorised)` row
+/// from the V1 PublicResolver `Authorisable` mixin (legacy).
+pub fn storeResolverAuthorisation(
+    db: *Database,
+    protocol: models.Protocol,
+    namehash: Hash,
+    resolver: Address,
+    owner: Address,
+    target: Address,
+    is_authorised: bool,
+    block_number: u64,
+    tx_hash: Hash,
+    log_index: u32,
+    timestamp: i64,
+) !void {
+    const sql =
+        \\INSERT OR REPLACE INTO resolver_authorisations
+        \\  (protocol, namehash, resolver, owner, target, is_authorised,
+        \\   block_number, transaction_hash, log_index, timestamp)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ;
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+    try q.bindTextStatic(protocol.toString());
+    try q.bindHash(namehash);
+    try q.bindAddress(resolver);
+    try q.bindAddress(owner);
+    try q.bindAddress(target);
+    try q.bindInt64(if (is_authorised) 1 else 0);
+    try q.bindInt64(@intCast(block_number));
+    try q.bindHash(tx_hash);
+    try q.bindInt64(@intCast(log_index));
+    try q.bindInt64(timestamp);
+    try q.exec();
+}
+
+/// Store an ENSIP-17 `DNSRecordChanged(node, name, resource, record)` row.
+/// `dns_name` and `record` are hex-encoded `0x…` strings.
+pub fn storeResolverDnsRecord(
+    db: *Database,
+    protocol: models.Protocol,
+    namehash: Hash,
+    resolver: Address,
+    dns_name: []const u8,
+    resource: u16,
+    record: []const u8,
+    block_number: u64,
+    tx_hash: Hash,
+    log_index: u32,
+    timestamp: i64,
+) !void {
+    const sql =
+        \\INSERT OR REPLACE INTO resolver_dns_records
+        \\  (protocol, namehash, resolver, dns_name, resource, record,
+        \\   block_number, transaction_hash, log_index, timestamp)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ;
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+    try q.bindTextStatic(protocol.toString());
+    try q.bindHash(namehash);
+    try q.bindAddress(resolver);
+    try q.bindText(dns_name);
+    try q.bindInt64(@intCast(resource));
+    try q.bindText(record);
+    try q.bindInt64(@intCast(block_number));
+    try q.bindHash(tx_hash);
+    try q.bindInt64(@intCast(log_index));
+    try q.bindInt64(timestamp);
+    try q.exec();
+}
+
+/// Delete an ENSIP-17 DNS record (matches `DNSRecordDeleted`).
+pub fn deleteResolverDnsRecord(
+    db: *Database,
+    protocol: models.Protocol,
+    namehash: Hash,
+    resolver: Address,
+    dns_name: []const u8,
+    resource: u16,
+) !void {
+    const sql =
+        \\DELETE FROM resolver_dns_records
+        \\WHERE protocol = ? AND namehash = ? AND resolver = ?
+        \\  AND dns_name = ? AND resource = ?
+    ;
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+    try q.bindTextStatic(protocol.toString());
+    try q.bindHash(namehash);
+    try q.bindAddress(resolver);
+    try q.bindText(dns_name);
+    try q.bindInt64(@intCast(resource));
+    try q.exec();
+}
+
+/// Store an ENSIP-17 `DNSZonehashChanged(node, lastzonehash, zonehash)` row.
+pub fn storeResolverDnsZonehash(
+    db: *Database,
+    protocol: models.Protocol,
+    namehash: Hash,
+    resolver: Address,
+    zonehash: []const u8,
+    last_zonehash: []const u8,
+    block_number: u64,
+    tx_hash: Hash,
+    log_index: u32,
+    timestamp: i64,
+) !void {
+    const sql =
+        \\INSERT OR REPLACE INTO resolver_dns_zonehashes
+        \\  (protocol, namehash, resolver, zonehash, last_zonehash,
+        \\   block_number, transaction_hash, log_index, timestamp)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ;
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+    try q.bindTextStatic(protocol.toString());
+    try q.bindHash(namehash);
+    try q.bindAddress(resolver);
+    try q.bindText(zonehash);
+    try q.bindText(last_zonehash);
+    try q.bindInt64(@intCast(block_number));
+    try q.bindHash(tx_hash);
+    try q.bindInt64(@intCast(log_index));
+    try q.bindInt64(timestamp);
+    try q.exec();
+}
 
 pub fn storeResolverAlias(
     db: *Database,
@@ -714,6 +1082,30 @@ pub fn getAbiContentTypes(db: *Database, resolver: Address, namehash_val: Hash) 
     }
 
     return types.toOwnedSlice(db.allocator);
+}
+
+/// Latest reverse-name record for a namehash, regardless of which resolver wrote it.
+/// Used by the primary-name (reverse-resolution) path: a reverse claim binds an address
+/// to a node; the most recent `NameChanged` against that node — across resolvers —
+/// is the displayed primary name. Resolver_names has no log_index column, so we
+/// tiebreak with the autoincrement `id` (monotone in insertion order).
+pub fn getLatestNameByNamehash(db: *Database, namehash_val: Hash) !?[]u8 {
+    const sql =
+        \\SELECT name FROM resolver_names
+        \\WHERE namehash = ?
+        \\ORDER BY block_number DESC, id DESC
+        \\LIMIT 1
+    ;
+
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+
+    try q.bindHash(namehash_val);
+
+    if (try q.step()) {
+        return try q.getText(0);
+    }
+    return null;
 }
 
 /// Reverse-name record (name() on the resolver) for (resolver, namehash).

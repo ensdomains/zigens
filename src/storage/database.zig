@@ -33,6 +33,13 @@ pub const RoleCountFilters = roles.RoleCountFilters;
 const ensip16 = @import("ensip16.zig");
 const registrations = @import("registrations.zig");
 pub const RegistrationFilterOptions = registrations.RegistrationFilterOptions;
+const accounts = @import("accounts.zig");
+pub const AccountFilters = accounts.AccountFilters;
+pub const AccountSortField = accounts.AccountSortField;
+pub const Account = accounts.Account;
+pub const ResolverEntity = resolvers.ResolverEntity;
+pub const ResolverEntityFilters = resolvers.ResolverEntityFilters;
+pub const ResolverEntitySortField = resolvers.ResolverEntitySortField;
 
 // Query abstraction module
 pub const query = @import("query.zig");
@@ -50,6 +57,18 @@ pub const Database = struct {
     db: ?*c.sqlite3,
     /// Prepared statement cache: maps SQL string → pre-compiled sqlite3_stmt
     stmt_cache: std.StringHashMap(*c.sqlite3_stmt),
+    /// EIP-155 chain ID for entity-ID formatting (`{chainId}-{protocol}-…`).
+    /// Set by callers via `setChainId` after init; defaults to 0 so the build
+    /// fails loudly if a path forgets to populate it (the emitted id would be
+    /// `0-v1-…` — visibly wrong but not unsafe).
+    chain_id: u64 = 0,
+
+    /// Records the chain ID this database serves data for. The value flows
+    /// into Resolver entity IDs at JSON-build time. Called by both the
+    /// indexer and the API at startup from the network config.
+    pub fn setChainId(self: *Database, chain_id: u64) void {
+        self.chain_id = chain_id;
+    }
 
     // ========================================================================
     // CORE FUNCTIONS (kept in this file)
@@ -147,13 +166,109 @@ pub const Database = struct {
         try database.exec("PRAGMA foreign_keys = ON;"); // Enable foreign key constraints
         try database.exec("PRAGMA temp_store = memory;"); // Use RAM for temp tables
 
-        // Load and apply schema files from schema/ directory
+        // Load and apply the consolidated schema from schema/schema.sql.
+        // The expected workflow for schema changes is to re-index from scratch
+        // — `schema/schema.sql` defines the final shape of every table. The
+        // `migrate()` scaffold below is intentionally kept as an empty hook
+        // so future emergency in-place migrations have a wired path without
+        // re-introducing the per-file migration ladder.
         try database.loadSchemaFiles();
-
-        // Run migrations (if any manual migrations are needed)
         try database.migrate();
 
         return database;
+    }
+
+    /// Scaffold for in-place migrations against existing databases that
+    /// pre-date a schema change. **Currently a no-op:** the consolidated
+    /// `schema/schema.sql` defines the final shape, and the documented
+    /// upgrade path is re-indexing.
+    ///
+    /// Add idempotent ALTER/UPDATE statements here when a future schema
+    /// change must be applied to existing databases without a full re-sync.
+    /// Use `try self.exec("ALTER TABLE … ADD COLUMN …")` — `exec()` swallows
+    /// the "duplicate column name" error when the column already exists, so
+    /// each migration block is safe to re-run.
+    fn migrate(self: *Database) !void {
+        // `loadSchemaFiles` short-circuits when `names` exists (to avoid
+        // multi-minute index rebuilds on large DBs), so any *new* tables
+        // introduced after the original schema must be created here too.
+        //
+        // If a previous build created `accounts` with the old single-protocol
+        // shape (`first_seen_protocol TEXT`), drop and recreate with the new
+        // per-protocol-flag shape. The table is a derived projection of names/
+        // registrations, so dropping is safe — the backfill below repopulates.
+        if (self.hasTable("accounts") and self.columnExists("accounts", "first_seen_protocol")) {
+            try self.exec("DROP TABLE accounts");
+            std.log.info("Dropped legacy `accounts` (single-protocol shape) for per-protocol-flag migration", .{});
+        }
+        try self.exec(
+            \\CREATE TABLE IF NOT EXISTS accounts (
+            \\  address TEXT PRIMARY KEY,
+            \\  seen_v1 INTEGER NOT NULL DEFAULT 0,
+            \\  seen_v2 INTEGER NOT NULL DEFAULT 0,
+            \\  first_seen_block INTEGER NOT NULL,
+            \\  first_seen_timestamp INTEGER NOT NULL
+            \\)
+        );
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_accounts_seen_v1 ON accounts(seen_v1) WHERE seen_v1 = 1");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_accounts_seen_v2 ON accounts(seen_v2) WHERE seen_v2 = 1");
+
+        // One-time backfill of the new entity tables. Skipped when the
+        // backfill source tables (`names`, `sync_state`) don't exist yet —
+        // that happens in `initWithoutSchema` test fixtures that create
+        // only the tables they care about. Once the indexer event handlers
+        // maintain these tables in real time (Phase 3), these backfills
+        // become belt-and-suspenders for any DB that was indexed before
+        // the writers were wired up.
+        if (self.hasTable("names") and self.hasTable("sync_state")) {
+            if ((try accounts.getAccountCount(self)) == 0) {
+                const n = try accounts.backfillFromExistingData(self);
+                if (n > 0) std.log.info("Backfilled {d} accounts from existing data", .{n});
+            }
+            if ((try resolvers.getResolverEntityCount(self)) == 0) {
+                const n = try resolvers.backfillResolverEntitiesFromNames(self);
+                if (n > 0) std.log.info("Backfilled {d} resolver entities from names.resolver", .{n});
+            }
+            // Ensure the root domain row exists (subgraph parity). The ENS root
+            // (namehash 0x000…000, empty name) isn't created by any event handler
+            // — the subgraph constructs it implicitly. Insert a synthetic row
+            // with `parent_namehash` self-referential to the root namehash; any
+            // ancestor walker terminates when it sees `namehash == parent_namehash`,
+            // mirroring how the subgraph handles the root.
+            //
+            // The cleanup-DELETE in front is one-time defensive plumbing: an
+            // earlier migration draft inserted the root with `parent_namehash = ''`,
+            // which makes downstream Hash.fromHex readers throw. INSERT OR IGNORE
+            // never overwrites, so we delete-and-recreate to guarantee the row
+            // has the current shape. The DELETE-key on (namehash, parent_namehash='')
+            // makes the fixup idempotent — once corrected, the predicate matches
+            // nothing on subsequent boots.
+            try self.exec(
+                \\DELETE FROM names
+                \\WHERE namehash = '0x0000000000000000000000000000000000000000000000000000000000000000'
+                \\  AND parent_namehash = ''
+            );
+            try self.exec(
+                \\INSERT OR IGNORE INTO names (
+                \\  protocol, name, namehash, label, label_hash,
+                \\  parent_name, parent_namehash, registry, owner, resolver,
+                \\  token_id, canonical_id, token_version,
+                \\  created_block, created_at, updated_block, updated_at
+                \\) VALUES (
+                \\  'v1', '',
+                \\  '0x0000000000000000000000000000000000000000000000000000000000000000',
+                \\  '',
+                \\  '0x0000000000000000000000000000000000000000000000000000000000000000',
+                \\  '',
+                \\  '0x0000000000000000000000000000000000000000000000000000000000000000',
+                \\  '0x0000000000000000000000000000000000000000',
+                \\  '0x0000000000000000000000000000000000000000',
+                \\  '0x0000000000000000000000000000000000000000',
+                \\  '0', '0', 0,
+                \\  0, 0, 0, 0
+                \\)
+            );
+        }
     }
 
     /// Initialize database without auto-loading schemas (for custom schema directories)
@@ -185,6 +300,12 @@ pub const Database = struct {
         try database.exec("PRAGMA foreign_keys = ON;");
         try database.exec("PRAGMA temp_store = memory;");
 
+        // Intentionally no `migrate()` here. The API is a read-only consumer of
+        // a DB that the indexer is the sole writer of. Running migrate from the
+        // API path would take a brief write lock at startup that collides with
+        // an indexer running on the same file — see git history for the bug
+        // this caused. Schema bootstrap is the indexer's responsibility.
+
         return database;
     }
 
@@ -207,6 +328,17 @@ pub const Database = struct {
         var q = Query.init(self, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?") catch return false;
         defer q.deinit();
         q.bindText(table_name) catch return false;
+        return (q.step() catch return false);
+    }
+
+    /// `pragma_table_info` returns one row per column on the given table.
+    /// We use it from `migrate()` to detect legacy column layouts that need
+    /// in-place migration.
+    fn columnExists(self: *Database, table_name: []const u8, column_name: []const u8) bool {
+        var q = Query.init(self, "SELECT 1 FROM pragma_table_info(?) WHERE name = ?") catch return false;
+        defer q.deinit();
+        q.bindText(table_name) catch return false;
+        q.bindText(column_name) catch return false;
         return (q.step() catch return false);
     }
 
@@ -233,210 +365,6 @@ pub const Database = struct {
             std.log.err("SQL error: {s}", .{err_msg});
             return error.SqlExecFailed;
         }
-    }
-
-    fn migrate(self: *Database) !void {
-        const token_id_utils = @import("../types/token_id.zig");
-
-        // Migration 1: Add canonical_id and token_version columns to names table
-        // Check if columns exist
-        const check_sql = "PRAGMA table_info(names)";
-        const check_sql_z = try self.allocator.dupeZ(u8, check_sql);
-        defer self.allocator.free(check_sql_z);
-
-        var stmt: ?*c.sqlite3_stmt = null;
-        const prepare_result = c.sqlite3_prepare_v2(self.db, check_sql_z.ptr, -1, &stmt, null);
-        if (prepare_result != c.SQLITE_OK) {
-            std.log.err("Failed to prepare SQL statement: {s}", .{c.sqlite3_errmsg(self.db)});
-            return error.PrepareFailed;
-        }
-        defer _ = c.sqlite3_finalize(stmt);
-
-        var has_canonical_id = false;
-        var has_token_version = false;
-
-        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-            const col_name = c.sqlite3_column_text(stmt, 1);
-            const name = std.mem.span(col_name);
-            if (std.mem.eql(u8, name, "canonical_id")) {
-                has_canonical_id = true;
-            }
-            if (std.mem.eql(u8, name, "token_version")) {
-                has_token_version = true;
-            }
-        }
-
-        if (!has_canonical_id or !has_token_version) {
-            std.log.info("Running migration: Adding canonical_id and token_version columns", .{});
-
-            // Add columns if they don't exist
-            if (!has_canonical_id) {
-                try self.exec("ALTER TABLE names ADD COLUMN canonical_id TEXT NOT NULL DEFAULT ''");
-            }
-            if (!has_token_version) {
-                try self.exec("ALTER TABLE names ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0");
-            }
-
-            // Update existing rows to populate canonical_id and token_version from token_id
-            const update_sql =
-                \\SELECT namehash, token_id FROM names WHERE canonical_id = '' OR token_version = 0
-            ;
-
-            const update_sql_z = try self.allocator.dupeZ(u8, update_sql);
-            defer self.allocator.free(update_sql_z);
-
-            var select_stmt: ?*c.sqlite3_stmt = null;
-            const select_prepare_result = c.sqlite3_prepare_v2(self.db, update_sql_z.ptr, -1, &select_stmt, null);
-            if (select_prepare_result != c.SQLITE_OK) {
-                std.log.err("Failed to prepare SQL statement: {s}", .{c.sqlite3_errmsg(self.db)});
-                return error.PrepareFailed;
-            }
-            defer _ = c.sqlite3_finalize(select_stmt);
-
-            while (c.sqlite3_step(select_stmt) == c.SQLITE_ROW) {
-                const namehash = c.sqlite3_column_text(select_stmt, 0);
-                const token_id_str = c.sqlite3_column_text(select_stmt, 1);
-
-                // Parse token_id from hex string
-                const token_id_slice = std.mem.span(token_id_str);
-                const hex_str = if (std.mem.startsWith(u8, token_id_slice, "0x")) token_id_slice[2..] else token_id_slice;
-                const token_id = std.fmt.parseInt(u256, hex_str, 16) catch continue;
-
-                // Calculate canonical_id and version
-                const canonical_id = token_id_utils.getCanonicalId(token_id);
-                const version = token_id_utils.getTokenVersion(token_id);
-
-                // Format canonical_id as hex string
-                var canonical_buf: [66]u8 = undefined;
-                const canonical_hex = try std.fmt.bufPrint(&canonical_buf, "0x{x:0>64}", .{canonical_id});
-
-                // Update the row
-                const update_row_sql =
-                    \\UPDATE names SET canonical_id = ?, token_version = ? WHERE namehash = ?
-                ;
-
-                const update_row_sql_z = try self.allocator.dupeZ(u8, update_row_sql);
-                defer self.allocator.free(update_row_sql_z);
-
-                var update_stmt: ?*c.sqlite3_stmt = null;
-                const update_prepare_result = c.sqlite3_prepare_v2(self.db, update_row_sql_z.ptr, -1, &update_stmt, null);
-                if (update_prepare_result != c.SQLITE_OK) {
-                    std.log.err("Failed to prepare SQL statement: {s}", .{c.sqlite3_errmsg(self.db)});
-                    return error.PrepareFailed;
-                }
-                defer _ = c.sqlite3_finalize(update_stmt);
-
-                _ = c.sqlite3_bind_text(update_stmt, 1, canonical_hex.ptr, @intCast(canonical_hex.len), SQLITE_TRANSIENT());
-                _ = c.sqlite3_bind_int64(update_stmt, 2, @intCast(version));
-                _ = c.sqlite3_bind_text(update_stmt, 3, namehash, -1, SQLITE_TRANSIENT());
-
-                _ = c.sqlite3_step(update_stmt);
-            }
-
-            // Create index if it doesn't exist
-            try self.exec("CREATE INDEX IF NOT EXISTS idx_names_canonical_id ON names(canonical_id)");
-
-            std.log.info("Migration completed successfully", .{});
-        }
-
-        // Migration 2: Registry-scoped unique constraints (migration 020)
-        // For existing DBs, the schema files are skipped, so we need to apply the constraint
-        // changes here. Check if the approvals table has a 'registry' column as a proxy.
-        if (self.hasTable("approvals")) {
-            var has_registry_col = false;
-
-            const check_approvals_sql = "PRAGMA table_info(approvals)";
-            const check_approvals_z = try self.allocator.dupeZ(u8, check_approvals_sql);
-            defer self.allocator.free(check_approvals_z);
-
-            var stmt2: ?*c.sqlite3_stmt = null;
-            if (c.sqlite3_prepare_v2(self.db, check_approvals_z.ptr, -1, &stmt2, null) == c.SQLITE_OK) {
-                defer _ = c.sqlite3_finalize(stmt2);
-                while (c.sqlite3_step(stmt2) == c.SQLITE_ROW) {
-                    const col_name2 = c.sqlite3_column_text(stmt2, 1);
-                    if (std.mem.eql(u8, std.mem.span(col_name2), "registry")) {
-                        has_registry_col = true;
-                        break;
-                    }
-                }
-            }
-
-            if (!has_registry_col) {
-                std.log.info("Running migration: Registry-scoped unique constraints (020)", .{});
-
-                // Recreate eac_roles with contract_address in unique constraint
-                try self.exec(
-                    \\CREATE TABLE IF NOT EXISTS eac_roles_new (
-                    \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    \\  protocol TEXT NOT NULL,
-                    \\  resource TEXT NOT NULL,
-                    \\  account TEXT NOT NULL,
-                    \\  role_bitmap TEXT NOT NULL,
-                    \\  block_number INTEGER NOT NULL,
-                    \\  transaction_hash TEXT NOT NULL,
-                    \\  log_index INTEGER NOT NULL,
-                    \\  timestamp INTEGER NOT NULL,
-                    \\  contract_address TEXT NOT NULL DEFAULT '',
-                    \\  UNIQUE(protocol, resource, account, contract_address)
-                    \\)
-                );
-                try self.exec("INSERT OR IGNORE INTO eac_roles_new SELECT id, protocol, resource, account, role_bitmap, block_number, transaction_hash, log_index, timestamp, contract_address FROM eac_roles");
-                try self.exec("DROP TABLE eac_roles");
-                try self.exec("ALTER TABLE eac_roles_new RENAME TO eac_roles");
-                try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_protocol ON eac_roles(protocol)");
-                try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_resource ON eac_roles(protocol, resource)");
-                try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_account ON eac_roles(protocol, account)");
-                try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_block ON eac_roles(protocol, block_number)");
-                try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_contract ON eac_roles(protocol, contract_address)");
-
-                // Recreate approvals with registry in unique constraint
-                try self.exec(
-                    \\CREATE TABLE IF NOT EXISTS approvals_new (
-                    \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    \\  protocol TEXT NOT NULL,
-                    \\  token_id TEXT NOT NULL,
-                    \\  owner TEXT NOT NULL,
-                    \\  approved TEXT NOT NULL,
-                    \\  block_number INTEGER NOT NULL,
-                    \\  tx_hash TEXT NOT NULL,
-                    \\  timestamp INTEGER NOT NULL,
-                    \\  registry TEXT NOT NULL DEFAULT '',
-                    \\  UNIQUE(protocol, token_id, registry)
-                    \\)
-                );
-                try self.exec("INSERT OR IGNORE INTO approvals_new SELECT id, protocol, token_id, owner, approved, block_number, tx_hash, timestamp, '' FROM approvals");
-                try self.exec("DROP TABLE approvals");
-                try self.exec("ALTER TABLE approvals_new RENAME TO approvals");
-                try self.exec("CREATE INDEX IF NOT EXISTS idx_approvals_protocol ON approvals(protocol)");
-                try self.exec("CREATE INDEX IF NOT EXISTS idx_approvals_token_id ON approvals(token_id)");
-                try self.exec("CREATE INDEX IF NOT EXISTS idx_approvals_owner ON approvals(owner)");
-
-                std.log.info("Migration 020 completed: registry-scoped constraints applied", .{});
-            }
-        }
-
-        // Migration 025: Reachability columns on names + registry_entries mirror.
-        // Idempotent: ALTER TABLE ... ADD COLUMN errors are swallowed by exec()
-        // when the column already exists (see exec at :217-232). The CREATE
-        // statements use IF NOT EXISTS so re-running is safe.
-        try self.exec("ALTER TABLE names ADD COLUMN is_reachable INTEGER NOT NULL DEFAULT 1");
-        try self.exec("ALTER TABLE names ADD COLUMN unreachable_since INTEGER");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_names_is_reachable ON names(protocol, is_reachable)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_names_registry_reachable ON names(protocol, registry, is_reachable)");
-        try self.exec(
-            \\CREATE TABLE IF NOT EXISTS registry_entries (
-            \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
-            \\  protocol TEXT NOT NULL,
-            \\  parent_registry TEXT NOT NULL,
-            \\  canonical_id TEXT NOT NULL,
-            \\  subregistry TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000',
-            \\  updated_block INTEGER NOT NULL,
-            \\  updated_at INTEGER NOT NULL,
-            \\  UNIQUE(protocol, parent_registry, canonical_id)
-            \\)
-        );
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_registry_entries_subregistry ON registry_entries(protocol, subregistry)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_registry_entries_parent ON registry_entries(protocol, parent_registry)");
     }
 
     // ========================================================================
@@ -533,22 +461,9 @@ pub const Database = struct {
         try self.exec("DROP INDEX IF EXISTS idx_eac_roles_block");
         try self.exec("DROP INDEX IF EXISTS idx_eac_roles_contract");
 
-        // Temporary registrar tables: drop all 15 indexes
-        try self.exec("DROP INDEX IF EXISTS idx_temp_auctions_status");
-        try self.exec("DROP INDEX IF EXISTS idx_temp_auctions_winner");
-        try self.exec("DROP INDEX IF EXISTS idx_temp_auctions_label");
-        try self.exec("DROP INDEX IF EXISTS idx_temp_auctions_start_block");
-        try self.exec("DROP INDEX IF EXISTS idx_temp_bids_label_hash");
-        try self.exec("DROP INDEX IF EXISTS idx_temp_bids_bidder");
-        try self.exec("DROP INDEX IF EXISTS idx_temp_bids_revealed");
-        try self.exec("DROP INDEX IF EXISTS idx_temp_bids_block");
-        try self.exec("DROP INDEX IF EXISTS idx_temp_bid_reveals_label_hash");
-        try self.exec("DROP INDEX IF EXISTS idx_temp_bid_reveals_bidder");
-        try self.exec("DROP INDEX IF EXISTS idx_temp_bid_reveals_block");
-        try self.exec("DROP INDEX IF EXISTS idx_temp_bid_reveals_status");
-        try self.exec("DROP INDEX IF EXISTS idx_temp_invalidations_label_hash");
-        try self.exec("DROP INDEX IF EXISTS idx_temp_invalidations_name");
-        try self.exec("DROP INDEX IF EXISTS idx_temp_invalidations_block");
+        // Temporary registrar pre-migration table indexes (the
+        // temp_auctions/temp_bids/temp_bid_reveals/temp_invalidations tables
+        // were removed; only temp_pre_migration_names remains).
         try self.exec("DROP INDEX IF EXISTS idx_temp_pre_migration_label_hash");
         try self.exec("DROP INDEX IF EXISTS idx_temp_pre_migration_protocol");
 
@@ -653,22 +568,8 @@ pub const Database = struct {
         try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_block ON eac_roles(protocol, block_number)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_contract ON eac_roles(protocol, contract_address)");
 
-        // Temporary registrar indexes (17)
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_auctions_status ON temp_auctions(status)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_auctions_winner ON temp_auctions(winner_address)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_auctions_label ON temp_auctions(label)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_auctions_start_block ON temp_auctions(start_block)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_bids_label_hash ON temp_bids(label_hash)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_bids_bidder ON temp_bids(bidder_address)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_bids_revealed ON temp_bids(revealed)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_bids_block ON temp_bids(block_number)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_bid_reveals_label_hash ON temp_bid_reveals(label_hash)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_bid_reveals_bidder ON temp_bid_reveals(bidder_address)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_bid_reveals_block ON temp_bid_reveals(block_number)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_bid_reveals_status ON temp_bid_reveals(status)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_invalidations_label_hash ON temp_invalidations(label_hash)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_invalidations_name ON temp_invalidations(name)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_invalidations_block ON temp_invalidations(invalidation_block)");
+        // Temporary registrar pre-migration table indexes (only
+        // temp_pre_migration_names remains after the V1 audit cleanup).
         try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_pre_migration_label_hash ON temp_pre_migration_names(label_hash)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_pre_migration_protocol ON temp_pre_migration_names(protocol)");
 
@@ -702,11 +603,19 @@ pub const Database = struct {
     pub const getNameByNamehashAndProtocol = names.getNameByNamehashAndProtocol;
     pub const getNamehashByResolver = names.getNamehashByResolver;
     pub const updateNameExpiry = names.updateNameExpiry;
+    pub const clearNameExpiry = names.clearNameExpiry;
+    pub const updateDomainExpiryIfGreater = names.updateDomainExpiryIfGreater;
+    pub const materializePccDomainExpiry = names.materializePccDomainExpiry;
     pub const updateNameOwner = names.updateNameOwner;
     pub const markNameMigrated = names.markNameMigrated;
     pub const upsertReverseRecord = resolvers.upsertReverseRecord;
     pub const getReverseRecordNamehash = resolvers.getReverseRecordNamehash;
     pub const updateNameResolver = names.updateNameResolver;
+    pub const updateResolvedAddress = names.updateResolvedAddress;
+    pub const updateResolvedAddressToNull = names.updateResolvedAddressToNull;
+    pub const recursivelyGcEmptyDomain = names.recursivelyGcEmptyDomain;
+    pub const updateNameTTL = names.updateNameTTL;
+    pub const updateNameIsLegacy = names.updateNameIsLegacy;
     pub const applyLatestResolverFromEvents = resolvers.applyLatestResolverFromEvents;
     pub const getNameByTokenIdAndRegistry = names.getNameByTokenIdAndRegistry;
     pub const deleteNameByNamehash = names.deleteNameByNamehash;
@@ -737,15 +646,25 @@ pub const Database = struct {
     pub const storeResolverText = resolvers.storeResolverText;
     pub const getAddressRecord = resolvers.getAddressRecord;
     pub const getAddressRecords = resolvers.getAddressRecords;
+    pub const getCoinTypes = resolvers.getCoinTypes;
     pub const countEventsBeforeCursor = events.countEventsBeforeCursor;
     pub const getContentHashRecord = resolvers.getContentHashRecord;
     pub const getTextRecordKeys = resolvers.getTextRecordKeys;
     pub const getTextRecord = resolvers.getTextRecord;
     pub const getResolversToIndex = resolvers.getResolversToIndex;
     pub const getResolversByOwner = resolvers.getResolversByOwner;
+    pub const upsertResolverEntity = resolvers.upsertResolverEntity;
+    pub const getResolverEntityCount = resolvers.getResolverEntityCount;
+    pub const backfillResolverEntitiesFromNames = resolvers.backfillResolverEntitiesFromNames;
+    pub const getFilteredResolverEntities = resolvers.getFilteredResolverEntities;
     pub const deleteResolverAddresses = resolvers.deleteResolverAddresses;
     pub const deleteResolverContentHash = resolvers.deleteResolverContentHash;
     pub const deleteResolverTexts = resolvers.deleteResolverTexts;
+    pub const deleteResolverText = resolvers.deleteResolverText;
+    pub const storeResolverAuthorisation = resolvers.storeResolverAuthorisation;
+    pub const storeResolverDnsRecord = resolvers.storeResolverDnsRecord;
+    pub const deleteResolverDnsRecord = resolvers.deleteResolverDnsRecord;
+    pub const storeResolverDnsZonehash = resolvers.storeResolverDnsZonehash;
     pub const deleteResolverAlias = resolvers.deleteResolverAlias;
     pub const deleteResolverPubkeys = resolvers.deleteResolverPubkeys;
     pub const deleteResolverAbis = resolvers.deleteResolverAbis;
@@ -763,6 +682,7 @@ pub const Database = struct {
     pub const getPubkeyRecord = resolvers.getPubkeyRecord;
     pub const getAbiContentTypes = resolvers.getAbiContentTypes;
     pub const getReverseNameRecord = resolvers.getReverseNameRecord;
+    pub const getLatestNameByNamehash = resolvers.getLatestNameByNamehash;
     pub const InterfaceRecord = resolvers.InterfaceRecord;
     pub const getInterfaceRecords = resolvers.getInterfaceRecords;
     pub const getNodeRecordVersion = resolvers.getNodeRecordVersion;
@@ -773,6 +693,9 @@ pub const Database = struct {
 
     // Names module - resolver query
     pub const getNamesByResolver = names.getNamesByResolver;
+    pub const getDomainByResolver = names.getDomainByResolver;
+    pub const WrappedDomainFilters = names.WrappedDomainFilters;
+    pub const getWrappedDomains = names.getWrappedDomains;
 
     // Sync module (14 functions)
     pub const getSyncState = sync.getSyncState;
@@ -850,6 +773,9 @@ pub const Database = struct {
     pub const getRegistrations = registrations.getRegistrations;
     pub const getRegistrationCount = registrations.getRegistrationCount;
     pub const insertRegistration = registrations.insertRegistration;
+    pub const updateRegistrationEconomics = registrations.updateRegistrationEconomics;
+    pub const updateRegistrationExpiry = registrations.updateRegistrationExpiry;
+    pub const updateRegistrationRegistrant = registrations.updateRegistrationRegistrant;
     pub const countRegistrationsBeforeCursor = registrations.countRegistrationsBeforeCursor;
 
     // Registry entries module — on-chain Entry mirror & reachability cascade
@@ -858,4 +784,12 @@ pub const Database = struct {
     pub const collectSubregistrySubtree = registry_entries.collectSubtreeRooted;
     pub const setRegistriesReachability = registry_entries.setRegistriesReachability;
     pub const markNameUnreachableByNamehash = registry_entries.markNameUnreachableByNamehash;
+
+    // Accounts module — first-class Account entity (subgraph parity)
+    pub const upsertAccount = accounts.upsertAccount;
+    pub const getAccount = accounts.getAccount;
+    pub const getAccountCount = accounts.getAccountCount;
+    pub const getFilteredAccounts = accounts.getFilteredAccounts;
+    pub const getFilteredAccountCount = accounts.getFilteredAccountCount;
+    pub const backfillAccounts = accounts.backfillFromExistingData;
 };

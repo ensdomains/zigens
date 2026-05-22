@@ -14,6 +14,11 @@ const json_utils = @import("../../utils/json.zig");
 /// Handle legacy AddrChanged event (2017 Public Resolver)
 /// AddrChanged(bytes32 indexed node, address a)
 /// Stores as coinType=60 (ETH) to match modern AddressChanged format
+///
+/// Storage idempotent; event emit suppressed to avoid double-counting against
+/// the paired `AddressChanged` event that modern resolvers (2018+) also emit
+/// for the same write. Legacy 2017 PublicResolver standalone AddrChanged
+/// writes lose the event row — accepted trade.
 pub fn handleLegacyAddrChanged(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
     // topics[0] = event signature
     // topics[1] = indexed node (namehash)
@@ -48,21 +53,6 @@ pub fn handleLegacyAddrChanged(self: *Indexer, protocol: models.Protocol, resolv
         log.transaction_hash,
         std.time.timestamp(),
     );
-
-    // Store event
-    const nh_hex = try namehash.toHex(self.allocator);
-    defer self.allocator.free(nh_hex);
-    const resolver_hex = try resolver.toHex(self.allocator);
-    defer self.allocator.free(resolver_hex);
-
-    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"coinType\":60,\"address\":\"{s}\"}}", .{
-        nh_hex,
-        resolver_hex,
-        addr_hex,
-    });
-
-    const domain_name = self.getNameFromNamehash(namehash);
-    try utils.emitEvent(self, protocol, log, .address_changed, domain_name, namehash, event_data);
 }
 
 /// Handle legacy ContentChanged event (2017 Public Resolver)
@@ -246,6 +236,19 @@ pub fn handleContentHashChanged(self: *Indexer, protocol: models.Protocol, resol
     try utils.emitEvent(self, protocol, log, .contenthash_changed, domain_name, namehash, event_data);
 }
 
+/// Return a newly allocated copy of `input` with all 0x00 bytes removed.
+/// Subgraph parity: SQLite TEXT and JSON output don't tolerate NUL bytes well.
+/// Caller owns the returned slice.
+fn stripNulls(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .{};
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, input.len);
+    for (input) |b| {
+        if (b != 0) out.appendAssumeCapacity(b);
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
 /// Handle TextChanged event
 /// TextChanged(bytes32 indexed node, string indexed indexedKey, string key, string value)
 pub fn handleTextChanged(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
@@ -273,25 +276,40 @@ pub fn handleTextChanged(self: *Indexer, protocol: models.Protocol, resolver: Ad
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "TextChanged")) return;
 
+    // Subgraph parity: strip embedded NULs from key/value (SQLite TEXT + JSON
+    // output safety), and treat an empty value as "clear" by deleting the
+    // existing key instead of writing an empty string row.
+    const clean_key = try stripNulls(self.allocator, key);
+    defer self.allocator.free(clean_key);
+    const clean_value = try stripNulls(self.allocator, value);
+    defer self.allocator.free(clean_value);
+
     const nh_hex_log = try namehash.toHex(self.allocator);
     defer self.allocator.free(nh_hex_log);
     std.log.debug("TextChanged: namehash={s} key={s} value={s}", .{
         nh_hex_log,
-        key,
-        value,
+        clean_key,
+        clean_value,
     });
 
-    // Store in database
-    try self.database.storeResolverText(
-        namehash,
-        resolver,
-        key,
-        value,
-        protocol,
-        log.block_number,
-        log.transaction_hash,
-        std.time.timestamp(),
-    );
+    if (clean_value.len == 0) {
+        // Empty value → treat as a clear. Skip INSERT, still emit the event
+        // row so audit history is preserved.
+        self.database.deleteResolverText(protocol, namehash, resolver, clean_key) catch |err| {
+            std.log.warn("Failed to delete cleared resolver text: {}", .{err});
+        };
+    } else {
+        try self.database.storeResolverText(
+            namehash,
+            resolver,
+            clean_key,
+            clean_value,
+            protocol,
+            log.block_number,
+            log.transaction_hash,
+            std.time.timestamp(),
+        );
+    }
 
     // Store event and trigger webhooks
     const nh_hex = try namehash.toHex(self.allocator);
@@ -300,9 +318,9 @@ pub fn handleTextChanged(self: *Indexer, protocol: models.Protocol, resolver: Ad
     defer self.allocator.free(resolver_hex);
 
     // Escape key and value for safe JSON inclusion
-    const escaped_key = try json_utils.escapeString(self.allocator, key);
+    const escaped_key = try json_utils.escapeString(self.allocator, clean_key);
     defer self.allocator.free(escaped_key);
-    const escaped_value = try json_utils.escapeString(self.allocator, value);
+    const escaped_value = try json_utils.escapeString(self.allocator, clean_value);
     defer self.allocator.free(escaped_value);
 
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"key\":\"{s}\",\"value\":\"{s}\"}}", .{
@@ -318,12 +336,311 @@ pub fn handleTextChanged(self: *Indexer, protocol: models.Protocol, resolver: Ad
     try utils.emitEvent(self, protocol, log, .text_changed, domain_name, namehash, event_data);
 }
 
+/// Handle legacy TextChanged event (V1 LegacyPublicResolver, 2017)
+/// TextChanged(bytes32 indexed node, string indexed indexedKey, string value)
+///
+/// Differs from the modern 4-arg variant: the non-indexed payload is just
+/// `(string value)` — there is no separate plaintext `key`, only the
+/// keccak-hashed key in topic[1]/topic[2]. Without the plaintext key we
+/// store using the hashed key hex as a placeholder so the event row is
+/// recoverable; V2 resolvers always emit the 4-arg variant so this path is
+/// V1-only.
+pub fn handleLegacyTextChanged(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
+    // topics[0] = event signature
+    // topics[1] = indexed node (namehash)
+    // topics[2] = indexed hashed key (keccak256 of the plaintext key)
+    if (log.topics.len < 2) return error.InvalidTopicCount;
+    var namehash = log.topics[1];
+
+    // Non-indexed payload for the 3-arg variant: (string value) only.
+    const data_values = try abi.decodeValues(log.data, &.{.string}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const value = data_values[0].string;
+
+    unicode.validateString(value) catch |err| {
+        std.log.warn("Invalid UTF-8 in legacy text record value: {any}", .{err});
+        return;
+    };
+
+    if (!try utils.resolveNamehash(self, &namehash, resolver, "TextChanged (legacy)")) return;
+
+    // Use the hashed indexed key as the storage key (prefixed to mark it as
+    // hashed-only — we don't have the plaintext from this event variant).
+    const key_storage: []u8 = blk: {
+        if (log.topics.len >= 3) {
+            const hashed_hex = try log.topics[2].toHex(self.allocator);
+            defer self.allocator.free(hashed_hex);
+            break :blk try std.fmt.allocPrint(self.allocator, "hashed:0x{s}", .{hashed_hex});
+        } else {
+            break :blk try self.allocator.dupe(u8, "hashed:unknown");
+        }
+    };
+    defer self.allocator.free(key_storage);
+
+    const clean_value = try stripNulls(self.allocator, value);
+    defer self.allocator.free(clean_value);
+
+    if (clean_value.len == 0) {
+        self.database.deleteResolverText(protocol, namehash, resolver, key_storage) catch |err| {
+            std.log.warn("Failed to delete legacy resolver text: {}", .{err});
+        };
+    } else {
+        try self.database.storeResolverText(
+            namehash,
+            resolver,
+            key_storage,
+            clean_value,
+            protocol,
+            log.block_number,
+            log.transaction_hash,
+            std.time.timestamp(),
+        );
+    }
+
+    const nh_hex = try namehash.toHex(self.allocator);
+    defer self.allocator.free(nh_hex);
+    const resolver_hex = try resolver.toHex(self.allocator);
+    defer self.allocator.free(resolver_hex);
+
+    const escaped_key = try json_utils.escapeString(self.allocator, key_storage);
+    defer self.allocator.free(escaped_key);
+    const escaped_value = try json_utils.escapeString(self.allocator, clean_value);
+    defer self.allocator.free(escaped_value);
+
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"key\":\"{s}\",\"value\":\"{s}\"}}", .{
+        nh_hex,
+        resolver_hex,
+        escaped_key,
+        escaped_value,
+    });
+
+    const domain_name = self.getNameFromNamehash(namehash);
+    try utils.emitEvent(self, protocol, log, .text_changed, domain_name, namehash, event_data);
+}
+
+/// Handle AuthorisationChanged event (V1 PublicResolver `Authorisable` mixin)
+/// AuthorisationChanged(bytes32 indexed node, address indexed owner, address indexed target, bool isAuthorised)
+///
+/// V2 PermissionedResolver does NOT emit this — pure V1 additive subscription.
+pub fn handleAuthorisationChanged(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
+    // topics[0] = event signature
+    // topics[1] = indexed node
+    // topics[2] = indexed owner
+    // topics[3] = indexed target
+    // data       = (bool isAuthorised)
+    if (log.topics.len < 4) return error.InvalidTopicCount;
+    var namehash = log.topics[1];
+
+    // Owner and target are 20-byte addresses right-aligned in the 32-byte topic.
+    var owner = Address{ .bytes = undefined };
+    @memcpy(&owner.bytes, log.topics[2].bytes[12..32]);
+    var target = Address{ .bytes = undefined };
+    @memcpy(&target.bytes, log.topics[3].bytes[12..32]);
+
+    // bool occupies the low byte of a 32-byte word.
+    var is_authorised: bool = false;
+    if (log.data.len >= 32) {
+        const data_values = abi.decodeValues(log.data, &.{.bool}, self.allocator) catch null;
+        if (data_values) |dv| {
+            defer abi.freeValues(dv, self.allocator);
+            is_authorised = dv[0].boolean;
+        } else {
+            is_authorised = log.data[31] != 0;
+        }
+    }
+
+    if (!try utils.resolveNamehash(self, &namehash, resolver, "AuthorisationChanged")) return;
+
+    self.database.storeResolverAuthorisation(
+        protocol,
+        namehash,
+        resolver,
+        owner,
+        target,
+        is_authorised,
+        log.block_number,
+        log.transaction_hash,
+        log.log_index,
+        self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+    ) catch |err| {
+        std.log.warn("Failed to store resolver authorisation: {}", .{err});
+    };
+
+    const nh_hex = try namehash.toHex(self.allocator);
+    defer self.allocator.free(nh_hex);
+    const resolver_hex = try resolver.toHex(self.allocator);
+    defer self.allocator.free(resolver_hex);
+    const owner_hex = try owner.toHex(self.allocator);
+    defer self.allocator.free(owner_hex);
+    const target_hex = try target.toHex(self.allocator);
+    defer self.allocator.free(target_hex);
+
+    const event_data = try std.fmt.allocPrint(
+        self.allocator,
+        "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"owner\":\"{s}\",\"target\":\"{s}\",\"isAuthorised\":{s}}}",
+        .{
+            nh_hex,
+            resolver_hex,
+            owner_hex,
+            target_hex,
+            if (is_authorised) "true" else "false",
+        },
+    );
+
+    const domain_name = self.getNameFromNamehash(namehash);
+    try utils.emitEvent(self, protocol, log, .resolver_update, domain_name, namehash, event_data);
+}
+
+/// Convert a byte slice to a `0x`-prefixed lowercase hex string. Caller owns
+/// the returned slice. Used for ENSIP-17 DNS record payloads.
+fn bytesToHexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var out = try allocator.alloc(u8, 2 + bytes.len * 2);
+    out[0] = '0';
+    out[1] = 'x';
+    for (bytes, 0..) |byte, i| {
+        _ = try std.fmt.bufPrint(out[2 + i * 2 .. 4 + i * 2], "{x:0>2}", .{byte});
+    }
+    return out;
+}
+
+/// Handle DNSRecordChanged event (ENSIP-17)
+/// DNSRecordChanged(bytes32 indexed node, bytes name, uint16 resource, bytes record)
+pub fn handleDnsRecordChanged(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
+    if (log.topics.len < 2) return error.InvalidTopicCount;
+    var namehash = log.topics[1];
+
+    const data_values = try abi.decodeValues(log.data, &.{ .bytes, .uint16, .bytes }, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const dns_name_bytes = data_values[0].bytes;
+    const resource: u16 = @truncate(data_values[1].uint256);
+    const record_bytes = data_values[2].bytes;
+
+    if (!try utils.resolveNamehash(self, &namehash, resolver, "DNSRecordChanged")) return;
+
+    const dns_name_hex = try bytesToHexAlloc(self.allocator, dns_name_bytes);
+    defer self.allocator.free(dns_name_hex);
+    const record_hex = try bytesToHexAlloc(self.allocator, record_bytes);
+    defer self.allocator.free(record_hex);
+
+    self.database.storeResolverDnsRecord(
+        protocol,
+        namehash,
+        resolver,
+        dns_name_hex,
+        resource,
+        record_hex,
+        log.block_number,
+        log.transaction_hash,
+        log.log_index,
+        self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+    ) catch |err| {
+        std.log.warn("Failed to store resolver DNS record: {}", .{err});
+    };
+
+    const nh_hex = try namehash.toHex(self.allocator);
+    defer self.allocator.free(nh_hex);
+    const resolver_hex = try resolver.toHex(self.allocator);
+    defer self.allocator.free(resolver_hex);
+
+    const event_data = try std.fmt.allocPrint(
+        self.allocator,
+        "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"dnsName\":\"{s}\",\"resource\":{d},\"record\":\"{s}\"}}",
+        .{ nh_hex, resolver_hex, dns_name_hex, resource, record_hex },
+    );
+
+    const domain_name = self.getNameFromNamehash(namehash);
+    try utils.emitEvent(self, protocol, log, .resolver_update, domain_name, namehash, event_data);
+}
+
+/// Handle DNSRecordDeleted event (ENSIP-17)
+/// DNSRecordDeleted(bytes32 indexed node, bytes name, uint16 resource)
+pub fn handleDnsRecordDeleted(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
+    if (log.topics.len < 2) return error.InvalidTopicCount;
+    var namehash = log.topics[1];
+
+    const data_values = try abi.decodeValues(log.data, &.{ .bytes, .uint16 }, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const dns_name_bytes = data_values[0].bytes;
+    const resource: u16 = @truncate(data_values[1].uint256);
+
+    if (!try utils.resolveNamehash(self, &namehash, resolver, "DNSRecordDeleted")) return;
+
+    const dns_name_hex = try bytesToHexAlloc(self.allocator, dns_name_bytes);
+    defer self.allocator.free(dns_name_hex);
+
+    self.database.deleteResolverDnsRecord(protocol, namehash, resolver, dns_name_hex, resource) catch |err| {
+        std.log.warn("Failed to delete resolver DNS record: {}", .{err});
+    };
+
+    const nh_hex = try namehash.toHex(self.allocator);
+    defer self.allocator.free(nh_hex);
+    const resolver_hex = try resolver.toHex(self.allocator);
+    defer self.allocator.free(resolver_hex);
+
+    const event_data = try std.fmt.allocPrint(
+        self.allocator,
+        "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"dnsName\":\"{s}\",\"resource\":{d}}}",
+        .{ nh_hex, resolver_hex, dns_name_hex, resource },
+    );
+
+    const domain_name = self.getNameFromNamehash(namehash);
+    try utils.emitEvent(self, protocol, log, .resolver_update, domain_name, namehash, event_data);
+}
+
+/// Handle DNSZonehashChanged event (ENSIP-17)
+/// DNSZonehashChanged(bytes32 indexed node, bytes lastzonehash, bytes zonehash)
+pub fn handleDnsZonehashChanged(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
+    if (log.topics.len < 2) return error.InvalidTopicCount;
+    var namehash = log.topics[1];
+
+    const data_values = try abi.decodeValues(log.data, &.{ .bytes, .bytes }, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const last_zonehash_bytes = data_values[0].bytes;
+    const zonehash_bytes = data_values[1].bytes;
+
+    if (!try utils.resolveNamehash(self, &namehash, resolver, "DNSZonehashChanged")) return;
+
+    const last_hex = try bytesToHexAlloc(self.allocator, last_zonehash_bytes);
+    defer self.allocator.free(last_hex);
+    const zone_hex = try bytesToHexAlloc(self.allocator, zonehash_bytes);
+    defer self.allocator.free(zone_hex);
+
+    self.database.storeResolverDnsZonehash(
+        protocol,
+        namehash,
+        resolver,
+        zone_hex,
+        last_hex,
+        log.block_number,
+        log.transaction_hash,
+        log.log_index,
+        self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+    ) catch |err| {
+        std.log.warn("Failed to store resolver DNS zonehash: {}", .{err});
+    };
+
+    const nh_hex = try namehash.toHex(self.allocator);
+    defer self.allocator.free(nh_hex);
+    const resolver_hex = try resolver.toHex(self.allocator);
+    defer self.allocator.free(resolver_hex);
+
+    const event_data = try std.fmt.allocPrint(
+        self.allocator,
+        "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"lastZonehash\":\"{s}\",\"zonehash\":\"{s}\"}}",
+        .{ nh_hex, resolver_hex, last_hex, zone_hex },
+    );
+
+    const domain_name = self.getNameFromNamehash(namehash);
+    try utils.emitEvent(self, protocol, log, .resolver_update, domain_name, namehash, event_data);
+}
+
 /// Handle ABIChanged event
 /// ABIChanged(bytes32 indexed node, uint256 indexed contentType)
 pub fn handleABIChanged(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
     // topics[0] = event signature
     // topics[1] = indexed node (namehash)
     // topics[2] = indexed contentType
+    if (log.topics.len < 3) return error.InvalidTopicCount;
     var namehash = log.topics[1];
     const content_type = try abi.ABI.decodeUint256(&log.topics[2].bytes, 0);
 
@@ -499,6 +816,7 @@ pub fn handleInterfaceChanged(self: *Indexer, protocol: models.Protocol, resolve
     // topics[0] = event signature
     // topics[1] = indexed node (namehash)
     // topics[2] = indexed interfaceID (bytes4 padded to bytes32)
+    if (log.topics.len < 3) return error.InvalidTopicCount;
     var namehash = log.topics[1];
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "InterfaceChanged")) return;
@@ -590,28 +908,30 @@ pub fn handleVersionChanged(self: *Indexer, protocol: models.Protocol, resolver:
         new_version,
     });
 
-    // Clear all resolver records for this namehash
-    self.database.deleteResolverAddresses(namehash) catch |err| {
+    // Clear all resolver records for this (resolver, namehash) pair only.
+    // Scoping by resolver prevents wiping records owned by a different resolver
+    // for the same name (e.g. resolver-A → resolver-B → resolver-A swap path).
+    self.database.deleteResolverAddresses(namehash, resolver) catch |err| {
         std.log.warn("Failed to delete resolver addresses: {}", .{err});
     };
-    self.database.deleteResolverContentHash(namehash) catch |err| {
+    self.database.deleteResolverContentHash(namehash, resolver) catch |err| {
         std.log.warn("Failed to delete resolver contenthash: {}", .{err});
     };
-    self.database.deleteResolverTexts(namehash) catch |err| {
+    self.database.deleteResolverTexts(namehash, resolver) catch |err| {
         std.log.warn("Failed to delete resolver texts: {}", .{err});
     };
     // Note: aliases are NOT versioned — they live in _storage().aliases, not _record(node).
     // So VersionChanged does NOT clear aliases.
-    self.database.deleteResolverPubkeys(namehash) catch |err| {
+    self.database.deleteResolverPubkeys(namehash, resolver) catch |err| {
         std.log.warn("Failed to delete resolver pubkeys: {}", .{err});
     };
-    self.database.deleteResolverAbis(namehash) catch |err| {
+    self.database.deleteResolverAbis(namehash, resolver) catch |err| {
         std.log.warn("Failed to delete resolver ABIs: {}", .{err});
     };
-    self.database.deleteResolverNames(namehash) catch |err| {
+    self.database.deleteResolverNames(namehash, resolver) catch |err| {
         std.log.warn("Failed to delete resolver names: {}", .{err});
     };
-    self.database.deleteResolverInterfaces(namehash) catch |err| {
+    self.database.deleteResolverInterfaces(namehash, resolver) catch |err| {
         std.log.warn("Failed to delete resolver interfaces: {}", .{err});
     };
 

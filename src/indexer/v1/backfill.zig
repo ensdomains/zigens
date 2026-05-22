@@ -205,21 +205,7 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
 /// Once the label is later resolved (by ETH Controller NameRegistered/NameRenewed), this function
 /// finds v1_labels entries without corresponding name records and creates them.
 pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
-    // Check if backfill already completed
-    {
-        var check_q = Query.init(self.database, "SELECT completed FROM backfill_status WHERE task = 'missing_eth_2ld_names'") catch |err| {
-            std.log.warn("Failed to check eth 2LD backfill status: {}", .{err});
-            return;
-        };
-        defer check_q.deinit();
-        if (try check_q.step()) {
-            if (check_q.getInt(0) == 1) {
-                std.log.info("Missing .eth 2LD names backfill already completed, skipping", .{});
-                return;
-            }
-        }
-    }
-
+    // Idempotent: rerun on every sync-complete to catch chunk-boundary races at the indexing head.
     std.log.info("Starting missing .eth 2LD names backfill...", .{});
 
     // Find v1_labels entries that don't have a corresponding name record
@@ -320,7 +306,11 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
             .resolver = Address.zero,
             .token_id = token_id,
             .canonical_id = token_id, // V1 doesn't use versioning
-            .token_version = 0,
+            // V1 BaseRegistrar tokens are version 1 (matches the pre-migration
+            // backfill above and the live NameRegistered path). Version 0 is
+            // reserved for non-tokenized V1 names (e.g. .eth itself). These
+            // backfilled rows are .eth 2LDs registered through the controller.
+            .token_version = 1,
             .expiry = expiry,
             .registry_locked = false,
             .migrated = false,
@@ -363,18 +353,6 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
     };
 
     std.log.info("Missing .eth 2LD backfill complete: found {d} labels without names, created {d} records", .{ total_found, created_count });
-
-    // Mark backfill as completed
-    mark: {
-        var mq = Query.init(self.database,
-            \\INSERT OR REPLACE INTO backfill_status (task, completed, completed_at, records_processed)
-            \\VALUES ('missing_eth_2ld_names', 1, ?, ?)
-        ) catch break :mark;
-        defer mq.deinit();
-        mq.bindInt64(std.time.timestamp()) catch break :mark;
-        mq.bindInt64(@intCast(created_count)) catch break :mark;
-        mq.exec() catch {};
-    }
 }
 
 /// Backfill unknown subdomain labels from transaction calldata

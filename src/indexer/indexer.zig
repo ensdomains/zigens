@@ -20,7 +20,6 @@ const handlers_v2_chain = @import("v2/handlers_chain.zig");
 const event_fetchers = @import("event_fetchers.zig");
 const v1_indexing = @import("v1/indexing.zig");
 const handlers_v1 = @import("v1/handlers.zig");
-const handlers_v1_temp = @import("v1/handlers_temp.zig");
 const backfill_mod = @import("v1/backfill.zig");
 const replay_mod = @import("replay.zig");
 pub const utils = @import("utils.zig");
@@ -498,6 +497,11 @@ pub const Indexer = struct {
         .{ .event_hash = abi.EventSignatures.address_changed_hash, .handler = handleAddressChanged, .name = "AddressChanged" },
         .{ .event_hash = abi.EventSignatures.content_hash_changed_hash, .handler = handleContentHashChanged, .name = "ContentHashChanged" },
         .{ .event_hash = abi.EventSignatures.text_changed_hash, .handler = handleTextChanged, .name = "TextChanged" },
+        .{ .event_hash = abi.EventSignatures.legacy_text_changed_hash, .handler = handleLegacyTextChanged, .name = "TextChanged (legacy)" },
+        .{ .event_hash = abi.EventSignatures.authorisation_changed_hash, .handler = handleAuthorisationChanged, .name = "AuthorisationChanged" },
+        .{ .event_hash = abi.EventSignatures.dns_record_changed_hash, .handler = handleDnsRecordChanged, .name = "DNSRecordChanged" },
+        .{ .event_hash = abi.EventSignatures.dns_record_deleted_hash, .handler = handleDnsRecordDeleted, .name = "DNSRecordDeleted" },
+        .{ .event_hash = abi.EventSignatures.dns_zonehash_changed_hash, .handler = handleDnsZonehashChanged, .name = "DNSZonehashChanged" },
         .{ .event_hash = abi.EventSignatures.abi_changed_hash, .handler = handleABIChanged, .name = "ABIChanged" },
         .{ .event_hash = abi.EventSignatures.pubkey_changed_hash, .handler = handlePubkeyChanged, .name = "PubkeyChanged" },
         .{ .event_hash = abi.EventSignatures.name_changed_hash, .handler = handleNameChanged, .name = "NameChanged" },
@@ -525,6 +529,8 @@ pub const Indexer = struct {
         .{ .event_hash = abi.EventSignatures.name_unwrapped_hash, .handler = handleV1NameUnwrapped, .name = "NameUnwrapped" },
         .{ .event_hash = abi.EventSignatures.fuses_set_hash, .handler = handleV1FusesSet, .name = "FusesSet" },
         .{ .event_hash = abi.EventSignatures.expiry_extended_hash, .handler = handleV1ExpiryExtended, .name = "ExpiryExtended" },
+        .{ .event_hash = abi.EventSignatures.transfer_single_hash, .handler = handleV1NameWrapperTransferSingle, .name = "NameWrapper TransferSingle" },
+        .{ .event_hash = abi.EventSignatures.transfer_batch_hash, .handler = handleV1NameWrapperTransferBatch, .name = "NameWrapper TransferBatch" },
     };
 
     // Base Registrar events (0x57f1887a8BF19b14fC0dF6Fd9B2acc9Af147eA85)
@@ -540,7 +546,10 @@ pub const Indexer = struct {
     // These events provide the label text, which is critical for V1 name resolution
     pub const V1_ETH_CONTROLLER_EVENTS = [_]RegistryEventConfig{
         .{ .event_hash = abi.EventSignatures.controller_name_registered_hash, .handler = handleV1ETHControllerNameRegistered, .name = "NameRegistered" },
+        .{ .event_hash = abi.EventSignatures.wrapped_controller_name_registered_hash, .handler = handleV1ETHControllerNameRegistered6Arg, .name = "NameRegistered (6-arg)" },
+        .{ .event_hash = abi.EventSignatures.unwrapped_controller_name_registered_hash, .handler = handleV1ETHControllerNameRegistered7Arg, .name = "NameRegistered (7-arg)" },
         .{ .event_hash = abi.EventSignatures.controller_name_renewed_hash, .handler = handleV1ETHControllerNameRenewed, .name = "NameRenewed" },
+        .{ .event_hash = abi.EventSignatures.unwrapped_controller_name_renewed_hash, .handler = handleV1ETHControllerNameRenewedWithReferrer, .name = "NameRenewed (with referrer)" },
     };
 
     // Reverse Registrar events (0xa58E81fe9b61B5c3fE2AFD33CF304c454AbFc7Cb)
@@ -555,21 +564,10 @@ pub const Indexer = struct {
         .{ .event_hash = abi.EventSignatures.reverse_claimed_hash, .handler = handleV1ReverseClaimed, .name = "ReverseClaimed" },
     };
 
-    // Temporary Registrar events (0x6090A6e47849629b7245Dfa1Ca21D94cd15878Ef)
-    // Pre-V1 Migration: May 2017 (block 3327417) - May 2019 (block 9380410)
-    pub const TEMP_REGISTRAR_EVENTS = [_]RegistryEventConfig{
-        .{ .event_hash = abi.EventSignatures.auction_started_hash, .handler = handleTempAuctionStarted, .name = "AuctionStarted" },
-        .{ .event_hash = abi.EventSignatures.new_bid_hash, .handler = handleTempNewBid, .name = "NewBid" },
-        .{ .event_hash = abi.EventSignatures.bid_revealed_hash, .handler = handleTempBidRevealed, .name = "BidRevealed" },
-        .{ .event_hash = abi.EventSignatures.hash_registered_hash, .handler = handleTempHashRegistered, .name = "HashRegistered" },
-        .{ .event_hash = abi.EventSignatures.hash_released_hash, .handler = handleTempHashReleased, .name = "HashReleased" },
-        .{ .event_hash = abi.EventSignatures.hash_invalidated_hash, .handler = handleTempHashInvalidated, .name = "HashInvalidated" },
-    };
-
     // V1 indexing orchestration (extracted to v1_indexing.zig)
     pub const indexV1EventsChunked = v1_indexing.indexV1EventsChunked;
     pub const indexAllV1Events = v1_indexing.indexAllV1Events;
-    pub const indexTempRegistrarEvents = v1_indexing.indexTempRegistrarEvents;
+    pub const indexPreMigrationRegistryEvents = v1_indexing.indexPreMigrationRegistryEvents;
     pub const indexV1RegistryEvents = v1_indexing.indexV1RegistryEvents;
     pub const indexV1NameWrapperEvents = v1_indexing.indexV1NameWrapperEvents;
     pub const indexV1BaseRegistrarEvents = v1_indexing.indexV1BaseRegistrarEvents;
@@ -671,6 +669,18 @@ pub const Indexer = struct {
                 };
 
                 self.initial_sync_complete.store(true, .release);
+
+                // PCC fuse → Domain.expiry mirror (V1 NameWrapper). The per-event
+                // mirror in handleV1NameWrapped/FusesSet/ExpiryExtended needs to
+                // read existing wrapper state, which the write_buffer can't
+                // service during bulk sync. Run a one-shot bulk UPDATE now that
+                // the buffer is flushed and indexes are restored.
+                const pcc_rows = self.database.materializePccDomainExpiry() catch |err| blk: {
+                    std.log.warn("materializePccDomainExpiry failed: {}", .{err});
+                    break :blk 0;
+                };
+                std.log.info("PCC Domain.expiry mirror materialized: {d} row(s) updated", .{pcc_rows});
+
                 if (self.webhook_manager) |wm| {
                     std.log.info("Initial sync complete - starting 8 webhook workers", .{});
                     try wm.startWorkers(8);
@@ -718,6 +728,21 @@ pub const Indexer = struct {
                     };
 
                     self.initial_sync_complete.store(true, .release);
+
+                    // PCC fuse → Domain.expiry mirror (V1 NameWrapper, runs only
+                    // on V1 protocol since V2 doesn't have NameWrapper). The
+                    // per-event mirror in handleV1NameWrapped/FusesSet/
+                    // ExpiryExtended needs to read existing wrapper state, which
+                    // the write_buffer can't service during bulk sync. Run a
+                    // one-shot bulk UPDATE now that the buffer is flushed.
+                    if (protocol == .v1) {
+                        const pcc_rows = self.database.materializePccDomainExpiry() catch |err| blk: {
+                            std.log.warn("materializePccDomainExpiry failed: {}", .{err});
+                            break :blk 0;
+                        };
+                        std.log.info("PCC Domain.expiry mirror materialized: {d} row(s) updated", .{pcc_rows});
+                    }
+
                     if (self.webhook_manager) |wm| {
                         std.log.info("Initial sync complete - starting webhook workers", .{});
                         try wm.startWorkers(1);
@@ -1042,6 +1067,11 @@ pub const Indexer = struct {
     pub const handleAddressChanged = handlers_v2_resolver.handleAddressChanged;
     pub const handleContentHashChanged = handlers_v2_resolver.handleContentHashChanged;
     pub const handleTextChanged = handlers_v2_resolver.handleTextChanged;
+    pub const handleLegacyTextChanged = handlers_v2_resolver.handleLegacyTextChanged;
+    pub const handleAuthorisationChanged = handlers_v2_resolver.handleAuthorisationChanged;
+    pub const handleDnsRecordChanged = handlers_v2_resolver.handleDnsRecordChanged;
+    pub const handleDnsRecordDeleted = handlers_v2_resolver.handleDnsRecordDeleted;
+    pub const handleDnsZonehashChanged = handlers_v2_resolver.handleDnsZonehashChanged;
     pub const handleABIChanged = handlers_v2_resolver.handleABIChanged;
     pub const handlePubkeyChanged = handlers_v2_resolver.handlePubkeyChanged;
     pub const handleNameChanged = handlers_v2_resolver.handleNameChanged;
@@ -1063,22 +1093,19 @@ pub const Indexer = struct {
     pub const handleV1NameUnwrapped = handlers_v1.handleV1NameUnwrapped;
     pub const handleV1FusesSet = handlers_v1.handleV1FusesSet;
     pub const handleV1ExpiryExtended = handlers_v1.handleV1ExpiryExtended;
+    pub const handleV1NameWrapperTransferSingle = handlers_v1.handleV1NameWrapperTransferSingle;
+    pub const handleV1NameWrapperTransferBatch = handlers_v1.handleV1NameWrapperTransferBatch;
     pub const handleV1ERC721Transfer = handlers_v1.handleV1ERC721Transfer;
     pub const handleV1BaseRegistrarNameRegistered = handlers_v1.handleV1BaseRegistrarNameRegistered;
     pub const handleV1BaseRegistrarNameRenewed = handlers_v1.handleV1BaseRegistrarNameRenewed;
     pub const handleV1ControllerAdded = handlers_v1.handleV1ControllerAdded;
     pub const handleV1ControllerRemoved = handlers_v1.handleV1ControllerRemoved;
     pub const handleV1ETHControllerNameRegistered = handlers_v1.handleV1ETHControllerNameRegistered;
+    pub const handleV1ETHControllerNameRegistered6Arg = handlers_v1.handleV1ETHControllerNameRegistered6Arg;
+    pub const handleV1ETHControllerNameRegistered7Arg = handlers_v1.handleV1ETHControllerNameRegistered7Arg;
     pub const handleV1ETHControllerNameRenewed = handlers_v1.handleV1ETHControllerNameRenewed;
+    pub const handleV1ETHControllerNameRenewedWithReferrer = handlers_v1.handleV1ETHControllerNameRenewedWithReferrer;
     pub const handleV1ReverseClaimed = handlers_v1.handleV1ReverseClaimed;
-
-    // Temporary registrar handlers (extracted to handlers_v1_temp.zig)
-    pub const handleTempHashRegistered = handlers_v1_temp.handleTempHashRegistered;
-    pub const handleTempAuctionStarted = handlers_v1_temp.handleTempAuctionStarted;
-    pub const handleTempNewBid = handlers_v1_temp.handleTempNewBid;
-    pub const handleTempBidRevealed = handlers_v1_temp.handleTempBidRevealed;
-    pub const handleTempHashReleased = handlers_v1_temp.handleTempHashReleased;
-    pub const handleTempHashInvalidated = handlers_v1_temp.handleTempHashInvalidated;
 
     // Backfill functions (extracted to backfill.zig)
     const backfillPreMigrationNames = backfill_mod.backfillPreMigrationNames;

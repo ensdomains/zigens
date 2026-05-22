@@ -111,6 +111,21 @@ pub const Name = struct {
     /// Timestamp (seconds) when this name first became unreachable. Null
     /// while `is_reachable = true`.
     unreachable_since: ?i64 = null,
+    /// V1 ENS Registry TTL (from `NewTTL(node, ttl)`). Null when never set;
+    /// only populated for V1 names whose owner explicitly called `setTTL`.
+    /// Not used by V2 (no equivalent concept).
+    ttl: ?u64 = null,
+    /// V1 ENS Registry provenance: true when the row's most recent update
+    /// came from the legacy pre-2020 ENS Registry (0x314159…). False once
+    /// the new Registry (0x00…2e1e) emits an event for the same node.
+    /// Always false for V2 rows.
+    is_legacy: bool = false,
+    /// V1-only materialized `resolvedAddress` (subgraph parity). Populated by
+    /// `handleV1NewResolver` after calling `addr(node)` on the resolver. Null
+    /// for V2 rows and for V1 rows where the call has not yet been made — the
+    /// API layer falls back to a query-time `Resolver.addr(coinType:60)` lookup
+    /// when null.
+    resolved_address: ?Address = null,
 
     pub fn deinit(self: *Name, allocator: std.mem.Allocator) void {
         if (self.name) |n| allocator.free(n);
@@ -203,6 +218,24 @@ pub const EventType = enum {
     // so consumers can filter on "migration" specifically (vs first-time mint).
     name_migrated,
 
+    // V1 NameWrapper lifecycle: distinct from `.transfer` so consumers can
+    // filter wrap/unwrap separately from ERC721/ERC1155 transfers.
+    name_wrapped,
+    name_unwrapped,
+    fuses_set,
+
+    // V1 ReverseRegistrar.claim: distinct from `.transfer` since the on-chain
+    // event is `ReverseClaimed`, not a token transfer. Surfaces via the
+    // existing Account.primaryName GraphQL path.
+    reverse_claimed,
+
+    // V1 ENS Registry setOwner: an `(node, owner)` ownership change emitted
+    // by the Registry contract directly (vs ERC721/ERC1155 transfer of a
+    // token-backed name). Subgraph models this as a distinct entity — we
+    // mirror that with its own event_type so clients don't conflate it
+    // with token transfers.
+    registry_transfer,
+
     pub fn toString(self: EventType) []const u8 {
         return switch (self) {
             .new_subname => "NewSubname",
@@ -235,6 +268,11 @@ pub const EventType = enum {
             .version_changed => "VersionChanged",
             .alias_changed => "AliasChanged",
             .name_migrated => "NameMigrated",
+            .name_wrapped => "NameWrapped",
+            .name_unwrapped => "NameUnwrapped",
+            .fuses_set => "FusesSet",
+            .reverse_claimed => "ReverseClaimed",
+            .registry_transfer => "RegistryTransfer",
         };
     }
 
@@ -269,6 +307,11 @@ pub const EventType = enum {
         if (std.mem.eql(u8, s, "ExpiryUpdated")) return .expiry_updated;
         if (std.mem.eql(u8, s, "ParentUpdated")) return .parent_updated;
         if (std.mem.eql(u8, s, "NameMigrated")) return .name_migrated;
+        if (std.mem.eql(u8, s, "NameWrapped")) return .name_wrapped;
+        if (std.mem.eql(u8, s, "NameUnwrapped")) return .name_unwrapped;
+        if (std.mem.eql(u8, s, "FusesSet")) return .fuses_set;
+        if (std.mem.eql(u8, s, "ReverseClaimed")) return .reverse_claimed;
+        if (std.mem.eql(u8, s, "RegistryTransfer")) return .registry_transfer;
         return null;
     }
 };
@@ -296,9 +339,32 @@ pub const Event = struct {
     /// Timestamp
     timestamp: i64,
 
+    // ------------------------------------------------------------------------
+    // Registration economics (populated only when this Event was synthesised
+    // from a `registrations` row — see storage/registrations.zig:rowToEvent).
+    // Null otherwise. Stored as u256 decimal strings because wei values
+    // routinely exceed i64 range.
+    // ------------------------------------------------------------------------
+    /// Base rent cost in wei (decimal-encoded u256). Null when the Controller
+    /// event has not been observed for this registration.
+    base_cost: ?[]const u8 = null,
+    /// Auction premium portion in wei (decimal-encoded u256). "0" for legacy
+    /// 5-arg controller. Null when the Controller event was not observed.
+    premium: ?[]const u8 = null,
+    /// Human-readable label from the Controller event preimage (e.g., "vitalik").
+    /// Null when the Controller event was not observed.
+    label_name: ?[]const u8 = null,
+    /// Referrer bytes32 hex from the 7-arg UnwrappedEthRegistrarController
+    /// variant. Null for older variants / unobserved events.
+    referrer: ?[]const u8 = null,
+
     pub fn deinit(self: *Event, allocator: std.mem.Allocator) void {
         if (self.name) |n| allocator.free(n);
         allocator.free(self.data);
+        if (self.base_cost) |s| allocator.free(s);
+        if (self.premium) |s| allocator.free(s);
+        if (self.label_name) |s| allocator.free(s);
+        if (self.referrer) |s| allocator.free(s);
     }
 };
 

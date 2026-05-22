@@ -147,6 +147,24 @@ pub fn extractIntField(data: []const u8, key: []const u8) ?i64 {
     return std.fmt.parseInt(i64, data[value_start..pos], 10) catch null;
 }
 
+/// Extract a numeric value as a borrowed digit slice (handles u256 range).
+/// Returns the raw decimal digits (with optional leading `-`) — works whether
+/// the source value is a JSON number or a quoted string containing digits.
+/// Used by typed event-data accessors that need to surface large ints as
+/// GraphQL strings without losing precision.
+pub fn extractNumericStringField(data: []const u8, key: []const u8) ?[]const u8 {
+    const value_start = findKeyValueStart(data, key) orelse return null;
+    if (value_start >= data.len) return null;
+    var pos = value_start;
+    // Skip an optional opening quote (when the source stored the number as a string).
+    if (data[pos] == '"') pos += 1;
+    const start = pos;
+    if (pos < data.len and data[pos] == '-') pos += 1;
+    while (pos < data.len and std.ascii.isDigit(data[pos])) pos += 1;
+    if (pos == start) return null;
+    return data[start..pos];
+}
+
 test "extractStringField finds top-level keys, ignores substrings" {
     const data = "{\"owner\":\"0xabc\",\"ownership\":\"x\",\"foo\":\"bar\"}";
     try std.testing.expectEqualStrings("0xabc", extractStringField(data, "owner").?);

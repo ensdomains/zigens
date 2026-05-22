@@ -12,10 +12,13 @@ const resolvers = @import("resolvers/resolvers.zig");
 
 /// GraphQL query handler for ENSv2 Indexer
 /// Provides subgraph-compatible GraphQL API
+const schema_validator_mod = @import("schema_validator.zig");
+
 pub const GraphQLHandler = struct {
     allocator: std.mem.Allocator,
     database: *db.Database,
     executor: parser.Executor,
+    schema_validator: schema_validator_mod.SchemaValidator,
     complexity_max_depth: u32,
     complexity_max_cost: u32,
     metrics: metrics_mod.Metrics,
@@ -36,23 +39,50 @@ pub const GraphQLHandler = struct {
         try executor.registerResolver("domains", resolvers.resolveDomains);
         try executor.registerResolver("domainConnection", resolvers.resolveDomainConnection);
         try executor.registerResolver("account", resolvers.resolveAccount);
+        try executor.registerResolver("accounts", resolvers.resolveAccounts);
         try executor.registerResolver("registrations", resolvers.resolveRegistrations);
         try executor.registerResolver("registrationConnection", resolvers.resolveRegistrationConnection);
         try executor.registerResolver("events", resolvers.resolveEvents);
         try executor.registerResolver("eventConnection", resolvers.resolveEventConnection);
+        // Subgraph-parity per-type top-level event queries (S7-S9).
+        try executor.registerResolver("transfers", resolvers.resolveTransfers);
+        try executor.registerResolver("nameRegistereds", resolvers.resolveNameRegistereds);
+        try executor.registerResolver("nameReneweds", resolvers.resolveNameReneweds);
+        try executor.registerResolver("textChangeds", resolvers.resolveTextChangeds);
+        try executor.registerResolver("addressChangeds", resolvers.resolveAddressChangeds);
+        try executor.registerResolver("nameWrappeds", resolvers.resolveNameWrappeds);
+        try executor.registerResolver("nameUnwrappeds", resolvers.resolveNameUnwrappeds);
+        try executor.registerResolver("fusesSets", resolvers.resolveFusesSets);
+        try executor.registerResolver("expiryUpdateds", resolvers.resolveExpiryUpdateds);
+        try executor.registerResolver("resolverUpdateds", resolvers.resolveResolverUpdateds);
+        try executor.registerResolver("labelRegistereds", resolvers.resolveLabelRegistereds);
+        try executor.registerResolver("reverseClaimeds", resolvers.resolveReverseClaimeds);
+        try executor.registerResolver("registryTransfers", resolvers.resolveRegistryTransfers);
         try executor.registerResolver("roles", resolvers.resolveRoles);
         try executor.registerResolver("roleConnection", resolvers.resolveRolesConnection);
+        try executor.registerResolver("resolversByOwner", resolvers.resolveResolversByOwner);
         try executor.registerResolver("resolvers", resolvers.resolveResolvers);
         try executor.registerResolver("resolver", resolvers.resolveResolver);
         try executor.registerResolver("registries", resolvers.resolveRegistries);
         try executor.registerResolver("registry", resolvers.resolveRegistry);
         try executor.registerResolver("metadata", resolvers.resolveMetadata);
         try executor.registerResolver("approvals", resolvers.resolveApprovals);
+        try executor.registerResolver("wrappedDomains", resolvers.resolveWrappedDomains);
+        try executor.registerResolver("_meta", resolvers.resolveMeta);
+
+        // Build the schema validator once from the embedded introspection JSON.
+        // It indexes the introspection types into hash maps used to reject
+        // missing-required-arg / unknown-arg / unknown-input-object-field
+        // before the query reaches the executor.
+        const introspection_json = @embedFile("introspection.json");
+        var schema_validator = try schema_validator_mod.SchemaValidator.init(allocator, introspection_json);
+        errdefer schema_validator.deinit();
 
         return .{
             .allocator = allocator,
             .database = database,
             .executor = executor,
+            .schema_validator = schema_validator,
             .complexity_max_depth = max_depth,
             .complexity_max_cost = max_cost,
             .metrics = metrics_mod.Metrics.init(allocator, metrics_enabled),
@@ -62,6 +92,19 @@ pub const GraphQLHandler = struct {
     pub fn deinit(self: *GraphQLHandler) void {
         self.metrics.deinit();
         self.executor.deinit();
+        self.schema_validator.deinit();
+    }
+
+    /// Walk the parsed operations and validate each root field against the
+    /// schema. The validator skips meta fields (`__typename`, `__schema`, …)
+    /// and unknown root field names (those are surfaced separately by the
+    /// executor as `UnknownRootField`).
+    fn validateDocumentArgs(self: *GraphQLHandler, document: *const parser.Document) schema_validator_mod.SchemaValidator.Error!void {
+        for (document.operations) |op| {
+            for (op.fields) |*field| {
+                try self.schema_validator.validateRootField(field);
+            }
+        }
     }
 
     /// Handle a GraphQL query with optional variables
@@ -128,6 +171,23 @@ pub const GraphQLHandler = struct {
 
         std.log.debug("Query complexity: depth={d}, cost={d}", .{ analysis.depth, analysis.cost });
 
+        // Schema validation pass — runs against the parsed document before any
+        // resolver runs. Catches missing required args, unknown args, and
+        // unknown fields inside input objects. Replaces per-resolver manual
+        // checks for the generic-cases (specific InvalidAddress / TooManyNames
+        // / etc. type errors stay in the resolvers — they need value-level
+        // context that schema validation can't see).
+        if (self.validateDocumentArgs(&document)) {} else |val_err| {
+            self.metrics.recordError();
+            const msg = switch (val_err) {
+                error.MissingRequiredArg => "Missing required argument: see the schema for the required `Type!`-marked fields.",
+                error.UnknownArgument => "Unknown argument: the query references a root-field argument that does not exist in the schema.",
+                error.UnknownInputObjectField => "Unknown field in input object: the `where` (or similar input) contains a field not declared in its filter type.",
+                else => "Query validation failed",
+            };
+            return try self.buildErrorResponseWithCode(msg, ErrorCode.VALIDATION_ERROR);
+        }
+
         // Execute the parsed query with the per-request executor (arena-backed)
         const result = request_executor.executeDocument(&document, variables, operation_name) catch |err| {
             std.log.err("Failed to execute GraphQL query: {}", .{err});
@@ -152,6 +212,8 @@ pub const GraphQLHandler = struct {
                 return try self.buildErrorResponseWithCode("Invalid protocol: must be 'v1' or 'v2'", ErrorCode.INVALID_ARGUMENT);
             } else if (err == error.TooManyNames) {
                 return try self.buildErrorResponseWithCode("name_in: too many names (cap is 1000 per query)", ErrorCode.INVALID_ARGUMENT);
+            } else if (err == error.UnknownRootField) {
+                return try self.buildErrorResponseWithCode("Unknown root field: query references a Query field that does not exist in the schema. Check the schema or run an introspection query.", ErrorCode.VALIDATION_ERROR);
             } else if (err == error.SubSelectionOnScalar) {
                 // Common porting mistake from the ENS subgraph, which exposes
                 // `texts { key value }`. Our schema declares `texts: [String!]`

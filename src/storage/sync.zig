@@ -217,8 +217,21 @@ pub fn isSubregistryKnown(db: *Database, protocol: models.Protocol, address: []c
     return try q.step();
 }
 
-/// Register or update a known subregistry
-pub fn registerSubregistry(db: *Database, protocol: models.Protocol, address: []const u8, block_number: u64) !void {
+/// Register or update a known subregistry.
+///
+/// `first_seen_block` should be the subregistry's actual creation block
+/// (from `registries.created_block`) — used only on initial INSERT.
+/// `last_indexed_block` is the high-water mark for events we've already
+/// indexed from this subregistry. On conflict, we keep the MAX of the
+/// existing and new value so callers advancing the checkpoint never go
+/// backwards.
+pub fn registerSubregistry(
+    db: *Database,
+    protocol: models.Protocol,
+    address: []const u8,
+    first_seen_block: u64,
+    last_indexed_block: u64,
+) !void {
     const sql =
         \\INSERT INTO known_subregistries (protocol, address, first_seen_block, last_indexed_block)
         \\VALUES (?, ?, ?, ?)
@@ -231,8 +244,8 @@ pub fn registerSubregistry(db: *Database, protocol: models.Protocol, address: []
 
     try q.bindTextStatic(protocol.toString());
     try q.bindText(address);
-    try q.bindInt64(@intCast(block_number));
-    try q.bindInt64(@intCast(block_number));
+    try q.bindInt64(@intCast(first_seen_block));
+    try q.bindInt64(@intCast(last_indexed_block));
 
     try q.exec();
 }
@@ -274,6 +287,11 @@ pub const SubregistryDiscoveryResult = struct {
 
 pub fn discoverAndGetSubregistries(db: *Database, protocol: models.Protocol, main_registry: []const u8, from_block: u64, to_block: u64) !SubregistryDiscoveryResult {
     _ = to_block;
+    // `from_block` is the current batch's lower bound and is intentionally
+    // unused here: each newly-discovered subregistry's checkpoint is keyed
+    // off its own `registries.created_block`, not the batch boundary. See
+    // the comment on the discovery SQL below for why.
+    _ = from_block;
     const protocol_str = protocol.toString();
 
     // Discover any subregistry recorded in the registries table that is not
@@ -287,13 +305,14 @@ pub fn discoverAndGetSubregistries(db: *Database, protocol: models.Protocol, mai
     // batches (window doesn't cover prior blocks). The LEFT JOIN keeps the
     // common case O(0) once steady state is reached.
     const discover_sql =
-        \\SELECT DISTINCT r.address
+        \\SELECT r.address, MIN(r.created_block) AS created_block
         \\FROM registries r
         \\LEFT JOIN known_subregistries ks ON ks.protocol = r.protocol AND ks.address = r.address
         \\WHERE r.protocol = ?
         \\  AND r.address != '0x0000000000000000000000000000000000000000'
         \\  AND r.address != ?
         \\  AND ks.address IS NULL
+        \\GROUP BY r.address
     ;
 
     var new_subregistries: std.ArrayList([]u8) = .{};
@@ -309,10 +328,20 @@ pub fn discoverAndGetSubregistries(db: *Database, protocol: models.Protocol, mai
         try q.bindTextStatic(protocol_str);
         try q.bindText(main_registry);
 
-        // Register newly discovered subregistries and track them
+        // Register newly discovered subregistries and track them.
+        // `first_seen_block` is the subregistry's actual creation block
+        // (from registries.created_block), which may predate the current
+        // batch by many blocks — PR #66 dropped the created_block window
+        // filter so late discoveries are now possible. `last_indexed_block`
+        // is set to the creation block as well: we have NOT yet indexed
+        // any events emitted by this subregistry, but events can only
+        // exist from created_block onward, so this is the correct lower
+        // bound. The follow-up `backfillSubregistryEvents` call will
+        // advance the checkpoint after the bulk backfill completes.
         while (try q.step()) {
             if (q.getTextSlice(0)) |addr_slice| {
-                try db.registerSubregistry(protocol, addr_slice, from_block);
+                const created_block: u64 = @intCast(q.getInt64(1));
+                try db.registerSubregistry(protocol, addr_slice, created_block, created_block);
                 const copy = try db.allocator.dupe(u8, addr_slice);
                 try new_subregistries.append(db.allocator, copy);
             }

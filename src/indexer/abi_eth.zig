@@ -44,8 +44,8 @@ pub const ABI = struct {
 
     /// Decode a dynamic string. The 32-byte word at `data[offset..]` holds the
     /// absolute byte offset (within `data`) of the string's length+payload.
-    /// Used by the trailing-string fallback in `handlers_temp.zig`; main paths
-    /// go through `decodeValues`.
+    /// Main decode paths go through `decodeValues`; this helper is kept for
+    /// any future ad-hoc trailing-string decoding.
     pub fn decodeString(allocator: std.mem.Allocator, data: []const u8, offset: usize) ![]u8 {
         if (offset + 32 > data.len) return error.DataTooShort;
         const head_word: [32]u8 = data[offset..][0..32].*;
@@ -204,4 +204,54 @@ test "decodeString rejects overlong" {
 
     const result = ABI.decodeString(std.testing.allocator, &data, 0);
     try std.testing.expectError(error.StringTooLong, result);
+}
+
+test "decodeUint256Array handles two-array TransferBatch payload" {
+    // ERC-1155 TransferBatch non-indexed payload: (uint256[] ids, uint256[] values).
+    // The tuple head occupies the first 2 words (bytes 0..64) and stores offsets
+    // (relative to the start of the payload) to each dynamic array's tail.
+    //
+    // Layout used here (packed):
+    //   bytes   0..32  head[0] = 0x40   → ids tail starts at byte 64
+    //   bytes  32..64  head[1] = 0xA0   → values tail starts at byte 160
+    //   bytes  64..96  ids.length = 2
+    //   bytes  96..128 ids[0] = 0xAA…AA
+    //   bytes 128..160 ids[1] = 0xBB…BB
+    //   bytes 160..192 values.length = 2
+    //   bytes 192..224 values[0] = 1
+    //   bytes 224..256 values[1] = 2
+    //
+    // Both `(data, 0)` and `(data, 32)` are head-slot offsets — decodeUint256Array
+    // dereferences each through the head pointer to reach the correct tail. If it
+    // were instead a raw byte offset, the second call would read garbage.
+
+    var data: [256]u8 = [_]u8{0} ** 256;
+    // Head[0] = 0x40 (ids tail at byte 64)
+    data[31] = 0x40;
+    // Head[1] = 0xA0 (values tail at byte 160; packed right after ids tail end)
+    data[63] = 0xA0;
+    // ids tail: length = 2
+    data[64 + 31] = 0x02;
+    // ids[0] = 0xAA…AA (byte 0xAA repeated for clarity)
+    for (data[96..128]) |*b| b.* = 0xAA;
+    // ids[1] = 0xBB…BB
+    for (data[128..160]) |*b| b.* = 0xBB;
+    // values tail: length = 2
+    data[160 + 31] = 0x02;
+    // values[0] = 1
+    data[192 + 31] = 0x01;
+    // values[1] = 2
+    data[224 + 31] = 0x02;
+
+    const ids = try ABI.decodeUint256Array(std.testing.allocator, &data, 0);
+    defer std.testing.allocator.free(ids);
+    const values = try ABI.decodeUint256Array(std.testing.allocator, &data, 32);
+    defer std.testing.allocator.free(values);
+
+    try std.testing.expectEqual(@as(usize, 2), ids.len);
+    try std.testing.expectEqual(@as(u256, 0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA), ids[0]);
+    try std.testing.expectEqual(@as(u256, 0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB), ids[1]);
+    try std.testing.expectEqual(@as(usize, 2), values.len);
+    try std.testing.expectEqual(@as(u256, 1), values[0]);
+    try std.testing.expectEqual(@as(u256, 2), values[1]);
 }

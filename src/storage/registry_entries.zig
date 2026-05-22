@@ -199,18 +199,20 @@ pub fn setRegistriesReachability(
 /// instead of losing history.
 pub fn markNameUnreachableByNamehash(
     db: *Database,
+    protocol: models.Protocol,
     namehash: Hash,
     block_number: u64,
     block_timestamp: i64,
 ) !void {
     var q = try Query.initCached(db,
         \\UPDATE names SET is_reachable = 0, unreachable_since = ?, updated_block = ?, updated_at = ?
-        \\WHERE namehash = ?
+        \\WHERE protocol = ? AND namehash = ?
     );
     defer q.deinit();
     try q.bindInt64(block_timestamp);
     try q.bindInt64(@intCast(block_number));
     try q.bindInt64(block_timestamp);
+    try q.bindTextStatic(protocol.toString());
     try q.bindHash(namehash);
     try q.exec();
 }

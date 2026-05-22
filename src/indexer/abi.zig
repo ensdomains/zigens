@@ -172,6 +172,32 @@ pub const EventSignatures = struct {
     pub const text_changed = "TextChanged(bytes32,string,string,string)";
     pub const text_changed_hash: Hash = eventHash(text_changed);
 
+    /// TextChanged(bytes32 indexed node, string indexed indexedKey, string value)
+    /// Legacy 3-arg variant emitted by the 2017 LegacyPublicResolver. No `key`
+    /// in the non-indexed payload — only the hashed indexed key is on-chain.
+    pub const legacy_text_changed = "TextChanged(bytes32,string,string)";
+    pub const legacy_text_changed_hash: Hash = eventHash(legacy_text_changed);
+
+    /// AuthorisationChanged(bytes32 indexed node, address indexed owner, address indexed target, bool isAuthorised)
+    /// Legacy V1 PublicResolver `Authorisable` mixin event.
+    pub const authorisation_changed = "AuthorisationChanged(bytes32,address,address,bool)";
+    pub const authorisation_changed_hash: Hash = eventHash(authorisation_changed);
+
+    /// DNSRecordChanged(bytes32 indexed node, bytes name, uint16 resource, bytes record)
+    /// ENSIP-17 DNS resolver event — V1 PublicResolver + V2 PublicResolverV2.
+    pub const dns_record_changed = "DNSRecordChanged(bytes32,bytes,uint16,bytes)";
+    pub const dns_record_changed_hash: Hash = eventHash(dns_record_changed);
+
+    /// DNSRecordDeleted(bytes32 indexed node, bytes name, uint16 resource)
+    /// ENSIP-17 DNS resolver event — V1 PublicResolver + V2 PublicResolverV2.
+    pub const dns_record_deleted = "DNSRecordDeleted(bytes32,bytes,uint16)";
+    pub const dns_record_deleted_hash: Hash = eventHash(dns_record_deleted);
+
+    /// DNSZonehashChanged(bytes32 indexed node, bytes lastzonehash, bytes zonehash)
+    /// ENSIP-17 DNS resolver event — V1 PublicResolver + V2 PublicResolverV2.
+    pub const dns_zonehash_changed = "DNSZonehashChanged(bytes32,bytes,bytes)";
+    pub const dns_zonehash_changed_hash: Hash = eventHash(dns_zonehash_changed);
+
     /// ABIChanged(bytes32 indexed node, uint256 indexed contentType)
     pub const abi_changed = "ABIChanged(bytes32,uint256)";
     pub const abi_changed_hash: Hash = eventHash(abi_changed);
@@ -317,16 +343,45 @@ pub const EventSignatures = struct {
     // ========================================================================
     // ENS V1 ETH Registrar Controller events (ETHRegistrarController.sol)
     // Address: 0x59E16fcCd424Cc24e280Be16E11Bcd56fb0CE547
+    //
+    // Three historical NameRegistered signatures coexist on mainnet:
+    //   1. Legacy 5-arg (LegacyEthRegistrarController, earliest deployment):
+    //      NameRegistered(string,bytes32,address,uint256,uint256)
+    //   2. Wrapped 6-arg (WrappedEthRegistrarController, ~block 16,925,618):
+    //      NameRegistered(string,bytes32,address,uint256,uint256,uint256)
+    //      Adds explicit baseCost/premium split.
+    //   3. Unwrapped 7-arg (UnwrappedEthRegistrarController, newer):
+    //      NameRegistered(string,bytes32,address,uint256,uint256,uint256,bytes32)
+    //      Adds non-indexed `referrer` (bytes32) at the tail.
+    // All three share `bytes32 indexed label` (topic[1]) and
+    // `address indexed owner` (topic[2]); only topic[0] (signature hash) and
+    // the non-indexed data tail differ.
     // ========================================================================
 
     /// NameRegistered(string name, bytes32 indexed label, address indexed owner, uint256 cost, uint256 expires)
-    /// Note: V1 Controller uses 5 parameters, NOT 6 (no separate baseCost/premium)
+    /// Legacy 5-arg: original LegacyEthRegistrarController (no baseCost/premium split, no referrer)
     pub const controller_name_registered = "NameRegistered(string,bytes32,address,uint256,uint256)";
     pub const controller_name_registered_hash: Hash = eventHash(controller_name_registered);
+
+    /// NameRegistered(string name, bytes32 indexed label, address indexed owner, uint256 baseCost, uint256 premium, uint256 expires)
+    /// 6-arg WrappedEthRegistrarController: baseCost/premium split, no referrer.
+    pub const wrapped_controller_name_registered = "NameRegistered(string,bytes32,address,uint256,uint256,uint256)";
+    pub const wrapped_controller_name_registered_hash: Hash = eventHash(wrapped_controller_name_registered);
+
+    /// NameRegistered(string label, bytes32 indexed labelhash, address indexed owner, uint256 baseCost, uint256 premium, uint256 expires, bytes32 referrer)
+    /// 7-arg UnwrappedEthRegistrarController: baseCost/premium split + non-indexed referrer tag.
+    pub const unwrapped_controller_name_registered = "NameRegistered(string,bytes32,address,uint256,uint256,uint256,bytes32)";
+    pub const unwrapped_controller_name_registered_hash: Hash = eventHash(unwrapped_controller_name_registered);
 
     /// NameRenewed(string name, bytes32 indexed label, uint256 cost, uint256 expires)
     pub const controller_name_renewed = "NameRenewed(string,bytes32,uint256,uint256)";
     pub const controller_name_renewed_hash: Hash = eventHash(controller_name_renewed);
+
+    /// NameRenewed(string label, bytes32 indexed labelhash, uint256 cost, uint256 expires, bytes32 referrer)
+    /// 5-arg UnwrappedEthRegistrarController: adds non-indexed referrer tag at
+    /// the data tail. Same labelhash indexed-topic shape as the legacy variant.
+    pub const unwrapped_controller_name_renewed = "NameRenewed(string,bytes32,uint256,uint256,bytes32)";
+    pub const unwrapped_controller_name_renewed_hash: Hash = eventHash(unwrapped_controller_name_renewed);
 
     // ========================================================================
     // ENS V1 Reverse Registrar events (ReverseRegistrar.sol)

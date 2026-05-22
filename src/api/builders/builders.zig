@@ -21,3 +21,4 @@ pub const buildEventJson = impl.buildEventJson;
 pub const buildRegistrationJson = impl.buildRegistrationJson;
 pub const buildAccountJson = impl.buildAccountJson;
 pub const buildResolverJson = impl.buildResolverJson;
+pub const buildWrappedDomainJson = impl.buildWrappedDomainJson;

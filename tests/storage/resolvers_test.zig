@@ -494,7 +494,7 @@ test "deleteResolverPubkeys clears pubkey" {
     }
 
     // Delete
-    try resolvers.deleteResolverPubkeys(database, nh);
+    try resolvers.deleteResolverPubkeys(database, nh, helpers.TEST_RESOLVER);
 
     const result = try resolvers.getPubkeyRecord(database, helpers.TEST_RESOLVER, nh);
     try testing.expect(result == null);
@@ -549,7 +549,7 @@ test "deleteResolverAbis clears all ABI records" {
     try resolvers.storeResolverABI(database, nh, helpers.TEST_RESOLVER, 1, .v2, 1000, tx_hash, 1700000000);
     try resolvers.storeResolverABI(database, nh, helpers.TEST_RESOLVER, 2, .v2, 1000, tx_hash, 1700000000);
 
-    try resolvers.deleteResolverAbis(database, nh);
+    try resolvers.deleteResolverAbis(database, nh, helpers.TEST_RESOLVER);
 
     const content_types = try resolvers.getAbiContentTypes(database, helpers.TEST_RESOLVER, nh);
     defer allocator.free(content_types);
@@ -617,7 +617,7 @@ test "deleteResolverNames clears reverse name" {
     const tx_hash = helpers.randomHash();
 
     try resolvers.storeResolverName(database, nh, helpers.TEST_RESOLVER, "name.eth", .v2, 1000, tx_hash, 1700000000);
-    try resolvers.deleteResolverNames(database, nh);
+    try resolvers.deleteResolverNames(database, nh, helpers.TEST_RESOLVER);
 
     const result = try resolvers.getReverseNameRecord(database, helpers.TEST_RESOLVER, nh);
     try testing.expect(result == null);
@@ -702,7 +702,7 @@ test "deleteResolverInterfaces clears all interfaces" {
     try resolvers.storeResolverInterface(database, nh, helpers.TEST_RESOLVER, "0x01ffc9a7", "0xaaaa", .v2, 1000, tx_hash, 1700000000);
     try resolvers.storeResolverInterface(database, nh, helpers.TEST_RESOLVER, "0x3b3b57de", "0xbbbb", .v2, 1000, tx_hash, 1700000000);
 
-    try resolvers.deleteResolverInterfaces(database, nh);
+    try resolvers.deleteResolverInterfaces(database, nh, helpers.TEST_RESOLVER);
 
     const ifaces = try resolvers.getInterfaceRecords(database, helpers.TEST_RESOLVER, nh);
     defer allocator.free(ifaces);
@@ -771,7 +771,7 @@ test "deleteResolverAddresses clears all addresses for namehash" {
     try resolvers.storeResolverAddress(database, nh, helpers.TEST_RESOLVER, 60, "0xeth", .v2, 1000, tx_hash, 1700000000);
     try resolvers.storeResolverAddress(database, nh, helpers.TEST_RESOLVER, 0, "bc1q", .v2, 1000, tx_hash, 1700000000);
 
-    try resolvers.deleteResolverAddresses(database, nh);
+    try resolvers.deleteResolverAddresses(database, nh, helpers.TEST_RESOLVER);
 
     const addresses = try resolvers.getAddressRecords(database, helpers.TEST_RESOLVER, nh);
     defer allocator.free(addresses);
@@ -788,7 +788,7 @@ test "deleteResolverContentHash clears contenthash" {
     const tx_hash = helpers.randomHash();
 
     try resolvers.storeResolverContentHash(database, nh, helpers.TEST_RESOLVER, "ipfs://Qm123", .v2, 1000, tx_hash, 1700000000);
-    try resolvers.deleteResolverContentHash(database, nh);
+    try resolvers.deleteResolverContentHash(database, nh, helpers.TEST_RESOLVER);
 
     const result = try resolvers.getContentHashRecord(database, helpers.TEST_RESOLVER, nh);
     try testing.expect(result == null);
@@ -805,7 +805,7 @@ test "deleteResolverTexts clears all text records" {
     try resolvers.storeResolverText(database, nh, helpers.TEST_RESOLVER, "avatar", "img.png", .v2, 1000, tx_hash, 1700000000);
     try resolvers.storeResolverText(database, nh, helpers.TEST_RESOLVER, "url", "https://x.com", .v2, 1000, tx_hash, 1700000000);
 
-    try resolvers.deleteResolverTexts(database, nh);
+    try resolvers.deleteResolverTexts(database, nh, helpers.TEST_RESOLVER);
 
     const keys = try resolvers.getTextRecordKeys(database, helpers.TEST_RESOLVER, nh);
     defer allocator.free(keys);

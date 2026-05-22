@@ -17,6 +17,18 @@ pub const Network = enum {
         if (std.ascii.eqlIgnoreCase(s, "mainnet")) return .mainnet;
         return error.UnknownNetwork;
     }
+
+    /// EIP-155 chain ID. Used as the leading segment of entity IDs (Resolver
+    /// `{chainId}-{protocol}-{address}-{namehash}`, …) so that when this
+    /// indexer is later extended to multi-chain plugins (basenames, lineanames,
+    /// 3DNS) entity IDs remain globally unique across chains without a schema
+    /// migration.
+    pub fn chainId(self: Network) u64 {
+        return switch (self) {
+            .sepolia => 11155111,
+            .mainnet => 1,
+        };
+    }
 };
 
 pub const ContractAddresses = struct {
@@ -47,6 +59,7 @@ pub const ContractAddresses = struct {
     // ═══════════════════════════════════════════════════════════════════════
     //  Migration (V1 → V2)
     // ═══════════════════════════════════════════════════════════════════════
+    migration_helper: Address, // V1 side: initiates migration by transferring tokens
     locked_migration_controller: Address, // V2 side: receives locked/wrapped names
     unlocked_migration_controller: Address, // V2 side: receives unlocked/unwrapped names
 
@@ -74,25 +87,26 @@ fn sepoliaAddresses() ContractAddresses {
         // Temporary Registrar (not used on Sepolia testnet)
         .temporary_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
 
-        // V1 Contracts (mainnet via tenderly fork)
-        .old_ens_registry = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable, // Not applicable on tenderly fork
-        .old_public_resolver = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable, // Not applicable on tenderly fork
-        .ens_registry = Address.fromHex("0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e") catch unreachable,
-        .base_registrar = Address.fromHex("0x57f1887a8bf19b14fc0df6fd9b2acc9af147ea85") catch unreachable,
-        .eth_registrar_controller = Address.fromHex("0xfb3cE5D01e0f33f41DbB39035dB9745962F1f968") catch unreachable,
-        .public_resolver = Address.fromHex("0xE99638b40E4Fff0129D56f03b55b6bbC4BBE49b5") catch unreachable,
-        .reverse_registrar = Address.fromHex("0xA0a1AbcDAe1a2a4A2EF8e9113Ff0e02DD81DC0C6") catch unreachable,
-        .name_wrapper = Address.fromHex("0x0635513f179D50A207757E05759CbD106d7dFcE8") catch unreachable,
+        // V1 Sepolia Contracts
+        .old_ens_registry = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable, // Not applicable for testnets
+        .old_public_resolver = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable, // Not applicable for testnets
+        .ens_registry = Address.fromHex("0x17795c119b8155ab9d3357c77747ba509695d7cb") catch unreachable,
+        .base_registrar = Address.fromHex("0xb16870800de7444f6b2ebd885465412a5e581614") catch unreachable,
+        .eth_registrar_controller = Address.fromHex("0x99e517db3db5ec5424367b8b50cd11ddcb0008f1") catch unreachable,
+        .public_resolver = Address.fromHex("0x0e14ee0592da66bb4c8a8090066bc8a5af15f3e6") catch unreachable,
+        .reverse_registrar = Address.fromHex("0xf79f9970030fe60bd89d21591c7f2d80d7d21242") catch unreachable,
+        .name_wrapper = Address.fromHex("0xca7e6d0ddc5f373197bbe6fc2f09c2314399f028") catch unreachable,
 
-        // V2 Contracts (tenderly fork — current deployment)
-        .root_registry = Address.fromHex("0xfd43dc00ab0d0e247a2827d15dddfc5bd9646a29") catch unreachable, // RootRegistry
-        .eth_registry = Address.fromHex("0x31a2bb5d933557cce1b3129993193896d074db92") catch unreachable, // ETHRegistry
-        .eth_registrar_v2 = Address.fromHex("0x26e5e80e8f36607ef401443fb34eea363c86e8f7") catch unreachable, // ETHRegistrar
-        .eth_reverse_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable, // Not in current deployment table
+        // V2 Sepolia Contracts (ENSv2 deployment)
+        .root_registry = Address.fromHex("0x3a3e15a5d27ff6f05c844313312f2e72096d3ed3") catch unreachable,
+        .eth_registry = Address.fromHex("0x796fff2e907449be8d5921bcc215b1b76d89d080") catch unreachable,
+        .eth_registrar_v2 = Address.fromHex("0x68586418353b771cf2425ed14a07512aa880c532") catch unreachable,
+        .eth_reverse_registrar = Address.fromHex("0xa35e6c5dc06e820cc6716ca33dfcd203503fb1d3") catch unreachable,
 
-        // Migration Contracts (V1→V2, tenderly fork)
-        .locked_migration_controller = Address.fromHex("0x7ca1ded4d929ebd8b09e24c2da8e909014abecd8") catch unreachable, // LockedMigrationController
-        .unlocked_migration_controller = Address.fromHex("0x5587003f8eeee1bc236d48ab39059cbfd99207d7") catch unreachable, // UnlockedMigrationController
+        // Migration Contracts (V1→V2, Sepolia deployment)
+        .migration_helper = Address.fromHex("0x8fa8b82a70e400ba99423c8f76cc2cead2adc590") catch unreachable,
+        .locked_migration_controller = Address.fromHex("0x22cd7e6a89f5bf4510ef22b3dd4ef190d22f95c3") catch unreachable,
+        .unlocked_migration_controller = Address.fromHex("0x76ae358d9ad91651b78463ae609dadc9e7ce4402") catch unreachable,
 
         // Deployment blocks (verified from on-protocol)
         .v1_deployment_block = 4700000, // V1 ENS deployment on Sepolia
@@ -127,6 +141,7 @@ fn mainnetAddresses() ContractAddresses {
         .eth_reverse_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
 
         // Migration Contracts (Not yet deployed on mainnet)
+        .migration_helper = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
         .locked_migration_controller = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
         .unlocked_migration_controller = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
 

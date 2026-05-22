@@ -37,6 +37,9 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
     var event_types_list: std.ArrayList([]const u8) = .{};
     defer event_types_list.deinit(allocator);
 
+    var event_types_not_list: std.ArrayList([]const u8) = .{};
+    defer event_types_not_list.deinit(allocator);
+
     var normalized_contract_address: ?[]u8 = null;
     defer if (normalized_contract_address) |addr| allocator.free(addr);
 
@@ -47,6 +50,13 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
                     if (item == .string) try event_types_list.append(allocator, item.string);
                 }
                 if (event_types_list.items.len > 0) filter_opts.event_types = event_types_list.items;
+                continue;
+            }
+            if (std.mem.eql(u8, a.name, "type_not_in") and a.value == .list) {
+                for (a.value.list) |item| {
+                    if (item == .string) try event_types_not_list.append(allocator, item.string);
+                }
+                if (event_types_not_list.items.len > 0) filter_opts.event_types_not = event_types_not_list.items;
                 continue;
             }
             if (std.mem.eql(u8, a.name, "contractAddress") and a.value == .string) {
@@ -64,6 +74,7 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
             }
 
             _ = common.matchStringArg(a, "type", &filter_opts.event_type) or
+                common.matchStringArg(a, "type_not", &filter_opts.event_type_not) or
                 common.matchStringArg(a, "domain", &filter_opts.domain) or
                 common.matchStringArg(a, "namehash", &filter_opts.namehash) or
                 common.matchIntArg(a, "blockNumber_gt", &filter_opts.block_number_gt) or
@@ -283,8 +294,67 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
     return parser.FieldResult{ .json = result_json };
 }
 
+/// Subgraph-parity top-level per-type event queries.
+///
+/// Each generated resolver below filters the flat `events` table by a fixed
+/// `event_type` and returns `[Event!]!` (typed projection via `as*` accessors).
+/// This avoids duplicating storage — these are just typed projections of the
+/// existing events list. The injected `event_type` overrides any client-set
+/// `where.type` so callers can't accidentally cross-query.
+fn perTypeEventResolver(comptime event_type_str: []const u8) parser.ResolverFn {
+    const inner = struct {
+        fn resolve(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
+            return resolveEventsWithForcedType(ctx, field, event_type_str);
+        }
+    };
+    return inner.resolve;
+}
+
+/// Same as `perTypeEventResolver` but unions multiple event types. Used for
+/// `nameRegistereds` where subgraph convention surfaces both V1 BaseRegistrar
+/// `NameRegistered` events AND V2 PermissionedRegistry `LabelRegistered` events
+/// as a single "name registration" stream — they're semantically the same
+/// "a name was registered" signal, just emitted by different contracts.
+fn perTypeEventResolverMulti(comptime event_types_arr: []const []const u8) parser.ResolverFn {
+    const inner = struct {
+        fn resolve(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
+            return resolveEventsWithForcedTypes(ctx, field, event_types_arr);
+        }
+    };
+    return inner.resolve;
+}
+
+pub const resolveTransfers = perTypeEventResolver("Transfer");
+pub const resolveNameRegistereds = perTypeEventResolverMulti(&[_][]const u8{ "NameRegistered", "LabelRegistered" });
+pub const resolveNameReneweds = perTypeEventResolver("NameRenewed");
+pub const resolveTextChangeds = perTypeEventResolver("TextChanged");
+pub const resolveAddressChangeds = perTypeEventResolver("AddressChanged");
+pub const resolveNameWrappeds = perTypeEventResolver("NameWrapped");
+pub const resolveNameUnwrappeds = perTypeEventResolver("NameUnwrapped");
+pub const resolveFusesSets = perTypeEventResolver("FusesSet");
+pub const resolveExpiryUpdateds = perTypeEventResolver("ExpiryUpdated");
+pub const resolveResolverUpdateds = perTypeEventResolver("ResolverUpdated");
+pub const resolveLabelRegistereds = perTypeEventResolver("LabelRegistered");
+pub const resolveReverseClaimeds = perTypeEventResolver("ReverseClaimed");
+pub const resolveRegistryTransfers = perTypeEventResolver("RegistryTransfer");
+
 /// Resolver for domain query (single domain)
 pub fn resolveEvents(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
+    return resolveEventsWithForcedType(ctx, field, null);
+}
+
+/// Sister entry-point for resolvers that need to union multiple event types
+/// (currently only `nameRegistereds`). Delegates to the same body as the
+/// single-type variant.
+fn resolveEventsWithForcedTypes(ctx: parser.ExecutionContext, field: *const parser.Field, forced_event_types: []const []const u8) !parser.FieldResult {
+    return resolveEventsWithForced(ctx, field, null, forced_event_types);
+}
+
+fn resolveEventsWithForcedType(ctx: parser.ExecutionContext, field: *const parser.Field, forced_event_type: ?[]const u8) !parser.FieldResult {
+    return resolveEventsWithForced(ctx, field, forced_event_type, null);
+}
+
+fn resolveEventsWithForced(ctx: parser.ExecutionContext, field: *const parser.Field, forced_event_type: ?[]const u8, forced_event_types: ?[]const []const u8) !parser.FieldResult {
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
     const allocator = ctx.allocator;
 
@@ -298,6 +368,9 @@ pub fn resolveEvents(ctx: parser.ExecutionContext, field: *const parser.Field) !
     // Temporary storage for event_types strings
     var event_types_list: std.ArrayList([]const u8) = .{};
     defer event_types_list.deinit(allocator);
+
+    var event_types_not_list: std.ArrayList([]const u8) = .{};
+    defer event_types_not_list.deinit(allocator);
 
     // Temporary storage for normalized contract address (to handle checksummed addresses)
     var normalized_contract_address: ?[]u8 = null;
@@ -313,6 +386,13 @@ pub fn resolveEvents(ctx: parser.ExecutionContext, field: *const parser.Field) !
                 if (event_types_list.items.len > 0) filter_opts.event_types = event_types_list.items;
                 continue;
             }
+            if (std.mem.eql(u8, a.name, "type_not_in") and a.value == .list) {
+                for (a.value.list) |item| {
+                    if (item == .string) try event_types_not_list.append(allocator, item.string);
+                }
+                if (event_types_not_list.items.len > 0) filter_opts.event_types_not = event_types_not_list.items;
+                continue;
+            }
             if (std.mem.eql(u8, a.name, "contractAddress") and a.value == .string) {
                 const addr = Address.fromHex(a.value.string) catch return error.InvalidContractAddress;
                 normalized_contract_address = try addr.toHex(allocator);
@@ -325,6 +405,7 @@ pub fn resolveEvents(ctx: parser.ExecutionContext, field: *const parser.Field) !
             }
 
             _ = common.matchStringArg(a, "type", &filter_opts.event_type) or
+                common.matchStringArg(a, "type_not", &filter_opts.event_type_not) or
                 common.matchStringArg(a, "domain", &filter_opts.domain) or
                 common.matchStringArg(a, "namehash", &filter_opts.namehash) or
                 common.matchIntArg(a, "blockNumber_gt", &filter_opts.block_number_gt) or
@@ -336,6 +417,21 @@ pub fn resolveEvents(ctx: parser.ExecutionContext, field: *const parser.Field) !
                 common.matchIntArg(a, "timestamp_lt", &filter_opts.timestamp_lt) or
                 common.matchIntArg(a, "timestamp_lte", &filter_opts.timestamp_lte);
         }
+    }
+
+    // Subgraph-parity per-type top-level queries (transfers, textChangeds, …)
+    // inject a fixed event_type that overrides any client-set `where.type`.
+    if (forced_event_type) |t| {
+        filter_opts.event_type = t;
+        filter_opts.event_types = null;
+        filter_opts.event_type_not = null;
+        filter_opts.event_types_not = null;
+    }
+    if (forced_event_types) |ts| {
+        filter_opts.event_type = null;
+        filter_opts.event_types = ts;
+        filter_opts.event_type_not = null;
+        filter_opts.event_types_not = null;
     }
 
     if (parser.getStringArg(field, "orderBy", null)) |order_by| {

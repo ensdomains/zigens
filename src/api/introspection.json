@@ -192,6 +192,67 @@
               "deprecationReason": null
             },
             {
+              "name": "accounts",
+              "description": "List Account entities with pagination and filtering (subgraph parity).",
+              "args": [
+                {
+                  "name": "first",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "skip",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "where",
+                  "description": null,
+                  "type": {
+                    "kind": "INPUT_OBJECT",
+                    "name": "AccountFilter"
+                  }
+                },
+                {
+                  "name": "orderBy",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "Account_orderBy"
+                  }
+                },
+                {
+                  "name": "orderDirection",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "OrderDirection"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Account"
+                    }
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
               "name": "registrations",
               "description": "Get domain registrations with pagination (legacy offset-based)",
               "args": [
@@ -456,6 +517,799 @@
               "deprecationReason": null
             },
             {
+              "name": "transfers",
+              "description": "Subgraph parity: top-level `Transfer` events. Equivalent to `events(where:{type:\"Transfer\"})`. Inspect typed fields via `asTransfer { ... }`.",
+              "args": [
+                {
+                  "name": "first",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "skip",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "where",
+                  "description": null,
+                  "type": {
+                    "kind": "INPUT_OBJECT",
+                    "name": "EventFilter"
+                  }
+                },
+                {
+                  "name": "orderBy",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "Event_orderBy"
+                  }
+                },
+                {
+                  "name": "orderDirection",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "OrderDirection"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Event"
+                    }
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "nameRegistereds",
+              "description": "Subgraph parity: top-level `NameRegistered` events. Inspect via `asNameRegistered { ... }`.",
+              "args": [
+                {
+                  "name": "first",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "skip",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "where",
+                  "description": null,
+                  "type": {
+                    "kind": "INPUT_OBJECT",
+                    "name": "EventFilter"
+                  }
+                },
+                {
+                  "name": "orderBy",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "Event_orderBy"
+                  }
+                },
+                {
+                  "name": "orderDirection",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "OrderDirection"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Event"
+                    }
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "nameReneweds",
+              "description": "Subgraph parity: top-level `NameRenewed` events. Inspect via `asNameRenewed { ... }`.",
+              "args": [
+                {
+                  "name": "first",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "skip",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "where",
+                  "description": null,
+                  "type": {
+                    "kind": "INPUT_OBJECT",
+                    "name": "EventFilter"
+                  }
+                },
+                {
+                  "name": "orderBy",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "Event_orderBy"
+                  }
+                },
+                {
+                  "name": "orderDirection",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "OrderDirection"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Event"
+                    }
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "textChangeds",
+              "description": "Subgraph parity: top-level `TextChanged` events. Inspect via `asTextChanged { ... }`.",
+              "args": [
+                {
+                  "name": "first",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "skip",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "where",
+                  "description": null,
+                  "type": {
+                    "kind": "INPUT_OBJECT",
+                    "name": "EventFilter"
+                  }
+                },
+                {
+                  "name": "orderBy",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "Event_orderBy"
+                  }
+                },
+                {
+                  "name": "orderDirection",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "OrderDirection"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Event"
+                    }
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "addressChangeds",
+              "description": "Subgraph parity: top-level `AddressChanged` events. Inspect via `asAddressChanged { ... }`.",
+              "args": [
+                {
+                  "name": "first",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "skip",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "where",
+                  "description": null,
+                  "type": {
+                    "kind": "INPUT_OBJECT",
+                    "name": "EventFilter"
+                  }
+                },
+                {
+                  "name": "orderBy",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "Event_orderBy"
+                  }
+                },
+                {
+                  "name": "orderDirection",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "OrderDirection"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Event"
+                    }
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "nameWrappeds",
+              "description": "Subgraph parity: top-level `NameWrapped` events. Inspect via `asNameWrapped { ... }`.",
+              "args": [
+                {
+                  "name": "first",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "skip",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "where",
+                  "description": null,
+                  "type": {
+                    "kind": "INPUT_OBJECT",
+                    "name": "EventFilter"
+                  }
+                },
+                {
+                  "name": "orderBy",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "Event_orderBy"
+                  }
+                },
+                {
+                  "name": "orderDirection",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "OrderDirection"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Event"
+                    }
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "nameUnwrappeds",
+              "description": "Subgraph parity: top-level `NameUnwrapped` events. Inspect via `asNameUnwrapped { ... }`.",
+              "args": [
+                {
+                  "name": "first",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "skip",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "where",
+                  "description": null,
+                  "type": {
+                    "kind": "INPUT_OBJECT",
+                    "name": "EventFilter"
+                  }
+                },
+                {
+                  "name": "orderBy",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "Event_orderBy"
+                  }
+                },
+                {
+                  "name": "orderDirection",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "OrderDirection"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Event"
+                    }
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "fusesSets",
+              "description": "Subgraph parity: top-level `FusesSet` events. Inspect via `asFusesSet { ... }`.",
+              "args": [
+                {
+                  "name": "first",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "skip",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "where",
+                  "description": null,
+                  "type": {
+                    "kind": "INPUT_OBJECT",
+                    "name": "EventFilter"
+                  }
+                },
+                {
+                  "name": "orderBy",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "Event_orderBy"
+                  }
+                },
+                {
+                  "name": "orderDirection",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "OrderDirection"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Event"
+                    }
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "expiryUpdateds",
+              "description": "Subgraph parity: top-level `ExpiryUpdated` events. Inspect via `asExpiryUpdated { ... }`.",
+              "args": [
+                {
+                  "name": "first",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "skip",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "where",
+                  "description": null,
+                  "type": {
+                    "kind": "INPUT_OBJECT",
+                    "name": "EventFilter"
+                  }
+                },
+                {
+                  "name": "orderBy",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "Event_orderBy"
+                  }
+                },
+                {
+                  "name": "orderDirection",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "OrderDirection"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Event"
+                    }
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "resolverUpdateds",
+              "description": "Subgraph parity: top-level `ResolverUpdated` events. Inspect via `asResolverUpdated { ... }`.",
+              "args": [
+                {
+                  "name": "first",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "skip",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "where",
+                  "description": null,
+                  "type": {
+                    "kind": "INPUT_OBJECT",
+                    "name": "EventFilter"
+                  }
+                },
+                {
+                  "name": "orderBy",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "Event_orderBy"
+                  }
+                },
+                {
+                  "name": "orderDirection",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "OrderDirection"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Event"
+                    }
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "labelRegistereds",
+              "description": "Subgraph parity: top-level `LabelRegistered` events. Inspect via `asLabelRegistered { ... }`.",
+              "args": [
+                {
+                  "name": "first",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "skip",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "where",
+                  "description": null,
+                  "type": {
+                    "kind": "INPUT_OBJECT",
+                    "name": "EventFilter"
+                  }
+                },
+                {
+                  "name": "orderBy",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "Event_orderBy"
+                  }
+                },
+                {
+                  "name": "orderDirection",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "OrderDirection"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Event"
+                    }
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "reverseClaimeds",
+              "description": "Subgraph parity: top-level `ReverseClaimed` events. Inspect via `asReverseClaimed { ... }`.",
+              "args": [
+                {
+                  "name": "first",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "skip",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "where",
+                  "description": null,
+                  "type": {
+                    "kind": "INPUT_OBJECT",
+                    "name": "EventFilter"
+                  }
+                },
+                {
+                  "name": "orderBy",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "Event_orderBy"
+                  }
+                },
+                {
+                  "name": "orderDirection",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "OrderDirection"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Event"
+                    }
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "registryTransfers",
+              "description": "Subgraph parity: top-level `RegistryTransfer` events. Inspect via `asRegistryTransfer { ... }`.",
+              "args": [
+                {
+                  "name": "first",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "skip",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "where",
+                  "description": null,
+                  "type": {
+                    "kind": "INPUT_OBJECT",
+                    "name": "EventFilter"
+                  }
+                },
+                {
+                  "name": "orderBy",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "Event_orderBy"
+                  }
+                },
+                {
+                  "name": "orderDirection",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "OrderDirection"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Event"
+                    }
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
               "name": "roles",
               "description": "Get EAC role assignments",
               "args": [
@@ -556,8 +1410,8 @@
               "deprecationReason": null
             },
             {
-              "name": "resolvers",
-              "description": "Get dedicated resolvers for an account",
+              "name": "resolversByOwner",
+              "description": "List resolver contracts owned by a specific account (admin view).\n  Hard-renamed from the previous `resolvers(account:)` in Phase 4a of the\n  parity migration so the bare `resolvers` field name is reserved for the\n  subgraph-style entity listing.",
               "args": [
                 {
                   "name": "account",
@@ -568,6 +1422,14 @@
                       "kind": "SCALAR",
                       "name": "String"
                     }
+                  }
+                },
+                {
+                  "name": "protocol",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "String"
                   }
                 }
               ],
@@ -580,6 +1442,67 @@
                     "ofType": {
                       "kind": "OBJECT",
                       "name": "ResolverDetail"
+                    }
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "resolvers",
+              "description": "List Resolver entities (subgraph parity). One entity per (protocol, address,\n  namehash) binding. Entity `id` is rendered `{protocol}-{address}-{namehash}`\n  (using `v1`/`v2` as the isolation prefix since both protocols share the chain).",
+              "args": [
+                {
+                  "name": "first",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "skip",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "where",
+                  "description": null,
+                  "type": {
+                    "kind": "INPUT_OBJECT",
+                    "name": "ResolverFilter"
+                  }
+                },
+                {
+                  "name": "orderBy",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "Resolver_orderBy"
+                  }
+                },
+                {
+                  "name": "orderDirection",
+                  "description": null,
+                  "type": {
+                    "kind": "ENUM",
+                    "name": "OrderDirection"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "Resolver"
                     }
                   }
                 }
@@ -724,6 +1647,275 @@
               },
               "isDeprecated": false,
               "deprecationReason": null
+            },
+            {
+              "name": "wrappedDomains",
+              "description": "Get V1 NameWrapper wrapped-domain records. Returns empty for V2 / unwrapped names. (Subgraph parity.)",
+              "args": [
+                {
+                  "name": "first",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "skip",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "where",
+                  "description": null,
+                  "type": {
+                    "kind": "INPUT_OBJECT",
+                    "name": "WrappedDomainFilter"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "WrappedDomain"
+                    }
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "_meta",
+              "description": "Indexer health / sync state (subgraph parity).",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "OBJECT",
+                  "name": "_Meta_"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "_Meta_",
+          "description": "Indexer health / sync state (subgraph parity).",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "block",
+              "description": "Current head block (highest block synced).",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "OBJECT",
+                  "name": "_Block_"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "hasIndexingErrors",
+              "description": "Whether the indexer has hit an indexing error and stalled.",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Boolean"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "deployment",
+              "description": "Deployment id / version string.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "_Block_",
+          "description": "Block descriptor returned inside `_Meta_`.",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "number",
+              "description": "Block number.",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "hash",
+              "description": "Block hash (hex), or null when unknown.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "timestamp",
+              "description": "Block timestamp (seconds), or null when unknown.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "WrappedDomain",
+          "description": "V1 NameWrapper wrapped-domain record. Returns null for unwrapped or V2 domains.",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "id",
+              "description": "Same as the wrapped Domain's namehash.",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "domain",
+              "description": "The wrapped Domain itself.",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "OBJECT",
+                  "name": "Domain"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "expiryDate",
+              "description": "Wrapper expiry timestamp.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "fuses",
+              "description": "Fuse bitmap (CANNOT_UNWRAP, PARENT_CANNOT_CONTROL, etc.).",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "owner",
+              "description": "Wrapped-token owner (EOA).",
+              "args": [],
+              "type": {
+                "kind": "OBJECT",
+                "name": "Account"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "name",
+              "description": "Name string.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "INPUT_OBJECT",
+          "name": "WrappedDomainFilter",
+          "description": "Filter criteria for querying wrapped domains.",
+          "inputFields": [
+            {
+              "name": "owner",
+              "description": "Filter by wrapped-domain owner address.",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "name",
+              "description": "Filter by domain name (exact).",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "expiryDate_gt",
+              "description": "Filter by expiry date greater than (Unix timestamp).",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "expiryDate_lt",
+              "description": "Filter by expiry date less than (Unix timestamp).",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
             }
           ]
         },
@@ -1263,11 +2455,25 @@
             },
             {
               "name": "ttl",
-              "description": "Time-to-live for DNS records",
+              "description": "ENS V1 Registry TTL (from `NewTTL` event). Null when never set or for V2 domains.",
               "args": [],
               "type": {
                 "kind": "SCALAR",
                 "name": "Int"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "isLegacy",
+              "description": "V1-only provenance: true when the row's most recent update came from the legacy pre-2020 ENS Registry (0x314159\u2026); false when it's been touched by the canonical post-2020 Registry (0x00\u20262e1e) or for V2 names.",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Boolean"
+                }
               },
               "isDeprecated": false,
               "deprecationReason": null
@@ -1281,6 +2487,67 @@
                 "ofType": {
                   "kind": "SCALAR",
                   "name": "Boolean"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "isWrapped",
+              "description": "Whether this name is currently wrapped in V1 NameWrapper. When true, the `owner` field returns the wrapped-token owner (EOA), NOT the NameWrapper contract address \u2014 this is a deliberate divergence from the ENS subgraph for client convenience. Subgraph clients that need the NameWrapper-as-owner shape should query the on-chain `ownerOf()` directly.",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Boolean"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "fuses",
+              "description": "Fuse bitmap from V1 NameWrapper (CANNOT_UNWRAP, PARENT_CANNOT_CONTROL, etc.). Null when not wrapped.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "wrapperExpiry",
+              "description": "Wrapper expiry timestamp from V1 NameWrapper. Null when not wrapped.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "gracePeriodEnd",
+              "description": "Grace-period end for V1 .eth 2LDs (expiry + 90 days). Now an explicit-name alias for `Domain.expiryDate` (which itself includes the grace period for V1 .eth 2LDs per subgraph parity). Null for non-V1 names, non-.eth 2LDs, or names without expiry.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "protocol",
+              "description": "ENS protocol version this domain belongs to (\"v1\" = legacy ENS, \"v2\" = ENSv2).",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
                 }
               },
               "isDeprecated": false,
@@ -1349,7 +2616,7 @@
             },
             {
               "name": "expiryDate",
-              "description": "Timestamp when domain expires",
+              "description": "Timestamp when domain expires. For V1 .eth 2LDs, includes the 90-day grace period (`BaseRegistrar.expires + 90d`) to match subgraph semantics. The bare on-chain `expires` is still available via the parallel `Registration.expiryDate`.",
               "args": [],
               "type": {
                 "kind": "SCALAR",
@@ -1455,7 +2722,21 @@
             },
             {
               "name": "subdomainsCount",
-              "description": "Count of direct subdomains (one level only)",
+              "description": "Count of direct subdomains (one level only). Filtered by `isReachable = 1` AND excluding fully-burned names (owner=0 AND resolver=0, mirroring subgraph's GC deletion criteria). DEPRECATED: prefer `subdomainCount` (subgraph-compatible name).",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "subdomainCount",
+              "description": "Subgraph-compatible alias for `subdomainsCount`. Returns the same value.",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
@@ -1477,6 +2758,28 @@
                   "kind": "SCALAR",
                   "name": "Int"
                 }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "wrappedDomain",
+              "description": "V1 NameWrapper wrapped-domain record. Null for V2 or unwrapped domains.",
+              "args": [],
+              "type": {
+                "kind": "OBJECT",
+                "name": "WrappedDomain"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "wrappedOwner",
+              "description": "Wrapped owner (V1 NameWrapper EOA). Null when not wrapped.",
+              "args": [],
+              "type": {
+                "kind": "OBJECT",
+                "name": "Account"
               },
               "isDeprecated": false,
               "deprecationReason": null
@@ -1559,6 +2862,238 @@
               },
               "isDeprecated": false,
               "deprecationReason": null
+            },
+            {
+              "name": "primaryName",
+              "description": "Reverse-resolved primary name for this address (V1 ReverseRegistrar + NameChanged path). Null if not claimed.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "wrappedDomains",
+              "description": "V1 NameWrapper wrapped-domain records owned by this account.",
+              "args": [
+                {
+                  "name": "first",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                },
+                {
+                  "name": "skip",
+                  "description": null,
+                  "type": {
+                    "kind": "SCALAR",
+                    "name": "Int"
+                  }
+                }
+              ],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "LIST",
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "ofType": {
+                      "kind": "OBJECT",
+                      "name": "WrappedDomain"
+                    }
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "seenV1",
+              "description": "True if this address has ever been observed acting under the V1 protocol (owner, registrant, role grantee, transfer recipient, or operator).",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Boolean"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "seenV2",
+              "description": "True if this address has ever been observed acting under the V2 protocol.",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Boolean"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "firstSeenBlock",
+              "description": "Block number of the earliest observation across protocols. Zero if the account row was populated by backfill (no first-observation block was recorded).",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "firstSeenTimestamp",
+              "description": "Unix timestamp (seconds) of the earliest observation across protocols. Zero if unknown.",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "INPUT_OBJECT",
+          "name": "AccountFilter",
+          "description": "Filter input for the `accounts` query (subgraph parity). All fields are optional;\nfields combine with AND semantics. `id`/`id_in` match exact addresses; `seenV1`/`seenV2`\nfilter by the per-protocol observation flag.",
+          "inputFields": [
+            {
+              "name": "id",
+              "description": "Exact address match.",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "id_in",
+              "description": "Address in list (up to 1000).",
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "SCALAR",
+                    "name": "String"
+                  }
+                }
+              }
+            },
+            {
+              "name": "seenV1",
+              "description": "Restrict to addresses observed under V1 (true) or never observed under V1 (false).",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Boolean"
+              }
+            },
+            {
+              "name": "seenV2",
+              "description": "Restrict to addresses observed under V2 (true) or never observed under V2 (false).",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Boolean"
+              }
+            }
+          ]
+        },
+        {
+          "kind": "ENUM",
+          "name": "Account_orderBy",
+          "description": "Sort key for the `accounts` query.",
+          "enumValues": [
+            {
+              "name": "id",
+              "description": "Lexicographic order on the 0x-prefixed address.",
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "firstSeenBlock",
+              "description": "First-observation block (the earlier of V1/V2 observations).",
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "INPUT_OBJECT",
+          "name": "ResolverFilter",
+          "description": "Filter input for the `resolvers` (entity-list) query (subgraph parity).\nFields combine with AND semantics. Use `address`/`address_in` to scope by\nresolver contract, `namehash` to scope by name, and `protocol` (`\"v1\"` or\n`\"v2\"`) for protocol isolation.",
+          "inputFields": [
+            {
+              "name": "address",
+              "description": "Exact match on resolver contract address (0x-hex, lowercase).",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "address_in",
+              "description": "Resolver contract address in list (up to 1000).",
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "SCALAR",
+                    "name": "String"
+                  }
+                }
+              }
+            },
+            {
+              "name": "namehash",
+              "description": "Exact match on the bound name's namehash.",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "protocol",
+              "description": "Restrict to a single protocol \u2014 `\"v1\"` or `\"v2\"`.",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            }
+          ]
+        },
+        {
+          "kind": "ENUM",
+          "name": "Resolver_orderBy",
+          "description": "Sort key for the `resolvers` (entity-list) query.",
+          "enumValues": [
+            {
+              "name": "address",
+              "description": "Lexicographic order on the resolver contract address.",
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "setBlock",
+              "description": "First-binding block (when this resolver was first bound to this name).",
+              "isDeprecated": false,
+              "deprecationReason": null
             }
           ]
         },
@@ -1570,13 +3105,27 @@
           "fields": [
             {
               "name": "coinType",
-              "description": "SLIP-44 coin type (e.g., 60 for ETH, 0 for BTC, 501 for SOL)",
+              "description": "SLIP-44 coin type (e.g., 60 for ETH, 0 for BTC, 501 for SOL). DEPRECATED: prefer `coinTypeBig` \u2014 ENSIP-11 L2 coin types (0x80000000 | chainId) exceed Int32 and will overflow. Kept for back-compat.",
               "args": [],
               "type": {
                 "kind": "NON_NULL",
                 "ofType": {
                   "kind": "SCALAR",
                   "name": "Int"
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "coinTypeBig",
+              "description": "Decimal-string coin type. Use this instead of `coinType` to safely represent ENSIP-11 L2 coin types that exceed Int32.",
+              "args": [],
+              "type": {
+                "kind": "NON_NULL",
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String"
                 }
               },
               "isDeprecated": false,
@@ -1773,6 +3322,34 @@
                     "name": "CoinAddress"
                   }
                 }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "coinTypes",
+              "description": "All coin types currently set on this resolver/name as decimal strings (ENSIP-11-safe). Parallel projection of `addresses.coinTypeBig`.",
+              "args": [],
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "SCALAR",
+                    "name": "String"
+                  }
+                }
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "domain",
+              "description": "Canonical Domain associated with this resolver (first by namehash). Null when this resolver isn't bound to any name. Subgraph parity.",
+              "args": [],
+              "type": {
+                "kind": "OBJECT",
+                "name": "Domain"
               },
               "isDeprecated": false,
               "deprecationReason": null
@@ -2017,6 +3594,693 @@
               },
               "isDeprecated": false,
               "deprecationReason": null
+            },
+            {
+              "name": "cost",
+              "description": "Total user-paid registration cost (base + premium) in wei, decimal-encoded. Returned as String because u256 wei values exceed GraphQL Int (Int32). Null when the Controller event has not been observed for this registration.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "baseCost",
+              "description": "Base rent cost in wei, decimal-encoded u256 (String for the same Int32 reason as `cost`). Null when the Controller event has not been observed.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "premium",
+              "description": "Auction premium portion in wei, decimal-encoded u256 (String, see `cost`). \\\"0\\\" for legacy 5-arg LegacyEthRegistrarController (no auction-premium semantics) or null when the Controller event has not been observed.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "labelName",
+              "description": "Human-readable label from the Controller event preimage (e.g., 'vitalik'). Null when the Controller event has not been observed or the label preimage was lost.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "referrer",
+              "description": "Referrer bytes32 hex from the 7-arg UnwrappedEthRegistrarController (V1) or V2 ETHRegistrar.NameRegistered. Null for older Controller variants or when no Controller event has been observed.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "TransferData",
+          "description": "Typed payload for `Transfer` events. Spans V1 BaseRegistrar ERC721 (`tokenId` numeric), V1 NameWrapper ERC1155 (`id` is the wrapped namehash, with `operator`/`value`), and V2 registry transfers.",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "from",
+              "description": "Sender address.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "to",
+              "description": "Recipient address.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "id",
+              "description": "Token id: ERC721 tokenId as a decimal string, or wrapper/V2 token id (namehash for NameWrapper). Stringified to preserve u256 range.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "value",
+              "description": "ERC1155 transfer amount (always 1 for ENS NameWrapper).",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "operator",
+              "description": "ERC1155 operator address (V1 NameWrapper / V2 only).",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "NameRegisteredData",
+          "description": "Typed payload for `NameRegistered` events (V1 BaseRegistrar + ETHController variants).",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "name",
+              "description": "Full ENS name registered (e.g., `vitalik.eth`).",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "label",
+              "description": "Hex labelhash (controller variant) or token id (BaseRegistrar-only fallback).",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "owner",
+              "description": "Registrant address.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "expires",
+              "description": "Absolute expiry timestamp (seconds).",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "baseCost",
+              "description": "Base price paid for the name, in wei (decimal string).",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "premium",
+              "description": "Premium component for premium-priced names (decimal string).",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "cost",
+              "description": "Total cost = baseCost + premium (decimal string).",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "referrer",
+              "description": "Referrer bytes32 (from the 7-arg UnwrappedEthRegistrarController variant).",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "NameRenewedData",
+          "description": "Typed payload for `NameRenewed` events.",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "id",
+              "description": "Token id (decimal string).",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "expires",
+              "description": "New absolute expiry timestamp (seconds).",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "NameWrappedData",
+          "description": "Typed payload for `NameWrapped` events (V1 NameWrapper). NOTE: V1 currently stores NameWrapper logs as Transfer events; this accessor exists for forward compatibility when a dedicated NameWrapped event type is added.",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "node",
+              "description": "Namehash of the wrapped name.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "owner",
+              "description": "Wrapped name owner.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "fuses",
+              "description": "Fuses bitmap (uint32).",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "expiry",
+              "description": "Wrapper expiry timestamp.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "NameUnwrappedData",
+          "description": "Typed payload for `NameUnwrapped` events. (See NameWrappedData for the V1 storage caveat.)",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "node",
+              "description": "Namehash of the unwrapped name.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "owner",
+              "description": "New owner after unwrap.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "FusesSetData",
+          "description": "Typed payload for `FusesSet` events from V1 NameWrapper.",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "node",
+              "description": "Namehash whose fuses changed.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "fuses",
+              "description": "New fuse bitmap (CANNOT_UNWRAP, PARENT_CANNOT_CONTROL, etc.).",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "ReverseClaimedData",
+          "description": "Typed payload for `ReverseClaimed` events from V1 ReverseRegistrar.",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "address",
+              "description": "Address that claimed reverse resolution.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "node",
+              "description": "Namehash of `<addr>.addr.reverse`.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "RegistryTransferData",
+          "description": "Typed payload for `RegistryTransfer` events. Emitted by V1 ENS Registry `setOwner` \u2014 distinct from ERC721/ERC1155 token transfers.",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "node",
+              "description": "Namehash whose owner changed.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "owner",
+              "description": "New owner address.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "TextChangedData",
+          "description": "Typed payload for `TextChanged` events.",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "namehash",
+              "description": "Namehash that the resolver record applies to.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "resolver",
+              "description": "Resolver contract address.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "key",
+              "description": "Text record key.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "value",
+              "description": "Text record value (may be empty when cleared).",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "AddressChangedData",
+          "description": "Typed payload for `AddressChanged` events (multi-coin AddressChanged signature).",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "namehash",
+              "description": "Namehash that the address record applies to.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "resolver",
+              "description": "Resolver contract address.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "coinType",
+              "description": "ENSIP-9 coin type.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "address",
+              "description": "Address value (hex for ETH, bytes hex for other chains).",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "ExpiryUpdatedData",
+          "description": "Typed payload for `ExpiryUpdated` events (V1 NameWrapper ExpiryExtended + V2 registry expiry updates).",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "node",
+              "description": "Namehash of the affected node (V1 NameWrapper variant).",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "tokenId",
+              "description": "Token id (V2 variant; decimal string).",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "expiry",
+              "description": "New expiry timestamp (V1 variant: `expiry`; V2 variant: `newExpiry`). Reported here as a unified value.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "ResolverUpdatedData",
+          "description": "Typed payload for `ResolverUpdated` events (V2 registry).",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "tokenId",
+              "description": "Token id (V2 ResolverUpdated; decimal string).",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "resolver",
+              "description": "New resolver contract address.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "sender",
+              "description": "Sender that performed the update.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            }
+          ]
+        },
+        {
+          "kind": "OBJECT",
+          "name": "LabelRegisteredData",
+          "description": "Typed payload for `LabelRegistered` events (V2 registry).",
+          "interfaces": [],
+          "fields": [
+            {
+              "name": "name",
+              "description": "Full ENS name.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "tokenId",
+              "description": "Token id (decimal string).",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "canonicalId",
+              "description": "Canonical token id (post truncation; decimal string).",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "owner",
+              "description": "Registrant address.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "expiry",
+              "description": "Expiry timestamp.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "sender",
+              "description": "Address that initiated the registration.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "registry",
+              "description": "Registry contract that emitted the event.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             }
           ]
         },
@@ -2167,6 +4431,171 @@
               },
               "isDeprecated": false,
               "deprecationReason": null
+            },
+            {
+              "name": "key",
+              "description": "Text record key, populated when `type == \"TextChanged\"` (subgraph parity). Null for other event types.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "value",
+              "description": "Text record value, populated when `type == \"TextChanged\"` (subgraph parity). Null for other event types.",
+              "args": [],
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "asTransfer",
+              "description": "Typed view of `data` when `type` is `Transfer`. Null otherwise.",
+              "args": [],
+              "type": {
+                "kind": "OBJECT",
+                "name": "TransferData"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "asNameRegistered",
+              "description": "Typed view of `data` when `type` is `NameRegistered`. Null otherwise.",
+              "args": [],
+              "type": {
+                "kind": "OBJECT",
+                "name": "NameRegisteredData"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "asNameRenewed",
+              "description": "Typed view of `data` when `type` is `NameRenewed`. Null otherwise.",
+              "args": [],
+              "type": {
+                "kind": "OBJECT",
+                "name": "NameRenewedData"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "asNameWrapped",
+              "description": "Typed view of `data` when `type` is `NameWrapped`. Null otherwise.",
+              "args": [],
+              "type": {
+                "kind": "OBJECT",
+                "name": "NameWrappedData"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "asNameUnwrapped",
+              "description": "Typed view of `data` when `type` is `NameUnwrapped`. Null otherwise.",
+              "args": [],
+              "type": {
+                "kind": "OBJECT",
+                "name": "NameUnwrappedData"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "asFusesSet",
+              "description": "Typed view of `data` when `type` is `FusesSet`. Null otherwise.",
+              "args": [],
+              "type": {
+                "kind": "OBJECT",
+                "name": "FusesSetData"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "asReverseClaimed",
+              "description": "Typed view of `data` when `type` is `ReverseClaimed`. Null otherwise.",
+              "args": [],
+              "type": {
+                "kind": "OBJECT",
+                "name": "ReverseClaimedData"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "asRegistryTransfer",
+              "description": "Typed view of `data` when `type` is `RegistryTransfer` (V1 ENS Registry setOwner). Null otherwise.",
+              "args": [],
+              "type": {
+                "kind": "OBJECT",
+                "name": "RegistryTransferData"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "asTextChanged",
+              "description": "Typed view of `data` when `type` is `TextChanged`. Null otherwise.",
+              "args": [],
+              "type": {
+                "kind": "OBJECT",
+                "name": "TextChangedData"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "asAddressChanged",
+              "description": "Typed view of `data` when `type` is `AddressChanged`. Null otherwise.",
+              "args": [],
+              "type": {
+                "kind": "OBJECT",
+                "name": "AddressChangedData"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "asExpiryUpdated",
+              "description": "Typed view of `data` when `type` is `ExpiryUpdated`. Null otherwise.",
+              "args": [],
+              "type": {
+                "kind": "OBJECT",
+                "name": "ExpiryUpdatedData"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "asResolverUpdated",
+              "description": "Typed view of `data` when `type` is `ResolverUpdated`. Null otherwise.",
+              "args": [],
+              "type": {
+                "kind": "OBJECT",
+                "name": "ResolverUpdatedData"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
+            },
+            {
+              "name": "asLabelRegistered",
+              "description": "Typed view of `data` when `type` is `LabelRegistered`. Null otherwise.",
+              "args": [],
+              "type": {
+                "kind": "OBJECT",
+                "name": "LabelRegisteredData"
+              },
+              "isDeprecated": false,
+              "deprecationReason": null
             }
           ]
         },
@@ -2198,6 +4627,28 @@
               }
             },
             {
+              "name": "name_not",
+              "description": "Negated exact-name match (subgraph parity).",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "name_not_in",
+              "description": "Negated name-in-list (subgraph parity, up to 1000 names).",
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "SCALAR",
+                    "name": "String"
+                  }
+                }
+              }
+            },
+            {
               "name": "name_contains",
               "description": "Partial name match (contains)",
               "type": {
@@ -2214,8 +4665,24 @@
               }
             },
             {
+              "name": "name_not_contains",
+              "description": "Negated partial name match (subgraph parity).",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
               "name": "name_starts_with",
               "description": "Name starts with prefix",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "name_starts_with_nocase",
+              "description": "Case-insensitive prefix match (subgraph parity).",
               "type": {
                 "kind": "SCALAR",
                 "name": "String"
@@ -2230,8 +4697,124 @@
               }
             },
             {
+              "name": "name_ends_with_nocase",
+              "description": "Case-insensitive suffix match (subgraph parity).",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "labelName",
+              "description": "Exact match on leftmost label (subgraph parity).",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "labelName_not",
+              "description": "Negated exact-label match.",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "labelName_in",
+              "description": "Label in list (up to 1000 labels).",
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "SCALAR",
+                    "name": "String"
+                  }
+                }
+              }
+            },
+            {
+              "name": "labelName_not_in",
+              "description": "Negated label-in-list (up to 1000 labels).",
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "SCALAR",
+                    "name": "String"
+                  }
+                }
+              }
+            },
+            {
+              "name": "labelName_contains",
+              "description": "Partial label match (contains).",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "labelName_contains_nocase",
+              "description": "Case-insensitive partial label match.",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "labelName_not_contains",
+              "description": "Negated partial label match.",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "labelName_starts_with",
+              "description": "Label starts with prefix.",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "labelName_starts_with_nocase",
+              "description": "Case-insensitive label-prefix match.",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "labelName_ends_with",
+              "description": "Label ends with suffix.",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "labelName_ends_with_nocase",
+              "description": "Case-insensitive label-suffix match.",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
               "name": "owner",
               "description": "Filter by owner address",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "owner_not",
+              "description": "Negated owner address match (subgraph parity).",
               "type": {
                 "kind": "SCALAR",
                 "name": "String"
@@ -2249,6 +4832,28 @@
                     "name": "String"
                   }
                 }
+              }
+            },
+            {
+              "name": "owner_not_in",
+              "description": "Negated owner-in-list (subgraph parity).",
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "SCALAR",
+                    "name": "String"
+                  }
+                }
+              }
+            },
+            {
+              "name": "owner_",
+              "description": "Nested-relation filter on owner Account (subgraph parity). E.g. `{owner_: {id_in: [...]}}`.",
+              "type": {
+                "kind": "INPUT_OBJECT",
+                "name": "AccountFilter"
               }
             },
             {
@@ -2324,6 +4929,38 @@
               }
             },
             {
+              "name": "expiryDate_gt",
+              "description": "Subgraph-compatible alias for `expiry_gt`.",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "expiryDate_gte",
+              "description": "Subgraph-compatible alias for `expiry_gte`.",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "expiryDate_lt",
+              "description": "Subgraph-compatible alias for `expiry_lt`.",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
+              "name": "expiryDate_lte",
+              "description": "Subgraph-compatible alias for `expiry_lte`.",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int"
+              }
+            },
+            {
               "name": "isMigrated",
               "description": "Filter by migration status",
               "type": {
@@ -2337,6 +4974,35 @@
               "type": {
                 "kind": "SCALAR",
                 "name": "Boolean"
+              }
+            }
+          ]
+        },
+        {
+          "kind": "INPUT_OBJECT",
+          "name": "AccountFilter",
+          "description": "Nested-relation filter on Account (subgraph parity). Used inside `DomainFilter.owner_`.",
+          "inputFields": [
+            {
+              "name": "id",
+              "description": "Match account by exact id (address).",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "id_in",
+              "description": "Match account by id in list.",
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "SCALAR",
+                    "name": "String"
+                  }
+                }
               }
             }
           ]
@@ -2426,6 +5092,28 @@
             {
               "name": "type_in",
               "description": "Filter by event type in list",
+              "type": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": {
+                    "kind": "SCALAR",
+                    "name": "String"
+                  }
+                }
+              }
+            },
+            {
+              "name": "type_not",
+              "description": "Negated event-type match (subgraph parity).",
+              "type": {
+                "kind": "SCALAR",
+                "name": "String"
+              }
+            },
+            {
+              "name": "type_not_in",
+              "description": "Negated event-type-in-list (subgraph parity).",
               "type": {
                 "kind": "LIST",
                 "ofType": {

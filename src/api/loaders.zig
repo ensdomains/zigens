@@ -22,15 +22,45 @@ pub const CacheStats = dataloader.CacheStats;
 // add fields here, keyed appropriately to avoid the legacy bug.
 pub const LoaderContext = struct {
     allocator: std.mem.Allocator,
+    /// Per-request memoization for Account rows. The four `seenV1` / `seenV2` /
+    /// `firstSeenBlock` / `firstSeenTimestamp` field handlers each fetch the
+    /// same row; in list queries that pull all four, the per-row count drops
+    /// from 4 → 1 with this cache. Keyed by 0x-prefixed lowercase address;
+    /// the entry value is the loaded row (or null sentinel for "looked up,
+    /// no such account"). All allocations live on the request arena and are
+    /// freed when the request ends.
+    account_cache: std.StringHashMap(?db.Account),
 
     pub fn init(allocator: std.mem.Allocator, database: *db.Database) !*LoaderContext {
         _ = database;
         const ctx = try allocator.create(LoaderContext);
-        ctx.* = .{ .allocator = allocator };
+        ctx.* = .{
+            .allocator = allocator,
+            .account_cache = std.StringHashMap(?db.Account).init(allocator),
+        };
         return ctx;
     }
 
+    /// Returns the cached row for `address`, fetching from the DB on first miss.
+    /// The returned pointer is owned by the LoaderContext (arena-scoped); callers
+    /// must not free it.
+    pub fn getAccountCached(self: *LoaderContext, database: *db.Database, address: []const u8) !?*const db.Account {
+        if (self.account_cache.getPtr(address)) |existing| {
+            if (existing.*) |*row| return row;
+            return null;
+        }
+        const fetched = try database.getAccount(address);
+        // Dupe the key onto the arena so the cache key outlives the caller's `address`.
+        const key_owned = try self.allocator.dupe(u8, address);
+        try self.account_cache.put(key_owned, fetched);
+        if (self.account_cache.getPtr(key_owned)) |slot| {
+            if (slot.*) |*row| return row;
+        }
+        return null;
+    }
+
     pub fn deinit(self: *LoaderContext) void {
+        self.account_cache.deinit();
         self.allocator.destroy(self);
     }
 };

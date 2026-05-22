@@ -117,6 +117,7 @@ pub fn main() !void {
     // Initialize database
     var database = try db.Database.init(allocator, cfg.database_path);
     defer database.deinit();
+    database.setChainId(cfg.network.chainId());
 
     std.log.info("Database initialized at: {s}", .{cfg.database_path});
 

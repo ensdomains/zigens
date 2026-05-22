@@ -185,9 +185,11 @@ pub fn indexV1EventsChunked(
 pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64, to_block: u64) !void {
     if (protocol != .v1) return; // V1 events only exist on mainnet L1
 
-    // Index Temporary Registrar events FIRST (for pre-migration blocks only)
-    // This function internally checks block ranges and only indexes before block 9380410
-    try indexTempRegistrarEvents(self, protocol, client, from_block, to_block);
+    // Index Old ENS Registry pre-migration events FIRST (only for blocks before
+    // the V1 Permanent Registrar migration). The Temporary Registrar (auction)
+    // contract has been intentionally removed — it was 2017-2019 only and its
+    // tables were not used by any client.
+    try indexPreMigrationRegistryEvents(self, protocol, client, from_block, to_block);
 
     // Predictive adaptive chunk sizing
     const MIN_CHUNK_SIZE: u64 = constants.RpcBatching.min_chunk_size;
@@ -539,17 +541,23 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
     }
 }
 
-/// Index pre-migration events: Temporary Registrar + Old ENS Registry in a single batched pass.
-/// Temporary Registrar: AuctionStarted, NewBid, BidRevealed, HashRegistered, HashReleased, HashInvalidated
+/// Index pre-migration events: Old ENS Registry only, in a single batched pass.
 /// Old ENS Registry (0x314159...): NewOwner, Transfer, NewResolver, NewTTL
-/// Active from May 2017 (block 3327417) to May 2019 (block 9380410)
-pub fn indexTempRegistrarEvents(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64, to_block: u64) !void {
-    if (protocol != .v1) return; // Temporary Registrar only exists on mainnet L1
+/// Active from May 2017 (block 3327417) to May 2019 (block ~9380410).
+///
+/// Note: the 2017-2019 Temporary Registrar (auction) contract used to be indexed
+/// here as well. It has been removed (audit finding #8): the auction handlers had
+/// data-corruption bugs and no client consumed the auction tables. The schema
+/// tables (`temp_auctions`, `temp_bids`, `temp_bid_reveals`, `temp_invalidations`)
+/// remain in `schema/008_temporary_registrar.sql` so existing DBs don't error on
+/// startup, but they are no longer populated.
+pub fn indexPreMigrationRegistryEvents(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64, to_block: u64) !void {
+    if (protocol != .v1) return; // Old ENS Registry only exists on mainnet L1
 
     // V1 Permanent Registrar migration block (from contract config)
     const v1_migration_block = self.config.v1_contracts.v1_migration_block;
-    if (v1_migration_block == 0) return; // Testnets don't have temp registrar
-    if (from_block >= v1_migration_block) return; // No temp registrar events after migration
+    if (v1_migration_block == 0) return; // Testnets don't have a pre-migration era
+    if (from_block >= v1_migration_block) return; // No pre-migration events after migration
 
     // Adjust to_block to not exceed migration block
     const adjusted_to_block = if (to_block >= v1_migration_block) v1_migration_block - 1 else to_block;
@@ -557,8 +565,8 @@ pub fn indexTempRegistrarEvents(self: *Indexer, protocol: models.Protocol, clien
     // Use old ENS registry for pre-migration period (new registry didn't exist yet)
     const old_registry = self.config.v1_contracts.old_ens_registry;
 
-    // Combine both contracts into a single batched pass
-    const total_event_configs = Indexer.TEMP_REGISTRAR_EVENTS.len + Indexer.V1_REGISTRY_EVENTS.len;
+    // Single contract, batched per event topic
+    const total_event_configs = Indexer.V1_REGISTRY_EVENTS.len;
 
     const ContractEventPair = struct {
         address: Address,
@@ -568,16 +576,6 @@ pub fn indexTempRegistrarEvents(self: *Indexer, protocol: models.Protocol, clien
     var pairs: [total_event_configs]ContractEventPair = undefined;
     var idx: usize = 0;
 
-    // Temporary Registrar events
-    for (Indexer.TEMP_REGISTRAR_EVENTS) |event_cfg| {
-        pairs[idx] = .{
-            .address = self.config.v1_contracts.temporary_registrar,
-            .config = event_cfg,
-        };
-        idx += 1;
-    }
-
-    // Old ENS Registry events
     for (Indexer.V1_REGISTRY_EVENTS) |event_cfg| {
         pairs[idx] = .{
             .address = old_registry,
@@ -661,7 +659,7 @@ pub fn indexTempRegistrarEvents(self: *Indexer, protocol: models.Protocol, clien
                 total_events += logs.len;
 
                 if (logs.len > 0) {
-                    const contract_name = if (i < Indexer.TEMP_REGISTRAR_EVENTS.len) "Temporary Registrar" else "Old ENS Registry";
+                    const contract_name = "Old ENS Registry";
                     std.log.info("  Found {d} {s} {s} event{s}", .{
                         logs.len,
                         contract_name,

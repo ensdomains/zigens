@@ -61,6 +61,116 @@ pub fn insertRegistration(
     try q.exec();
 }
 
+/// Update a registration row's expiry column on renewal.
+///
+/// Subgraph parity (`Registrar.ts:271`): NameRenewed updates the Registration's
+/// expiryDate. Without this, `registrations.expiry` would persist the
+/// originally-registered value forever, drifting from `names.expiry` after the
+/// first renewal.
+///
+/// Silently a no-op if no matching row exists (renewal observed before the
+/// canonical registrar row — should not happen for V1 in practice, but
+/// harmless if it does).
+pub fn updateRegistrationExpiry(
+    db: *Database,
+    protocol: models.Protocol,
+    namehash: Hash,
+    new_expiry: i64,
+) !void {
+    var q = try db_module.Query.initCached(db,
+        \\UPDATE registrations SET expiry = ? WHERE protocol = ? AND namehash = ?
+    );
+    defer q.deinit();
+
+    try q.bindInt64(new_expiry);
+    try q.bindTextStatic(protocol.toString());
+    try q.bindHash(namehash);
+    try q.exec();
+}
+
+/// Update a registration row's registrant column on ERC721 secondary transfer.
+///
+/// Subgraph parity (`Registrar.ts:287, 313-327`): Transfer updates the
+/// Registration's registrantId. Without this, `registrations.registrant` stays
+/// pinned to the original minter even after the token changes hands.
+/// On burn (to == Address.zero), the subgraph still updates registrantId to
+/// the zero address — we mirror that behavior.
+pub fn updateRegistrationRegistrant(
+    db: *Database,
+    protocol: models.Protocol,
+    namehash: Hash,
+    new_registrant: Address,
+) !void {
+    var q = try db_module.Query.initCached(db,
+        \\UPDATE registrations SET registrant = LOWER(?) WHERE protocol = ? AND namehash = ?
+    );
+    defer q.deinit();
+
+    try q.bindAddress(new_registrant);
+    try q.bindTextStatic(protocol.toString());
+    try q.bindHash(namehash);
+    try q.exec();
+}
+
+/// Enrich an existing registrations row with controller-side economics data.
+///
+/// The canonical row is written by BaseRegistrar.NameRegistered (V1) or
+/// PermissionedRegistry.LabelRegistered (V2), neither of which carries cost,
+/// premium, the human-readable label preimage, or referrer — those live in
+/// the matching ETH Controller event that fires shortly after in the same tx.
+/// This UPDATE backfills those columns once the controller event arrives.
+///
+/// Silently a no-op if no row matches (controller event seen before
+/// registrar event — unexpected per typical V1/V2 ordering but harmless;
+/// debug-logged so it's still observable).
+pub fn updateRegistrationEconomics(
+    db: *Database,
+    protocol: models.Protocol,
+    namehash: Hash,
+    label_name: []const u8,
+    base_cost: u256,
+    premium: u256,
+    referrer: ?Hash,
+) !void {
+    const sql =
+        \\UPDATE registrations
+        \\SET base_cost = ?, premium = ?, label_name = ?, referrer = ?
+        \\WHERE protocol = ? AND namehash = ?
+    ;
+
+    // u256 decimal strings. 78 digits max (2^256 - 1), plus terminator
+    // headroom; allocate the canonical 80-byte buffers to keep this stack-only.
+    var base_cost_buf: [80]u8 = undefined;
+    const base_cost_str = try std.fmt.bufPrint(&base_cost_buf, "{d}", .{base_cost});
+    var premium_buf: [80]u8 = undefined;
+    const premium_str = try std.fmt.bufPrint(&premium_buf, "{d}", .{premium});
+
+    var q = try db_module.Query.initCached(db, sql);
+    defer q.deinit();
+
+    try q.bindText(base_cost_str);
+    try q.bindText(premium_str);
+    try q.bindText(label_name);
+    if (referrer) |r| {
+        try q.bindHash(r);
+    } else {
+        try q.bindNull();
+    }
+    try q.bindTextStatic(protocol.toString());
+    try q.bindHash(namehash);
+
+    try q.exec();
+
+    if (q.changes() == 0) {
+        var nh_buf: [66]u8 = undefined;
+        const nh_hex = namehash.toHexBuf(&nh_buf);
+        std.log.debug(
+            "updateRegistrationEconomics: no row matched protocol={s} namehash={s} (registrar event not yet seen?)",
+            .{ protocol.toString(), nh_hex },
+        );
+    }
+}
+
 // ============================================================================
 // REGISTRATION QUERIES
 // ============================================================================
@@ -159,7 +269,11 @@ fn rowToEvent(allocator: std.mem.Allocator, q: *db_module.Query) !models.Event {
     // Column order matches the SELECT in `getRegistrations` and `cursorBlockOf`.
     //  0: protocol, 1: namehash, 2: label, 3: parent_name, 4: registrant,
     //  5: registered_at, 6: expiry, 7: block_number, 8: transaction_hash,
-    //  9: log_index, 10: event_type
+    //  9: log_index, 10: event_type,
+    // 11: base_cost (TEXT u256 decimal, nullable),
+    // 12: premium   (TEXT u256 decimal, nullable),
+    // 13: label_name (TEXT, nullable),
+    // 14: referrer  (TEXT 0x-prefixed hex, nullable)
     const protocol_str = q.getTextSlice(0) orelse return error.RegistrationRowMissingProtocol;
     const namehash_str = q.getTextSlice(1) orelse return error.RegistrationRowMissingNamehash;
     const label = q.getTextSlice(2) orelse "";
@@ -192,6 +306,16 @@ fn rowToEvent(allocator: std.mem.Allocator, q: *db_module.Query) !models.Event {
         try std.fmt.allocPrint(allocator, "{{\"name\":\"{s}\",\"owner\":\"{s}\"}}", .{ name, registrant });
     errdefer allocator.free(data);
 
+    // Controller-side economics. May be NULL (controller event not yet observed).
+    const base_cost_owned: ?[]const u8 = if (try q.getText(11)) |s| s else null;
+    errdefer if (base_cost_owned) |s| allocator.free(s);
+    const premium_owned: ?[]const u8 = if (try q.getText(12)) |s| s else null;
+    errdefer if (premium_owned) |s| allocator.free(s);
+    const label_name_owned: ?[]const u8 = if (try q.getText(13)) |s| s else null;
+    errdefer if (label_name_owned) |s| allocator.free(s);
+    const referrer_owned: ?[]const u8 = if (try q.getText(14)) |s| s else null;
+    errdefer if (referrer_owned) |s| allocator.free(s);
+
     return models.Event{
         .event_type = event_type,
         .protocol = protocol,
@@ -203,6 +327,10 @@ fn rowToEvent(allocator: std.mem.Allocator, q: *db_module.Query) !models.Event {
         .namehash = namehash,
         .data = data,
         .timestamp = registered_at,
+        .base_cost = base_cost_owned,
+        .premium = premium_owned,
+        .label_name = label_name_owned,
+        .referrer = referrer_owned,
     };
 }
 
@@ -210,9 +338,17 @@ fn rowToEvent(allocator: std.mem.Allocator, q: *db_module.Query) !models.Event {
 /// Returns synthetic Event values for resolver/builder compat. Caller owns the
 /// slice and each Event (deinit each).
 pub fn getRegistrations(database: *Database, filter: RegistrationFilterOptions) ![]models.Event {
+    // `label_name` is enriched lazily by Controller-event enrichment
+    // (`updateRegistrationEconomics`). For registrations that don't go through
+    // a Controller path — notably V2 PermissionedRegistry `LabelRegistered`
+    // events that carry the human label inline — the `label_name` column stays
+    // null. Fall back to `label` so `Registration.labelName` is populated for
+    // every registration regardless of which contract emitted it. Subgraph
+    // parity expects a non-null human label.
     const base_sql =
         "SELECT protocol, namehash, label, parent_name, registrant, registered_at, " ++
-        "expiry, block_number, transaction_hash, log_index, event_type FROM registrations";
+        "expiry, block_number, transaction_hash, log_index, event_type, " ++
+        "base_cost, premium, COALESCE(label_name, label) AS label_name, referrer FROM registrations";
 
     var sql_buf: std.ArrayList(u8) = .{};
     defer sql_buf.deinit(database.allocator);

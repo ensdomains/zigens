@@ -246,6 +246,96 @@ pub fn resolveRolesConnection(ctx: parser.ExecutionContext, field: *const parser
     return parser.FieldResult{ .json = try allocator.dupe(u8, json.items) };
 }
 
+fn mapResolverEntityOrderBy(order_by: ?[]const u8) db.ResolverEntitySortField {
+    if (order_by) |s| {
+        if (std.mem.eql(u8, s, "setBlock")) return .set_block;
+    }
+    return .address;
+}
+
+/// Resolver for the new subgraph-style `resolvers(first, skip, where, orderBy)`
+/// list query. Reads from the `resolvers` table (one row per (protocol, address,
+/// namehash) binding). IDs are emitted as `{protocol}-{address}-{namehash}` via
+/// the standard `buildResolverJson` builder, which now takes a protocol arg.
+pub fn resolveResolverEntities(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
+    const database: *db.Database = @ptrCast(@alignCast(ctx.database));
+    const allocator = ctx.allocator;
+
+    const page = try common.parsePagination(field, 100);
+    const first = page.first;
+    const skip = page.skip;
+
+    var filter_address: ?[]const u8 = null;
+    var filter_address_in: ?[][]const u8 = null;
+    var filter_namehash: ?[]const u8 = null;
+    var filter_protocol: ?[]const u8 = null;
+
+    if (common.getObjectArg(field, "where")) |where_args| {
+        for (where_args) |a| {
+            if (std.mem.eql(u8, a.name, "address_in") and a.value == .list) {
+                var lst: std.ArrayList([]const u8) = .{};
+                defer lst.deinit(allocator);
+                for (a.value.list) |item| {
+                    if (item == .string) try lst.append(allocator, item.string);
+                }
+                filter_address_in = try lst.toOwnedSlice(allocator);
+                continue;
+            }
+            // Unknown args caught at parse time by schema_validator.zig.
+            _ = common.matchStringArg(a, "address", &filter_address) or
+                common.matchStringArg(a, "namehash", &filter_namehash) or
+                common.matchStringArg(a, "protocol", &filter_protocol);
+        }
+    }
+    defer if (filter_address_in) |a| allocator.free(a);
+
+    const order_by = parser.getStringArg(field, "orderBy", null);
+    const sort_field = mapResolverEntityOrderBy(order_by);
+    const order_dir = common.parseOrderDirection(field, db.OrderDir, .asc);
+
+    const filters = db.ResolverEntityFilters{
+        .address = filter_address,
+        .address_in = filter_address_in,
+        .namehash = filter_namehash,
+        .protocol = filter_protocol,
+    };
+
+    const entities = try database.getFilteredResolverEntities(filters, @intCast(skip), first, order_dir, sort_field);
+    defer {
+        for (entities) |*e| {
+            var m = e.*;
+            m.deinit(allocator);
+        }
+        allocator.free(entities);
+    }
+
+    var json: std.ArrayList(u8) = .{};
+    defer json.deinit(allocator);
+    try json.appendSlice(allocator, "[");
+    for (entities, 0..) |row, i| {
+        if (i > 0) try json.appendSlice(allocator, ",");
+        const resolver_addr = Address.fromHex(row.address) catch continue;
+        const namehash_val = Hash.fromHex(row.namehash) catch continue;
+        const protocol_val: models.Protocol = if (std.mem.eql(u8, row.protocol, "v2")) .v2 else .v1;
+        const entity_json = try builders.buildResolverJson(
+            resolver_addr,
+            namehash_val,
+            protocol_val,
+            field.selections,
+            .{
+                .database = database,
+                .depth = 0,
+                .allocator = allocator,
+                .loaders = ctx.loaders,
+            },
+        );
+        defer allocator.free(entity_json);
+        try json.appendSlice(allocator, entity_json);
+    }
+    try json.appendSlice(allocator, "]");
+    return parser.FieldResult{ .json = try allocator.dupe(u8, json.items) };
+}
+
 /// Resolver for resolvers query
 pub fn resolveResolvers(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
     const allocator = ctx.allocator;
@@ -1573,4 +1663,123 @@ fn handleResolverApprovalField(ctx: *anyopaque, output_key: []const u8, field_na
         return true;
     }
     return false;
+}
+
+// ============================================================================
+// SUBGRAPH-PARITY ADDITIONS
+// ============================================================================
+
+/// Top-level `wrappedDomains(first, skip, where)` resolver. Filter shape mirrors
+/// the subgraph WrappedDomain entity. Returns an empty array when no wrapped
+/// rows match — never null.
+pub fn resolveWrappedDomains(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
+    const allocator = ctx.allocator;
+    const database: *db.Database = @ptrCast(@alignCast(ctx.database));
+
+    const page = try common.parsePagination(field, 100);
+
+    var filter_owner: ?Address = null;
+    var filter_name: ?[]const u8 = null;
+    var filter_expiry_gt: ?i64 = null;
+    var filter_expiry_lt: ?i64 = null;
+
+    if (common.getObjectArg(field, "where")) |where_args| {
+        for (where_args) |a| {
+            _ = common.matchStringArg(a, "name", &filter_name) or
+                (try common.matchAddressArg(a, "owner", &filter_owner)) or
+                common.matchIntArg(a, "expiryDate_gt", &filter_expiry_gt) or
+                common.matchIntArg(a, "expiryDate_lt", &filter_expiry_lt);
+        }
+    }
+
+    const filters = db.Database.WrappedDomainFilters{
+        .owner = filter_owner,
+        .name = filter_name,
+        .expiry_gt = filter_expiry_gt,
+        .expiry_lt = filter_expiry_lt,
+    };
+
+    const rows = try database.getWrappedDomains(filters, @intCast(page.skip), page.first);
+    defer {
+        for (rows) |*r| @constCast(r).deinit(allocator);
+        allocator.free(rows);
+    }
+
+    var json: std.ArrayList(u8) = .{};
+    defer json.deinit(allocator);
+    try json.appendSlice(allocator, "[");
+    for (rows, 0..) |*r, i| {
+        if (i > 0) try json.appendSlice(allocator, ",");
+        const wd_json = try builders.buildWrappedDomainJson(r, field.selections, .{
+            .database = database,
+            .depth = 0,
+            .allocator = allocator,
+            .loaders = ctx.loaders,
+        });
+        defer allocator.free(wd_json);
+        try json.appendSlice(allocator, wd_json);
+    }
+    try json.appendSlice(allocator, "]");
+    return parser.FieldResult{ .json = try allocator.dupe(u8, json.items) };
+}
+
+/// Top-level `_meta` resolver. Reports the highest-synced block across V1/V2
+/// `sync_state` rows. `hasIndexingErrors` is currently a literal `false` — we
+/// don't track per-tick errors centrally; if/when we do, surface that here.
+/// `deployment` is null until we wire in a version/git-sha env var.
+pub fn resolveMeta(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
+    const allocator = ctx.allocator;
+    const database: *db.Database = @ptrCast(@alignCast(ctx.database));
+
+    const v1_block = (try database.getSyncState(.v1)) orelse 0;
+    const v2_block = (try database.getSyncState(.v2)) orelse 0;
+    const head: u64 = if (v1_block > v2_block) v1_block else v2_block;
+
+    var json: std.ArrayList(u8) = .{};
+    defer json.deinit(allocator);
+    const w = json.writer(allocator);
+
+    try w.writeAll("{");
+    var first_meta = true;
+    for (field.selections) |*sel| {
+        const key = sel.alias orelse sel.name;
+        if (!first_meta) try w.writeAll(",");
+        if (std.mem.eql(u8, sel.name, "block")) {
+            try w.print("\"{s}\":{{", .{key});
+            var first_b = true;
+            // If no sub-selection, default to number-only.
+            const block_sels = sel.selections;
+            if (block_sels.len == 0) {
+                try w.print("\"number\":{d}", .{head});
+            } else {
+                for (block_sels) |*bs| {
+                    const bk = bs.alias orelse bs.name;
+                    if (!first_b) try w.writeAll(",");
+                    if (std.mem.eql(u8, bs.name, "number")) {
+                        try w.print("\"{s}\":{d}", .{ bk, head });
+                    } else if (std.mem.eql(u8, bs.name, "hash")) {
+                        // We don't surface a synthetic head-hash across the two
+                        // protocols (they have different chains); keep null.
+                        try w.print("\"{s}\":null", .{bk});
+                    } else if (std.mem.eql(u8, bs.name, "timestamp")) {
+                        try w.print("\"{s}\":null", .{bk});
+                    } else {
+                        try w.print("\"{s}\":null", .{bk});
+                    }
+                    first_b = false;
+                }
+            }
+            try w.writeAll("}");
+        } else if (std.mem.eql(u8, sel.name, "hasIndexingErrors")) {
+            try w.print("\"{s}\":false", .{key});
+        } else if (std.mem.eql(u8, sel.name, "deployment")) {
+            try w.print("\"{s}\":null", .{key});
+        } else {
+            try w.print("\"{s}\":null", .{key});
+        }
+        first_meta = false;
+    }
+    try w.writeAll("}");
+
+    return parser.FieldResult{ .json = try allocator.dupe(u8, json.items) };
 }

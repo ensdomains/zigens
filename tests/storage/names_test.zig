@@ -557,7 +557,9 @@ test "getAllNames returns all names" {
         allocator.free(names);
     }
 
-    try testing.expectEqual(@as(usize, 2), names.len);
+    // Two test names plus the synthetic root domain (subgraph parity, inserted
+    // by `Database.migrate`).
+    try testing.expectEqual(@as(usize, 3), names.len);
 }
 
 // ============================================================================

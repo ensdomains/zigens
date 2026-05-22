@@ -25,31 +25,32 @@ fn safeU64ToI64(val: u64) i64 {
 // CONSTANTS
 // ============================================================================
 
-/// Standard SELECT columns for names table (29 columns)
+/// Standard SELECT columns for names table (32 columns)
 /// Column order: name(0), label(1), label_hash(2), parent_name(3), parent_namehash(4),
 ///               protocol(5), registry(6), owner(7), registrant(8), resolver(9),
 ///               token_id(10), canonical_id(11), token_version(12), namehash(13), expiry(14),
 ///               registry_locked(15), migrated(16), created_block(17), created_at(18),
 ///               registered_at(19), updated_block(20), updated_at(21), is_wrapped(22), wrapper_fuses(23),
 ///               wrapper_expiry(24), is_v1_name(25), v1_label_hash(26),
-///               is_reachable(27), unreachable_since(28)
+///               is_reachable(27), unreachable_since(28), ttl(29), is_legacy(30),
+///               resolved_address(31)
 const SQL_SELECT_NAMES =
     \\SELECT name, label, label_hash, parent_name, parent_namehash, protocol, registry,
     \\       owner, registrant, resolver, token_id, canonical_id, token_version, namehash, expiry,
     \\       registry_locked, migrated, created_block, created_at, registered_at, updated_block, updated_at,
     \\       is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash,
-    \\       is_reachable, unreachable_since
+    \\       is_reachable, unreachable_since, ttl, is_legacy, resolved_address
     \\FROM names
 ;
 
-/// Shorter SELECT for queries that don't need wrapper fields (24 columns).
-/// Still includes is_reachable/unreachable_since so callers can honor
+/// Shorter SELECT for queries that don't need wrapper fields (27 columns).
+/// Still includes is_reachable/unreachable_since/ttl so callers can honor
 /// reachability filtering and serialize the flag.
 const SQL_SELECT_NAMES_SHORT =
     \\SELECT name, label, label_hash, parent_name, parent_namehash, protocol, registry,
     \\       owner, registrant, resolver, token_id, canonical_id, token_version, namehash, expiry,
     \\       registry_locked, migrated, created_block, created_at, registered_at, updated_block, updated_at,
-    \\       is_reachable, unreachable_since
+    \\       is_reachable, unreachable_since, ttl, is_legacy, resolved_address
     \\FROM names
 ;
 
@@ -133,10 +134,16 @@ fn parseNameRow(q: *Query, allocator: std.mem.Allocator) !models.Name {
         .v1_label_hash = v1_label_hash,
         .is_reachable = q.getBool(27),
         .unreachable_since = q.getOptionalInt64(28),
+        .ttl = if (q.getOptionalInt64(29)) |t| @intCast(t) else null,
+        .is_legacy = q.getBool(30),
+        .resolved_address = if (q.getTextSlice(31)) |s|
+            Address.fromHex(s) catch null
+        else
+            null,
     };
 }
 
-/// Parse a Name model from short query (22 columns, no wrapper fields)
+/// Parse a Name model from short query (27 columns, no wrapper fields)
 fn parseNameRowShort(q: *Query, allocator: std.mem.Allocator) !models.Name {
     const name_str = q.getTextSlice(0) orelse "";
     const label_str = q.getTextSlice(1) orelse "";
@@ -187,6 +194,12 @@ fn parseNameRowShort(q: *Query, allocator: std.mem.Allocator) !models.Name {
         .v1_label_hash = null,
         .is_reachable = q.getBool(22),
         .unreachable_since = q.getOptionalInt64(23),
+        .ttl = if (q.getOptionalInt64(24)) |t| @intCast(t) else null,
+        .is_legacy = q.getBool(25),
+        .resolved_address = if (q.getTextSlice(26)) |s|
+            Address.fromHex(s) catch null
+        else
+            null,
     };
 }
 
@@ -367,8 +380,8 @@ pub fn insertName(db: *Database, name: models.Name) !void {
         \\ registry, owner, registrant, resolver, token_id, canonical_id, token_version, expiry,
         \\ registry_locked, migrated, created_block, created_at, registered_at, updated_block, updated_at,
         \\ is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash,
-        \\ is_reachable, unreachable_since)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        \\ is_reachable, unreachable_since, ttl, is_legacy, resolved_address)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         \\ON CONFLICT(protocol, namehash) DO UPDATE SET
         \\ name = excluded.name,
         \\ label = excluded.label,
@@ -394,7 +407,10 @@ pub fn insertName(db: *Database, name: models.Name) !void {
         \\ is_v1_name = excluded.is_v1_name,
         \\ v1_label_hash = excluded.v1_label_hash,
         \\ is_reachable = excluded.is_reachable,
-        \\ unreachable_since = excluded.unreachable_since
+        \\ unreachable_since = excluded.unreachable_since,
+        \\ ttl = excluded.ttl,
+        \\ is_legacy = excluded.is_legacy,
+        \\ resolved_address = COALESCE(excluded.resolved_address, names.resolved_address)
     );
     defer q.deinit();
 
@@ -434,6 +450,28 @@ pub fn insertName(db: *Database, name: models.Name) !void {
     try q.bindOptionalText(name.v1_label_hash);
     try q.bindInt(if (name.is_reachable) 1 else 0);
     try q.bindOptionalInt64(name.unreachable_since);
+    try q.bindOptionalInt64(if (name.ttl) |t| @intCast(t) else null);
+    try q.bindInt(if (name.is_legacy) 1 else 0);
+    if (name.resolved_address) |addr| {
+        var resolved_buf: [42]u8 = undefined;
+        const resolved_hex = addr.toHexBuf(&resolved_buf);
+        try q.bindText(resolved_hex);
+    } else {
+        try q.bindNull();
+    }
+    try q.exec();
+}
+
+/// Update the `is_legacy` flag on an existing name row. Called by V1 Registry
+/// handlers to track whether the most recent update came from the legacy
+/// pre-2020 Registry (0x314159…) or the canonical post-2020 Registry.
+/// No-op when no row exists for `namehash`.
+pub fn updateNameIsLegacy(db: *Database, namehash: Hash, is_legacy: bool) !void {
+    var q = try Query.initCached(db, "UPDATE names SET is_legacy = ?, updated_at = ? WHERE namehash = ?");
+    defer q.deinit();
+    try q.bindInt(if (is_legacy) 1 else 0);
+    try q.bindInt64(std.time.timestamp());
+    try q.bindHashBuf(namehash);
     try q.exec();
 }
 
@@ -484,6 +522,45 @@ pub fn updateNameResolver(db: *Database, namehash: Hash, resolver: Address) !voi
     try q.exec();
 }
 
+/// V1 NewResolver materialization (subgraph parity): write the resolver's
+/// current `addr(node)` result into `names.resolved_address`. No-op if the
+/// row doesn't exist (consistent with `updateNameResolver`). Lowercase hex.
+pub fn updateResolvedAddress(db: *Database, namehash: Hash, addr: Address) !void {
+    var q = try Query.initCached(db, "UPDATE names SET resolved_address = ?, updated_at = ? WHERE namehash = ?");
+    defer q.deinit();
+
+    try q.bindAddressBuf(addr);
+    try q.bindInt64(std.time.timestamp());
+    try q.bindHashBuf(namehash);
+    try q.exec();
+}
+
+/// Clear `names.resolved_address` (set to NULL). Called when V1 NewResolver
+/// either points at the zero resolver or the `addr(node)` call returns zero
+/// — both indicate "no resolution available right now". No-op if the row
+/// doesn't exist.
+pub fn updateResolvedAddressToNull(db: *Database, namehash: Hash) !void {
+    var q = try Query.initCached(db, "UPDATE names SET resolved_address = NULL, updated_at = ? WHERE namehash = ?");
+    defer q.deinit();
+
+    try q.bindInt64(std.time.timestamp());
+    try q.bindHashBuf(namehash);
+    try q.exec();
+}
+
+/// Update TTL for a name (V1 ENS Registry NewTTL event).
+/// No-op if no row exists with this namehash — consistent with NewResolver:
+/// V1 NewTTL on a non-existent name has nothing to attach to.
+pub fn updateNameTTL(db: *Database, namehash: Hash, ttl: u64) !void {
+    var q = try Query.initCached(db, "UPDATE names SET ttl = ?, updated_at = ? WHERE namehash = ?");
+    defer q.deinit();
+
+    try q.bindInt64(@intCast(ttl));
+    try q.bindInt64(std.time.timestamp());
+    try q.bindHashBuf(namehash);
+    try q.exec();
+}
+
 /// Delete a name by its namehash (registry-safe: only deletes the exact name)
 pub fn deleteNameByNamehash(db: *Database, namehash: Hash) !void {
     var q = try Query.initCached(db, "DELETE FROM names WHERE namehash = ?");
@@ -491,6 +568,72 @@ pub fn deleteNameByNamehash(db: *Database, namehash: Hash) !void {
 
     try q.bindHashBuf(namehash);
     try q.exec();
+}
+
+/// Recursively delete a domain and walk up parent chain GCing empty parents.
+/// Mirrors subgraph's `recursivelyRemoveEmptyDomainFromParentSubdomainCount`.
+/// A "fully-burned" name (owner=0, resolver=0, no live subdomains, no expiry)
+/// is deleted and the parent re-checked. Stops at the root or at the first
+/// parent that's not fully burned. Returns the total number of rows deleted.
+///
+/// V1-only: V2 hard-deletes on burn (LabelUnregistered cascade), so this
+/// reconciliation is only meaningful for V1 ENS Registry `NewOwner`/`Transfer`
+/// events that set `owner = 0x0`. The walker is iterative (stack-driven) to
+/// avoid recursion in Zig and to keep the parent chain check explicit.
+pub fn recursivelyGcEmptyDomain(db: *Database, namehash: Hash) !u32 {
+    var deleted: u32 = 0;
+    var current = namehash;
+
+    // Cap the walk to defend against pathological parent chains (data
+    // corruption or self-referential rows); ENS depth in practice is small.
+    var safety: u32 = 0;
+    const SAFETY_LIMIT: u32 = 256;
+
+    while (safety < SAFETY_LIMIT) : (safety += 1) {
+        // Root has parent_namehash=0; stop GC at the root.
+        if (current.isZero()) break;
+
+        // Fetch the row's owner/resolver/expiry/parent_namehash. We must read
+        // the row before deciding to delete: the GC criteria require checking
+        // owner=0 AND resolver=0 AND no children AND no expiry.
+        var q = try Query.initCached(db,
+            \\SELECT owner, resolver, expiry, parent_namehash FROM names WHERE namehash = ? LIMIT 1
+        );
+        defer q.deinit();
+        try q.bindHashBuf(current);
+        if (!try q.step()) break; // Row already gone, nothing to do.
+
+        const owner_str = q.getTextSlice(0) orelse "";
+        const resolver_str = q.getTextSlice(1) orelse "";
+        const expiry = q.getOptionalInt64(2);
+        const parent_str = q.getTextSlice(3) orelse "";
+
+        const ZERO = "0x0000000000000000000000000000000000000000";
+        const owner_zero = std.mem.eql(u8, owner_str, ZERO);
+        const resolver_zero = std.mem.eql(u8, resolver_str, ZERO) or resolver_str.len == 0;
+        const expiry_unset = (expiry == null) or (expiry.? == 0);
+        if (!(owner_zero and resolver_zero and expiry_unset)) break;
+
+        // Capture parent before we delete this row.
+        const parent_hash = Hash.fromHex(parent_str) catch break;
+
+        // Children check: stop if this row has any descendant pointing at it
+        // via parent_namehash. NOT EXISTS is a single-row probe — cheap.
+        var child_q = try Query.initCached(db,
+            \\SELECT 1 FROM names WHERE parent_namehash = ? LIMIT 1
+        );
+        defer child_q.deinit();
+        try child_q.bindHashBuf(current);
+        const has_child = try child_q.step();
+        if (has_child) break;
+
+        // All gates passed — delete this row and walk up to parent.
+        try deleteNameByNamehash(db, current);
+        deleted += 1;
+        current = parent_hash;
+    }
+
+    return deleted;
 }
 
 /// Update token_id for a specific name by namehash (registry-safe: only updates the exact name).
@@ -528,6 +671,22 @@ pub fn updateNameWrapperState(db: *Database, namehash: Hash, fuses: u32, expiry:
     try q.bindInt64(safeU64ToI64(expiry));
     try q.bindInt64(std.time.timestamp());
     try q.bindHash(namehash);
+    try q.exec();
+}
+
+/// Clear `names.expiry` (set to NULL) for a namehash. Used on NameUnwrapped
+/// for subnames whose parent is NOT the .eth registrar: subgraph
+/// (`NameWrapper.ts:250-259`) resets domain.expiryDate to null on unwrap
+/// unless the parent is the .eth registrar (in which case the registration's
+/// expiry remains canonical).
+pub fn clearNameExpiry(db: *Database, namehash: Hash) !void {
+    var q = try Query.initCached(db,
+        \\UPDATE names SET expiry = NULL, updated_at = ? WHERE namehash = ?
+    );
+    defer q.deinit();
+
+    try q.bindInt64(std.time.timestamp());
+    try q.bindHashBuf(namehash);
     try q.exec();
 }
 
@@ -571,6 +730,69 @@ pub fn updateNameWrapperExpiry(db: *Database, namehash: Hash, expiry: u64) !void
     try q.bindInt64(std.time.timestamp());
     try q.bindHash(namehash);
     try q.exec();
+}
+
+/// PCC-aware Domain expiry mirror. Subgraph parity: when the wrapped name's
+/// PARENT_CANNOT_CONTROL fuse is burned, the wrapper expiry IS the canonical
+/// Domain expiry — mirror it (max with existing) so `Domain.expiryDate` returns
+/// the wrapper-extended date rather than the registration's base expiry (or null
+/// for wrapped subdomains that never had a base registrar expiry).
+///
+/// SQL `MAX(COALESCE(existing, 0), new)` handles NULL existing rows cleanly —
+/// no row in `names` for this namehash → UPDATE affects zero rows (no-op).
+/// That edge case is fine: `NameWrapped` on a name we never saw via Registry
+/// will simply skip the mirror until the Registry row materializes.
+pub fn updateDomainExpiryIfGreater(db: *Database, namehash: Hash, new_expiry: i64) !void {
+    var q = try Query.initCached(db,
+        \\UPDATE names
+        \\SET expiry = MAX(COALESCE(expiry, 0), ?),
+        \\    updated_at = ?
+        \\WHERE namehash = ?
+    );
+    defer q.deinit();
+    try q.bindInt64(new_expiry);
+    try q.bindInt64(std.time.timestamp());
+    try q.bindHashBuf(namehash);
+    try q.exec();
+}
+
+/// Bulk-materialize the PCC (PARENT_CANNOT_CONTROL = 0x10000) fuse → Domain.expiry
+/// mirror for every wrapped name. Idempotent: only updates rows where the wrapper
+/// expiry would actually advance Domain.expiry, and only where the PCC fuse is set.
+///
+/// Why this exists separately from the per-event mirror in handlers:
+/// - During initial bulk sync the write_buffer is active. The per-event mirror in
+///   handleV1NameWrapped/FusesSet/ExpiryExtended needs to READ existing rows to
+///   determine PCC state, which the write_buffer cannot service. The per-event
+///   mirror is therefore skipped while buffered.
+/// - After bulk sync flushes, this function runs once to materialize the mirror
+///   in one bulk UPDATE. For incremental sync after bulk, the per-event mirror
+///   handles updates directly (write_buffer is inactive).
+///
+/// SQL safety:
+/// - `CAST(wrapper_fuses AS INTEGER)` returns 0 for null/non-numeric strings, so
+///   the AND check naturally short-circuits. Combined with the explicit IS NOT
+///   NULL guards, this avoids touching unrelated rows.
+/// - `wrapper_expiry > COALESCE(expiry, 0)` ensures we never lower Domain.expiry.
+/// Returns the number of rows updated.
+pub fn materializePccDomainExpiry(db: *Database) !u32 {
+    const PARENT_CANNOT_CONTROL: i64 = 0x10000;
+    var q = try Query.init(db,
+        \\UPDATE names
+        \\SET expiry = wrapper_expiry,
+        \\    updated_at = ?
+        \\WHERE is_wrapped = 1
+        \\  AND wrapper_expiry IS NOT NULL
+        \\  AND wrapper_fuses IS NOT NULL
+        \\  AND wrapper_fuses != ''
+        \\  AND (CAST(wrapper_fuses AS INTEGER) & ?) != 0
+        \\  AND wrapper_expiry > COALESCE(expiry, 0)
+    );
+    defer q.deinit();
+    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(PARENT_CANNOT_CONTROL);
+    try q.exec();
+    return q.changes();
 }
 
 /// Update label and name fields for a name record (used by label healing)
@@ -738,6 +960,72 @@ pub fn getNamesByResolver(db: *Database, resolver: Address, limit: u32) ![]model
     return names.toOwnedSlice(db.allocator);
 }
 
+/// Get wrapped V1 names (paginated). Optionally filter by owner / exact name /
+/// expiry bounds — backs the top-level `wrappedDomains` GraphQL query.
+/// Unreachable rows are filtered out to match the rest of the API contract.
+pub const WrappedDomainFilters = struct {
+    owner: ?Address = null,
+    name: ?[]const u8 = null,
+    expiry_gt: ?i64 = null,
+    expiry_lt: ?i64 = null,
+};
+
+pub fn getWrappedDomains(
+    db: *Database,
+    filters: WrappedDomainFilters,
+    skip: u32,
+    limit: u32,
+) ![]models.Name {
+    var sql_buf: std.ArrayList(u8) = .{};
+    defer sql_buf.deinit(db.allocator);
+    try sql_buf.appendSlice(db.allocator, SQL_SELECT_NAMES);
+    try sql_buf.appendSlice(db.allocator, " WHERE is_reachable = 1 AND is_wrapped = 1");
+    if (filters.owner != null) try sql_buf.appendSlice(db.allocator, " AND owner = ?");
+    if (filters.name != null) try sql_buf.appendSlice(db.allocator, " AND name = ?");
+    if (filters.expiry_gt != null) try sql_buf.appendSlice(db.allocator, " AND wrapper_expiry > ?");
+    if (filters.expiry_lt != null) try sql_buf.appendSlice(db.allocator, " AND wrapper_expiry < ?");
+    try sql_buf.appendSlice(db.allocator, " ORDER BY created_at DESC LIMIT ? OFFSET ?");
+
+    var q = try Query.init(db, sql_buf.items);
+    defer q.deinit();
+
+    if (filters.owner) |o| try q.bindAddress(o);
+    if (filters.name) |n| try q.bindText(n);
+    if (filters.expiry_gt) |v| try q.bindInt64(v);
+    if (filters.expiry_lt) |v| try q.bindInt64(v);
+    try q.bindInt(@intCast(limit));
+    try q.bindInt(@intCast(skip));
+
+    var names: std.ArrayList(models.Name) = .{};
+    errdefer {
+        for (names.items) |*n| n.deinit(db.allocator);
+        names.deinit(db.allocator);
+    }
+    while (try q.step()) {
+        try names.append(db.allocator, try parseNameRow(&q, db.allocator));
+    }
+    return names.toOwnedSlice(db.allocator);
+}
+
+/// Get the canonical Domain row for a resolver (first by namehash ASC).
+/// Used by the `Resolver.domain` back-reference (subgraph parity). Returns
+/// null when no name currently points at this resolver. Unreachable rows
+/// are filtered out to match the rest of the API contract.
+pub fn getDomainByResolver(db: *Database, resolver: Address) !?models.Name {
+    var q = try Query.initCached(
+        db,
+        SQL_SELECT_NAMES ++ " WHERE is_reachable = 1 AND resolver = ? ORDER BY namehash ASC LIMIT 1",
+    );
+    defer q.deinit();
+
+    try q.bindAddress(resolver);
+
+    if (try q.step()) {
+        return try parseNameRow(&q, db.allocator);
+    }
+    return null;
+}
+
 /// Get names by registrant address. Unreachable rows are filtered out.
 pub fn getNamesByRegistrant(db: *Database, registrant: Address, skip: u32, limit: u32) ![]models.Name {
     var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND registrant = ? ORDER BY created_at DESC LIMIT ? OFFSET ?");
@@ -801,6 +1089,9 @@ fn appendNameFilterConditions(
     if (filters.owner != null) {
         try conditions.append(db.allocator, "owner = ?");
     }
+    if (filters.owner_not != null) {
+        try conditions.append(db.allocator, "owner != ?");
+    }
     if (filters.owner_in) |owners| {
         if (owners.len > 0) {
             var in_parts: std.ArrayList(u8) = .{};
@@ -816,11 +1107,103 @@ fn appendNameFilterConditions(
             try conditions.append(db.allocator, clause);
         }
     }
+    if (filters.owner_not_in) |owners| {
+        if (owners.len > 0) {
+            var in_parts: std.ArrayList(u8) = .{};
+            defer in_parts.deinit(db.allocator);
+            try in_parts.appendSlice(db.allocator, "owner NOT IN (");
+            for (owners, 0..) |_, i| {
+                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
+                try in_parts.appendSlice(db.allocator, "?");
+            }
+            try in_parts.appendSlice(db.allocator, ")");
+            const clause = try db.allocator.dupe(u8, in_parts.items);
+            try allocated_strings.append(db.allocator, clause);
+            try conditions.append(db.allocator, clause);
+        }
+    }
     if (filters.name != null) try conditions.append(db.allocator, "name = ?");
+    if (filters.name_not != null) try conditions.append(db.allocator, "name != ?");
+    if (filters.name_in) |names| {
+        if (names.len == 0) {
+            try conditions.append(db.allocator, "1=0");
+        } else {
+            var in_parts: std.ArrayList(u8) = .{};
+            defer in_parts.deinit(db.allocator);
+            try in_parts.appendSlice(db.allocator, "name IN (");
+            for (names, 0..) |_, i| {
+                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
+                try in_parts.appendSlice(db.allocator, "?");
+            }
+            try in_parts.appendSlice(db.allocator, ")");
+            const clause = try db.allocator.dupe(u8, in_parts.items);
+            try allocated_strings.append(db.allocator, clause);
+            try conditions.append(db.allocator, clause);
+        }
+    }
+    if (filters.name_not_in) |names| {
+        if (names.len > 0) {
+            var in_parts: std.ArrayList(u8) = .{};
+            defer in_parts.deinit(db.allocator);
+            try in_parts.appendSlice(db.allocator, "name NOT IN (");
+            for (names, 0..) |_, i| {
+                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
+                try in_parts.appendSlice(db.allocator, "?");
+            }
+            try in_parts.appendSlice(db.allocator, ")");
+            const clause = try db.allocator.dupe(u8, in_parts.items);
+            try allocated_strings.append(db.allocator, clause);
+            try conditions.append(db.allocator, clause);
+        }
+    }
     if (filters.name_contains != null) try conditions.append(db.allocator, "name LIKE '%' || ? || '%'");
     if (filters.name_contains_nocase != null) try conditions.append(db.allocator, "LOWER(name) LIKE '%' || LOWER(?) || '%'");
+    if (filters.name_not_contains != null) try conditions.append(db.allocator, "name NOT LIKE '%' || ? || '%'");
     if (filters.name_starts_with != null) try conditions.append(db.allocator, "name LIKE ? || '%'");
+    if (filters.name_starts_with_nocase != null) try conditions.append(db.allocator, "LOWER(name) LIKE LOWER(?) || '%'");
     if (filters.name_ends_with != null) try conditions.append(db.allocator, "name LIKE '%' || ?");
+    if (filters.name_ends_with_nocase != null) try conditions.append(db.allocator, "LOWER(name) LIKE '%' || LOWER(?)");
+    if (filters.label_name != null) try conditions.append(db.allocator, "label = ?");
+    if (filters.label_name_not != null) try conditions.append(db.allocator, "label != ?");
+    if (filters.label_name_in) |labels| {
+        if (labels.len == 0) {
+            try conditions.append(db.allocator, "1=0");
+        } else {
+            var in_parts: std.ArrayList(u8) = .{};
+            defer in_parts.deinit(db.allocator);
+            try in_parts.appendSlice(db.allocator, "label IN (");
+            for (labels, 0..) |_, i| {
+                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
+                try in_parts.appendSlice(db.allocator, "?");
+            }
+            try in_parts.appendSlice(db.allocator, ")");
+            const clause = try db.allocator.dupe(u8, in_parts.items);
+            try allocated_strings.append(db.allocator, clause);
+            try conditions.append(db.allocator, clause);
+        }
+    }
+    if (filters.label_name_not_in) |labels| {
+        if (labels.len > 0) {
+            var in_parts: std.ArrayList(u8) = .{};
+            defer in_parts.deinit(db.allocator);
+            try in_parts.appendSlice(db.allocator, "label NOT IN (");
+            for (labels, 0..) |_, i| {
+                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
+                try in_parts.appendSlice(db.allocator, "?");
+            }
+            try in_parts.appendSlice(db.allocator, ")");
+            const clause = try db.allocator.dupe(u8, in_parts.items);
+            try allocated_strings.append(db.allocator, clause);
+            try conditions.append(db.allocator, clause);
+        }
+    }
+    if (filters.label_name_contains != null) try conditions.append(db.allocator, "label LIKE '%' || ? || '%'");
+    if (filters.label_name_contains_nocase != null) try conditions.append(db.allocator, "LOWER(label) LIKE '%' || LOWER(?) || '%'");
+    if (filters.label_name_not_contains != null) try conditions.append(db.allocator, "label NOT LIKE '%' || ? || '%'");
+    if (filters.label_name_starts_with != null) try conditions.append(db.allocator, "label LIKE ? || '%'");
+    if (filters.label_name_starts_with_nocase != null) try conditions.append(db.allocator, "LOWER(label) LIKE LOWER(?) || '%'");
+    if (filters.label_name_ends_with != null) try conditions.append(db.allocator, "label LIKE '%' || ?");
+    if (filters.label_name_ends_with_nocase != null) try conditions.append(db.allocator, "LOWER(label) LIKE '%' || LOWER(?)");
     if (filters.expiry_gt != null) try conditions.append(db.allocator, "expiry > ?");
     if (filters.expiry_gte != null) try conditions.append(db.allocator, "expiry >= ?");
     if (filters.expiry_lt != null) try conditions.append(db.allocator, "expiry < ?");
@@ -850,14 +1233,43 @@ fn appendNameFilterConditions(
 /// Bind values for `NameFilters` in the same order `appendNameFilterConditions` appends them.
 fn bindNameFilters(q: *Query, filters: NameFilters) !void {
     if (filters.owner) |o| try q.bindAddress(o);
+    if (filters.owner_not) |o| try q.bindAddress(o);
     if (filters.owner_in) |owners| {
         for (owners) |o| try q.bindAddress(o);
     }
+    if (filters.owner_not_in) |owners| {
+        for (owners) |o| try q.bindAddress(o);
+    }
     if (filters.name) |n| try q.bindText(n);
+    if (filters.name_not) |n| try q.bindText(n);
+    if (filters.name_in) |names| {
+        for (names) |n| try q.bindText(n);
+    }
+    if (filters.name_not_in) |names| {
+        for (names) |n| try q.bindText(n);
+    }
     if (filters.name_contains) |n| try q.bindText(n);
     if (filters.name_contains_nocase) |n| try q.bindText(n);
+    if (filters.name_not_contains) |n| try q.bindText(n);
     if (filters.name_starts_with) |n| try q.bindText(n);
+    if (filters.name_starts_with_nocase) |n| try q.bindText(n);
     if (filters.name_ends_with) |n| try q.bindText(n);
+    if (filters.name_ends_with_nocase) |n| try q.bindText(n);
+    if (filters.label_name) |n| try q.bindText(n);
+    if (filters.label_name_not) |n| try q.bindText(n);
+    if (filters.label_name_in) |labels| {
+        for (labels) |n| try q.bindText(n);
+    }
+    if (filters.label_name_not_in) |labels| {
+        for (labels) |n| try q.bindText(n);
+    }
+    if (filters.label_name_contains) |n| try q.bindText(n);
+    if (filters.label_name_contains_nocase) |n| try q.bindText(n);
+    if (filters.label_name_not_contains) |n| try q.bindText(n);
+    if (filters.label_name_starts_with) |n| try q.bindText(n);
+    if (filters.label_name_starts_with_nocase) |n| try q.bindText(n);
+    if (filters.label_name_ends_with) |n| try q.bindText(n);
+    if (filters.label_name_ends_with_nocase) |n| try q.bindText(n);
     if (filters.expiry_gt) |v| try q.bindInt64(v);
     if (filters.expiry_gte) |v| try q.bindInt64(v);
     if (filters.expiry_lt) |v| try q.bindInt64(v);
@@ -985,6 +1397,8 @@ fn parseNameRows(q: *Query, allocator: std.mem.Allocator) ![]models.Name {
             .v1_label_hash = null,
             .is_reachable = q.getBool(21),
             .unreachable_since = q.getOptionalInt64(22),
+            .ttl = if (q.getOptionalInt64(23)) |t| @intCast(t) else null,
+            .is_legacy = q.getBool(24),
         });
     }
 
@@ -1000,13 +1414,32 @@ pub const NameFilters = struct {
     // Owner filters
     owner: ?Address = null,
     owner_in: ?[]const Address = null,
+    owner_not: ?Address = null,
+    owner_not_in: ?[]const Address = null,
     // Name filters
     name: ?[]const u8 = null,
     name_in: ?[]const []const u8 = null,
+    name_not: ?[]const u8 = null,
+    name_not_in: ?[]const []const u8 = null,
     name_contains: ?[]const u8 = null,
     name_contains_nocase: ?[]const u8 = null,
+    name_not_contains: ?[]const u8 = null,
     name_starts_with: ?[]const u8 = null,
+    name_starts_with_nocase: ?[]const u8 = null,
     name_ends_with: ?[]const u8 = null,
+    name_ends_with_nocase: ?[]const u8 = null,
+    // Label (leftmost component) filters — map to the `label` column on names.
+    label_name: ?[]const u8 = null,
+    label_name_not: ?[]const u8 = null,
+    label_name_in: ?[]const []const u8 = null,
+    label_name_not_in: ?[]const []const u8 = null,
+    label_name_contains: ?[]const u8 = null,
+    label_name_contains_nocase: ?[]const u8 = null,
+    label_name_not_contains: ?[]const u8 = null,
+    label_name_starts_with: ?[]const u8 = null,
+    label_name_starts_with_nocase: ?[]const u8 = null,
+    label_name_ends_with: ?[]const u8 = null,
+    label_name_ends_with_nocase: ?[]const u8 = null,
     // Expiry filters
     expiry_gt: ?i64 = null,
     expiry_gte: ?i64 = null,
@@ -1034,130 +1467,16 @@ pub const NameFilters = struct {
 pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u32, order_dir: OrderDir, sort_field: NameSortField) ![]models.Name {
     const order_str = if (order_dir == .desc) "DESC" else "ASC";
 
-    // Build WHERE clause dynamically using ArrayList for conditions
+    // Build WHERE conditions via the shared helper so all callers (getFilteredNames,
+    // getFilteredNameCount, countRowsBeforeNamehash) stay in lockstep.
     var conditions: std.ArrayList([]const u8) = .{};
     defer conditions.deinit(db.allocator);
-
-    // Track allocations for cleanup
     var allocated_strings: std.ArrayList([]const u8) = .{};
     defer {
         for (allocated_strings.items) |s| db.allocator.free(s);
         allocated_strings.deinit(db.allocator);
     }
-
-    // Reachability filter: default-on, hides orphans from subregistry repoints.
-    // Caller passes `include_unreachable = true` to disable for audit queries.
-    if (!filters.include_unreachable) {
-        try conditions.append(db.allocator, "is_reachable = 1");
-    }
-
-    // Owner filters
-    if (filters.owner != null) {
-        try conditions.append(db.allocator, "owner = ?");
-    }
-    if (filters.owner_in) |owners| {
-        if (owners.len > 0) {
-            // Build IN clause: owner IN (?, ?, ...)
-            var in_parts: std.ArrayList(u8) = .{};
-            defer in_parts.deinit(db.allocator);
-            try in_parts.appendSlice(db.allocator, "owner IN (");
-            for (owners, 0..) |_, i| {
-                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
-                try in_parts.appendSlice(db.allocator, "?");
-            }
-            try in_parts.appendSlice(db.allocator, ")");
-            const clause = try db.allocator.dupe(u8, in_parts.items);
-            try allocated_strings.append(db.allocator, clause);
-            try conditions.append(db.allocator, clause);
-        }
-    }
-
-    // Name filters
-    if (filters.name != null) {
-        try conditions.append(db.allocator, "name = ?");
-    }
-    if (filters.name_in) |names| {
-        if (names.len == 0) {
-            try conditions.append(db.allocator, "1=0");
-        } else {
-            var in_parts: std.ArrayList(u8) = .{};
-            defer in_parts.deinit(db.allocator);
-            try in_parts.appendSlice(db.allocator, "name IN (");
-            for (names, 0..) |_, i| {
-                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
-                try in_parts.appendSlice(db.allocator, "?");
-            }
-            try in_parts.appendSlice(db.allocator, ")");
-            const clause = try db.allocator.dupe(u8, in_parts.items);
-            try allocated_strings.append(db.allocator, clause);
-            try conditions.append(db.allocator, clause);
-        }
-    }
-    if (filters.name_contains != null) {
-        try conditions.append(db.allocator, "name LIKE '%' || ? || '%'");
-    }
-    if (filters.name_contains_nocase != null) {
-        try conditions.append(db.allocator, "LOWER(name) LIKE '%' || LOWER(?) || '%'");
-    }
-    if (filters.name_starts_with != null) {
-        try conditions.append(db.allocator, "name LIKE ? || '%'");
-    }
-    if (filters.name_ends_with != null) {
-        try conditions.append(db.allocator, "name LIKE '%' || ?");
-    }
-
-    // Expiry filters
-    if (filters.expiry_gt != null) {
-        try conditions.append(db.allocator, "expiry > ?");
-    }
-    if (filters.expiry_gte != null) {
-        try conditions.append(db.allocator, "expiry >= ?");
-    }
-    if (filters.expiry_lt != null) {
-        try conditions.append(db.allocator, "expiry < ?");
-    }
-    if (filters.expiry_lte != null) {
-        try conditions.append(db.allocator, "expiry <= ?");
-    }
-
-    // Resolved address filter (join with resolver_addresses table)
-    if (filters.resolved_address != null) {
-        try conditions.append(db.allocator, "namehash IN (SELECT namehash FROM resolver_addresses WHERE address = ?)");
-    }
-
-    // Resolver contract address filter
-    if (filters.resolver != null) {
-        try conditions.append(db.allocator, "resolver = ?");
-    }
-
-    // Registry contract address filter
-    if (filters.registry != null) {
-        try conditions.append(db.allocator, "registry = ?");
-    }
-
-    // Migration filter
-    if (filters.migrated) |m| {
-        if (m) {
-            try conditions.append(db.allocator, "migrated = 1");
-        } else {
-            try conditions.append(db.allocator, "migrated = 0");
-        }
-    }
-
-    // Subdomain count filters (using subquery)
-    if (filters.has_subdomains) |has_subs| {
-        if (has_subs) {
-            try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) > 0");
-        } else {
-            try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) = 0");
-        }
-    }
-    if (filters.subdomain_count_gt != null) {
-        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) > ?");
-    }
-    if (filters.subdomain_count_lt != null) {
-        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) < ?");
-    }
+    try appendNameFilterConditions(db, filters, &conditions, &allocated_strings);
 
     // Build WHERE clause
     var where_clause: std.ArrayList(u8) = .{};
@@ -1188,63 +1507,8 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
     var q = try Query.initCached(db, sql);
     defer q.deinit();
 
-    // Bind parameters in the same order as conditions were added
-    if (filters.owner) |o| {
-        try q.bindAddress(o);
-    }
-    if (filters.owner_in) |owners| {
-        for (owners) |o| {
-            try q.bindAddress(o);
-        }
-    }
-    if (filters.name) |n| {
-        try q.bindText(n);
-    }
-    if (filters.name_in) |names| {
-        for (names) |n| {
-            try q.bindText(n);
-        }
-    }
-    if (filters.name_contains) |n| {
-        try q.bindText(n);
-    }
-    if (filters.name_contains_nocase) |n| {
-        try q.bindText(n);
-    }
-    if (filters.name_starts_with) |n| {
-        try q.bindText(n);
-    }
-    if (filters.name_ends_with) |n| {
-        try q.bindText(n);
-    }
-    if (filters.expiry_gt) |v| {
-        try q.bindInt64(v);
-    }
-    if (filters.expiry_gte) |v| {
-        try q.bindInt64(v);
-    }
-    if (filters.expiry_lt) |v| {
-        try q.bindInt64(v);
-    }
-    if (filters.expiry_lte) |v| {
-        try q.bindInt64(v);
-    }
-    if (filters.resolved_address) |addr| {
-        try q.bindAddress(addr);
-    }
-    if (filters.resolver) |addr| {
-        try q.bindAddress(addr);
-    }
-    if (filters.registry) |addr| {
-        try q.bindAddress(addr);
-    }
-    // has_subdomains doesn't need binding (no ?)
-    if (filters.subdomain_count_gt) |v| {
-        try q.bindInt64(v);
-    }
-    if (filters.subdomain_count_lt) |v| {
-        try q.bindInt64(v);
-    }
+    // Bind parameters via the shared helper (same order as appendNameFilterConditions).
+    try bindNameFilters(&q, filters);
     try q.bindInt(@intCast(limit));
     try q.bindInt(@intCast(skip));
 
@@ -1263,7 +1527,7 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
             \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, protocol,
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated,
             \\       created_at, registered_at, created_block, updated_at, updated_block,
-            \\       is_reachable, unreachable_since
+            \\       is_reachable, unreachable_since, ttl, is_legacy
             \\FROM names WHERE is_reachable = 1 AND owner = ? ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
         , .{ sort_field.toSql(), order_str, order_str })
     else
@@ -1271,7 +1535,7 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
             \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, protocol,
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated,
             \\       created_at, registered_at, created_block, updated_at, updated_block,
-            \\       is_reachable, unreachable_since
+            \\       is_reachable, unreachable_since, ttl, is_legacy
             \\FROM names WHERE is_reachable = 1 ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
         , .{ sort_field.toSql(), order_str, order_str });
     defer db.allocator.free(sql);
@@ -1342,6 +1606,8 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
             .v1_label_hash = null,
             .is_reachable = q.getBool(21),
             .unreachable_since = q.getOptionalInt64(22),
+            .ttl = if (q.getOptionalInt64(23)) |t| @intCast(t) else null,
+            .is_legacy = q.getBool(24),
         });
     }
 
@@ -1368,102 +1634,7 @@ pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
         for (allocated_strings.items) |s| db.allocator.free(s);
         allocated_strings.deinit(db.allocator);
     }
-
-    // Build WHERE conditions (same order as getFilteredNames)
-    if (!filters.include_unreachable) {
-        try conditions.append(db.allocator, "is_reachable = 1");
-    }
-    if (filters.owner != null) {
-        try conditions.append(db.allocator, "owner = ?");
-    }
-    if (filters.owner_in) |owners| {
-        if (owners.len > 0) {
-            var in_parts: std.ArrayList(u8) = .{};
-            defer in_parts.deinit(db.allocator);
-            try in_parts.appendSlice(db.allocator, "owner IN (");
-            for (owners, 0..) |_, i| {
-                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
-                try in_parts.appendSlice(db.allocator, "?");
-            }
-            try in_parts.appendSlice(db.allocator, ")");
-            const clause = try db.allocator.dupe(u8, in_parts.items);
-            try allocated_strings.append(db.allocator, clause);
-            try conditions.append(db.allocator, clause);
-        }
-    }
-    if (filters.name != null) {
-        try conditions.append(db.allocator, "name = ?");
-    }
-    if (filters.name_in) |names| {
-        if (names.len == 0) {
-            try conditions.append(db.allocator, "1=0");
-        } else {
-            var in_parts: std.ArrayList(u8) = .{};
-            defer in_parts.deinit(db.allocator);
-            try in_parts.appendSlice(db.allocator, "name IN (");
-            for (names, 0..) |_, i| {
-                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
-                try in_parts.appendSlice(db.allocator, "?");
-            }
-            try in_parts.appendSlice(db.allocator, ")");
-            const clause = try db.allocator.dupe(u8, in_parts.items);
-            try allocated_strings.append(db.allocator, clause);
-            try conditions.append(db.allocator, clause);
-        }
-    }
-    if (filters.name_contains != null) {
-        try conditions.append(db.allocator, "name LIKE '%' || ? || '%'");
-    }
-    if (filters.name_contains_nocase != null) {
-        try conditions.append(db.allocator, "LOWER(name) LIKE '%' || LOWER(?) || '%'");
-    }
-    if (filters.name_starts_with != null) {
-        try conditions.append(db.allocator, "name LIKE ? || '%'");
-    }
-    if (filters.name_ends_with != null) {
-        try conditions.append(db.allocator, "name LIKE '%' || ?");
-    }
-    if (filters.expiry_gt != null) {
-        try conditions.append(db.allocator, "expiry > ?");
-    }
-    if (filters.expiry_gte != null) {
-        try conditions.append(db.allocator, "expiry >= ?");
-    }
-    if (filters.expiry_lt != null) {
-        try conditions.append(db.allocator, "expiry < ?");
-    }
-    if (filters.expiry_lte != null) {
-        try conditions.append(db.allocator, "expiry <= ?");
-    }
-    if (filters.resolved_address != null) {
-        try conditions.append(db.allocator, "namehash IN (SELECT namehash FROM resolver_addresses WHERE address = ?)");
-    }
-    if (filters.resolver != null) {
-        try conditions.append(db.allocator, "resolver = ?");
-    }
-    if (filters.registry != null) {
-        try conditions.append(db.allocator, "registry = ?");
-    }
-    if (filters.migrated) |m| {
-        if (m) {
-            try conditions.append(db.allocator, "migrated = 1");
-        } else {
-            try conditions.append(db.allocator, "migrated = 0");
-        }
-    }
-    if (filters.has_subdomains) |has_subs| {
-        if (has_subs) {
-            try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) > 0");
-        } else {
-            try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) = 0");
-        }
-    }
-    if (filters.subdomain_count_gt != null) {
-        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) > ?");
-    }
-    if (filters.subdomain_count_lt != null) {
-        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) < ?");
-    }
+    try appendNameFilterConditions(db, filters, &conditions, &allocated_strings);
 
     // Build SQL
     var where_clause: std.ArrayList(u8) = .{};
@@ -1484,63 +1655,7 @@ pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
     var q = try Query.initCached(db, sql);
     defer q.deinit();
 
-    // Bind parameters (same order as getFilteredNames)
-    if (filters.owner) |o| {
-        try q.bindAddress(o);
-    }
-    if (filters.owner_in) |owners| {
-        for (owners) |o| {
-            try q.bindAddress(o);
-        }
-    }
-    if (filters.name) |n| {
-        try q.bindText(n);
-    }
-    if (filters.name_in) |names| {
-        for (names) |n| {
-            try q.bindText(n);
-        }
-    }
-    if (filters.name_contains) |n| {
-        try q.bindText(n);
-    }
-    if (filters.name_contains_nocase) |n| {
-        try q.bindText(n);
-    }
-    if (filters.name_starts_with) |n| {
-        try q.bindText(n);
-    }
-    if (filters.name_ends_with) |n| {
-        try q.bindText(n);
-    }
-    if (filters.expiry_gt) |v| {
-        try q.bindInt64(v);
-    }
-    if (filters.expiry_gte) |v| {
-        try q.bindInt64(v);
-    }
-    if (filters.expiry_lt) |v| {
-        try q.bindInt64(v);
-    }
-    if (filters.expiry_lte) |v| {
-        try q.bindInt64(v);
-    }
-    if (filters.resolved_address) |addr| {
-        try q.bindAddress(addr);
-    }
-    if (filters.resolver) |addr| {
-        try q.bindAddress(addr);
-    }
-    if (filters.registry) |addr| {
-        try q.bindAddress(addr);
-    }
-    // has_subdomains doesn't need binding (no ?)
-    if (filters.subdomain_count_gt) |v| {
-        try q.bindInt64(v);
-    }
-    if (filters.subdomain_count_lt) |v| {
-        try q.bindInt64(v);
-    }
+    try bindNameFilters(&q, filters);
 
     if (try q.step()) {
         return @intCast(q.getInt64(0));
@@ -1554,8 +1669,19 @@ pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
 
 /// Count direct subdomains of a name. Unreachable subdomains (orphaned by
 /// a subregistry repoint) are excluded to match `getSubdomains` semantics.
+/// Subgraph parity: a name is considered fully burned (eligible for GC) when
+/// both `owner` and `resolver` are the zero address. Subgraph deletes such
+/// rows recursively when their subdomainCount is also 0; we approximate at
+/// query time by filtering them out of subdomain queries. The full recursive
+/// `subdomainCount == 0` check is omitted because it would require a sub-
+/// query per row — the practical effect of filtering on owner+resolver alone
+/// is close enough (a name with no owner/resolver but live children is rare
+/// and clients can still reach it via direct namehash lookup).
+const ZERO_ADDR_HEX: []const u8 = "0x0000000000000000000000000000000000000000";
+const SUBDOMAIN_GC_FILTER: []const u8 = " AND NOT (owner = '" ++ ZERO_ADDR_HEX ++ "' AND resolver = '" ++ ZERO_ADDR_HEX ++ "')";
+
 pub fn countDirectSubdomains(db: *Database, parent_name: []const u8) !u32 {
-    var q = try Query.init(db, "SELECT COUNT(*) FROM names WHERE is_reachable = 1 AND parent_name = ?");
+    var q = try Query.init(db, "SELECT COUNT(*) FROM names WHERE is_reachable = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER);
     defer q.deinit();
 
     try q.bindText(parent_name);
@@ -1566,9 +1692,9 @@ pub fn countDirectSubdomains(db: *Database, parent_name: []const u8) !u32 {
     return 0;
 }
 
-/// Check if a name has any direct subdomains (reachable only).
+/// Check if a name has any direct subdomains (reachable + non-burned).
 pub fn hasDirectSubdomains(db: *Database, parent_name: []const u8) !bool {
-    var q = try Query.init(db, "SELECT 1 FROM names WHERE is_reachable = 1 AND parent_name = ? LIMIT 1");
+    var q = try Query.init(db, "SELECT 1 FROM names WHERE is_reachable = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER ++ " LIMIT 1");
     defer q.deinit();
 
     try q.bindText(parent_name);
@@ -1600,7 +1726,7 @@ pub fn batchCountDirectSubdomains(db: *Database, allocator: std.mem.Allocator, p
         if (i > 0) try sql_buf.appendSlice(allocator, ", ");
         try sql_buf.appendSlice(allocator, "?");
     }
-    try sql_buf.appendSlice(allocator, ") GROUP BY parent_name");
+    try sql_buf.appendSlice(allocator, ")" ++ SUBDOMAIN_GC_FILTER ++ " GROUP BY parent_name");
 
     const sql_z = try allocator.dupeZ(u8, sql_buf.items);
     defer allocator.free(sql_z);
@@ -1633,10 +1759,13 @@ pub fn batchCountDirectSubdomains(db: *Database, allocator: std.mem.Allocator, p
 }
 
 /// Get direct subdomains of a name with pagination. Unreachable rows
-/// (orphans of a subregistry repoint) are filtered out — callers that
-/// need them must query `getFilteredNames` with `include_unreachable`.
+/// (orphans of a subregistry repoint) AND fully-burned rows (owner=0 AND
+/// resolver=0, mirroring subgraph's GC deletion criteria) are filtered out
+/// — callers that need them must query `getFilteredNames` with
+/// `include_unreachable` (which still applies the GC filter; resurrection
+/// requires direct namehash lookup).
 pub fn getSubdomains(db: *Database, parent_name_arg: []const u8, skip: u32, limit: u32) ![]models.Name {
-    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND parent_name = ? ORDER BY name LIMIT ? OFFSET ?");
+    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER ++ " ORDER BY name LIMIT ? OFFSET ?");
     defer q.deinit();
 
     try q.bindText(parent_name_arg);

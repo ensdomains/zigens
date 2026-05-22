@@ -286,9 +286,24 @@ pub fn handleResolverUpdate(self: *Indexer, protocol: models.Protocol, log: rpc.
     var resolver_hex_buf: [42]u8 = undefined;
     const resolver_hex = resolver_addr.toHexBuf(&resolver_hex_buf);
 
-    // Register resolver for record indexing (if not zero address)
+    // Register resolver for record indexing (if not zero address) and record
+    // the Resolver entity binding (subgraph parity). INSERT OR IGNORE so the
+    // first observation of a (protocol, address, namehash) triple wins; later
+    // events with the same triple are no-ops, mirroring subgraph semantics.
     if (!resolver_addr.isZero()) {
         try self.database.registerResolver(protocol, resolver_hex, log.block_number);
+        var namehash_hex_buf: [66]u8 = undefined;
+        const namehash_hex = namehash.toHexBuf(&namehash_hex_buf);
+        self.database.upsertResolverEntity(
+            protocol,
+            resolver_hex,
+            namehash_hex,
+            name_str,
+            log.block_number,
+            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        ) catch |err| {
+            std.log.debug("upsertResolverEntity failed: {}", .{err});
+        };
     }
 
     // Store event
@@ -337,6 +352,17 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
     };
 
     std.log.debug("NameRegistered: {s} (tokenId={d}, expiration={d}, registeredBy={any})", .{ label_str, token_id, expiration, registered_by });
+
+    if (!registered_by.isZero()) {
+        var registered_by_buf: [42]u8 = undefined;
+        const registered_by_hex = registered_by.toHexBuf(&registered_by_buf);
+        self.database.upsertAccount(
+            protocol,
+            registered_by_hex,
+            log.block_number,
+            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
+    }
 
     // Determine parent name based on registry address
     // If from main .eth registry, parent is "eth". Otherwise look up subregistry parent.
@@ -581,6 +607,17 @@ pub fn handleTransfer(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !
 
     std.log.debug("Transfer: from={any}, to={any}, id={d}, value={d}", .{ from, to, id, value });
 
+    if (!to.isZero()) {
+        var to_acct_buf: [42]u8 = undefined;
+        const to_acct_hex = to.toHexBuf(&to_acct_buf);
+        self.database.upsertAccount(
+            protocol,
+            to_acct_hex,
+            log.block_number,
+            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
+    }
+
     // Update name owner in database
     // Look up the name by token ID AND registry to avoid cross-registry tokenId collisions
     // (e.g., label "1" has the same tokenId in every registry)
@@ -666,6 +703,17 @@ pub fn handleETHNameRegistered(self: *Indexer, protocol: models.Protocol, log: r
 
     std.log.debug("ETHRegistrar.NameRegistered: {s} (tokenId={d}, owner={any}, duration={d}, base={d}, premium={d})", .{ label_str, token_id, owner, duration, base_price, premium });
 
+    if (!owner.isZero()) {
+        var owner_acct_buf: [42]u8 = undefined;
+        const owner_acct_hex = owner.toHexBuf(&owner_acct_buf);
+        self.database.upsertAccount(
+            protocol,
+            owner_acct_hex,
+            log.block_number,
+            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
+    }
+
     // Compute namehash
     const full_name = try std.fmt.allocPrint(self.allocator, "{s}.eth", .{label_str});
     defer self.allocator.free(full_name);
@@ -745,8 +793,23 @@ pub fn handleETHNameRegistered(self: *Indexer, protocol: models.Protocol, log: r
     // `PermissionedRegistry.LabelRegistered` (the canonical "label exists"
     // signal). Writing both would produce 2 rows per name. The
     // LabelRegistered handler (handleLabelRegistered) is the single canonical
-    // writer for the registrations table; payment details remain queryable
-    // via the `events` table for callers that want them.
+    // writer for the registrations table.
+    //
+    // Instead, enrich the LabelRegistered-written row with controller-side
+    // economics (baseCost, premium, label preimage, referrer) so they're
+    // first-class on the Registration entity. Ordering caveat: if this
+    // event happens to be processed before LabelRegistered in the chunk,
+    // the UPDATE no-ops; updateRegistrationEconomics logs that at debug.
+    self.database.updateRegistrationEconomics(
+        protocol,
+        namehash,
+        label_str,
+        base_price,
+        premium,
+        referrer,
+    ) catch |err| {
+        std.log.debug("updateRegistrationEconomics failed: {} (row may not yet exist)", .{err});
+    };
 
     // Store event with payment details
     var payment_token_hex_buf: [42]u8 = undefined;
@@ -1026,6 +1089,17 @@ pub fn handleTransferBatch(self: *Indexer, protocol: models.Protocol, log: rpc.L
 
     std.log.debug("TransferBatch: operator={any}, from={any}, to={any}, count={d}", .{ operator, from, to, token_ids.len });
 
+    if (!to.isZero()) {
+        var to_acct_buf: [42]u8 = undefined;
+        const to_acct_hex = to.toHexBuf(&to_acct_buf);
+        self.database.upsertAccount(
+            protocol,
+            to_acct_hex,
+            log.block_number,
+            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
+    }
+
     // Store event
     var operator_hex_buf: [42]u8 = undefined;
     const operator_hex = operator.toHexBuf(&operator_hex_buf);
@@ -1069,6 +1143,29 @@ pub fn handleApproval(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !
     const token_id: u256 = token_id_raw;
 
     std.log.debug("Approval: owner={any}, approved={any}, tokenId={d}", .{ owner, approved, token_id });
+
+    // Both owner and approved are real account observations — `owner` granted
+    // permission; `approved` is a new operator address worth tracking too.
+    if (!owner.isZero()) {
+        var owner_acct_buf: [42]u8 = undefined;
+        const owner_acct_hex = owner.toHexBuf(&owner_acct_buf);
+        self.database.upsertAccount(
+            protocol,
+            owner_acct_hex,
+            log.block_number,
+            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
+    }
+    if (!approved.isZero()) {
+        var approved_acct_buf: [42]u8 = undefined;
+        const approved_acct_hex = approved.toHexBuf(&approved_acct_buf);
+        self.database.upsertAccount(
+            protocol,
+            approved_acct_hex,
+            log.block_number,
+            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
+    }
 
     // Look up the name by tokenId and registry to avoid cross-registry collisions
     const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
@@ -1124,6 +1221,17 @@ pub fn handleEACRolesChanged(self: *Indexer, protocol: models.Protocol, log: rpc
     // Decode indexed parameters from topics
     const resource_uint = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
     const account = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
+
+    if (!account.isZero()) {
+        var account_acct_buf: [42]u8 = undefined;
+        const account_acct_hex = account.toHexBuf(&account_acct_buf);
+        self.database.upsertAccount(
+            protocol,
+            account_acct_hex,
+            log.block_number,
+            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
+    }
 
     // Non-indexed payload: (uint256 oldRoleBitmap, uint256 newRoleBitmap)
     const data_values = try abi.decodeValues(
@@ -1660,7 +1768,7 @@ pub fn handleLabelUnregistered(self: *Indexer, protocol: models.Protocol, log: r
         // Soft-delete: set is_reachable = 0 so a future re-register can
         // reactivate this row instead of losing history. Hard-delete would
         // drop createdAt / registrationDate / events linkage.
-        try self.database.markNameUnreachableByNamehash(n.namehash, log.block_number, block_timestamp);
+        try self.database.markNameUnreachableByNamehash(protocol, n.namehash, log.block_number, block_timestamp);
         name_str = try self.allocator.dupe(u8, n.name orelse "[unknown]");
         namehash_opt = n.namehash;
         var name_copy = n;
@@ -1985,6 +2093,23 @@ pub fn handleResolverUpdated(self: *Indexer, protocol: models.Protocol, log: rpc
         namehash_opt = n.namehash;
         var name_copy = n;
         name_copy.deinit(self.allocator);
+        // Record the Resolver entity binding (subgraph parity). Only when we
+        // know which name the resolver is bound to; orphan ResolverUpdated
+        // events skip this just like the resolver-on-names update above.
+        if (!resolver_addr.isZero()) {
+            var namehash_hex_buf: [66]u8 = undefined;
+            const namehash_hex = namehash_opt.?.toHexBuf(&namehash_hex_buf);
+            self.database.upsertResolverEntity(
+                protocol,
+                resolver_hex,
+                namehash_hex,
+                name_str,
+                log.block_number,
+                self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+            ) catch |err| {
+                std.log.debug("upsertResolverEntity failed: {}", .{err});
+            };
+        }
     } else {
         name_str = try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{token_id});
     }

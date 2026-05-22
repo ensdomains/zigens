@@ -186,6 +186,8 @@ pub fn getRecentEventsWithOrder(db: *Database, protocol: ?models.Protocol, event
 pub const EventFilterOptions = struct {
     event_type: ?[]const u8 = null,
     event_types: ?[]const []const u8 = null,
+    event_type_not: ?[]const u8 = null,
+    event_types_not: ?[]const []const u8 = null,
     protocol: ?models.Protocol = null,
     domain: ?[]const u8 = null,
     contract_address: ?[]const u8 = null,
@@ -223,11 +225,25 @@ fn appendEventFilterConditions(
 ) !void {
     if (filter.protocol != null) try conditions.append(db.allocator, "protocol = ?");
     if (filter.event_type != null) try conditions.append(db.allocator, "event_type = ?");
+    if (filter.event_type_not != null) try conditions.append(db.allocator, "event_type != ?");
     if (filter.event_types != null and filter.event_types.?.len > 0) {
         var in_parts: std.ArrayList(u8) = .{};
         defer in_parts.deinit(db.allocator);
         try in_parts.appendSlice(db.allocator, "event_type IN (");
         for (filter.event_types.?, 0..) |_, i| {
+            if (i > 0) try in_parts.append(db.allocator, ',');
+            try in_parts.append(db.allocator, '?');
+        }
+        try in_parts.append(db.allocator, ')');
+        const clause = try db.allocator.dupe(u8, in_parts.items);
+        try allocated_clauses.append(db.allocator, clause);
+        try conditions.append(db.allocator, clause);
+    }
+    if (filter.event_types_not != null and filter.event_types_not.?.len > 0) {
+        var in_parts: std.ArrayList(u8) = .{};
+        defer in_parts.deinit(db.allocator);
+        try in_parts.appendSlice(db.allocator, "event_type NOT IN (");
+        for (filter.event_types_not.?, 0..) |_, i| {
             if (i > 0) try in_parts.append(db.allocator, ',');
             try in_parts.append(db.allocator, '?');
         }
@@ -288,7 +304,11 @@ fn appendEventFilterConditions(
 fn bindEventFilters(q: *Query, filter: EventFilterOptions) !void {
     if (filter.protocol) |c| try q.bindTextStatic(c.toString());
     if (filter.event_type) |t| try q.bindText(t);
+    if (filter.event_type_not) |t| try q.bindText(t);
     if (filter.event_types) |types| {
+        for (types) |t| try q.bindText(t);
+    }
+    if (filter.event_types_not) |types| {
         for (types) |t| try q.bindText(t);
     }
     if (filter.domain) |d| try q.bindText(d);
@@ -403,6 +423,9 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     if (filter.event_type != null) {
         try conditions.append(db.allocator, "event_type = ?");
     }
+    if (filter.event_type_not != null) {
+        try conditions.append(db.allocator, "event_type != ?");
+    }
     if (filter.event_types != null and filter.event_types.?.len > 0) {
         var in_clause_buf: [256]u8 = undefined;
         var in_len: usize = 0;
@@ -410,6 +433,26 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
         @memcpy(in_clause_buf[in_len..][0..prefix.len], prefix);
         in_len += prefix.len;
         for (filter.event_types.?, 0..) |_, i| {
+            if (i > 0) {
+                in_clause_buf[in_len] = ',';
+                in_len += 1;
+            }
+            in_clause_buf[in_len] = '?';
+            in_len += 1;
+        }
+        in_clause_buf[in_len] = ')';
+        in_len += 1;
+        const clause = try db.allocator.dupe(u8, in_clause_buf[0..in_len]);
+        try allocated_clauses.append(db.allocator, clause);
+        try conditions.append(db.allocator, clause);
+    }
+    if (filter.event_types_not != null and filter.event_types_not.?.len > 0) {
+        var in_clause_buf: [256]u8 = undefined;
+        var in_len: usize = 0;
+        const prefix = "event_type NOT IN (";
+        @memcpy(in_clause_buf[in_len..][0..prefix.len], prefix);
+        in_len += prefix.len;
+        for (filter.event_types_not.?, 0..) |_, i| {
             if (i > 0) {
                 in_clause_buf[in_len] = ',';
                 in_len += 1;
@@ -580,7 +623,15 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     if (filter.event_type) |et| {
         try q.bindText(et);
     }
+    if (filter.event_type_not) |et| {
+        try q.bindText(et);
+    }
     if (filter.event_types) |types| {
+        for (types) |t| {
+            try q.bindText(t);
+        }
+    }
+    if (filter.event_types_not) |types| {
         for (types) |t| {
             try q.bindText(t);
         }
@@ -754,6 +805,9 @@ pub fn getEventCount(db: *Database, filter: EventFilterOptions) !usize {
     if (filter.event_type != null) {
         try conditions.append(db.allocator, "event_type = ?");
     }
+    if (filter.event_type_not != null) {
+        try conditions.append(db.allocator, "event_type != ?");
+    }
     if (filter.event_types != null and filter.event_types.?.len > 0) {
         var in_clause_buf: [256]u8 = undefined;
         var in_len: usize = 0;
@@ -761,6 +815,26 @@ pub fn getEventCount(db: *Database, filter: EventFilterOptions) !usize {
         @memcpy(in_clause_buf[in_len..][0..prefix.len], prefix);
         in_len += prefix.len;
         for (filter.event_types.?, 0..) |_, i| {
+            if (i > 0) {
+                in_clause_buf[in_len] = ',';
+                in_len += 1;
+            }
+            in_clause_buf[in_len] = '?';
+            in_len += 1;
+        }
+        in_clause_buf[in_len] = ')';
+        in_len += 1;
+        const clause = try db.allocator.dupe(u8, in_clause_buf[0..in_len]);
+        try allocated_clauses.append(db.allocator, clause);
+        try conditions.append(db.allocator, clause);
+    }
+    if (filter.event_types_not != null and filter.event_types_not.?.len > 0) {
+        var in_clause_buf: [256]u8 = undefined;
+        var in_len: usize = 0;
+        const prefix = "event_type NOT IN (";
+        @memcpy(in_clause_buf[in_len..][0..prefix.len], prefix);
+        in_len += prefix.len;
+        for (filter.event_types_not.?, 0..) |_, i| {
             if (i > 0) {
                 in_clause_buf[in_len] = ',';
                 in_len += 1;
@@ -892,7 +966,15 @@ pub fn getEventCount(db: *Database, filter: EventFilterOptions) !usize {
     if (filter.event_type) |et| {
         try q.bindText(et);
     }
+    if (filter.event_type_not) |et| {
+        try q.bindText(et);
+    }
     if (filter.event_types) |types| {
+        for (types) |t| {
+            try q.bindText(t);
+        }
+    }
+    if (filter.event_types_not) |types| {
         for (types) |t| {
             try q.bindText(t);
         }
