@@ -27,29 +27,17 @@ pub const EventSignatures = struct {
     pub const name_burned = "NameBurned(uint256,address)";
     pub const name_burned_hash: Hash = eventHash(name_burned);
 
-    /// SubregistryUpdate(uint256 indexed id, address subregistry) - OLD signature (pre-deployment)
-    pub const subregistry_update = "SubregistryUpdate(uint256,address)";
-    pub const subregistry_update_hash: Hash = eventHash(subregistry_update);
-
-    /// SubregistryUpdated(uint256 indexed id, address indexed subregistry, address indexed sender) - NEW signature (current deployment)
+    /// SubregistryUpdated(uint256 indexed id, address indexed subregistry, address indexed sender)
     pub const subregistry_updated = "SubregistryUpdated(uint256,address,address)";
     pub const subregistry_updated_hash: Hash = eventHash(subregistry_updated);
 
-    /// ResolverUpdate(uint256 indexed id, address resolver) - OLD signature (pre-deployment)
-    pub const resolver_update = "ResolverUpdate(uint256,address)";
-    pub const resolver_update_hash: Hash = eventHash(resolver_update);
-
-    /// ResolverUpdated(uint256 indexed id, address indexed resolver, address indexed sender) - NEW signature (current deployment)
+    /// ResolverUpdated(uint256 indexed id, address indexed resolver, address indexed sender)
     pub const resolver_updated = "ResolverUpdated(uint256,address,address)";
     pub const resolver_updated_hash: Hash = eventHash(resolver_updated);
 
-    /// TokenRegenerated(uint256 oldTokenId, uint256 newTokenId) - OLD signature (2 params)
+    /// TokenRegenerated(uint256 oldTokenId, uint256 newTokenId)
     pub const token_regenerated = "TokenRegenerated(uint256,uint256)";
     pub const token_regenerated_hash: Hash = eventHash(token_regenerated);
-
-    /// TokenRegenerated(uint256 oldTokenId, uint256 newTokenId, uint256 flags) - NEW signature (3 params)
-    pub const token_regenerated_v2 = "TokenRegenerated(uint256,uint256,uint256)";
-    pub const token_regenerated_v2_hash: Hash = eventHash(token_regenerated_v2);
 
     /// ExpiryUpdated(uint256 indexed tokenId, uint64 newExpiry, address changedBy)
     /// New event signature that replaces NameRenewed in current namechain deployment
@@ -75,11 +63,6 @@ pub const EventSignatures = struct {
     /// Emitted when the parent of a registry is changed
     pub const parent_updated = "ParentUpdated(address,string,address)";
     pub const parent_updated_hash: Hash = eventHash(parent_updated);
-
-    /// TokenResource(uint256 indexed tokenId, uint256 indexed resource)
-    /// Emitted when a token's resource is set during registration
-    pub const token_resource = "TokenResource(uint256,uint256)";
-    pub const token_resource_hash: Hash = eventHash(token_resource);
 
     // ========================================================================
     // Enhanced Access Control events (from common/access-control/interfaces/IEnhancedAccessControl.sol)
@@ -363,19 +346,21 @@ pub const EventSignatures = struct {
     pub const approval_for_all = "ApprovalForAll(address,address,bool)";
     pub const approval_for_all_hash: Hash = eventHash(approval_for_all);
 
-    /// Approved(bytes32 indexed node, address indexed owner, address indexed target, bool isAuthorised)
-    /// PublicResolver approval event
-    pub const approved = "Approved(bytes32,address,address,bool)";
-    pub const approved_hash: Hash = eventHash(approved);
+    /// TokenResource(uint256 indexed tokenId, uint256 indexed resource)
+    /// Emitted when a token's resource is set during registration. Still emitted
+    /// by PermissionedRegistry post-audit; not currently subscribed to.
+    pub const token_resource = "TokenResource(uint256,uint256)";
+    pub const token_resource_hash: Hash = eventHash(token_resource);
 
-    // ========================================================================
     // ========================================================================
     // PermissionedRegistry events
     // ========================================================================
 
-    /// TokenObserverSet(uint256 indexed tokenId, address observer)
-    pub const token_observer_set = "TokenObserverSet(uint256,address)";
-    pub const token_observer_set_hash: Hash = eventHash(token_observer_set);
+    /// RegistryCreated()
+    /// Emitted by PermissionedRegistry, WrapperRegistry, UserRegistry constructors.
+    /// The cleanest signal to discover newly-deployed subregistries.
+    pub const registry_created = "RegistryCreated()";
+    pub const registry_created_hash: Hash = eventHash(registry_created);
 };
 
 /// ABI encoding/decoding utilities

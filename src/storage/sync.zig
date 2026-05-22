@@ -96,7 +96,6 @@ pub fn rollbackToBlock(db: *Database, protocol: models.Protocol, block_number: u
     const insert_only_tables = [_][]const u8{
         "events",
         "block_hashes",
-        "token_observers",
     };
 
     inline for (insert_only_tables) |table| {
@@ -351,31 +350,6 @@ pub fn discoverAndGetSubregistries(db: *Database, protocol: models.Protocol, mai
     };
 }
 
-/// Insert a token observer event
-pub fn insertTokenObserver(db: *Database, protocol: models.Protocol, token_id: u256, observer: Address, block_number: u64, tx_hash: Hash, log_index: u32) !void {
-    const sql =
-        \\INSERT OR IGNORE INTO token_observers
-        \\(protocol, token_id, observer, block_number, transaction_hash, log_index, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?)
-    ;
-
-    var q = try Query.init(db, sql);
-    defer q.deinit();
-
-    const token_id_str = try std.fmt.allocPrint(db.allocator, "{d}", .{token_id});
-    defer db.allocator.free(token_id_str);
-
-    try q.bindTextStatic(protocol.toString());
-    try q.bindText(token_id_str);
-    try q.bindAddress(observer);
-    try q.bindInt64(@intCast(block_number));
-    try q.bindHash(tx_hash);
-    try q.bindInt(@intCast(log_index));
-    try q.bindInt64(std.time.timestamp());
-
-    try q.exec();
-}
-
 /// Delete all data after a specific block (for clean re-indexing)
 pub fn deleteDataAfterBlock(db: *Database, block_number: u64) !void {
     std.log.info("Deleting data after block {d}...", .{block_number});
@@ -388,7 +362,6 @@ pub fn deleteDataAfterBlock(db: *Database, block_number: u64) !void {
         .{ .name = "resolver_addresses", .block_col = "block_number" },
         .{ .name = "resolver_contenthashes", .block_col = "block_number" },
         .{ .name = "resolver_texts", .block_col = "block_number" },
-        .{ .name = "token_observers", .block_col = "block_number" },
         .{ .name = "resolver_aliases", .block_col = "block_number" },
         .{ .name = "resolver_pubkeys", .block_col = "block_number" },
         .{ .name = "resolver_abis", .block_col = "block_number" },

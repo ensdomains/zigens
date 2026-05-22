@@ -11,31 +11,6 @@ const Indexer = @import("../indexer.zig").Indexer;
 const utils = @import("../utils.zig");
 const json_utils = @import("../../utils/json.zig");
 
-pub fn handleSubregistryUpdate(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
-    // Event: SubregistryUpdate(uint256 indexed id, address subregistry)
-    // Note: The 'id' in SubregistryUpdate is the canonical_id (version=0), not the full token_id
-    if (log.topics.len < 2) return error.InvalidTopicCount;
-
-    const token_id = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
-    const token_id_utils = @import("../../types/token_id.zig");
-    const canonical_id = token_id_utils.getCanonicalId(token_id);
-
-    // data = subregistry address
-    const subregistry_addr = try abi.ABI.decodeAddress(log.data, 0);
-
-    std.log.debug("SubregistryUpdate: tokenId={d}, canonicalId={d}, subregistry={any}, contract={any}", .{ token_id, canonical_id, subregistry_addr, log.address });
-
-    try processSubregistryPointerChange(
-        self,
-        protocol,
-        log,
-        token_id,
-        subregistry_addr,
-        null,
-        .subregistry_update,
-    );
-}
-
 /// Process an orphaned registration now that we know its parent
 pub fn processOrphanedRegistration(
     self: *Indexer,
@@ -231,77 +206,6 @@ pub fn processRemainingOrphans(self: *Indexer, protocol: models.Protocol) !void 
             try self.database.deleteOrphanedRegistrations(protocol, addr.*);
         }
     }
-}
-
-pub fn handleResolverUpdate(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
-    // Event: ResolverUpdate(uint256 indexed id, address resolver)
-    // Note: The 'id' in ResolverUpdate is the current token_id (including version bits),
-    // NOT the canonical_id. We must strip version bits to look up the name.
-    if (log.topics.len < 2) return error.InvalidTopicCount;
-
-    // topics[0] = event signature
-    // topics[1] = indexed id (this is the full token_id, including version bits)
-    const token_id = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
-    const token_id_utils_local = @import("../../types/token_id.zig");
-    const canonical_id = token_id_utils_local.getCanonicalId(token_id);
-
-    // data = resolver address
-    const resolver_addr = try abi.ABI.decodeAddress(log.data, 0);
-
-    std.log.debug("ResolverUpdate: tokenId={d}, canonicalId={d}, resolver={any}, contract={any}", .{ token_id, canonical_id, resolver_addr, log.address });
-
-    // Look up the name by token_id AND registry to avoid cross-registry collisions
-    // (e.g., "tester.eth" and "tester.calendars.eth" share the same token_id)
-    const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
-
-    // With log-index ordering the parent LabelRegistered/NameRegistered is processed before
-    // its ResolverUpdate in the same batch, so this branch is defensive: it fires on reorg
-    // replay or when the registry hasn't been discovered yet (subregistry outside the known set).
-    if (maybe_name == null) {
-        std.log.warn("  → Skipping ResolverUpdate for unknown tokenId={d} in registry {any}", .{ token_id, log.address });
-        return;
-    }
-
-    // Extract and allocate name_str and copy namehash before any cleanup
-    const name_str = try self.allocator.dupe(u8, maybe_name.?.name orelse "[unknown]");
-    defer self.allocator.free(name_str);
-    const namehash = maybe_name.?.namehash;
-
-    // Clean up the name struct
-    var name_copy = maybe_name.?;
-    name_copy.deinit(self.allocator);
-
-    // Update resolver in database
-    try self.database.updateNameResolver(namehash, resolver_addr);
-
-    // Stack-buffer the resolver hex once and reuse for both registerResolver + the
-    // subsequent event JSON; avoids two separate heap allocs in this handler.
-    var resolver_hex_buf: [42]u8 = undefined;
-    const resolver_hex = resolver_addr.toHexBuf(&resolver_hex_buf);
-
-    // Register resolver for record indexing (if not zero address)
-    if (!resolver_addr.isZero()) {
-        try self.database.registerResolver(protocol, resolver_hex, log.block_number);
-    }
-
-    // Store event
-    var contract_hex_buf: [42]u8 = undefined;
-    const contract_hex = log.address.toHexBuf(&contract_hex_buf);
-
-    // Escape name_str for safe JSON inclusion
-    const escaped_name = try json_utils.escapeString(self.allocator, name_str);
-    defer self.allocator.free(escaped_name);
-
-    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\",\"canonicalId\":{d},\"resolver\":\"{s}\",\"registry\":\"{s}\"}}", .{
-        escaped_name,
-        canonical_id,
-        resolver_hex,
-        contract_hex,
-    });
-
-    const event_name = try self.allocator.dupe(u8, name_str);
-
-    try utils.emitEvent(self, protocol, log, .resolver_update, event_name, namehash, event_data);
 }
 
 pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
