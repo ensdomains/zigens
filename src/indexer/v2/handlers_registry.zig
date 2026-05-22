@@ -353,16 +353,7 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
 
     std.log.debug("NameRegistered: {s} (tokenId={d}, expiration={d}, registeredBy={any})", .{ label_str, token_id, expiration, registered_by });
 
-    if (!registered_by.isZero()) {
-        var registered_by_buf: [42]u8 = undefined;
-        const registered_by_hex = registered_by.toHexBuf(&registered_by_buf);
-        self.database.upsertAccount(
-            protocol,
-            registered_by_hex,
-            log.block_number,
-            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
-    }
+    utils.recordAccountObservation(self, protocol, registered_by, log);
 
     // Determine parent name based on registry address
     // If from main .eth registry, parent is "eth". Otherwise look up subregistry parent.
@@ -607,16 +598,7 @@ pub fn handleTransfer(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !
 
     std.log.debug("Transfer: from={any}, to={any}, id={d}, value={d}", .{ from, to, id, value });
 
-    if (!to.isZero()) {
-        var to_acct_buf: [42]u8 = undefined;
-        const to_acct_hex = to.toHexBuf(&to_acct_buf);
-        self.database.upsertAccount(
-            protocol,
-            to_acct_hex,
-            log.block_number,
-            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
-    }
+    utils.recordAccountObservation(self, protocol, to, log);
 
     // Update name owner in database
     // Look up the name by token ID AND registry to avoid cross-registry tokenId collisions
@@ -703,16 +685,7 @@ pub fn handleETHNameRegistered(self: *Indexer, protocol: models.Protocol, log: r
 
     std.log.debug("ETHRegistrar.NameRegistered: {s} (tokenId={d}, owner={any}, duration={d}, base={d}, premium={d})", .{ label_str, token_id, owner, duration, base_price, premium });
 
-    if (!owner.isZero()) {
-        var owner_acct_buf: [42]u8 = undefined;
-        const owner_acct_hex = owner.toHexBuf(&owner_acct_buf);
-        self.database.upsertAccount(
-            protocol,
-            owner_acct_hex,
-            log.block_number,
-            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
-    }
+    utils.recordAccountObservation(self, protocol, owner, log);
 
     // Compute namehash
     const full_name = try std.fmt.allocPrint(self.allocator, "{s}.eth", .{label_str});
@@ -1089,16 +1062,7 @@ pub fn handleTransferBatch(self: *Indexer, protocol: models.Protocol, log: rpc.L
 
     std.log.debug("TransferBatch: operator={any}, from={any}, to={any}, count={d}", .{ operator, from, to, token_ids.len });
 
-    if (!to.isZero()) {
-        var to_acct_buf: [42]u8 = undefined;
-        const to_acct_hex = to.toHexBuf(&to_acct_buf);
-        self.database.upsertAccount(
-            protocol,
-            to_acct_hex,
-            log.block_number,
-            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
-    }
+    utils.recordAccountObservation(self, protocol, to, log);
 
     // Store event
     var operator_hex_buf: [42]u8 = undefined;
@@ -1146,26 +1110,8 @@ pub fn handleApproval(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !
 
     // Both owner and approved are real account observations — `owner` granted
     // permission; `approved` is a new operator address worth tracking too.
-    if (!owner.isZero()) {
-        var owner_acct_buf: [42]u8 = undefined;
-        const owner_acct_hex = owner.toHexBuf(&owner_acct_buf);
-        self.database.upsertAccount(
-            protocol,
-            owner_acct_hex,
-            log.block_number,
-            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
-    }
-    if (!approved.isZero()) {
-        var approved_acct_buf: [42]u8 = undefined;
-        const approved_acct_hex = approved.toHexBuf(&approved_acct_buf);
-        self.database.upsertAccount(
-            protocol,
-            approved_acct_hex,
-            log.block_number,
-            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
-    }
+    utils.recordAccountObservation(self, protocol, owner, log);
+    utils.recordAccountObservation(self, protocol, approved, log);
 
     // Look up the name by tokenId and registry to avoid cross-registry collisions
     const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
@@ -1222,16 +1168,7 @@ pub fn handleEACRolesChanged(self: *Indexer, protocol: models.Protocol, log: rpc
     const resource_uint = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
     const account = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
 
-    if (!account.isZero()) {
-        var account_acct_buf: [42]u8 = undefined;
-        const account_acct_hex = account.toHexBuf(&account_acct_buf);
-        self.database.upsertAccount(
-            protocol,
-            account_acct_hex,
-            log.block_number,
-            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
-    }
+    utils.recordAccountObservation(self, protocol, account, log);
 
     // Non-indexed payload: (uint256 oldRoleBitmap, uint256 newRoleBitmap)
     const data_values = try abi.decodeValues(

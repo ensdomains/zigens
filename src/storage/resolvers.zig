@@ -116,15 +116,7 @@ pub fn getFilteredResolverEntities(
         if (addrs.len == 0) {
             try conditions.append(db.allocator, "1=0");
         } else {
-            var in_parts: std.ArrayList(u8) = .{};
-            defer in_parts.deinit(db.allocator);
-            try in_parts.appendSlice(db.allocator, "address IN (");
-            for (addrs, 0..) |_, i| {
-                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
-                try in_parts.appendSlice(db.allocator, "?");
-            }
-            try in_parts.appendSlice(db.allocator, ")");
-            const clause = try db.allocator.dupe(u8, in_parts.items);
+            const clause = try db_module.query.buildInClause(db.allocator, "address", "IN", addrs.len);
             try allocated.append(db.allocator, clause);
             try conditions.append(db.allocator, clause);
         }

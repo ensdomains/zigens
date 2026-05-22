@@ -20,6 +20,46 @@ fn mapRegistrationOrderBy(order_by: ?[]const u8) db.EventSortField {
     return .block_number;
 }
 
+/// Parsed `where:` arguments for the registration queries. Both
+/// `resolveRegistrations` and `resolveRegistrationConnection` accept the
+/// same `RegistrationFilter` input — this helper centralises parsing so the
+/// two stay in sync by construction (mirrors `parseDomainWhere` in domain.zig).
+const ParsedRegistrationFilter = struct {
+    registrant: ?[]const u8 = null,
+    registrant_in: ?[][]const u8 = null,
+    expiry_gt: ?i64 = null,
+    expiry_gte: ?i64 = null,
+    expiry_lt: ?i64 = null,
+    expiry_lte: ?i64 = null,
+    chain: ?models.Protocol = null,
+
+    pub fn deinit(self: *ParsedRegistrationFilter, allocator: std.mem.Allocator) void {
+        if (self.registrant_in) |s| allocator.free(s);
+    }
+};
+
+fn parseRegistrationWhere(field: *const parser.Field, allocator: std.mem.Allocator) !ParsedRegistrationFilter {
+    var out = ParsedRegistrationFilter{};
+    errdefer out.deinit(allocator);
+    const where_args = common.getObjectArg(field, "where") orelse return out;
+    for (where_args) |a| {
+        if (std.mem.eql(u8, a.name, "protocol") and a.value == .string) {
+            out.chain = models.Protocol.fromString(a.value.string) catch return error.InvalidProtocol;
+            continue;
+        }
+        if (std.mem.eql(u8, a.name, "registrant_in")) {
+            if (try common.parseStringListArg(a, allocator)) |v| out.registrant_in = v;
+            continue;
+        }
+        _ = common.matchStringArg(a, "registrant", &out.registrant) or
+            common.matchIntArg(a, "expiryDate_gt", &out.expiry_gt) or
+            common.matchIntArg(a, "expiryDate_gte", &out.expiry_gte) or
+            common.matchIntArg(a, "expiryDate_lt", &out.expiry_lt) or
+            common.matchIntArg(a, "expiryDate_lte", &out.expiry_lte);
+    }
+    return out;
+}
+
 /// Resolver for registrationConnection query (cursor-based pagination)
 pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
@@ -40,55 +80,19 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
         1000, // max limit
     );
 
-    // Parse where filters
-    var filter_registrant: ?[]const u8 = null;
-    var filter_registrant_in: ?[][]const u8 = null;
-    var filter_expiry_gt: ?i64 = null;
-    var filter_expiry_gte: ?i64 = null;
-    var filter_expiry_lt: ?i64 = null;
-    var filter_expiry_lte: ?i64 = null;
-    var filter_chain: ?models.Protocol = null;
-
-    if (common.getObjectArg(field, "where")) |where_args| {
-        for (where_args) |a| {
-            // protocol: string → enum (special-cased)
-            // Surface invalid protocol as an error so a typo doesn't silently expand
-            // the result set across all chains.
-            if (std.mem.eql(u8, a.name, "protocol") and a.value == .string) {
-                filter_chain = models.Protocol.fromString(a.value.string) catch return error.InvalidProtocol;
-                continue;
-            }
-            // registrant_in: list-of-string — allocates
-            if (std.mem.eql(u8, a.name, "registrant_in") and a.value == .list) {
-                var addresses: std.ArrayList([]const u8) = .{};
-                defer addresses.deinit(allocator);
-                for (a.value.list) |item| {
-                    if (item == .string) {
-                        try addresses.append(allocator, item.string);
-                    }
-                }
-                filter_registrant_in = try addresses.toOwnedSlice(allocator);
-                continue;
-            }
-
-            _ = common.matchStringArg(a, "registrant", &filter_registrant) or
-                common.matchIntArg(a, "expiryDate_gt", &filter_expiry_gt) or
-                common.matchIntArg(a, "expiryDate_gte", &filter_expiry_gte) or
-                common.matchIntArg(a, "expiryDate_lt", &filter_expiry_lt) or
-                common.matchIntArg(a, "expiryDate_lte", &filter_expiry_lte);
-        }
-    }
-    defer if (filter_registrant_in) |regs| allocator.free(regs);
+    // Parse where filter via the shared helper.
+    var parsed = try parseRegistrationWhere(field, allocator);
+    defer parsed.deinit(allocator);
 
     // Build registration filter
     const reg_filter = db.RegistrationFilterOptions{
-        .protocol = filter_chain,
-        .registrant = filter_registrant,
-        .registrant_in = filter_registrant_in,
-        .expiry_gt = filter_expiry_gt,
-        .expiry_gte = filter_expiry_gte,
-        .expiry_lt = filter_expiry_lt,
-        .expiry_lte = filter_expiry_lte,
+        .protocol = parsed.chain,
+        .registrant = parsed.registrant,
+        .registrant_in = parsed.registrant_in,
+        .expiry_gt = parsed.expiry_gt,
+        .expiry_gte = parsed.expiry_gte,
+        .expiry_lt = parsed.expiry_lt,
+        .expiry_lte = parsed.expiry_lte,
     };
 
     // Check which top-level fields are requested (for totalCount-only fast path)
@@ -305,41 +309,9 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
     const first = page.first;
     const skip = page.skip;
 
-    // Parse filter if provided
-    var filter_registrant: ?[]const u8 = null;
-    var filter_registrant_in: ?[][]const u8 = null;
-    var filter_expiry_gt: ?i64 = null;
-    var filter_expiry_gte: ?i64 = null;
-    var filter_expiry_lt: ?i64 = null;
-    var filter_expiry_lte: ?i64 = null;
-    var filter_chain: ?models.Protocol = null;
-
-    if (common.getObjectArg(field, "where")) |where_args| {
-        for (where_args) |a| {
-            if (std.mem.eql(u8, a.name, "protocol") and a.value == .string) {
-                filter_chain = models.Protocol.fromString(a.value.string) catch return error.InvalidProtocol;
-                continue;
-            }
-            if (std.mem.eql(u8, a.name, "registrant_in") and a.value == .list) {
-                var addresses: std.ArrayList([]const u8) = .{};
-                defer addresses.deinit(allocator);
-                for (a.value.list) |item| {
-                    if (item == .string) {
-                        try addresses.append(allocator, item.string);
-                    }
-                }
-                filter_registrant_in = try addresses.toOwnedSlice(allocator);
-                continue;
-            }
-
-            _ = common.matchStringArg(a, "registrant", &filter_registrant) or
-                common.matchIntArg(a, "expiryDate_gt", &filter_expiry_gt) or
-                common.matchIntArg(a, "expiryDate_gte", &filter_expiry_gte) or
-                common.matchIntArg(a, "expiryDate_lt", &filter_expiry_lt) or
-                common.matchIntArg(a, "expiryDate_lte", &filter_expiry_lte);
-        }
-    }
-    defer if (filter_registrant_in) |regs| allocator.free(regs);
+    // Parse where filter via the shared helper.
+    var parsed = try parseRegistrationWhere(field, allocator);
+    defer parsed.deinit(allocator);
 
     const order_by = parser.getStringArg(field, "orderBy", null);
     const sort_field = mapRegistrationOrderBy(order_by);
@@ -350,16 +322,16 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
     const fetch_limit: u32 = @intCast(first + skip);
 
     const events_result = try database.getRegistrations(.{
-        .protocol = filter_chain,
-        .registrant = filter_registrant,
-        .registrant_in = filter_registrant_in,
+        .protocol = parsed.chain,
+        .registrant = parsed.registrant,
+        .registrant_in = parsed.registrant_in,
         .limit = fetch_limit,
         .order_dir = order_dir,
         .sort_field = sort_field,
-        .expiry_gt = filter_expiry_gt,
-        .expiry_gte = filter_expiry_gte,
-        .expiry_lt = filter_expiry_lt,
-        .expiry_lte = filter_expiry_lte,
+        .expiry_gt = parsed.expiry_gt,
+        .expiry_gte = parsed.expiry_gte,
+        .expiry_lt = parsed.expiry_lt,
+        .expiry_lte = parsed.expiry_lte,
     });
     defer {
         for (events_result) |*event| {

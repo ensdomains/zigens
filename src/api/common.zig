@@ -123,6 +123,46 @@ pub fn matchAddressArg(arg: parser.Argument, name: []const u8, out: *?Address) !
     return true;
 }
 
+/// Collect a `[String!]` list-typed `where:` arg into a heap-owned slice of
+/// borrowed `[]const u8` slices. The slices point into the GraphQL arg
+/// buffer (caller-owned); only the outer container is freshly allocated.
+/// Use this for filters like `name_in: [String!]`, `labelName_not_in: [String!]`,
+/// `id_in: [String!]` etc. — replaces a ~9-line inline ArrayList dance at
+/// each call site.
+///
+/// Caps the list at `constants.Pagination.max_limit` to keep filter SQL
+/// bounded (large IN clauses degenerate into thousands of namehash lookups).
+/// Returns `error.TooManyNames` when over the cap. Returns `null` if the
+/// arg's value is not a list (caller can treat as "filter not applied").
+pub fn parseStringListArg(arg: parser.Argument, allocator: std.mem.Allocator) !?[][]const u8 {
+    const constants_mod = @import("../constants.zig");
+    if (arg.value != .list) return null;
+    if (arg.value.list.len > constants_mod.Pagination.max_limit) return error.TooManyNames;
+    var list: std.ArrayList([]const u8) = .{};
+    defer list.deinit(allocator);
+    for (arg.value.list) |item| {
+        if (item == .string) try list.append(allocator, item.string);
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+/// Collect a `[String!]` list-typed `where:` arg into a heap-owned slice of
+/// parsed `Address`. Sister to `parseStringListArg` — for filters like
+/// `owner_in: [String!]`. Surfaces `error.InvalidAddress` on any item that
+/// fails hex parsing (matches `matchAddressArg`'s fail-loud semantics).
+pub fn parseAddressListArg(arg: parser.Argument, allocator: std.mem.Allocator) !?[]Address {
+    if (arg.value != .list) return null;
+    var list: std.ArrayList(Address) = .{};
+    defer list.deinit(allocator);
+    for (arg.value.list) |item| {
+        if (item == .string) {
+            const addr = Address.fromHex(item.string) catch return error.InvalidAddress;
+            try list.append(allocator, addr);
+        }
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
 // ============================================================================
 // TESTS
 // ============================================================================

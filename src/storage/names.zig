@@ -1094,30 +1094,14 @@ fn appendNameFilterConditions(
     }
     if (filters.owner_in) |owners| {
         if (owners.len > 0) {
-            var in_parts: std.ArrayList(u8) = .{};
-            defer in_parts.deinit(db.allocator);
-            try in_parts.appendSlice(db.allocator, "owner IN (");
-            for (owners, 0..) |_, i| {
-                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
-                try in_parts.appendSlice(db.allocator, "?");
-            }
-            try in_parts.appendSlice(db.allocator, ")");
-            const clause = try db.allocator.dupe(u8, in_parts.items);
+            const clause = try db_module.query.buildInClause(db.allocator, "owner", "IN", owners.len);
             try allocated_strings.append(db.allocator, clause);
             try conditions.append(db.allocator, clause);
         }
     }
     if (filters.owner_not_in) |owners| {
         if (owners.len > 0) {
-            var in_parts: std.ArrayList(u8) = .{};
-            defer in_parts.deinit(db.allocator);
-            try in_parts.appendSlice(db.allocator, "owner NOT IN (");
-            for (owners, 0..) |_, i| {
-                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
-                try in_parts.appendSlice(db.allocator, "?");
-            }
-            try in_parts.appendSlice(db.allocator, ")");
-            const clause = try db.allocator.dupe(u8, in_parts.items);
+            const clause = try db_module.query.buildInClause(db.allocator, "owner", "NOT IN", owners.len);
             try allocated_strings.append(db.allocator, clause);
             try conditions.append(db.allocator, clause);
         }
@@ -1128,30 +1112,14 @@ fn appendNameFilterConditions(
         if (names.len == 0) {
             try conditions.append(db.allocator, "1=0");
         } else {
-            var in_parts: std.ArrayList(u8) = .{};
-            defer in_parts.deinit(db.allocator);
-            try in_parts.appendSlice(db.allocator, "name IN (");
-            for (names, 0..) |_, i| {
-                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
-                try in_parts.appendSlice(db.allocator, "?");
-            }
-            try in_parts.appendSlice(db.allocator, ")");
-            const clause = try db.allocator.dupe(u8, in_parts.items);
+            const clause = try db_module.query.buildInClause(db.allocator, "name", "IN", names.len);
             try allocated_strings.append(db.allocator, clause);
             try conditions.append(db.allocator, clause);
         }
     }
     if (filters.name_not_in) |names| {
         if (names.len > 0) {
-            var in_parts: std.ArrayList(u8) = .{};
-            defer in_parts.deinit(db.allocator);
-            try in_parts.appendSlice(db.allocator, "name NOT IN (");
-            for (names, 0..) |_, i| {
-                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
-                try in_parts.appendSlice(db.allocator, "?");
-            }
-            try in_parts.appendSlice(db.allocator, ")");
-            const clause = try db.allocator.dupe(u8, in_parts.items);
+            const clause = try db_module.query.buildInClause(db.allocator, "name", "NOT IN", names.len);
             try allocated_strings.append(db.allocator, clause);
             try conditions.append(db.allocator, clause);
         }
@@ -1169,30 +1137,14 @@ fn appendNameFilterConditions(
         if (labels.len == 0) {
             try conditions.append(db.allocator, "1=0");
         } else {
-            var in_parts: std.ArrayList(u8) = .{};
-            defer in_parts.deinit(db.allocator);
-            try in_parts.appendSlice(db.allocator, "label IN (");
-            for (labels, 0..) |_, i| {
-                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
-                try in_parts.appendSlice(db.allocator, "?");
-            }
-            try in_parts.appendSlice(db.allocator, ")");
-            const clause = try db.allocator.dupe(u8, in_parts.items);
+            const clause = try db_module.query.buildInClause(db.allocator, "label", "IN", labels.len);
             try allocated_strings.append(db.allocator, clause);
             try conditions.append(db.allocator, clause);
         }
     }
     if (filters.label_name_not_in) |labels| {
         if (labels.len > 0) {
-            var in_parts: std.ArrayList(u8) = .{};
-            defer in_parts.deinit(db.allocator);
-            try in_parts.appendSlice(db.allocator, "label NOT IN (");
-            for (labels, 0..) |_, i| {
-                if (i > 0) try in_parts.appendSlice(db.allocator, ", ");
-                try in_parts.appendSlice(db.allocator, "?");
-            }
-            try in_parts.appendSlice(db.allocator, ")");
-            const clause = try db.allocator.dupe(u8, in_parts.items);
+            const clause = try db_module.query.buildInClause(db.allocator, "label", "NOT IN", labels.len);
             try allocated_strings.append(db.allocator, clause);
             try conditions.append(db.allocator, clause);
         }

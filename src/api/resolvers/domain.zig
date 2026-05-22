@@ -4,7 +4,6 @@
 /// - resolveDomainConnection: Cursor-based pagination for domains
 const std = @import("std");
 const common = @import("common.zig");
-const constants = @import("../../constants.zig");
 const db = common.db;
 const models = common.models;
 const Address = common.Address;
@@ -42,6 +41,154 @@ pub fn mapDomainOrderBy(order_by: ?[]const u8) db.NameSortField {
     return .created_at;
 }
 
+/// Parsed `where:` arguments for the Domain queries.
+///
+/// `resolveDomains` and `resolveDomainConnection` both accept the same
+/// `DomainFilter` input object. Before this helper, each one had its own
+/// ~140-line parsing block that drifted between them every time a filter
+/// was added (and forced every new filter to be wired in twice). This struct
+/// centralises both the slot layout AND the parsing so they stay in sync by
+/// construction.
+const ParsedDomainFilter = struct {
+    name: ?[]const u8 = null,
+    name_in: ?[][]const u8 = null,
+    name_not: ?[]const u8 = null,
+    name_not_in: ?[][]const u8 = null,
+    name_contains: ?[]const u8 = null,
+    name_contains_nocase: ?[]const u8 = null,
+    name_not_contains: ?[]const u8 = null,
+    name_starts_with: ?[]const u8 = null,
+    name_starts_with_nocase: ?[]const u8 = null,
+    name_ends_with: ?[]const u8 = null,
+    name_ends_with_nocase: ?[]const u8 = null,
+    label_name: ?[]const u8 = null,
+    label_name_not: ?[]const u8 = null,
+    label_name_in: ?[][]const u8 = null,
+    label_name_not_in: ?[][]const u8 = null,
+    label_name_contains: ?[]const u8 = null,
+    label_name_contains_nocase: ?[]const u8 = null,
+    label_name_not_contains: ?[]const u8 = null,
+    label_name_starts_with: ?[]const u8 = null,
+    label_name_starts_with_nocase: ?[]const u8 = null,
+    label_name_ends_with: ?[]const u8 = null,
+    label_name_ends_with_nocase: ?[]const u8 = null,
+    owner: ?Address = null,
+    owner_in: ?[]Address = null,
+    owner_not: ?Address = null,
+    owner_not_in: ?[]Address = null,
+    resolved_address: ?Address = null,
+    resolver: ?Address = null,
+    has_subdomains: ?bool = null,
+    subdomain_count_gt: ?i64 = null,
+    subdomain_count_lt: ?i64 = null,
+    expiry_gt: ?i64 = null,
+    expiry_gte: ?i64 = null,
+    expiry_lt: ?i64 = null,
+    expiry_lte: ?i64 = null,
+    migrated: ?bool = null,
+    include_unreachable: ?bool = null,
+
+    /// Frees the heap-allocated slice fields (`*_in` lists) populated by the
+    /// parser. Scalar fields point into the caller-owned GraphQL arg buffer
+    /// and need no cleanup.
+    pub fn deinit(self: *ParsedDomainFilter, allocator: std.mem.Allocator) void {
+        if (self.name_in) |s| allocator.free(s);
+        if (self.name_not_in) |s| allocator.free(s);
+        if (self.label_name_in) |s| allocator.free(s);
+        if (self.label_name_not_in) |s| allocator.free(s);
+        if (self.owner_in) |s| allocator.free(s);
+        if (self.owner_not_in) |s| allocator.free(s);
+    }
+};
+
+/// Parse the `where:` arg of a domains/domainConnection query into the
+/// `ParsedDomainFilter` struct. Unknown args were already rejected by the
+/// schema validator at parse time, so the `or`-chain at the bottom discards
+/// match-misses silently.
+fn parseDomainWhere(field: *const parser.Field, allocator: std.mem.Allocator) !ParsedDomainFilter {
+    var out = ParsedDomainFilter{};
+    errdefer out.deinit(allocator);
+
+    const where_args = common.getObjectArg(field, "where") orelse return out;
+
+    for (where_args) |a| {
+        // List-typed args allocate via the shared helpers in common.zig.
+        if (std.mem.eql(u8, a.name, "owner_in")) {
+            if (try common.parseAddressListArg(a, allocator)) |v| out.owner_in = v;
+            continue;
+        }
+        if (std.mem.eql(u8, a.name, "owner_not_in")) {
+            if (try common.parseAddressListArg(a, allocator)) |v| out.owner_not_in = v;
+            continue;
+        }
+        if (std.mem.eql(u8, a.name, "name_in")) {
+            if (try common.parseStringListArg(a, allocator)) |v| out.name_in = v;
+            continue;
+        }
+        if (std.mem.eql(u8, a.name, "name_not_in")) {
+            if (try common.parseStringListArg(a, allocator)) |v| out.name_not_in = v;
+            continue;
+        }
+        if (std.mem.eql(u8, a.name, "labelName_in")) {
+            if (try common.parseStringListArg(a, allocator)) |v| out.label_name_in = v;
+            continue;
+        }
+        if (std.mem.eql(u8, a.name, "labelName_not_in")) {
+            if (try common.parseStringListArg(a, allocator)) |v| out.label_name_not_in = v;
+            continue;
+        }
+        // `owner_:` nested AccountFilter — subgraph parity — translates to owner / owner_in.
+        if (std.mem.eql(u8, a.name, "owner_") and a.value == .object) {
+            for (a.value.object) |nested| {
+                if (std.mem.eql(u8, nested.name, "id") and nested.value == .string) {
+                    out.owner = Address.fromHex(nested.value.string) catch return error.InvalidAddress;
+                } else if (std.mem.eql(u8, nested.name, "id_in")) {
+                    if (try common.parseAddressListArg(nested, allocator)) |v| out.owner_in = v;
+                }
+            }
+            continue;
+        }
+
+        _ = common.matchStringArg(a, "name", &out.name) or
+            common.matchStringArg(a, "name_not", &out.name_not) or
+            common.matchStringArg(a, "name_contains", &out.name_contains) or
+            common.matchStringArg(a, "name_contains_nocase", &out.name_contains_nocase) or
+            common.matchStringArg(a, "name_not_contains", &out.name_not_contains) or
+            common.matchStringArg(a, "name_starts_with", &out.name_starts_with) or
+            common.matchStringArg(a, "name_starts_with_nocase", &out.name_starts_with_nocase) or
+            common.matchStringArg(a, "name_ends_with", &out.name_ends_with) or
+            common.matchStringArg(a, "name_ends_with_nocase", &out.name_ends_with_nocase) or
+            common.matchStringArg(a, "labelName", &out.label_name) or
+            common.matchStringArg(a, "labelName_not", &out.label_name_not) or
+            common.matchStringArg(a, "labelName_contains", &out.label_name_contains) or
+            common.matchStringArg(a, "labelName_contains_nocase", &out.label_name_contains_nocase) or
+            common.matchStringArg(a, "labelName_not_contains", &out.label_name_not_contains) or
+            common.matchStringArg(a, "labelName_starts_with", &out.label_name_starts_with) or
+            common.matchStringArg(a, "labelName_starts_with_nocase", &out.label_name_starts_with_nocase) or
+            common.matchStringArg(a, "labelName_ends_with", &out.label_name_ends_with) or
+            common.matchStringArg(a, "labelName_ends_with_nocase", &out.label_name_ends_with_nocase) or
+            (try common.matchAddressArg(a, "owner", &out.owner)) or
+            (try common.matchAddressArg(a, "owner_not", &out.owner_not)) or
+            (try common.matchAddressArg(a, "resolvedAddress", &out.resolved_address)) or
+            (try common.matchAddressArg(a, "resolver", &out.resolver)) or
+            common.matchBoolArg(a, "hasSubdomains", &out.has_subdomains) or
+            common.matchIntArg(a, "subdomainCount_gt", &out.subdomain_count_gt) or
+            common.matchIntArg(a, "subdomainCount_lt", &out.subdomain_count_lt) or
+            common.matchIntArg(a, "expiry_gt", &out.expiry_gt) or
+            common.matchIntArg(a, "expiry_gte", &out.expiry_gte) or
+            common.matchIntArg(a, "expiry_lt", &out.expiry_lt) or
+            common.matchIntArg(a, "expiry_lte", &out.expiry_lte) or
+            // Subgraph-parity aliases — populate the same filter slots as expiry_*.
+            common.matchIntArg(a, "expiryDate_gt", &out.expiry_gt) or
+            common.matchIntArg(a, "expiryDate_gte", &out.expiry_gte) or
+            common.matchIntArg(a, "expiryDate_lt", &out.expiry_lt) or
+            common.matchIntArg(a, "expiryDate_lte", &out.expiry_lte) or
+            common.matchBoolArg(a, "isMigrated", &out.migrated) or
+            common.matchBoolArg(a, "includeUnreachable", &out.include_unreachable);
+    }
+    return out;
+}
+
 pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
     const allocator = ctx.allocator;
@@ -50,196 +197,47 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
     const first = page.first;
     const skip = page.skip;
 
-    // Parse `where` filter
-    var filter_name: ?[]const u8 = null;
-    var filter_name_in: ?[][]const u8 = null;
-    var filter_name_not: ?[]const u8 = null;
-    var filter_name_not_in: ?[][]const u8 = null;
-    var filter_name_contains: ?[]const u8 = null;
-    var filter_name_contains_nocase: ?[]const u8 = null;
-    var filter_name_not_contains: ?[]const u8 = null;
-    var filter_name_starts_with: ?[]const u8 = null;
-    var filter_name_starts_with_nocase: ?[]const u8 = null;
-    var filter_name_ends_with: ?[]const u8 = null;
-    var filter_name_ends_with_nocase: ?[]const u8 = null;
-    var filter_label_name: ?[]const u8 = null;
-    var filter_label_name_not: ?[]const u8 = null;
-    var filter_label_name_in: ?[][]const u8 = null;
-    var filter_label_name_not_in: ?[][]const u8 = null;
-    var filter_label_name_contains: ?[]const u8 = null;
-    var filter_label_name_contains_nocase: ?[]const u8 = null;
-    var filter_label_name_not_contains: ?[]const u8 = null;
-    var filter_label_name_starts_with: ?[]const u8 = null;
-    var filter_label_name_starts_with_nocase: ?[]const u8 = null;
-    var filter_label_name_ends_with: ?[]const u8 = null;
-    var filter_label_name_ends_with_nocase: ?[]const u8 = null;
-    var filter_owner: ?Address = null;
-    var filter_owner_in: ?[]Address = null;
-    var filter_owner_not: ?Address = null;
-    var filter_owner_not_in: ?[]Address = null;
-    var filter_resolved_address: ?Address = null;
-    var filter_resolver: ?Address = null;
-    var filter_has_subdomains: ?bool = null;
-    var filter_subdomain_count_gt: ?i64 = null;
-    var filter_subdomain_count_lt: ?i64 = null;
-    var filter_expiry_gt: ?i64 = null;
-    var filter_expiry_gte: ?i64 = null;
-    var filter_expiry_lt: ?i64 = null;
-    var filter_expiry_lte: ?i64 = null;
-    var filter_migrated: ?bool = null;
-    var filter_include_unreachable: ?bool = null;
+    // Parse `where` filter via the shared helper.
+    var parsed = try parseDomainWhere(field, allocator);
+    defer parsed.deinit(allocator);
+    const filter_name = parsed.name;
+    const filter_name_in = parsed.name_in;
+    const filter_name_not = parsed.name_not;
+    const filter_name_not_in = parsed.name_not_in;
+    const filter_name_contains = parsed.name_contains;
+    const filter_name_contains_nocase = parsed.name_contains_nocase;
+    const filter_name_not_contains = parsed.name_not_contains;
+    const filter_name_starts_with = parsed.name_starts_with;
+    const filter_name_starts_with_nocase = parsed.name_starts_with_nocase;
+    const filter_name_ends_with = parsed.name_ends_with;
+    const filter_name_ends_with_nocase = parsed.name_ends_with_nocase;
+    const filter_label_name = parsed.label_name;
+    const filter_label_name_not = parsed.label_name_not;
+    const filter_label_name_in = parsed.label_name_in;
+    const filter_label_name_not_in = parsed.label_name_not_in;
+    const filter_label_name_contains = parsed.label_name_contains;
+    const filter_label_name_contains_nocase = parsed.label_name_contains_nocase;
+    const filter_label_name_not_contains = parsed.label_name_not_contains;
+    const filter_label_name_starts_with = parsed.label_name_starts_with;
+    const filter_label_name_starts_with_nocase = parsed.label_name_starts_with_nocase;
+    const filter_label_name_ends_with = parsed.label_name_ends_with;
+    const filter_label_name_ends_with_nocase = parsed.label_name_ends_with_nocase;
+    const filter_owner = parsed.owner;
+    const filter_owner_in = parsed.owner_in;
+    const filter_owner_not = parsed.owner_not;
+    const filter_owner_not_in = parsed.owner_not_in;
+    const filter_resolved_address = parsed.resolved_address;
+    const filter_resolver = parsed.resolver;
+    const filter_has_subdomains = parsed.has_subdomains;
+    const filter_subdomain_count_gt = parsed.subdomain_count_gt;
+    const filter_subdomain_count_lt = parsed.subdomain_count_lt;
+    const filter_expiry_gt = parsed.expiry_gt;
+    const filter_expiry_gte = parsed.expiry_gte;
+    const filter_expiry_lt = parsed.expiry_lt;
+    const filter_expiry_lte = parsed.expiry_lte;
+    const filter_migrated = parsed.migrated;
 
-    if (common.getObjectArg(field, "where")) |where_args| {
-        for (where_args) |a| {
-            // owner_in / owner_not_in: list-of-Address — handled inline because it allocates.
-            // Surface invalid addresses as errors (matches matchAddressArg's behavior).
-            if (std.mem.eql(u8, a.name, "owner_in") and a.value == .list) {
-                var addresses: std.ArrayList(Address) = .{};
-                defer addresses.deinit(allocator);
-                for (a.value.list) |item| {
-                    if (item == .string) {
-                        const addr = Address.fromHex(item.string) catch return error.InvalidAddress;
-                        try addresses.append(allocator, addr);
-                    }
-                }
-                filter_owner_in = try addresses.toOwnedSlice(allocator);
-                continue;
-            }
-            if (std.mem.eql(u8, a.name, "owner_not_in") and a.value == .list) {
-                var addresses: std.ArrayList(Address) = .{};
-                defer addresses.deinit(allocator);
-                for (a.value.list) |item| {
-                    if (item == .string) {
-                        const addr = Address.fromHex(item.string) catch return error.InvalidAddress;
-                        try addresses.append(allocator, addr);
-                    }
-                }
-                filter_owner_not_in = try addresses.toOwnedSlice(allocator);
-                continue;
-            }
-
-            // name_in / name_not_in: list-of-string. Cap at MAX_FIRST so a query can't
-            // degenerate into thousands of namehash lookups via the filter.
-            if (std.mem.eql(u8, a.name, "name_in") and a.value == .list) {
-                if (a.value.list.len > constants.Pagination.max_limit) return error.TooManyNames;
-                var names_list: std.ArrayList([]const u8) = .{};
-                defer names_list.deinit(allocator);
-                for (a.value.list) |item| {
-                    if (item == .string) {
-                        try names_list.append(allocator, item.string);
-                    }
-                }
-                filter_name_in = try names_list.toOwnedSlice(allocator);
-                continue;
-            }
-            if (std.mem.eql(u8, a.name, "name_not_in") and a.value == .list) {
-                if (a.value.list.len > constants.Pagination.max_limit) return error.TooManyNames;
-                var names_list: std.ArrayList([]const u8) = .{};
-                defer names_list.deinit(allocator);
-                for (a.value.list) |item| {
-                    if (item == .string) {
-                        try names_list.append(allocator, item.string);
-                    }
-                }
-                filter_name_not_in = try names_list.toOwnedSlice(allocator);
-                continue;
-            }
-
-            // labelName_in / labelName_not_in: list-of-string — allocates so handled inline.
-            if (std.mem.eql(u8, a.name, "labelName_in") and a.value == .list) {
-                if (a.value.list.len > constants.Pagination.max_limit) return error.TooManyNames;
-                var labels_list: std.ArrayList([]const u8) = .{};
-                defer labels_list.deinit(allocator);
-                for (a.value.list) |item| {
-                    if (item == .string) {
-                        try labels_list.append(allocator, item.string);
-                    }
-                }
-                filter_label_name_in = try labels_list.toOwnedSlice(allocator);
-                continue;
-            }
-            if (std.mem.eql(u8, a.name, "labelName_not_in") and a.value == .list) {
-                if (a.value.list.len > constants.Pagination.max_limit) return error.TooManyNames;
-                var labels_list: std.ArrayList([]const u8) = .{};
-                defer labels_list.deinit(allocator);
-                for (a.value.list) |item| {
-                    if (item == .string) {
-                        try labels_list.append(allocator, item.string);
-                    }
-                }
-                filter_label_name_not_in = try labels_list.toOwnedSlice(allocator);
-                continue;
-            }
-
-            // owner_: nested AccountFilter (subgraph parity). Translates to owner / owner_in.
-            if (std.mem.eql(u8, a.name, "owner_") and a.value == .object) {
-                for (a.value.object) |nested| {
-                    if (std.mem.eql(u8, nested.name, "id") and nested.value == .string) {
-                        filter_owner = Address.fromHex(nested.value.string) catch return error.InvalidAddress;
-                    } else if (std.mem.eql(u8, nested.name, "id_in") and nested.value == .list) {
-                        var addresses: std.ArrayList(Address) = .{};
-                        defer addresses.deinit(allocator);
-                        for (nested.value.list) |item| {
-                            if (item == .string) {
-                                const addr = Address.fromHex(item.string) catch return error.InvalidAddress;
-                                try addresses.append(allocator, addr);
-                            }
-                        }
-                        filter_owner_in = try addresses.toOwnedSlice(allocator);
-                    }
-                }
-                continue;
-            }
-
-            // Unknown-arg rejection is handled at parse time by the schema
-            // validator (src/api/schema_validator.zig). We discard the
-            // `or`-chain result with `_ =` because match misses are no longer
-            // a resolver-layer concern.
-            _ = common.matchStringArg(a, "name", &filter_name) or
-                common.matchStringArg(a, "name_not", &filter_name_not) or
-                common.matchStringArg(a, "name_contains", &filter_name_contains) or
-                common.matchStringArg(a, "name_contains_nocase", &filter_name_contains_nocase) or
-                common.matchStringArg(a, "name_not_contains", &filter_name_not_contains) or
-                common.matchStringArg(a, "name_starts_with", &filter_name_starts_with) or
-                common.matchStringArg(a, "name_starts_with_nocase", &filter_name_starts_with_nocase) or
-                common.matchStringArg(a, "name_ends_with", &filter_name_ends_with) or
-                common.matchStringArg(a, "name_ends_with_nocase", &filter_name_ends_with_nocase) or
-                common.matchStringArg(a, "labelName", &filter_label_name) or
-                common.matchStringArg(a, "labelName_not", &filter_label_name_not) or
-                common.matchStringArg(a, "labelName_contains", &filter_label_name_contains) or
-                common.matchStringArg(a, "labelName_contains_nocase", &filter_label_name_contains_nocase) or
-                common.matchStringArg(a, "labelName_not_contains", &filter_label_name_not_contains) or
-                common.matchStringArg(a, "labelName_starts_with", &filter_label_name_starts_with) or
-                common.matchStringArg(a, "labelName_starts_with_nocase", &filter_label_name_starts_with_nocase) or
-                common.matchStringArg(a, "labelName_ends_with", &filter_label_name_ends_with) or
-                common.matchStringArg(a, "labelName_ends_with_nocase", &filter_label_name_ends_with_nocase) or
-                (try common.matchAddressArg(a, "owner", &filter_owner)) or
-                (try common.matchAddressArg(a, "owner_not", &filter_owner_not)) or
-                (try common.matchAddressArg(a, "resolvedAddress", &filter_resolved_address)) or
-                (try common.matchAddressArg(a, "resolver", &filter_resolver)) or
-                common.matchBoolArg(a, "hasSubdomains", &filter_has_subdomains) or
-                common.matchIntArg(a, "subdomainCount_gt", &filter_subdomain_count_gt) or
-                common.matchIntArg(a, "subdomainCount_lt", &filter_subdomain_count_lt) or
-                common.matchIntArg(a, "expiry_gt", &filter_expiry_gt) or
-                common.matchIntArg(a, "expiry_gte", &filter_expiry_gte) or
-                common.matchIntArg(a, "expiry_lt", &filter_expiry_lt) or
-                common.matchIntArg(a, "expiry_lte", &filter_expiry_lte) or
-                // Subgraph-parity aliases — populate the same filter slots as expiry_*.
-                common.matchIntArg(a, "expiryDate_gt", &filter_expiry_gt) or
-                common.matchIntArg(a, "expiryDate_gte", &filter_expiry_gte) or
-                common.matchIntArg(a, "expiryDate_lt", &filter_expiry_lt) or
-                common.matchIntArg(a, "expiryDate_lte", &filter_expiry_lte) or
-                common.matchBoolArg(a, "isMigrated", &filter_migrated) or
-                common.matchBoolArg(a, "includeUnreachable", &filter_include_unreachable);
-        }
-    }
-    defer if (filter_name_in) |names| allocator.free(names);
-    defer if (filter_name_not_in) |names| allocator.free(names);
-    defer if (filter_label_name_in) |labels| allocator.free(labels);
-    defer if (filter_label_name_not_in) |labels| allocator.free(labels);
-    defer if (filter_owner_not_in) |owners| allocator.free(owners);
-
-    const include_unreachable = filter_include_unreachable orelse false;
+    const include_unreachable = parsed.include_unreachable orelse false;
 
     const order_by = parser.getStringArg(field, "orderBy", null);
     const order_dir_parsed = common.parseOrderDirection(field, db.OrderDir, .desc);
@@ -423,190 +421,47 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         1000, // max limit
     );
 
-    // Parse where filters
-    var filter_owner: ?Address = null;
-    var filter_owner_in: ?[]Address = null;
-    var filter_owner_not: ?Address = null;
-    var filter_owner_not_in: ?[]Address = null;
-    var filter_name: ?[]const u8 = null;
-    var filter_name_in: ?[][]const u8 = null;
-    var filter_name_not: ?[]const u8 = null;
-    var filter_name_not_in: ?[][]const u8 = null;
-    var filter_name_contains: ?[]const u8 = null;
-    var filter_name_contains_nocase: ?[]const u8 = null;
-    var filter_name_not_contains: ?[]const u8 = null;
-    var filter_name_starts_with: ?[]const u8 = null;
-    var filter_name_starts_with_nocase: ?[]const u8 = null;
-    var filter_name_ends_with: ?[]const u8 = null;
-    var filter_name_ends_with_nocase: ?[]const u8 = null;
-    var filter_label_name: ?[]const u8 = null;
-    var filter_label_name_not: ?[]const u8 = null;
-    var filter_label_name_in: ?[][]const u8 = null;
-    var filter_label_name_not_in: ?[][]const u8 = null;
-    var filter_label_name_contains: ?[]const u8 = null;
-    var filter_label_name_contains_nocase: ?[]const u8 = null;
-    var filter_label_name_not_contains: ?[]const u8 = null;
-    var filter_label_name_starts_with: ?[]const u8 = null;
-    var filter_label_name_starts_with_nocase: ?[]const u8 = null;
-    var filter_label_name_ends_with: ?[]const u8 = null;
-    var filter_label_name_ends_with_nocase: ?[]const u8 = null;
-    var filter_resolved_address: ?Address = null;
-    var filter_resolver: ?Address = null;
-    var filter_has_subdomains: ?bool = null;
-    var filter_subdomain_count_gt: ?i64 = null;
-    var filter_subdomain_count_lt: ?i64 = null;
-    var filter_expiry_gt: ?i64 = null;
-    var filter_expiry_gte: ?i64 = null;
-    var filter_expiry_lt: ?i64 = null;
-    var filter_expiry_lte: ?i64 = null;
-    var filter_migrated: ?bool = null;
-    var filter_include_unreachable: ?bool = null;
+    // Parse `where` filter via the shared helper.
+    var parsed = try parseDomainWhere(field, allocator);
+    defer parsed.deinit(allocator);
+    const filter_owner = parsed.owner;
+    const filter_owner_in = parsed.owner_in;
+    const filter_owner_not = parsed.owner_not;
+    const filter_owner_not_in = parsed.owner_not_in;
+    const filter_name = parsed.name;
+    const filter_name_in = parsed.name_in;
+    const filter_name_not = parsed.name_not;
+    const filter_name_not_in = parsed.name_not_in;
+    const filter_name_contains = parsed.name_contains;
+    const filter_name_contains_nocase = parsed.name_contains_nocase;
+    const filter_name_not_contains = parsed.name_not_contains;
+    const filter_name_starts_with = parsed.name_starts_with;
+    const filter_name_starts_with_nocase = parsed.name_starts_with_nocase;
+    const filter_name_ends_with = parsed.name_ends_with;
+    const filter_name_ends_with_nocase = parsed.name_ends_with_nocase;
+    const filter_label_name = parsed.label_name;
+    const filter_label_name_not = parsed.label_name_not;
+    const filter_label_name_in = parsed.label_name_in;
+    const filter_label_name_not_in = parsed.label_name_not_in;
+    const filter_label_name_contains = parsed.label_name_contains;
+    const filter_label_name_contains_nocase = parsed.label_name_contains_nocase;
+    const filter_label_name_not_contains = parsed.label_name_not_contains;
+    const filter_label_name_starts_with = parsed.label_name_starts_with;
+    const filter_label_name_starts_with_nocase = parsed.label_name_starts_with_nocase;
+    const filter_label_name_ends_with = parsed.label_name_ends_with;
+    const filter_label_name_ends_with_nocase = parsed.label_name_ends_with_nocase;
+    const filter_resolved_address = parsed.resolved_address;
+    const filter_resolver = parsed.resolver;
+    const filter_has_subdomains = parsed.has_subdomains;
+    const filter_subdomain_count_gt = parsed.subdomain_count_gt;
+    const filter_subdomain_count_lt = parsed.subdomain_count_lt;
+    const filter_expiry_gt = parsed.expiry_gt;
+    const filter_expiry_gte = parsed.expiry_gte;
+    const filter_expiry_lt = parsed.expiry_lt;
+    const filter_expiry_lte = parsed.expiry_lte;
+    const filter_migrated = parsed.migrated;
 
-    if (common.getObjectArg(field, "where")) |where_args| {
-        for (where_args) |a| {
-            if (std.mem.eql(u8, a.name, "owner_in") and a.value == .list) {
-                var addresses: std.ArrayList(Address) = .{};
-                defer addresses.deinit(allocator);
-                for (a.value.list) |item| {
-                    if (item == .string) {
-                        const addr = Address.fromHex(item.string) catch return error.InvalidAddress;
-                        try addresses.append(allocator, addr);
-                    }
-                }
-                filter_owner_in = try addresses.toOwnedSlice(allocator);
-                continue;
-            }
-            if (std.mem.eql(u8, a.name, "owner_not_in") and a.value == .list) {
-                var addresses: std.ArrayList(Address) = .{};
-                defer addresses.deinit(allocator);
-                for (a.value.list) |item| {
-                    if (item == .string) {
-                        const addr = Address.fromHex(item.string) catch return error.InvalidAddress;
-                        try addresses.append(allocator, addr);
-                    }
-                }
-                filter_owner_not_in = try addresses.toOwnedSlice(allocator);
-                continue;
-            }
-
-            if (std.mem.eql(u8, a.name, "name_in") and a.value == .list) {
-                if (a.value.list.len > constants.Pagination.max_limit) return error.TooManyNames;
-                var names_list: std.ArrayList([]const u8) = .{};
-                defer names_list.deinit(allocator);
-                for (a.value.list) |item| {
-                    if (item == .string) {
-                        try names_list.append(allocator, item.string);
-                    }
-                }
-                filter_name_in = try names_list.toOwnedSlice(allocator);
-                continue;
-            }
-            if (std.mem.eql(u8, a.name, "name_not_in") and a.value == .list) {
-                if (a.value.list.len > constants.Pagination.max_limit) return error.TooManyNames;
-                var names_list: std.ArrayList([]const u8) = .{};
-                defer names_list.deinit(allocator);
-                for (a.value.list) |item| {
-                    if (item == .string) {
-                        try names_list.append(allocator, item.string);
-                    }
-                }
-                filter_name_not_in = try names_list.toOwnedSlice(allocator);
-                continue;
-            }
-
-            // labelName_in / labelName_not_in: list-of-string — allocates so handled inline.
-            if (std.mem.eql(u8, a.name, "labelName_in") and a.value == .list) {
-                if (a.value.list.len > constants.Pagination.max_limit) return error.TooManyNames;
-                var labels_list: std.ArrayList([]const u8) = .{};
-                defer labels_list.deinit(allocator);
-                for (a.value.list) |item| {
-                    if (item == .string) {
-                        try labels_list.append(allocator, item.string);
-                    }
-                }
-                filter_label_name_in = try labels_list.toOwnedSlice(allocator);
-                continue;
-            }
-            if (std.mem.eql(u8, a.name, "labelName_not_in") and a.value == .list) {
-                if (a.value.list.len > constants.Pagination.max_limit) return error.TooManyNames;
-                var labels_list: std.ArrayList([]const u8) = .{};
-                defer labels_list.deinit(allocator);
-                for (a.value.list) |item| {
-                    if (item == .string) {
-                        try labels_list.append(allocator, item.string);
-                    }
-                }
-                filter_label_name_not_in = try labels_list.toOwnedSlice(allocator);
-                continue;
-            }
-
-            // owner_: nested AccountFilter (subgraph parity). Translates to owner / owner_in.
-            if (std.mem.eql(u8, a.name, "owner_") and a.value == .object) {
-                for (a.value.object) |nested| {
-                    if (std.mem.eql(u8, nested.name, "id") and nested.value == .string) {
-                        filter_owner = Address.fromHex(nested.value.string) catch return error.InvalidAddress;
-                    } else if (std.mem.eql(u8, nested.name, "id_in") and nested.value == .list) {
-                        var addresses: std.ArrayList(Address) = .{};
-                        defer addresses.deinit(allocator);
-                        for (nested.value.list) |item| {
-                            if (item == .string) {
-                                const addr = Address.fromHex(item.string) catch return error.InvalidAddress;
-                                try addresses.append(allocator, addr);
-                            }
-                        }
-                        filter_owner_in = try addresses.toOwnedSlice(allocator);
-                    }
-                }
-                continue;
-            }
-
-            // Unknown args caught at parse time by schema_validator.zig.
-            _ = common.matchStringArg(a, "name", &filter_name) or
-                common.matchStringArg(a, "name_not", &filter_name_not) or
-                common.matchStringArg(a, "name_contains", &filter_name_contains) or
-                common.matchStringArg(a, "name_contains_nocase", &filter_name_contains_nocase) or
-                common.matchStringArg(a, "name_not_contains", &filter_name_not_contains) or
-                common.matchStringArg(a, "name_starts_with", &filter_name_starts_with) or
-                common.matchStringArg(a, "name_starts_with_nocase", &filter_name_starts_with_nocase) or
-                common.matchStringArg(a, "name_ends_with", &filter_name_ends_with) or
-                common.matchStringArg(a, "name_ends_with_nocase", &filter_name_ends_with_nocase) or
-                common.matchStringArg(a, "labelName", &filter_label_name) or
-                common.matchStringArg(a, "labelName_not", &filter_label_name_not) or
-                common.matchStringArg(a, "labelName_contains", &filter_label_name_contains) or
-                common.matchStringArg(a, "labelName_contains_nocase", &filter_label_name_contains_nocase) or
-                common.matchStringArg(a, "labelName_not_contains", &filter_label_name_not_contains) or
-                common.matchStringArg(a, "labelName_starts_with", &filter_label_name_starts_with) or
-                common.matchStringArg(a, "labelName_starts_with_nocase", &filter_label_name_starts_with_nocase) or
-                common.matchStringArg(a, "labelName_ends_with", &filter_label_name_ends_with) or
-                common.matchStringArg(a, "labelName_ends_with_nocase", &filter_label_name_ends_with_nocase) or
-                (try common.matchAddressArg(a, "owner", &filter_owner)) or
-                (try common.matchAddressArg(a, "owner_not", &filter_owner_not)) or
-                (try common.matchAddressArg(a, "resolvedAddress", &filter_resolved_address)) or
-                (try common.matchAddressArg(a, "resolver", &filter_resolver)) or
-                common.matchBoolArg(a, "hasSubdomains", &filter_has_subdomains) or
-                common.matchIntArg(a, "subdomainCount_gt", &filter_subdomain_count_gt) or
-                common.matchIntArg(a, "subdomainCount_lt", &filter_subdomain_count_lt) or
-                common.matchIntArg(a, "expiry_gt", &filter_expiry_gt) or
-                common.matchIntArg(a, "expiry_gte", &filter_expiry_gte) or
-                common.matchIntArg(a, "expiry_lt", &filter_expiry_lt) or
-                common.matchIntArg(a, "expiry_lte", &filter_expiry_lte) or
-                // Subgraph-parity aliases — populate the same filter slots as expiry_*.
-                common.matchIntArg(a, "expiryDate_gt", &filter_expiry_gt) or
-                common.matchIntArg(a, "expiryDate_gte", &filter_expiry_gte) or
-                common.matchIntArg(a, "expiryDate_lt", &filter_expiry_lt) or
-                common.matchIntArg(a, "expiryDate_lte", &filter_expiry_lte) or
-                common.matchBoolArg(a, "isMigrated", &filter_migrated) or
-                common.matchBoolArg(a, "includeUnreachable", &filter_include_unreachable);
-        }
-    }
-    defer if (filter_owner_in) |owners| allocator.free(owners);
-    defer if (filter_owner_not_in) |owners| allocator.free(owners);
-    defer if (filter_name_in) |names| allocator.free(names);
-    defer if (filter_name_not_in) |names| allocator.free(names);
-    defer if (filter_label_name_in) |labels| allocator.free(labels);
-    defer if (filter_label_name_not_in) |labels| allocator.free(labels);
-
-    const include_unreachable = filter_include_unreachable orelse false;
+    const include_unreachable = parsed.include_unreachable orelse false;
 
     const name_filters = db.NameFilters{
         .owner = filter_owner,

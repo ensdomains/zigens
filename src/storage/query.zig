@@ -428,6 +428,33 @@ pub const Query = struct {
 // CONVENIENCE FUNCTIONS
 // ============================================================================
 
+/// Build a parameterized SQL `IN`/`NOT IN` clause: `<column> <op> (?, ?, …)`.
+///
+/// Caller owns the returned slice (free with `allocator.free`). `op` is the
+/// uppercase phrase to insert between column and parenthesised placeholders,
+/// typically `"IN"` or `"NOT IN"`. `count` is the number of placeholders;
+/// callers should special-case `count == 0` themselves (this helper returns
+/// a syntactically valid but always-empty clause when count is 0).
+///
+/// Replaces the 13-line ArrayList/loop dance that previously sat at 7
+/// different sites in `names.zig` and `accounts.zig`. New filter slots get
+/// one-liner clause construction with no chance of formatting drift.
+pub fn buildInClause(allocator: std.mem.Allocator, column: []const u8, op: []const u8, count: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .{};
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, column);
+    try out.append(allocator, ' ');
+    try out.appendSlice(allocator, op);
+    try out.appendSlice(allocator, " (");
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        if (i > 0) try out.appendSlice(allocator, ", ");
+        try out.appendSlice(allocator, "?");
+    }
+    try out.appendSlice(allocator, ")");
+    return try out.toOwnedSlice(allocator);
+}
+
 /// Execute a simple statement with no parameters or results
 pub fn exec(database: *Database, sql: []const u8) !void {
     var q = try Query.init(database, sql);

@@ -272,13 +272,8 @@ pub fn resolveResolverEntities(ctx: parser.ExecutionContext, field: *const parse
 
     if (common.getObjectArg(field, "where")) |where_args| {
         for (where_args) |a| {
-            if (std.mem.eql(u8, a.name, "address_in") and a.value == .list) {
-                var lst: std.ArrayList([]const u8) = .{};
-                defer lst.deinit(allocator);
-                for (a.value.list) |item| {
-                    if (item == .string) try lst.append(allocator, item.string);
-                }
-                filter_address_in = try lst.toOwnedSlice(allocator);
+            if (std.mem.eql(u8, a.name, "address_in")) {
+                if (try common.parseStringListArg(a, allocator)) |v| filter_address_in = v;
                 continue;
             }
             // Unknown args caught at parse time by schema_validator.zig.

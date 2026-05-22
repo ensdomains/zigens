@@ -50,14 +50,7 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
 
     // Record the new owner as an Account on first observation. Skip the
     // zero-address sentinel (burned/cleared, not a real account holder).
-    if (!owner.isZero()) {
-        self.database.upsertAccount(
-            protocol,
-            owner_hex,
-            log.block_number,
-            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
-    }
+    utils.recordAccountObservation(self, protocol, owner, log);
 
     // Compute the subdomain namehash: keccak256(parent_node + labelhash)
     var subdomain_input: [64]u8 = undefined;
@@ -294,14 +287,7 @@ pub fn handleV1RegistryTransfer(self: *Indexer, protocol: models.Protocol, log: 
     var owner_buf: [42]u8 = undefined;
     const owner_hex = owner.toHexBuf(&owner_buf);
 
-    if (!owner.isZero()) {
-        self.database.upsertAccount(
-            protocol,
-            owner_hex,
-            log.block_number,
-            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
-    }
+    utils.recordAccountObservation(self, protocol, owner, log);
 
     std.log.debug("V1 RegistryTransfer: node={s} owner={s}", .{ node_hex, owner_hex });
 
@@ -501,14 +487,7 @@ pub fn handleV1NameWrapped(self: *Indexer, protocol: models.Protocol, log: rpc.L
     var owner_buf: [42]u8 = undefined;
     const owner_hex = owner.toHexBuf(&owner_buf);
 
-    if (!owner.isZero()) {
-        self.database.upsertAccount(
-            protocol,
-            owner_hex,
-            log.block_number,
-            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
-    }
+    utils.recordAccountObservation(self, protocol, owner, log);
 
     std.log.debug("V1 NameWrapped: node={s} owner={s} fuses={d} expiry={d}", .{ node_hex, owner_hex, fuses, expiry });
 
@@ -749,14 +728,7 @@ pub fn handleV1ERC721Transfer(self: *Indexer, protocol: models.Protocol, log: rp
     var to_buf: [42]u8 = undefined;
     const to_hex = to.toHexBuf(&to_buf);
 
-    if (!to.isZero()) {
-        self.database.upsertAccount(
-            protocol,
-            to_hex,
-            log.block_number,
-            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
-    }
+    utils.recordAccountObservation(self, protocol, to, log);
 
     std.log.debug("V1 ERC721 Transfer: from={s} to={s} tokenId={d}", .{ from_hex, to_hex, token_id });
 
@@ -860,14 +832,7 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, protocol: models.Prot
     var owner_buf: [42]u8 = undefined;
     const owner_hex = owner.toHexBuf(&owner_buf);
 
-    if (!owner.isZero()) {
-        self.database.upsertAccount(
-            protocol,
-            owner_hex,
-            log.block_number,
-            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
-    }
+    utils.recordAccountObservation(self, protocol, owner, log);
 
     // Convert tokenID to hex for label lookup (big-endian byte order)
     const token_id_hex = try utils.tokenIdToHex(self.allocator, token_id);
@@ -1562,14 +1527,7 @@ pub fn handleV1ReverseClaimed(self: *Indexer, protocol: models.Protocol, log: rp
     var node_buf: [66]u8 = undefined;
     const node_hex = node.toHexBuf(&node_buf);
 
-    if (!addr.isZero()) {
-        self.database.upsertAccount(
-            protocol,
-            addr_hex,
-            log.block_number,
-            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
-    }
+    utils.recordAccountObservation(self, protocol, addr, log);
 
     std.log.debug("V1 ReverseClaimed: addr={s} node={s}", .{ addr_hex, node_hex });
 
@@ -1795,14 +1753,7 @@ pub fn handleV1NameWrapperTransferSingle(self: *Indexer, protocol: models.Protoc
     // we simply update the owner field here and skip if it's a burn.
     if (!to.isZero()) {
         try applyNameWrapperOwnerChange(self, id, to);
-        var to_account_buf: [42]u8 = undefined;
-        const to_account_hex = to.toHexBuf(&to_account_buf);
-        self.database.upsertAccount(
-            protocol,
-            to_account_hex,
-            log.block_number,
-            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
+        utils.recordAccountObservation(self, protocol, to, log);
     }
 
     // Emit event
@@ -1865,14 +1816,7 @@ pub fn handleV1NameWrapperTransferBatch(self: *Indexer, protocol: models.Protoco
                 std.log.warn("V1 NameWrapper TransferBatch: failed to update owner for id: {any}", .{err});
             };
         }
-        var to_account_buf: [42]u8 = undefined;
-        const to_account_hex = to.toHexBuf(&to_account_buf);
-        self.database.upsertAccount(
-            protocol,
-            to_account_hex,
-            log.block_number,
-            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-        ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
+        utils.recordAccountObservation(self, protocol, to, log);
     }
 
     // Emit event

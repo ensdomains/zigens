@@ -5,6 +5,27 @@ const Hash = @import("../types/hash.zig").Hash;
 const Address = @import("../types/address.zig").Address;
 const Indexer = @import("indexer.zig").Indexer;
 
+/// Record `addr` in the `accounts` entity table at the block/timestamp of
+/// the log that observed it. Skip the zero-address sentinel (burned / cleared,
+/// not a real account holder). Failure is logged at debug — never aborts
+/// event processing.
+///
+/// Centralises the 15 identical 5-line blocks that previously sat in every
+/// V1+V2 handler that observed an address. Use this from any handler that
+/// touches a new owner / registrant / role-grantee / transfer-recipient /
+/// operator.
+pub fn recordAccountObservation(self: *Indexer, protocol: models.Protocol, addr: Address, log: rpc.Log) void {
+    if (addr.isZero()) return;
+    var addr_buf: [42]u8 = undefined;
+    const addr_hex = addr.toHexBuf(&addr_buf);
+    self.database.upsertAccount(
+        protocol,
+        addr_hex,
+        log.block_number,
+        self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+    ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
+}
+
 /// Construct a models.Event from common log fields and emit it via insertEventAndNotify.
 /// Eliminates 6 identical field assignments repeated across handler files.
 pub fn emitEvent(

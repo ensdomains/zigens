@@ -29,3 +29,5 @@ pub const matchStringArg = api_common.matchStringArg;
 pub const matchIntArg = api_common.matchIntArg;
 pub const matchBoolArg = api_common.matchBoolArg;
 pub const matchAddressArg = api_common.matchAddressArg;
+pub const parseStringListArg = api_common.parseStringListArg;
+pub const parseAddressListArg = api_common.parseAddressListArg;

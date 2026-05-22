@@ -8,7 +8,6 @@ const models = common.models;
 const Address = common.Address;
 const parser = common.parser;
 const builders = @import("../builders/builders.zig");
-const constants = @import("../../constants.zig");
 
 /// Resolver for account query
 pub fn resolveAccount(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
@@ -60,14 +59,8 @@ pub fn resolveAccounts(ctx: parser.ExecutionContext, field: *const parser.Field)
 
     if (common.getObjectArg(field, "where")) |where_args| {
         for (where_args) |a| {
-            if (std.mem.eql(u8, a.name, "id_in") and a.value == .list) {
-                if (a.value.list.len > constants.Pagination.max_limit) return error.TooManyNames;
-                var ids_list: std.ArrayList([]const u8) = .{};
-                defer ids_list.deinit(allocator);
-                for (a.value.list) |item| {
-                    if (item == .string) try ids_list.append(allocator, item.string);
-                }
-                filter_id_in = try ids_list.toOwnedSlice(allocator);
+            if (std.mem.eql(u8, a.name, "id_in")) {
+                if (try common.parseStringListArg(a, allocator)) |v| filter_id_in = v;
                 continue;
             }
             // Unknown args caught at parse time by schema_validator.zig.
