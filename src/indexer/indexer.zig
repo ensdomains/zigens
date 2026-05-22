@@ -494,7 +494,7 @@ pub const Indexer = struct {
         .{ .event_hash = abi.EventSignatures.legacy_content_changed_hash, .handler = handleLegacyContentChanged, .name = "ContentChanged (legacy)" },
         // Modern resolver events (EIP-2304+)
         .{ .event_hash = abi.EventSignatures.address_changed_hash, .handler = handleAddressChanged, .name = "AddressChanged" },
-        .{ .event_hash = abi.EventSignatures.content_hash_changed_hash, .handler = handleContentHashChanged, .name = "ContentHashChanged" },
+        .{ .event_hash = abi.EventSignatures.content_hash_changed_hash, .handler = handleContentHashChanged, .name = "ContenthashChanged" },
         .{ .event_hash = abi.EventSignatures.text_changed_hash, .handler = handleTextChanged, .name = "TextChanged" },
         .{ .event_hash = abi.EventSignatures.abi_changed_hash, .handler = handleABIChanged, .name = "ABIChanged" },
         .{ .event_hash = abi.EventSignatures.pubkey_changed_hash, .handler = handlePubkeyChanged, .name = "PubkeyChanged" },
@@ -534,11 +534,15 @@ pub const Indexer = struct {
         .{ .event_hash = abi.EventSignatures.controller_removed_hash, .handler = handleV1ControllerRemoved, .name = "ControllerRemoved" },
     };
 
-    // ETH Registrar Controller events (0x59E16fcCd424Cc24e280Be16E11Bcd56fb0CE547)
-    // These events provide the label text, which is critical for V1 name resolution
+    // ETH Registrar Controller events
+    // Multiple controllers have existed (legacy 5/4-param and current 7/5-param
+    // with referrer). Register both signatures — the handler picks the right
+    // decoding path based on data length.
     pub const V1_ETH_CONTROLLER_EVENTS = [_]RegistryEventConfig{
-        .{ .event_hash = abi.EventSignatures.controller_name_registered_hash, .handler = handleV1ETHControllerNameRegistered, .name = "NameRegistered" },
-        .{ .event_hash = abi.EventSignatures.controller_name_renewed_hash, .handler = handleV1ETHControllerNameRenewed, .name = "NameRenewed" },
+        .{ .event_hash = abi.EventSignatures.controller_name_registered_hash, .handler = handleV1ETHControllerNameRegistered, .name = "NameRegistered (legacy)" },
+        .{ .event_hash = abi.EventSignatures.controller_name_registered_v2_hash, .handler = handleV1ETHControllerNameRegistered, .name = "NameRegistered" },
+        .{ .event_hash = abi.EventSignatures.controller_name_renewed_hash, .handler = handleV1ETHControllerNameRenewed, .name = "NameRenewed (legacy)" },
+        .{ .event_hash = abi.EventSignatures.controller_name_renewed_v2_hash, .handler = handleV1ETHControllerNameRenewed, .name = "NameRenewed" },
     };
 
     // Reverse Registrar events (0xa58E81fe9b61B5c3fE2AFD33CF304c454AbFc7Cb)
@@ -546,11 +550,12 @@ pub const Indexer = struct {
         .{ .event_hash = abi.EventSignatures.reverse_claimed_hash, .handler = handleV1ReverseClaimed, .name = "ReverseClaimed" },
     };
 
-    // V2 ETH Reverse Registrar events (V2 contract on the V2 chain).
-    // Same `ReverseClaimed(address,bytes32)` shape as V1 — handler is protocol-agnostic
-    // (writes to reverse_records with the protocol passed in).
+    // V2 ETH Reverse Registrar events (L2ReverseRegistrar / StandaloneReverseRegistrar).
+    // V2 emits `NameForAddrChanged(address indexed addr, string name)` — there is
+    // no V1-style `ReverseClaimed(addr, node)` since V2 stores the name directly
+    // on the reverse registrar rather than going through a separate resolver.
     pub const V2_REVERSE_REGISTRAR_EVENTS = [_]RegistryEventConfig{
-        .{ .event_hash = abi.EventSignatures.reverse_claimed_hash, .handler = handleV1ReverseClaimed, .name = "ReverseClaimed" },
+        .{ .event_hash = abi.EventSignatures.name_for_addr_changed_hash, .handler = handleV2NameForAddrChanged, .name = "NameForAddrChanged" },
     };
 
     // Temporary Registrar events (0x6090A6e47849629b7245Dfa1Ca21D94cd15878Ef)
@@ -1016,6 +1021,7 @@ pub const Indexer = struct {
     pub const handleV1ETHControllerNameRegistered = handlers_v1.handleV1ETHControllerNameRegistered;
     pub const handleV1ETHControllerNameRenewed = handlers_v1.handleV1ETHControllerNameRenewed;
     pub const handleV1ReverseClaimed = handlers_v1.handleV1ReverseClaimed;
+    pub const handleV2NameForAddrChanged = handlers_v1.handleV2NameForAddrChanged;
 
     // Temporary registrar handlers (extracted to handlers_v1_temp.zig)
     pub const handleTempHashRegistered = handlers_v1_temp.handleTempHashRegistered;

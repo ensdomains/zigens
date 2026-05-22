@@ -4,7 +4,8 @@ const models = @import("../../types/models.zig");
 const abi = @import("../abi.zig");
 const rpc = @import("../../rpc/client.zig");
 const db = @import("../../storage/database.zig");
-const Hash = @import("../../types/hash.zig").Hash;
+const hash_mod = @import("../../types/hash.zig");
+const Hash = hash_mod.Hash;
 const Address = @import("../../types/address.zig").Address;
 const unknown_labels_storage = @import("../../storage/unknown_labels.zig");
 const Indexer = @import("../indexer.zig").Indexer;
@@ -794,8 +795,14 @@ pub fn handleV1ControllerRemoved(self: *Indexer, protocol: models.Protocol, log:
     self.invalidateControllerCache();
 }
 
-/// Handle V1 ETH Registrar Controller NameRegistered event
-/// NameRegistered(string name, bytes32 indexed label, address indexed owner, uint256 baseCost, uint256 premium, uint256 expires)
+/// Handle V1 ETH Registrar Controller NameRegistered event.
+/// Supports both signatures:
+///   Legacy (5 params): NameRegistered(string name, bytes32 indexed label, address indexed owner, uint256 cost, uint256 expires)
+///   Current (7 params): NameRegistered(string name, bytes32 indexed label, address indexed owner,
+///                                       uint256 baseCost, uint256 premium, uint256 expires, bytes32 referrer)
+/// The non-indexed payload is `name` (head pointer at offset 0) plus 2 or 4
+/// trailing uint256 words and an optional bytes32 referrer. We pick the layout
+/// by counting trailing words after the string data.
 pub fn handleV1ETHControllerNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
 
     // topics[0] = event signature
@@ -809,21 +816,45 @@ pub fn handleV1ETHControllerNameRegistered(self: *Indexer, protocol: models.Prot
     const label_hash = log.topics[1];
     const owner = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
 
-    // Decode data: name (string), cost (uint256), expires (uint256)
-    // Note: V1 Controller has only 2 non-indexed parameters (cost, expires), NOT 3
+    // Decode data: name (string) is a dynamic head pointer at offset 0
     // Note: name ownership is transferred to the Event struct, so don't free it here
-    // name is a dynamic type, so it starts with an offset pointer
     const name = try abi.ABI.decodeString(self.allocator, log.data, 0);
 
-    // cost, expires are after the string data
-    // Skip to second word for cost (after string offset pointer and string data)
-    var offset: usize = 32; // Skip string offset
-    const str_len_offset = try abi.ABI.decodeUint256(log.data, 0);
-    offset = @intCast(str_len_offset + 32 + ((name.len + 31) / 32) * 32); // String length + padded string data
+    // Compute offset to first trailing fixed-size param (after the string tail).
+    const str_offset = try abi.ABI.decodeUint256(log.data, 0);
+    var offset: usize = @intCast(str_offset + 32 + ((name.len + 31) / 32) * 32);
 
-    const cost = if (offset < log.data.len) try abi.ABI.decodeUint256(log.data, offset) else 0;
-    offset += 32;
-    const expires = if (offset < log.data.len) try abi.ABI.decodeUint256(log.data, offset) else 0;
+    // Count how many 32-byte words follow the string data.
+    const trailing_bytes: usize = if (log.data.len > offset) log.data.len - offset else 0;
+    const trailing_words: usize = trailing_bytes / 32;
+
+    // Decode `cost` and `expires` based on which layout the event uses.
+    var cost: u256 = 0;
+    var premium: u256 = 0;
+    var expires: u256 = 0;
+    var referrer_bytes: [32]u8 = [_]u8{0} ** 32;
+    var has_referrer = false;
+
+    if (trailing_words >= 4) {
+        // Current 7-param layout: baseCost, premium, expires, referrer
+        cost = try abi.ABI.decodeUint256(log.data, offset);
+        offset += 32;
+        premium = try abi.ABI.decodeUint256(log.data, offset);
+        offset += 32;
+        expires = try abi.ABI.decodeUint256(log.data, offset);
+        offset += 32;
+        @memcpy(&referrer_bytes, log.data[offset .. offset + 32]);
+        has_referrer = true;
+    } else {
+        // Legacy 5-param layout: cost, expires
+        if (offset < log.data.len) {
+            cost = try abi.ABI.decodeUint256(log.data, offset);
+            offset += 32;
+        }
+        if (offset < log.data.len) {
+            expires = try abi.ABI.decodeUint256(log.data, offset);
+        }
+    }
 
     var owner_buf: [42]u8 = undefined;
     const owner_hex = owner.toHexBuf(&owner_buf);
@@ -857,8 +888,18 @@ pub fn handleV1ETHControllerNameRegistered(self: *Indexer, protocol: models.Prot
     // Populate the in-memory label cache
     try self.putCachedV1Label(label_hash_hex, name);
 
-    // Store event
-    const event_data = try std.fmt.allocPrint(
+    // Store event. When the event carries premium/referrer (current 7-param layout)
+    // include them; otherwise emit the legacy payload shape.
+    const event_data = if (has_referrer) blk: {
+        const referrer_hash = Hash{ .bytes = referrer_bytes };
+        var ref_hex_buf: [66]u8 = undefined;
+        const ref_hex = referrer_hash.toHexBuf(&ref_hex_buf);
+        break :blk try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"name\":\"{s}\",\"label\":\"{s}\",\"owner\":\"{s}\",\"baseCost\":{d},\"premium\":{d},\"cost\":{d},\"expires\":{d},\"referrer\":\"{s}\"}}",
+            .{ name, label_hash_hex, owner_hex, cost, premium, cost + premium, expires, ref_hex },
+        );
+    } else try std.fmt.allocPrint(
         self.allocator,
         "{{\"name\":\"{s}\",\"label\":\"{s}\",\"owner\":\"{s}\",\"cost\":{d},\"expires\":{d}}}",
         .{ name, label_hash_hex, owner_hex, cost, expires },
@@ -867,8 +908,10 @@ pub fn handleV1ETHControllerNameRegistered(self: *Indexer, protocol: models.Prot
     try utils.emitEvent(self, protocol, log, .name_registered, name, namehash, event_data);
 }
 
-/// Handle V1 ETH Registrar Controller NameRenewed event
-/// NameRenewed(string name, bytes32 indexed label, uint256 cost, uint256 expires)
+/// Handle V1 ETH Registrar Controller NameRenewed event.
+/// Supports both signatures:
+///   Legacy (4 params): NameRenewed(string name, bytes32 indexed label, uint256 cost, uint256 expires)
+///   Current (5 params): NameRenewed(string name, bytes32 indexed label, uint256 cost, uint256 expires, bytes32 referrer)
 pub fn handleV1ETHControllerNameRenewed(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
 
     // topics[0] = event signature
@@ -880,18 +923,39 @@ pub fn handleV1ETHControllerNameRenewed(self: *Indexer, protocol: models.Protoco
 
     const label_hash = log.topics[1];
 
-    // Decode data: name (string), cost (uint256), expires (uint256)
+    // Decode data: name (string) at offset 0, followed by trailing fixed-size words.
     // Note: name ownership is transferred to the Event struct, so don't free it here
     const name = try abi.ABI.decodeString(self.allocator, log.data, 0);
 
-    // cost and expires are after the string data
-    var offset: usize = 32; // Skip string offset
-    const str_len_offset = try abi.ABI.decodeUint256(log.data, 0);
-    offset = @intCast(str_len_offset + 32 + ((name.len + 31) / 32) * 32);
+    const str_offset = try abi.ABI.decodeUint256(log.data, 0);
+    var offset: usize = @intCast(str_offset + 32 + ((name.len + 31) / 32) * 32);
 
-    const cost = if (offset < log.data.len) try abi.ABI.decodeUint256(log.data, offset) else 0;
-    offset += 32;
-    const expires = if (offset < log.data.len) try abi.ABI.decodeUint256(log.data, offset) else 0;
+    const trailing_bytes: usize = if (log.data.len > offset) log.data.len - offset else 0;
+    const trailing_words: usize = trailing_bytes / 32;
+
+    var cost: u256 = 0;
+    var expires: u256 = 0;
+    var referrer_bytes: [32]u8 = [_]u8{0} ** 32;
+    var has_referrer = false;
+
+    if (trailing_words >= 3) {
+        // Current 5-param layout: cost, expires, referrer
+        cost = try abi.ABI.decodeUint256(log.data, offset);
+        offset += 32;
+        expires = try abi.ABI.decodeUint256(log.data, offset);
+        offset += 32;
+        @memcpy(&referrer_bytes, log.data[offset .. offset + 32]);
+        has_referrer = true;
+    } else {
+        // Legacy 4-param layout: cost, expires
+        if (offset < log.data.len) {
+            cost = try abi.ABI.decodeUint256(log.data, offset);
+            offset += 32;
+        }
+        if (offset < log.data.len) {
+            expires = try abi.ABI.decodeUint256(log.data, offset);
+        }
+    }
 
     var label_hash_buf: [66]u8 = undefined;
     const label_hash_hex = label_hash.toHexBuf(&label_hash_buf);
@@ -922,8 +986,17 @@ pub fn handleV1ETHControllerNameRenewed(self: *Indexer, protocol: models.Protoco
     // Populate the in-memory label cache
     try self.putCachedV1Label(label_hash_hex, name);
 
-    // Store event
-    const event_data = try std.fmt.allocPrint(
+    // Store event. Include referrer for the current 5-param layout.
+    const event_data = if (has_referrer) blk: {
+        const referrer_hash = Hash{ .bytes = referrer_bytes };
+        var ref_hex_buf: [66]u8 = undefined;
+        const ref_hex = referrer_hash.toHexBuf(&ref_hex_buf);
+        break :blk try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"name\":\"{s}\",\"label\":\"{s}\",\"cost\":{d},\"expires\":{d},\"referrer\":\"{s}\"}}",
+            .{ name, label_hash_hex, cost, expires, ref_hex },
+        );
+    } else try std.fmt.allocPrint(
         self.allocator,
         "{{\"name\":\"{s}\",\"label\":\"{s}\",\"cost\":{d},\"expires\":{d}}}",
         .{ name, label_hash_hex, cost, expires },
@@ -974,6 +1047,64 @@ pub fn handleV1ReverseClaimed(self: *Indexer, protocol: models.Protocol, log: rp
     });
 
     try utils.emitEvent(self, protocol, log, .transfer, null, node, event_data);
+}
+
+/// Handle V2 L2ReverseRegistrar / StandaloneReverseRegistrar NameForAddrChanged event.
+///   NameForAddrChanged(address indexed addr, string name)
+///
+/// V2 stores the primary name directly on the reverse registrar (no node
+/// indirection) — there is no `addr.reverse` ENS subtree like V1 has. The
+/// equivalent reverse namehash for an address `a` on chain `c` is computed
+/// off-protocol as `namehash("<a>.<c-hex>.reverse")` if we ever need one. For now
+/// we just record the event so the events feed reflects the state change; the
+/// reverse_records table (which is V1-shaped) is updated with a zero node so
+/// downstream code can still find the most-recent reverse-claim block.
+pub fn handleV2NameForAddrChanged(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
+    if (log.topics.len < 2) return error.InvalidTopicCount;
+
+    const addr = try abi.ABI.decodeAddress(&log.topics[1].bytes, 0);
+
+    // data = (string name) — single dynamic head pointer at offset 0.
+    // `name` ownership is later transferred to `emitEvent`, which frees it via
+    // `insertEventAndNotify`. Do NOT add a defer-free here.
+    const name = try abi.ABI.decodeString(self.allocator, log.data, 0);
+
+    var addr_buf: [42]u8 = undefined;
+    const addr_hex = addr.toHexBuf(&addr_buf);
+
+    std.log.debug("V2 NameForAddrChanged: addr={s} name={s}", .{ addr_hex, name });
+
+    // Persist a "current name" hint keyed by address. We store the name's
+    // namehash so the existing schema (address → namehash) keeps working;
+    // forward-resolution still needs to be verified via the resolver per ENSIP-3.
+    const namehash = if (name.len > 0)
+        hash_mod.namehash(self.allocator, name) catch Hash.zero
+    else
+        Hash.zero;
+
+    const block_timestamp = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
+    self.database.upsertReverseRecord(
+        protocol,
+        addr,
+        namehash,
+        log.block_number,
+        log.transaction_hash,
+        log.log_index,
+        block_timestamp,
+    ) catch |err| {
+        std.log.warn("Failed to upsert V2 reverse record for {s}: {}", .{ addr_hex, err });
+    };
+
+    // Store event (JSON payload mirrors the on-chain event shape)
+    var nh_buf: [66]u8 = undefined;
+    const nh_hex = namehash.toHexBuf(&nh_buf);
+    const event_data = try std.fmt.allocPrint(
+        self.allocator,
+        "{{\"address\":\"{s}\",\"name\":\"{s}\",\"namehash\":\"{s}\"}}",
+        .{ addr_hex, name, nh_hex },
+    );
+
+    try utils.emitEvent(self, protocol, log, .name_changed, name, namehash, event_data);
 }
 
 // ============================================================================

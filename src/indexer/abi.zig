@@ -142,8 +142,10 @@ pub const EventSignatures = struct {
     pub const address_changed = "AddressChanged(bytes32,uint256,bytes)";
     pub const address_changed_hash: Hash = eventHash(address_changed);
 
-    /// ContentHashChanged(bytes32 indexed node, bytes hash)
-    pub const content_hash_changed = "ContentHashChanged(bytes32,bytes)";
+    /// ContenthashChanged(bytes32 indexed node, bytes hash)
+    /// Note: lowercase 'h' in `Contenthash` — this is the canonical ENS event name
+    /// emitted by both V1 PublicResolver and V2 PermissionedResolver / OwnedResolver.
+    pub const content_hash_changed = "ContenthashChanged(bytes32,bytes)";
     pub const content_hash_changed_hash: Hash = eventHash(content_hash_changed);
 
     /// TextChanged(bytes32 indexed node, string indexed indexedKey, string key, string value)
@@ -179,15 +181,29 @@ pub const EventSignatures = struct {
     pub const named_resource = "NamedResource(uint256,bytes)";
     pub const named_resource_hash: Hash = eventHash(named_resource);
 
-    /// NamedTextResource(uint256 indexed resource, bytes name, bytes32 indexed key)
-    /// Emitted when a named text resource is set in PermissionedResolver
-    pub const named_text_resource = "NamedTextResource(uint256,bytes,bytes32)";
+    /// NamedTextResource(uint256 indexed resource, bytes name, bytes32 indexed keyHash, string key)
+    /// Emitted when a named text resource is set in PermissionedResolver.
+    /// NOTE: signature changed from the prior 3-arg form to 4 args (plaintext key
+    /// appended) in the latest PermissionedResolver deployment.
+    pub const named_text_resource = "NamedTextResource(uint256,bytes,bytes32,string)";
     pub const named_text_resource_hash: Hash = eventHash(named_text_resource);
 
     /// NamedAddrResource(uint256 indexed resource, bytes name, uint256 indexed coinType)
     /// Emitted when a named address resource is set in PermissionedResolver
     pub const named_addr_resource = "NamedAddrResource(uint256,bytes,uint256)";
     pub const named_addr_resource_hash: Hash = eventHash(named_addr_resource);
+
+    /// NamedDataResource(uint256 indexed resource, bytes name, bytes32 indexed keyHash, string key)
+    /// Emitted by the latest PermissionedResolver alongside `DataChanged`. Carries
+    /// the plaintext key (the bytes32 hash is the topic) and the resource id.
+    pub const named_data_resource = "NamedDataResource(uint256,bytes,bytes32,string)";
+    pub const named_data_resource_hash: Hash = eventHash(named_data_resource);
+
+    /// DataChanged(bytes32 indexed node, string indexedKey, string key, bytes value)
+    /// New generic key/value record event in the latest PermissionedResolver.
+    /// Mirrors `TextChanged` but the value is `bytes` instead of `string`.
+    pub const data_changed = "DataChanged(bytes32,string,string,bytes)";
+    pub const data_changed_hash: Hash = eventHash(data_changed);
 
     // ========================================================================
     // ENS Temporary Registrar events (Pre-V1 Migration, May 2017 - May 2019)
@@ -294,26 +310,49 @@ pub const EventSignatures = struct {
 
     // ========================================================================
     // ENS V1 ETH Registrar Controller events (ETHRegistrarController.sol)
-    // Address: 0x59E16fcCd424Cc24e280Be16E11Bcd56fb0CE547
+    // Two generations are deployed in the wild:
+    //   * Legacy (5/4 params): early mainnet controllers (e.g. 0x283Af0B2...)
+    //   * Current (7/5 params with separate baseCost/premium + referrer):
+    //     latest mainnet (0xb5778cf6...) and Sepolia (0xb5778cf6cc9586d9...).
+    // We register both signatures and dispatch them to the same handler, which
+    // selects the decoding strategy based on `log.data.len`.
     // ========================================================================
 
-    /// NameRegistered(string name, bytes32 indexed label, address indexed owner, uint256 cost, uint256 expires)
-    /// Note: V1 Controller uses 5 parameters, NOT 6 (no separate baseCost/premium)
+    /// Legacy NameRegistered(string name, bytes32 indexed label, address indexed owner, uint256 cost, uint256 expires)
+    /// Used by the very first ETHRegistrarController on mainnet (5 params).
     pub const controller_name_registered = "NameRegistered(string,bytes32,address,uint256,uint256)";
     pub const controller_name_registered_hash: Hash = eventHash(controller_name_registered);
 
-    /// NameRenewed(string name, bytes32 indexed label, uint256 cost, uint256 expires)
+    /// Current NameRegistered(string name, bytes32 indexed label, address indexed owner,
+    ///                        uint256 baseCost, uint256 premium, uint256 expires, bytes32 referrer)
+    /// 7 params — used by 0xb5778cf6... on both mainnet and Sepolia.
+    pub const controller_name_registered_v2 = "NameRegistered(string,bytes32,address,uint256,uint256,uint256,bytes32)";
+    pub const controller_name_registered_v2_hash: Hash = eventHash(controller_name_registered_v2);
+
+    /// Legacy NameRenewed(string name, bytes32 indexed label, uint256 cost, uint256 expires)
     pub const controller_name_renewed = "NameRenewed(string,bytes32,uint256,uint256)";
     pub const controller_name_renewed_hash: Hash = eventHash(controller_name_renewed);
+
+    /// Current NameRenewed(string name, bytes32 indexed label, uint256 cost, uint256 expires, bytes32 referrer)
+    /// 5 params — used by 0xb5778cf6... on both mainnet and Sepolia.
+    pub const controller_name_renewed_v2 = "NameRenewed(string,bytes32,uint256,uint256,bytes32)";
+    pub const controller_name_renewed_v2_hash: Hash = eventHash(controller_name_renewed_v2);
 
     // ========================================================================
     // ENS V1 Reverse Registrar events (ReverseRegistrar.sol)
     // Address: 0xa58E81fe9b61B5c3fE2AFD33CF304c454AbFc7Cb
     // ========================================================================
 
-    /// ReverseClaimed(address indexed addr, bytes32 indexed node)
+    /// V1 ReverseRegistrar: ReverseClaimed(address indexed addr, bytes32 indexed node)
     pub const reverse_claimed = "ReverseClaimed(address,bytes32)";
     pub const reverse_claimed_hash: Hash = eventHash(reverse_claimed);
+
+    /// V2 L2ReverseRegistrar / StandaloneReverseRegistrar:
+    /// NameForAddrChanged(address indexed addr, string name)
+    /// V2 reverse resolution stores the primary name directly on the reverse
+    /// registrar rather than going through a node-keyed registry.
+    pub const name_for_addr_changed = "NameForAddrChanged(address,string)";
+    pub const name_for_addr_changed_hash: Hash = eventHash(name_for_addr_changed);
 
     // ========================================================================
     // Approval events (various contracts)
