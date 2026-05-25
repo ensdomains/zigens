@@ -912,9 +912,9 @@ pub fn getNameByTokenIdAndRegistry(db: *Database, token_id: u256, registry: Addr
 /// subregistry repoint or LabelUnregistered) are filtered out.
 pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Name {
     const sql = if (limit) |l|
-        try std.fmt.allocPrint(db.allocator, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND owner = ? LIMIT {d}", .{l})
+        try std.fmt.allocPrint(db.allocator, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND owner = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' LIMIT {d}", .{l})
     else
-        try db.allocator.dupe(u8, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND owner = ?");
+        try db.allocator.dupe(u8, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND owner = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000'");
     defer db.allocator.free(sql);
 
     var q = try Query.initCached(db, sql);
@@ -939,7 +939,7 @@ pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Nam
 
 /// Get names by resolver address. Unreachable rows are filtered out.
 pub fn getNamesByResolver(db: *Database, resolver: Address, limit: u32) ![]models.Name {
-    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND resolver = ? ORDER BY created_at DESC LIMIT ?");
+    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND resolver = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY created_at DESC LIMIT ?");
     defer q.deinit();
 
     try q.bindAddress(resolver);
@@ -1014,7 +1014,7 @@ pub fn getWrappedDomains(
 pub fn getDomainByResolver(db: *Database, resolver: Address) !?models.Name {
     var q = try Query.initCached(
         db,
-        SQL_SELECT_NAMES ++ " WHERE is_reachable = 1 AND resolver = ? ORDER BY namehash ASC LIMIT 1",
+        SQL_SELECT_NAMES ++ " WHERE is_reachable = 1 AND resolver = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY namehash ASC LIMIT 1",
     );
     defer q.deinit();
 
@@ -1085,6 +1085,13 @@ fn appendNameFilterConditions(
 ) !void {
     if (!filters.include_unreachable) {
         try conditions.append(db.allocator, "is_reachable = 1");
+        // Hide the synthetic root domain (namehash 0x000…000, name="") from
+        // default GraphQL queries. The row is materialized by `Database.migrate`
+        // so internal graph traversal terminates cleanly at the root, but it's
+        // noise for client-facing listings (`createdAt = 0`, blank `name`).
+        // Audit/debug callers that pass `includeUnreachable: true` also opt
+        // back into seeing it.
+        try conditions.append(db.allocator, "namehash != '0x0000000000000000000000000000000000000000000000000000000000000000'");
     }
     if (filters.owner != null) {
         try conditions.append(db.allocator, "owner = ?");
@@ -1472,15 +1479,16 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
     const order_str = if (order_dir == .desc) "DESC" else "ASC";
     // Secondary sort on namehash (same direction) — see countRowsBeforeNamehash for why.
     // is_reachable = 1 filter is applied by default; unreachable rows are
-    // hidden from the legacy unfiltered listing. Use `getFilteredNames` with
-    // `include_unreachable = true` to override.
+    // hidden from the legacy unfiltered listing. Synthetic root domain
+    // (namehash 0x000…0) is also excluded — see `appendNameFilterConditions`.
+    // Use `getFilteredNames` with `include_unreachable = true` to override.
     const sql = if (owner != null)
         try std.fmt.allocPrint(db.allocator,
             \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, protocol,
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated,
             \\       created_at, registered_at, created_block, updated_at, updated_block,
             \\       is_reachable, unreachable_since, ttl, is_legacy
-            \\FROM names WHERE is_reachable = 1 AND owner = ? ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
+            \\FROM names WHERE is_reachable = 1 AND owner = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
         , .{ sort_field.toSql(), order_str, order_str })
     else
         try std.fmt.allocPrint(db.allocator,
@@ -1488,7 +1496,7 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated,
             \\       created_at, registered_at, created_block, updated_at, updated_block,
             \\       is_reachable, unreachable_since, ttl, is_legacy
-            \\FROM names WHERE is_reachable = 1 ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
+            \\FROM names WHERE is_reachable = 1 AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
         , .{ sort_field.toSql(), order_str, order_str });
     defer db.allocator.free(sql);
 
