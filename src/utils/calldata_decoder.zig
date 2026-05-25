@@ -86,24 +86,6 @@ pub const CalldataDecoder = struct {
         return try allocator.dupe(u8, label_text);
     }
 
-    /// Decode label from ENS Registry setSubnode* function calldata (hex string version)
-    /// This is a convenience wrapper that first converts hex string to bytes
-    pub fn decodeSubnodeLabelFromHex(allocator: std.mem.Allocator, calldata_hex: []const u8) !?[]u8 {
-        // Remove 0x prefix if present
-        const hex_data = if (std.mem.startsWith(u8, calldata_hex, "0x"))
-            calldata_hex[2..]
-        else
-            calldata_hex;
-
-        // Convert hex to bytes
-        const calldata_bytes = try allocator.alloc(u8, hex_data.len / 2);
-        defer allocator.free(calldata_bytes);
-
-        _ = try std.fmt.hexToBytes(calldata_bytes, hex_data);
-
-        return try decodeSubnodeLabel(allocator, calldata_bytes);
-    }
-
     /// Decode label from multicall pattern
     /// This function searches for setSubnode* calls within multicall(bytes[]) patterns
     ///
@@ -215,12 +197,23 @@ test "decode setSubnodeRecord calldata" {
     const calldata = [_]u8{
         0x5b, 0x0f, 0xc9, 0xc3, // selector
         // node (32 bytes of zeros)
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,
+        0,
         // label: "test" (0x74657374) padded with zeros
         0x74, 0x65, 0x73, 0x74, // "test"
-        0,    0,    0,    0,    0, 0, 0, 0, 0, 0, 0, 0,
-        0,    0,    0,    0,    0, 0, 0, 0, 0, 0, 0, 0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
         0,    0,    0,    0,
     };
 
@@ -238,12 +231,23 @@ test "decode setSubnodeOwner calldata" {
     const calldata = [_]u8{
         0x06, 0xab, 0x59, 0x23, // selector
         // node (32 bytes of zeros)
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,
+        0,
         // label: "mail" (0x6d61696c) padded
         0x6d, 0x61, 0x69, 0x6c, // "mail"
-        0,    0,    0,    0,    0, 0, 0, 0, 0, 0, 0, 0,
-        0,    0,    0,    0,    0, 0, 0, 0, 0, 0, 0, 0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
         0,    0,    0,    0,
     };
 
@@ -259,10 +263,22 @@ test "reject invalid selector" {
 
     const calldata = [_]u8{
         0xff, 0xff, 0xff, 0xff, // invalid selector
-        0,    0,    0,    0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0,    0,    0,    0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0x74, 0x65, 0x73, 0x74, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0,    0,    0,    0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0x74, 0x65, 0x73, 0x74,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
     };
 
     const label = try CalldataDecoder.decodeSubnodeLabel(allocator, &calldata);
@@ -283,11 +299,23 @@ test "reject empty label" {
 
     const calldata = [_]u8{
         0x5b, 0x0f, 0xc9, 0xc3, // selector
-        0,    0,    0,    0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0,    0,    0,    0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
         // label: all zeros
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
     };
 
     const label = try CalldataDecoder.decodeSubnodeLabel(allocator, &calldata);
@@ -313,10 +341,16 @@ test "decode using wrapper function" {
     // Direct setSubnodeRecord
     const direct_calldata = [_]u8{
         0x5b, 0x0f, 0xc9, 0xc3, // selector
-        0,    0,    0,    0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0,    0,    0,    0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
         0x77, 0x77, 0x77, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // "www"
-        0,    0,    0,    0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0,    0,    0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     };
 
     const label1 = try CalldataDecoder.decodeLabelFromCalldata(allocator, &direct_calldata);

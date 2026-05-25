@@ -1485,10 +1485,11 @@ pub const Executor = struct {
             return try std.fmt.allocPrint(self.allocator, "\"{s}\":\"Query\"", .{field_name});
         }
 
-        // Look up resolver for this field
+        // Look up resolver for this field. Unknown root fields are a schema
+        // violation, not a "silently null" condition — surface as an error so
+        // clients learn about typos / removed-field references at query time.
         const resolver = self.resolvers.get(field.name) orelse {
-            // No resolver found - return null
-            return try std.fmt.allocPrint(self.allocator, "\"{s}\":null", .{field_name});
+            return error.UnknownRootField;
         };
 
         // Resolve arguments (replace variable references with actual values)

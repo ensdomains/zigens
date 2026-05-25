@@ -2,22 +2,23 @@ const std = @import("std");
 const Address = @import("address.zig").Address;
 const Hash = @import("hash.zig").Hash;
 
-/// Chain identifier
-pub const Chain = enum {
-    l1,
-    l2,
+/// ENS protocol version (v1 = legacy ENS; v2 = ENSv2). Distinguishes which name
+/// system a row belongs to in the unified DB. Not a blockchain identifier.
+pub const Protocol = enum {
+    v1,
+    v2,
 
-    pub fn toString(self: Chain) []const u8 {
+    pub fn toString(self: Protocol) []const u8 {
         return switch (self) {
-            .l1 => "l1",
-            .l2 => "l2",
+            .v1 => "v1",
+            .v2 => "v2",
         };
     }
 
-    pub fn fromString(s: []const u8) !Chain {
-        if (std.mem.eql(u8, s, "l1")) return .l1;
-        if (std.mem.eql(u8, s, "l2")) return .l2;
-        return error.InvalidChain;
+    pub fn fromString(s: []const u8) !Protocol {
+        if (std.mem.eql(u8, s, "v1")) return .v1;
+        if (std.mem.eql(u8, s, "v2")) return .v2;
+        return error.InvalidProtocol;
     }
 };
 
@@ -26,7 +27,7 @@ pub const Registry = struct {
     /// Address of the registry contract
     address: Address,
     /// Chain where this registry exists
-    chain: Chain,
+    protocol: Protocol,
     /// Name this registry is responsible for (e.g., "eth", "alice.eth")
     name: []const u8,
     /// Namehash of the name
@@ -58,7 +59,7 @@ pub const Name = struct {
     /// Parent namehash
     parent_namehash: Hash,
     /// Chain where this name is registered
-    chain: Chain,
+    protocol: Protocol,
     /// Registry contract managing this name
     registry: Address,
     /// Current owner address
@@ -82,8 +83,6 @@ pub const Name = struct {
     registry_locked: bool,
     /// Whether this is a migrated name from ENSv1
     migrated: bool,
-    /// Whether this is an ejected name (on L1 but registered on L2)
-    ejected: bool,
     /// Block number when created
     created_block: u64,
     /// Timestamp when created
@@ -104,6 +103,29 @@ pub const Name = struct {
     is_v1_name: bool,
     /// V1 label hash (for V1 names - keccak256 of the label)
     v1_label_hash: ?[]const u8,
+    /// Canonical-resolution reachability flag. Set to false when an ancestor
+    /// label's `setSubregistry` repoints away from this name's source registry
+    /// (or its expiry passes / LabelUnregistered fires). Default-filtered out
+    /// of GraphQL queries unless `includeUnreachable: true` is passed.
+    is_reachable: bool = true,
+    /// Timestamp (seconds) when this name first became unreachable. Null
+    /// while `is_reachable = true`.
+    unreachable_since: ?i64 = null,
+    /// V1 ENS Registry TTL (from `NewTTL(node, ttl)`). Null when never set;
+    /// only populated for V1 names whose owner explicitly called `setTTL`.
+    /// Not used by V2 (no equivalent concept).
+    ttl: ?u64 = null,
+    /// V1 ENS Registry provenance: true when the row's most recent update
+    /// came from the legacy pre-2020 ENS Registry (0x314159…). False once
+    /// the new Registry (0x00…2e1e) emits an event for the same node.
+    /// Always false for V2 rows.
+    is_legacy: bool = false,
+    /// V1-only materialized `resolvedAddress` (subgraph parity). Populated by
+    /// `handleV1NewResolver` after calling `addr(node)` on the resolver. Null
+    /// for V2 rows and for V1 rows where the call has not yet been made — the
+    /// API layer falls back to a query-time `Resolver.addr(coinType:60)` lookup
+    /// when null.
+    resolved_address: ?Address = null,
 
     pub fn deinit(self: *Name, allocator: std.mem.Allocator) void {
         if (self.name) |n| allocator.free(n);
@@ -129,7 +151,7 @@ pub const Resolver = struct {
     /// Resolver address
     address: Address,
     /// Chain where this resolver exists
-    chain: Chain,
+    protocol: Protocol,
     /// Name this resolver is set for
     name: []const u8,
     /// Namehash
@@ -146,28 +168,30 @@ pub const Resolver = struct {
 
 /// Event types in ENSv2
 pub const EventType = enum {
-    // Registry events
+    // Registry events (ENSIP-16)
     new_subname,
     subregistry_update,
+    subregistry_updated,
     resolver_update,
+    resolver_updated,
     transfer,
 
     // Registration events
     name_registered,
     name_renewed,
     name_burned,
+    label_registered,
+    label_reserved,
+    label_unregistered,
+    expiry_updated,
     commitment_made,
+
+    // Parent events
+    parent_updated,
 
     // Token events
     token_regenerated,
     approval,
-
-    // Migration events
-    name_migrated,
-
-    // Ejection events
-    name_ejected_to_l1,
-    name_returned_to_l2,
 
     // ENSIP-16 Offchain metadata events
     metadata_changed,
@@ -189,21 +213,48 @@ pub const EventType = enum {
     version_changed,
     alias_changed,
 
+    // V1 → V2 migration: emitted on the V1 row when a token transfers to a
+    // MigrationController. Distinct from `name_registered`/`label_registered`
+    // so consumers can filter on "migration" specifically (vs first-time mint).
+    name_migrated,
+
+    // V1 NameWrapper lifecycle: distinct from `.transfer` so consumers can
+    // filter wrap/unwrap separately from ERC721/ERC1155 transfers.
+    name_wrapped,
+    name_unwrapped,
+    fuses_set,
+
+    // V1 ReverseRegistrar.claim: distinct from `.transfer` since the on-chain
+    // event is `ReverseClaimed`, not a token transfer. Surfaces via the
+    // existing Account.primaryName GraphQL path.
+    reverse_claimed,
+
+    // V1 ENS Registry setOwner: an `(node, owner)` ownership change emitted
+    // by the Registry contract directly (vs ERC721/ERC1155 transfer of a
+    // token-backed name). Subgraph models this as a distinct entity — we
+    // mirror that with its own event_type so clients don't conflate it
+    // with token transfers.
+    registry_transfer,
+
     pub fn toString(self: EventType) []const u8 {
         return switch (self) {
             .new_subname => "NewSubname",
             .subregistry_update => "SubregistryUpdate",
+            .subregistry_updated => "SubregistryUpdated",
             .resolver_update => "ResolverUpdate",
+            .resolver_updated => "ResolverUpdated",
             .transfer => "Transfer",
             .name_registered => "NameRegistered",
             .name_renewed => "NameRenewed",
             .name_burned => "NameBurned",
+            .label_registered => "LabelRegistered",
+            .label_reserved => "LabelReserved",
+            .label_unregistered => "LabelUnregistered",
+            .expiry_updated => "ExpiryUpdated",
             .commitment_made => "CommitmentMade",
+            .parent_updated => "ParentUpdated",
             .token_regenerated => "TokenRegenerated",
             .approval => "Approval",
-            .name_migrated => "NameMigrated",
-            .name_ejected_to_l1 => "NameEjectedToL1",
-            .name_returned_to_l2 => "NameReturnedToL2",
             .metadata_changed => "MetadataChanged",
             .resolver_approved => "ResolverApproved",
             .text_changed => "TextChanged",
@@ -216,13 +267,21 @@ pub const EventType = enum {
             .eac_roles_changed => "EACRolesChanged",
             .version_changed => "VersionChanged",
             .alias_changed => "AliasChanged",
+            .name_migrated => "NameMigrated",
+            .name_wrapped => "NameWrapped",
+            .name_unwrapped => "NameUnwrapped",
+            .fuses_set => "FusesSet",
+            .reverse_claimed => "ReverseClaimed",
+            .registry_transfer => "RegistryTransfer",
         };
     }
 
     pub fn fromString(s: []const u8) ?EventType {
         if (std.mem.eql(u8, s, "NewSubname")) return .new_subname;
         if (std.mem.eql(u8, s, "SubregistryUpdate")) return .subregistry_update;
+        if (std.mem.eql(u8, s, "SubregistryUpdated")) return .subregistry_updated;
         if (std.mem.eql(u8, s, "ResolverUpdate")) return .resolver_update;
+        if (std.mem.eql(u8, s, "ResolverUpdated")) return .resolver_updated;
         if (std.mem.eql(u8, s, "Transfer")) return .transfer;
         if (std.mem.eql(u8, s, "NameRegistered")) return .name_registered;
         if (std.mem.eql(u8, s, "NameRenewed")) return .name_renewed;
@@ -230,9 +289,6 @@ pub const EventType = enum {
         if (std.mem.eql(u8, s, "CommitmentMade")) return .commitment_made;
         if (std.mem.eql(u8, s, "TokenRegenerated")) return .token_regenerated;
         if (std.mem.eql(u8, s, "Approval")) return .approval;
-        if (std.mem.eql(u8, s, "NameMigrated")) return .name_migrated;
-        if (std.mem.eql(u8, s, "NameEjectedToL1")) return .name_ejected_to_l1;
-        if (std.mem.eql(u8, s, "NameReturnedToL2")) return .name_returned_to_l2;
         if (std.mem.eql(u8, s, "MetadataChanged")) return .metadata_changed;
         if (std.mem.eql(u8, s, "ResolverApproved")) return .resolver_approved;
         if (std.mem.eql(u8, s, "TextChanged")) return .text_changed;
@@ -245,6 +301,17 @@ pub const EventType = enum {
         if (std.mem.eql(u8, s, "EACRolesChanged")) return .eac_roles_changed;
         if (std.mem.eql(u8, s, "VersionChanged")) return .version_changed;
         if (std.mem.eql(u8, s, "AliasChanged")) return .alias_changed;
+        if (std.mem.eql(u8, s, "LabelRegistered")) return .label_registered;
+        if (std.mem.eql(u8, s, "LabelReserved")) return .label_reserved;
+        if (std.mem.eql(u8, s, "LabelUnregistered")) return .label_unregistered;
+        if (std.mem.eql(u8, s, "ExpiryUpdated")) return .expiry_updated;
+        if (std.mem.eql(u8, s, "ParentUpdated")) return .parent_updated;
+        if (std.mem.eql(u8, s, "NameMigrated")) return .name_migrated;
+        if (std.mem.eql(u8, s, "NameWrapped")) return .name_wrapped;
+        if (std.mem.eql(u8, s, "NameUnwrapped")) return .name_unwrapped;
+        if (std.mem.eql(u8, s, "FusesSet")) return .fuses_set;
+        if (std.mem.eql(u8, s, "ReverseClaimed")) return .reverse_claimed;
+        if (std.mem.eql(u8, s, "RegistryTransfer")) return .registry_transfer;
         return null;
     }
 };
@@ -254,7 +321,7 @@ pub const Event = struct {
     /// Event type
     event_type: EventType,
     /// Chain where event occurred
-    chain: Chain,
+    protocol: Protocol,
     /// Block number
     block_number: u64,
     /// Transaction hash
@@ -272,9 +339,32 @@ pub const Event = struct {
     /// Timestamp
     timestamp: i64,
 
+    // ------------------------------------------------------------------------
+    // Registration economics (populated only when this Event was synthesised
+    // from a `registrations` row — see storage/registrations.zig:rowToEvent).
+    // Null otherwise. Stored as u256 decimal strings because wei values
+    // routinely exceed i64 range.
+    // ------------------------------------------------------------------------
+    /// Base rent cost in wei (decimal-encoded u256). Null when the Controller
+    /// event has not been observed for this registration.
+    base_cost: ?[]const u8 = null,
+    /// Auction premium portion in wei (decimal-encoded u256). "0" for legacy
+    /// 5-arg controller. Null when the Controller event was not observed.
+    premium: ?[]const u8 = null,
+    /// Human-readable label from the Controller event preimage (e.g., "vitalik").
+    /// Null when the Controller event was not observed.
+    label_name: ?[]const u8 = null,
+    /// Referrer bytes32 hex from the 7-arg UnwrappedEthRegistrarController
+    /// variant. Null for older variants / unobserved events.
+    referrer: ?[]const u8 = null,
+
     pub fn deinit(self: *Event, allocator: std.mem.Allocator) void {
         if (self.name) |n| allocator.free(n);
         allocator.free(self.data);
+        if (self.base_cost) |s| allocator.free(s);
+        if (self.premium) |s| allocator.free(s);
+        if (self.label_name) |s| allocator.free(s);
+        if (self.referrer) |s| allocator.free(s);
     }
 };
 
@@ -284,6 +374,9 @@ pub const Webhook = struct {
     id: u64,
     /// URL to send events to
     url: []const u8,
+    /// Per-webhook HMAC-SHA256 secret (hex-encoded). Returned to the registrant once
+    /// at creation time so they can verify incoming `X-Webhook-Signature` headers.
+    secret: []const u8,
     /// Event types to listen for (empty = all)
     event_types: []const EventType,
     /// Whether this webhook is active
@@ -295,93 +388,9 @@ pub const Webhook = struct {
 
     pub fn deinit(self: *Webhook, allocator: std.mem.Allocator) void {
         allocator.free(self.url);
+        allocator.free(self.secret);
         allocator.free(self.event_types);
     }
-};
-
-/// Migration direction
-pub const MigrationDirection = enum {
-    to_l1,
-    to_l2,
-
-    pub fn toString(self: MigrationDirection) []const u8 {
-        return switch (self) {
-            .to_l1 => "to_l1",
-            .to_l2 => "to_l2",
-        };
-    }
-
-    pub fn fromString(s: []const u8) !MigrationDirection {
-        if (std.mem.eql(u8, s, "to_l1")) return .to_l1;
-        if (std.mem.eql(u8, s, "to_l2")) return .to_l2;
-        return error.InvalidDirection;
-    }
-};
-
-/// Migration record
-pub const Migration = struct {
-    /// Migration ID
-    id: u64,
-    /// Chain where the migration event occurred
-    chain: Chain,
-    /// Token ID being migrated
-    token_id: u256,
-    /// Migration direction
-    direction: MigrationDirection,
-    /// DNS-encoded name
-    dns_encoded_name: []const u8,
-    /// Block number
-    block_number: u64,
-    /// Transaction hash
-    tx_hash: Hash,
-    /// Log index
-    log_index: u32,
-    /// Timestamp
-    timestamp: i64,
-
-    pub fn deinit(self: *Migration, allocator: std.mem.Allocator) void {
-        allocator.free(self.dns_encoded_name);
-    }
-};
-
-/// Renewal synchronization record (cross-chain renewal sync)
-pub const RenewalSync = struct {
-    /// Record ID
-    id: u64,
-    /// Chain where the sync event occurred
-    chain: Chain,
-    /// Token ID being renewed
-    token_id: u256,
-    /// New expiration timestamp
-    new_expiry: u64,
-    /// Block number
-    block_number: u64,
-    /// Transaction hash
-    tx_hash: Hash,
-    /// Log index
-    log_index: u32,
-    /// Timestamp
-    timestamp: i64,
-};
-
-/// Token observer record
-pub const TokenObserver = struct {
-    /// Record ID
-    id: u64,
-    /// Chain where the observer was set
-    chain: Chain,
-    /// Token ID being observed
-    token_id: u256,
-    /// Observer contract address
-    observer: Address,
-    /// Block number
-    block_number: u64,
-    /// Transaction hash
-    tx_hash: Hash,
-    /// Log index
-    log_index: u32,
-    /// Timestamp
-    timestamp: i64,
 };
 
 /// EAC (Enhanced Access Control) role types
@@ -415,7 +424,7 @@ pub const EACRoleAssignment = struct {
     /// Record ID
     id: u64,
     /// Chain
-    chain: Chain,
+    protocol: Protocol,
     /// Resource (token ID or resource identifier) as hex string
     resource: []const u8,
     /// Account that has the role
@@ -445,7 +454,7 @@ pub const ResolverMetadata = struct {
     /// Record ID
     id: u64,
     /// Chain
-    chain: Chain,
+    protocol: Protocol,
     /// Resolver contract address
     resolver: Address,
     /// GraphQL endpoint URL for offchain data
@@ -467,7 +476,7 @@ pub const ResolverApproval = struct {
     /// Record ID
     id: u64,
     /// Chain
-    chain: Chain,
+    protocol: Protocol,
     /// Resolver contract address
     resolver: Address,
     /// Namehash of the name being delegated

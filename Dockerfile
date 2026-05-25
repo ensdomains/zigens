@@ -1,5 +1,5 @@
 # Multi-stage Dockerfile for ENSv2 Indexer + API
-# Builds L2 indexer and GraphQL API server
+# Builds V1+V2 indexer and GraphQL API server
 # Rainbow table is downloaded automatically on first startup
 
 # Stage 1: Build Zig applications
@@ -17,7 +17,10 @@ RUN apk add --no-cache \
 
 # Install Zig 0.15.x (latest stable)
 # Note: Zig 0.15+ uses new naming convention: zig-{arch}-linux instead of zig-linux-{arch}
-ARG ZIG_VERSION=0.15.1
+# 0.15.2 is a stdlib patch release with std.http.Client + std.crypto.tls fixes;
+# 0.15.1 produced 90s+ TLS/HTTP hangs in deployment that manifested as 408s from
+# the RPC provider, while 0.15.2 (matching local dev) works fine.
+ARG ZIG_VERSION=0.15.2
 ARG TARGETARCH
 RUN ARCH=$(case ${TARGETARCH:-$(uname -m)} in \
         amd64|x86_64) echo "x86_64" ;; \
@@ -67,8 +70,8 @@ WORKDIR /app
 
 # Copy binaries from builder
 COPY --from=builder /app/zig-out/bin/ensv2-indexer /app/ensv2-indexer
-COPY --from=builder /app/zig-out/bin/ensv2-indexer-l1 /app/ensv2-indexer-l1
-COPY --from=builder /app/zig-out/bin/ensv2-indexer-l2 /app/ensv2-indexer-l2
+COPY --from=builder /app/zig-out/bin/ensv2-indexer-v1 /app/ensv2-indexer-v1
+COPY --from=builder /app/zig-out/bin/ensv2-indexer-v2 /app/ensv2-indexer-v2
 COPY --from=builder /app/zig-out/bin/ensv2-api /app/ensv2-api
 
 # Copy schema files (needed for database initialization)

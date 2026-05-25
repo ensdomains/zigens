@@ -102,9 +102,9 @@ zig build test
 
 | Binary | Description |
 |--------|-------------|
-| `ensv2-indexer` | Main indexer (L1 + L2) |
-| `ensv2-indexer-l1` | L1-only indexer |
-| `ensv2-indexer-l2` | L2-only indexer |
+| `ensv2-indexer` | Main indexer (V1 + V2) |
+| `ensv2-indexer-v1` | V1-only indexer |
+| `ensv2-indexer-v2` | V2-only indexer |
 | `ensv2-api` | Standalone GraphQL API server |
 | `rainbow-backfill` | Rainbow table label backfill |
 
@@ -113,9 +113,8 @@ zig build test
 Configuration is done via environment variables. Create a `.env` file:
 
 ```bash
-# RPC URLs
-L1_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_API_KEY
-L2_RPC_URL=https://arb-sepolia.g.alchemy.com/v2/YOUR_API_KEY
+# RPC URL
+RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_API_KEY
 
 # Network Configuration
 NETWORK=sepolia  # or mainnet
@@ -150,8 +149,7 @@ WEBHOOK_DB_PATH=./data/webhooks.db
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `L1_RPC_URL` | Ethereum L1 RPC endpoint | Required |
-| `L2_RPC_URL` | L2 RPC endpoint | Required |
+| `RPC_URL` | Ethereum RPC endpoint | Required |
 | `NETWORK` | Network name (sepolia, mainnet) | sepolia |
 | `START_BLOCK` | Block to start indexing from | 0 |
 | `POLL_INTERVAL` | Polling interval in seconds | 12 |
@@ -257,7 +255,7 @@ Webhooks are sent as HTTP POST requests with JSON payloads:
 ```json
 {
   "event_type": "NameRegistered",
-  "chain": "l2",
+  "chain": "v2",
   "block_number": 12345678,
   "tx_hash": "0x...",
   "name": "alice.eth",

@@ -9,7 +9,7 @@ pub const labelhash = hash.labelhash;
 pub const token_id = @import("token_id.zig");
 
 // Re-export common model types
-pub const Chain = models.Chain;
+pub const Chain = models.Protocol;
 pub const Name = models.Name;
 pub const Event = models.Event;
 pub const Registry = models.Registry;

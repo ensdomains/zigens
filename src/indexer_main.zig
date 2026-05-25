@@ -7,7 +7,7 @@ const models = @import("types/models.zig");
 // Configure logging: filter debug logs, use file redirection in production
 // Run with: ./ensv2-indexer > logs/indexer.log 2>&1 &
 pub const std_options: std.Options = .{
-    .log_level = .info,  // Only show info, warn, err (no debug)
+    .log_level = .info, // Only show info, warn, err (no debug)
 };
 
 const CliArgs = struct {
@@ -108,10 +108,8 @@ pub fn main() !void {
     defer cfg.deinit();
 
     std.log.info("ENSv2 Indexer starting...", .{});
-    std.log.info("L1 Network: {s}", .{cfg.network_l1.toString()});
-    std.log.info("L2 Network: {s}", .{cfg.network_l2.toString()});
-    std.log.info("L1 RPC: [CONFIGURED]", .{});
-    std.log.info("L2 RPC: [CONFIGURED]", .{});
+    std.log.info("Network: {s}", .{cfg.network.toString()});
+    std.log.info("RPC: [CONFIGURED]", .{});
     std.log.info("Start block: {d}", .{cfg.start_block});
     std.log.info("Batch size: {d}", .{cfg.batch_size});
     std.log.info("Rate limit: {d} req/s", .{cfg.rate_limit_per_second});
@@ -119,6 +117,7 @@ pub fn main() !void {
     // Initialize database
     var database = try db.Database.init(allocator, cfg.database_path);
     defer database.deinit();
+    database.setChainId(cfg.network.chainId());
 
     std.log.info("Database initialized at: {s}", .{cfg.database_path});
 
@@ -145,8 +144,8 @@ pub fn main() !void {
 
         // Reset sync state for both chains
         std.log.info("Resetting sync state to block {d}...", .{from_block});
-        try database.setSyncState(.l1, from_block);
-        try database.setSyncState(.l2, from_block);
+        try database.setSyncState(.v1, from_block);
+        try database.setSyncState(.v2, from_block);
         std.log.info("Sync state reset complete. Indexer will resume from block {d}", .{from_block});
     }
 

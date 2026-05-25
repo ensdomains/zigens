@@ -1,0 +1,103 @@
+# ENSv2 Migration Indexer + GraphQL API
+# Standalone deployment for running against a tenderly-fork RPC (V1→V2 migration
+# fixture testing). Mirrors docker-compose.staging.yml but with distinct names,
+# volumes, ports, and DB path so it can co-exist on the same host as staging.
+# Usage: docker compose -f docker-compose.migration.yml up -d
+
+services:
+  # V2 Indexer (Migration)
+  indexer-v2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ensv2-indexer-v2-migration
+    restart: unless-stopped
+    command: ["/app/ensv2-indexer-v2"]
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - ens-data-migration:/app/data
+      - webhook-data-migration:/app/webhooks
+    environment:
+      - DATABASE_PATH=/app/data/ens_migration.db
+      - RAINBOW_PATH=/app/data/ens_rainbow.db
+      - DOWNLOAD_RAINBOW=true
+      - RPC_URL=${RPC_URL}
+      - NETWORK=${NETWORK:-sepolia}
+      - BATCH_SIZE=10000
+      - POLL_INTERVAL=12
+      - RATE_LIMIT_PER_SECOND=25
+      - STATUS_PORT=3003
+      - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
+      - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
+      - WEBHOOK_MAX_RETRIES=${WEBHOOK_MAX_RETRIES:-3}
+    healthcheck:
+      test: ["CMD", "/app/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - ens-network-migration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # GraphQL API Server (Migration)
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ensv2-api-migration
+    restart: unless-stopped
+    command: ["/app/api-entrypoint.sh"]
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "5657:5657"
+    volumes:
+      - ens-data-migration:/app/data:ro
+      - webhook-data-migration:/app/webhooks
+    environment:
+      - DATABASE_PATH=/app/data/ens_migration.db
+      - RAINBOW_PATH=/app/data/ens_rainbow.db
+      - DOWNLOAD_RAINBOW=false
+      - API_PORT=5657
+      - GRAPHQL_MAX_DEPTH=10
+      - GRAPHQL_MAX_COST=${GRAPHQL_MAX_COST:-10000}
+      - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
+      - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
+      - WEBHOOK_ADMIN_USERNAME=${WEBHOOK_ADMIN_USERNAME:-}
+      - WEBHOOK_ADMIN_PASSWORD=${WEBHOOK_ADMIN_PASSWORD:-}
+      - METRICS_ENABLED=false
+    depends_on:
+      - indexer-v2
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:5657/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - ens-network-migration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  ens-network-migration:
+    driver: bridge
+
+volumes:
+  ens-data-migration:
+    driver: local
+  webhook-data-migration:
+    driver: local

@@ -8,9 +8,9 @@ const models = common.models;
 const Address = common.Address;
 const parser = common.parser;
 const pagination = common.pagination;
-const builders = common.builders;
+const builders = @import("../builders/builders.zig");
 const loaders = common.loaders;
-const NestedContext = common.NestedContext;
+const NestedContext = builders.NestedContext;
 
 pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
@@ -37,74 +37,79 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
     var event_types_list: std.ArrayList([]const u8) = .{};
     defer event_types_list.deinit(allocator);
 
+    var event_types_not_list: std.ArrayList([]const u8) = .{};
+    defer event_types_not_list.deinit(allocator);
+
     var normalized_contract_address: ?[]u8 = null;
     defer if (normalized_contract_address) |addr| allocator.free(addr);
 
-    for (field.arguments) |arg| {
-        if (std.mem.eql(u8, arg.name, "where") and arg.value == .object) {
-            for (arg.value.object) |filter_arg| {
-                if (std.mem.eql(u8, filter_arg.name, "type")) {
-                    if (filter_arg.value == .string) {
-                        filter_opts.event_type = filter_arg.value.string;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "type_in")) {
-                    if (filter_arg.value == .list) {
-                        for (filter_arg.value.list) |item| {
-                            if (item == .string) {
-                                try event_types_list.append(allocator, item.string);
-                            }
-                        }
-                        if (event_types_list.items.len > 0) {
-                            filter_opts.event_types = event_types_list.items;
-                        }
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "domain")) {
-                    if (filter_arg.value == .string) {
-                        filter_opts.domain = filter_arg.value.string;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "contractAddress")) {
-                    if (filter_arg.value == .string) {
-                        const addr = Address.fromHex(filter_arg.value.string) catch continue;
-                        normalized_contract_address = try addr.toHex(allocator);
-                        filter_opts.contract_address = normalized_contract_address;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "namehash")) {
-                    if (filter_arg.value == .string) {
-                        filter_opts.namehash = filter_arg.value.string;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "blockNumber_gt")) {
-                    if (filter_arg.value == .int) {
-                        filter_opts.block_number_gt = filter_arg.value.int;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "blockNumber_lt")) {
-                    if (filter_arg.value == .int) {
-                        filter_opts.block_number_lt = filter_arg.value.int;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "timestamp_gt")) {
-                    if (filter_arg.value == .int) {
-                        filter_opts.timestamp_gt = filter_arg.value.int;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "timestamp_lt")) {
-                    if (filter_arg.value == .int) {
-                        filter_opts.timestamp_lt = filter_arg.value.int;
-                    }
+    if (common.getObjectArg(field, "where")) |where_args| {
+        for (where_args) |a| {
+            if (std.mem.eql(u8, a.name, "type_in") and a.value == .list) {
+                for (a.value.list) |item| {
+                    if (item == .string) try event_types_list.append(allocator, item.string);
                 }
+                if (event_types_list.items.len > 0) filter_opts.event_types = event_types_list.items;
+                continue;
             }
-        } else if (std.mem.eql(u8, arg.name, "orderBy") and arg.value == .string) {
-            if (std.mem.eql(u8, arg.value.string, "blockNumber")) {
-                filter_opts.sort_field = .block_number;
-            } else if (std.mem.eql(u8, arg.value.string, "timestamp")) {
-                filter_opts.sort_field = .timestamp;
-            } else if (std.mem.eql(u8, arg.value.string, "name")) {
-                filter_opts.sort_field = .name;
+            if (std.mem.eql(u8, a.name, "type_not_in") and a.value == .list) {
+                for (a.value.list) |item| {
+                    if (item == .string) try event_types_not_list.append(allocator, item.string);
+                }
+                if (event_types_not_list.items.len > 0) filter_opts.event_types_not = event_types_not_list.items;
+                continue;
             }
-        } else if (std.mem.eql(u8, arg.name, "orderDirection") and arg.value == .string) {
-            if (std.mem.eql(u8, arg.value.string, "asc")) {
-                filter_opts.order_dir = .asc;
-            } else if (std.mem.eql(u8, arg.value.string, "desc")) {
-                filter_opts.order_dir = .desc;
+            if (std.mem.eql(u8, a.name, "contractAddress") and a.value == .string) {
+                // Normalize inline — needs allocation owned by the caller.
+                // Surface invalid input as an error rather than silently dropping the filter.
+                const addr = Address.fromHex(a.value.string) catch return error.InvalidContractAddress;
+                normalized_contract_address = try addr.toHex(allocator);
+                filter_opts.contract_address = normalized_contract_address;
+                continue;
             }
+            if (std.mem.eql(u8, a.name, "protocol") and a.value == .string) {
+                // Surface invalid protocol as an error so a typo doesn't silently drop the filter.
+                filter_opts.protocol = models.Protocol.fromString(a.value.string) catch return error.InvalidProtocol;
+                continue;
+            }
+
+            _ = common.matchStringArg(a, "type", &filter_opts.event_type) or
+                common.matchStringArg(a, "type_not", &filter_opts.event_type_not) or
+                common.matchStringArg(a, "domain", &filter_opts.domain) or
+                common.matchStringArg(a, "namehash", &filter_opts.namehash) or
+                common.matchIntArg(a, "blockNumber_gt", &filter_opts.block_number_gt) or
+                common.matchIntArg(a, "blockNumber_gte", &filter_opts.block_number_gte) or
+                common.matchIntArg(a, "blockNumber_lt", &filter_opts.block_number_lt) or
+                common.matchIntArg(a, "blockNumber_lte", &filter_opts.block_number_lte) or
+                common.matchIntArg(a, "timestamp_gt", &filter_opts.timestamp_gt) or
+                common.matchIntArg(a, "timestamp_gte", &filter_opts.timestamp_gte) or
+                common.matchIntArg(a, "timestamp_lt", &filter_opts.timestamp_lt) or
+                common.matchIntArg(a, "timestamp_lte", &filter_opts.timestamp_lte);
         }
+    }
+
+    if (parser.getStringArg(field, "orderBy", null)) |order_by| {
+        if (std.mem.eql(u8, order_by, "blockNumber")) filter_opts.sort_field = .block_number;
+        if (std.mem.eql(u8, order_by, "timestamp")) filter_opts.sort_field = .timestamp;
+        if (std.mem.eql(u8, order_by, "name")) filter_opts.sort_field = .name;
+    }
+    filter_opts.order_dir = common.parseOrderDirection(field, db.EventOrderDir, filter_opts.order_dir);
+
+    // Check which top-level fields are requested (for totalCount-only fast path)
+    var wants_edges = false;
+    var wants_page_info = false;
+    var wants_total_count = false;
+    for (field.selections) |*sel| {
+        if (std.mem.eql(u8, sel.name, "edges")) wants_edges = true;
+        if (std.mem.eql(u8, sel.name, "pageInfo")) wants_page_info = true;
+        if (std.mem.eql(u8, sel.name, "totalCount")) wants_total_count = true;
+    }
+
+    // Fast path: only totalCount requested — skip row fetching entirely
+    if (wants_total_count and !wants_edges and !wants_page_info) {
+        const count = try database.getEventCount(filter_opts);
+        const result = try std.fmt.allocPrint(allocator, "{{\"totalCount\":{d}}}", .{count});
+        return parser.FieldResult{ .json = result };
     }
 
     // Extract node selections from query
@@ -131,9 +136,24 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
     else
         user_dir;
 
+    // Convert cursor → skip offset. Cursor format: "<tx_hash_hex>-<log_index>". The count
+    // must apply the SAME filters as the row query (type, namehash, contractAddress, block
+    // range, …) — otherwise offset is taken over the unfiltered superset and pages drop rows.
+    var skip: u32 = 0;
+    if (params.cursor) |c| {
+        const decoded = try pagination.CursorCodec.decodeString(allocator, c);
+        defer allocator.free(decoded);
+        const sep = std.mem.lastIndexOfScalar(u8, decoded, '-') orelse return error.InvalidCursor;
+        const tx_hash = decoded[0..sep];
+        const log_index = std.fmt.parseInt(u32, decoded[sep + 1 ..], 10) catch return error.InvalidCursor;
+        const events_before = database.countEventsBeforeCursor(tx_hash, log_index, order_dir, filter_opts) catch 0;
+        skip = events_before +| 1;
+    }
+
     // Apply filters and fetch
     var fetch_filter = filter_opts;
     fetch_filter.limit = @intCast(fetch_limit);
+    fetch_filter.skip = skip;
     fetch_filter.order_dir = order_dir;
 
     const events = try database.getEventsFiltered(fetch_filter);
@@ -144,7 +164,9 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
         allocator.free(events);
     }
 
-    // Determine actual items to return
+    // We fetched `params.limit + 1` to detect a trailing page; if we actually got
+    // more than `limit`, there's more data in the pagination direction.
+    const has_more = events.len > params.limit;
     const actual_items = @min(events.len, params.limit);
 
     // For backward pagination, reverse the results to maintain proper edge order
@@ -195,14 +217,7 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
         };
     }
 
-    // Only compute total count when requested in the GraphQL selection
-    var wants_total_count = false;
-    for (field.selections) |*sel| {
-        if (std.mem.eql(u8, sel.name, "totalCount")) {
-            wants_total_count = true;
-            break;
-        }
-    }
+    // Only compute total count when requested (reuse wants_total_count from earlier scan)
     const total_count: ?usize = if (wants_total_count)
         try database.getEventCount(filter_opts)
     else
@@ -214,6 +229,7 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
         allocator,
         wrapper_items,
         params,
+        has_more,
         getId,
         total_count,
     );
@@ -278,99 +294,152 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
     return parser.FieldResult{ .json = result_json };
 }
 
-/// Resolver for domain query (single domain)
+/// Subgraph-parity top-level per-type event queries.
+///
+/// Each generated resolver below filters the flat `events` table by a fixed
+/// `event_type` and returns `[Event!]!` (typed projection via `as*` accessors).
+/// This avoids duplicating storage — these are just typed projections of the
+/// existing events list. The injected `event_type` overrides any client-set
+/// `where.type` so callers can't accidentally cross-query.
+fn perTypeEventResolver(comptime event_type_str: []const u8) parser.ResolverFn {
+    const inner = struct {
+        fn resolve(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
+            return resolveEventsWithForcedType(ctx, field, event_type_str);
+        }
+    };
+    return inner.resolve;
+}
 
+/// Same as `perTypeEventResolver` but unions multiple event types. Used for
+/// `nameRegistereds` where subgraph convention surfaces both V1 BaseRegistrar
+/// `NameRegistered` events AND V2 PermissionedRegistry `LabelRegistered` events
+/// as a single "name registration" stream — they're semantically the same
+/// "a name was registered" signal, just emitted by different contracts.
+fn perTypeEventResolverMulti(comptime event_types_arr: []const []const u8) parser.ResolverFn {
+    const inner = struct {
+        fn resolve(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
+            return resolveEventsWithForcedTypes(ctx, field, event_types_arr);
+        }
+    };
+    return inner.resolve;
+}
+
+pub const resolveTransfers = perTypeEventResolver("Transfer");
+pub const resolveNameRegistereds = perTypeEventResolverMulti(&[_][]const u8{ "NameRegistered", "LabelRegistered" });
+pub const resolveNameReneweds = perTypeEventResolver("NameRenewed");
+pub const resolveTextChangeds = perTypeEventResolver("TextChanged");
+pub const resolveAddressChangeds = perTypeEventResolver("AddressChanged");
+pub const resolveNameWrappeds = perTypeEventResolver("NameWrapped");
+pub const resolveNameUnwrappeds = perTypeEventResolver("NameUnwrapped");
+pub const resolveFusesSets = perTypeEventResolver("FusesSet");
+pub const resolveExpiryUpdateds = perTypeEventResolver("ExpiryUpdated");
+pub const resolveResolverUpdateds = perTypeEventResolver("ResolverUpdated");
+pub const resolveLabelRegistereds = perTypeEventResolver("LabelRegistered");
+pub const resolveReverseClaimeds = perTypeEventResolver("ReverseClaimed");
+pub const resolveRegistryTransfers = perTypeEventResolver("RegistryTransfer");
+
+/// Resolver for domain query (single domain)
 pub fn resolveEvents(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
+    return resolveEventsWithForcedType(ctx, field, null);
+}
+
+/// Sister entry-point for resolvers that need to union multiple event types
+/// (currently only `nameRegistereds`). Delegates to the same body as the
+/// single-type variant.
+fn resolveEventsWithForcedTypes(ctx: parser.ExecutionContext, field: *const parser.Field, forced_event_types: []const []const u8) !parser.FieldResult {
+    return resolveEventsWithForced(ctx, field, null, forced_event_types);
+}
+
+fn resolveEventsWithForcedType(ctx: parser.ExecutionContext, field: *const parser.Field, forced_event_type: ?[]const u8) !parser.FieldResult {
+    return resolveEventsWithForced(ctx, field, forced_event_type, null);
+}
+
+fn resolveEventsWithForced(ctx: parser.ExecutionContext, field: *const parser.Field, forced_event_type: ?[]const u8, forced_event_types: ?[]const []const u8) !parser.FieldResult {
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
     const allocator = ctx.allocator;
 
-    // Extract arguments
-    const first = parser.getIntArg(field, "first", 100) orelse 100;
+    const first = (try common.parsePagination(field, 100)).first;
 
     // Parse EventFilter if provided
     var filter_opts = db.EventFilterOptions{
-        .limit = @intCast(first),
+        .limit = first,
     };
 
     // Temporary storage for event_types strings
     var event_types_list: std.ArrayList([]const u8) = .{};
     defer event_types_list.deinit(allocator);
 
+    var event_types_not_list: std.ArrayList([]const u8) = .{};
+    defer event_types_not_list.deinit(allocator);
+
     // Temporary storage for normalized contract address (to handle checksummed addresses)
     var normalized_contract_address: ?[]u8 = null;
     defer if (normalized_contract_address) |addr| allocator.free(addr);
 
     // Parse arguments
-    for (field.arguments) |arg| {
-        if (std.mem.eql(u8, arg.name, "where") and arg.value == .object) {
-            for (arg.value.object) |filter_arg| {
-                if (std.mem.eql(u8, filter_arg.name, "type")) {
-                    if (filter_arg.value == .string) {
-                        filter_opts.event_type = filter_arg.value.string;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "type_in")) {
-                    if (filter_arg.value == .list) {
-                        for (filter_arg.value.list) |item| {
-                            if (item == .string) {
-                                try event_types_list.append(allocator, item.string);
-                            }
-                        }
-                        if (event_types_list.items.len > 0) {
-                            filter_opts.event_types = event_types_list.items;
-                        }
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "domain")) {
-                    if (filter_arg.value == .string) {
-                        filter_opts.domain = filter_arg.value.string;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "contractAddress")) {
-                    if (filter_arg.value == .string) {
-                        // Parse and normalize address using Address.fromHex (validates format, normalizes to lowercase)
-                        const addr = Address.fromHex(filter_arg.value.string) catch {
-                            // Invalid address format - return error to user
-                            return error.InvalidContractAddress;
-                        };
-                        normalized_contract_address = try addr.toHex(allocator);
-                        filter_opts.contract_address = normalized_contract_address;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "namehash")) {
-                    if (filter_arg.value == .string) {
-                        filter_opts.namehash = filter_arg.value.string;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "blockNumber_gt")) {
-                    if (filter_arg.value == .int) {
-                        filter_opts.block_number_gt = filter_arg.value.int;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "blockNumber_lt")) {
-                    if (filter_arg.value == .int) {
-                        filter_opts.block_number_lt = filter_arg.value.int;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "timestamp_gt")) {
-                    if (filter_arg.value == .int) {
-                        filter_opts.timestamp_gt = filter_arg.value.int;
-                    }
-                } else if (std.mem.eql(u8, filter_arg.name, "timestamp_lt")) {
-                    if (filter_arg.value == .int) {
-                        filter_opts.timestamp_lt = filter_arg.value.int;
-                    }
+    if (common.getObjectArg(field, "where")) |where_args| {
+        for (where_args) |a| {
+            if (std.mem.eql(u8, a.name, "type_in") and a.value == .list) {
+                for (a.value.list) |item| {
+                    if (item == .string) try event_types_list.append(allocator, item.string);
                 }
+                if (event_types_list.items.len > 0) filter_opts.event_types = event_types_list.items;
+                continue;
             }
-        } else if (std.mem.eql(u8, arg.name, "orderBy") and arg.value == .string) {
-            if (std.mem.eql(u8, arg.value.string, "blockNumber")) {
-                filter_opts.sort_field = .block_number;
-            } else if (std.mem.eql(u8, arg.value.string, "timestamp")) {
-                filter_opts.sort_field = .timestamp;
-            } else if (std.mem.eql(u8, arg.value.string, "name")) {
-                filter_opts.sort_field = .name;
+            if (std.mem.eql(u8, a.name, "type_not_in") and a.value == .list) {
+                for (a.value.list) |item| {
+                    if (item == .string) try event_types_not_list.append(allocator, item.string);
+                }
+                if (event_types_not_list.items.len > 0) filter_opts.event_types_not = event_types_not_list.items;
+                continue;
             }
-        } else if (std.mem.eql(u8, arg.name, "orderDirection") and arg.value == .string) {
-            if (std.mem.eql(u8, arg.value.string, "asc")) {
-                filter_opts.order_dir = .asc;
-            } else if (std.mem.eql(u8, arg.value.string, "desc")) {
-                filter_opts.order_dir = .desc;
+            if (std.mem.eql(u8, a.name, "contractAddress") and a.value == .string) {
+                const addr = Address.fromHex(a.value.string) catch return error.InvalidContractAddress;
+                normalized_contract_address = try addr.toHex(allocator);
+                filter_opts.contract_address = normalized_contract_address;
+                continue;
             }
+            if (std.mem.eql(u8, a.name, "protocol") and a.value == .string) {
+                filter_opts.protocol = models.Protocol.fromString(a.value.string) catch return error.InvalidProtocol;
+                continue;
+            }
+
+            _ = common.matchStringArg(a, "type", &filter_opts.event_type) or
+                common.matchStringArg(a, "type_not", &filter_opts.event_type_not) or
+                common.matchStringArg(a, "domain", &filter_opts.domain) or
+                common.matchStringArg(a, "namehash", &filter_opts.namehash) or
+                common.matchIntArg(a, "blockNumber_gt", &filter_opts.block_number_gt) or
+                common.matchIntArg(a, "blockNumber_gte", &filter_opts.block_number_gte) or
+                common.matchIntArg(a, "blockNumber_lt", &filter_opts.block_number_lt) or
+                common.matchIntArg(a, "blockNumber_lte", &filter_opts.block_number_lte) or
+                common.matchIntArg(a, "timestamp_gt", &filter_opts.timestamp_gt) or
+                common.matchIntArg(a, "timestamp_gte", &filter_opts.timestamp_gte) or
+                common.matchIntArg(a, "timestamp_lt", &filter_opts.timestamp_lt) or
+                common.matchIntArg(a, "timestamp_lte", &filter_opts.timestamp_lte);
         }
     }
+
+    // Subgraph-parity per-type top-level queries (transfers, textChangeds, …)
+    // inject a fixed event_type that overrides any client-set `where.type`.
+    if (forced_event_type) |t| {
+        filter_opts.event_type = t;
+        filter_opts.event_types = null;
+        filter_opts.event_type_not = null;
+        filter_opts.event_types_not = null;
+    }
+    if (forced_event_types) |ts| {
+        filter_opts.event_type = null;
+        filter_opts.event_types = ts;
+        filter_opts.event_type_not = null;
+        filter_opts.event_types_not = null;
+    }
+
+    if (parser.getStringArg(field, "orderBy", null)) |order_by| {
+        if (std.mem.eql(u8, order_by, "blockNumber")) filter_opts.sort_field = .block_number;
+        if (std.mem.eql(u8, order_by, "timestamp")) filter_opts.sort_field = .timestamp;
+        if (std.mem.eql(u8, order_by, "name")) filter_opts.sort_field = .name;
+    }
+    filter_opts.order_dir = common.parseOrderDirection(field, db.EventOrderDir, filter_opts.order_dir);
 
     // Get events from database with filters
     const events = try database.getEventsFiltered(filter_opts);

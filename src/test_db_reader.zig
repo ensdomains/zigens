@@ -76,11 +76,7 @@ pub fn main() !void {
         const block_number = db.c.sqlite3_column_int64(latest_stmt, 1);
         const tx_hash = db.c.sqlite3_column_text(latest_stmt, 2);
         const tx_hash_slice = std.mem.span(tx_hash);
-        std.log.info("  Block {d}: {s} (tx: {s})", .{
-            block_number,
-            event_type,
-            if (tx_hash_slice.len > 10) tx_hash_slice[0..10] else tx_hash_slice
-        });
+        std.log.info("  Block {d}: {s} (tx: {s})", .{ block_number, event_type, if (tx_hash_slice.len > 10) tx_hash_slice[0..10] else tx_hash_slice });
     }
 
     std.log.info("\n✅ Database read test completed successfully!", .{});

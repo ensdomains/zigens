@@ -21,7 +21,7 @@ const COMMIT_INTERVAL: u64 = 100_000;
 
 /// The replay SQL query — extracts fields from JSON in SQL to avoid per-row JSON parsing in Zig.
 const REPLAY_SQL =
-    \\SELECT event_type, chain, block_number, tx_hash, log_index,
+    \\SELECT event_type, protocol, block_number, tx_hash, log_index,
     \\       contract_address, name, namehash, timestamp,
     \\       json_extract(data, '$.parentNode'),
     \\       json_extract(data, '$.labelhash'),
@@ -38,7 +38,7 @@ const REPLAY_SQL =
     \\       json_extract(data, '$.expiry'),
     \\       json_extract(data, '$.name'),
     \\       json_extract(data, '$.address')
-    \\FROM events WHERE chain = 'l1' AND json_valid(data)
+    \\FROM events WHERE protocol = 'v1' AND json_valid(data)
     \\ORDER BY block_number ASC, log_index ASC
 ;
 
@@ -74,12 +74,12 @@ pub fn replayEventsToRebuildNames(self: *Indexer) !void {
 
     // ── Step 1: Ensure events indexes exist (needed for the replay query ORDER BY) ──
     std.log.info("Ensuring events indexes exist for replay query...", .{});
-    try database.exec("CREATE INDEX IF NOT EXISTS idx_events_chain ON events(chain)");
+    try database.exec("CREATE INDEX IF NOT EXISTS idx_events_protocol ON events(protocol)");
     try database.exec("CREATE INDEX IF NOT EXISTS idx_events_block_log ON events(block_number, log_index)");
 
     // ── Step 2: Count total events (fast with index) ──
     const total_events = blk: {
-        var cq = try Query.init(database, "SELECT COUNT(*) FROM events WHERE chain = 'l1'");
+        var cq = try Query.init(database, "SELECT COUNT(*) FROM events WHERE protocol = 'v1'");
         defer cq.deinit();
         if (try cq.step()) {
             break :blk @as(u64, @intCast(cq.getInt64(0)));
@@ -99,7 +99,7 @@ pub fn replayEventsToRebuildNames(self: *Indexer) !void {
     try database.exec(
         \\CREATE TABLE names (
         \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
-        \\  chain TEXT NOT NULL,
+        \\  protocol TEXT NOT NULL,
         \\  name TEXT NOT NULL,
         \\  namehash TEXT NOT NULL,
         \\  label TEXT NOT NULL,
@@ -115,7 +115,6 @@ pub fn replayEventsToRebuildNames(self: *Indexer) !void {
         \\  expiry INTEGER,
         \\  registry_locked INTEGER NOT NULL DEFAULT 0,
         \\  migrated INTEGER NOT NULL DEFAULT 0,
-        \\  ejected INTEGER NOT NULL DEFAULT 0,
         \\  created_block INTEGER NOT NULL,
         \\  created_at INTEGER NOT NULL,
         \\  updated_block INTEGER NOT NULL,
@@ -127,7 +126,7 @@ pub fn replayEventsToRebuildNames(self: *Indexer) !void {
         \\  v1_label_hash TEXT DEFAULT NULL,
         \\  registrant TEXT,
         \\  registered_at INTEGER,
-        \\  UNIQUE(chain, namehash)
+        \\  UNIQUE(protocol, namehash)
         \\)
     );
     // Keep the namehash index — it's the primary lookup key used during replay
@@ -239,7 +238,7 @@ fn replayOneEvent(self: *Indexer, q: *Query) !void {
 
     const contract = try Address.fromHex(contract_str);
 
-    const cfg = self.config.l1_contracts;
+    const cfg = self.config.v1_contracts;
 
     // ── Registry events ──
     if (contract.eql(cfg.ens_registry)) {
@@ -330,7 +329,7 @@ fn replayNewOwner(self: *Indexer, q: *Query) !void {
     const subdomain_namehash = Hash{ .bytes = subdomain_bytes };
 
     // Skip pre-migration .eth 2LDs (handled by backfillPreMigrationNames)
-    const v1_migration_block = self.config.l1_contracts.v1_migration_block;
+    const v1_migration_block = self.config.v1_contracts.v1_migration_block;
     if (v1_migration_block > 0 and block_number < v1_migration_block) return;
 
     // .eth 2LDs are handled by BaseRegistrar NameRegistered — skip
@@ -406,14 +405,14 @@ fn replayNewOwner(self: *Indexer, q: *Query) !void {
         existing_mut.deinit(self.allocator);
         try names_storage.updateNameOwner(self.database, subdomain_namehash, owner);
     } else {
-        const registry = self.config.l1_contracts.ens_registry;
+        const registry = self.config.v1_contracts.ens_registry;
 
         const name_copy = try self.allocator.dupe(u8, full_name);
         const label_copy = try self.allocator.dupe(u8, label_str);
         const parent_copy = if (parent_name_str) |pn| try self.allocator.dupe(u8, pn) else null;
 
         var name = models.Name{
-            .chain = .l1,
+            .protocol = .v1,
             .name = name_copy,
             .namehash = subdomain_namehash,
             .label = label_copy,
@@ -430,7 +429,6 @@ fn replayNewOwner(self: *Indexer, q: *Query) !void {
             .expiry = 0,
             .registry_locked = false,
             .migrated = false,
-            .ejected = false,
             .created_block = block_number,
             .created_at = timestamp,
             .registered_at = timestamp,
@@ -535,8 +533,8 @@ fn replayBaseRegistrarNameReg(self: *Indexer, q: *Query) !void {
             .label_hash = label_hash,
             .parent_name = "eth",
             .parent_namehash = eth_node,
-            .chain = .l1,
-            .registry = self.config.l1_contracts.ens_registry,
+            .protocol = .v1,
+            .registry = self.config.v1_contracts.ens_registry,
             .owner = owner,
             .registrant = owner,
             .resolver = Address.zero,
@@ -546,7 +544,6 @@ fn replayBaseRegistrarNameReg(self: *Indexer, q: *Query) !void {
             .expiry = expires,
             .registry_locked = false,
             .migrated = false,
-            .ejected = false,
             .created_block = block_number,
             .created_at = timestamp,
             .registered_at = timestamp,
@@ -692,7 +689,7 @@ fn normalizeTokenId(allocator: std.mem.Allocator, id_str: []const u8) ![]u8 {
 
 /// Drop only names-related indexes (keep events indexes for the replay query).
 fn dropNamesIndexes(database: *db_module.Database) !void {
-    try database.exec("DROP INDEX IF EXISTS idx_names_chain");
+    try database.exec("DROP INDEX IF EXISTS idx_names_protocol");
     try database.exec("DROP INDEX IF EXISTS idx_names_name");
     try database.exec("DROP INDEX IF EXISTS idx_names_label");
     try database.exec("DROP INDEX IF EXISTS idx_names_owner");
@@ -711,14 +708,14 @@ fn dropNamesIndexes(database: *db_module.Database) !void {
 /// Recreate only names-related indexes after bulk replay.
 fn createNamesIndexes(database: *db_module.Database) !void {
     const timer = std.time.milliTimestamp();
-    try database.exec("CREATE INDEX IF NOT EXISTS idx_names_chain ON names(chain)");
+    try database.exec("CREATE INDEX IF NOT EXISTS idx_names_protocol ON names(protocol)");
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_name ON names(name)");
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_label ON names(label)");
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_owner ON names(owner)");
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_expiry ON names(expiry)");
-    try database.exec("CREATE INDEX IF NOT EXISTS idx_names_registry ON names(chain, registry)");
-    try database.exec("CREATE INDEX IF NOT EXISTS idx_names_resolver ON names(chain, resolver)");
-    try database.exec("CREATE INDEX IF NOT EXISTS idx_names_created_block ON names(chain, created_block)");
+    try database.exec("CREATE INDEX IF NOT EXISTS idx_names_registry ON names(protocol, registry)");
+    try database.exec("CREATE INDEX IF NOT EXISTS idx_names_resolver ON names(protocol, resolver)");
+    try database.exec("CREATE INDEX IF NOT EXISTS idx_names_created_block ON names(protocol, created_block)");
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_registrant ON names(registrant)");
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_v1_label_hash ON names(v1_label_hash)");
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_parent_namehash ON names(parent_namehash)");

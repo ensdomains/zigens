@@ -9,7 +9,6 @@ const v1_names = @import("../../utils/v1_names.zig");
 const LabelBackfill = @import("../label_backfill.zig").LabelBackfill;
 const Indexer = @import("../indexer.zig").Indexer;
 
-
 /// Backfill pre-migration names with labels from v1_labels table
 /// This runs once after initial sync completes and v1_labels is populated
 pub fn backfillPreMigrationNames(self: *Indexer) !void {
@@ -94,7 +93,7 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
 
         // Create the name entry
         var name = models.Name{
-            .chain = .l1,
+            .protocol = .v1,
             .name = full_name,
             .namehash = namehash,
             .label = label_copy,
@@ -111,7 +110,6 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
             .expiry = 0,
             .registry_locked = false,
             .migrated = false,
-            .ejected = false,
             .created_block = @intCast(block_number),
             .created_at = @intCast(created_at),
             .registered_at = @intCast(created_at),
@@ -160,11 +158,11 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
         history: {
             var hq = Query.init(self.database,
                 \\INSERT OR IGNORE INTO name_history
-                \\(chain, namehash, name, change_type, old_value, new_value, block_number, tx_hash, log_index, timestamp)
+                \\(protocol, namehash, name, change_type, old_value, new_value, block_number, tx_hash, log_index, timestamp)
                 \\VALUES (?, ?, ?, 'migration', NULL, 'Migrated from temporary registrar', ?, ?, 0, ?)
             ) catch break :history;
             defer hq.deinit();
-            hq.bindText("l1") catch break :history;
+            hq.bindText("v1") catch break :history;
             hq.bindText(namehash_hex) catch break :history;
             hq.bindText(full_name) catch break :history;
             hq.bindInt64(@intCast(block_number)) catch break :history;
@@ -207,21 +205,7 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
 /// Once the label is later resolved (by ETH Controller NameRegistered/NameRenewed), this function
 /// finds v1_labels entries without corresponding name records and creates them.
 pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
-    // Check if backfill already completed
-    {
-        var check_q = Query.init(self.database, "SELECT completed FROM backfill_status WHERE task = 'missing_eth_2ld_names'") catch |err| {
-            std.log.warn("Failed to check eth 2LD backfill status: {}", .{err});
-            return;
-        };
-        defer check_q.deinit();
-        if (try check_q.step()) {
-            if (check_q.getInt(0) == 1) {
-                std.log.info("Missing .eth 2LD names backfill already completed, skipping", .{});
-                return;
-            }
-        }
-    }
-
+    // Idempotent: rerun on every sync-complete to catch chunk-boundary races at the indexing head.
     std.log.info("Starting missing .eth 2LD names backfill...", .{});
 
     // Find v1_labels entries that don't have a corresponding name record
@@ -271,7 +255,7 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
                 \\SELECT json_extract(data, '$.owner'), json_extract(data, '$.expires'),
                 \\       timestamp, block_number
                 \\FROM events
-                \\WHERE namehash = ? AND event_type = 'name_registered' AND chain = 'l1'
+                \\WHERE namehash = ? AND event_type = 'name_registered' AND protocol = 'v1'
                 \\ORDER BY block_number ASC
                 \\LIMIT 1
             ) catch {
@@ -309,7 +293,7 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
         const v1_label_hash = try self.allocator.dupe(u8, token_id_str);
 
         var name = models.Name{
-            .chain = .l1,
+            .protocol = .v1,
             .name = full_name,
             .namehash = stored_namehash,
             .label = label_copy,
@@ -322,11 +306,14 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
             .resolver = Address.zero,
             .token_id = token_id,
             .canonical_id = token_id, // V1 doesn't use versioning
-            .token_version = 0,
+            // V1 BaseRegistrar tokens are version 1 (matches the pre-migration
+            // backfill above and the live NameRegistered path). Version 0 is
+            // reserved for non-tokenized V1 names (e.g. .eth itself). These
+            // backfilled rows are .eth 2LDs registered through the controller.
+            .token_version = 1,
             .expiry = expiry,
             .registry_locked = false,
             .migrated = false,
-            .ejected = false,
             .created_block = @intCast(reg_block),
             .created_at = reg_timestamp,
             .registered_at = reg_timestamp,
@@ -366,25 +353,13 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
     };
 
     std.log.info("Missing .eth 2LD backfill complete: found {d} labels without names, created {d} records", .{ total_found, created_count });
-
-    // Mark backfill as completed
-    mark: {
-        var mq = Query.init(self.database,
-            \\INSERT OR REPLACE INTO backfill_status (task, completed, completed_at, records_processed)
-            \\VALUES ('missing_eth_2ld_names', 1, ?, ?)
-        ) catch break :mark;
-        defer mq.deinit();
-        mq.bindInt64(std.time.timestamp()) catch break :mark;
-        mq.bindInt64(@intCast(created_count)) catch break :mark;
-        mq.exec() catch {};
-    }
 }
 
 /// Backfill unknown subdomain labels from transaction calldata
 /// This runs after initial sync completes to resolve labels that weren't in events
 pub fn backfillUnknownLabels(self: *Indexer) !void {
     // Get statistics first
-    var label_backfill = LabelBackfill.init(self.allocator, self.l1_client, self.database, if (self.rainbow != null) &self.rainbow.? else null);
+    var label_backfill = LabelBackfill.init(self.allocator, self.v1_client, self.database, if (self.rainbow != null) &self.rainbow.? else null);
     const stats = try label_backfill.getStats();
 
     if (stats.total == 0) {

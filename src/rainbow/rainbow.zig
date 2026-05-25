@@ -16,7 +16,6 @@
 ///       defer allocator.free(text);
 ///       // Use label text
 ///   }
-
 const std = @import("std");
 const c = @cImport({
     @cInclude("sqlite3.h");
@@ -153,13 +152,6 @@ pub const Rainbow = struct {
             std.log.err("Rainbow query failed: {s}", .{c.sqlite3_errmsg(self.db)});
             return error.QueryFailed;
         }
-    }
-
-    /// Lookup label by labelhash (hex string like "0x123abc...")
-    /// Convenience wrapper for hex input
-    pub fn lookupHex(self: *Rainbow, labelhash_hex: []const u8) !?[]u8 {
-        const labelhash = try hexToBytes(labelhash_hex);
-        return try self.lookup(labelhash);
     }
 
     /// Get database statistics

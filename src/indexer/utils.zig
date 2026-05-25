@@ -5,11 +5,32 @@ const Hash = @import("../types/hash.zig").Hash;
 const Address = @import("../types/address.zig").Address;
 const Indexer = @import("indexer.zig").Indexer;
 
+/// Record `addr` in the `accounts` entity table at the block/timestamp of
+/// the log that observed it. Skip the zero-address sentinel (burned / cleared,
+/// not a real account holder). Failure is logged at debug — never aborts
+/// event processing.
+///
+/// Centralises the 15 identical 5-line blocks that previously sat in every
+/// V1+V2 handler that observed an address. Use this from any handler that
+/// touches a new owner / registrant / role-grantee / transfer-recipient /
+/// operator.
+pub fn recordAccountObservation(self: *Indexer, protocol: models.Protocol, addr: Address, log: rpc.Log) void {
+    if (addr.isZero()) return;
+    var addr_buf: [42]u8 = undefined;
+    const addr_hex = addr.toHexBuf(&addr_buf);
+    self.database.upsertAccount(
+        protocol,
+        addr_hex,
+        log.block_number,
+        self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+    ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
+}
+
 /// Construct a models.Event from common log fields and emit it via insertEventAndNotify.
 /// Eliminates 6 identical field assignments repeated across handler files.
 pub fn emitEvent(
     self: *Indexer,
-    chain: models.Chain,
+    protocol: models.Protocol,
     log: rpc.Log,
     event_type: models.EventType,
     name: ?[]const u8,
@@ -21,7 +42,7 @@ pub fn emitEvent(
 
     const event = models.Event{
         .event_type = event_type,
-        .chain = chain,
+        .protocol = protocol,
         .block_number = log.block_number,
         .tx_hash = log.transaction_hash,
         .log_index = log.log_index,
@@ -29,7 +50,7 @@ pub fn emitEvent(
         .name = name,
         .namehash = namehash,
         .data = data,
-        .timestamp = self.getBlockTimestamp(chain, log.block_number, log.block_timestamp),
+        .timestamp = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     };
     try Indexer.insertEventAndNotify(self, event);
 }
@@ -64,4 +85,30 @@ pub fn deinitBatchResults(allocator: std.mem.Allocator, batch_results: [][]rpc.L
         allocator.free(logs);
     }
     allocator.free(batch_results);
+}
+
+/// Handler + log pair for ordered dispatch.
+/// The `log` aliases slices owned by the source batch result — keep the original
+/// result array alive until dispatch finishes.
+pub const DispatchEntry = struct {
+    handler: *const fn (*Indexer, models.Protocol, rpc.Log) anyerror!void,
+    log: rpc.Log,
+};
+
+fn dispatchEntryLessThan(_: void, a: DispatchEntry, b: DispatchEntry) bool {
+    if (a.log.block_number != b.log.block_number) return a.log.block_number < b.log.block_number;
+    return a.log.log_index < b.log.log_index;
+}
+
+/// Sort entries by (block_number, log_index) and dispatch each to its handler.
+/// Preserves on-protocol event order across different event types within a batch.
+pub fn dispatchOrdered(
+    self: *Indexer,
+    protocol: models.Protocol,
+    entries: []DispatchEntry,
+) !void {
+    std.mem.sort(DispatchEntry, entries, {}, dispatchEntryLessThan);
+    for (entries) |entry| {
+        try entry.handler(self, protocol, entry.log);
+    }
 }

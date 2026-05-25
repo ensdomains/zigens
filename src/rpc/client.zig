@@ -6,7 +6,7 @@ const Hash = @import("../types/hash.zig").Hash;
 fn writeJsonValue(writer: anytype, value: anytype) !void {
     const T = @TypeOf(value);
     switch (@typeInfo(T)) {
-        .@"bool" => try writer.print("{}", .{value}),
+        .bool => try writer.print("{}", .{value}),
         .int, .comptime_int => try writer.print("{d}", .{value}),
         .float, .comptime_float => try writer.print("{d}", .{value}),
         .pointer => |ptr_info| {
@@ -123,6 +123,32 @@ pub const Transaction = struct {
     }
 };
 
+/// Walk an http.Client's idle-connection pool and destroy every entry.
+///
+/// Workaround for Zig 0.15.2: std.http.Client.ConnectionPool.resize is broken
+/// (Client.zig:167 calls `popped.data.close()` but the popped value is a
+/// `*DoublyLinkedList.Node` with no `data` field; the function fails to
+/// compile when invoked). We replicate what resize(0) was meant to do — lock
+/// the pool mutex, pop every node from `free`, recover the parent Connection
+/// via @fieldParentPtr, and call Connection.destroy() (which closes the
+/// socket and frees the per-connection allocation).
+///
+/// Touches stdlib internals (the ConnectionPool struct fields and
+/// Connection.pool_node are public, but reaching into them is brittle).
+/// Safe-ish: only the indexer thread writes to this pool, and the API
+/// server has its own http.Client.
+fn drainIdleHttpConnections(http_client: *std.http.Client) void {
+    const pool = &http_client.connection_pool;
+    pool.mutex.lock();
+    defer pool.mutex.unlock();
+
+    while (pool.free.popFirst()) |node| {
+        pool.free_len -= 1;
+        const conn: *std.http.Client.Connection = @alignCast(@fieldParentPtr("pool_node", node));
+        conn.destroy();
+    }
+}
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     rpc_url: []const u8,
@@ -169,72 +195,133 @@ pub const Client = struct {
         return self.request_id.fetchAdd(1, .monotonic);
     }
 
-    /// Execute curl with retry logic and exponential backoff
-    /// Returns stdout on success, error on failure after all retries exhausted
-    fn executeCurlWithRetry(self: *Client, arena_allocator: std.mem.Allocator, request_body: []const u8) ![]const u8 {
+    /// Execute a JSON-RPC POST using std.http.Client with retry and exponential backoff.
+    /// Uses the shared http_client (connection pooling + keep-alive) and gzip/deflate decompression.
+    /// Returns the response body on success, error on failure after all retries exhausted.
+    ///
+    /// Timeout NOTE: Zig 0.15's std.http.Client does not expose per-request connect/read
+    /// timeouts. Previously `curl --connect-timeout 30 --max-time 120` protected against
+    /// hung RPC endpoints. Until Zig's http client exposes timeouts (or we wrap fetch in a
+    /// watchdog thread), a single request that hangs can block this indexer thread indefinitely.
+    /// Mitigation today: most real RPC providers return quickly; TCP keep-alive detects dead
+    /// connections within ~2 hours by default.
+    fn executeHttpRequest(self: *Client, arena_allocator: std.mem.Allocator, request_body: []const u8) ![]const u8 {
         const max_retries: u32 = 3;
+        const max_response_bytes: usize = 50 * 1024 * 1024;
         var attempt: u32 = 0;
         var last_error: ?anyerror = null;
 
+        const extra_headers = [_]std.http.Header{
+            .{ .name = "Content-Type", .value = "application/json" },
+            .{ .name = "Accept-Encoding", .value = "gzip, deflate" },
+        };
+
         while (attempt < max_retries) : (attempt += 1) {
-            // Exponential backoff: 0ms, 1000ms, 2000ms, 4000ms
             if (attempt > 0) {
                 const delay_ms: u64 = @as(u64, 1000) * (@as(u64, 1) << @intCast(attempt - 1));
                 std.log.warn("RPC request failed, retrying in {d}ms (attempt {d}/{d})", .{ delay_ms, attempt + 1, max_retries });
                 std.Thread.sleep(delay_ms * std.time.ns_per_ms);
             }
 
-            const curl_start = std.time.milliTimestamp();
-            const curl_result = std.process.Child.run(.{
-                .allocator = arena_allocator,
-                .argv = &.{
-                    "curl",
-                    "-s", // Silent mode
-                    "--compressed", // Request gzip/deflate compression (9x speedup on large responses)
-                    "--connect-timeout",
-                    "30", // 30 second connection timeout
-                    "--max-time",
-                    "120", // 120 second total timeout
-                    "-X",
-                    "POST",
-                    "-H",
-                    "Content-Type: application/json",
-                    "-d",
-                    request_body,
-                    self.rpc_url,
-                },
-                .max_output_bytes = 50 * 1024 * 1024, // 50MB max response (handles spam bursts)
+            const start_ms = std.time.milliTimestamp();
+
+            var response_buf: std.Io.Writer.Allocating = .init(arena_allocator);
+            defer response_buf.deinit();
+
+            const result = self.http_client.fetch(.{
+                .location = .{ .url = self.rpc_url },
+                .method = .POST,
+                .payload = request_body,
+                .extra_headers = &extra_headers,
+                .response_writer = &response_buf.writer,
+                .keep_alive = true,
             }) catch |err| {
-                // StdoutStreamTooLong means response is too big - retrying won't help
-                // Return immediately so caller can reduce query size
-                if (err == error.StdoutStreamTooLong) {
-                    std.log.debug("Response too large for buffer, returning immediately", .{});
+                if (err == error.StreamTooLong) {
+                    // Response exceeds buffer — not a transient failure; the
+                    // caller's adaptive chunking should shrink the request.
+                    std.log.debug("Response too large: {}", .{err});
                     return err;
                 }
+                // Zig 0.15.2's std.http.Client does NOT evict pooled connections
+                // when fetch fails — Request.deinit() looks at reader.state to
+                // decide closing, and several failure modes leave state in a
+                // shape that makes the dead socket get returned to the free
+                // pool. Next fetch picks the dead socket and fails the same
+                // way. We can't use ConnectionPool.resize either — it's itself
+                // broken in 0.15.2 (Client.zig:167 calls `popped.data.close()`
+                // but DoublyLinkedList.Node has no `data` field; doesn't
+                // compile when invoked).
+                //
+                // Workaround: on ANY transient fetch error, walk the free pool
+                // and destroy every idle connection so the next attempt opens
+                // a fresh socket. We've observed `ReadFailed` and `WriteFailed`
+                // both arise from stale pooled connections (different TCP
+                // states at the time of reuse); draining on either keeps the
+                // pool healthy. After heavy initial sync the pool may hold
+                // several stale connections; one drain + one retry typically
+                // restores forward progress.
+                //
+                // Remove this whole block once Zig fixes the pool eviction
+                // or we move to 0.16 (which rewrites http.Client on std.Io).
+                if (err == error.WriteFailed or
+                    err == error.ReadFailed or
+                    err == error.UnexpectedReadFailure or
+                    err == error.EndOfStream or
+                    err == error.BrokenPipe or
+                    err == error.ConnectionResetByPeer)
+                {
+                    drainIdleHttpConnections(self.http_client);
+                    last_error = err;
+                    std.log.warn("http.fetch {} (likely stale pooled connection); evicted free pool, retrying", .{err});
+                    continue;
+                }
                 last_error = err;
-                std.log.warn("curl spawn error: {}", .{err});
+                std.log.warn("http.fetch error: {}", .{err});
                 continue;
             };
 
-            if (curl_result.term != .Exited or curl_result.term.Exited != 0) {
+            const status_code = @intFromEnum(result.status);
+            if (status_code < 200 or status_code >= 300) {
+                // Capture response body for diagnostics (RPC providers typically send a
+                // JSON error describing the issue: "block range too large", "too many logs", etc.).
+                const body_preview_len = @min(response_buf.written().len, 512);
+                const body_preview = response_buf.written()[0..body_preview_len];
+
+                // 4xx = permanent client error (request too big, malformed, etc.) — caller's
+                // adaptive chunking can halve the range and retry. EXCEPT 408 (Request Timeout)
+                // and 429 (Too Many Requests), which are explicitly transient per HTTP spec:
+                // 408 means "server timed out waiting; resend the request", 429 is rate-limit
+                // and resolves on backoff. Treating either as permanent aborts indexing on a
+                // hiccup that retry would have absorbed (observed at deployment startup with
+                // some RPC providers returning 408 under load).
+                if (status_code >= 400 and status_code < 500 and status_code != 408 and status_code != 429) {
+                    std.log.warn("HTTP {d} from RPC (permanent; not retrying). Body: {s}", .{ status_code, body_preview });
+                    return error.RpcError;
+                }
+
+                // 5xx, 408, 429, and other transient: retry with backoff
                 last_error = error.HttpError;
-                std.log.warn("curl process failed with exit: {}", .{curl_result.term});
+                std.log.warn("HTTP {d} from RPC (transient; retrying). Body: {s}", .{ status_code, body_preview });
                 continue;
             }
 
-            // Check for empty response (network issues sometimes return empty)
-            if (curl_result.stdout.len == 0) {
+            const body = response_buf.written();
+            if (body.len == 0) {
                 last_error = error.HttpError;
-                std.log.warn("curl returned empty response", .{});
+                std.log.warn("http.fetch returned empty response", .{});
                 continue;
             }
-
-            const curl_elapsed = std.time.milliTimestamp() - curl_start;
-            if (curl_elapsed > 500) {
-                std.log.debug("RPC curl took {d}ms, response {d} bytes", .{ curl_elapsed, curl_result.stdout.len });
+            if (body.len > max_response_bytes) {
+                return error.StreamTooLong;
             }
 
-            return curl_result.stdout;
+            const elapsed = std.time.milliTimestamp() - start_ms;
+            if (elapsed > 500) {
+                std.log.debug("RPC http took {d}ms, response {d} bytes", .{ elapsed, body.len });
+            }
+
+            // Copy out of the allocating writer's arena-backed buffer
+            return try arena_allocator.dupe(u8, body);
         }
 
         std.log.err("RPC request failed after {d} retries", .{max_retries});
@@ -279,8 +366,8 @@ pub const Client = struct {
 
         try writer.writeAll("}");
 
-        // Execute curl with retry logic
-        const response_body = try self.executeCurlWithRetry(arena_allocator, request_buf.items);
+        // Execute HTTP request with retry logic
+        const response_body = try self.executeHttpRequest(arena_allocator, request_buf.items);
 
         // Parse JSON response with main allocator (result will outlive this function)
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response_body, .{}) catch |err| {
@@ -323,8 +410,8 @@ pub const Client = struct {
 
         try writer.writeAll("}");
 
-        // Execute curl with retry logic
-        const response_body = try self.executeCurlWithRetry(arena_allocator, request_buf.items);
+        // Execute HTTP request with retry logic
+        const response_body = try self.executeHttpRequest(arena_allocator, request_buf.items);
 
         // Parse JSON response with main allocator (result will outlive this function)
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response_body, .{}) catch |err| {
@@ -377,8 +464,8 @@ pub const Client = struct {
 
         try writer.writeAll("]");
 
-        // Execute curl with retry logic
-        const response_body = try self.executeCurlWithRetry(arena_allocator, request_buf.items);
+        // Execute HTTP request with retry logic
+        const response_body = try self.executeHttpRequest(arena_allocator, request_buf.items);
 
         // Parse JSON response with main allocator (result will outlive this function)
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response_body, .{}) catch |err| {
@@ -908,41 +995,7 @@ pub const Client = struct {
         return results;
     }
 
-    /// Fetch a single transaction by hash
-    pub fn getTransactionByHash(self: *Client, tx_hash: Hash) !Transaction {
-        const tx_hash_hex = try tx_hash.toHex(self.allocator);
-        defer self.allocator.free(tx_hash_hex);
-
-        const parsed = try self.makeRpcCall("eth_getTransactionByHash", .{tx_hash_hex});
-        defer parsed.deinit();
-
-        const result = parsed.value.object.get("result").?;
-        if (result == .null) {
-            return error.TransactionNotFound;
-        }
-
-        const tx_obj = result.object;
-
-        // Parse input data
-        const input_hex = tx_obj.get("input").?.string;
-        const input_bytes = try self.hexToBytes(input_hex);
-
-        return Transaction{
-            .hash = try Hash.fromHex(tx_obj.get("hash").?.string),
-            .block_number = try std.fmt.parseInt(u64, tx_obj.get("blockNumber").?.string[2..], 16),
-            .from = try Address.fromHex(tx_obj.get("from").?.string),
-            .to = if (tx_obj.get("to")) |to_val|
-                if (to_val == .null) null else try Address.fromHex(to_val.string)
-            else
-                null,
-            .input = input_bytes,
-            .value = tx_obj.get("value").?.string,
-            .gas = try std.fmt.parseInt(u64, tx_obj.get("gas").?.string[2..], 16),
-            .gas_price = tx_obj.get("gasPrice").?.string,
-        };
-    }
-
-    /// Batch version of getTransactionByHash - fetches multiple transactions in a single HTTP request
+    /// Batch version of eth_getTransactionByHash - fetches multiple transactions in a single HTTP request
     /// Returns array of transactions in the same order as requested hashes
     /// Caller must free the returned array and each transaction's contents
     pub fn getTransactionsByHashBatch(self: *Client, tx_hashes: []const Hash) ![]Transaction {

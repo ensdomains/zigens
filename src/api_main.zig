@@ -51,6 +51,7 @@ pub fn main() !void {
     // Initialize database (read-only for API - skip schema loading)
     var database = try db.Database.initWithoutSchema(allocator, cfg.database_path);
     defer database.deinit();
+    database.setChainId(cfg.network.chainId());
 
     // Check database integrity
     const integrity_ok = try database.checkIntegrity();

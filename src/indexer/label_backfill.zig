@@ -28,6 +28,17 @@ pub const LabelBackfill = struct {
 
     const BATCH_SIZE = 100; // Fetch 100 transactions at a time
 
+    /// Maximum number of batches to process per invocation. Bounds RPC usage so a
+    /// fresh sync with millions of unknown labels doesn't hammer the RPC for hours
+    /// in a single run. Backfill is resumable: remaining work is picked up by
+    /// subsequent sync cycles. 200 * BATCH_SIZE = up to 20,000 labels per call.
+    const MAX_ITERATIONS: u32 = 200;
+
+    /// Inter-batch sleep (milliseconds) — reuses the existing RPC batch delay so
+    /// we don't slam upstream providers. TODO: consider a dedicated
+    /// `label_backfill_delay_ms` constant if backfill needs separate tuning.
+    const INTER_BATCH_DELAY_MS: u64 = constants.Timing.rpc_batch_delay_ms;
+
     pub fn init(allocator: std.mem.Allocator, rpc_client: *rpc.Client, database: *db_module.Database, rainbow: ?*Rainbow) LabelBackfill {
         return LabelBackfill{
             .allocator = allocator,
@@ -37,13 +48,18 @@ pub const LabelBackfill = struct {
         };
     }
 
-    /// Run backfill process for all unknown labels
-    /// Returns the number of labels successfully resolved
+    /// Run backfill process for all unknown labels.
+    /// Bounded to MAX_ITERATIONS batches per invocation to keep RPC load sane;
+    /// remaining work is picked up by subsequent sync cycles. Sleeps
+    /// INTER_BATCH_DELAY_MS between batches. The underlying SQL query already
+    /// filters `WHERE backfill_attempts < 3`, so dead labels don't burn budget.
+    /// Returns the number of labels successfully resolved in this invocation.
     pub fn backfillAll(self: *LabelBackfill) !u64 {
         var total_resolved: u64 = 0;
+        var iteration: u32 = 0;
 
-        while (true) {
-            // Get batch of unknown labels
+        while (iteration < MAX_ITERATIONS) : (iteration += 1) {
+            // Get batch of unknown labels (query already excludes attempts >= 3)
             const unknown_labels = try unknown_labels_storage.getUnknownLabelsForBackfill(
                 self.allocator,
                 self.database.db.?,
@@ -60,13 +76,27 @@ pub const LabelBackfill = struct {
                 break; // No more labels to process
             }
 
-            std.log.info("Backfilling batch of {d} unknown labels...", .{unknown_labels.len});
+            std.log.info("Backfilling batch {d}/{d} ({d} labels)...", .{ iteration + 1, MAX_ITERATIONS, unknown_labels.len });
 
             // Process this batch
             const resolved = try self.backfillBatch(unknown_labels);
             total_resolved += resolved;
 
             std.log.info("Resolved {d}/{d} labels in this batch (total: {d})", .{ resolved, unknown_labels.len, total_resolved });
+
+            // Inter-batch sleep to be kind to the RPC provider. Skip on the
+            // last iteration (loop is about to exit anyway).
+            if (iteration + 1 < MAX_ITERATIONS) {
+                std.Thread.sleep(INTER_BATCH_DELAY_MS * std.time.ns_per_ms);
+            }
+        }
+
+        if (iteration >= MAX_ITERATIONS) {
+            const remaining = unknown_labels_storage.getUnknownLabelCount(self.database.db.?) catch 0;
+            std.log.info(
+                "Reached MAX_ITERATIONS ({d}) for unknown-label backfill; {d} labels still pending (attempts<3). Will resume on next sync cycle.",
+                .{ MAX_ITERATIONS, remaining },
+            );
         }
 
         return total_resolved;

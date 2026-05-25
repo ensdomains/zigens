@@ -65,8 +65,7 @@ nano config.json
 ```
 
 **Required changes:**
-- `l1_rpc_url`: Your Ethereum mainnet RPC
-- `l2_rpc_url`: Your L2 RPC (Base, etc.)
+- `rpc_url`: Your Ethereum RPC
 - Contract addresses (will be available after ENSv2 deployment)
 - Start blocks (deployment blocks)
 
@@ -118,11 +117,11 @@ sqlite3 ensv2.db
 # Insert test name
 INSERT INTO names (
   namehash, name, label, label_hash, parent_name, parent_namehash,
-  chain, registry, owner, resolver, token_id, expiry, registry_locked,
+  protocol, registry, owner, resolver, token_id, expiry, registry_locked,
   migrated, ejected, created_block, created_at, updated_block, updated_at
 ) VALUES (
   '0x1234...', 'test.eth', 'test', '0xabcd...', 'eth', '0x9876...',
-  'l2', '0x0000000000000000000000000000000000000001',
+  'v2', '0x0000000000000000000000000000000000000001',
   '0x0000000000000000000000000000000000000123',
   '0x0000000000000000000000000000000000000456',
   '12345', 1735689600, 0, 1, 0, 100, 1704067200, 100, 1704067200

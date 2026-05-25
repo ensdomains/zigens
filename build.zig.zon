@@ -25,7 +25,7 @@
     .fingerprint = 0x55c63ae67eb6650f, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.15.1",
+    .minimum_zig_version = "0.15.2",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
@@ -35,6 +35,10 @@
         .z_ens_normalize = .{
             .url = "git+https://github.com/mdtanrikulu/z-ens-normalize#59bdaaad5e63ad945a9ac00908aa39f3187c5754",
             .hash = "z_ens_normalize-0.0.0-Iv6nMOa-AgDfR1ILozGzMNzPcfFzNxWxLTRvoSW75i4_",
+        },
+        .eth = .{
+            .url = "git+https://github.com/StrobeLabs/eth.zig#757ac11ee5e6bf489aa82ff5db05f4b1fca09a21",
+            .hash = "eth_zig-0.3.0-efEm-i65QgC_yawMMg1E1xrc3E8yTZsAlfhj0wJjPyMe",
         },
     },
     .paths = .{

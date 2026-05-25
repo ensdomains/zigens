@@ -1,7 +1,29 @@
-const std = @import("std");
+// ============================================================================
+// Event signatures and their compile-time keccak-256 hashes.
+//
+// Single source of truth for which on-chain events the indexer cares about.
+// `abi_eth.zig` re-exports `EventSignatures` so handler files can reach the
+// hashes via `abi.EventSignatures.<name>_hash` (used as `topics[0]` matchers
+// in the dispatcher hot loop).
+//
+// Why these hashes live here and not in eth.zig:
+//   * The signature *strings* are project-specific knowledge — every indexer
+//     cares about a different set of events. A library can't enumerate them
+//     for us.
+//   * The *hashes* are computed at comptime via `keccak.eventSignature`, which
+//     produces static [32]u8 constants baked into the binary. eth.zig's
+//     keccak is a C library (XKCP) and runtime-only; using it would force
+//     lazy initialization of every signature for no correctness benefit.
+//
+// Historical: this file used to also contain an `ABI` struct with hand-rolled
+// decoders (decodeUint256/decodeAddress/decodeString/...). All handlers were
+// migrated to `abi_eth.zig` (eth.zig-backed schema-driven decode) and the
+// dead struct + its tests were removed once the new path was verified end-
+// to-end on real on-chain data.
+// ============================================================================
+
 const Hash = @import("../types/hash.zig").Hash;
 const keccak = @import("../utils/keccak.zig");
-const constants = @import("../constants.zig");
 
 /// Compute event signature hash at compile time
 inline fn eventHash(comptime sig: []const u8) Hash {
@@ -27,39 +49,42 @@ pub const EventSignatures = struct {
     pub const name_burned = "NameBurned(uint256,address)";
     pub const name_burned_hash: Hash = eventHash(name_burned);
 
-    /// SubregistryUpdate(uint256 indexed id, address subregistry) - OLD signature (pre-deployment)
-    pub const subregistry_update = "SubregistryUpdate(uint256,address)";
-    pub const subregistry_update_hash: Hash = eventHash(subregistry_update);
-
-    /// SubregistryUpdated(uint256 indexed id, address subregistry) - NEW signature (current deployment)
-    pub const subregistry_updated = "SubregistryUpdated(uint256,address)";
+    /// SubregistryUpdated(uint256 indexed id, address indexed subregistry, address indexed sender)
+    pub const subregistry_updated = "SubregistryUpdated(uint256,address,address)";
     pub const subregistry_updated_hash: Hash = eventHash(subregistry_updated);
 
-    /// ResolverUpdate(uint256 indexed id, address resolver) - OLD signature (pre-deployment)
-    pub const resolver_update = "ResolverUpdate(uint256,address)";
-    pub const resolver_update_hash: Hash = eventHash(resolver_update);
-
-    /// ResolverUpdated(uint256 indexed id, address resolver) - NEW signature (current deployment)
-    pub const resolver_updated = "ResolverUpdated(uint256,address)";
+    /// ResolverUpdated(uint256 indexed id, address indexed resolver, address indexed sender)
+    pub const resolver_updated = "ResolverUpdated(uint256,address,address)";
     pub const resolver_updated_hash: Hash = eventHash(resolver_updated);
 
-    /// TokenRegenerated(uint256 oldTokenId, uint256 newTokenId) - OLD signature (2 params)
+    /// TokenRegenerated(uint256 oldTokenId, uint256 newTokenId)
     pub const token_regenerated = "TokenRegenerated(uint256,uint256)";
     pub const token_regenerated_hash: Hash = eventHash(token_regenerated);
-
-    /// TokenRegenerated(uint256 oldTokenId, uint256 newTokenId, uint256 flags) - NEW signature (3 params)
-    pub const token_regenerated_v2 = "TokenRegenerated(uint256,uint256,uint256)";
-    pub const token_regenerated_v2_hash: Hash = eventHash(token_regenerated_v2);
-
-    /// NewSubname(uint256 indexed tokenId, string label)
-    /// This event is emitted by UserRegistry contracts instead of NameRegistered
-    pub const new_subname = "NewSubname(uint256,string)";
-    pub const new_subname_hash: Hash = eventHash(new_subname);
 
     /// ExpiryUpdated(uint256 indexed tokenId, uint64 newExpiry, address changedBy)
     /// New event signature that replaces NameRenewed in current namechain deployment
     pub const expiry_updated = "ExpiryUpdated(uint256,uint64,address)";
     pub const expiry_updated_hash: Hash = eventHash(expiry_updated);
+
+    /// LabelRegistered(uint256 indexed tokenId, bytes32 indexed labelHash, string label, address owner, uint64 expiry, address indexed sender)
+    /// Emitted when a label is registered (owner != 0) in PermissionedRegistry
+    pub const label_registered = "LabelRegistered(uint256,bytes32,string,address,uint64,address)";
+    pub const label_registered_hash: Hash = eventHash(label_registered);
+
+    /// LabelReserved(uint256 indexed tokenId, bytes32 indexed labelHash, string label, uint64 expiry, address indexed sender)
+    /// Emitted when a label is reserved (owner == 0) in PermissionedRegistry
+    pub const label_reserved = "LabelReserved(uint256,bytes32,string,uint64,address)";
+    pub const label_reserved_hash: Hash = eventHash(label_reserved);
+
+    /// LabelUnregistered(uint256 indexed tokenId, address indexed sender)
+    /// Emitted when a label is unregistered in PermissionedRegistry
+    pub const label_unregistered = "LabelUnregistered(uint256,address)";
+    pub const label_unregistered_hash: Hash = eventHash(label_unregistered);
+
+    /// ParentUpdated(IRegistry indexed parent, string label, address indexed sender)
+    /// Emitted when the parent of a registry is changed
+    pub const parent_updated = "ParentUpdated(address,string,address)";
+    pub const parent_updated_hash: Hash = eventHash(parent_updated);
 
     // ========================================================================
     // Enhanced Access Control events (from common/access-control/interfaces/IEnhancedAccessControl.sol)
@@ -67,21 +92,8 @@ pub const EventSignatures = struct {
 
     /// EACRolesChanged(uint256 indexed resource, address indexed account, uint256 oldRoleBitmap, uint256 newRoleBitmap)
     /// Emitted when roles are changed for an account on a resource (tokenId)
-    /// NEW signature - current ETH registry deployment
     pub const eac_roles_changed = "EACRolesChanged(uint256,address,uint256,uint256)";
     pub const eac_roles_changed_hash: Hash = eventHash(eac_roles_changed);
-
-    /// EACRolesGranted(uint256 resource, uint256 roleBitmap, address account)
-    /// OLD signature - used by earlier subregistry deployments on Sepolia
-    /// data = resource (uint256) + roleBitmap (uint256) + account (address)
-    pub const eac_roles_granted = "EACRolesGranted(uint256,uint256,address)";
-    pub const eac_roles_granted_hash: Hash = eventHash(eac_roles_granted);
-
-    /// EACRolesRevoked(uint256 resource, uint256 roleBitmap, address account)
-    /// OLD signature - used by earlier subregistry deployments on Sepolia
-    /// data = resource (uint256) + roleBitmap (uint256) + account (address)
-    pub const eac_roles_revoked = "EACRolesRevoked(uint256,uint256,address)";
-    pub const eac_roles_revoked_hash: Hash = eventHash(eac_roles_revoked);
 
     // ========================================================================
     // IETHRegistrar events (from L2/registrar/interfaces/IETHRegistrar.sol)
@@ -135,13 +147,41 @@ pub const EventSignatures = struct {
     pub const address_changed = "AddressChanged(bytes32,uint256,bytes)";
     pub const address_changed_hash: Hash = eventHash(address_changed);
 
-    /// ContentHashChanged(bytes32 indexed node, bytes hash)
-    pub const content_hash_changed = "ContentHashChanged(bytes32,bytes)";
+    /// ContenthashChanged(bytes32 indexed node, bytes hash)
+    /// Note: lowercase 'h' in `Contenthash` — this is the canonical ENS event name
+    /// emitted by both V1 PublicResolver and V2 PermissionedResolver / OwnedResolver.
+    pub const content_hash_changed = "ContenthashChanged(bytes32,bytes)";
     pub const content_hash_changed_hash: Hash = eventHash(content_hash_changed);
 
     /// TextChanged(bytes32 indexed node, string indexed indexedKey, string key, string value)
     pub const text_changed = "TextChanged(bytes32,string,string,string)";
     pub const text_changed_hash: Hash = eventHash(text_changed);
+
+    /// TextChanged(bytes32 indexed node, string indexed indexedKey, string value)
+    /// Legacy 3-arg variant emitted by the 2017 LegacyPublicResolver. No `key`
+    /// in the non-indexed payload — only the hashed indexed key is on-chain.
+    pub const legacy_text_changed = "TextChanged(bytes32,string,string)";
+    pub const legacy_text_changed_hash: Hash = eventHash(legacy_text_changed);
+
+    /// AuthorisationChanged(bytes32 indexed node, address indexed owner, address indexed target, bool isAuthorised)
+    /// Legacy V1 PublicResolver `Authorisable` mixin event.
+    pub const authorisation_changed = "AuthorisationChanged(bytes32,address,address,bool)";
+    pub const authorisation_changed_hash: Hash = eventHash(authorisation_changed);
+
+    /// DNSRecordChanged(bytes32 indexed node, bytes name, uint16 resource, bytes record)
+    /// ENSIP-17 DNS resolver event — V1 PublicResolver + V2 PublicResolverV2.
+    pub const dns_record_changed = "DNSRecordChanged(bytes32,bytes,uint16,bytes)";
+    pub const dns_record_changed_hash: Hash = eventHash(dns_record_changed);
+
+    /// DNSRecordDeleted(bytes32 indexed node, bytes name, uint16 resource)
+    /// ENSIP-17 DNS resolver event — V1 PublicResolver + V2 PublicResolverV2.
+    pub const dns_record_deleted = "DNSRecordDeleted(bytes32,bytes,uint16)";
+    pub const dns_record_deleted_hash: Hash = eventHash(dns_record_deleted);
+
+    /// DNSZonehashChanged(bytes32 indexed node, bytes lastzonehash, bytes zonehash)
+    /// ENSIP-17 DNS resolver event — V1 PublicResolver + V2 PublicResolverV2.
+    pub const dns_zonehash_changed = "DNSZonehashChanged(bytes32,bytes,bytes)";
+    pub const dns_zonehash_changed_hash: Hash = eventHash(dns_zonehash_changed);
 
     /// ABIChanged(bytes32 indexed node, uint256 indexed contentType)
     pub const abi_changed = "ABIChanged(bytes32,uint256)";
@@ -166,6 +206,35 @@ pub const EventSignatures = struct {
     /// AliasChanged(bytes indexed indexedFromName, bytes indexed indexedToName, bytes fromName, bytes toName)
     pub const alias_changed = "AliasChanged(bytes,bytes,bytes,bytes)";
     pub const alias_changed_hash: Hash = eventHash(alias_changed);
+
+    /// NamedResource(uint256 indexed resource, bytes name)
+    /// Emitted when a named resource is set in PermissionedResolver
+    pub const named_resource = "NamedResource(uint256,bytes)";
+    pub const named_resource_hash: Hash = eventHash(named_resource);
+
+    /// NamedTextResource(uint256 indexed resource, bytes name, bytes32 indexed keyHash, string key)
+    /// Emitted when a named text resource is set in PermissionedResolver.
+    /// NOTE: signature changed from the prior 3-arg form to 4 args (plaintext key
+    /// appended) in the latest PermissionedResolver deployment.
+    pub const named_text_resource = "NamedTextResource(uint256,bytes,bytes32,string)";
+    pub const named_text_resource_hash: Hash = eventHash(named_text_resource);
+
+    /// NamedAddrResource(uint256 indexed resource, bytes name, uint256 indexed coinType)
+    /// Emitted when a named address resource is set in PermissionedResolver
+    pub const named_addr_resource = "NamedAddrResource(uint256,bytes,uint256)";
+    pub const named_addr_resource_hash: Hash = eventHash(named_addr_resource);
+
+    /// NamedDataResource(uint256 indexed resource, bytes name, bytes32 indexed keyHash, string key)
+    /// Emitted by the latest PermissionedResolver alongside `DataChanged`. Carries
+    /// the plaintext key (the bytes32 hash is the topic) and the resource id.
+    pub const named_data_resource = "NamedDataResource(uint256,bytes,bytes32,string)";
+    pub const named_data_resource_hash: Hash = eventHash(named_data_resource);
+
+    /// DataChanged(bytes32 indexed node, string indexedKey, string key, bytes value)
+    /// New generic key/value record event in the latest PermissionedResolver.
+    /// Mirrors `TextChanged` but the value is `bytes` instead of `string`.
+    pub const data_changed = "DataChanged(bytes32,string,string,bytes)";
+    pub const data_changed_hash: Hash = eventHash(data_changed);
 
     // ========================================================================
     // ENS Temporary Registrar events (Pre-V1 Migration, May 2017 - May 2019)
@@ -272,26 +341,67 @@ pub const EventSignatures = struct {
 
     // ========================================================================
     // ENS V1 ETH Registrar Controller events (ETHRegistrarController.sol)
-    // Address: 0x59E16fcCd424Cc24e280Be16E11Bcd56fb0CE547
+    // Address: 0x59E16fcCd424Cc24e280Be16E11Bcd56fb0CE547 (legacy),
+    //          0xb5778cf6... (current mainnet + fresh Sepolia deployment)
+    //
+    // Three historical NameRegistered signatures coexist on mainnet:
+    //   1. Legacy 5-arg (LegacyEthRegistrarController, earliest deployment):
+    //      NameRegistered(string,bytes32,address,uint256,uint256)
+    //   2. Wrapped 6-arg (WrappedEthRegistrarController, ~block 16,925,618):
+    //      NameRegistered(string,bytes32,address,uint256,uint256,uint256)
+    //      Adds explicit baseCost/premium split.
+    //   3. Unwrapped 7-arg (UnwrappedEthRegistrarController, newer + current
+    //      Sepolia 0xb5778cf6...):
+    //      NameRegistered(string,bytes32,address,uint256,uint256,uint256,bytes32)
+    //      Adds non-indexed `referrer` (bytes32) at the tail.
+    // All three share `bytes32 indexed label` (topic[1]) and
+    // `address indexed owner` (topic[2]); only topic[0] (signature hash) and
+    // the non-indexed data tail differ.
     // ========================================================================
 
     /// NameRegistered(string name, bytes32 indexed label, address indexed owner, uint256 cost, uint256 expires)
-    /// Note: V1 Controller uses 5 parameters, NOT 6 (no separate baseCost/premium)
+    /// Legacy 5-arg: original LegacyEthRegistrarController (no baseCost/premium split, no referrer)
     pub const controller_name_registered = "NameRegistered(string,bytes32,address,uint256,uint256)";
     pub const controller_name_registered_hash: Hash = eventHash(controller_name_registered);
+
+    /// NameRegistered(string name, bytes32 indexed label, address indexed owner, uint256 baseCost, uint256 premium, uint256 expires)
+    /// 6-arg WrappedEthRegistrarController: baseCost/premium split, no referrer.
+    /// Mainnet-only (the fresh Sepolia deployment skipped this generation).
+    pub const wrapped_controller_name_registered = "NameRegistered(string,bytes32,address,uint256,uint256,uint256)";
+    pub const wrapped_controller_name_registered_hash: Hash = eventHash(wrapped_controller_name_registered);
+
+    /// NameRegistered(string label, bytes32 indexed labelhash, address indexed owner, uint256 baseCost, uint256 premium, uint256 expires, bytes32 referrer)
+    /// 7-arg UnwrappedEthRegistrarController: baseCost/premium split + non-indexed referrer tag.
+    /// Also the current Sepolia deployment (0xb5778cf6...).
+    pub const unwrapped_controller_name_registered = "NameRegistered(string,bytes32,address,uint256,uint256,uint256,bytes32)";
+    pub const unwrapped_controller_name_registered_hash: Hash = eventHash(unwrapped_controller_name_registered);
 
     /// NameRenewed(string name, bytes32 indexed label, uint256 cost, uint256 expires)
     pub const controller_name_renewed = "NameRenewed(string,bytes32,uint256,uint256)";
     pub const controller_name_renewed_hash: Hash = eventHash(controller_name_renewed);
+
+    /// NameRenewed(string label, bytes32 indexed labelhash, uint256 cost, uint256 expires, bytes32 referrer)
+    /// 5-arg UnwrappedEthRegistrarController: adds non-indexed referrer tag at
+    /// the data tail. Same labelhash indexed-topic shape as the legacy variant.
+    /// Also the current Sepolia deployment.
+    pub const unwrapped_controller_name_renewed = "NameRenewed(string,bytes32,uint256,uint256,bytes32)";
+    pub const unwrapped_controller_name_renewed_hash: Hash = eventHash(unwrapped_controller_name_renewed);
 
     // ========================================================================
     // ENS V1 Reverse Registrar events (ReverseRegistrar.sol)
     // Address: 0xa58E81fe9b61B5c3fE2AFD33CF304c454AbFc7Cb
     // ========================================================================
 
-    /// ReverseClaimed(address indexed addr, bytes32 indexed node)
+    /// V1 ReverseRegistrar: ReverseClaimed(address indexed addr, bytes32 indexed node)
     pub const reverse_claimed = "ReverseClaimed(address,bytes32)";
     pub const reverse_claimed_hash: Hash = eventHash(reverse_claimed);
+
+    /// V2 L2ReverseRegistrar / StandaloneReverseRegistrar:
+    /// NameForAddrChanged(address indexed addr, string name)
+    /// V2 reverse resolution stores the primary name directly on the reverse
+    /// registrar rather than going through a node-keyed registry.
+    pub const name_for_addr_changed = "NameForAddrChanged(address,string)";
+    pub const name_for_addr_changed_hash: Hash = eventHash(name_for_addr_changed);
 
     // ========================================================================
     // Approval events (various contracts)
@@ -302,350 +412,21 @@ pub const EventSignatures = struct {
     pub const approval_for_all = "ApprovalForAll(address,address,bool)";
     pub const approval_for_all_hash: Hash = eventHash(approval_for_all);
 
-    /// Approved(bytes32 indexed node, address indexed owner, address indexed target, bool isAuthorised)
-    /// PublicResolver approval event
-    pub const approved = "Approved(bytes32,address,address,bool)";
-    pub const approved_hash: Hash = eventHash(approved);
-
-    // ========================================================================
-    // Bridge/Ejection events (from EjectionController and L1BridgeController)
-    // ========================================================================
-
-    /// NameEjectedToL1(bytes dnsEncodedName, uint256 tokenId)
-    pub const name_ejected_to_l1 = "NameEjectedToL1(bytes,uint256)";
-    pub const name_ejected_to_l1_hash: Hash = eventHash(name_ejected_to_l1);
-
-    /// NameEjectedToL2(bytes dnsEncodedName, uint256 tokenId)
-    pub const name_ejected_to_l2 = "NameEjectedToL2(bytes,uint256)";
-    pub const name_ejected_to_l2_hash: Hash = eventHash(name_ejected_to_l2);
-
-    /// RenewalSynchronized(uint256 tokenId, uint64 newExpiry)
-    pub const renewal_synchronized = "RenewalSynchronized(uint256,uint64)";
-    pub const renewal_synchronized_hash: Hash = eventHash(renewal_synchronized);
+    /// TokenResource(uint256 indexed tokenId, uint256 indexed resource)
+    /// Emitted when a token's resource is set during registration. Still emitted
+    /// by PermissionedRegistry post-audit; not currently subscribed to.
+    pub const token_resource = "TokenResource(uint256,uint256)";
+    pub const token_resource_hash: Hash = eventHash(token_resource);
 
     // ========================================================================
     // PermissionedRegistry events
     // ========================================================================
 
-    /// TokenObserverSet(uint256 indexed tokenId, address observer)
-    pub const token_observer_set = "TokenObserverSet(uint256,address)";
-    pub const token_observer_set_hash: Hash = eventHash(token_observer_set);
+    /// RegistryCreated()
+    /// Emitted by PermissionedRegistry, WrapperRegistry, UserRegistry constructors.
+    /// The cleanest signal to discover newly-deployed subregistries.
+    pub const registry_created = "RegistryCreated()";
+    pub const registry_created_hash: Hash = eventHash(registry_created);
 };
 
-/// ABI encoding/decoding utilities
-pub const ABI = struct {
-    /// Maximum allowed string length (1 MB) to prevent DoS attacks
-    pub const MAX_STRING_LENGTH: usize = 1024 * 1024;
 
-    /// Maximum allowed array length to prevent DoS attacks
-    pub const MAX_ARRAY_LENGTH: usize = constants.Validation.max_abi_array_length;
-
-    /// Maximum allowed bytes length (1 MB) to prevent DoS attacks
-    pub const MAX_BYTES_LENGTH: usize = 1024 * 1024;
-
-    /// Decode uint256 from bytes
-    pub fn decodeUint256(data: []const u8, offset: usize) !u256 {
-        if (offset + 32 > data.len) {
-            return error.DataTooShort;
-        }
-
-        var result: u256 = 0;
-        var i: usize = 0;
-        while (i < 32) : (i += 1) {
-            result = (result << 8) | data[offset + i];
-        }
-
-        return result;
-    }
-
-    /// Decode address from bytes (20 bytes, padded to 32)
-    pub fn decodeAddress(data: []const u8, offset: usize) !@import("../types/address.zig").Address {
-        if (offset + 32 > data.len) {
-            return error.DataTooShort;
-        }
-
-        var addr = @import("../types/address.zig").Address{ .bytes = undefined };
-        @memcpy(&addr.bytes, data[offset + 12 .. offset + 32]);
-
-        return addr;
-    }
-
-    /// Decode bytes32 from bytes
-    pub fn decodeBytes32(data: []const u8, offset: usize) !Hash {
-        if (offset + 32 > data.len) {
-            return error.DataTooShort;
-        }
-
-        var hash = Hash{ .bytes = undefined };
-        @memcpy(&hash.bytes, data[offset .. offset + 32]);
-
-        return hash;
-    }
-
-    /// Decode string from bytes
-    pub fn decodeString(allocator: std.mem.Allocator, data: []const u8, offset: usize) ![]u8 {
-        if (offset + 32 > data.len) {
-            return error.DataTooShort;
-        }
-
-        // First 32 bytes is the offset to the string data
-        const str_offset_bytes = data[offset .. offset + 32];
-        var str_offset: usize = 0;
-        for (str_offset_bytes) |byte| {
-            str_offset = (str_offset << 8) | byte;
-        }
-
-        // At the string offset, first 32 bytes is the length
-        if (str_offset + 32 > data.len) {
-            return error.InvalidStringOffset;
-        }
-
-        const length_bytes = data[str_offset .. str_offset + 32];
-        var length: usize = 0;
-        for (length_bytes) |byte| {
-            length = (length << 8) | byte;
-        }
-
-        // Validate string length to prevent DoS attacks
-        if (length > MAX_STRING_LENGTH) {
-            return error.StringTooLong;
-        }
-
-        // Then comes the actual string data
-        if (str_offset + 32 + length > data.len) {
-            return error.InvalidStringLength;
-        }
-
-        const str_data = data[str_offset + 32 .. str_offset + 32 + length];
-        return try allocator.dupe(u8, str_data);
-    }
-
-    /// Decode dynamic uint256 array from ABI-encoded data
-    /// Returns array length and offset to array data
-    pub fn decodeUint256ArrayInfo(data: []const u8, offset: usize) !struct { length: usize, data_offset: usize } {
-        if (offset + 32 > data.len) {
-            return error.InsufficientData;
-        }
-
-        // First 32 bytes at offset is the offset to the array data
-        const array_offset_bytes = data[offset .. offset + 32];
-        var array_offset: usize = 0;
-        for (array_offset_bytes) |byte| {
-            array_offset = (array_offset << 8) | byte;
-        }
-
-        // At the array offset, first 32 bytes is the length
-        if (array_offset + 32 > data.len) {
-            return error.InvalidArrayOffset;
-        }
-
-        const length_bytes = data[array_offset .. array_offset + 32];
-        var length: usize = 0;
-        for (length_bytes) |byte| {
-            length = (length << 8) | byte;
-        }
-
-        // Validate array length to prevent DoS attacks
-        if (length > MAX_ARRAY_LENGTH) {
-            return error.ArrayTooLong;
-        }
-
-        return .{
-            .length = length,
-            .data_offset = array_offset + 32,
-        };
-    }
-
-    /// Decode dynamic uint256 array from ABI-encoded data
-    pub fn decodeUint256Array(allocator: std.mem.Allocator, data: []const u8, offset: usize) ![]u256 {
-        const info = try decodeUint256ArrayInfo(data, offset);
-
-        // Each element is 32 bytes
-        const array_data_end = info.data_offset + (info.length * 32);
-        if (array_data_end > data.len) {
-            return error.ArrayDataTooShort;
-        }
-
-        var result = try allocator.alloc(u256, info.length);
-        errdefer allocator.free(result);
-
-        for (0..info.length) |i| {
-            const elem_offset = info.data_offset + (i * 32);
-            result[i] = try decodeUint256(data, elem_offset);
-        }
-
-        return result;
-    }
-
-    /// Decode dynamic bytes from ABI-encoded data
-    pub fn decodeBytes(allocator: std.mem.Allocator, data: []const u8, offset: usize) ![]u8 {
-        if (offset + 32 > data.len) {
-            return error.DataTooShort;
-        }
-
-        // First 32 bytes is the offset to the bytes data
-        const bytes_offset_bytes = data[offset .. offset + 32];
-        var bytes_offset: usize = 0;
-        for (bytes_offset_bytes) |byte| {
-            bytes_offset = (bytes_offset << 8) | byte;
-        }
-
-        // At the bytes offset, first 32 bytes is the length
-        if (bytes_offset + 32 > data.len) {
-            return error.InvalidBytesOffset;
-        }
-
-        const length_bytes = data[bytes_offset .. bytes_offset + 32];
-        var length: usize = 0;
-        for (length_bytes) |byte| {
-            length = (length << 8) | byte;
-        }
-
-        // Validate bytes length to prevent DoS attacks
-        if (length > MAX_BYTES_LENGTH) {
-            return error.BytesTooLong;
-        }
-
-        // Then comes the actual bytes data
-        if (bytes_offset + 32 + length > data.len) {
-            return error.InvalidBytesLength;
-        }
-
-        const bytes_data = data[bytes_offset + 32 .. bytes_offset + 32 + length];
-        return try allocator.dupe(u8, bytes_data);
-    }
-
-    /// Encode function call
-    pub fn encodeCall(allocator: std.mem.Allocator, signature: []const u8) ![]u8 {
-        const sig_hash = try @import("../types/hash.zig").keccak256(allocator, signature);
-
-        const result = try allocator.alloc(u8, 4);
-        @memcpy(result, sig_hash.bytes[0..4]);
-
-        return result;
-    }
-};
-
-test "ABI decode uint256" {
-    const data = [_]u8{0} ** 31 ++ [_]u8{42};
-    const value = try ABI.decodeUint256(&data, 0);
-    try std.testing.expectEqual(@as(u256, 42), value);
-}
-
-test "ABI decode address" {
-    var data = [_]u8{0} ** 32;
-    data[31] = 1;
-
-    const addr = try ABI.decodeAddress(&data, 0);
-    try std.testing.expectEqual(@as(u8, 1), addr.bytes[19]);
-}
-
-test "ABI decodeString rejects string exceeding MAX_STRING_LENGTH" {
-    const allocator = std.testing.allocator;
-
-    // Create data with string length > MAX_STRING_LENGTH (1 MB)
-    // Structure: [offset(32), length(32)]
-    const offset: u32 = 32;
-    const too_long: usize = ABI.MAX_STRING_LENGTH + 1;
-
-    var data = try allocator.alloc(u8, 64);
-    defer allocator.free(data);
-
-    // Offset pointer (points to position 32 where length is stored)
-    @memset(data[0..32], 0);
-    data[31] = @intCast(offset);
-
-    // String length = MAX_STRING_LENGTH + 1 (big-endian encoding)
-    @memset(data[32..64], 0);
-    // Store the length in big-endian format in the last 8 bytes
-    var i: usize = 0;
-    while (i < 8) : (i += 1) {
-        const shift: u6 = @intCast(56 - i * 8);
-        data[56 + i] = @intCast((too_long >> shift) & 0xFF);
-    }
-
-    const result = ABI.decodeString(allocator, data, 0);
-    try std.testing.expectError(error.StringTooLong, result);
-}
-
-test "ABI decodeBytes rejects bytes exceeding MAX_BYTES_LENGTH" {
-    const allocator = std.testing.allocator;
-
-    // Create data with bytes length > MAX_BYTES_LENGTH (1 MB)
-    const offset: u32 = 32;
-    const too_long: usize = ABI.MAX_BYTES_LENGTH + 1;
-
-    var data = try allocator.alloc(u8, 64);
-    defer allocator.free(data);
-
-    // Offset pointer
-    @memset(data[0..32], 0);
-    data[31] = @intCast(offset);
-
-    // Bytes length = MAX_BYTES_LENGTH + 1 (big-endian encoding)
-    @memset(data[32..64], 0);
-    var i: usize = 0;
-    while (i < 8) : (i += 1) {
-        const shift: u6 = @intCast(56 - i * 8);
-        data[56 + i] = @intCast((too_long >> shift) & 0xFF);
-    }
-
-    const result = ABI.decodeBytes(allocator, data, 0);
-    try std.testing.expectError(error.BytesTooLong, result);
-}
-
-test "ABI decodeUint256Array rejects array exceeding MAX_ARRAY_LENGTH" {
-    const allocator = std.testing.allocator;
-
-    // Create data with array length > MAX_ARRAY_LENGTH (10,000)
-    const offset: u32 = 32;
-    const too_long: usize = ABI.MAX_ARRAY_LENGTH + 1;
-
-    var data = try allocator.alloc(u8, 64);
-    defer allocator.free(data);
-
-    // Offset pointer
-    @memset(data[0..32], 0);
-    data[31] = @intCast(offset);
-
-    // Array length = MAX_ARRAY_LENGTH + 1 (big-endian encoding)
-    @memset(data[32..64], 0);
-    var i: usize = 0;
-    while (i < 8) : (i += 1) {
-        const shift: u6 = @intCast(56 - i * 8);
-        data[56 + i] = @intCast((too_long >> shift) & 0xFF);
-    }
-
-    const result = ABI.decodeUint256Array(allocator, data, 0);
-    try std.testing.expectError(error.ArrayTooLong, result);
-}
-
-test "ABI decodeString accepts string at MAX_STRING_LENGTH" {
-    const allocator = std.testing.allocator;
-
-    // Create minimal valid data structure for max length string
-    const offset: u32 = 32;
-    const length: u32 = 1000; // Use smaller test size for speed
-
-    var data = try allocator.alloc(u8, offset + 32 + length);
-    defer allocator.free(data);
-
-    // Offset pointer
-    @memset(data[0..32], 0);
-    data[31] = @intCast(offset);
-
-    // String length
-    @memset(data[offset..offset + 32], 0);
-    data[offset + 28] = @intCast((length >> 24) & 0xFF);
-    data[offset + 29] = @intCast((length >> 16) & 0xFF);
-    data[offset + 30] = @intCast((length >> 8) & 0xFF);
-    data[offset + 31] = @intCast(length & 0xFF);
-
-    // String data (fill with 'a')
-    @memset(data[offset + 32..], 'a');
-
-    const result = try ABI.decodeString(allocator, data, 0);
-    defer allocator.free(result);
-
-    try std.testing.expectEqual(length, result.len);
-}

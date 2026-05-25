@@ -1,44 +1,31 @@
 # ENSv2 Indexer + GraphQL API for Coolify deployment
-#
-# For V2 (NameChain/Sepolia) indexing:
-#   Set NETWORK_L2=sepolia and L2_RPC_URL to your Sepolia RPC
-#
-# For V1 (Mainnet) indexing:
-#   Set NETWORK_L1=mainnet and L1_RPC_URL to your Mainnet RPC
 
 services:
-  # L2 Indexer (NameChain/Sepolia V2)
-  indexer-l2:
+  # V2 Indexer
+  indexer-v2:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: ensv2-indexer-l2
+    container_name: ensv2-indexer-v2
     restart: unless-stopped
-    command: ["/app/ensv2-indexer-l2"]
-    # Increase file descriptor limits to prevent SystemResources errors
+    command: ["/app/ensv2-indexer-v2"]
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
     volumes:
       - ens-data:/app/data
-      - webhook-data:/app/webhooks  # Shared webhook database
+      - webhook-data:/app/webhooks
     environment:
-      # Database
-      - DATABASE_PATH=/app/data/ens_v2.db
-      # Rainbow table (auto-downloaded on first startup)
+      - DATABASE_PATH=/app/data/ens.db
       - RAINBOW_PATH=/app/data/ens_rainbow.db
       - DOWNLOAD_RAINBOW=true
-      # L2 RPC (Sepolia for V2)
-      - L2_RPC_URL=${L2_RPC_URL}
-      - NETWORK_L2=sepolia
-      # Indexing settings
+      - RPC_URL=${RPC_URL}
+      - NETWORK=${NETWORK:-sepolia}
       - BATCH_SIZE=10000
       - POLL_INTERVAL=12
       - RATE_LIMIT_PER_SECOND=25
-      # Status server
       - STATUS_PORT=3001
-      # Webhooks (optional)
       - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
       - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
       - WEBHOOK_MAX_RETRIES=${WEBHOOK_MAX_RETRIES:-3}
@@ -64,38 +51,29 @@ services:
     container_name: ensv2-api
     restart: unless-stopped
     command: ["/app/api-entrypoint.sh"]
-    # Increase file descriptor limits for handling many concurrent connections
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
-    # Expose port for Coolify/Traefik to route traffic
     ports:
       - "5655:5655"
     volumes:
-      - ens-data:/app/data:ro  # Read-only access to database
-      - webhook-data:/app/webhooks  # Writable volume for webhook database
+      - ens-data:/app/data:ro
+      - webhook-data:/app/webhooks
     environment:
-      # Database (same as indexer)
-      - DATABASE_PATH=/app/data/ens_v2.db
-      # Rainbow table (shared with indexer via volume)
+      - DATABASE_PATH=/app/data/ens.db
       - RAINBOW_PATH=/app/data/ens_rainbow.db
       - DOWNLOAD_RAINBOW=false
-      # API settings
       - API_PORT=5655
       - GRAPHQL_MAX_DEPTH=10
-      - GRAPHQL_MAX_COST=1000
-      # Webhooks
+      - GRAPHQL_MAX_COST=${GRAPHQL_MAX_COST:-10000}
       - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
       - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
       - WEBHOOK_ADMIN_USERNAME=${WEBHOOK_ADMIN_USERNAME:-}
       - WEBHOOK_ADMIN_PASSWORD=${WEBHOOK_ADMIN_PASSWORD:-}
-      # Metrics (optional)
       - METRICS_ENABLED=false
     depends_on:
-      - indexer-l2
-    # Note: Removed service_healthy condition because indexer takes 10-20 min
-    # for rainbow download on first startup. API will retry DB connection.
+      - indexer-v2
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:5655/health"]
       interval: 30s

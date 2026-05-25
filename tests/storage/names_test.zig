@@ -23,10 +23,10 @@ test "insertRegistry creates new registry" {
     const registry_addr = helpers.TEST_REGISTRY;
     const nh = try namehash_fn(allocator, "eth");
 
-    try helpers.createTestRegistry(database, .l2, registry_addr, "eth", nh);
+    try helpers.createTestRegistry(database, .v2, registry_addr, "eth", nh);
 
     // Verify registry was created by querying
-    const registries = try database.getRegistriesByOwner(.l2, helpers.TEST_OWNER_1);
+    const registries = try database.getRegistriesByOwner(.v2, helpers.TEST_OWNER_1);
     defer {
         for (registries) |*r| r.deinit(allocator);
         allocator.free(registries);
@@ -44,11 +44,11 @@ test "insertRegistry updates existing registry on conflict" {
     const nh = try namehash_fn(allocator, "eth");
 
     // Insert first time
-    try helpers.createTestRegistry(database, .l2, registry_addr, "eth", nh);
+    try helpers.createTestRegistry(database, .v2, registry_addr, "eth", nh);
 
     // Insert again with same address - should update, not fail
     try database.insertRegistry(models.Registry{
-        .chain = .l2,
+        .protocol = .v2,
         .address = registry_addr,
         .name = "eth-updated",
         .namehash = nh,
@@ -65,7 +65,7 @@ test "getRegistriesByOwner returns empty for unknown owner" {
     defer helpers.destroyTestDatabase(allocator, database);
 
     const unknown_owner = helpers.randomAddress();
-    const registries = try database.getRegistriesByOwner(.l2, unknown_owner);
+    const registries = try database.getRegistriesByOwner(.v2, unknown_owner);
     defer allocator.free(registries);
 
     try testing.expectEqual(@as(usize, 0), registries.len);
@@ -103,7 +103,7 @@ test "insertName with null optional fields" {
     const parent_nh = try namehash_fn(allocator, "eth");
 
     try database.insertName(models.Name{
-        .chain = .l2,
+        .protocol = .v2,
         .name = "minimal.eth",
         .namehash = nh,
         .label = "minimal",
@@ -120,7 +120,6 @@ test "insertName with null optional fields" {
         .expiry = 0,
         .registry_locked = false,
         .migrated = false,
-        .ejected = false,
         .created_block = 1000,
         .created_at = 1700000000,
         .registered_at = 1700000000,
@@ -249,7 +248,7 @@ test "insertName with expiry > i64::max stores as 0 (never expires)" {
     const huge_expiry: u64 = @as(u64, @intCast(std.math.maxInt(i64))) + 100;
 
     try database.insertName(models.Name{
-        .chain = .l2,
+        .protocol = .v2,
         .name = "hugeinsert.eth",
         .namehash = nh,
         .label = "hugeinsert",
@@ -266,7 +265,6 @@ test "insertName with expiry > i64::max stores as 0 (never expires)" {
         .expiry = huge_expiry,
         .registry_locked = false,
         .migrated = false,
-        .ejected = false,
         .created_block = 1000,
         .created_at = 1700000000,
         .registered_at = 1700000000,
@@ -361,7 +359,7 @@ test "updateNameExpiry via namehash clamps u64 > i64::max to 0" {
     const parent_nh = try namehash_fn(allocator, "eth");
 
     try database.insertName(models.Name{
-        .chain = .l2,
+        .protocol = .v2,
         .name = "canonical.eth",
         .namehash = nh,
         .label = "canonical",
@@ -378,7 +376,6 @@ test "updateNameExpiry via namehash clamps u64 > i64::max to 0" {
         .expiry = 1700000000,
         .registry_locked = false,
         .migrated = false,
-        .ejected = false,
         .created_block = 1000,
         .created_at = 1700000000,
         .registered_at = 1700000000,
@@ -404,26 +401,6 @@ test "updateNameExpiry via namehash clamps u64 > i64::max to 0" {
     try testing.expect(!name.isExpired());
 }
 
-test "insertRenewalSync with expiry > i64::max stores as 0" {
-    const allocator = testing.allocator;
-    const database = try helpers.createTestDatabase(allocator);
-    defer helpers.destroyTestDatabase(allocator, database);
-
-    const sync_storage = @import("lib").storage.sync;
-    const huge_expiry: u64 = @as(u64, @intCast(std.math.maxInt(i64))) + 1;
-    const tx_hash = helpers.randomHash();
-
-    try sync_storage.insertRenewalSync(database, .l2, 999, huge_expiry, 1000, tx_hash, 0);
-
-    // Verify by querying raw SQL — renewal_syncs stores new_expiry as integer
-    var q = try @import("lib").storage.Query.init(database, "SELECT new_expiry FROM renewal_syncs WHERE token_id = '999'");
-    defer q.deinit();
-
-    try testing.expect(try q.step());
-    const stored_expiry: i64 = q.getInt64(0);
-    try testing.expectEqual(@as(i64, 0), stored_expiry);
-}
-
 test "insertOrphanedRegistration with expiry > i64::max stores as 0 and reads back as 0" {
     const allocator = testing.allocator;
     const database = try helpers.createTestDatabase(allocator);
@@ -435,7 +412,7 @@ test "insertOrphanedRegistration with expiry > i64::max stores as 0 and reads ba
 
     try sync_storage.insertOrphanedRegistration(
         database,
-        .l2,
+        .v2,
         "0xaaaa",
         42,
         "testlabel",
@@ -446,7 +423,7 @@ test "insertOrphanedRegistration with expiry > i64::max stores as 0 and reads ba
         0,
     );
 
-    const orphans = try sync_storage.getOrphanedRegistrations(database, .l2, "0xaaaa");
+    const orphans = try sync_storage.getOrphanedRegistrations(database, .v2, "0xaaaa");
     defer {
         for (orphans) |*o| o.deinit(allocator);
         allocator.free(orphans);
@@ -580,7 +557,9 @@ test "getAllNames returns all names" {
         allocator.free(names);
     }
 
-    try testing.expectEqual(@as(usize, 2), names.len);
+    // Two test names plus the synthetic root domain (subgraph parity, inserted
+    // by `Database.migrate`).
+    try testing.expectEqual(@as(usize, 3), names.len);
 }
 
 // ============================================================================
@@ -680,7 +659,7 @@ test "multiple names with same owner different chains" {
 
     // Insert on L2
     try database.insertName(models.Name{
-        .chain = .l2,
+        .protocol = .v2,
         .name = "multichain.eth",
         .namehash = nh,
         .label = "multichain",
@@ -697,7 +676,6 @@ test "multiple names with same owner different chains" {
         .expiry = 0,
         .registry_locked = false,
         .migrated = false,
-        .ejected = false,
         .created_block = 1000,
         .created_at = 1700000000,
         .registered_at = 1700000000,
@@ -712,7 +690,7 @@ test "multiple names with same owner different chains" {
 
     // Insert on L1
     try database.insertName(models.Name{
-        .chain = .l1,
+        .protocol = .v1,
         .name = "multichain.eth",
         .namehash = nh,
         .label = "multichain",
@@ -729,7 +707,6 @@ test "multiple names with same owner different chains" {
         .expiry = 0,
         .registry_locked = false,
         .migrated = false,
-        .ejected = false,
         .created_block = 1000,
         .created_at = 1700000000,
         .registered_at = 1700000000,
@@ -742,12 +719,110 @@ test "multiple names with same owner different chains" {
         .v1_label_hash = null,
     });
 
-    // Query all names for owner (getNamesByOwner doesn't filter by chain)
+    // Query all names for owner (getNamesByOwner doesn't filter by protocol)
     const all_names = try database.getNamesByOwner(helpers.TEST_OWNER_1, null);
     defer {
         for (all_names) |*n| n.deinit(allocator);
         allocator.free(all_names);
     }
-    // Both L1 and L2 names should be returned since function doesn't filter by chain
+    // Both L1 and L2 names should be returned since function doesn't filter by protocol
     try testing.expectEqual(@as(usize, 2), all_names.len);
+}
+
+// ============================================================================
+// T3 REGRESSION: re-registration must preserve created_at / created_block
+// ============================================================================
+//
+// On re-registration after expiry, the V2 LabelRegistered handler builds a fresh
+// Name struct with the current block's timestamp. The insertName SQL uses
+// ON CONFLICT(protocol, namehash) DO UPDATE SET — and the SET list intentionally
+// excludes created_at + created_block so they're preserved across the conflict.
+// This test pins that behavior so a future "fix" doesn't accidentally add them
+// to the SET list and silently start clobbering historical timestamps.
+
+test "insertName ON CONFLICT preserves created_at and created_block" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "preserve.eth");
+    const label_hash = try labelhash_fn(allocator, "preserve");
+    const parent_nh = try namehash_fn(allocator, "eth");
+
+    // First insert — first registration. created_at/created_block are the
+    // historical values we expect to survive the re-mint below.
+    try database.insertName(models.Name{
+        .protocol = .v2,
+        .name = "preserve.eth",
+        .namehash = nh,
+        .label = "preserve",
+        .label_hash = label_hash,
+        .parent_name = "eth",
+        .parent_namehash = parent_nh,
+        .registry = Address.zero,
+        .owner = helpers.TEST_OWNER_1,
+        .registrant = helpers.TEST_OWNER_1,
+        .resolver = Address.zero,
+        .token_id = 0x1111_0000_0000_0000,
+        .canonical_id = 0x1111_0000_0000_0000,
+        .token_version = 0,
+        .expiry = 1700_010_000,
+        .registry_locked = false,
+        .migrated = false,
+        .created_block = 9_000_000,
+        .created_at = 1700_000_000,
+        .registered_at = 1700_000_000,
+        .updated_block = 9_000_000,
+        .updated_at = 1700_000_000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    });
+
+    // Second insert — simulates re-registration after expiry. Same (protocol,
+    // namehash), but later block + later timestamp + new owner. ON CONFLICT
+    // should update everything in the SET list (including registered_at) but
+    // leave created_at and created_block at their original values.
+    try database.insertName(models.Name{
+        .protocol = .v2,
+        .name = "preserve.eth",
+        .namehash = nh,
+        .label = "preserve",
+        .label_hash = label_hash,
+        .parent_name = "eth",
+        .parent_namehash = parent_nh,
+        .registry = Address.zero,
+        .owner = helpers.TEST_OWNER_1,
+        .registrant = helpers.TEST_OWNER_1,
+        .resolver = Address.zero,
+        .token_id = 0x1111_0000_0000_0001, // new version bit
+        .canonical_id = 0x1111_0000_0000_0000,
+        .token_version = 1,
+        .expiry = 1800_010_000,
+        .registry_locked = false,
+        .migrated = false,
+        .created_block = 10_000_000, // new value — must be IGNORED on conflict
+        .created_at = 1800_000_000, // new value — must be IGNORED on conflict
+        .registered_at = 1800_000_000, // new value — must overwrite (current tenancy)
+        .updated_block = 10_000_000,
+        .updated_at = 1800_000_000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    });
+
+    // Read back and assert created_* preserved, registered_at advanced.
+    const stored = try database.getNameByNamehash(nh);
+    try testing.expect(stored != null);
+    var stored_mut = stored.?;
+    defer stored_mut.deinit(allocator);
+
+    try testing.expectEqual(@as(i64, 1700_000_000), stored_mut.created_at);
+    try testing.expectEqual(@as(u64, 9_000_000), stored_mut.created_block);
+    try testing.expectEqual(@as(i64, 1800_000_000), stored_mut.registered_at);
+    try testing.expectEqual(@as(u32, 1), stored_mut.token_version);
 }

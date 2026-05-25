@@ -10,14 +10,15 @@
 /// - buildRegistrationJson: Build JSON for Registration entities
 /// - buildAccountJson: Build JSON for Account entities
 /// - buildResolverJson: Build JSON for Resolver entities
-
 const impl = @import("impl.zig");
+const fields = @import("../ens_fields.zig");
 
 // Re-export all public functions and types
-pub const hasValidExpiry = impl.hasValidExpiry;
+pub const hasValidExpiry = fields.hasValidExpiry;
 pub const NestedContext = impl.NestedContext;
 pub const buildDomainJson = impl.buildDomainJson;
 pub const buildEventJson = impl.buildEventJson;
 pub const buildRegistrationJson = impl.buildRegistrationJson;
 pub const buildAccountJson = impl.buildAccountJson;
 pub const buildResolverJson = impl.buildResolverJson;
+pub const buildWrappedDomainJson = impl.buildWrappedDomainJson;

@@ -10,6 +10,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // StrobeLabs/eth.zig — Ethereum primitives, ABI codecs, RPC.
+    // We're migrating off the hand-written src/indexer/abi.zig (and eventually
+    // src/rpc/client.zig) onto this. The old code is kept for fallback while
+    // the migration is in progress.
+    const eth_dep = b.dependency("eth", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const eth_module = eth_dep.module("eth");
+
     // Create GraphQL library module for use by test files
     const graphql_lib_mod = b.createModule(.{
         .root_source_file = b.path("src/lib/graphql/graphql.zig"),
@@ -17,7 +27,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Combined indexer executable (both L1 and L2 in one process)
+    // Combined indexer executable (both V1 and V2 in one process)
     const indexer_exe = b.addExecutable(.{
         .name = "ensv2-indexer",
         .root_module = b.createModule(.{
@@ -26,6 +36,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
+                .{ .name = "eth", .module = eth_module },
             },
         }),
     });
@@ -33,37 +44,39 @@ pub fn build(b: *std.Build) void {
     indexer_exe.linkSystemLibrary("sqlite3");
     b.installArtifact(indexer_exe);
 
-    // L1-only indexer executable (separate process)
-    const indexer_l1_exe = b.addExecutable(.{
-        .name = "ensv2-indexer-l1",
+    // V1-only indexer executable (separate process)
+    const indexer_v1_exe = b.addExecutable(.{
+        .name = "ensv2-indexer-v1",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/indexer_l1_main.zig"),
+            .root_source_file = b.path("src/indexer_v1_main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
+                .{ .name = "eth", .module = eth_module },
             },
         }),
     });
-    indexer_l1_exe.linkLibC();
-    indexer_l1_exe.linkSystemLibrary("sqlite3");
-    b.installArtifact(indexer_l1_exe);
+    indexer_v1_exe.linkLibC();
+    indexer_v1_exe.linkSystemLibrary("sqlite3");
+    b.installArtifact(indexer_v1_exe);
 
-    // L2-only indexer executable (separate process)
-    const indexer_l2_exe = b.addExecutable(.{
-        .name = "ensv2-indexer-l2",
+    // V2-only indexer executable (separate process)
+    const indexer_v2_exe = b.addExecutable(.{
+        .name = "ensv2-indexer-v2",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/indexer_l2_main.zig"),
+            .root_source_file = b.path("src/indexer_v2_main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
+                .{ .name = "eth", .module = eth_module },
             },
         }),
     });
-    indexer_l2_exe.linkLibC();
-    indexer_l2_exe.linkSystemLibrary("sqlite3");
-    b.installArtifact(indexer_l2_exe);
+    indexer_v2_exe.linkLibC();
+    indexer_v2_exe.linkSystemLibrary("sqlite3");
+    b.installArtifact(indexer_v2_exe);
 
     // Generate GraphQL introspection from schema.graphql
     const generate_schema = b.addSystemCommand(&[_][]const u8{
@@ -144,6 +157,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/indexer_main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
+                .{ .name = "eth", .module = eth_module },
+            },
         }),
     });
     unit_tests.linkLibC();
@@ -159,6 +176,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "eth", .module = eth_module },
+        },
     });
 
     // Integration tests
@@ -231,6 +251,38 @@ pub fn build(b: *std.Build) void {
     const run_filter_tests = b.addRunArtifact(filter_tests);
     const filter_test_step = b.step("test-filters", "Run filter logic unit tests");
     filter_test_step.dependOn(&run_filter_tests.step);
+
+    // lib/graphql/json_writer inline tests (self-contained within lib/graphql)
+    const json_writer_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lib/graphql/json_writer.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_json_writer_tests = b.addRunArtifact(json_writer_tests);
+    const json_writer_test_step = b.step("test-json-writer", "Run JSON writer helper tests");
+    json_writer_test_step.dependOn(&run_json_writer_tests.step);
+
+    // API module inline tests (rooted at api_main so cross-directory imports resolve).
+    // Covers src/api/common.zig, src/api/loaders.zig, and any other `test` blocks
+    // transitively reachable from the API entry point.
+    const api_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/api_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
+            },
+        }),
+    });
+    api_tests.linkLibC();
+    api_tests.linkSystemLibrary("sqlite3");
+    const run_api_tests = b.addRunArtifact(api_tests);
+    run_api_tests.setCwd(b.path("."));
+    const api_test_step = b.step("test-api", "Run api-module inline tests");
+    api_test_step.dependOn(&run_api_tests.step);
 
     // Event filtering tests
     const events_tests = b.addTest(.{
@@ -390,15 +442,36 @@ pub fn build(b: *std.Build) void {
     const run_storage_webhooks_tests = b.addRunArtifact(storage_webhooks_tests);
     run_storage_webhooks_tests.setCwd(b.path("."));
 
+    // Storage tests - registry_entries (on-chain Entry mirror + reachability cascade)
+    const storage_registry_entries_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/storage/registry_entries_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "helpers", .module = helpers_mod },
+                .{ .name = "lib", .module = lib_mod },
+            },
+        }),
+    });
+    storage_registry_entries_tests.linkLibC();
+    storage_registry_entries_tests.linkSystemLibrary("sqlite3");
+
+    const run_storage_registry_entries_tests = b.addRunArtifact(storage_registry_entries_tests);
+    run_storage_registry_entries_tests.setCwd(b.path("."));
+
     // Storage test step
     const storage_test_step = b.step("test-storage", "Run storage module tests");
     storage_test_step.dependOn(&run_storage_names_tests.step);
     storage_test_step.dependOn(&run_storage_resolvers_tests.step);
     storage_test_step.dependOn(&run_storage_roles_tests.step);
     storage_test_step.dependOn(&run_storage_webhooks_tests.step);
+    storage_test_step.dependOn(&run_storage_registry_entries_tests.step);
 
     // Make the default test command run all tests
     test_step.dependOn(&run_filter_tests.step);
+    test_step.dependOn(&run_json_writer_tests.step);
+    test_step.dependOn(&run_api_tests.step);
     test_step.dependOn(&run_events_tests.step);
     test_step.dependOn(&run_apollo_tests.step);
     test_step.dependOn(&run_variables_tests.step);
@@ -407,4 +480,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_storage_resolvers_tests.step);
     test_step.dependOn(&run_storage_roles_tests.step);
     test_step.dependOn(&run_storage_webhooks_tests.step);
+    test_step.dependOn(&run_storage_registry_entries_tests.step);
 }

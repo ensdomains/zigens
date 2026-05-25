@@ -16,7 +16,7 @@ The `database.zig` file contains 45 functions organized into categories:
 
 ### Core Operations (5 functions)
 - `init()`, `deinit()` - Database lifecycle
-- `exec()`, `loadSchemaFiles()`, `migrate()` - Schema management
+- `exec()`, `loadSchemaFiles()` - Schema management (consolidated schema/schema.sql; re-index required for changes)
 
 ### Name Operations (12 functions)
 - `insertRegistry()`, `insertName()` - Create
@@ -35,7 +35,7 @@ The `database.zig` file contains 45 functions organized into categories:
 - `storeBlockHash()`, `getBlockHash()`, `rollbackToBlock()`, `pruneOldBlockHashes()` - Block tracking
 - `registerSubregistry()`, `registerResolver()` - Cache management
 - `getSubregistriesToIndex()`, `getResolversToIndex()` - Index queries
-- `insertMigration()`, `insertRenewalSync()`, `insertTokenObserver()` - Bridge events
+- `insertTokenObserver()` - V2 Registry TokenObserverSet events
 - `deleteDataAfterBlock()` - Cleanup
 - `checkIntegrity()` - Validation
 

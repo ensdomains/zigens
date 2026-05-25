@@ -1,7 +1,6 @@
 /// Centralized constants for the ENS indexer
 /// This module contains all magic numbers, timing values, and well-known hashes
 /// that were previously scattered throughout the codebase.
-
 const Hash = @import("types/hash.zig").Hash;
 
 // ============================================================================
@@ -102,34 +101,6 @@ pub const WellKnown = struct {
     pub const root_namehash: Hash = Hash.fromHex("0000000000000000000000000000000000000000000000000000000000000000") catch unreachable;
 };
 
-// ============================================================================
-// HISTORICAL BLOCK NUMBERS (Mainnet)
-// ============================================================================
-
-/// Historical block numbers for Ethereum mainnet
-/// These mark important ENS deployment and migration milestones
-pub const MainnetBlocks = struct {
-    /// Temporary Registrar deployment - May 2017
-    /// Start of ENS auction system (pre-V1)
-    pub const temp_registrar_start: u64 = 3327417;
-
-    /// V1 Permanent Registrar deployment - May 2019
-    /// End of auction system, start of instant registration
-    pub const v1_migration: u64 = 9380410;
-
-    /// Name Wrapper deployment - September 2022
-    pub const name_wrapper_deployment: u64 = 15628465;
-};
-
-// ============================================================================
-// HELPER FUNCTIONS
-// ============================================================================
-
-/// Convert timing constants to nanoseconds for std.Thread.sleep
-pub fn toNanoseconds(ms: u64) u64 {
-    return ms * std.time.ns_per_ms;
-}
-
 const std = @import("std");
 
 // ============================================================================
@@ -143,11 +114,4 @@ test "well-known hashes are valid" {
     try testing.expectEqual(@as(usize, 32), WellKnown.eth_namehash.bytes.len);
     try testing.expectEqual(@as(usize, 32), WellKnown.reverse_namehash.bytes.len);
     try testing.expectEqual(@as(usize, 32), WellKnown.root_namehash.bytes.len);
-}
-
-test "mainnet blocks are in order" {
-    const testing = std.testing;
-
-    try testing.expect(MainnetBlocks.temp_registrar_start < MainnetBlocks.v1_migration);
-    try testing.expect(MainnetBlocks.v1_migration < MainnetBlocks.name_wrapper_deployment);
 }

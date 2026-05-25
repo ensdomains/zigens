@@ -303,15 +303,6 @@ pub const Query = struct {
         }
     }
 
-    /// Bind an optional Address parameter (binds NULL if none)
-    pub fn bindOptionalAddress(self: *Query, addr: ?Address) !void {
-        if (addr) |a| {
-            try self.bindAddress(a);
-        } else {
-            try self.bindNull();
-        }
-    }
-
     /// Bind an optional Hash parameter (binds NULL if none)
     pub fn bindOptionalHash(self: *Query, hash: ?Hash) !void {
         if (hash) |h| {
@@ -413,24 +404,6 @@ pub const Query = struct {
         return c.sqlite3_column_int64(self.stmt, col_idx);
     }
 
-    /// Get optional i32 from column (returns null if column is NULL)
-    pub fn getOptionalInt(self: *Query, col: usize) ?i32 {
-        const col_idx: c_int = @intCast(col);
-        if (c.sqlite3_column_type(self.stmt, col_idx) == c.SQLITE_NULL) {
-            return null;
-        }
-        return c.sqlite3_column_int(self.stmt, col_idx);
-    }
-
-    /// Get optional bool from column (returns null if column is NULL)
-    pub fn getOptionalBool(self: *Query, col: usize) ?bool {
-        const col_idx: c_int = @intCast(col);
-        if (c.sqlite3_column_type(self.stmt, col_idx) == c.SQLITE_NULL) {
-            return null;
-        }
-        return c.sqlite3_column_int(self.stmt, col_idx) != 0;
-    }
-
     /// Check if column is NULL
     pub fn isNull(self: *Query, col: usize) bool {
         return c.sqlite3_column_type(self.stmt, @intCast(col)) == c.SQLITE_NULL;
@@ -455,18 +428,37 @@ pub const Query = struct {
 // CONVENIENCE FUNCTIONS
 // ============================================================================
 
+/// Build a parameterized SQL `IN`/`NOT IN` clause: `<column> <op> (?, ?, …)`.
+///
+/// Caller owns the returned slice (free with `allocator.free`). `op` is the
+/// uppercase phrase to insert between column and parenthesised placeholders,
+/// typically `"IN"` or `"NOT IN"`. `count` is the number of placeholders;
+/// callers should special-case `count == 0` themselves (this helper returns
+/// a syntactically valid but always-empty clause when count is 0).
+///
+/// Replaces the 13-line ArrayList/loop dance that previously sat at 7
+/// different sites in `names.zig` and `accounts.zig`. New filter slots get
+/// one-liner clause construction with no chance of formatting drift.
+pub fn buildInClause(allocator: std.mem.Allocator, column: []const u8, op: []const u8, count: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .{};
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, column);
+    try out.append(allocator, ' ');
+    try out.appendSlice(allocator, op);
+    try out.appendSlice(allocator, " (");
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        if (i > 0) try out.appendSlice(allocator, ", ");
+        try out.appendSlice(allocator, "?");
+    }
+    try out.appendSlice(allocator, ")");
+    return try out.toOwnedSlice(allocator);
+}
+
 /// Execute a simple statement with no parameters or results
 pub fn exec(database: *Database, sql: []const u8) !void {
     var q = try Query.init(database, sql);
     defer q.deinit();
-    try q.exec();
-}
-
-/// Execute a statement with parameters, no results
-pub fn execWith(database: *Database, sql: []const u8, binder: anytype) !void {
-    var q = try Query.init(database, sql);
-    defer q.deinit();
-    try binder(&q);
     try q.exec();
 }
 

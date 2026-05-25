@@ -40,7 +40,10 @@ pub const FieldType = enum {
     hash,
     /// Optional hash field
     optional_hash,
-    /// Custom function for complex fields (nested objects, computed values)
+    /// Custom writer that produces a scalar value (sub-selections invalid).
+    custom_scalar,
+    /// Custom writer that produces an object/list (sub-selections may be valid; the
+    /// writer is responsible for honoring them).
     custom,
 };
 
@@ -114,11 +117,6 @@ pub const FieldDef = struct {
         return .{ .name = name, .field_type = .address, .getter = getter, .custom_writer = null };
     }
 
-    /// Create an optional address field
-    pub fn optionalAddress(name: []const u8, getter: FieldGetter) FieldDef {
-        return .{ .name = name, .field_type = .optional_address, .getter = getter, .custom_writer = null };
-    }
-
     /// Create a hash field
     pub fn hashField(name: []const u8, getter: FieldGetter) FieldDef {
         return .{ .name = name, .field_type = .hash, .getter = getter, .custom_writer = null };
@@ -129,9 +127,16 @@ pub const FieldDef = struct {
         return .{ .name = name, .field_type = .optional_hash, .getter = getter, .custom_writer = null };
     }
 
-    /// Create a custom field with direct writer access
+    /// Create a custom field with direct writer access. Use this for fields whose JSON
+    /// shape is an object or list — the writer is expected to honor sub-selections itself.
     pub fn custom(name: []const u8, writer_fn: CustomWriter) FieldDef {
         return .{ .name = name, .field_type = .custom, .getter = null, .custom_writer = writer_fn };
+    }
+
+    /// Create a custom field whose value is scalar (e.g. a formatted string or number).
+    /// Sub-selections will be rejected at the entity-builder level.
+    pub fn customScalar(name: []const u8, writer_fn: CustomWriter) FieldDef {
+        return .{ .name = name, .field_type = .custom_scalar, .getter = null, .custom_writer = writer_fn };
     }
 };
 
@@ -162,8 +167,8 @@ fn writeFieldValue(
     allocator: std.mem.Allocator,
     def: FieldDef,
 ) !bool {
-    // Handle custom fields
-    if (def.field_type == .custom) {
+    // Handle custom fields (both scalar and object kinds dispatch through the writer)
+    if (def.field_type == .custom or def.field_type == .custom_scalar) {
         if (def.custom_writer) |custom_fn| {
             return try custom_fn(ctx, output_key, writer, allocator);
         }
@@ -309,9 +314,39 @@ fn getEventContractAddress(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
     return FieldValue{ .address = event.contract_address };
 }
 
-fn getEventChain(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
+fn getEventProtocol(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
     const event = getEventCtx(ctx);
-    return FieldValue{ .string = event.chain.toString() };
+    return FieldValue{ .string = event.protocol.toString() };
+}
+
+/// Extract a string field from the event's JSON `data` blob, gated on the
+/// event type. Used by the flat subgraph-parity accessors that surface
+/// event-type-specific payload fields directly on the `Event` GraphQL type
+/// (e.g., `key`/`value` on TextChanged, instead of forcing clients through
+/// the `asTextChanged { key }` projection).
+fn extractDataField(data: ?[]const u8, expected_type: []const u8, event_type: []const u8, field: []const u8, allocator: std.mem.Allocator) !FieldValue {
+    if (!std.mem.eql(u8, event_type, expected_type)) return FieldValue{ .optional_string = null };
+    const blob = data orelse return FieldValue{ .optional_string = null };
+    // Minimal JSON probe — we only need to find a `"field":"value"` pair. Mirrors
+    // the json_utils.extractStringField approach used elsewhere but inlined
+    // here to avoid a cross-module import for one call site.
+    const needle_buf = try std.fmt.allocPrint(allocator, "\"{s}\":\"", .{field});
+    defer allocator.free(needle_buf);
+    const start = std.mem.indexOf(u8, blob, needle_buf) orelse return FieldValue{ .optional_string = null };
+    const value_start = start + needle_buf.len;
+    const value_end_rel = std.mem.indexOfScalar(u8, blob[value_start..], '"') orelse return FieldValue{ .optional_string = null };
+    const owned = try allocator.dupe(u8, blob[value_start .. value_start + value_end_rel]);
+    return FieldValue{ .optional_string = owned };
+}
+
+fn getEventTextKey(ctx: *anyopaque, allocator: std.mem.Allocator) !FieldValue {
+    const event = getEventCtx(ctx);
+    return try extractDataField(event.data, "TextChanged", event.event_type.toString(), "key", allocator);
+}
+
+fn getEventTextValue(ctx: *anyopaque, allocator: std.mem.Allocator) !FieldValue {
+    const event = getEventCtx(ctx);
+    return try extractDataField(event.data, "TextChanged", event.event_type.toString(), "value", allocator);
 }
 
 fn getEventData(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
@@ -321,7 +356,7 @@ fn getEventData(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
 
 /// Event field definitions table
 pub const EventFields = [_]FieldDef{
-    FieldDef.custom("id", writeEventId),
+    FieldDef.customScalar("id", writeEventId),
     FieldDef.string("type", getEventType),
     FieldDef.int("blockNumber", getEventBlockNumber),
     FieldDef.hashField("transactionHash", getEventTransactionHash),
@@ -329,8 +364,14 @@ pub const EventFields = [_]FieldDef{
     FieldDef.optionalString("name", getEventName),
     FieldDef.optionalHash("namehash", getEventNamehash),
     FieldDef.address("contractAddress", getEventContractAddress),
-    FieldDef.string("chain", getEventChain),
+    FieldDef.string("protocol", getEventProtocol),
     FieldDef.optionalString("data", getEventData),
+    // Subgraph-parity flat accessors for event-type-specific payload fields.
+    // These extract the matching value from the JSON `data` blob when the
+    // event type matches; null otherwise. The `as*` typed projection accessors
+    // remain available for clients that prefer the discriminated-union shape.
+    FieldDef.optionalString("key", getEventTextKey),
+    FieldDef.optionalString("value", getEventTextValue),
 };
 
 /// Custom writer for event ID (composite field)
@@ -392,9 +433,9 @@ fn getEACRoleName(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
 
 /// EAC Role field definitions table
 pub const EACRoleFields = [_]FieldDef{
-    FieldDef.custom("id", writeEACRoleId),
+    FieldDef.customScalar("id", writeEACRoleId),
     FieldDef.string("resource", getEACRoleResource),
-    FieldDef.custom("account", writeEACRoleAccount),
+    FieldDef.customScalar("account", writeEACRoleAccount),
     FieldDef.string("roleBitmap", getEACRoleBitmap),
     FieldDef.int("blockNumber", getEACRoleBlockNumber),
     FieldDef.hashField("transactionHash", getEACRoleTransactionHash),
@@ -528,9 +569,65 @@ fn getRegistrationTimestamp(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
     return FieldValue{ .int = event.timestamp };
 }
 
-fn getRegistrationChain(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
+fn getRegistrationProtocol(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
     const event = getEventCtx(ctx);
-    return FieldValue{ .string = event.chain.toString() };
+    return FieldValue{ .string = event.protocol.toString() };
+}
+
+/// Registration economic field getters. All four columns are optional —
+/// they're NULL until the matching ETH Controller event arrives and the
+/// indexer enriches the row via updateRegistrationEconomics. The fields
+/// are decimal-string u256 (cost, baseCost, premium) or 0x-prefixed hex
+/// (referrer); see schema.graphql comments and models.Event for rationale.
+fn getRegistrationBaseCost(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
+    const event = getEventCtx(ctx);
+    return FieldValue{ .optional_string = event.base_cost };
+}
+
+fn getRegistrationPremium(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
+    const event = getEventCtx(ctx);
+    return FieldValue{ .optional_string = event.premium };
+}
+
+fn getRegistrationLabelName(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
+    const event = getEventCtx(ctx);
+    return FieldValue{ .optional_string = event.label_name };
+}
+
+fn getRegistrationReferrer(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
+    const event = getEventCtx(ctx);
+    return FieldValue{ .optional_string = event.referrer };
+}
+
+/// `cost = base_cost + premium`. Computed lazily because we don't store
+/// a redundant column. Custom writer so the temporary allocation has a
+/// clean lifetime (returning an allocated string via FieldValue.optional_string
+/// would leak — the dispatcher in lib/graphql/fields.zig doesn't free getter
+/// return values, and we can't safely escape/free in-line).
+fn writeRegistrationCost(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+    const event = getEventCtx(ctx);
+    const base = event.base_cost orelse {
+        try writer.print("\"{s}\":null", .{output_key});
+        return true;
+    };
+    const premium = event.premium orelse "0";
+
+    // Parse u256 decimal strings, sum, render back. base+premium can't
+    // overflow u256 for any realistic registration; wrapping add is safe.
+    const base_u = std.fmt.parseInt(u256, base, 10) catch {
+        try writer.print("\"{s}\":null", .{output_key});
+        return true;
+    };
+    const premium_u = std.fmt.parseInt(u256, premium, 10) catch {
+        try writer.print("\"{s}\":null", .{output_key});
+        return true;
+    };
+    const total = base_u +% premium_u;
+
+    const total_str = try std.fmt.allocPrint(allocator, "{d}", .{total});
+    defer allocator.free(total_str);
+    try writer.print("\"{s}\":\"{s}\"", .{ output_key, total_str });
+    return true;
 }
 
 /// Registration field definitions table
@@ -543,7 +640,12 @@ pub const RegistrationFields = [_]FieldDef{
     FieldDef.int("blockNumber", getRegistrationBlock),
     FieldDef.int("timestamp", getRegistrationTimestamp),
     FieldDef.int("registrationDate", getRegistrationTimestamp),
-    FieldDef.string("chain", getRegistrationChain),
+    FieldDef.string("protocol", getRegistrationProtocol),
+    FieldDef.customScalar("cost", writeRegistrationCost),
+    FieldDef.optionalString("baseCost", getRegistrationBaseCost),
+    FieldDef.optionalString("premium", getRegistrationPremium),
+    FieldDef.optionalString("labelName", getRegistrationLabelName),
+    FieldDef.optionalString("referrer", getRegistrationReferrer),
 };
 
 // ============================================================================
@@ -593,7 +695,7 @@ fn writeResolverMetadataId(ctx: *anyopaque, output_key: []const u8, writer: std.
 
 /// Resolver metadata field definitions table
 pub const ResolverMetadataFields = [_]FieldDef{
-    FieldDef.custom("id", writeResolverMetadataId),
+    FieldDef.customScalar("id", writeResolverMetadataId),
     FieldDef.address("resolver", getResolverMetadataResolver),
     FieldDef.string("graphqlUrl", getResolverMetadataGraphqlUrl),
     FieldDef.int("blockNumber", getResolverMetadataBlockNumber),
@@ -668,7 +770,7 @@ fn writeResolverApprovalId(ctx: *anyopaque, output_key: []const u8, writer: std.
 
 /// Resolver approval field definitions table
 pub const ResolverApprovalFields = [_]FieldDef{
-    FieldDef.custom("id", writeResolverApprovalId),
+    FieldDef.customScalar("id", writeResolverApprovalId),
     FieldDef.address("resolver", getResolverApprovalResolver),
     FieldDef.hashField("namehash", getResolverApprovalNamehash),
     FieldDef.optionalString("context", getResolverApprovalContext),
@@ -734,28 +836,36 @@ fn writeNameResolver(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayL
     return true;
 }
 
-/// Custom writer for expiryDate field (null if not valid)
+/// Custom writer for expiryDate field. For V1 .eth 2LDs, includes the 90-day
+/// grace period (subgraph parity). Null when no expiry is set.
 fn writeNameExpiryDate(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, _: std.mem.Allocator) !bool {
     const name = getNameCtx(ctx);
     if (hasValidExpiry(name.expiry)) {
-        try writer.print("\"{s}\":{d}", .{ output_key, name.expiry });
+        try writer.print("\"{s}\":{d}", .{ output_key, effectiveDomainExpiry(name) });
     } else {
         try writer.print("\"{s}\":null", .{output_key});
     }
     return true;
 }
 
-/// Check if expiry is valid (non-zero and not max value)
+/// Check if expiry is valid. We store 0 for "no expiry" (subnames without duration).
 pub fn hasValidExpiry(expiry: anytype) bool {
-    const T = @TypeOf(expiry);
-    if (@typeInfo(T) == .int) {
-        // For unsigned types, check against maxInt of that type
-        if (@typeInfo(T).int.signedness == .unsigned) {
-            return expiry > 0 and expiry < std.math.maxInt(T);
-        }
-    }
-    // For signed types or other, just check > 0
     return expiry > 0;
+}
+
+/// V1 BaseRegistrar grace-period: subgraph defines `Domain.expiryDate =
+/// BaseRegistrar.expires + 90d` while `Registration.expiryDate = expires`.
+/// We store bare `expires` on the row (matches on-chain truth) and add the
+/// grace at read time only for V1 .eth 2LDs. Other names (V2, V1 subnames,
+/// non-`.eth` TLDs) return the stored value unchanged.
+pub const V1_GRACE_PERIOD_SECONDS: i64 = 90 * 24 * 60 * 60;
+pub fn effectiveDomainExpiry(name: anytype) i64 {
+    const base: i64 = @intCast(name.expiry);
+    if (name.protocol != .v1) return base;
+    if (name.expiry == 0) return base;
+    const parent = name.parent_name orelse return base;
+    if (!std.mem.eql(u8, parent, "eth")) return base;
+    return base + V1_GRACE_PERIOD_SECONDS;
 }
 
 /// Name/Domain field definitions table (for simple queries)
@@ -799,6 +909,12 @@ fn getDomainIsMigrated(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValu
     return FieldValue{ .bool_val = name.migrated };
 }
 
+/// Get domain namehash (hex)
+fn getDomainNamehash(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue {
+    const name = getNameCtx(ctx);
+    return FieldValue{ .hash = name.namehash };
+}
+
 /// Get domain createdAt
 fn getDomainCreatedAt(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue {
     const name = getNameCtx(ctx);
@@ -811,26 +927,109 @@ fn getDomainRegistrationDate(ctx: *anyopaque, _: std.mem.Allocator) anyerror!Fie
     return FieldValue{ .int = name.registered_at };
 }
 
-/// Get domain expiry (may be null)
+/// Get domain expiry. For V1 .eth 2LDs, includes the 90-day grace period
+/// (subgraph parity: `Domain.expiryDate = expires + 90d`). The bare on-chain
+/// `expires` is still available via the parallel `Registration.expiryDate`.
 fn getDomainExpiry(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue {
     const name = getNameCtx(ctx);
     if (hasValidExpiry(name.expiry)) {
-        return FieldValue{ .int = name.expiry };
+        return FieldValue{ .int = effectiveDomainExpiry(name) };
     }
     return FieldValue{ .none = {} };
+}
+
+/// Get domain isReachable
+fn getDomainIsReachable(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue {
+    const name = getNameCtx(ctx);
+    return FieldValue{ .bool_val = name.is_reachable };
+}
+
+/// Get domain unreachableSince (null when reachable)
+fn getDomainUnreachableSince(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue {
+    const name = getNameCtx(ctx);
+    if (name.unreachable_since) |ts| return FieldValue{ .int = ts };
+    return FieldValue{ .none = {} };
+}
+
+/// Get domain protocol ("v1" or "v2")
+fn getDomainProtocol(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue {
+    const name = getNameCtx(ctx);
+    return FieldValue{ .string = name.protocol.toString() };
+}
+
+/// Get domain isWrapped (V1 NameWrapper state)
+fn getDomainIsWrapped(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue {
+    const name = getNameCtx(ctx);
+    return FieldValue{ .bool_val = name.is_wrapped };
+}
+
+/// Get domain fuses (V1 NameWrapper fuse bitmap, stored as decimal string).
+/// Parse on read; return .none on null or parse error.
+fn getDomainFuses(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue {
+    const name = getNameCtx(ctx);
+    if (name.wrapper_fuses) |fuses_str| {
+        const parsed = std.fmt.parseInt(u64, fuses_str, 10) catch return FieldValue{ .none = {} };
+        return FieldValue{ .int = @intCast(parsed) };
+    }
+    return FieldValue{ .none = {} };
+}
+
+/// Get domain wrapperExpiry (V1 NameWrapper expiry timestamp)
+fn getDomainWrapperExpiry(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue {
+    const name = getNameCtx(ctx);
+    if (name.wrapper_expiry) |ts| return FieldValue{ .int = ts };
+    return FieldValue{ .none = {} };
+}
+
+/// Get domain TTL (V1 ENS Registry `NewTTL`). Null when unset.
+fn getDomainTTL(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue {
+    const name = getNameCtx(ctx);
+    if (name.ttl) |t| return FieldValue{ .int = @intCast(t) };
+    return FieldValue{ .none = {} };
+}
+
+/// Get domain isLegacy (V1 ENS Registry provenance flag).
+fn getDomainIsLegacy(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue {
+    const name = getNameCtx(ctx);
+    return FieldValue{ .bool_val = name.is_legacy };
+}
+
+/// Get domain gracePeriodEnd: subgraph semantics — `Domain.expiryDate =
+/// BaseRegistrar.expires + 90d` for V1 .eth 2LDs, while `Registration.expiryDate
+/// = expires` (no grace). Explicit-name alias for the same value that
+/// `Domain.expiryDate` now returns. Kept for client-side discoverability —
+/// some clients prefer naming the field that explicitly indicates the
+/// grace-period semantic. Returns null for non-V1 / non-.eth-2LD names.
+fn getDomainGracePeriodEnd(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue {
+    const name = getNameCtx(ctx);
+    if (name.protocol != .v1) return FieldValue{ .none = {} };
+    if (!hasValidExpiry(name.expiry)) return FieldValue{ .none = {} };
+    const parent = name.parent_name orelse return FieldValue{ .none = {} };
+    if (!std.mem.eql(u8, parent, "eth")) return FieldValue{ .none = {} };
+    return FieldValue{ .int = effectiveDomainExpiry(name) };
 }
 
 /// Domain build field definitions - scalar fields only
 /// Nested fields (owner, registrant, resolver, etc.) are handled via NestedFieldDef
 pub const DomainBuildFields = [_]FieldDef{
-    FieldDef.custom("id", writeNameId),
-    FieldDef.custom("name", writeNameId),
-    FieldDef.custom("labelName", writeNameLabelName),
-    FieldDef.custom("labelhash", writeNameLabelhash),
+    FieldDef.customScalar("id", writeNameId),
+    FieldDef.customScalar("name", writeNameId),
+    FieldDef.hashField("namehash", getDomainNamehash),
+    FieldDef.customScalar("labelName", writeNameLabelName),
+    FieldDef.customScalar("labelhash", writeNameLabelhash),
     FieldDef.string("tokenId", getDomainTokenId),
     FieldDef.string("canonicalId", getDomainCanonicalId),
     FieldDef.int("tokenVersion", getDomainTokenVersion),
     FieldDef.boolean("isMigrated", getDomainIsMigrated),
+    FieldDef.string("protocol", getDomainProtocol),
+    FieldDef.boolean("isReachable", getDomainIsReachable),
+    FieldDef.int("unreachableSince", getDomainUnreachableSince),
+    FieldDef.boolean("isWrapped", getDomainIsWrapped),
+    FieldDef.int("fuses", getDomainFuses),
+    FieldDef.int("wrapperExpiry", getDomainWrapperExpiry),
+    FieldDef.int("ttl", getDomainTTL),
+    FieldDef.boolean("isLegacy", getDomainIsLegacy),
+    FieldDef.int("gracePeriodEnd", getDomainGracePeriodEnd),
     FieldDef.int("createdAt", getDomainCreatedAt),
     FieldDef.int("registrationDate", getDomainRegistrationDate),
 };
@@ -880,10 +1079,18 @@ pub const AccountFields = [_]FieldDef{
 // ============================================================================
 
 /// Context for building Resolver JSON
-/// Holds both resolver address and domain namehash needed for nested queries
+/// Holds the (chainId, protocol, address, namehash) quadruple — superset of
+/// the entity table's UNIQUE key so the entity ID can be rendered as
+/// `{chainId}-{protocol}-{address}-{namehash}`. ChainId leads so the ID
+/// stays globally unique once this indexer extends to multi-chain plugins
+/// (basenames, lineanames, 3DNS). The `v1`/`v2` protocol segment stays
+/// because V1 and V2 share a single chain's namehash space — collisions are
+/// inevitable otherwise once names are migrated keeping the same resolver.
 pub const ResolverBuildContext = struct {
     resolver: Address,
     namehash: Hash,
+    protocol: models.Protocol,
+    chain_id: u64,
 };
 
 /// Helper to get ResolverBuildContext from opaque pointer
@@ -891,8 +1098,30 @@ fn getResolverBuildCtx(ctx: *anyopaque) *const ResolverBuildContext {
     return @ptrCast(@alignCast(ctx));
 }
 
-/// Get resolver id (address as hex)
+/// Get resolver entity id `{chainId}-{protocol}-{address}-{namehash}`.
+/// Phase 4b changed this from address-only to a triple for subgraph parity.
+/// A follow-up extends it to a quadruple with the leading chain ID, making
+/// the ID safe to merge across chains the day this indexer adds multi-chain
+/// plugin support without a schema migration. Reading `domain.resolver.id`
+/// returns the entity ID, NOT the raw contract address — clients that need
+/// the bare address should select `domain.resolver.address` instead.
 fn getResolverBuildId(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!FieldValue {
+    const rctx = getResolverBuildCtx(ctx);
+    const addr_hex = try rctx.resolver.toHex(allocator);
+    defer allocator.free(addr_hex);
+    const namehash_hex = try rctx.namehash.toHex(allocator);
+    defer allocator.free(namehash_hex);
+    const id = try std.fmt.allocPrint(allocator, "{d}-{s}-{s}-{s}", .{
+        rctx.chain_id,
+        rctx.protocol.toString(),
+        addr_hex,
+        namehash_hex,
+    });
+    return FieldValue{ .string = id };
+}
+
+/// Address-only view of the resolver contract.
+fn getResolverBuildAddress(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!FieldValue {
     const rctx = getResolverBuildCtx(ctx);
     const hex = try rctx.resolver.toHex(allocator);
     return FieldValue{ .string = hex };
@@ -902,7 +1131,7 @@ fn getResolverBuildId(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!Fi
 /// Nested fields (addr, addresses, contentHash, texts, text) are handled via NestedFieldDef
 pub const ResolverBuildFields = [_]FieldDef{
     FieldDef.string("id", getResolverBuildId),
-    FieldDef.string("address", getResolverBuildId),
+    FieldDef.string("address", getResolverBuildAddress),
 };
 
 // ============================================================================

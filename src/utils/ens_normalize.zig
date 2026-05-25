@@ -3,7 +3,6 @@
 /// Wraps the z_ens_normalize library to provide ENSIP-15 compliant
 /// name normalization. Names that fail normalization are flagged
 /// as non-normalized but still stored.
-
 const std = @import("std");
 const ens = @import("ens_normalize");
 
@@ -65,6 +64,16 @@ pub fn isNormalized(allocator: std.mem.Allocator, name: []const u8) bool {
     const normalized = ens.normalize(allocator, name) catch return false;
     defer allocator.free(normalized);
     return std.mem.eql(u8, name, normalized);
+}
+
+/// Check if a single label is ENSIP-15 normalized (fast path for indexer).
+/// Rejects labels containing dots, invalid characters, or that would be changed by normalization.
+pub fn isLabelNormalized(allocator: std.mem.Allocator, label: []const u8) bool {
+    if (label.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, label, '.') != null) return false;
+    const normalized = ens.normalize(allocator, label) catch return false;
+    defer allocator.free(normalized);
+    return std.mem.eql(u8, label, normalized);
 }
 
 /// Check if a label contains invalid characters (quick check)
