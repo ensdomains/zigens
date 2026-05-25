@@ -166,12 +166,14 @@ pub fn setRegistriesReachability(
     defer sql_buf.deinit(db.allocator);
 
     if (reachable) {
-        try sql_buf.appendSlice(db.allocator,
+        try sql_buf.appendSlice(
+            db.allocator,
             "UPDATE names SET is_reachable = 1, unreachable_since = NULL, updated_block = ?, updated_at = ? " ++
                 "WHERE protocol = ? AND is_reachable = 0 AND registry IN (",
         );
     } else {
-        try sql_buf.appendSlice(db.allocator,
+        try sql_buf.appendSlice(
+            db.allocator,
             "UPDATE names SET is_reachable = 0, unreachable_since = ?, updated_block = ?, updated_at = ? " ++
                 "WHERE protocol = ? AND is_reachable = 1 AND registry IN (",
         );

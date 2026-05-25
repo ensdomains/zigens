@@ -16,7 +16,6 @@ const status_mod = @import("../server/status.zig");
 const IndexerStatus = status_mod.IndexerStatus;
 const handlers_v2_registry = @import("v2/handlers_registry.zig");
 const handlers_v2_resolver = @import("v2/handlers_resolver.zig");
-const handlers_v2_chain = @import("v2/handlers_chain.zig");
 const event_fetchers = @import("event_fetchers.zig");
 const v1_indexing = @import("v1/indexing.zig");
 const handlers_v1 = @import("v1/handlers.zig");
@@ -444,8 +443,6 @@ pub const Indexer = struct {
         .{ .event_hash = abi.EventSignatures.name_renewed_hash, .handler = handleNameRenewed, .name = "NameRenewed" },
         .{ .event_hash = abi.EventSignatures.name_burned_hash, .handler = handleNameBurned, .name = "NameBurned" },
         .{ .event_hash = abi.EventSignatures.token_regenerated_hash, .handler = handleTokenRegenerated, .name = "TokenRegenerated" },
-        // NEW: TokenRegenerated V2 with 3 params (oldTokenId, newTokenId, flags) - current Sepolia deployment
-        .{ .event_hash = abi.EventSignatures.token_regenerated_v2_hash, .handler = handleTokenRegenerated, .name = "TokenRegeneratedV2" },
         .{ .event_hash = abi.EventSignatures.eac_roles_changed_hash, .handler = handleEACRolesChanged, .name = "EACRolesChanged" },
         // LabelRegistered on the main ETH Registry happens during V1→V2 migration
         // (migration controllers call ETHRegistry directly, not through a subregistry)
@@ -468,7 +465,6 @@ pub const Indexer = struct {
         .{ .event_hash = abi.EventSignatures.subregistry_updated_hash, .handler = handleSubregistryUpdated, .name = "SubregistryUpdated" },
         .{ .event_hash = abi.EventSignatures.resolver_updated_hash, .handler = handleResolverUpdated, .name = "ResolverUpdated" },
         .{ .event_hash = abi.EventSignatures.token_regenerated_hash, .handler = handleTokenRegenerated, .name = "TokenRegenerated" },
-        .{ .event_hash = abi.EventSignatures.token_regenerated_v2_hash, .handler = handleTokenRegenerated, .name = "TokenRegeneratedV2" },
         .{ .event_hash = abi.EventSignatures.eac_roles_changed_hash, .handler = handleEACRolesChanged, .name = "EACRolesChanged" },
     };
 
@@ -495,7 +491,7 @@ pub const Indexer = struct {
         .{ .event_hash = abi.EventSignatures.legacy_content_changed_hash, .handler = handleLegacyContentChanged, .name = "ContentChanged (legacy)" },
         // Modern resolver events (EIP-2304+)
         .{ .event_hash = abi.EventSignatures.address_changed_hash, .handler = handleAddressChanged, .name = "AddressChanged" },
-        .{ .event_hash = abi.EventSignatures.content_hash_changed_hash, .handler = handleContentHashChanged, .name = "ContentHashChanged" },
+        .{ .event_hash = abi.EventSignatures.content_hash_changed_hash, .handler = handleContentHashChanged, .name = "ContenthashChanged" },
         .{ .event_hash = abi.EventSignatures.text_changed_hash, .handler = handleTextChanged, .name = "TextChanged" },
         .{ .event_hash = abi.EventSignatures.legacy_text_changed_hash, .handler = handleLegacyTextChanged, .name = "TextChanged (legacy)" },
         .{ .event_hash = abi.EventSignatures.authorisation_changed_hash, .handler = handleAuthorisationChanged, .name = "AuthorisationChanged" },
@@ -542,8 +538,10 @@ pub const Indexer = struct {
         .{ .event_hash = abi.EventSignatures.controller_removed_hash, .handler = handleV1ControllerRemoved, .name = "ControllerRemoved" },
     };
 
-    // ETH Registrar Controller events (0x59E16fcCd424Cc24e280Be16E11Bcd56fb0CE547)
-    // These events provide the label text, which is critical for V1 name resolution
+    // ETH Registrar Controller events
+    // Multiple controllers have existed (legacy 5/4-param and current 7/5-param
+    // with referrer). Register both signatures — the handler picks the right
+    // decoding path based on data length.
     pub const V1_ETH_CONTROLLER_EVENTS = [_]RegistryEventConfig{
         .{ .event_hash = abi.EventSignatures.controller_name_registered_hash, .handler = handleV1ETHControllerNameRegistered, .name = "NameRegistered" },
         .{ .event_hash = abi.EventSignatures.wrapped_controller_name_registered_hash, .handler = handleV1ETHControllerNameRegistered6Arg, .name = "NameRegistered (6-arg)" },
@@ -557,11 +555,12 @@ pub const Indexer = struct {
         .{ .event_hash = abi.EventSignatures.reverse_claimed_hash, .handler = handleV1ReverseClaimed, .name = "ReverseClaimed" },
     };
 
-    // V2 ETH Reverse Registrar events (V2 contract on the V2 chain).
-    // Same `ReverseClaimed(address,bytes32)` shape as V1 — handler is protocol-agnostic
-    // (writes to reverse_records with the protocol passed in).
+    // V2 ETH Reverse Registrar events (L2ReverseRegistrar / StandaloneReverseRegistrar).
+    // V2 emits `NameForAddrChanged(address indexed addr, string name)` — there is
+    // no V1-style `ReverseClaimed(addr, node)` since V2 stores the name directly
+    // on the reverse registrar rather than going through a separate resolver.
     pub const V2_REVERSE_REGISTRAR_EVENTS = [_]RegistryEventConfig{
-        .{ .event_hash = abi.EventSignatures.reverse_claimed_hash, .handler = handleV1ReverseClaimed, .name = "ReverseClaimed" },
+        .{ .event_hash = abi.EventSignatures.name_for_addr_changed_hash, .handler = handleV2NameForAddrChanged, .name = "NameForAddrChanged" },
     };
 
     // V1 indexing orchestration (extracted to v1_indexing.zig)
@@ -1014,10 +1013,9 @@ pub const Indexer = struct {
             try self.indexSubregistryEvents(protocol, client, from_block, to_block);
             try self.processRemainingOrphans(protocol);
 
-            // Phase 3: Transfer + Observer events (depends on names existing)
+            // Phase 3: Transfer events (depends on names existing)
             // Note: V1→V2 migration is detected in handleLabelRegistered via sender address
             try self.indexTransferEvents(protocol, client, from_block, to_block);
-            try self.indexTokenObserverEvents(protocol, client, from_block, to_block);
 
             // Phase 4: Resolver events (depends on names + resolvers being set)
             try self.indexResolverEvents(protocol, client, from_block, to_block);
@@ -1033,15 +1031,12 @@ pub const Indexer = struct {
     pub const indexPhase1V2Events = event_fetchers.indexPhase1V2Events;
     pub const indexSubregistryEvents = event_fetchers.indexSubregistryEvents;
     pub const indexTransferEvents = event_fetchers.indexTransferEvents;
-    pub const indexTokenObserverEvents = event_fetchers.indexTokenObserverEvents;
     pub const indexResolverEvents = event_fetchers.indexResolverEvents;
     pub const indexV2ReverseRegistrarEvents = event_fetchers.indexV2ReverseRegistrarEvents;
 
     // V2 registry handlers (extracted to handlers_v2_registry.zig)
-    pub const handleSubregistryUpdate = handlers_v2_registry.handleSubregistryUpdate;
     pub const processOrphanedRegistration = handlers_v2_registry.processOrphanedRegistration;
     pub const processRemainingOrphans = handlers_v2_registry.processRemainingOrphans;
-    pub const handleResolverUpdate = handlers_v2_registry.handleResolverUpdate;
     pub const handleNameRegistered = handlers_v2_registry.handleNameRegistered;
     pub const handleNameRenewed = handlers_v2_registry.handleNameRenewed;
     pub const handleTransfer = handlers_v2_registry.handleTransfer;
@@ -1081,9 +1076,6 @@ pub const Indexer = struct {
     pub const decodeDnsWireFormat = handlers_v2_resolver.decodeDnsWireFormat;
     pub const handleResolverEACRolesChanged = handlers_v2_resolver.handleResolverEACRolesChanged;
 
-    // V2 protocol sync handlers (extracted to handlers_v2_chain.zig)
-    pub const handleTokenObserverSet = handlers_v2_chain.handleTokenObserverSet;
-
     // V1 event handlers (extracted to handlers_v1.zig)
     pub const handleV1NewOwner = handlers_v1.handleV1NewOwner;
     pub const handleV1RegistryTransfer = handlers_v1.handleV1RegistryTransfer;
@@ -1106,6 +1098,7 @@ pub const Indexer = struct {
     pub const handleV1ETHControllerNameRenewed = handlers_v1.handleV1ETHControllerNameRenewed;
     pub const handleV1ETHControllerNameRenewedWithReferrer = handlers_v1.handleV1ETHControllerNameRenewedWithReferrer;
     pub const handleV1ReverseClaimed = handlers_v1.handleV1ReverseClaimed;
+    pub const handleV2NameForAddrChanged = handlers_v1.handleV2NameForAddrChanged;
 
     // Backfill functions (extracted to backfill.zig)
     const backfillPreMigrationNames = backfill_mod.backfillPreMigrationNames;

@@ -176,8 +176,8 @@ pub fn handleAddressChanged(self: *Indexer, protocol: models.Protocol, resolver:
     try utils.emitEvent(self, protocol, log, .address_changed, domain_name, namehash, event_data);
 }
 
-/// Handle ContentHashChanged event
-/// ContentHashChanged(bytes32 indexed node, bytes hash)
+/// Handle ContenthashChanged event (note: lowercase 'h' — canonical ENS event name).
+/// ContenthashChanged(bytes32 indexed node, bytes hash)
 pub fn handleContentHashChanged(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
     // topics[0] = event signature
     // topics[1] = indexed node (namehash)
@@ -198,11 +198,11 @@ pub fn handleContentHashChanged(self: *Indexer, protocol: models.Protocol, resol
         _ = try std.fmt.bufPrint(content_hash_hex[2 + i * 2 .. 4 + i * 2], "{x:0>2}", .{byte});
     }
 
-    if (!try utils.resolveNamehash(self, &namehash, resolver, "ContentHashChanged")) return;
+    if (!try utils.resolveNamehash(self, &namehash, resolver, "ContenthashChanged")) return;
 
     const nh_hex_log = try namehash.toHex(self.allocator);
     defer self.allocator.free(nh_hex_log);
-    std.log.debug("ContentHashChanged: namehash={s} contentHash={s}", .{
+    std.log.debug("ContenthashChanged: namehash={s} contentHash={s}", .{
         nh_hex_log,
         content_hash_hex,
     });

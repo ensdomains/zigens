@@ -284,7 +284,6 @@ pub fn build(b: *std.Build) void {
     const api_test_step = b.step("test-api", "Run api-module inline tests");
     api_test_step.dependOn(&run_api_tests.step);
 
-
     // Event filtering tests
     const events_tests = b.addTest(.{
         .root_module = b.createModule(.{

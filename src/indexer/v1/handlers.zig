@@ -5,7 +5,8 @@ const models = @import("../../types/models.zig");
 const abi = @import("../abi_eth.zig");
 const rpc = @import("../../rpc/client.zig");
 const db = @import("../../storage/database.zig");
-const Hash = @import("../../types/hash.zig").Hash;
+const hash_mod = @import("../../types/hash.zig");
+const Hash = hash_mod.Hash;
 const Address = @import("../../types/address.zig").Address;
 const unknown_labels_storage = @import("../../storage/unknown_labels.zig");
 const Indexer = @import("../indexer.zig").Indexer;
@@ -1555,6 +1556,64 @@ pub fn handleV1ReverseClaimed(self: *Indexer, protocol: models.Protocol, log: rp
     });
 
     try utils.emitEvent(self, protocol, log, .reverse_claimed, null, node, event_data);
+}
+
+/// Handle V2 L2ReverseRegistrar / StandaloneReverseRegistrar NameForAddrChanged event.
+///   NameForAddrChanged(address indexed addr, string name)
+///
+/// V2 stores the primary name directly on the reverse registrar (no node
+/// indirection) — there is no `addr.reverse` ENS subtree like V1 has. The
+/// equivalent reverse namehash for an address `a` on chain `c` is computed
+/// off-chain as `namehash("<a>.<c-hex>.reverse")` if we ever need one. For now
+/// we just record the event so the events feed reflects the state change; the
+/// reverse_records table (which is V1-shaped) is updated with a zero node so
+/// downstream code can still find the most-recent reverse-claim block.
+pub fn handleV2NameForAddrChanged(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
+    if (log.topics.len < 2) return error.InvalidTopicCount;
+
+    const addr = try abi.ABI.decodeAddress(&log.topics[1].bytes, 0);
+
+    // data = (string name) — single dynamic head pointer at offset 0.
+    // `name` ownership is later transferred to `emitEvent`, which frees it via
+    // `insertEventAndNotify`. Do NOT add a defer-free here.
+    const name = try abi.ABI.decodeString(self.allocator, log.data, 0);
+
+    var addr_buf: [42]u8 = undefined;
+    const addr_hex = addr.toHexBuf(&addr_buf);
+
+    std.log.debug("V2 NameForAddrChanged: addr={s} name={s}", .{ addr_hex, name });
+
+    // Persist a "current name" hint keyed by address. We store the name's
+    // namehash so the existing schema (address → namehash) keeps working;
+    // forward-resolution still needs to be verified via the resolver per ENSIP-3.
+    const namehash = if (name.len > 0)
+        hash_mod.namehash(self.allocator, name) catch Hash.zero
+    else
+        Hash.zero;
+
+    const block_timestamp = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
+    self.database.upsertReverseRecord(
+        protocol,
+        addr,
+        namehash,
+        log.block_number,
+        log.transaction_hash,
+        log.log_index,
+        block_timestamp,
+    ) catch |err| {
+        std.log.warn("Failed to upsert V2 reverse record for {s}: {}", .{ addr_hex, err });
+    };
+
+    // Store event (JSON payload mirrors the on-chain event shape)
+    var nh_buf: [66]u8 = undefined;
+    const nh_hex = namehash.toHexBuf(&nh_buf);
+    const event_data = try std.fmt.allocPrint(
+        self.allocator,
+        "{{\"address\":\"{s}\",\"name\":\"{s}\",\"namehash\":\"{s}\"}}",
+        .{ addr_hex, name, nh_hex },
+    );
+
+    try utils.emitEvent(self, protocol, log, .name_changed, name, namehash, event_data);
 }
 
 // ============================================================================

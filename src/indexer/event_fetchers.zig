@@ -391,34 +391,6 @@ pub fn indexTransferEvents(self: *Indexer, protocol: models.Protocol, client: *r
     try utils.dispatchOrdered(self, protocol, entries.items);
 }
 
-/// Index TokenObserverSet events from the V2 registry contract.
-/// Migration detection (V1→V2) is handled in handleLabelRegistered by checking
-/// if the sender is a migration controller — no separate event fetching needed.
-pub fn indexTokenObserverEvents(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64, to_block: u64) !void {
-    const registry_addr = self.getEthRegistry(protocol);
-
-    const topics = [_]?Hash{abi.EventSignatures.token_observer_set_hash};
-    const logs = try client.getLogs(from_block, to_block, registry_addr, &topics);
-    defer {
-        for (logs) |*log| {
-            log.deinit(self.allocator);
-        }
-        self.allocator.free(logs);
-    }
-
-    if (logs.len > 0) {
-        std.log.info("Found {d} TokenObserverSet event{s} from {s}", .{
-            logs.len,
-            if (logs.len == 1) "" else "s",
-            protocol.toString(),
-        });
-    }
-
-    for (logs) |log| {
-        try self.handleTokenObserverSet(protocol, log);
-    }
-}
-
 /// Index V2 ETHReverseRegistrar events. Subscribes to ReverseClaimed on the V2
 /// reverse registrar contract and dispatches the same handler as V1 (which is
 /// protocol-agnostic — it writes to `reverse_records` with the protocol passed
@@ -684,16 +656,14 @@ pub fn indexPhase1V2Events(self: *Indexer, protocol: models.Protocol, client: *r
         registrar_topics[i] = .{event_cfg.event_hash};
     }
 
-    const ds_topics = [4][1]?Hash{
-        .{abi.EventSignatures.subregistry_update_hash},
+    const ds_topics = [2][1]?Hash{
         .{abi.EventSignatures.subregistry_updated_hash},
-        .{abi.EventSignatures.resolver_update_hash},
         .{abi.EventSignatures.resolver_updated_hash},
     };
 
     const N_REG = Indexer.ETH_REGISTRY_EVENTS.len;
     const N_REGISTRAR = Indexer.ETH_REGISTRAR_EVENTS.len;
-    const N_DS: usize = 4;
+    const N_DS: usize = 2;
 
     if (protocol == .v2) {
         const eth_registrar = self.config.v2_contracts.eth_registrar_v2;
@@ -724,10 +694,8 @@ pub fn indexPhase1V2Events(self: *Indexer, protocol: models.Protocol, client: *r
         // Datastore events (indices N_REG+N_REGISTRAR..TOTAL)
         batch[N_REG + N_REGISTRAR + 0] = .{ .from_block = from_block, .to_block = to_block, .address = eth_registry, .topics = &ds_topics[0] };
         batch[N_REG + N_REGISTRAR + 1] = .{ .from_block = from_block, .to_block = to_block, .address = eth_registry, .topics = &ds_topics[1] };
-        batch[N_REG + N_REGISTRAR + 2] = .{ .from_block = from_block, .to_block = to_block, .address = eth_registry, .topics = &ds_topics[2] };
-        batch[N_REG + N_REGISTRAR + 3] = .{ .from_block = from_block, .to_block = to_block, .address = eth_registry, .topics = &ds_topics[3] };
 
-        // Single HTTP call for all 13 requests
+        // Single HTTP call for all 11 requests
         const results = try client.getLogsBatch(&batch);
         defer utils.deinitBatchResults(self.allocator, results);
 
@@ -773,10 +741,8 @@ pub fn indexPhase1V2Events(self: *Indexer, protocol: models.Protocol, client: *r
         inline for (Indexer.ETH_REGISTRAR_EVENTS, 0..) |event_cfg, i| {
             for (results[N_REG + i]) |log| entries.appendAssumeCapacity(.{ .handler = event_cfg.handler, .log = log });
         }
-        for (results[N_REG + N_REGISTRAR + 0]) |log| entries.appendAssumeCapacity(.{ .handler = Indexer.handleSubregistryUpdate, .log = log });
-        for (results[N_REG + N_REGISTRAR + 1]) |log| entries.appendAssumeCapacity(.{ .handler = Indexer.handleSubregistryUpdated, .log = log });
-        for (results[N_REG + N_REGISTRAR + 2]) |log| entries.appendAssumeCapacity(.{ .handler = Indexer.handleResolverUpdate, .log = log });
-        for (results[N_REG + N_REGISTRAR + 3]) |log| entries.appendAssumeCapacity(.{ .handler = Indexer.handleResolverUpdated, .log = log });
+        for (results[N_REG + N_REGISTRAR + 0]) |log| entries.appendAssumeCapacity(.{ .handler = Indexer.handleSubregistryUpdated, .log = log });
+        for (results[N_REG + N_REGISTRAR + 1]) |log| entries.appendAssumeCapacity(.{ .handler = Indexer.handleResolverUpdated, .log = log });
 
         try utils.dispatchOrdered(self, protocol, entries.items);
     } else {
@@ -796,8 +762,6 @@ pub fn indexPhase1V2Events(self: *Indexer, protocol: models.Protocol, client: *r
 
         batch[N_REG + 0] = .{ .from_block = from_block, .to_block = to_block, .address = eth_registry, .topics = &ds_topics[0] };
         batch[N_REG + 1] = .{ .from_block = from_block, .to_block = to_block, .address = eth_registry, .topics = &ds_topics[1] };
-        batch[N_REG + 2] = .{ .from_block = from_block, .to_block = to_block, .address = eth_registry, .topics = &ds_topics[2] };
-        batch[N_REG + 3] = .{ .from_block = from_block, .to_block = to_block, .address = eth_registry, .topics = &ds_topics[3] };
 
         const results = try client.getLogsBatch(&batch);
         defer utils.deinitBatchResults(self.allocator, results);
@@ -823,10 +787,8 @@ pub fn indexPhase1V2Events(self: *Indexer, protocol: models.Protocol, client: *r
         inline for (Indexer.ETH_REGISTRY_EVENTS, 0..) |event_cfg, i| {
             for (results[i]) |log| entries.appendAssumeCapacity(.{ .handler = event_cfg.handler, .log = log });
         }
-        for (results[N_REG + 0]) |log| entries.appendAssumeCapacity(.{ .handler = Indexer.handleSubregistryUpdate, .log = log });
-        for (results[N_REG + 1]) |log| entries.appendAssumeCapacity(.{ .handler = Indexer.handleSubregistryUpdated, .log = log });
-        for (results[N_REG + 2]) |log| entries.appendAssumeCapacity(.{ .handler = Indexer.handleResolverUpdate, .log = log });
-        for (results[N_REG + 3]) |log| entries.appendAssumeCapacity(.{ .handler = Indexer.handleResolverUpdated, .log = log });
+        for (results[N_REG + 0]) |log| entries.appendAssumeCapacity(.{ .handler = Indexer.handleSubregistryUpdated, .log = log });
+        for (results[N_REG + 1]) |log| entries.appendAssumeCapacity(.{ .handler = Indexer.handleResolverUpdated, .log = log });
 
         try utils.dispatchOrdered(self, protocol, entries.items);
     }

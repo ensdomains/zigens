@@ -14,33 +14,10 @@ const Indexer = @import("../indexer.zig").Indexer;
 const utils = @import("../utils.zig");
 const json_utils = @import("../../utils/json.zig");
 
-pub fn handleSubregistryUpdate(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
-    // Event: SubregistryUpdate(uint256 indexed id, address subregistry)
-    // Note: The 'id' in SubregistryUpdate is the canonical_id (version=0), not the full token_id
-    if (log.topics.len < 2) return error.InvalidTopicCount;
-
-    const token_id = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
-    const token_id_utils = @import("../../types/token_id.zig");
-    const canonical_id = token_id_utils.getCanonicalId(token_id);
-
-    // Non-indexed payload: (address subregistry)
-    const data_values = try abi.decodeValues(log.data, &.{.address}, self.allocator);
-    defer abi.freeValues(data_values, self.allocator);
-    const subregistry_addr = Address{ .bytes = data_values[0].address };
-
-    std.log.debug("SubregistryUpdate: tokenId={d}, canonicalId={d}, subregistry={any}, contract={any}", .{ token_id, canonical_id, subregistry_addr, log.address });
-
-    try processSubregistryPointerChange(
-        self,
-        protocol,
-        log,
-        token_id,
-        subregistry_addr,
-        null,
-        .subregistry_update,
-    );
-}
-
+// `handleSubregistryUpdate` (2-arg `SubregistryUpdate(uint256,address)`) was
+// removed in the post-audit cleanup — the fresh-Sepolia contracts only emit
+// the 3-arg `SubregistryUpdated(uint256,address,address)` variant, handled
+// below by `handleSubregistryUpdated`.
 /// Process an orphaned registration now that we know its parent
 pub fn processOrphanedRegistration(
     self: *Indexer,
@@ -238,93 +215,11 @@ pub fn processRemainingOrphans(self: *Indexer, protocol: models.Protocol) !void 
     }
 }
 
-pub fn handleResolverUpdate(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
-    // Event: ResolverUpdate(uint256 indexed id, address resolver)
-    // Note: The 'id' in ResolverUpdate is the current token_id (including version bits),
-    // NOT the canonical_id. We must strip version bits to look up the name.
-    if (log.topics.len < 2) return error.InvalidTopicCount;
-
-    // topics[0] = event signature
-    // topics[1] = indexed id (this is the full token_id, including version bits)
-    const token_id = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
-    const token_id_utils_local = @import("../../types/token_id.zig");
-    const canonical_id = token_id_utils_local.getCanonicalId(token_id);
-
-    // Non-indexed payload: (address resolver)
-    const data_values = try abi.decodeValues(log.data, &.{.address}, self.allocator);
-    defer abi.freeValues(data_values, self.allocator);
-    const resolver_addr = Address{ .bytes = data_values[0].address };
-
-    std.log.debug("ResolverUpdate: tokenId={d}, canonicalId={d}, resolver={any}, contract={any}", .{ token_id, canonical_id, resolver_addr, log.address });
-
-    // Look up the name by token_id AND registry to avoid cross-registry collisions
-    // (e.g., "tester.eth" and "tester.calendars.eth" share the same token_id)
-    const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
-
-    // With log-index ordering the parent LabelRegistered/NameRegistered is processed before
-    // its ResolverUpdate in the same batch, so this branch is defensive: it fires on reorg
-    // replay or when the registry hasn't been discovered yet (subregistry outside the known set).
-    if (maybe_name == null) {
-        std.log.warn("  → Skipping ResolverUpdate for unknown tokenId={d} in registry {any}", .{ token_id, log.address });
-        return;
-    }
-
-    // Extract and allocate name_str and copy namehash before any cleanup
-    const name_str = try self.allocator.dupe(u8, maybe_name.?.name orelse "[unknown]");
-    defer self.allocator.free(name_str);
-    const namehash = maybe_name.?.namehash;
-
-    // Clean up the name struct
-    var name_copy = maybe_name.?;
-    name_copy.deinit(self.allocator);
-
-    // Update resolver in database
-    try self.database.updateNameResolver(namehash, resolver_addr);
-
-    // Stack-buffer the resolver hex once and reuse for both registerResolver + the
-    // subsequent event JSON; avoids two separate heap allocs in this handler.
-    var resolver_hex_buf: [42]u8 = undefined;
-    const resolver_hex = resolver_addr.toHexBuf(&resolver_hex_buf);
-
-    // Register resolver for record indexing (if not zero address) and record
-    // the Resolver entity binding (subgraph parity). INSERT OR IGNORE so the
-    // first observation of a (protocol, address, namehash) triple wins; later
-    // events with the same triple are no-ops, mirroring subgraph semantics.
-    if (!resolver_addr.isZero()) {
-        try self.database.registerResolver(protocol, resolver_hex, log.block_number);
-        var namehash_hex_buf: [66]u8 = undefined;
-        const namehash_hex = namehash.toHexBuf(&namehash_hex_buf);
-        self.database.upsertResolverEntity(
-            protocol,
-            resolver_hex,
-            namehash_hex,
-            name_str,
-            log.block_number,
-            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-        ) catch |err| {
-            std.log.debug("upsertResolverEntity failed: {}", .{err});
-        };
-    }
-
-    // Store event
-    var contract_hex_buf: [42]u8 = undefined;
-    const contract_hex = log.address.toHexBuf(&contract_hex_buf);
-
-    // Escape name_str for safe JSON inclusion
-    const escaped_name = try json_utils.escapeString(self.allocator, name_str);
-    defer self.allocator.free(escaped_name);
-
-    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\",\"canonicalId\":{d},\"resolver\":\"{s}\",\"registry\":\"{s}\"}}", .{
-        escaped_name,
-        canonical_id,
-        resolver_hex,
-        contract_hex,
-    });
-
-    const event_name = try self.allocator.dupe(u8, name_str);
-
-    try utils.emitEvent(self, protocol, log, .resolver_update, event_name, namehash, event_data);
-}
+// `handleResolverUpdate` (2-arg `ResolverUpdate(uint256,address)`) was removed
+// in the post-audit cleanup — the fresh-Sepolia contracts only emit the 3-arg
+// `ResolverUpdated(uint256,address,address)` variant, handled below by
+// `handleResolverUpdated`. The Resolver-entity upsert (subgraph parity) lives
+// on that handler too, so no functionality is lost.
 
 pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     // V2 Event: NameRegistered(uint256 indexed tokenId, string label, uint64 expiration, address registeredBy)

@@ -467,11 +467,6 @@ pub const Database = struct {
         try self.exec("DROP INDEX IF EXISTS idx_temp_pre_migration_label_hash");
         try self.exec("DROP INDEX IF EXISTS idx_temp_pre_migration_protocol");
 
-        // Token observers (V2 Registry) indexes
-        try self.exec("DROP INDEX IF EXISTS idx_token_observers_token_id");
-        try self.exec("DROP INDEX IF EXISTS idx_token_observers_block");
-        try self.exec("DROP INDEX IF EXISTS idx_token_observers_observer");
-
         // Rainbow labels & unknown labels: drop all 5 indexes
         try self.exec("DROP INDEX IF EXISTS idx_rainbow_source");
         try self.exec("DROP INDEX IF EXISTS idx_rainbow_block");
@@ -572,11 +567,6 @@ pub const Database = struct {
         // temp_pre_migration_names remains after the V1 audit cleanup).
         try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_pre_migration_label_hash ON temp_pre_migration_names(label_hash)");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_pre_migration_protocol ON temp_pre_migration_names(protocol)");
-
-        // Token observers (V2 Registry) indexes
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_token_observers_token_id ON token_observers(protocol, token_id)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_token_observers_block ON token_observers(protocol, block_number)");
-        try self.exec("CREATE INDEX IF NOT EXISTS idx_token_observers_observer ON token_observers(observer)");
 
         // Rainbow labels & unknown labels indexes (5)
         try self.exec("CREATE INDEX IF NOT EXISTS idx_rainbow_source ON rainbow_labels(source)");
@@ -709,7 +699,6 @@ pub const Database = struct {
     pub const registerSubregistry = sync.registerSubregistry;
     pub const registerResolver = sync.registerResolver;
     pub const discoverAndGetSubregistries = sync.discoverAndGetSubregistries;
-    pub const insertTokenObserver = sync.insertTokenObserver;
     pub const deleteDataAfterBlock = sync.deleteDataAfterBlock;
     pub const OrphanedRegistration = sync.OrphanedRegistration;
     pub const insertOrphanedRegistration = sync.insertOrphanedRegistration;

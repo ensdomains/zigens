@@ -49,29 +49,17 @@ pub const EventSignatures = struct {
     pub const name_burned = "NameBurned(uint256,address)";
     pub const name_burned_hash: Hash = eventHash(name_burned);
 
-    /// SubregistryUpdate(uint256 indexed id, address subregistry) - OLD signature (pre-deployment)
-    pub const subregistry_update = "SubregistryUpdate(uint256,address)";
-    pub const subregistry_update_hash: Hash = eventHash(subregistry_update);
-
-    /// SubregistryUpdated(uint256 indexed id, address indexed subregistry, address indexed sender) - NEW signature (current deployment)
+    /// SubregistryUpdated(uint256 indexed id, address indexed subregistry, address indexed sender)
     pub const subregistry_updated = "SubregistryUpdated(uint256,address,address)";
     pub const subregistry_updated_hash: Hash = eventHash(subregistry_updated);
 
-    /// ResolverUpdate(uint256 indexed id, address resolver) - OLD signature (pre-deployment)
-    pub const resolver_update = "ResolverUpdate(uint256,address)";
-    pub const resolver_update_hash: Hash = eventHash(resolver_update);
-
-    /// ResolverUpdated(uint256 indexed id, address indexed resolver, address indexed sender) - NEW signature (current deployment)
+    /// ResolverUpdated(uint256 indexed id, address indexed resolver, address indexed sender)
     pub const resolver_updated = "ResolverUpdated(uint256,address,address)";
     pub const resolver_updated_hash: Hash = eventHash(resolver_updated);
 
-    /// TokenRegenerated(uint256 oldTokenId, uint256 newTokenId) - OLD signature (2 params)
+    /// TokenRegenerated(uint256 oldTokenId, uint256 newTokenId)
     pub const token_regenerated = "TokenRegenerated(uint256,uint256)";
     pub const token_regenerated_hash: Hash = eventHash(token_regenerated);
-
-    /// TokenRegenerated(uint256 oldTokenId, uint256 newTokenId, uint256 flags) - NEW signature (3 params)
-    pub const token_regenerated_v2 = "TokenRegenerated(uint256,uint256,uint256)";
-    pub const token_regenerated_v2_hash: Hash = eventHash(token_regenerated_v2);
 
     /// ExpiryUpdated(uint256 indexed tokenId, uint64 newExpiry, address changedBy)
     /// New event signature that replaces NameRenewed in current namechain deployment
@@ -97,11 +85,6 @@ pub const EventSignatures = struct {
     /// Emitted when the parent of a registry is changed
     pub const parent_updated = "ParentUpdated(address,string,address)";
     pub const parent_updated_hash: Hash = eventHash(parent_updated);
-
-    /// TokenResource(uint256 indexed tokenId, uint256 indexed resource)
-    /// Emitted when a token's resource is set during registration
-    pub const token_resource = "TokenResource(uint256,uint256)";
-    pub const token_resource_hash: Hash = eventHash(token_resource);
 
     // ========================================================================
     // Enhanced Access Control events (from common/access-control/interfaces/IEnhancedAccessControl.sol)
@@ -164,8 +147,10 @@ pub const EventSignatures = struct {
     pub const address_changed = "AddressChanged(bytes32,uint256,bytes)";
     pub const address_changed_hash: Hash = eventHash(address_changed);
 
-    /// ContentHashChanged(bytes32 indexed node, bytes hash)
-    pub const content_hash_changed = "ContentHashChanged(bytes32,bytes)";
+    /// ContenthashChanged(bytes32 indexed node, bytes hash)
+    /// Note: lowercase 'h' in `Contenthash` — this is the canonical ENS event name
+    /// emitted by both V1 PublicResolver and V2 PermissionedResolver / OwnedResolver.
+    pub const content_hash_changed = "ContenthashChanged(bytes32,bytes)";
     pub const content_hash_changed_hash: Hash = eventHash(content_hash_changed);
 
     /// TextChanged(bytes32 indexed node, string indexed indexedKey, string key, string value)
@@ -227,15 +212,29 @@ pub const EventSignatures = struct {
     pub const named_resource = "NamedResource(uint256,bytes)";
     pub const named_resource_hash: Hash = eventHash(named_resource);
 
-    /// NamedTextResource(uint256 indexed resource, bytes name, bytes32 indexed key)
-    /// Emitted when a named text resource is set in PermissionedResolver
-    pub const named_text_resource = "NamedTextResource(uint256,bytes,bytes32)";
+    /// NamedTextResource(uint256 indexed resource, bytes name, bytes32 indexed keyHash, string key)
+    /// Emitted when a named text resource is set in PermissionedResolver.
+    /// NOTE: signature changed from the prior 3-arg form to 4 args (plaintext key
+    /// appended) in the latest PermissionedResolver deployment.
+    pub const named_text_resource = "NamedTextResource(uint256,bytes,bytes32,string)";
     pub const named_text_resource_hash: Hash = eventHash(named_text_resource);
 
     /// NamedAddrResource(uint256 indexed resource, bytes name, uint256 indexed coinType)
     /// Emitted when a named address resource is set in PermissionedResolver
     pub const named_addr_resource = "NamedAddrResource(uint256,bytes,uint256)";
     pub const named_addr_resource_hash: Hash = eventHash(named_addr_resource);
+
+    /// NamedDataResource(uint256 indexed resource, bytes name, bytes32 indexed keyHash, string key)
+    /// Emitted by the latest PermissionedResolver alongside `DataChanged`. Carries
+    /// the plaintext key (the bytes32 hash is the topic) and the resource id.
+    pub const named_data_resource = "NamedDataResource(uint256,bytes,bytes32,string)";
+    pub const named_data_resource_hash: Hash = eventHash(named_data_resource);
+
+    /// DataChanged(bytes32 indexed node, string indexedKey, string key, bytes value)
+    /// New generic key/value record event in the latest PermissionedResolver.
+    /// Mirrors `TextChanged` but the value is `bytes` instead of `string`.
+    pub const data_changed = "DataChanged(bytes32,string,string,bytes)";
+    pub const data_changed_hash: Hash = eventHash(data_changed);
 
     // ========================================================================
     // ENS Temporary Registrar events (Pre-V1 Migration, May 2017 - May 2019)
@@ -342,7 +341,8 @@ pub const EventSignatures = struct {
 
     // ========================================================================
     // ENS V1 ETH Registrar Controller events (ETHRegistrarController.sol)
-    // Address: 0x59E16fcCd424Cc24e280Be16E11Bcd56fb0CE547
+    // Address: 0x59E16fcCd424Cc24e280Be16E11Bcd56fb0CE547 (legacy),
+    //          0xb5778cf6... (current mainnet + fresh Sepolia deployment)
     //
     // Three historical NameRegistered signatures coexist on mainnet:
     //   1. Legacy 5-arg (LegacyEthRegistrarController, earliest deployment):
@@ -350,7 +350,8 @@ pub const EventSignatures = struct {
     //   2. Wrapped 6-arg (WrappedEthRegistrarController, ~block 16,925,618):
     //      NameRegistered(string,bytes32,address,uint256,uint256,uint256)
     //      Adds explicit baseCost/premium split.
-    //   3. Unwrapped 7-arg (UnwrappedEthRegistrarController, newer):
+    //   3. Unwrapped 7-arg (UnwrappedEthRegistrarController, newer + current
+    //      Sepolia 0xb5778cf6...):
     //      NameRegistered(string,bytes32,address,uint256,uint256,uint256,bytes32)
     //      Adds non-indexed `referrer` (bytes32) at the tail.
     // All three share `bytes32 indexed label` (topic[1]) and
@@ -365,11 +366,13 @@ pub const EventSignatures = struct {
 
     /// NameRegistered(string name, bytes32 indexed label, address indexed owner, uint256 baseCost, uint256 premium, uint256 expires)
     /// 6-arg WrappedEthRegistrarController: baseCost/premium split, no referrer.
+    /// Mainnet-only (the fresh Sepolia deployment skipped this generation).
     pub const wrapped_controller_name_registered = "NameRegistered(string,bytes32,address,uint256,uint256,uint256)";
     pub const wrapped_controller_name_registered_hash: Hash = eventHash(wrapped_controller_name_registered);
 
     /// NameRegistered(string label, bytes32 indexed labelhash, address indexed owner, uint256 baseCost, uint256 premium, uint256 expires, bytes32 referrer)
     /// 7-arg UnwrappedEthRegistrarController: baseCost/premium split + non-indexed referrer tag.
+    /// Also the current Sepolia deployment (0xb5778cf6...).
     pub const unwrapped_controller_name_registered = "NameRegistered(string,bytes32,address,uint256,uint256,uint256,bytes32)";
     pub const unwrapped_controller_name_registered_hash: Hash = eventHash(unwrapped_controller_name_registered);
 
@@ -380,6 +383,7 @@ pub const EventSignatures = struct {
     /// NameRenewed(string label, bytes32 indexed labelhash, uint256 cost, uint256 expires, bytes32 referrer)
     /// 5-arg UnwrappedEthRegistrarController: adds non-indexed referrer tag at
     /// the data tail. Same labelhash indexed-topic shape as the legacy variant.
+    /// Also the current Sepolia deployment.
     pub const unwrapped_controller_name_renewed = "NameRenewed(string,bytes32,uint256,uint256,bytes32)";
     pub const unwrapped_controller_name_renewed_hash: Hash = eventHash(unwrapped_controller_name_renewed);
 
@@ -388,9 +392,16 @@ pub const EventSignatures = struct {
     // Address: 0xa58E81fe9b61B5c3fE2AFD33CF304c454AbFc7Cb
     // ========================================================================
 
-    /// ReverseClaimed(address indexed addr, bytes32 indexed node)
+    /// V1 ReverseRegistrar: ReverseClaimed(address indexed addr, bytes32 indexed node)
     pub const reverse_claimed = "ReverseClaimed(address,bytes32)";
     pub const reverse_claimed_hash: Hash = eventHash(reverse_claimed);
+
+    /// V2 L2ReverseRegistrar / StandaloneReverseRegistrar:
+    /// NameForAddrChanged(address indexed addr, string name)
+    /// V2 reverse resolution stores the primary name directly on the reverse
+    /// registrar rather than going through a node-keyed registry.
+    pub const name_for_addr_changed = "NameForAddrChanged(address,string)";
+    pub const name_for_addr_changed_hash: Hash = eventHash(name_for_addr_changed);
 
     // ========================================================================
     // Approval events (various contracts)
@@ -401,19 +412,21 @@ pub const EventSignatures = struct {
     pub const approval_for_all = "ApprovalForAll(address,address,bool)";
     pub const approval_for_all_hash: Hash = eventHash(approval_for_all);
 
-    /// Approved(bytes32 indexed node, address indexed owner, address indexed target, bool isAuthorised)
-    /// PublicResolver approval event
-    pub const approved = "Approved(bytes32,address,address,bool)";
-    pub const approved_hash: Hash = eventHash(approved);
+    /// TokenResource(uint256 indexed tokenId, uint256 indexed resource)
+    /// Emitted when a token's resource is set during registration. Still emitted
+    /// by PermissionedRegistry post-audit; not currently subscribed to.
+    pub const token_resource = "TokenResource(uint256,uint256)";
+    pub const token_resource_hash: Hash = eventHash(token_resource);
 
-    // ========================================================================
     // ========================================================================
     // PermissionedRegistry events
     // ========================================================================
 
-    /// TokenObserverSet(uint256 indexed tokenId, address observer)
-    pub const token_observer_set = "TokenObserverSet(uint256,address)";
-    pub const token_observer_set_hash: Hash = eventHash(token_observer_set);
+    /// RegistryCreated()
+    /// Emitted by PermissionedRegistry, WrapperRegistry, UserRegistry constructors.
+    /// The cleanest signal to discover newly-deployed subregistries.
+    pub const registry_created = "RegistryCreated()";
+    pub const registry_created_hash: Hash = eventHash(registry_created);
 };
 
 
