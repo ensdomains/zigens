@@ -912,9 +912,9 @@ pub fn getNameByTokenIdAndRegistry(db: *Database, token_id: u256, registry: Addr
 /// subregistry repoint or LabelUnregistered) are filtered out.
 pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Name {
     const sql = if (limit) |l|
-        try std.fmt.allocPrint(db.allocator, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND owner = ? LIMIT {d}", .{l})
+        try std.fmt.allocPrint(db.allocator, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND owner = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' LIMIT {d}", .{l})
     else
-        try db.allocator.dupe(u8, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND owner = ?");
+        try db.allocator.dupe(u8, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND owner = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000'");
     defer db.allocator.free(sql);
 
     var q = try Query.initCached(db, sql);
@@ -939,7 +939,7 @@ pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Nam
 
 /// Get names by resolver address. Unreachable rows are filtered out.
 pub fn getNamesByResolver(db: *Database, resolver: Address, limit: u32) ![]models.Name {
-    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND resolver = ? ORDER BY created_at DESC LIMIT ?");
+    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND resolver = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY created_at DESC LIMIT ?");
     defer q.deinit();
 
     try q.bindAddress(resolver);
@@ -1014,7 +1014,7 @@ pub fn getWrappedDomains(
 pub fn getDomainByResolver(db: *Database, resolver: Address) !?models.Name {
     var q = try Query.initCached(
         db,
-        SQL_SELECT_NAMES ++ " WHERE is_reachable = 1 AND resolver = ? ORDER BY namehash ASC LIMIT 1",
+        SQL_SELECT_NAMES ++ " WHERE is_reachable = 1 AND resolver = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY namehash ASC LIMIT 1",
     );
     defer q.deinit();
 
