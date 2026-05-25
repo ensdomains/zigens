@@ -557,9 +557,10 @@ test "getAllNames returns all names" {
         allocator.free(names);
     }
 
-    // Two test names plus the synthetic root domain (subgraph parity, inserted
-    // by `Database.migrate`).
-    try testing.expectEqual(@as(usize, 3), names.len);
+    // Only the two test names. The synthetic root domain inserted by
+    // `Database.migrate` is hidden from default listings — see
+    // `appendNameFilterConditions` / `getAllNamesWithOrder`.
+    try testing.expectEqual(@as(usize, 2), names.len);
 }
 
 // ============================================================================
