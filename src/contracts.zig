@@ -93,18 +93,18 @@ pub fn getContractAddresses(network: Network) !ContractAddresses {
 
 fn sepoliaAddresses() ContractAddresses {
     return .{
-        // Temporary Registrar (not used on Sepolia testnet)
-        .temporary_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
+        // Temporary Registrar (LegacyETHRegistrarController)
+        .temporary_registrar = Address.fromHex("0x7e02892cfc2Bfd53a75275451d73cF620e793fc0") catch unreachable,
 
-        // V1 Sepolia Contracts (fresh deployment alongside V2)
-        .old_ens_registry = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable, // Not applicable for testnets
-        .old_public_resolver = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable, // Not applicable for testnets
-        .ens_registry = Address.fromHex("0xb6fb46e1458915dd828633d91e1df8e4c3f2d4dd") catch unreachable,
-        .base_registrar = Address.fromHex("0xa51c9e6efe589407c72984e93b45e35a71a398ec") catch unreachable,
-        .eth_registrar_controller = Address.fromHex("0xb5778cf6cc9586d9ce740039c84dfb1802f307bc") catch unreachable,
-        .public_resolver = Address.fromHex("0xb441cb480460eb8b2964dcb82b64a883b14abf3e") catch unreachable,
-        .reverse_registrar = Address.fromHex("0x26e5e80e8f36607ef401443fb34eea363c86e8f7") catch unreachable,
-        .name_wrapper = Address.fromHex("0x250a6c640297f605b63c6e91c7cd376f04b288da") catch unreachable,
+        // V1 Sepolia Contracts
+        .old_ens_registry = Address.fromHex("0x94f523b8261B815b87EFfCf4d18E6aBeF18d6e4b") catch unreachable,
+        .old_public_resolver = Address.fromHex("0x0CeEC524b2807841739D3B5E161F5bf1430FFA48") catch unreachable,
+        .ens_registry = Address.fromHex("0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e") catch unreachable,
+        .base_registrar = Address.fromHex("0x57f1887a8bf19b14fc0df6fd9b2acc9af147ea85") catch unreachable,
+        .eth_registrar_controller = Address.fromHex("0xfb3cE5D01e0f33f41DbB39035dB9745962F1f968") catch unreachable,
+        .public_resolver = Address.fromHex("0xE99638b40E4Fff0129D56f03b55b6bbC4BBE49b5") catch unreachable,
+        .reverse_registrar = Address.fromHex("0xA0a1AbcDAe1a2a4A2EF8e9113Ff0e02DD81DC0C6") catch unreachable,
+        .name_wrapper = Address.fromHex("0x0635513f179D50A207757E05759CbD106d7dFcE8") catch unreachable,
 
         // V2 Sepolia Contracts (ENSv2 deployment)
         .root_registry = Address.fromHex("0xc960f7217d3643b525ef36bec8adf86953cd9ab8") catch unreachable,
