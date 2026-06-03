@@ -38,8 +38,10 @@ WORKDIR /app
 # Copy source code
 COPY . .
 
-# Build all applications (generates introspection.json, builds indexer + API)
-RUN zig build -Doptimize=ReleaseFast
+# Build all applications (generates introspection.json, builds indexer + API).
+# ReleaseSafe keeps bounds/overflow/optional-unwrap checks active in production —
+# the indexer parses untrusted RPC/ABI bytes, so safety checks are worth the cost.
+RUN zig build -Doptimize=ReleaseSafe
 
 # Stage 2: Runtime
 FROM alpine:3.19
