@@ -579,32 +579,47 @@ fn accountDomainsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx
 }
 
 /// Account nested field handler: registrations
+///
+/// Returns Registration entities (from the `registrations` table) registered by
+/// this account — matching the schema's `[Registration!]!`. Sourced via
+/// `getRegistrations` filtered by registrant, NOT `getNamesByRegistrant` (which
+/// returns Domain rows from the `names` table); the latter produced a Domain
+/// shape under a Registration-typed field.
 fn accountRegistrationsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
     const addr: *const Address = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
     const page = try api_common.parsePagination(field, 10);
 
-    const names = try database.getNamesByRegistrant(addr.*, page.skip, page.first);
+    const registrant_hex = try addr.toHex(nested_ctx.allocator);
+    defer nested_ctx.allocator.free(registrant_hex);
+
+    const fetch_limit: u32 = page.first + page.skip;
+    const registrations = try database.getRegistrations(.{
+        .registrant = registrant_hex,
+        .limit = fetch_limit,
+    });
     defer {
-        for (names) |*name| {
-            name.deinit(nested_ctx.allocator);
+        for (registrations) |*reg| {
+            reg.deinit(nested_ctx.allocator);
         }
-        nested_ctx.allocator.free(names);
+        nested_ctx.allocator.free(registrations);
     }
 
     var json: std.ArrayList(u8) = .{};
     errdefer json.deinit(nested_ctx.allocator);
     var arr = try jw.arrayOn(json.writer(nested_ctx.allocator));
-    for (names) |*name| {
-        const domain_json = try buildDomainJson(name, field.selections, .{
+    const start_idx: usize = @min(@as(usize, @intCast(page.skip)), registrations.len);
+    const end_idx: usize = @min(start_idx + @as(usize, @intCast(page.first)), registrations.len);
+    for (registrations[start_idx..end_idx]) |*reg| {
+        const reg_json = try buildRegistrationJson(reg, field.selections, .{
             .database = database,
             .depth = nested_ctx.depth + 1,
             .allocator = nested_ctx.allocator,
             .loaders = nested_ctx.loaders,
         });
-        defer nested_ctx.allocator.free(domain_json);
-        try arr.itemRaw(domain_json);
+        defer nested_ctx.allocator.free(reg_json);
+        try arr.itemRaw(reg_json);
     }
     try arr.end();
 
