@@ -570,10 +570,9 @@ pub const WebhookManager = struct {
 
     /// Attempt webhook delivery and return success status
     fn attemptDelivery(self: *WebhookManager, queue_id: u64, url: []const u8, secret: []const u8, payload: []const u8, retry_count: u32) !bool {
-        _ = queue_id;
         _ = retry_count;
 
-        return self.sendHttpPost(url, secret, payload) catch false;
+        return self.sendHttpPost(queue_id, url, secret, payload) catch false;
     }
 
     /// Mark webhook as successfully delivered
@@ -661,6 +660,9 @@ pub const WebhookManager = struct {
         url: []u8,
         payload: []u8,
         secret: []u8,
+        // Stable idempotency key (webhook_queue row id). Constant across retries
+        // so receivers can dedup the same delivery; sent as X-Webhook-Id.
+        queue_id: u64,
         // Result, written by the thread, read by the worker.
         // 0 = running, 1 = 2xx success, 2 = non-2xx response, 3 = transport error
         done: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
@@ -708,11 +710,18 @@ pub const WebhookManager = struct {
             return;
         };
 
+        var id_buf: [24]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{args.queue_id}) catch {
+            args.done.store(3, .release);
+            return;
+        };
+
         const extra_headers = [_]std.http.Header{
             .{ .name = "Content-Type", .value = "application/json" },
             .{ .name = "User-Agent", .value = "ENSv2-Indexer/0.1.0" },
             .{ .name = "X-Webhook-Timestamp", .value = timestamp_str },
             .{ .name = "X-Webhook-Signature", .value = sig_header.items },
+            .{ .name = "X-Webhook-Id", .value = id_str },
         };
 
         var response_buf: std.Io.Writer.Allocating = .init(args.allocator);
@@ -744,7 +753,7 @@ pub const WebhookManager = struct {
     /// POST JSON to `url`. Returns true on 2xx within `HTTP_DELIVERY_DEADLINE_MS`,
     /// false on non-2xx; returns `error.HttpTimeout` if the deadline elapses.
     /// Spawns a detached delivery thread so a hung endpoint cannot stall the worker.
-    fn sendHttpPost(self: *WebhookManager, url: []const u8, secret: []const u8, payload: []const u8) !bool {
+    fn sendHttpPost(self: *WebhookManager, queue_id: u64, url: []const u8, secret: []const u8, payload: []const u8) !bool {
         // Heap-allocate args + dupe inputs so the spawned thread can outlive this stack frame.
         const args = try self.allocator.create(DeliveryArgs);
         args.* = DeliveryArgs{
@@ -753,6 +762,7 @@ pub const WebhookManager = struct {
             .url = try self.allocator.dupe(u8, url),
             .payload = try self.allocator.dupe(u8, payload),
             .secret = try self.allocator.dupe(u8, secret),
+            .queue_id = queue_id,
         };
         // Worker holds one ref; thread will hold the other once spawned.
         defer args.release();
