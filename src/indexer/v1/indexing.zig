@@ -127,6 +127,7 @@ pub fn indexV1EventsChunked(
                 }
 
                 for (logs) |log| {
+                    self.markEventBlock(protocol, log.block_number);
                     try event_cfg.handler(self, protocol, log);
                 }
             }
@@ -375,8 +376,16 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
             const controller_count_before = active_controllers.len;
             var total_events: usize = 0;
 
-            // Activate write buffer for batched DB writes
-            self.write_buffer.active = true;
+            // Activate the write buffer for batched DB writes — EXCEPT within the reorg
+            // retention window of the tip. The buffer dedups updates across the whole
+            // chunk, collapsing a name's per-block history into one final value flushed
+            // at the chunk's last block. That would prevent the reorg undo-log from
+            // restoring exact state-as-of-N if a reorg later lands inside this chunk.
+            // Near the tip we therefore write direct per-event so each mutation is
+            // captured at its own block; the RPC batch is unaffected (still one call).
+            const REORG_WINDOW: u64 = 1000; // matches sync.zig REORG_RETENTION_BLOCKS / pruneOldBlockHashes
+            const near_tip = to_block >= REORG_WINDOW and chunk_end > to_block - REORG_WINDOW;
+            self.write_buffer.active = !near_tip;
             errdefer {
                 self.write_buffer.active = false;
                 self.write_buffer.reset();
@@ -390,6 +399,7 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
             total_events += eth_logs.len;
             for (eth_logs) |log| {
                 if (log.topics.len == 0) continue;
+                self.markEventBlock(protocol, log.block_number);
                 inline for (Indexer.V1_ETH_CONTROLLER_EVENTS) |cfg| {
                     if (log.topics[0].eql(cfg.event_hash)) {
                         try cfg.handler(self, protocol, log);
@@ -405,6 +415,7 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
             total_events += base_logs.len;
             for (base_logs) |log| {
                 if (log.topics.len == 0) continue;
+                self.markEventBlock(protocol, log.block_number);
                 inline for (Indexer.V1_BASE_REGISTRAR_EVENTS) |cfg| {
                     if (log.topics[0].eql(cfg.event_hash)) {
                         try cfg.handler(self, protocol, log);
@@ -420,6 +431,7 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
             total_events += registry_logs.len;
             for (registry_logs) |log| {
                 if (log.topics.len == 0) continue;
+                self.markEventBlock(protocol, log.block_number);
                 inline for (Indexer.V1_REGISTRY_EVENTS) |cfg| {
                     if (log.topics[0].eql(cfg.event_hash)) {
                         try cfg.handler(self, protocol, log);
@@ -439,6 +451,7 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
                 total_events += wrapper_logs.len;
                 for (wrapper_logs) |log| {
                     if (log.topics.len == 0) continue;
+                    self.markEventBlock(protocol, log.block_number);
                     inline for (Indexer.V1_NAME_WRAPPER_EVENTS) |cfg| {
                         if (log.topics[0].eql(cfg.event_hash)) {
                             try cfg.handler(self, protocol, log);
@@ -455,6 +468,7 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
             total_events += reverse_logs.len;
             for (reverse_logs) |log| {
                 if (log.topics.len == 0) continue;
+                self.markEventBlock(protocol, log.block_number);
                 inline for (Indexer.V1_REVERSE_REGISTRAR_EVENTS) |cfg| {
                     if (log.topics[0].eql(cfg.event_hash)) {
                         try cfg.handler(self, protocol, log);
@@ -669,6 +683,7 @@ pub fn indexPreMigrationRegistryEvents(self: *Indexer, protocol: models.Protocol
                 }
 
                 for (logs) |log| {
+                    self.markEventBlock(protocol, log.block_number);
                     try pair.config.handler(self, protocol, log);
                 }
             }

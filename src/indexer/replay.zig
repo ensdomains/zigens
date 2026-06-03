@@ -13,6 +13,7 @@ const names_storage = @import("../storage/names.zig");
 const v1_names = @import("../utils/v1_names.zig");
 const Indexer = @import("indexer.zig").Indexer;
 const utils = @import("utils.zig");
+const reorg_undo = @import("../storage/reorg_undo.zig");
 
 const Keccak256 = std.crypto.hash.sha3.Keccak256;
 
@@ -191,6 +192,11 @@ pub fn replayEventsToRebuildNames(self: *Indexer) !void {
     // ── Step 7: Recreate names indexes ──
     std.log.info("Recreating names indexes...", .{});
     try createNamesIndexes(database);
+
+    // Reinstall reorg undo-log triggers: DROP TABLE names (step 5) also dropped its
+    // triggers. Idempotent for the other protected tables. Replay itself sets no
+    // cursor, so the bulk rebuild above captured nothing.
+    try reorg_undo.installTriggers(database);
 
     // ── Step 8: Post-replay backfill passes ──
     std.log.info("Running post-replay backfill passes...", .{});

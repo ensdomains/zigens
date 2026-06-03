@@ -150,6 +150,7 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
             const event_sig = log.topics[0];
 
             // Find matching handler
+            self.markEventBlock(protocol, log.block_number);
             inline for (Indexer.SUBREGISTRY_ENS_EVENTS) |event_cfg| {
                 if (event_sig.eql(event_cfg.event_hash)) {
                     try event_cfg.handler(self, protocol, log);
@@ -264,6 +265,7 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
                         transfer_filtered_unknown += 1;
                         continue;
                     }
+                    self.markEventBlock(protocol, log.block_number);
                     Indexer.SUBREGISTRY_TRANSFER_EVENT.handler(self, protocol, log) catch |handler_err| {
                         std.log.warn("    Failed to process transfer: {}", .{handler_err});
                     };
@@ -307,6 +309,7 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
                 }
 
                 // Process the transfer event
+                self.markEventBlock(protocol, log.block_number);
                 Indexer.SUBREGISTRY_TRANSFER_EVENT.handler(self, protocol, log) catch |err| {
                     std.log.warn("    Failed to process transfer: {}", .{err});
                 };
@@ -495,6 +498,7 @@ pub fn indexResolverEvents(self: *Indexer, protocol: models.Protocol, client: *r
         const resolver = log.address;
 
         // Find matching handler by comparing event signature
+        self.markEventBlock(protocol, log.block_number);
         inline for (Indexer.RESOLVER_EVENTS) |event_cfg| {
             if (event_sig.eql(event_cfg.event_hash)) {
                 try event_cfg.handler(self, protocol, resolver, log);

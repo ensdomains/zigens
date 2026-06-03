@@ -20,6 +20,7 @@ const event_fetchers = @import("event_fetchers.zig");
 const v1_indexing = @import("v1/indexing.zig");
 const handlers_v1 = @import("v1/handlers.zig");
 const backfill_mod = @import("v1/backfill.zig");
+const reorg_undo = @import("../storage/reorg_undo.zig");
 const replay_mod = @import("replay.zig");
 pub const utils = @import("utils.zig");
 const WriteBuffer = @import("write_buffer.zig").WriteBuffer;
@@ -49,6 +50,10 @@ pub const Indexer = struct {
     // Track block hash from processed logs to avoid extra getBlockByNumber RPC calls
     last_seen_block_hash: ?Hash = null,
     last_seen_block_number: u64 = 0,
+    // Reorg undo-log cursor de-dup: last (protocol, block) the cursor was written for,
+    // so `markEventBlock` only writes on a change (avoids a per-event upsert). -1 = unset.
+    reorg_cursor_block: i64 = -1,
+    reorg_cursor_proto: i8 = -1,
     // Write buffer for batching DB operations during chunk processing
     write_buffer: WriteBuffer,
     // Rainbow table for resolving labelhashes to labels (optional)
@@ -802,6 +807,32 @@ pub const Indexer = struct {
         std.log.info("{s} indexer stopped.", .{protocol.toString()});
     }
 
+    /// Record the block currently being processed so the reorg undo-log tags captured
+    /// mutations with the correct block. Called per event from the dispatch loops,
+    /// BEFORE the handler mutates. De-duped on (protocol, block) so it's one cheap
+    /// upsert per block, not per event. Capture failure must not abort indexing — a
+    /// missed cursor only degrades reorg-rollback precision, so errors are logged.
+    pub fn markEventBlock(self: *Indexer, protocol: models.Protocol, block_number: u64) void {
+        const proto_i: i8 = @intCast(@intFromEnum(protocol));
+        if (self.reorg_cursor_block == @as(i64, @intCast(block_number)) and self.reorg_cursor_proto == proto_i) return;
+        reorg_undo.setCursor(self.database, protocol, block_number) catch |err| {
+            std.log.warn("reorg undo-log: failed to set cursor for {s} block {d}: {}", .{ protocol.toString(), block_number, err });
+            return;
+        };
+        self.reorg_cursor_block = @intCast(block_number);
+        self.reorg_cursor_proto = proto_i;
+    }
+
+    /// Forget the in-memory cursor mirror so the next markEventBlock re-sets the DB
+    /// cursor row unconditionally. MUST be called whenever the reorg_cursor row is
+    /// cleared out-of-band (reorg rollback clears it; a batch-transaction rollback
+    /// reverts the setCursor write). Otherwise the de-dup short-circuit would keep
+    /// believing the row is set and silently disable undo capture for that block.
+    pub fn invalidateReorgCursor(self: *Indexer) void {
+        self.reorg_cursor_block = -1;
+        self.reorg_cursor_proto = -1;
+    }
+
     /// True if the stored hash for `block_number` still matches the protocol, or no hash is stored.
     /// On RPC failure, returns true (skip the reorg check this round) rather than aborting the
     /// whole sync — reorgs are rare, transient network errors are not, and the next iteration
@@ -827,6 +858,9 @@ pub const Indexer = struct {
         }
         std.log.warn("Rolling back {s} to block {d}", .{ protocol.toString(), rollback_to });
         try self.database.rollbackToBlock(protocol, rollback_to);
+        // rollbackToBlock cleared the reorg_cursor row; drop the in-memory mirror so the
+        // next event re-arms it (otherwise capture stays silently disabled for that block).
+        self.invalidateReorgCursor();
         return rollback_to;
     }
 
@@ -907,6 +941,9 @@ pub const Indexer = struct {
             // Try indexing - on RPC response size errors, rollback, halve batch, retry
             self.indexBlockRange(protocol, client, from_block, to_block) catch |err| {
                 self.database.rollbackTransaction();
+                // The reverted transaction included this batch's setCursor writes; drop the
+                // in-memory mirror so the smaller-batch retry re-arms the cursor per block.
+                self.invalidateReorgCursor();
 
                 if ((err == error.RpcError or err == error.StreamTooLong) and current_batch_size > ABSOLUTE_MIN_BATCH) {
                     current_batch_size = @max(ABSOLUTE_MIN_BATCH, current_batch_size / 2);
@@ -961,6 +998,13 @@ pub const Indexer = struct {
 
                 // Prune old block hashes (keep last 1000 blocks)
                 try self.database.pruneOldBlockHashes(protocol, to_block);
+
+                // Prune undo-log entries below the reorg retention window (same 1000-block
+                // horizon as block_hashes — rollbacks deeper than that are refused).
+                const undo_keep_from: u64 = if (to_block > 1000) to_block - 1000 else 0;
+                reorg_undo.pruneBelow(self.database, protocol, undo_keep_from) catch |err| {
+                    std.log.warn("reorg undo-log prune failed (non-fatal): {}", .{err});
+                };
 
                 // Clear block timestamp cache to prevent memory growth
                 self.clearBlockTimestampCache();

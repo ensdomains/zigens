@@ -109,6 +109,7 @@ pub fn dispatchOrdered(
 ) !void {
     std.mem.sort(DispatchEntry, entries, {}, dispatchEntryLessThan);
     for (entries) |entry| {
+        self.markEventBlock(protocol, entry.log.block_number);
         try entry.handler(self, protocol, entry.log);
     }
 }
