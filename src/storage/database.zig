@@ -15,6 +15,7 @@ const Hash = @import("../types/hash.zig").Hash;
 const names = @import("names.zig");
 const resolvers = @import("resolvers.zig");
 const registry_entries = @import("registry_entries.zig");
+const reorg_undo = @import("reorg_undo.zig");
 
 // Re-export types for use by other modules
 pub const OrderDir = names.OrderDir;
@@ -165,6 +166,11 @@ pub const Database = struct {
         try database.exec(std.fmt.comptimePrint("PRAGMA cache_size = {d};", .{constants.SQLite.cache_size_kb}));
         try database.exec("PRAGMA foreign_keys = ON;"); // Enable foreign key constraints
         try database.exec("PRAGMA temp_store = memory;"); // Use RAM for temp tables
+        // Required by the reorg undo-log: derived tables (resolver records, approvals,
+        // …) are rewritten with INSERT OR REPLACE, whose implicit row delete only fires
+        // the AFTER DELETE capture trigger when recursive triggers are enabled. Without
+        // this, in-place overwrites would silently bypass undo capture (see reorg_undo.zig).
+        try database.exec("PRAGMA recursive_triggers = ON;");
 
         // Load and apply the consolidated schema from schema/schema.sql.
         // The expected workflow for schema changes is to re-index from scratch
@@ -174,6 +180,12 @@ pub const Database = struct {
         // re-introducing the per-file migration ladder.
         try database.loadSchemaFiles();
         try database.migrate();
+
+        // Reorg undo-log: capture tables + per-table triggers so rollbackToBlock can
+        // reverse in-place mutations. Generated from the live schema; gated by
+        // reorg_cursor (no capture unless the indexer sets the current block).
+        try reorg_undo.ensureSchema(&database);
+        try reorg_undo.installTriggers(&database);
 
         return database;
     }
@@ -299,6 +311,8 @@ pub const Database = struct {
         try database.exec(std.fmt.comptimePrint("PRAGMA cache_size = {d};", .{constants.SQLite.cache_size_kb}));
         try database.exec("PRAGMA foreign_keys = ON;");
         try database.exec("PRAGMA temp_store = memory;");
+        // Match the writer connection (see init): harmless on this read-only path.
+        try database.exec("PRAGMA recursive_triggers = ON;");
 
         // Intentionally no `migrate()` here. The API is a read-only consumer of
         // a DB that the indexer is the sole writer of. Running migrate from the

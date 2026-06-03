@@ -5,6 +5,7 @@ const Query = db_module.Query;
 const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
+const reorg_undo = @import("reorg_undo.zig");
 
 /// Safely convert u64 expiry to i64 for SQLite storage.
 /// Values exceeding i64::max are mapped to 0 (never expires).
@@ -83,14 +84,45 @@ pub fn getBlockHash(db: *Database, protocol: models.Protocol, block_number: u64)
 }
 
 /// Rollback all derived state to the given block (for reorg handling).
-/// Deletes:
-///   - events and block_hashes after the block (insert-only tables)
-///   - rows in derived tables (names, registries, resolver_*, approvals, etc.) with created_block > block
-/// Does NOT roll back in-place updates to rows created at or before block_number
-/// (those will be re-derived when events are re-processed on re-sync from block+1).
+/// Atomic (single transaction) and bounded by the block_hashes retention window.
+/// Bit-equivalent to a clean sync stopping at `block_number`:
+///   1. Reverses in-place mutations to rows created at/before the block (owner/
+///      resolver/expiry/… on names, registrant on registrations, and resolver
+///      records removed by clear-events) via the reorg undo-log (see reorg_undo.zig).
+///   2. Deletes rows created after the block (created_block/block_number > block).
+///   3. Deletes insert-only events + block_hashes after the block.
+/// Undo capture requires the indexer to set the per-protocol cursor per event
+/// (reorg_undo.setCursor); without a cursor (backfill/replay) nothing is captured.
 pub fn rollbackToBlock(db: *Database, protocol: models.Protocol, block_number: u64) !void {
     const protocol_str = protocol.toString();
     const block_i64: i64 = @intCast(block_number);
+
+    // Reorg-depth guardrail: never roll back further than the block_hashes retention
+    // window (cleanupOldBlockHashes keeps the last 1000 blocks). Beyond it there are
+    // no stored hashes to validate against, so a deeper "rollback" is a blind guess —
+    // fail loud rather than silently corrupt state.
+    {
+        const REORG_RETENTION_BLOCKS: u64 = 1000; // matches cleanupOldBlockHashes keep_blocks
+        const head = (try db.getSyncState(protocol)) orelse block_number;
+        if (head > block_number and head - block_number > REORG_RETENTION_BLOCKS) {
+            std.log.err("Refusing reorg rollback on {s}: depth {d} exceeds retention window {d} (head={d}, target={d})", .{ protocol_str, head - block_number, REORG_RETENTION_BLOCKS, head, block_number });
+            return error.ReorgTooDeep;
+        }
+    }
+
+    // Atomicity: the entire rollback runs in one transaction. A crash or error
+    // mid-rollback must leave the DB at its pre-rollback state, never half-rolled.
+    try db.exec("BEGIN IMMEDIATE TRANSACTION");
+    errdefer db.exec("ROLLBACK") catch |rb_err| {
+        std.log.err("CRITICAL: failed to ROLLBACK reorg transaction after error: {}", .{rb_err});
+    };
+
+    // Reverse in-place mutations FIRST: clear the cursor so the restore writes don't
+    // self-capture, then reverse-apply every undo entry with block > N. This must run
+    // before the created-after deletes below — a re-inserted (cleared) row created
+    // after N is then removed by those deletes; an UPDATE-restored pre-N row survives.
+    try reorg_undo.clearCursor(db, protocol);
+    try reorg_undo.replayUndo(db, protocol, block_number);
 
     // Insert-only tables: delete anything after the block
     const insert_only_tables = [_][]const u8{
@@ -133,11 +165,12 @@ pub fn rollbackToBlock(db: *Database, protocol: models.Protocol, block_number: u
         try q.exec();
     }
 
-    // Resolver record and EAC tables: block_number with protocol.
-    // Includes all resolver record tables (see deleteDataAfterBlock for canonical list).
+    // Derived tables keyed by block_number with protocol: delete rows created after N.
+    // (replayUndo above already reversed in-place overwrites of pre-N rows, restoring
+    // their as-of-N block_number, so these deletes only remove genuinely-new rows.)
     // If a table is missing from the schema, Query.init (preparing the DELETE) will fail
     // at the `try` boundary and bubble up — reorg rollback is not safe to continue on partial failure.
-    const resolver_record_tables = [_][]const u8{
+    const block_number_tables = [_][]const u8{
         "resolver_addresses",
         "resolver_contenthashes",
         "resolver_texts",
@@ -147,13 +180,19 @@ pub fn rollbackToBlock(db: *Database, protocol: models.Protocol, block_number: u
         "resolver_names",
         "resolver_interfaces",
         "resolver_versions",
+        "resolver_dns_records",
+        "resolver_dns_zonehashes",
+        "resolver_authorisations",
+        "reverse_records",
         "approvals",
         "eac_roles",
         "resolver_metadata",
         "resolver_approvals",
+        "registrations",
+        "name_history",
     };
 
-    inline for (resolver_record_tables) |table| {
+    inline for (block_number_tables) |table| {
         const sql = "DELETE FROM " ++ table ++ " WHERE protocol = ? AND block_number > ?";
         var q = try Query.init(db, sql);
         defer q.deinit();
@@ -162,10 +201,43 @@ pub fn rollbackToBlock(db: *Database, protocol: models.Protocol, block_number: u
         try q.exec();
     }
 
+    // Tables keyed by a non-`block_number` block column: same created-after delete,
+    // different column. registry_entries → updated_block; resolvers (insert-only entity
+    // table) → set_block. replayUndo above restored pre-N rows to their as-of-N value, so
+    // these remove only genuinely-new rows.
+    const other_block_col_tables = [_]struct { name: []const u8, col: []const u8 }{
+        .{ .name = "registry_entries", .col = "updated_block" },
+        .{ .name = "resolvers", .col = "set_block" },
+    };
+    inline for (other_block_col_tables) |t| {
+        const sql = "DELETE FROM " ++ t.name ++ " WHERE protocol = ? AND " ++ t.col ++ " > ?";
+        var q = try Query.init(db, sql);
+        defer q.deinit();
+        try q.bindTextStatic(protocol_str);
+        try q.bindInt64(block_i64);
+        try q.exec();
+    }
+
+    // v1_controllers (V1-only, no protocol column) drives WHICH contracts get indexed
+    // (getActiveControllers), so a reorged-out ControllerAdded/Removed must be wound back or
+    // subsequent indexing scope is corrupted. It is captured in the undo-log via the
+    // reorg_active triggers (add=INSERT op 'I', remove/re-add=UPDATE op 'U') and reversed by
+    // replayUndo above — which correctly handles a remove-then-readd straddling N that a
+    // column-predicate delete could not. Nothing to do here.
+
+    // accounts is cross-protocol (no protocol column) and rolled back PER protocol and
+    // independently — so we must NOT blanket-delete by first_seen_block (that would drop
+    // the OTHER, still-synced protocol's accounts). Instead the undo-log handles it: the
+    // reorg_active triggers capture each protocol's UPDATE/DELETE (reversed by replayUndo
+    // above) AND its INSERT (op 'I'), and replayUndo's 'I' handler clears only this
+    // protocol's seen flag and drops the row only when neither protocol still claims it.
+
     // Update sync state
     try db.setSyncState(protocol, block_number);
 
-    std.log.warn("Rolled back {s} protocol to block {d} (derived state rolled back, in-place updates to pre-{d} rows will re-derive on re-sync)", .{ protocol_str, block_number, block_number });
+    try db.exec("COMMIT");
+
+    std.log.warn("Rolled back {s} to block {d} (atomic; in-place updates reversed via undo-log + created-after rows removed)", .{ protocol_str, block_number });
 }
 
 /// Cleanup old block hashes (keep last 1000 blocks for reorg detection)
@@ -383,11 +455,23 @@ pub fn discoverAndGetSubregistries(db: *Database, protocol: models.Protocol, mai
 pub fn deleteDataAfterBlock(db: *Database, block_number: u64) !void {
     std.log.info("Deleting data after block {d}...", .{block_number});
 
-    // List of tables to clean, with their block_number column name
+    // Tables to clean, with the block column that dates each row. Kept in sync with
+    // rollbackToBlock's coverage so --clean is clean-at-N equivalent for ALL protocols
+    // (no protocol filter here — the replayUndo above ran for both v1 and v2).
     const tables = [_]struct { name: []const u8, block_col: []const u8 }{
         .{ .name = "names", .block_col = "created_block" },
+        .{ .name = "registries", .block_col = "created_block" },
         .{ .name = "events", .block_col = "block_number" },
+        .{ .name = "block_hashes", .block_col = "block_number" },
+        .{ .name = "orphaned_registrations", .block_col = "block_number" },
         .{ .name = "approvals", .block_col = "block_number" },
+        .{ .name = "eac_roles", .block_col = "block_number" },
+        .{ .name = "registrations", .block_col = "block_number" },
+        .{ .name = "registry_entries", .block_col = "updated_block" },
+        .{ .name = "reverse_records", .block_col = "block_number" },
+        .{ .name = "resolvers", .block_col = "set_block" },
+        .{ .name = "name_history", .block_col = "block_number" },
+        .{ .name = "accounts", .block_col = "first_seen_block" },
         .{ .name = "resolver_addresses", .block_col = "block_number" },
         .{ .name = "resolver_contenthashes", .block_col = "block_number" },
         .{ .name = "resolver_texts", .block_col = "block_number" },
@@ -397,6 +481,11 @@ pub fn deleteDataAfterBlock(db: *Database, block_number: u64) !void {
         .{ .name = "resolver_names", .block_col = "block_number" },
         .{ .name = "resolver_interfaces", .block_col = "block_number" },
         .{ .name = "resolver_versions", .block_col = "block_number" },
+        .{ .name = "resolver_metadata", .block_col = "block_number" },
+        .{ .name = "resolver_approvals", .block_col = "block_number" },
+        .{ .name = "resolver_dns_records", .block_col = "block_number" },
+        .{ .name = "resolver_dns_zonehashes", .block_col = "block_number" },
+        .{ .name = "resolver_authorisations", .block_col = "block_number" },
     };
 
     // Begin transaction for atomic cleanup
@@ -405,6 +494,14 @@ pub fn deleteDataAfterBlock(db: *Database, block_number: u64) !void {
         db.exec("ROLLBACK") catch |err| {
             std.log.err("CRITICAL: Failed to rollback transaction during cleanup error: {}", .{err});
         };
+    }
+
+    // Reverse in-place mutations after the block for BOTH protocols (this path is
+    // protocol-agnostic), so --clean is clean-at-N equivalent and no stale undo
+    // entries survive. Clear cursors first so the restore writes don't self-capture.
+    inline for ([_]models.Protocol{ .v1, .v2 }) |proto| {
+        try reorg_undo.clearCursor(db, proto);
+        try reorg_undo.replayUndo(db, proto, block_number);
     }
 
     for (tables) |table| {
@@ -426,6 +523,9 @@ pub fn deleteDataAfterBlock(db: *Database, block_number: u64) !void {
             std.log.info("  Deleted {d} rows from {s}", .{ deleted, table.name });
         }
     }
+
+    // v1_controllers is wound back by the replayUndo calls above (reorg_active undo-log,
+    // both protocols) — no explicit column-predicate cleanup needed.
 
     // Commit transaction
     try db.exec("COMMIT");

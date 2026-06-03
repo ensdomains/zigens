@@ -12,6 +12,8 @@ pub const storage = struct {
     pub const webhooks = @import("storage/webhooks.zig");
     pub const registrations = @import("storage/registrations.zig");
     pub const sync = @import("storage/sync.zig");
+    pub const reorg_undo = @import("storage/reorg_undo.zig");
+    pub const v1_controllers = @import("storage/v1_controllers.zig");
 };
 
 pub const types = struct {
