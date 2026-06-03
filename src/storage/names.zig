@@ -1028,7 +1028,7 @@ pub fn getDomainByResolver(db: *Database, resolver: Address) !?models.Name {
 
 /// Get names by registrant address. Unreachable rows are filtered out.
 pub fn getNamesByRegistrant(db: *Database, registrant: Address, skip: u32, limit: u32) ![]models.Name {
-    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND registrant = ? ORDER BY created_at DESC LIMIT ? OFFSET ?");
+    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND registrant = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY created_at DESC LIMIT ? OFFSET ?");
     defer q.deinit();
 
     try q.bindAddress(registrant);
@@ -1177,15 +1177,15 @@ fn appendNameFilterConditions(
     }
     if (filters.has_subdomains) |has_subs| {
         try conditions.append(db.allocator, if (has_subs)
-            "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) > 0"
+            "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1 AND sub.namehash != '0x0000000000000000000000000000000000000000000000000000000000000000') > 0"
         else
-            "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) = 0");
+            "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1 AND sub.namehash != '0x0000000000000000000000000000000000000000000000000000000000000000') = 0");
     }
     if (filters.subdomain_count_gt != null) {
-        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) > ?");
+        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1 AND sub.namehash != '0x0000000000000000000000000000000000000000000000000000000000000000') > ?");
     }
     if (filters.subdomain_count_lt != null) {
-        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1) < ?");
+        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1 AND sub.namehash != '0x0000000000000000000000000000000000000000000000000000000000000000') < ?");
     }
 }
 
