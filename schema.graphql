@@ -1121,13 +1121,13 @@ type RegistryInfo {
   """
   owner: Account
 
-  """Names whose subregistry is this contract (the labels under this registry, legacy offset-based)."""
+  """Names whose `registry` is this contract — i.e. the labels minted in and managed by this registry (the reverse of a name's parent-registry lookup). Legacy offset-based pagination; prefer `labelConnection`."""
   labels(first: Int, skip: Int, where: DomainFilter, orderBy: Domain_orderBy, orderDirection: OrderDirection): [Domain!]!
 
-  """Cursor-based labels for this registry (recommended)."""
+  """Cursor-based version of `labels`: names whose `registry` is this contract (recommended)."""
   labelConnection(first: Int, after: String, last: Int, before: String, where: DomainFilter, orderBy: Domain_orderBy, orderDirection: OrderDirection): DomainConnection!
 
-  """Total label count for this registry."""
+  """Total count of names whose `registry` is this contract."""
   labelCount: Int!
 
   """Events emitted by this registry contract (legacy offset-based)."""
