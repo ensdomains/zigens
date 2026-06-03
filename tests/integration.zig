@@ -463,6 +463,255 @@ test "reorg rollback deletes derived state created after the block" {
 }
 
 // ============================================================================
+// Reorg undo-log: in-place mutation reversal (#6/#7 correctness fix)
+// rollbackToBlock(N) must reverse UPDATEs to rows that existed at/before N, not
+// just delete created-after rows. The undo-log captures each mutation (tagged by
+// the per-protocol cursor) so rollback restores the row's state as of N.
+// ============================================================================
+
+fn makeReorgName(allocator: std.mem.Allocator, name: []const u8, protocol: models.Protocol, owner: Address, block: u64) !models.Name {
+    return models.Name{
+        .name = try allocator.dupe(u8, name),
+        .namehash = try namehash(allocator, name),
+        .label = try allocator.dupe(u8, name),
+        .label_hash = try keccak256(allocator, name),
+        .parent_name = try allocator.dupe(u8, "eth"),
+        .parent_namehash = try namehash(allocator, "eth"),
+        .protocol = protocol,
+        .registry = try Address.fromHex("0x0000000000000000000000000000000000000001"),
+        .owner = owner,
+        .registrant = owner,
+        .resolver = Address.zero,
+        .token_id = 0,
+        .canonical_id = 0,
+        .token_version = 1,
+        .expiry = 0,
+        .registry_locked = false,
+        .migrated = false,
+        .created_block = block,
+        .created_at = @intCast(1700000000 + block),
+        .registered_at = @intCast(1700000000 + block),
+        .updated_block = block,
+        .updated_at = @intCast(1700000000 + block),
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = (protocol == .v1),
+        .v1_label_hash = null,
+    };
+}
+
+fn ownerOf(allocator: std.mem.Allocator, database: *Database, nh: Hash) !Address {
+    var n = (try database.getNameByNamehash(nh)) orelse return error.NameVanished;
+    defer n.deinit(allocator);
+    return n.owner;
+}
+
+fn expectInPlaceOwnerReversed(protocol: models.Protocol) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const owner_a = try Address.fromHex("0x00000000000000000000000000000000000000aa");
+    const owner_b = try Address.fromHex("0x00000000000000000000000000000000000000bb");
+    const nh = try namehash(allocator, "foo.eth");
+
+    // Block 100: created with owner A (INSERT — not captured; covered by created_block delete).
+    try lib.storage.reorg_undo.setCursor(&database, protocol, 100);
+    var n = try makeReorgName(allocator, "foo.eth", protocol, owner_a, 100);
+    defer n.deinit(allocator);
+    try database.insertName(n);
+
+    // Block 200: owner changed to B (in-place UPDATE — captured, tagged block 200).
+    try lib.storage.reorg_undo.setCursor(&database, protocol, 200);
+    try database.updateNameOwner(nh, owner_b);
+    try testing.expectEqualSlices(u8, &owner_b.bytes, &(try ownerOf(allocator, &database, nh)).bytes);
+
+    // Reorg to 150: the block-200 update is reversed; the name (created 100) survives.
+    try lib.storage.sync.rollbackToBlock(&database, protocol, 150);
+    try testing.expectEqualSlices(u8, &owner_a.bytes, &(try ownerOf(allocator, &database, nh)).bytes);
+}
+
+test "reorg undo-log reverses an in-place owner update (v2)" {
+    try expectInPlaceOwnerReversed(.v2);
+    std.debug.print("✓ v2 in-place owner update reversed on reorg (B→A)\n", .{});
+}
+
+test "reorg undo-log reverses an in-place owner update (v1)" {
+    try expectInPlaceOwnerReversed(.v1);
+    std.debug.print("✓ v1 in-place owner update reversed on reorg (B→A)\n", .{});
+}
+
+test "reorg undo-log: created-after removed AND updated pre-reorg restored together" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const owner_a = try Address.fromHex("0x00000000000000000000000000000000000000aa");
+    const owner_b = try Address.fromHex("0x00000000000000000000000000000000000000bb");
+    const x = try namehash(allocator, "x.eth");
+    const y = try namehash(allocator, "y.eth");
+
+    // X created at 100 (owner A); Y created at 300 (owner A); X updated to B at 200.
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 100);
+    var nx = try makeReorgName(allocator, "x.eth", .v2, owner_a, 100);
+    defer nx.deinit(allocator);
+    try database.insertName(nx);
+
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 300);
+    var ny = try makeReorgName(allocator, "y.eth", .v2, owner_a, 300);
+    defer ny.deinit(allocator);
+    try database.insertName(ny);
+
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
+    try database.updateNameOwner(x, owner_b);
+
+    // Reorg to 150: X (created 100) restored to owner A; Y (created 300) deleted.
+    try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
+
+    try testing.expectEqualSlices(u8, &owner_a.bytes, &(try ownerOf(allocator, &database, x)).bytes);
+    try testing.expect((try database.getNameByNamehash(y)) == null);
+    std.debug.print("✓ created-after removed + updated pre-reorg restored compose correctly\n", .{});
+}
+
+test "reorg undo-log: rollback is idempotent" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const owner_a = try Address.fromHex("0x00000000000000000000000000000000000000aa");
+    const owner_b = try Address.fromHex("0x00000000000000000000000000000000000000bb");
+    const nh = try namehash(allocator, "foo.eth");
+
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 100);
+    var n = try makeReorgName(allocator, "foo.eth", .v2, owner_a, 100);
+    defer n.deinit(allocator);
+    try database.insertName(n);
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
+    try database.updateNameOwner(nh, owner_b);
+
+    try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
+    try lib.storage.sync.rollbackToBlock(&database, .v2, 150); // second time = no-op
+    try testing.expectEqualSlices(u8, &owner_a.bytes, &(try ownerOf(allocator, &database, nh)).bytes);
+    std.debug.print("✓ rollback idempotent\n", .{});
+}
+
+fn resolverAddrCount(database: *Database, nh: Hash) !i64 {
+    var nh_buf: [66]u8 = undefined;
+    const nh_hex = nh.toHexBuf(&nh_buf);
+    var q = try lib.storage.Query.init(database, "SELECT COUNT(*) FROM resolver_addresses WHERE namehash = ?");
+    defer q.deinit();
+    try q.bindText(nh_hex);
+    _ = try q.step();
+    return q.getInt64(0);
+}
+
+test "reorg undo-log re-inserts a resolver record cleared after the reorg block" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const nh = try namehash(allocator, "foo.eth");
+    const resolver = try Address.fromHex("0x00000000000000000000000000000000000000cc");
+    const tx = try Hash.fromHex("0x0000000000000000000000000000000000000000000000000000000000000abc");
+
+    // Block 100: resolver addr record created (INSERT — not captured).
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 100);
+    try database.storeResolverAddress(nh, resolver, 60, "0x00000000000000000000000000000000000000dd", .v2, 100, tx, 1700000100);
+    try testing.expectEqual(@as(i64, 1), try resolverAddrCount(&database, nh));
+
+    // Block 200: cleared (DELETE — captured by the AFTER DELETE trigger, tagged 200).
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
+    try database.deleteResolverAddresses(nh, resolver);
+    try testing.expectEqual(@as(i64, 0), try resolverAddrCount(&database, nh));
+
+    // Reorg to 150: the cleared record (created 100 ≤ 150) is re-inserted.
+    try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
+    try testing.expectEqual(@as(i64, 1), try resolverAddrCount(&database, nh));
+    std.debug.print("✓ resolver clear-DELETE re-inserted on reorg\n", .{});
+}
+
+test "reorg undo-log restores exact state-as-of-N across multiple updates" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const a = try Address.fromHex("0x00000000000000000000000000000000000000aa");
+    const b = try Address.fromHex("0x00000000000000000000000000000000000000bb");
+    const c = try Address.fromHex("0x00000000000000000000000000000000000000cc");
+    const d = try Address.fromHex("0x00000000000000000000000000000000000000dd");
+    const nh = try namehash(allocator, "foo.eth");
+
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 100);
+    var n = try makeReorgName(allocator, "foo.eth", .v2, a, 100);
+    defer n.deinit(allocator);
+    try database.insertName(n);
+
+    // owner A→B@200, B→C@250, C→D@300.
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
+    try database.updateNameOwner(nh, b);
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 250);
+    try database.updateNameOwner(nh, c);
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 300);
+    try database.updateNameOwner(nh, d);
+
+    // Reorg to 220: last update ≤ 220 was @200 (→B), so owner must be B (not A, not C/D).
+    try lib.storage.sync.rollbackToBlock(&database, .v2, 220);
+    try testing.expectEqualSlices(u8, &b.bytes, &(try ownerOf(allocator, &database, nh)).bytes);
+    std.debug.print("✓ multi-update reverse restores exact state-as-of-N (owner B)\n", .{});
+}
+
+test "reorg undo-log: rolling back one protocol leaves the other untouched" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const a = try Address.fromHex("0x00000000000000000000000000000000000000aa");
+    const b = try Address.fromHex("0x00000000000000000000000000000000000000bb");
+    const v1nh = try namehash(allocator, "v1name.eth");
+    const v2nh = try namehash(allocator, "v2name.eth");
+
+    // A v1 name and a v2 name, both created @100, both updated to B @200.
+    try lib.storage.reorg_undo.setCursor(&database, .v1, 100);
+    var nv1 = try makeReorgName(allocator, "v1name.eth", .v1, a, 100);
+    defer nv1.deinit(allocator);
+    try database.insertName(nv1);
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 100);
+    var nv2 = try makeReorgName(allocator, "v2name.eth", .v2, a, 100);
+    defer nv2.deinit(allocator);
+    try database.insertName(nv2);
+
+    try lib.storage.reorg_undo.setCursor(&database, .v1, 200);
+    try database.updateNameOwner(v1nh, b);
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
+    try database.updateNameOwner(v2nh, b);
+
+    // Reorg ONLY v2 to 150: v2 reverts to A; v1 stays at B.
+    try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
+    try testing.expectEqualSlices(u8, &a.bytes, &(try ownerOf(allocator, &database, v2nh)).bytes);
+    try testing.expectEqualSlices(u8, &b.bytes, &(try ownerOf(allocator, &database, v1nh)).bytes);
+    std.debug.print("✓ per-protocol rollback isolation (v2 reverted, v1 intact)\n", .{});
+}
+
+// ============================================================================
 // Regression tests for where.name filter (task #2)
 // ============================================================================
 
@@ -547,4 +796,357 @@ test "where.name filter combined with isMigrated respects both" {
     try testing.expectEqual(@as(usize, 1), results_match.len);
 
     std.debug.print("✓ where.name + isMigrated filter combo works correctly\n", .{});
+}
+
+// ============================================================================
+// Reorg undo-log: post-audit coverage closure (2026-06-02)
+// Tests for the gaps the adversarial audit found: INSERT-OR-REPLACE overwrite
+// capture (recursive_triggers), newly-protected tables, post-N insert removal,
+// and the cross-protocol accounts path.
+// ============================================================================
+
+fn resolverTextValue(allocator: std.mem.Allocator, database: *Database, nh: Hash, key: []const u8) !?[]u8 {
+    var nh_buf: [66]u8 = undefined;
+    const nh_hex = nh.toHexBuf(&nh_buf);
+    var q = try lib.storage.Query.init(database, "SELECT value FROM resolver_texts WHERE namehash = ? AND key = ?");
+    defer q.deinit();
+    try q.bindText(nh_hex);
+    try q.bindText(key);
+    if (!(try q.step())) return null;
+    const v = q.getTextSlice(0) orelse return null;
+    return try allocator.dupe(u8, v);
+}
+
+fn reverseNamehashHex(allocator: std.mem.Allocator, database: *Database, addr: Address) !?[]u8 {
+    var ab: [42]u8 = undefined;
+    const ah = addr.toHexBuf(&ab);
+    var q = try lib.storage.Query.init(database, "SELECT namehash FROM reverse_records WHERE address = LOWER(?)");
+    defer q.deinit();
+    try q.bindText(ah);
+    if (!(try q.step())) return null;
+    const v = q.getTextSlice(0) orelse return null;
+    return try allocator.dupe(u8, v);
+}
+
+fn countAll(database: *Database, comptime table: []const u8) !i64 {
+    var q = try lib.storage.Query.init(database, "SELECT COUNT(*) FROM " ++ table);
+    defer q.deinit();
+    _ = try q.step();
+    return q.getInt64(0);
+}
+
+// THE core blocker: resolver records are written with INSERT OR REPLACE. Without
+// recursive_triggers=ON the implicit DELETE fires no trigger, so an overwrite of a
+// pre-N record was never captured and rollback would lose the old value entirely.
+test "reorg undo-log reverses a resolver text OVERWRITE (INSERT OR REPLACE)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const nh = try namehash(allocator, "foo.eth");
+    const resolver = try Address.fromHex("0x00000000000000000000000000000000000000cc");
+    const tx = try Hash.fromHex("0x0000000000000000000000000000000000000000000000000000000000000abc");
+
+    // Block 100: text "url" = "old" (first insert; not captured).
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 100);
+    try database.storeResolverText(nh, resolver, "url", "old", .v2, 100, tx, 1700000100);
+
+    // Block 200: overwrite to "new" via INSERT OR REPLACE — implicit DELETE of the
+    // old row must fire the AFTER DELETE undo trigger (recursive_triggers=ON).
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
+    try database.storeResolverText(nh, resolver, "url", "new", .v2, 200, tx, 1700000200);
+    {
+        const cur = (try resolverTextValue(allocator, &database, nh, "url")).?;
+        defer allocator.free(cur);
+        try testing.expectEqualStrings("new", cur);
+    }
+
+    // Reorg to 150: the overwrite is reversed; the record (created 100 ≤ 150) keeps "old".
+    try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
+    const restored = (try resolverTextValue(allocator, &database, nh, "url")) orelse return error.RecordVanished;
+    defer allocator.free(restored);
+    try testing.expectEqualStrings("old", restored);
+    std.debug.print("✓ resolver text INSERT-OR-REPLACE overwrite reversed on reorg (new→old)\n", .{});
+}
+
+test "reorg undo-log: reverse_records overwrite reversed + post-N insert removed" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const addr_x = try Address.fromHex("0x00000000000000000000000000000000000000a1");
+    const addr_y = try Address.fromHex("0x00000000000000000000000000000000000000a2");
+    const nh1 = try namehash(allocator, "one.eth");
+    const nh2 = try namehash(allocator, "two.eth");
+    const tx = try Hash.fromHex("0x0000000000000000000000000000000000000000000000000000000000000abc");
+
+    // X → one.eth @100 (insert), then X → two.eth @200 (in-place overwrite via upsert).
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 100);
+    try database.upsertReverseRecord(.v2, addr_x, nh1, 100, tx, 0, 1700000100);
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
+    try database.upsertReverseRecord(.v2, addr_x, nh2, 200, tx, 0, 1700000200);
+    // Y → some.eth @200 (insert created after the reorg point).
+    try database.upsertReverseRecord(.v2, addr_y, nh1, 200, tx, 0, 1700000200);
+
+    try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
+
+    // X reverted to one.eth (created 100); Y (created 200) removed.
+    const xnh = (try reverseNamehashHex(allocator, &database, addr_x)) orelse return error.RecordVanished;
+    defer allocator.free(xnh);
+    var nh1_buf: [66]u8 = undefined;
+    try testing.expectEqualStrings(nh1.toHexBuf(&nh1_buf), xnh);
+    try testing.expect((try reverseNamehashHex(allocator, &database, addr_y)) == null);
+    std.debug.print("✓ reverse_records overwrite reversed + post-N insert removed\n", .{});
+}
+
+test "reorg undo-log: resolver_authorisations post-N insert removed" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const nh = try namehash(allocator, "foo.eth");
+    const resolver = try Address.fromHex("0x00000000000000000000000000000000000000cc");
+    const owner = try Address.fromHex("0x00000000000000000000000000000000000000aa");
+    const target = try Address.fromHex("0x00000000000000000000000000000000000000bb");
+    const tx = try Hash.fromHex("0x0000000000000000000000000000000000000000000000000000000000000abc");
+
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
+    try database.storeResolverAuthorisation(.v2, nh, resolver, owner, target, true, 200, tx, 0, 1700000200);
+    try testing.expectEqual(@as(i64, 1), try countAll(&database, "resolver_authorisations"));
+
+    try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
+    try testing.expectEqual(@as(i64, 0), try countAll(&database, "resolver_authorisations"));
+    std.debug.print("✓ resolver_authorisations post-N insert removed on reorg\n", .{});
+}
+
+test "reorg undo-log: registrations + registry_entries post-N inserts removed" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const nh_keep = try namehash(allocator, "keep.eth");
+    const nh_drop = try namehash(allocator, "drop.eth");
+    const registrant = try Address.fromHex("0x00000000000000000000000000000000000000aa");
+    const parent = try Address.fromHex("0x0000000000000000000000000000000000000001");
+    const tx = try Hash.fromHex("0x0000000000000000000000000000000000000000000000000000000000000abc");
+
+    // One registration before the reorg point, one after.
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 100);
+    try database.insertRegistration(.v2, nh_keep, "keep", "eth", registrant, 1700000100, 0, 100, tx, 0, .name_registered);
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
+    try database.insertRegistration(.v2, nh_drop, "drop", "eth", registrant, 1700000200, 0, 200, tx, 1, .name_registered);
+    // A registry_entries row first-seen after the reorg point.
+    _ = try database.upsertRegistryEntrySubregistry(.v2, parent, 7, parent, 200, 1700000200);
+
+    try testing.expectEqual(@as(i64, 2), try countAll(&database, "registrations"));
+    try testing.expectEqual(@as(i64, 1), try countAll(&database, "registry_entries"));
+
+    try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
+
+    // The pre-N registration survives; the post-N one and the post-N registry_entry are gone.
+    try testing.expectEqual(@as(i64, 1), try countAll(&database, "registrations"));
+    try testing.expectEqual(@as(i64, 0), try countAll(&database, "registry_entries"));
+    std.debug.print("✓ registrations + registry_entries post-N inserts removed\n", .{});
+}
+
+test "reorg undo-log: accounts first-seen-after-N removed, pre-N kept" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const a_keep = "0x00000000000000000000000000000000000000a1";
+    const a_drop = "0x00000000000000000000000000000000000000a2";
+
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 100);
+    try database.upsertAccount(.v2, a_keep, 100, 1700000100);
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
+    try database.upsertAccount(.v2, a_drop, 200, 1700000200);
+
+    try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
+
+    const keep = try database.getAccount(a_keep);
+    try testing.expect(keep != null);
+    if (keep) |k| {
+        var kk = k;
+        kk.deinit(allocator);
+    }
+    const drop = try database.getAccount(a_drop);
+    try testing.expect(drop == null);
+    std.debug.print("✓ accounts first-seen-after-N removed, pre-N kept\n", .{});
+}
+
+// accounts has no `protocol` column, so it's captured via the single-row reorg_active
+// context. A v2 sighting that flips seen_v2 on an address first seen in v1 must be
+// reverted on a v2 reorg, leaving seen_v1 and first_seen intact.
+test "reorg undo-log: accounts seen-flag flip reversed via reorg_active" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const addr = "0x00000000000000000000000000000000000000b7";
+
+    // Block 100: first seen in v1 (seen_v1=1, seen_v2=0, first_seen=100).
+    try lib.storage.reorg_undo.setCursor(&database, .v1, 100);
+    try database.upsertAccount(.v1, addr, 100, 1700000100);
+    // Block 200: seen in v2 → in-place UPDATE flips seen_v2 (captured under reorg_active=v2@200).
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
+    try database.upsertAccount(.v2, addr, 200, 1700000200);
+    {
+        const mid = (try database.getAccount(addr)).?;
+        var m = mid;
+        defer m.deinit(allocator);
+        try testing.expect(m.seen_v2);
+    }
+
+    // Reorg v2 to 150: the seen_v2 flip is reversed; seen_v1 + first_seen survive.
+    try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
+    const after = (try database.getAccount(addr)) orelse return error.AccountVanished;
+    var aft = after;
+    defer aft.deinit(allocator);
+    try testing.expect(aft.seen_v1);
+    try testing.expect(!aft.seen_v2);
+    try testing.expectEqual(@as(u64, 100), aft.first_seen_block);
+    std.debug.print("✓ accounts seen_v2 flip reversed on v2 reorg (seen_v1 + first_seen intact)\n", .{});
+}
+
+// Regression for the audit's data-loss bug: rollback is PER-protocol and independent,
+// so a v1 rollback must NOT delete an account that only v2 ever saw (v2 is still synced).
+test "reorg undo-log: per-protocol rollback preserves the other protocol's accounts" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const v2_only = "0x00000000000000000000000000000000000000e1";
+
+    // First seen ONLY by v2 at block 120 (after the v1 rollback point 100).
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 120);
+    try database.upsertAccount(.v2, v2_only, 120, 1700000120);
+
+    // An INDEPENDENT v1 rollback to 100 must leave the v2-only account untouched.
+    try lib.storage.sync.rollbackToBlock(&database, .v1, 100);
+
+    const acc = (try database.getAccount(v2_only)) orelse return error.V2AccountWronglyDeleted;
+    var a = acc;
+    defer a.deinit(allocator);
+    try testing.expect(a.seen_v2);
+    std.debug.print("✓ per-protocol rollback preserves the other protocol's accounts (no cross-protocol delete)\n", .{});
+}
+
+// Shared address first seen by v2@200 then v1@250; a v2 reorg to 150 must clear ONLY
+// v2's flag and keep the row (v1 never rolled back) — no data loss.
+test "reorg undo-log: shared account — v2 reorg clears only seen_v2, keeps the row" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const addr = "0x00000000000000000000000000000000000000e2";
+
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
+    try database.upsertAccount(.v2, addr, 200, 1700000200); // 'I' tagged v2@200
+    try lib.storage.reorg_undo.setCursor(&database, .v1, 250);
+    try database.upsertAccount(.v1, addr, 250, 1700000250); // 'U' tagged v1@250 (sets seen_v1)
+
+    try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
+
+    const acc = (try database.getAccount(addr)) orelse return error.SharedAccountWronglyDeleted;
+    var a = acc;
+    defer a.deinit(allocator);
+    try testing.expect(a.seen_v1); // v1 sighting survives (v1 not rolled back)
+    try testing.expect(!a.seen_v2); // v2 sighting reverted
+    std.debug.print("✓ shared account: v2 reorg clears only seen_v2, keeps seen_v1 (no data loss)\n", .{});
+}
+
+// v1_controllers drives which contracts get indexed (getActiveControllers). A reorged-out
+// ControllerAdded/Removed must be wound back: added-after-N dropped, removed-after-N reactivated.
+test "reorg undo-log: v1_controllers wound back on reorg" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const c_old = try Address.fromHex("0x00000000000000000000000000000000000000c1");
+    const c_new = try Address.fromHex("0x00000000000000000000000000000000000000c2");
+    const tx = "0x0000000000000000000000000000000000000000000000000000000000000abc";
+
+    // c_old added @100 (pre-N), removed @200 (after N=150); c_new added @200 (after N).
+    // The cursor is set per event (as the live indexer does) so the undo-log captures.
+    try lib.storage.reorg_undo.setCursor(&database, .v1, 100);
+    try lib.storage.v1_controllers.addController(&database, c_old, 100, tx);
+    try lib.storage.reorg_undo.setCursor(&database, .v1, 200);
+    try lib.storage.v1_controllers.removeController(&database, c_old, 200, tx);
+    try lib.storage.v1_controllers.addController(&database, c_new, 200, tx);
+
+    try lib.storage.sync.rollbackToBlock(&database, .v1, 150);
+
+    const active = try lib.storage.v1_controllers.getActiveControllers(allocator, &database);
+    defer allocator.free(active);
+    var has_old = false;
+    var has_new = false;
+    for (active) |a| {
+        if (std.mem.eql(u8, &a.bytes, &c_old.bytes)) has_old = true;
+        if (std.mem.eql(u8, &a.bytes, &c_new.bytes)) has_new = true;
+    }
+    try testing.expect(has_old); // removal @200 reverted → active again as of 150
+    try testing.expect(!has_new); // added @200 → dropped by rollback
+    std.debug.print("✓ v1_controllers wound back on reorg (reactivate removed-after-N, drop added-after-N)\n", .{});
+}
+
+// The hard case the column-predicate fix could not handle: a controller removed THEN
+// re-added straddling N. The undo-log captures each mutation, so rollback restores the
+// exact as-of-N state (removed), not the post-readd state (active).
+test "reorg undo-log: v1_controllers remove-then-readd straddling N restores removed state" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const c = try Address.fromHex("0x00000000000000000000000000000000000000c3");
+    const tx = "0x0000000000000000000000000000000000000000000000000000000000000abc";
+
+    // added@100, removed@200, re-added@300; reorg to 250 → as-of-250 state is REMOVED.
+    try lib.storage.reorg_undo.setCursor(&database, .v1, 100);
+    try lib.storage.v1_controllers.addController(&database, c, 100, tx);
+    try lib.storage.reorg_undo.setCursor(&database, .v1, 200);
+    try lib.storage.v1_controllers.removeController(&database, c, 200, tx);
+    try lib.storage.reorg_undo.setCursor(&database, .v1, 300);
+    try lib.storage.v1_controllers.addController(&database, c, 300, tx); // re-add
+
+    try lib.storage.sync.rollbackToBlock(&database, .v1, 250);
+
+    const active = try lib.storage.v1_controllers.getActiveControllers(allocator, &database);
+    defer allocator.free(active);
+    var has_c = false;
+    for (active) |a| {
+        if (std.mem.eql(u8, &a.bytes, &c.bytes)) has_c = true;
+    }
+    try testing.expect(!has_c); // re-add@300 reverted → controller is removed/inactive at 250
+    std.debug.print("✓ v1_controllers remove-then-readd straddle restores as-of-N removed state\n", .{});
 }
