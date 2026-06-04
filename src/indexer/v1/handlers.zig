@@ -13,6 +13,7 @@ const Indexer = @import("../indexer.zig").Indexer;
 const utils = @import("../utils.zig");
 const dns = @import("../../utils/dns.zig");
 const names_storage = @import("../../storage/names.zig");
+const ens_normalize = @import("../../utils/ens_normalize.zig");
 const v1_names = @import("../../utils/v1_names.zig");
 
 /// Returns true when the log came from the legacy pre-2020 ENS Registry
@@ -243,7 +244,7 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
         };
         defer name.deinit(self.allocator);
 
-        names_storage.insertName(self.database, name) catch |err| {
+        self.insertName(name) catch |err| {
             std.log.warn("Failed to create subdomain name {s}: {}", .{ full_name, err });
         };
     }
@@ -910,7 +911,7 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, protocol: models.Prot
         if (self.write_buffer.active) {
             try self.write_buffer.insertName(name_record);
         } else {
-            try names_storage.insertName(self.database, name_record);
+            try self.insertName(name_record);
         }
 
         // Canonical V1 registration row. V1 has only this one event type per
@@ -1021,7 +1022,7 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, protocol: models.Prot
         if (self.write_buffer.active) {
             try self.write_buffer.insertName(name_record);
         } else {
-            try names_storage.insertName(self.database, name_record);
+            try self.insertName(name_record);
         }
 
         // Canonical registrations row (same as the label-known path). Placeholder
@@ -1241,7 +1242,7 @@ fn writeControllerRegistration(
         const full_name = std.fmt.allocPrint(self.allocator, "{s}.eth", .{name}) catch null;
         if (full_name) |fn_str| {
             defer self.allocator.free(fn_str);
-            names_storage.updateNameLabel(self.database, namehash, name, fn_str) catch |err| {
+            names_storage.updateNameLabel(self.database, namehash, name, fn_str, ens_normalize.nameIsNormalized(self.allocator, fn_str)) catch |err| {
                 std.log.debug("updateNameLabel failed (placeholder will heal via backfillMissingEth2LDNames): {}", .{err});
             };
         }
@@ -1655,7 +1656,7 @@ fn healLabelsFromDNSName(self: *Indexer, name_bytes: []const u8, wrapped_node: H
                 (existing.name != null and std.mem.indexOf(u8, existing.name.?, "[") != null);
 
             if (needs_label_heal or needs_name_heal) {
-                try names_storage.updateNameLabel(self.database, wrapped_node, labels[0], name_str);
+                try names_storage.updateNameLabel(self.database, wrapped_node, labels[0], name_str, ens_normalize.nameIsNormalized(self.allocator, name_str));
                 std.log.info("Healed name from NameWrapped DNS: {s}", .{name_str});
             }
         }
@@ -1724,7 +1725,7 @@ fn healLabelsFromDNSName(self: *Indexer, name_bytes: []const u8, wrapped_node: H
                 (existing.label != null and existing.label.?[0] == '[');
 
             if (needs_heal) {
-                try names_storage.updateNameLabel(self.database, node_hash, label, level_name);
+                try names_storage.updateNameLabel(self.database, node_hash, label, level_name, ens_normalize.nameIsNormalized(self.allocator, level_name));
                 std.log.info("Healed parent name from NameWrapped DNS: {s} (label={s})", .{ level_name, label });
             }
         }

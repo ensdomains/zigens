@@ -21,6 +21,7 @@ const v1_indexing = @import("v1/indexing.zig");
 const handlers_v1 = @import("v1/handlers.zig");
 const backfill_mod = @import("v1/backfill.zig");
 const reorg_undo = @import("../storage/reorg_undo.zig");
+const ens_normalize = @import("../utils/ens_normalize.zig");
 const replay_mod = @import("replay.zig");
 pub const utils = @import("utils.zig");
 const WriteBuffer = @import("write_buffer.zig").WriteBuffer;
@@ -805,6 +806,17 @@ pub const Indexer = struct {
         }
 
         std.log.info("{s} indexer stopped.", .{protocol.toString()});
+    }
+
+    /// Persist a name with its ENSIP-15 `is_normalized` flag computed from `name.name`.
+    /// Single chokepoint for direct (non-buffered) inserts so every path records the
+    /// flag; the V1 write buffer computes it at buffer time (see WriteBuffer.insertName).
+    /// Keeping the computation in the indexer layer keeps the storage layer free of the
+    /// normalization dependency.
+    pub fn insertName(self: *Indexer, name: models.Name) !void {
+        var n = name;
+        n.is_normalized = ens_normalize.nameIsNormalized(self.allocator, n.name);
+        try self.database.insertName(n);
     }
 
     /// Record the block currently being processed so the reorg undo-log tags captured

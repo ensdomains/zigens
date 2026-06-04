@@ -1150,3 +1150,203 @@ test "reorg undo-log: v1_controllers remove-then-readd straddling N restores rem
     try testing.expect(!has_c); // re-add@300 reverted → controller is removed/inactive at 250
     std.debug.print("✓ v1_controllers remove-then-readd straddle restores as-of-N removed state\n", .{});
 }
+
+// ============================================================================
+// Reorg undo-log: the reconcile invariant (#9, RPC-free)
+//
+// The property the whole undo-log exists to guarantee: rolling a DB back to block
+// N must leave it byte-identical to a DB that only ever indexed up to N. This builds
+// two DBs from the same baseline (≤ N), drives one past N and rolls it back, and
+// diffs EVERY chain-derived table. It's the regression guard that locks the undo-log:
+// a future change that breaks any table's rollback fails here.
+// ============================================================================
+
+// Chain-derived tables to reconcile. Operational/cache tables (sync_state, block_hashes,
+// reorg_*, rainbow_*, v1_labels, backfill_status, unknown_labels, temp_*, token_observers)
+// are excluded — they're not part of the indexed entity state.
+const RECONCILE_TABLES = [_][]const u8{
+    "names",                "registries",              "registrations",           "registry_entries",
+    "resolvers",            "resolver_addresses",      "resolver_contenthashes",  "resolver_texts",
+    "resolver_aliases",     "resolver_pubkeys",        "resolver_abis",           "resolver_names",
+    "resolver_interfaces",  "resolver_versions",       "resolver_metadata",       "resolver_approvals",
+    "resolver_dns_records", "resolver_dns_zonehashes", "resolver_authorisations", "reverse_records",
+    "approvals",            "eac_roles",               "accounts",                "v1_controllers",
+    "name_history",
+};
+
+// Volatile columns excluded from the content comparison: the autoincrement id (insertion
+// order differs) and the wall-clock columns set via std.time.timestamp() on write
+// (names.updated_at, and the internal timestamps of approvals/eac_roles/resolvers/
+// resolver_metadata). Deterministic block-derived columns (block_number, *_block, expiry,
+// registered_at, first_seen_timestamp, …) ARE compared.
+const RECONCILE_IGNORE = [_][]const u8{ "id", "created_at", "updated_at", "set_at", "timestamp" };
+
+fn reconcileIgnored(col: []const u8) bool {
+    for (RECONCILE_IGNORE) |ig| if (std.mem.eql(u8, ig, col)) return true;
+    return false;
+}
+
+/// Canonical dump of a table's content: every non-volatile column, every row, ordered
+/// by full content so two DBs built from the same events produce identical bytes.
+fn dumpTable(allocator: std.mem.Allocator, db: *Database, table: []const u8) ![]u8 {
+    var cols: std.ArrayList([]u8) = .{};
+    defer {
+        for (cols.items) |c| allocator.free(c);
+        cols.deinit(allocator);
+    }
+    {
+        const pragma = try std.fmt.allocPrint(allocator, "PRAGMA table_info(\"{s}\")", .{table});
+        defer allocator.free(pragma);
+        var pq = try lib.storage.Query.init(db, pragma);
+        defer pq.deinit();
+        while (try pq.step()) {
+            const name = pq.getTextSlice(1) orelse continue;
+            if (reconcileIgnored(name)) continue;
+            try cols.append(allocator, try allocator.dupe(u8, name));
+        }
+    }
+
+    var sql: std.ArrayList(u8) = .{};
+    defer sql.deinit(allocator);
+    try sql.appendSlice(allocator, "SELECT ");
+    for (cols.items, 0..) |c, i| {
+        if (i > 0) try sql.appendSlice(allocator, ", ");
+        try sql.writer(allocator).print("\"{s}\"", .{c});
+    }
+    try sql.writer(allocator).print(" FROM \"{s}\" ORDER BY ", .{table});
+    for (cols.items, 0..) |c, i| {
+        if (i > 0) try sql.appendSlice(allocator, ", ");
+        try sql.writer(allocator).print("\"{s}\"", .{c});
+    }
+
+    var out: std.ArrayList(u8) = .{};
+    errdefer out.deinit(allocator);
+    var q = try lib.storage.Query.init(db, sql.items);
+    defer q.deinit();
+    while (try q.step()) {
+        for (cols.items, 0..) |_, i| {
+            const v = q.getTextSlice(i) orelse "\x00NULL";
+            try out.appendSlice(allocator, v);
+            try out.append(allocator, 0x1f); // unit separator
+        }
+        try out.append(allocator, '\n');
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// True if every reconciled table is content-identical between the two DBs.
+fn reconcileEqual(allocator: std.mem.Allocator, db_a: *Database, db_b: *Database, print_on_diff: bool) !bool {
+    for (RECONCILE_TABLES) |table| {
+        const a = try dumpTable(allocator, db_a, table);
+        defer allocator.free(a);
+        const b = try dumpTable(allocator, db_b, table);
+        defer allocator.free(b);
+        if (!std.mem.eql(u8, a, b)) {
+            if (print_on_diff) {
+                std.debug.print("reconcile MISMATCH in '{s}':\n  expected (clean):\n{s}\n  actual (rolled-back):\n{s}\n", .{ table, a, b });
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+// Mutations at or before N=150 — the canonical state a clean sync would produce at 150.
+fn applyReconcileBaseline(allocator: std.mem.Allocator, db: *Database) !void {
+    const a = try Address.fromHex("0x00000000000000000000000000000000000000aa");
+    const b = try Address.fromHex("0x00000000000000000000000000000000000000bb");
+    const resolver = try Address.fromHex("0x00000000000000000000000000000000000000cc");
+    const c1 = try Address.fromHex("0x00000000000000000000000000000000000000c1");
+    const nh_foo = try namehash(allocator, "foo.eth");
+    const tx = try Hash.fromHex("0x0000000000000000000000000000000000000000000000000000000000000abc");
+    const txs = "0x0000000000000000000000000000000000000000000000000000000000000abc";
+    const acc = "0x00000000000000000000000000000000000000a1";
+
+    try lib.storage.reorg_undo.setCursor(db, .v2, 100);
+    var n = try makeReorgName(allocator, "foo.eth", .v2, a, 100);
+    defer n.deinit(allocator);
+    try db.insertName(n);
+    try db.storeResolverText(nh_foo, resolver, "url", "a", .v2, 100, tx, 1700000100);
+    try db.upsertAccount(.v2, acc, 100, 1700000100);
+
+    try lib.storage.reorg_undo.setCursor(db, .v1, 110);
+    try lib.storage.v1_controllers.addController(db, c1, 110, txs);
+
+    try lib.storage.reorg_undo.setCursor(db, .v2, 120);
+    try db.updateNameOwner(nh_foo, b); // in-place update, ≤ N
+
+    try lib.storage.reorg_undo.setCursor(db, .v2, 130);
+    try db.upsertReverseRecord(.v2, a, nh_foo, 130, tx, 0, 1700000130);
+
+    try lib.storage.reorg_undo.setCursor(db, .v2, 140);
+    try db.insertRegistration(.v2, nh_foo, "foo", "eth", a, 1700000140, 0, 140, tx, 0, .name_registered);
+}
+
+// Mutations after N=150 — must be fully reversed by the rollback.
+fn applyReconcileReorged(allocator: std.mem.Allocator, db: *Database) !void {
+    const a = try Address.fromHex("0x00000000000000000000000000000000000000aa");
+    const cc_owner = try Address.fromHex("0x00000000000000000000000000000000000000dd");
+    const resolver = try Address.fromHex("0x00000000000000000000000000000000000000cc");
+    const c1 = try Address.fromHex("0x00000000000000000000000000000000000000c1");
+    const nh_foo = try namehash(allocator, "foo.eth");
+    const nh_bar = try namehash(allocator, "bar.eth");
+    const tx = try Hash.fromHex("0x0000000000000000000000000000000000000000000000000000000000000abc");
+    const txs = "0x0000000000000000000000000000000000000000000000000000000000000abc";
+    const acc_z = "0x00000000000000000000000000000000000000a2";
+
+    try lib.storage.reorg_undo.setCursor(db, .v2, 200);
+    try db.updateNameOwner(nh_foo, cc_owner); // owner B→new (revert to B)
+    try db.storeResolverText(nh_foo, resolver, "url", "b", .v2, 200, tx, 1700000200); // overwrite (revert to "a")
+    try db.upsertAccount(.v2, acc_z, 200, 1700000200); // new account (remove)
+    var bar = try makeReorgName(allocator, "bar.eth", .v2, a, 200); // new name (remove)
+    defer bar.deinit(allocator);
+    try db.insertName(bar);
+    try db.insertRegistration(.v2, nh_bar, "bar", "eth", a, 1700000200, 0, 200, tx, 1, .name_registered); // new reg (remove)
+    try db.upsertReverseRecord(.v2, a, nh_bar, 200, tx, 0, 1700000200); // reverse overwrite (revert to foo)
+
+    try lib.storage.reorg_undo.setCursor(db, .v1, 210);
+    try lib.storage.v1_controllers.removeController(db, c1, 210, txs); // remove (revert to active)
+}
+
+test "reorg undo-log: rollback(N) equals a clean build at N across all entity tables" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var clean = try Database.init(allocator, ":memory:");
+    defer clean.deinit();
+    try applyReconcileBaseline(allocator, &clean);
+
+    var reorged = try Database.init(allocator, ":memory:");
+    defer reorged.deinit();
+    try applyReconcileBaseline(allocator, &reorged);
+    try applyReconcileReorged(allocator, &reorged);
+    // Both protocols roll back (v1 controller + v2 entities), as a real chain reorg would.
+    try lib.storage.sync.rollbackToBlock(&reorged, .v2, 150);
+    try lib.storage.sync.rollbackToBlock(&reorged, .v1, 150);
+
+    try testing.expect(try reconcileEqual(allocator, &clean, &reorged, true));
+    std.debug.print("✓ rollback(N) == clean build at N across all 25 entity tables\n", .{});
+}
+
+// Negative control: prove the comparator actually detects drift (so the invariant
+// test above can't pass vacuously).
+test "reorg undo-log: reconcile comparator detects planted drift" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var a = try Database.init(allocator, ":memory:");
+    defer a.deinit();
+    try applyReconcileBaseline(allocator, &a);
+
+    var b = try Database.init(allocator, ":memory:");
+    defer b.deinit();
+    try applyReconcileBaseline(allocator, &b);
+    // Plant one extra in-place change in b only.
+    try lib.storage.reorg_undo.setCursor(&b, .v2, 145);
+    try b.updateNameOwner(try namehash(allocator, "foo.eth"), try Address.fromHex("0x00000000000000000000000000000000000000ee"));
+
+    try testing.expect(!(try reconcileEqual(allocator, &a, &b, false)));
+    std.debug.print("✓ reconcile comparator detects planted drift (negative control)\n", .{});
+}

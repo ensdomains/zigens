@@ -9,6 +9,7 @@ const Hash = @import("../types/hash.zig").Hash;
 const Address = @import("../types/address.zig").Address;
 const models = @import("../types/models.zig");
 const names_storage = @import("../storage/names.zig");
+const ens_normalize = @import("../utils/ens_normalize.zig");
 const Rainbow = @import("../rainbow/rainbow.zig").Rainbow;
 const constants = @import("../constants.zig");
 const Keccak256 = std.crypto.hash.sha3.Keccak256;
@@ -357,7 +358,9 @@ pub const LabelBackfill = struct {
                 try self.allocator.dupe(u8, label_text);
             defer self.allocator.free(full_name);
 
-            try names_storage.updateNameLabel(self.database, namehash, label_text, full_name);
+            // Now that the plaintext name is known, recompute the ENSIP-15 flag.
+            const is_norm = ens_normalize.nameIsNormalized(self.allocator, full_name);
+            try names_storage.updateNameLabel(self.database, namehash, label_text, full_name, is_norm);
             std.log.debug("Healed subdomain label: {s}", .{full_name});
         }
         // If name doesn't exist (shouldn't happen with new indexing), skip silently

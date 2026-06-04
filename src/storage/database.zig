@@ -201,6 +201,15 @@ pub const Database = struct {
     /// the "duplicate column name" error when the column already exists, so
     /// each migration block is safe to re-run.
     fn migrate(self: *Database) !void {
+        // Add the `is_normalized` column to pre-existing `names` tables. Idempotent:
+        // exec() swallows the "duplicate column" error on DBs that already have it
+        // (fresh DBs get it from schema.sql). DEFAULT 1 keeps existing rows visible
+        // until the indexer recomputes the flag on the next write/heal of each name.
+        if (self.hasTable("names")) {
+            try self.exec("ALTER TABLE names ADD COLUMN is_normalized INTEGER NOT NULL DEFAULT 1");
+            try self.exec("CREATE INDEX IF NOT EXISTS idx_names_is_normalized ON names(is_normalized)");
+        }
+
         // `loadSchemaFiles` short-circuits when `names` exists (to avoid
         // multi-minute index rebuilds on large DBs), so any *new* tables
         // introduced after the original schema must be created here too.
@@ -615,7 +624,6 @@ pub const Database = struct {
     pub const upsertReverseRecord = resolvers.upsertReverseRecord;
     pub const getReverseRecordNamehash = resolvers.getReverseRecordNamehash;
     pub const updateNameResolver = names.updateNameResolver;
-    pub const updateResolvedAddress = names.updateResolvedAddress;
     pub const updateResolvedAddressToNull = names.updateResolvedAddressToNull;
     pub const recursivelyGcEmptyDomain = names.recursivelyGcEmptyDomain;
     pub const updateNameTTL = names.updateNameTTL;
@@ -625,7 +633,6 @@ pub const Database = struct {
     pub const deleteNameByNamehash = names.deleteNameByNamehash;
     pub const updateNameTokenIdByNamehash = names.updateNameTokenIdByNamehash;
     pub const getNamesByOwner = names.getNamesByOwner;
-    pub const getNamesByRegistrant = names.getNamesByRegistrant;
     pub const getAllNames = names.getAllNames;
     pub const getAllNamesWithOrder = names.getAllNamesWithOrder;
     pub const getFilteredNames = names.getFilteredNames;
@@ -637,11 +644,9 @@ pub const Database = struct {
     pub const getRegistry = names.getRegistry;
     pub const countDirectSubdomains = names.countDirectSubdomains;
     pub const hasDirectSubdomains = names.hasDirectSubdomains;
-    pub const batchCountDirectSubdomains = names.batchCountDirectSubdomains;
     pub const getSubdomains = names.getSubdomains;
     pub const updateRegistryPlaceholderName = names.updateRegistryPlaceholderName;
     pub const updatePlaceholderEventsByName = names.updatePlaceholderEventsByName;
-    pub const getTotalNameCount = names.getTotalNameCount;
     pub const getFilteredNameCount = names.getFilteredNameCount;
 
     // Resolver module (11 functions)
@@ -709,7 +714,6 @@ pub const Database = struct {
     pub const rollbackToBlock = sync.rollbackToBlock;
     pub const pruneOldBlockHashes = sync.pruneOldBlockHashes;
     pub const checkIntegrity = sync.checkIntegrity;
-    pub const isSubregistryKnown = sync.isSubregistryKnown;
     pub const registerSubregistry = sync.registerSubregistry;
     pub const registerResolver = sync.registerResolver;
     pub const discoverAndGetSubregistries = sync.discoverAndGetSubregistries;
@@ -731,10 +735,8 @@ pub const Database = struct {
     pub const getEventsByDomain = events.getEventsByDomain;
     pub const insertApproval = events.insertApproval;
     pub const updateApprovalTokenId = events.updateApprovalTokenId;
-    pub const getTotalEventCount = events.getTotalEventCount;
     pub const getEventCount = events.getEventCount;
     pub const countEventsByNamehash = events.countEventsByNamehash;
-    pub const countEventsByDomain = events.countEventsByDomain;
 
     // Webhooks module (3 functions)
     pub const insertWebhook = webhooks.insertWebhook;
@@ -793,6 +795,4 @@ pub const Database = struct {
     pub const getAccount = accounts.getAccount;
     pub const getAccountCount = accounts.getAccountCount;
     pub const getFilteredAccounts = accounts.getFilteredAccounts;
-    pub const getFilteredAccountCount = accounts.getFilteredAccountCount;
-    pub const backfillAccounts = accounts.backfillFromExistingData;
 };

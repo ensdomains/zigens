@@ -154,6 +154,10 @@ CREATE TABLE IF NOT EXISTS names (
   -- not write this column — V2 readers fall back to the query-time resolver
   -- lookup (see api/builders/impl.zig:domainResolvedAddressHandler).
   resolved_address TEXT DEFAULT NULL,
+  -- ENSIP-15 normalization status of `name`, computed at ingest. 1 = normalized,
+  -- 0 = non-normalized or unknown label. Default-filtered out of GraphQL listings
+  -- unless includeUnnormalized is passed (mirrors is_reachable).
+  is_normalized INTEGER NOT NULL DEFAULT 1,
   UNIQUE(protocol, namehash)
 );
 
@@ -176,6 +180,7 @@ CREATE INDEX IF NOT EXISTS idx_names_registrant ON names(registrant);
 CREATE INDEX IF NOT EXISTS idx_names_parent_namehash ON names(parent_namehash);
 CREATE INDEX IF NOT EXISTS idx_names_is_reachable ON names(protocol, is_reachable);
 CREATE INDEX IF NOT EXISTS idx_names_registry_reachable ON names(protocol, registry, is_reachable);
+CREATE INDEX IF NOT EXISTS idx_names_is_normalized ON names(is_normalized);
 
 -- Partial index targeting Domain.subdomainsCount / subdomainCount / hasDirectSubdomains
 -- / getSubdomains queries (see src/storage/names.zig:SUBDOMAIN_GC_FILTER for the matching

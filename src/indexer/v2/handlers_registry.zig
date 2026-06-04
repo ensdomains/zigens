@@ -81,7 +81,7 @@ pub fn processOrphanedRegistration(
         .v1_label_hash = null,
     };
 
-    try self.database.insertName(name);
+    try self.insertName(name);
 
     // Store event
     var owner_hex_buf: [42]u8 = undefined;
@@ -371,7 +371,7 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
         .v1_label_hash = null,
     };
 
-    try self.database.insertName(name);
+    try self.insertName(name);
 
     // Log-index-ordered dispatch means SubregistryUpdated/ResolverUpdated for a newly-minted
     // name can be processed before LabelRegistered/NameRegistered (the on-protocol tx emits them
@@ -636,7 +636,7 @@ pub fn handleETHNameRegistered(self: *Indexer, protocol: models.Protocol, log: r
         .v1_label_hash = null,
     };
 
-    try self.database.insertName(name);
+    try self.insertName(name);
 
     // If subregistry was deployed at registration, store it in the registries table
     if (!subregistry.isZero()) {
@@ -1328,7 +1328,7 @@ pub fn handleLabelRegistered(self: *Indexer, protocol: models.Protocol, log: rpc
         .v1_label_hash = preserved_v1_label_hash_hex,
     };
 
-    try self.database.insertName(name);
+    try self.insertName(name);
 
     if (is_migration) {
         // Per-name migration log moved to debug — a Sepolia sync produces thousands of
@@ -1509,7 +1509,7 @@ pub fn handleLabelReserved(self: *Indexer, protocol: models.Protocol, log: rpc.L
         .v1_label_hash = null,
     };
 
-    try self.database.insertName(name);
+    try self.insertName(name);
 
     var sender_hex_buf: [42]u8 = undefined;
     const sender_hex = sender.toHexBuf(&sender_hex_buf);

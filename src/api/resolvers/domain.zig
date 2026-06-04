@@ -87,6 +87,8 @@ const ParsedDomainFilter = struct {
     expiry_lte: ?i64 = null,
     migrated: ?bool = null,
     include_unreachable: ?bool = null,
+    is_normalized: ?bool = null,
+    include_unnormalized: ?bool = null,
 
     /// Frees the heap-allocated slice fields (`*_in` lists) populated by the
     /// parser. Scalar fields point into the caller-owned GraphQL arg buffer
@@ -184,7 +186,9 @@ fn parseDomainWhere(field: *const parser.Field, allocator: std.mem.Allocator) !P
             common.matchIntArg(a, "expiryDate_lt", &out.expiry_lt) or
             common.matchIntArg(a, "expiryDate_lte", &out.expiry_lte) or
             common.matchBoolArg(a, "isMigrated", &out.migrated) or
-            common.matchBoolArg(a, "includeUnreachable", &out.include_unreachable);
+            common.matchBoolArg(a, "includeUnreachable", &out.include_unreachable) or
+            common.matchBoolArg(a, "isNormalized", &out.is_normalized) or
+            common.matchBoolArg(a, "includeUnnormalized", &out.include_unnormalized);
     }
     return out;
 }
@@ -238,6 +242,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
     const filter_migrated = parsed.migrated;
 
     const include_unreachable = parsed.include_unreachable orelse false;
+    const include_unnormalized = parsed.include_unnormalized orelse false;
 
     const order_by = parser.getStringArg(field, "orderBy", null);
     const order_dir_parsed = common.parseOrderDirection(field, db.OrderDir, .desc);
@@ -281,6 +286,19 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
                 defer name.deinit(allocator);
                 return .{ .json = try allocator.dupe(u8, "[]") };
             }
+            // Normalization filter — mirror getFilteredNames so this fast-path matches
+            // the listing contract (domainConnection / domains both default-hide
+            // non-normalized names). An explicit isNormalized wins; otherwise hide
+            // non-normalized unless includeUnnormalized. (Singular domain(id:) does NOT
+            // apply this — exact id/namehash lookups still return non-normalized names.)
+            const norm_ok = if (parsed.is_normalized) |want|
+                (name.is_normalized == want)
+            else
+                (include_unnormalized or name.is_normalized);
+            if (!norm_ok) {
+                defer name.deinit(allocator);
+                return .{ .json = try allocator.dupe(u8, "[]") };
+            }
             defer name.deinit(allocator);
 
             const name_json = try builders.buildDomainJson(name, field.selections, .{
@@ -317,7 +335,8 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
         filter_subdomain_count_gt != null or filter_subdomain_count_lt != null or
         filter_expiry_gt != null or filter_expiry_gte != null or
         filter_expiry_lt != null or filter_expiry_lte != null or
-        filter_migrated != null or include_unreachable;
+        filter_migrated != null or include_unreachable or
+        include_unnormalized or parsed.is_normalized != null;
 
     // All filters pushed to DB - no need to over-fetch
     const fetch_limit: u32 = first;
@@ -366,6 +385,8 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
             .subdomain_count_gt = filter_subdomain_count_gt,
             .subdomain_count_lt = filter_subdomain_count_lt,
             .include_unreachable = include_unreachable,
+            .include_unnormalized = include_unnormalized,
+            .is_normalized = parsed.is_normalized,
         }, @intCast(skip), fetch_limit, order_dir, sort_field)
     else
         try database.getAllNamesWithOrder(null, @intCast(skip), fetch_limit, order_dir, sort_field);
@@ -462,6 +483,7 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
     const filter_migrated = parsed.migrated;
 
     const include_unreachable = parsed.include_unreachable orelse false;
+    const include_unnormalized = parsed.include_unnormalized orelse false;
 
     const name_filters = db.NameFilters{
         .owner = filter_owner,
@@ -501,6 +523,8 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         .subdomain_count_gt = filter_subdomain_count_gt,
         .subdomain_count_lt = filter_subdomain_count_lt,
         .include_unreachable = include_unreachable,
+        .include_unnormalized = include_unnormalized,
+        .is_normalized = parsed.is_normalized,
     };
 
     const has_filters = filter_name != null or filter_name_in != null or
@@ -521,7 +545,8 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         filter_subdomain_count_gt != null or filter_subdomain_count_lt != null or
         filter_expiry_gt != null or filter_expiry_gte != null or
         filter_expiry_lt != null or filter_expiry_lte != null or
-        filter_migrated != null or include_unreachable;
+        filter_migrated != null or include_unreachable or
+        include_unnormalized or parsed.is_normalized != null;
 
     // Check which top-level fields are requested
     var wants_edges = false;

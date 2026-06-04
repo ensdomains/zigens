@@ -448,7 +448,7 @@ fn replayNewOwner(self: *Indexer, q: *Query) !void {
         };
         defer name.deinit(self.allocator);
 
-        names_storage.insertName(self.database, name) catch |err| {
+        self.insertName(name) catch |err| {
             std.log.debug("Failed to create subdomain name {s}: {}", .{ full_name, err });
         };
     }
@@ -562,7 +562,7 @@ fn replayBaseRegistrarNameReg(self: *Indexer, q: *Query) !void {
             .v1_label_hash = v1_label_hash_hex,
         };
 
-        names_storage.insertName(self.database, name_record) catch |err| {
+        self.insertName(name_record) catch |err| {
             std.log.debug("Failed to create .eth 2LD name {s}: {}", .{ full_name, err });
             self.allocator.free(full_name);
         };

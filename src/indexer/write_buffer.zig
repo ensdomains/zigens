@@ -13,6 +13,7 @@ const Address = @import("../types/address.zig").Address;
 const Database = @import("../storage/database.zig").Database;
 const names_storage = @import("../storage/names.zig");
 const events_storage = @import("../storage/events.zig");
+const ens_normalize = @import("../utils/ens_normalize.zig");
 
 /// Safely convert u64 expiry to i64 for SQLite storage.
 /// Values exceeding i64::max are mapped to 0 (never expires).
@@ -123,6 +124,9 @@ pub const WriteBuffer = struct {
                 .record = try dupeName(self.allocator, name),
             };
         }
+        // Compute the ENSIP-15 flag here (the buffered insert chokepoint) so flushed
+        // V1 names persist it just like the direct-insert path (Indexer.insertName).
+        gop.value_ptr.record.?.is_normalized = ens_normalize.nameIsNormalized(self.allocator, name.name);
     }
 
     /// Buffer an owner update. If the name was INSERT'd this chunk, updates in-place.

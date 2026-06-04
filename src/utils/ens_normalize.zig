@@ -66,14 +66,15 @@ pub fn isNormalized(allocator: std.mem.Allocator, name: []const u8) bool {
     return std.mem.eql(u8, name, normalized);
 }
 
-/// Check if a single label is ENSIP-15 normalized (fast path for indexer).
-/// Rejects labels containing dots, invalid characters, or that would be changed by normalization.
-pub fn isLabelNormalized(allocator: std.mem.Allocator, label: []const u8) bool {
-    if (label.len == 0) return false;
-    if (std.mem.indexOfScalar(u8, label, '.') != null) return false;
-    const normalized = ens.normalize(allocator, label) catch return false;
-    defer allocator.free(normalized);
-    return std.mem.eql(u8, label, normalized);
+/// Normalization status for the indexer's `names.is_normalized` column. False when
+/// the name is null/empty or its label is unknown (`[0x..]` placeholder), else the
+/// ENSIP-15 `name == normalize(name)` check. The single helper every ingest path uses.
+pub fn nameIsNormalized(allocator: std.mem.Allocator, name: ?[]const u8) bool {
+    const n = name orelse return false;
+    if (n.len == 0) return false;
+    // An unhealed labelhash placeholder ("[0x…]") is not a normalized human name.
+    if (std.mem.indexOfScalar(u8, n, '[') != null) return false;
+    return isNormalized(allocator, n);
 }
 
 /// Check if a label contains invalid characters (quick check)
@@ -118,4 +119,56 @@ test "has invalid label chars" {
     try std.testing.expect(hasInvalidLabelChars("fotobank.eth"));
     try std.testing.expect(!hasInvalidLabelChars("fotobank"));
     try std.testing.expect(!hasInvalidLabelChars("vitalik"));
+}
+
+test "nameIsNormalized: the indexer is_normalized column value" {
+    const a = std.testing.allocator;
+    // Normalized human names.
+    try std.testing.expect(nameIsNormalized(a, "nick.eth"));
+    try std.testing.expect(nameIsNormalized(a, "alice.eth"));
+    // Non-normalized: uppercase / mixed case.
+    try std.testing.expect(!nameIsNormalized(a, "Nick.eth"));
+    try std.testing.expect(!nameIsNormalized(a, "VITALIK"));
+    // Unknown / placeholder / empty: never normalized.
+    try std.testing.expect(!nameIsNormalized(a, null));
+    try std.testing.expect(!nameIsNormalized(a, ""));
+    try std.testing.expect(!nameIsNormalized(a, "[af2caa1c…].eth"));
+}
+
+// ENSIP-15 conformance vectors (#18). Curated from the official adraffy/ens-normalize.js
+// validation suite (v2025-09-14, CLDR 47): emoji/ZWJ/ZWNJ sequences, fullwidth + combining
+// (UTS-46) mappings, and ~870 validation-error rules. The FULL 29,643-case suite passes the
+// vendored z_ens_normalize lib with 0 failures (measured 2026-06-02) — see docs; this committed
+// subset is the CI regression guard. Refetch the full suite from the URL in docs to re-verify.
+test "ENSIP-15 normalization vectors (UTS-46 / emoji / ZWJ)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, @embedFile("ens_normalize_vectors.json"), .{});
+    var pass: usize = 0;
+    var fails: usize = 0;
+    for (parsed.value.array.items) |item| {
+        const obj = item.object;
+        const name = obj.get("name").?.string;
+        const is_err = if (obj.get("error")) |e| (e == .bool and e.bool) else false;
+        if (is_err) {
+            if (ens.normalize(a, name)) |_| {
+                std.debug.print("ENSIP-15: expected ERROR but normalized: <{s}>\n", .{name});
+                fails += 1;
+            } else |_| pass += 1;
+        } else {
+            const want = obj.get("norm").?.string;
+            if (ens.normalize(a, name)) |got| {
+                if (std.mem.eql(u8, got, want)) pass += 1 else {
+                    std.debug.print("ENSIP-15: <{s}> want <{s}> got <{s}>\n", .{ name, want, got });
+                    fails += 1;
+                }
+            } else |_| {
+                std.debug.print("ENSIP-15: <{s}> expected <{s}> but errored\n", .{ name, want });
+                fails += 1;
+            }
+        }
+    }
+    std.debug.print("✓ ENSIP-15 vectors: {d}/{d} passed (emoji/ZWJ/ZWNJ/fullwidth/combining + validation rules)\n", .{ pass, pass + fails });
+    try std.testing.expectEqual(@as(usize, 0), fails);
 }

@@ -582,9 +582,8 @@ fn accountDomainsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx
 ///
 /// Returns Registration entities (from the `registrations` table) registered by
 /// this account — matching the schema's `[Registration!]!`. Sourced via
-/// `getRegistrations` filtered by registrant, NOT `getNamesByRegistrant` (which
-/// returns Domain rows from the `names` table); the latter produced a Domain
-/// shape under a Registration-typed field.
+/// `getRegistrations` filtered by registrant (NOT the `names` table, which would
+/// produce a Domain shape under a Registration-typed field).
 fn accountRegistrationsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
     const addr: *const Address = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
@@ -1570,19 +1569,12 @@ fn domainNormalizedNameHandler(ctx: *anyopaque, field: *const parser.Field, nest
     return try nested_ctx.allocator.dupe(u8, "null");
 }
 
-/// Domain nested field handler: isNormalized (computed at query time)
+/// Domain nested field handler: isNormalized. Reads the stored column (computed once
+/// at ingest via ENSIP-15), not recomputed per query.
 fn domainIsNormalizedHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
     _ = field;
     const domain: *const models.Name = @ptrCast(@alignCast(ctx));
-    if (domain.name) |name| {
-        if (ens_normalize.normalize(nested_ctx.allocator, name)) |normalized| {
-            defer nested_ctx.allocator.free(normalized);
-            return try nested_ctx.allocator.dupe(u8, if (std.mem.eql(u8, name, normalized)) "true" else "false");
-        } else |_| {
-            return try nested_ctx.allocator.dupe(u8, "false");
-        }
-    }
-    return try nested_ctx.allocator.dupe(u8, "false");
+    return try nested_ctx.allocator.dupe(u8, if (domain.is_normalized) "true" else "false");
 }
 
 /// Domain nested field handler: subdomainsCount (aggregation)

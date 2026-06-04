@@ -2,7 +2,7 @@
 # This schema defines the GraphQL API for querying ENS V2 data
 
 type Query {
-  """Get a single domain by name or namehash"""
+  """Get a single domain by name or namehash. Exact get: returns the row even if non-normalized (unlike domains/where.name, which default-hide non-normalized names); unreachable rows are still hidden (returns null)."""
   domain(id: String!): Domain
 
   """Get multiple domains with pagination and filtering (legacy offset-based)"""
@@ -820,7 +820,7 @@ type Event {
 
 """Filter criteria for querying domains"""
 input DomainFilter {
-  """Exact name match"""
+  """Exact name match (list filter). Unlike domain(id:), the domains/domainConnection list default-hides non-normalized, unreachable, and synthetic-root rows unless includeUnnormalized / includeUnreachable / isNormalized override."""
   name: String
 
   """Filter by name in list (up to 1000 names)"""
@@ -949,6 +949,20 @@ input DomainFilter {
   ancestors). Default false — set true for audit / debug queries.
   """
   includeUnreachable: Boolean
+
+  """
+  Filter by ENSIP-15 normalization status. When omitted, only normalized
+  names are returned (non-normalized names like `Nick.eth` are hidden by
+  default); set explicitly to `true`/`false` to filter, or pass
+  `includeUnnormalized: true` to include both.
+  """
+  isNormalized: Boolean
+
+  """
+  Include non-normalized domains (e.g. `Nick.eth`, `VITALIK`) that are
+  hidden by default. Default false. Ignored when `isNormalized` is set.
+  """
+  includeUnnormalized: Boolean
 }
 
 """Nested-relation filter on Account (subgraph parity). Used inside `DomainFilter.owner_`."""

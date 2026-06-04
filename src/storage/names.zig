@@ -39,7 +39,7 @@ const SQL_SELECT_NAMES =
     \\       owner, registrant, resolver, token_id, canonical_id, token_version, namehash, expiry,
     \\       registry_locked, migrated, created_block, created_at, registered_at, updated_block, updated_at,
     \\       is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash,
-    \\       is_reachable, unreachable_since, ttl, is_legacy, resolved_address
+    \\       is_reachable, unreachable_since, ttl, is_legacy, resolved_address, is_normalized
     \\FROM names
 ;
 
@@ -50,7 +50,7 @@ const SQL_SELECT_NAMES_SHORT =
     \\SELECT name, label, label_hash, parent_name, parent_namehash, protocol, registry,
     \\       owner, registrant, resolver, token_id, canonical_id, token_version, namehash, expiry,
     \\       registry_locked, migrated, created_block, created_at, registered_at, updated_block, updated_at,
-    \\       is_reachable, unreachable_since, ttl, is_legacy, resolved_address
+    \\       is_reachable, unreachable_since, ttl, is_legacy, resolved_address, is_normalized
     \\FROM names
 ;
 
@@ -140,6 +140,7 @@ fn parseNameRow(q: *Query, allocator: std.mem.Allocator) !models.Name {
             Address.fromHex(s) catch null
         else
             null,
+        .is_normalized = q.getBool(32),
     };
 }
 
@@ -200,6 +201,7 @@ fn parseNameRowShort(q: *Query, allocator: std.mem.Allocator) !models.Name {
             Address.fromHex(s) catch null
         else
             null,
+        .is_normalized = q.getBool(27),
     };
 }
 
@@ -380,8 +382,8 @@ pub fn insertName(db: *Database, name: models.Name) !void {
         \\ registry, owner, registrant, resolver, token_id, canonical_id, token_version, expiry,
         \\ registry_locked, migrated, created_block, created_at, registered_at, updated_block, updated_at,
         \\ is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash,
-        \\ is_reachable, unreachable_since, ttl, is_legacy, resolved_address)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        \\ is_reachable, unreachable_since, ttl, is_legacy, resolved_address, is_normalized)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         \\ON CONFLICT(protocol, namehash) DO UPDATE SET
         \\ name = excluded.name,
         \\ label = excluded.label,
@@ -410,7 +412,8 @@ pub fn insertName(db: *Database, name: models.Name) !void {
         \\ unreachable_since = excluded.unreachable_since,
         \\ ttl = excluded.ttl,
         \\ is_legacy = excluded.is_legacy,
-        \\ resolved_address = COALESCE(excluded.resolved_address, names.resolved_address)
+        \\ resolved_address = COALESCE(excluded.resolved_address, names.resolved_address),
+        \\ is_normalized = excluded.is_normalized
     );
     defer q.deinit();
 
@@ -459,6 +462,7 @@ pub fn insertName(db: *Database, name: models.Name) !void {
     } else {
         try q.bindNull();
     }
+    try q.bindInt(if (name.is_normalized) 1 else 0);
     try q.exec();
 }
 
@@ -517,19 +521,6 @@ pub fn updateNameResolver(db: *Database, namehash: Hash, resolver: Address) !voi
     defer q.deinit();
 
     try q.bindAddressBuf(resolver);
-    try q.bindInt64(std.time.timestamp());
-    try q.bindHashBuf(namehash);
-    try q.exec();
-}
-
-/// V1 NewResolver materialization (subgraph parity): write the resolver's
-/// current `addr(node)` result into `names.resolved_address`. No-op if the
-/// row doesn't exist (consistent with `updateNameResolver`). Lowercase hex.
-pub fn updateResolvedAddress(db: *Database, namehash: Hash, addr: Address) !void {
-    var q = try Query.initCached(db, "UPDATE names SET resolved_address = ?, updated_at = ? WHERE namehash = ?");
-    defer q.deinit();
-
-    try q.bindAddressBuf(addr);
     try q.bindInt64(std.time.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
@@ -795,16 +786,19 @@ pub fn materializePccDomainExpiry(db: *Database) !u32 {
     return q.changes();
 }
 
-/// Update label and name fields for a name record (used by label healing)
-pub fn updateNameLabel(database: *Database, namehash: Hash, label: []const u8, name: []const u8) !void {
+/// Update label and name fields for a name record (used by label healing).
+/// `is_normalized` is recomputed by the caller (indexer layer, which has the
+/// ENSIP-15 lib) now that the plaintext label/name is known.
+pub fn updateNameLabel(database: *Database, namehash: Hash, label: []const u8, name: []const u8, is_normalized: bool) !void {
     var q = try Query.initCached(database,
-        \\UPDATE names SET label = ?, name = ?
+        \\UPDATE names SET label = ?, name = ?, is_normalized = ?
         \\WHERE namehash = ?
     );
     defer q.deinit();
 
     try q.bindText(label);
     try q.bindText(name);
+    try q.bindInt(if (is_normalized) 1 else 0);
     try q.bindHash(namehash);
     try q.exec();
 }
@@ -912,9 +906,9 @@ pub fn getNameByTokenIdAndRegistry(db: *Database, token_id: u256, registry: Addr
 /// subregistry repoint or LabelUnregistered) are filtered out.
 pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Name {
     const sql = if (limit) |l|
-        try std.fmt.allocPrint(db.allocator, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND owner = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' LIMIT {d}", .{l})
+        try std.fmt.allocPrint(db.allocator, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND owner = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' LIMIT {d}", .{l})
     else
-        try db.allocator.dupe(u8, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND owner = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000'");
+        try db.allocator.dupe(u8, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND owner = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000'");
     defer db.allocator.free(sql);
 
     var q = try Query.initCached(db, sql);
@@ -939,7 +933,7 @@ pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Nam
 
 /// Get names by resolver address. Unreachable rows are filtered out.
 pub fn getNamesByResolver(db: *Database, resolver: Address, limit: u32) ![]models.Name {
-    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND resolver = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY created_at DESC LIMIT ?");
+    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND resolver = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY created_at DESC LIMIT ?");
     defer q.deinit();
 
     try q.bindAddress(resolver);
@@ -979,7 +973,7 @@ pub fn getWrappedDomains(
     var sql_buf: std.ArrayList(u8) = .{};
     defer sql_buf.deinit(db.allocator);
     try sql_buf.appendSlice(db.allocator, SQL_SELECT_NAMES);
-    try sql_buf.appendSlice(db.allocator, " WHERE is_reachable = 1 AND is_wrapped = 1");
+    try sql_buf.appendSlice(db.allocator, " WHERE is_reachable = 1 AND is_normalized = 1 AND is_wrapped = 1");
     if (filters.owner != null) try sql_buf.appendSlice(db.allocator, " AND owner = ?");
     if (filters.name != null) try sql_buf.appendSlice(db.allocator, " AND name = ?");
     if (filters.expiry_gt != null) try sql_buf.appendSlice(db.allocator, " AND wrapper_expiry > ?");
@@ -1014,7 +1008,7 @@ pub fn getWrappedDomains(
 pub fn getDomainByResolver(db: *Database, resolver: Address) !?models.Name {
     var q = try Query.initCached(
         db,
-        SQL_SELECT_NAMES ++ " WHERE is_reachable = 1 AND resolver = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY namehash ASC LIMIT 1",
+        SQL_SELECT_NAMES ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND resolver = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY namehash ASC LIMIT 1",
     );
     defer q.deinit();
 
@@ -1024,30 +1018,6 @@ pub fn getDomainByResolver(db: *Database, resolver: Address) !?models.Name {
         return try parseNameRow(&q, db.allocator);
     }
     return null;
-}
-
-/// Get names by registrant address. Unreachable rows are filtered out.
-pub fn getNamesByRegistrant(db: *Database, registrant: Address, skip: u32, limit: u32) ![]models.Name {
-    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND registrant = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY created_at DESC LIMIT ? OFFSET ?");
-    defer q.deinit();
-
-    try q.bindAddress(registrant);
-    try q.bindInt(@intCast(limit));
-    try q.bindInt(@intCast(skip));
-
-    var names: std.ArrayList(models.Name) = .{};
-    errdefer {
-        for (names.items) |*name| {
-            name.deinit(db.allocator);
-        }
-        names.deinit(db.allocator);
-    }
-
-    while (try q.step()) {
-        try names.append(db.allocator, try parseNameRowShort(&q, db.allocator));
-    }
-
-    return names.toOwnedSlice(db.allocator);
 }
 
 /// Order direction for queries
@@ -1092,6 +1062,13 @@ fn appendNameFilterConditions(
         // Audit/debug callers that pass `includeUnreachable: true` also opt
         // back into seeing it.
         try conditions.append(db.allocator, "namehash != '0x0000000000000000000000000000000000000000000000000000000000000000'");
+    }
+    // ENSIP-15 enforcement (mirrors is_reachable): an explicit `isNormalized` filter
+    // wins; otherwise non-normalized names are hidden unless `includeUnnormalized` is set.
+    if (filters.is_normalized) |want| {
+        try conditions.append(db.allocator, if (want) "is_normalized = 1" else "is_normalized = 0");
+    } else if (!filters.include_unnormalized) {
+        try conditions.append(db.allocator, "is_normalized = 1");
     }
     if (filters.owner != null) {
         try conditions.append(db.allocator, "owner = ?");
@@ -1177,15 +1154,15 @@ fn appendNameFilterConditions(
     }
     if (filters.has_subdomains) |has_subs| {
         try conditions.append(db.allocator, if (has_subs)
-            "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1 AND sub.namehash != '0x0000000000000000000000000000000000000000000000000000000000000000') > 0"
+            "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1 AND is_normalized = 1 AND sub.namehash != '0x0000000000000000000000000000000000000000000000000000000000000000') > 0"
         else
-            "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1 AND sub.namehash != '0x0000000000000000000000000000000000000000000000000000000000000000') = 0");
+            "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1 AND is_normalized = 1 AND sub.namehash != '0x0000000000000000000000000000000000000000000000000000000000000000') = 0");
     }
     if (filters.subdomain_count_gt != null) {
-        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1 AND sub.namehash != '0x0000000000000000000000000000000000000000000000000000000000000000') > ?");
+        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1 AND is_normalized = 1 AND sub.namehash != '0x0000000000000000000000000000000000000000000000000000000000000000') > ?");
     }
     if (filters.subdomain_count_lt != null) {
-        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1 AND sub.namehash != '0x0000000000000000000000000000000000000000000000000000000000000000') < ?");
+        try conditions.append(db.allocator, "(SELECT COUNT(*) FROM names AS sub WHERE sub.parent_name = names.name AND sub.is_reachable = 1 AND is_normalized = 1 AND sub.namehash != '0x0000000000000000000000000000000000000000000000000000000000000000') < ?");
     }
 }
 
@@ -1358,6 +1335,7 @@ fn parseNameRows(q: *Query, allocator: std.mem.Allocator) ![]models.Name {
             .unreachable_since = q.getOptionalInt64(22),
             .ttl = if (q.getOptionalInt64(23)) |t| @intCast(t) else null,
             .is_legacy = q.getBool(24),
+            .is_normalized = q.getBool(25),
         });
     }
 
@@ -1420,6 +1398,12 @@ pub const NameFilters = struct {
     /// Set to true to include rows orphaned by ancestor subregistry repoints
     /// (for audit/debug). See `registry_entries.zig` for invalidation logic.
     include_unreachable: bool = false,
+    /// When false (default), only `is_normalized = 1` rows are returned (ENSIP-15
+    /// enforcement). Set true to include non-normalized names (e.g. `Nick.eth`).
+    include_unnormalized: bool = false,
+    /// Exact normalization filter: when set, returns only rows matching it (overrides
+    /// the default-hide). Maps to GraphQL `isNormalized: Boolean`.
+    is_normalized: ?bool = null,
 };
 
 /// Get names with filters pushed down to DB query
@@ -1458,7 +1442,7 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
         \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, protocol,
         \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated,
         \\       created_at, registered_at, created_block, updated_at, updated_block,
-        \\       is_reachable, unreachable_since
+        \\       is_reachable, unreachable_since, ttl, is_legacy, is_normalized
         \\FROM names {s}ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
     , .{ where_clause.items, sort_field.toSql(), order_str, order_str });
     defer db.allocator.free(sql);
@@ -1487,16 +1471,16 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
             \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, protocol,
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated,
             \\       created_at, registered_at, created_block, updated_at, updated_block,
-            \\       is_reachable, unreachable_since, ttl, is_legacy
-            \\FROM names WHERE is_reachable = 1 AND owner = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
+            \\       is_reachable, unreachable_since, ttl, is_legacy, is_normalized
+            \\FROM names WHERE is_reachable = 1 AND is_normalized = 1 AND owner = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
         , .{ sort_field.toSql(), order_str, order_str })
     else
         try std.fmt.allocPrint(db.allocator,
             \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, protocol,
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated,
             \\       created_at, registered_at, created_block, updated_at, updated_block,
-            \\       is_reachable, unreachable_since, ttl, is_legacy
-            \\FROM names WHERE is_reachable = 1 AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
+            \\       is_reachable, unreachable_since, ttl, is_legacy, is_normalized
+            \\FROM names WHERE is_reachable = 1 AND is_normalized = 1 AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
         , .{ sort_field.toSql(), order_str, order_str });
     defer db.allocator.free(sql);
 
@@ -1509,79 +1493,12 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
     try q.bindInt(@intCast(limit));
     try q.bindInt(@intCast(skip));
 
-    var names: std.ArrayList(models.Name) = .{};
-    errdefer {
-        for (names.items) |*name| {
-            name.deinit(db.allocator);
-        }
-        names.deinit(db.allocator);
-    }
-
-    while (try q.step()) {
-        // Column order: name(0), namehash(1), label(2), label_hash(3), parent_name(4), parent_namehash(5),
-        //               owner(6), resolver(7), registry(8), protocol(9), token_id(10),
-        //               canonical_id(11), token_version(12), expiry(13), registry_locked(14),
-        //               migrated(15), created_at(16), registered_at(17),
-        //               created_block(18), updated_at(19), updated_block(20)
-        const name_str = q.getTextSlice(0) orelse "";
-        const namehash_str = q.getTextSlice(1) orelse "";
-        const label_str = q.getTextSlice(2) orelse "";
-        const label_hash_str = q.getTextSlice(3) orelse "";
-        const parent_name_str = q.getTextSlice(4) orelse "";
-        const parent_namehash_str = q.getTextSlice(5) orelse "";
-        const owner_str = q.getTextSlice(6) orelse "";
-        const resolver_str = q.getTextSlice(7) orelse "";
-        const registry_str = q.getTextSlice(8) orelse "";
-        const protocol_str = q.getTextSlice(9) orelse models.Protocol.v2.toString();
-        const token_id_str = q.getTextSlice(10) orelse "0x0";
-        const canonical_id_str = q.getTextSlice(11) orelse "0x0";
-
-        try names.append(db.allocator, .{
-            .name = try db.allocator.dupe(u8, name_str),
-            .namehash = try Hash.fromHex(namehash_str),
-            .label = try db.allocator.dupe(u8, label_str),
-            .label_hash = try Hash.fromHex(label_hash_str),
-            .parent_name = try db.allocator.dupe(u8, parent_name_str),
-            .parent_namehash = try Hash.fromHex(parent_namehash_str),
-            .owner = try Address.fromHex(owner_str),
-            .registrant = try Address.fromHex(owner_str), // Fallback
-            .resolver = try Address.fromHex(resolver_str),
-            .registry = try Address.fromHex(registry_str),
-            .protocol = try models.Protocol.fromString(protocol_str),
-            .token_id = try parseU256Hex(token_id_str),
-            .canonical_id = try parseU256Hex(canonical_id_str),
-            .token_version = @intCast(q.getInt64(12)),
-            .expiry = @bitCast(q.getInt64(13)),
-            .registry_locked = q.getBool(14),
-            .migrated = q.getBool(15),
-            .created_at = q.getInt64(16),
-            .registered_at = q.getOptionalInt64(17) orelse q.getInt64(16),
-            .created_block = @intCast(q.getInt64(18)),
-            .updated_at = q.getInt64(19),
-            .updated_block = @intCast(q.getInt64(20)),
-            .is_wrapped = false,
-            .wrapper_fuses = null,
-            .wrapper_expiry = null,
-            .is_v1_name = false,
-            .v1_label_hash = null,
-            .is_reachable = q.getBool(21),
-            .unreachable_since = q.getOptionalInt64(22),
-            .ttl = if (q.getOptionalInt64(23)) |t| @intCast(t) else null,
-            .is_legacy = q.getBool(24),
-        });
-    }
-
-    return names.toOwnedSlice(db.allocator);
+    return parseNameRows(&q, db.allocator);
 }
 
 // ============================================================================
 // AGGREGATION OPERATIONS
 // ============================================================================
-
-/// Get total count of all names in the database
-pub fn getTotalNameCount(db: *Database) !usize {
-    return getFilteredNameCount(db, .{});
-}
 
 /// Get count of names with optional filters.
 /// Builds the same WHERE clause as getFilteredNames but uses SELECT COUNT(*).
@@ -1641,7 +1558,7 @@ const ZERO_ADDR_HEX: []const u8 = "0x0000000000000000000000000000000000000000";
 const SUBDOMAIN_GC_FILTER: []const u8 = " AND NOT (owner = '" ++ ZERO_ADDR_HEX ++ "' AND resolver = '" ++ ZERO_ADDR_HEX ++ "')";
 
 pub fn countDirectSubdomains(db: *Database, parent_name: []const u8) !u32 {
-    var q = try Query.init(db, "SELECT COUNT(*) FROM names WHERE is_reachable = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER);
+    var q = try Query.init(db, "SELECT COUNT(*) FROM names WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER);
     defer q.deinit();
 
     try q.bindText(parent_name);
@@ -1654,68 +1571,11 @@ pub fn countDirectSubdomains(db: *Database, parent_name: []const u8) !u32 {
 
 /// Check if a name has any direct subdomains (reachable + non-burned).
 pub fn hasDirectSubdomains(db: *Database, parent_name: []const u8) !bool {
-    var q = try Query.init(db, "SELECT 1 FROM names WHERE is_reachable = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER ++ " LIMIT 1");
+    var q = try Query.init(db, "SELECT 1 FROM names WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER ++ " LIMIT 1");
     defer q.deinit();
 
     try q.bindText(parent_name);
     return try q.step();
-}
-
-/// Batch count direct subdomains for multiple parent names in a single query
-/// Returns a hashmap mapping parent_name -> subdomain count
-pub fn batchCountDirectSubdomains(db: *Database, allocator: std.mem.Allocator, parent_names: []const []const u8) !std.StringHashMap(u32) {
-    var counts = std.StringHashMap(u32).init(allocator);
-    errdefer {
-        var it = counts.keyIterator();
-        while (it.next()) |key| {
-            allocator.free(key.*);
-        }
-        counts.deinit();
-    }
-
-    if (parent_names.len == 0) {
-        return counts;
-    }
-
-    // Build dynamic SQL: SELECT parent_name, COUNT(*) FROM names WHERE parent_name IN (?, ?, ...) GROUP BY parent_name
-    var sql_buf: std.ArrayList(u8) = .{};
-    defer sql_buf.deinit(allocator);
-
-    try sql_buf.appendSlice(allocator, "SELECT parent_name, COUNT(*) FROM names WHERE is_reachable = 1 AND parent_name IN (");
-    for (parent_names, 0..) |_, i| {
-        if (i > 0) try sql_buf.appendSlice(allocator, ", ");
-        try sql_buf.appendSlice(allocator, "?");
-    }
-    try sql_buf.appendSlice(allocator, ")" ++ SUBDOMAIN_GC_FILTER ++ " GROUP BY parent_name");
-
-    const sql_z = try allocator.dupeZ(u8, sql_buf.items);
-    defer allocator.free(sql_z);
-
-    var stmt: ?*c.sqlite3_stmt = null;
-    if (c.sqlite3_prepare_v2(db.db, sql_z.ptr, -1, &stmt, null) != c.SQLITE_OK) {
-        return counts; // Return empty map on error
-    }
-    defer _ = c.sqlite3_finalize(stmt);
-
-    // Bind all parent names
-    for (parent_names, 0..) |name, i| {
-        _ = c.sqlite3_bind_text(stmt, @intCast(i + 1), name.ptr, @intCast(name.len), null);
-    }
-
-    // Execute and collect results
-    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const parent_text = c.sqlite3_column_text(stmt, 0);
-        const parent_len = c.sqlite3_column_bytes(stmt, 0);
-        const count = c.sqlite3_column_int(stmt, 1);
-
-        if (parent_text != null and parent_len > 0) {
-            const parent_slice = parent_text[0..@intCast(parent_len)];
-            const key = try allocator.dupe(u8, parent_slice);
-            try counts.put(key, @intCast(count));
-        }
-    }
-
-    return counts;
 }
 
 /// Get direct subdomains of a name with pagination. Unreachable rows
@@ -1725,7 +1585,7 @@ pub fn batchCountDirectSubdomains(db: *Database, allocator: std.mem.Allocator, p
 /// `include_unreachable` (which still applies the GC filter; resurrection
 /// requires direct namehash lookup).
 pub fn getSubdomains(db: *Database, parent_name_arg: []const u8, skip: u32, limit: u32) ![]models.Name {
-    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER ++ " ORDER BY name LIMIT ? OFFSET ?");
+    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER ++ " ORDER BY name LIMIT ? OFFSET ?");
     defer q.deinit();
 
     try q.bindText(parent_name_arg);

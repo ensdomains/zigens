@@ -143,7 +143,7 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
             std.log.debug("Updated creation date for existing name: {s}", .{full_name});
         } else {
             // Name doesn't exist - create it
-            names_storage.insertName(self.database, name) catch |err| {
+            self.insertName(name) catch |err| {
                 std.log.warn("Failed to backfill name {s}: {}", .{ name.name.?, err });
                 name.deinit(self.allocator);
                 continue;
@@ -327,7 +327,7 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
         };
         defer name.deinit(self.allocator);
 
-        names_storage.insertName(self.database, name) catch |err| {
+        self.insertName(name) catch |err| {
             std.log.warn("Failed to create missing .eth 2LD name {s}: {}", .{ full_name, err });
             continue;
         };
