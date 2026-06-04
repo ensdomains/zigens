@@ -112,15 +112,10 @@ pub const GraphQLHandler = struct {
         // Start timing for metrics
         var timer = metrics_mod.QueryTimer.start();
 
-        // Handle introspection queries for autocomplete/schema exploration
-        if (std.mem.indexOf(u8, query, "__schema") != null or std.mem.indexOf(u8, query, "IntrospectionQuery") != null) {
-            return try self.handleIntrospectionQuery();
-        }
-
-        // Handle __type introspection queries (but not __typename)
-        if (std.mem.indexOf(u8, query, "__type(") != null) {
-            return try self.handleTypeIntrospectionQuery(query);
-        }
+        // Introspection (__schema / __type) is detected AFTER parsing, from the
+        // parsed root fields — see below. Matching on the raw query text here would
+        // false-positive whenever the substring appears in a string-argument value
+        // (e.g. where:{name_contains:"__schema"}) or an operation name.
 
         // Per-request arena allocator: all short-lived request allocations (parsing,
         // execution, dataloaders, resolver intermediates) go here instead of the GPA.
@@ -151,6 +146,29 @@ pub const GraphQLHandler = struct {
             return try self.buildErrorResponseWithCode("Invalid GraphQL syntax", ErrorCode.SYNTAX_ERROR);
         };
         defer document.deinit(request_alloc);
+
+        // Introspection routing: detect __schema / __type from the PARSED root
+        // fields, not a raw-text substring match. The executor has no __schema/
+        // __type resolver (only __typename), so these must be intercepted here —
+        // before complexity analysis, validation, and execution.
+        intro: {
+            const op: *const parser.Operation = sel: {
+                if (operation_name) |nm| {
+                    for (document.operations) |*o| {
+                        if (o.name != null and std.mem.eql(u8, o.name.?, nm)) break :sel o;
+                    }
+                    break :intro; // named op not found -> let the executor report it
+                }
+                if (document.operations.len == 1) break :sel &document.operations[0];
+                break :intro; // multiple unnamed ops -> let the executor error
+            };
+            for (op.fields) |*f| {
+                if (std.mem.eql(u8, f.name, "__schema")) return try self.handleIntrospectionQuery();
+            }
+            for (op.fields) |*f| {
+                if (std.mem.eql(u8, f.name, "__type")) return try self.handleTypeIntrospectionQuery(f);
+            }
+        }
 
         // Analyze query complexity to prevent DoS attacks
         const limits = complexity.ComplexityLimits{
@@ -244,36 +262,10 @@ pub const GraphQLHandler = struct {
         return try self.allocator.dupe(u8, introspection_response);
     }
 
-    fn handleTypeIntrospectionQuery(self: *GraphQLHandler, query: []const u8) ![]u8 {
-        // Extract type name from __type(name: "TypeName") query
-        // Look for pattern: __type(name: "..." or __type(name: '...'
-        const type_name = blk: {
-            // Find __type(name:
-            const start_marker = "__type(name:";
-            const start_pos = std.mem.indexOf(u8, query, start_marker) orelse
-                return try self.buildErrorResponseWithCode("Invalid __type query: missing name argument", ErrorCode.VALIDATION_ERROR);
-
-            const after_marker = query[start_pos + start_marker.len ..];
-
-            // Skip whitespace
-            var i: usize = 0;
-            while (i < after_marker.len and (after_marker[i] == ' ' or after_marker[i] == '\t')) : (i += 1) {}
-
-            if (i >= after_marker.len)
-                return try self.buildErrorResponseWithCode("Invalid __type query: missing name value", ErrorCode.VALIDATION_ERROR);
-
-            // Check for quote character
-            const quote_char = after_marker[i];
-            if (quote_char != '"' and quote_char != '\'')
-                return try self.buildErrorResponseWithCode("Invalid __type query: name must be a string", ErrorCode.VALIDATION_ERROR);
-
-            // Find closing quote
-            const name_start = i + 1;
-            const name_end = std.mem.indexOfScalarPos(u8, after_marker, name_start, quote_char) orelse
-                return try self.buildErrorResponseWithCode("Invalid __type query: unterminated string", ErrorCode.VALIDATION_ERROR);
-
-            break :blk after_marker[name_start..name_end];
-        };
+    fn handleTypeIntrospectionQuery(self: *GraphQLHandler, field: *const parser.Field) ![]u8 {
+        // Read the requested type name from the parsed __type(name: "...") field.
+        const type_name = parser.getStringArg(field, "name", null) orelse
+            return try self.buildErrorResponseWithCode("Invalid __type query: missing name argument", ErrorCode.VALIDATION_ERROR);
 
         // Load and parse introspection data
         const introspection_json = @embedFile("introspection.json");
@@ -397,3 +389,66 @@ pub const GraphQLHandler = struct {
         return response.toOwnedSlice(self.allocator);
     }
 };
+
+const testing = std.testing;
+
+// Build a handler over a fresh in-memory DB (full schema loaded by Database.init),
+// run a query end-to-end through handleQuery, and assert the response is a DATA
+// response — NOT the static introspection schema. Guards #23: introspection must be
+// detected from parsed root fields, never from a raw-text substring match.
+fn expectQueryReturnsData(query: []const u8, op_name: ?[]const u8) !void {
+    const allocator = testing.allocator;
+    var database = try db.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var handler = try GraphQLHandler.init(allocator, &database, 10, 10000, false);
+    defer handler.deinit();
+
+    const result = try handler.handleQuery(query, null, op_name);
+    defer allocator.free(result);
+
+    try testing.expect(std.mem.indexOf(u8, result, "\"data\"") != null);
+    // Introspection markers from the static introspection.json must be absent.
+    try testing.expect(std.mem.indexOf(u8, result, "\"queryType\"") == null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"__schema\"") == null);
+}
+
+test "handleQuery: __schema inside a string argument is data, not introspection" {
+    try expectQueryReturnsData("{ domains(where:{name_contains:\"__schema\"}){ id name } }", null);
+}
+
+test "handleQuery: operation named IntrospectionQuery still executes its data fields" {
+    try expectQueryReturnsData("query IntrospectionQuery { domains(first:1){ id } }", "IntrospectionQuery");
+}
+
+test "handleQuery: __type( inside a string argument is data, not introspection" {
+    try expectQueryReturnsData("{ domains(where:{name_contains:\"__type(\"}){ id } }", null);
+}
+
+test "handleQuery: real __schema query still returns introspection" {
+    const allocator = testing.allocator;
+    var database = try db.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var handler = try GraphQLHandler.init(allocator, &database, 10, 10000, false);
+    defer handler.deinit();
+
+    const result = try handler.handleQuery("{ __schema { queryType { name } } }", null, null);
+    defer allocator.free(result);
+    try testing.expect(std.mem.indexOf(u8, result, "\"queryType\"") != null);
+}
+
+test "handleQuery: real __type(name:) returns the requested type via parsed arg" {
+    const allocator = testing.allocator;
+    var database = try db.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var handler = try GraphQLHandler.init(allocator, &database, 10, 10000, false);
+    defer handler.deinit();
+
+    const found = try handler.handleQuery("{ __type(name:\"Domain\"){ name kind } }", null, null);
+    defer allocator.free(found);
+    try testing.expect(std.mem.indexOf(u8, found, "\"__type\"") != null);
+    try testing.expect(std.mem.indexOf(u8, found, "Domain") != null);
+
+    const missing = try handler.handleQuery("{ __type(name:\"NoSuchType\"){ name } }", null, null);
+    defer allocator.free(missing);
+    try testing.expectEqualStrings("{\"data\":{\"__type\":null}}", missing);
+}
