@@ -180,34 +180,6 @@ pub fn getFilteredAccounts(
     return try results.toOwnedSlice(db.allocator);
 }
 
-pub fn getFilteredAccountCount(db: *Database, filters: AccountFilters) !u64 {
-    var conditions: std.ArrayList([]const u8) = .{};
-    defer conditions.deinit(db.allocator);
-    var allocated: std.ArrayList([]const u8) = .{};
-    defer {
-        for (allocated.items) |s| db.allocator.free(s);
-        allocated.deinit(db.allocator);
-    }
-    try appendAccountConditions(db, filters, &conditions, &allocated);
-
-    var sql_buf: std.ArrayList(u8) = .{};
-    defer sql_buf.deinit(db.allocator);
-    try sql_buf.appendSlice(db.allocator, "SELECT COUNT(*) FROM accounts");
-    if (conditions.items.len > 0) {
-        try sql_buf.appendSlice(db.allocator, " WHERE ");
-        for (conditions.items, 0..) |c, i| {
-            if (i > 0) try sql_buf.appendSlice(db.allocator, " AND ");
-            try sql_buf.appendSlice(db.allocator, c);
-        }
-    }
-
-    var q = try Query.init(db, sql_buf.items);
-    defer q.deinit();
-    try bindAccountFilters(&q, filters);
-    if (!(try q.step())) return 0;
-    return @intCast(q.getInt64(0));
-}
-
 // ============================================================================
 // BACKFILL
 // ============================================================================

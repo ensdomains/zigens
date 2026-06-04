@@ -539,79 +539,6 @@ pub const Client = struct {
         };
     }
 
-    pub fn getLogs(self: *Client, from_block: u64, to_block: u64, address: ?Address, topics: []const ?Hash) ![]Log {
-        // Use arena allocator to keep all filter strings alive during the call
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const arena_allocator = arena.allocator();
-
-        // Build filter object with arena-allocated strings
-        const from_hex = try std.fmt.allocPrint(arena_allocator, "0x{x}", .{from_block});
-        const to_hex = try std.fmt.allocPrint(arena_allocator, "0x{x}", .{to_block});
-
-        var filter = std.json.ObjectMap.init(arena_allocator);
-        try filter.put("fromBlock", .{ .string = from_hex });
-        try filter.put("toBlock", .{ .string = to_hex });
-
-        if (address) |addr| {
-            const addr_hex = try addr.toHex(arena_allocator);
-            try filter.put("address", .{ .string = addr_hex });
-        }
-
-        // Convert topics to JSON array
-        if (topics.len > 0) {
-            var topics_array = std.json.Array.init(arena_allocator);
-
-            for (topics) |topic_opt| {
-                if (topic_opt) |topic| {
-                    const topic_hex = try topic.toHex(arena_allocator);
-                    try topics_array.append(.{ .string = topic_hex });
-                } else {
-                    try topics_array.append(.null);
-                }
-            }
-
-            try filter.put("topics", .{ .array = topics_array });
-        }
-
-        const parsed = try self.makeRpcCall("eth_getLogs", .{filter});
-        defer parsed.deinit();
-
-        const result = parsed.value.object.get("result").?;
-        const logs_array = result.array;
-        var logs = try self.allocator.alloc(Log, logs_array.items.len);
-
-        for (logs_array.items, 0..) |log_value, i| {
-            const log_obj = log_value.object;
-
-            // Parse topics
-            const topics_json = log_obj.get("topics").?.array;
-            var log_topics = try self.allocator.alloc(Hash, topics_json.items.len);
-            for (topics_json.items, 0..) |topic_val, j| {
-                log_topics[j] = try Hash.fromHex(topic_val.string);
-            }
-
-            // Parse data
-            const data_hex = log_obj.get("data").?.string;
-            const data_bytes = try self.hexToBytes(data_hex);
-
-            logs[i] = Log{
-                .address = try Address.fromHex(log_obj.get("address").?.string),
-                .topics = log_topics,
-                .data = data_bytes,
-                .block_number = try std.fmt.parseInt(u64, log_obj.get("blockNumber").?.string[2..], 16),
-                .transaction_hash = try Hash.fromHex(log_obj.get("transactionHash").?.string),
-                .transaction_index = @intCast(try std.fmt.parseInt(u64, log_obj.get("transactionIndex").?.string[2..], 16)),
-                .log_index = @intCast(try std.fmt.parseInt(u64, log_obj.get("logIndex").?.string[2..], 16)),
-                .removed = if (log_obj.get("removed")) |r| r.bool else false,
-                .block_timestamp = if (log_obj.get("blockTimestamp")) |ts| std.fmt.parseInt(u64, ts.string[2..], 16) catch null else null,
-                .block_hash = if (log_obj.get("blockHash")) |bh| Hash.fromHex(bh.string) catch null else null,
-            };
-        }
-
-        return logs;
-    }
-
     /// Descriptor for a single getLogs request in a batch
     pub const BatchGetLogsRequest = struct {
         from_block: u64,
@@ -1068,32 +995,6 @@ pub const Client = struct {
         return transactions;
     }
 
-    pub fn call(self: *Client, to: Address, data: []const u8, block_number: ?u64) ![]u8 {
-        const to_hex = try to.toHex(self.allocator);
-        defer self.allocator.free(to_hex);
-
-        const data_hex = try self.bytesToHex(data);
-        defer self.allocator.free(data_hex);
-
-        const block_param = if (block_number) |bn|
-            try std.fmt.allocPrint(self.allocator, "0x{x}", .{bn})
-        else
-            try self.allocator.dupe(u8, "latest");
-        defer self.allocator.free(block_param);
-
-        var call_obj = std.json.ObjectMap.init(self.allocator);
-        defer call_obj.deinit();
-
-        try call_obj.put("to", .{ .string = to_hex });
-        try call_obj.put("data", .{ .string = data_hex });
-
-        const parsed = try self.makeRpcCall("eth_call", .{ call_obj, block_param });
-        defer parsed.deinit();
-
-        const result = parsed.value.object.get("result").?;
-        return try self.hexToBytes(result.string);
-    }
-
     fn hexToBytes(self: *Client, hex: []const u8) ![]u8 {
         const hex_data = if (std.mem.startsWith(u8, hex, "0x")) hex[2..] else hex;
 
@@ -1106,22 +1007,5 @@ pub const Client = struct {
         _ = try std.fmt.hexToBytes(bytes, hex_data);
 
         return bytes;
-    }
-
-    fn bytesToHex(self: *Client, bytes: []const u8) ![]u8 {
-        // SECURITY: Use built-in std.fmt.bytesToHex (industry standard hex encoding)
-        var result = try self.allocator.alloc(u8, 2 + bytes.len * 2);
-        result[0] = '0';
-        result[1] = 'x';
-
-        // bytesToHex returns a fixed-size array, we need to use allocPrint for dynamic sizes
-        const hex_slice = result[2..];
-        for (bytes, 0..) |byte, i| {
-            const hex_byte = std.fmt.bytesToHex(&[_]u8{byte}, .lower);
-            hex_slice[i * 2] = hex_byte[0];
-            hex_slice[i * 2 + 1] = hex_byte[1];
-        }
-
-        return result;
     }
 };

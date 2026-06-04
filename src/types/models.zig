@@ -126,6 +126,11 @@ pub const Name = struct {
     /// API layer falls back to a query-time `Resolver.addr(coinType:60)` lookup
     /// when null.
     resolved_address: ?Address = null,
+    /// ENSIP-15 normalization status of `name`, computed at ingest (indexer layer)
+    /// and persisted. False when the name is non-normalized or its label is unknown
+    /// (`[0x..]` placeholder). Default-filtered out of GraphQL listings unless
+    /// `includeUnnormalized: true` (mirrors `is_reachable`).
+    is_normalized: bool = true,
 
     pub fn deinit(self: *Name, allocator: std.mem.Allocator) void {
         if (self.name) |n| allocator.free(n);
@@ -390,32 +395,6 @@ pub const Webhook = struct {
         allocator.free(self.url);
         allocator.free(self.secret);
         allocator.free(self.event_types);
-    }
-};
-
-/// EAC (Enhanced Access Control) role types
-/// Each role is a nybble (4 bits) in the role bitmap
-pub const EACRole = enum(u8) {
-    // Owner roles (lower 128 bits)
-    registrar = 0, // Can register names
-    renew = 4, // Can renew names
-    set_subregistry = 8, // Can set subregistries
-    set_resolver = 12, // Can set resolvers
-    set_token_observer = 16, // Can set token observers
-    burn = 20, // Can burn tokens
-
-    // Admin roles would be at (role + 128)
-    // We don't need to enumerate all of them here
-
-    pub fn toString(self: EACRole) []const u8 {
-        return switch (self) {
-            .registrar => "REGISTRAR",
-            .renew => "RENEW",
-            .set_subregistry => "SET_SUBREGISTRY",
-            .set_resolver => "SET_RESOLVER",
-            .set_token_observer => "SET_TOKEN_OBSERVER",
-            .burn => "BURN",
-        };
     }
 };
 

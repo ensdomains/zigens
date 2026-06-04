@@ -12,9 +12,6 @@ pub const Timing = struct {
     /// Delay between RPC batch calls to avoid rate limiting (milliseconds)
     pub const rpc_batch_delay_ms: u64 = 50;
 
-    /// Delay before retrying a failed RPC call (milliseconds)
-    pub const rpc_retry_delay_ms: u64 = 50;
-
     /// Delay after non-network errors before retry (milliseconds)
     pub const error_recovery_delay_ms: u64 = 5000;
 
@@ -41,17 +38,8 @@ pub const Pagination = struct {
 
 /// RPC batching limits for multi-address queries
 pub const RpcBatching = struct {
-    /// Number of contract addresses per eth_getLogs call
-    pub const addresses_per_call: u32 = 60;
-
     /// Minimum block chunk size for adaptive chunking
     pub const min_chunk_size: u64 = 100;
-
-    /// Maximum block chunk size for adaptive chunking
-    pub const max_chunk_size: u64 = 10000;
-
-    /// Absolute minimum chunk size (never go below this)
-    pub const absolute_min_chunk: u64 = 10;
 };
 
 // ============================================================================
@@ -66,9 +54,6 @@ pub const SQLite = struct {
     /// Cache size in KB (negative means KB, positive means pages)
     /// 100MB = 100000 KB
     pub const cache_size_kb: i32 = -100000;
-
-    /// Journal size limit in bytes (512MB)
-    pub const journal_size_limit: i64 = 512 * 1024 * 1024;
 };
 
 // ============================================================================

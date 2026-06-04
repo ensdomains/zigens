@@ -85,9 +85,6 @@ pub const FieldResult = parser.FieldResult;
 /// Page information for Relay-style pagination
 pub const PageInfo = pagination.PageInfo;
 
-/// Result with cursor pagination support
-pub const PaginatedResult = pagination.PaginatedResult;
-
 // ============================================================================
 // Complexity Analysis Types
 // ============================================================================
@@ -100,16 +97,6 @@ pub const ComplexityAnalysis = complexity.ComplexityAnalysis;
 
 /// Query complexity analyzer
 pub const ComplexityAnalyzer = complexity.ComplexityAnalyzer;
-
-// ============================================================================
-// Metrics Types
-// ============================================================================
-
-/// Query metrics collector
-pub const QueryMetrics = metrics.QueryMetrics;
-
-/// Query metrics summary
-pub const QueryMetricsSummary = metrics.QueryMetricsSummary;
 
 // ============================================================================
 // DataLoader Types

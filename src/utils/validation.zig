@@ -3,8 +3,6 @@ const constants = @import("../constants.zig");
 
 /// Maximum lengths for various input types (industry standard limits)
 pub const MAX_ENS_NAME_LENGTH: usize = 255; // DNS label standard
-pub const MAX_HEX_ADDRESS_LENGTH: usize = 42; // "0x" + 40 hex chars
-pub const MAX_REQUEST_BODY_SIZE: usize = 1024 * 1024; // 1MB for GraphQL queries
 pub const MAX_GRAPHQL_QUERY_LENGTH: usize = constants.Validation.max_graphql_query_length;
 
 /// Validates an ENS name for reasonable length

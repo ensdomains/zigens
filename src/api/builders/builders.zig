@@ -11,10 +11,8 @@
 /// - buildAccountJson: Build JSON for Account entities
 /// - buildResolverJson: Build JSON for Resolver entities
 const impl = @import("impl.zig");
-const fields = @import("../ens_fields.zig");
 
 // Re-export all public functions and types
-pub const hasValidExpiry = fields.hasValidExpiry;
 pub const NestedContext = impl.NestedContext;
 pub const buildDomainJson = impl.buildDomainJson;
 pub const buildEventJson = impl.buildEventJson;

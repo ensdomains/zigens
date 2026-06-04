@@ -275,19 +275,6 @@ pub fn checkIntegrity(db: *Database) !bool {
     return false;
 }
 
-/// Check if a subregistry is already known
-pub fn isSubregistryKnown(db: *Database, protocol: models.Protocol, address: []const u8) !bool {
-    const sql = "SELECT 1 FROM known_subregistries WHERE protocol = ? AND address = ? LIMIT 1";
-
-    var q = try Query.init(db, sql);
-    defer q.deinit();
-
-    try q.bindTextStatic(protocol.toString());
-    try q.bindText(address);
-
-    return try q.step();
-}
-
 /// Register or update a known subregistry.
 ///
 /// `first_seen_block` should be the subregistry's actual creation block

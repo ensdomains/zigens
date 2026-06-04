@@ -5,12 +5,6 @@ const std = @import("std");
 const Hash = @import("../types/hash.zig").Hash;
 const Keccak256 = std.crypto.hash.sha3.Keccak256;
 
-// SQLITE_TRANSIENT - For Zig 0.15.1, we can't use the C constant due to alignment issues
-// Instead, we use null which tells SQLite to make a copy of the string
-inline fn SQLITE_TRANSIENT() @import("../storage/database.zig").c.sqlite3_destructor_type {
-    return null;
-}
-
 /// Runtime keccak256 hash function
 inline fn keccak256Runtime(input: []const u8) [32]u8 {
     var hash: [32]u8 = undefined;
