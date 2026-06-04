@@ -252,6 +252,43 @@ pub fn build(b: *std.Build) void {
     const filter_test_step = b.step("test-filters", "Run filter logic unit tests");
     filter_test_step.dependOn(&run_filter_tests.step);
 
+    // ENSIP-15 normalization wrapper tests (needs the z_ens_normalize module)
+    const normalize_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/utils/ens_normalize.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
+            },
+        }),
+    });
+    const run_normalize_tests = b.addRunArtifact(normalize_tests);
+    const normalize_test_step = b.step("test-normalize", "Run ENSIP-15 normalization tests");
+    normalize_test_step.dependOn(&run_normalize_tests.step);
+
+    // Indexer tests: runs the indexer's inline tests (abi_eth) and the pure helpers
+    // it relies on (DNS wire decode, token-id math, calldata + V1 name decoding) that
+    // the lib.zig-rooted `test` step never reaches, plus new decodeDnsWireFormat cases.
+    const indexer_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/indexer_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
+                .{ .name = "eth", .module = eth_module },
+            },
+        }),
+    });
+    indexer_tests.linkLibC();
+    indexer_tests.linkSystemLibrary("sqlite3");
+
+    const run_indexer_tests = b.addRunArtifact(indexer_tests);
+    run_indexer_tests.setCwd(b.path("."));
+    const indexer_test_step = b.step("test-indexer", "Run indexer + helper unit tests");
+    indexer_test_step.dependOn(&run_indexer_tests.step);
+
     // lib/graphql/json_writer inline tests (self-contained within lib/graphql)
     const json_writer_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -481,4 +518,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_storage_roles_tests.step);
     test_step.dependOn(&run_storage_webhooks_tests.step);
     test_step.dependOn(&run_storage_registry_entries_tests.step);
+    test_step.dependOn(&run_normalize_tests.step);
+    test_step.dependOn(&run_indexer_tests.step);
 }
