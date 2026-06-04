@@ -13,6 +13,10 @@ pub const Config = struct {
     batch_size: u64,
     max_blocks_per_request: u64,
     rate_limit_per_second: u32,
+    /// Trusted reverse-proxy hops for rate limiting. 0 (default) = key on the direct TCP
+    /// peer. > 0 = trust X-Forwarded-For from this many hops (e.g. 1 for a single LB) and
+    /// key on the real client IP. Only enable behind a proxy you control that sets XFF.
+    trusted_proxy_hops: u32,
     api_port: u16,
     api_enabled: bool,
     status_port: ?u16,
@@ -59,6 +63,7 @@ pub const Config = struct {
             .batch_size = env_mod.getEnvInt(&env_map, u64, "BATCH_SIZE", 2000),
             .max_blocks_per_request = env_mod.getEnvInt(&env_map, u64, "MAX_BLOCKS_PER_REQUEST", 2000),
             .rate_limit_per_second = env_mod.getEnvInt(&env_map, u32, "RATE_LIMIT_PER_SECOND", 15),
+            .trusted_proxy_hops = env_mod.getEnvInt(&env_map, u32, "TRUSTED_PROXY_HOPS", 0),
             .api_port = env_mod.getEnvInt(&env_map, u16, "API_PORT", 8080),
             .api_enabled = env_mod.getEnvBool(&env_map, "API_ENABLED", true),
             .status_port = blk: {

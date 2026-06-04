@@ -10,6 +10,44 @@ const validation = @import("../utils/validation.zig");
 const PerIpRateLimiter = @import("../rate_limiter.zig").PerIpRateLimiter;
 const webhook_manager = @import("../webhooks/manager.zig");
 
+/// Find a header value (case-insensitive name) in a raw HTTP header block. Returns the
+/// trimmed value or null. Handles CRLF and LF line endings.
+fn findHeaderValue(header_data: []const u8, name_lower: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, header_data, '\n');
+    while (lines.next()) |line0| {
+        const line = std.mem.trimRight(u8, line0, "\r");
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(line[0..colon], name_lower)) {
+            return std.mem.trim(u8, line[colon + 1 ..], " \t");
+        }
+    }
+    return null;
+}
+
+/// Resolve the client IP to rate-limit on, given the direct TCP peer and request headers,
+/// trusting `hops` reverse-proxy hops. The observed-address chain is
+/// `[XFF entries…, direct_peer]`; the real client is the entry `hops` from the right (the
+/// address the outermost trusted proxy saw). Spoof-resistant: a client can prepend fake
+/// XFF entries on the LEFT, but trusted proxies append the true peer on the RIGHT, so
+/// counting from the right skips exactly the trusted hops. The direct peer is the hop-th
+/// proxy (not in XFF), so we skip `hops - 1` XFF entries. Falls back to the direct peer if
+/// XFF is absent, too short, or unparseable.
+fn resolveClientAddress(direct_peer: std.net.Address, header_data: []const u8, hops: u32) std.net.Address {
+    const xff = findHeaderValue(header_data, "x-forwarded-for") orelse return direct_peer;
+    var skip: u32 = if (hops > 0) hops - 1 else 0;
+    var it = std.mem.splitBackwardsScalar(u8, xff, ',');
+    while (it.next()) |raw| {
+        const ip_str = std.mem.trim(u8, raw, " \t");
+        if (ip_str.len == 0) continue;
+        if (skip > 0) {
+            skip -= 1;
+            continue;
+        }
+        return std.net.Address.parseIp(ip_str, 0) catch direct_peer;
+    }
+    return direct_peer;
+}
+
 /// Simple JSON API Server for ENSv2 Indexer
 /// Provides REST endpoints and GraphQL for querying indexed data
 pub const Server = struct {
@@ -22,8 +60,12 @@ pub const Server = struct {
     rate_limiter: PerIpRateLimiter,
     webhook_admin_username: ?[]const u8, // Optional - if set with password, requires Basic Auth
     webhook_admin_password: ?[]const u8, // Optional - if set, requires Basic Auth for webhook endpoints
+    /// Number of trusted reverse-proxy hops. 0 (default) = rate-limit on the direct TCP
+    /// peer. > 0 = trust X-Forwarded-For from this many hops and rate-limit on the real
+    /// client IP (see handleConnection / resolveClientAddress).
+    trusted_proxy_hops: u32,
 
-    pub fn init(allocator: std.mem.Allocator, database: *db.Database, webhook_db_path: ?[]const u8, port: u16, complexity_max_depth: u32, complexity_max_cost: u32, metrics_enabled: bool, rate_limit_per_second: u32, webhook_admin_username: ?[]const u8, webhook_admin_password: ?[]const u8) !Server {
+    pub fn init(allocator: std.mem.Allocator, database: *db.Database, webhook_db_path: ?[]const u8, port: u16, complexity_max_depth: u32, complexity_max_cost: u32, metrics_enabled: bool, rate_limit_per_second: u32, webhook_admin_username: ?[]const u8, webhook_admin_password: ?[]const u8, trusted_proxy_hops: u32) !Server {
         // Only open webhook database if path is provided (webhooks enabled)
         var webhook_db: ?*db.Database = null;
         if (webhook_db_path) |path| {
@@ -47,6 +89,7 @@ pub const Server = struct {
             .rate_limiter = PerIpRateLimiter.init(allocator, rate_limit * 2, rate_limit, 100_000),
             .webhook_admin_username = webhook_admin_username,
             .webhook_admin_password = webhook_admin_password,
+            .trusted_proxy_hops = trusted_proxy_hops,
         };
     }
 
@@ -96,13 +139,16 @@ pub const Server = struct {
     }
 
     fn handleConnection(self: *Server, connection: std.net.Server.Connection) !void {
-        // Check per-IP rate limit before processing request.
-        // Note: connection.address is the direct peer; if running behind a trusted
-        // reverse proxy, use X-Forwarded-For (not yet wired — every visible client
-        // would share the proxy's IP otherwise).
-        if (!self.rate_limiter.tryAcquireFor(connection.address)) {
-            try self.sendRateLimited(connection.stream);
-            return;
+        // Rate limit on the direct TCP peer when NOT behind a proxy (the common case) —
+        // before any header read, so a flooding peer is refused immediately. Behind a
+        // trusted proxy (trusted_proxy_hops > 0) the direct peer is the proxy and is shared
+        // by all clients, so we instead limit on the real client IP from X-Forwarded-For
+        // after reading headers (still bounded — headers are capped at 4KB below).
+        if (self.trusted_proxy_hops == 0) {
+            if (!self.rate_limiter.tryAcquireFor(connection.address)) {
+                try self.sendRateLimited(connection.stream);
+                return;
+            }
         }
 
         // Read headers first (up to 4KB for headers)
@@ -129,6 +175,17 @@ pub const Server = struct {
         if (total_header_bytes == 0) return;
 
         const header_data = header_buffer[0..total_header_bytes];
+
+        // Behind a trusted proxy: rate-limit on the real client IP from X-Forwarded-For
+        // (spoof-resistant — see resolveClientAddress). Done after the bounded header read,
+        // still before any request body is processed.
+        if (self.trusted_proxy_hops > 0) {
+            const client_addr = resolveClientAddress(connection.address, header_data, self.trusted_proxy_hops);
+            if (!self.rate_limiter.tryAcquireFor(client_addr)) {
+                try self.sendRateLimited(connection.stream);
+                return;
+            }
+        }
 
         // Find end of headers
         const header_end_crlf = std.mem.indexOf(u8, header_data, "\r\n\r\n");
@@ -1842,8 +1899,32 @@ test "Server init" {
     var database = try db.Database.init(allocator, ":memory:");
     defer database.deinit();
 
-    var server = try Server.init(allocator, &database, null, 8080, 10, 1000, false, 100, null, null);
+    var server = try Server.init(allocator, &database, null, 8080, 10, 1000, false, 100, null, null, 0);
     defer server.deinit();
 
     try std.testing.expect(server.port == 8080);
+}
+
+test "resolveClientAddress: X-Forwarded-For trusted-proxy resolution (spoof-resistant)" {
+    const peer = try std.net.Address.parseIp("10.0.0.1", 0); // the proxy = direct peer
+    const eq = struct {
+        fn f(a: std.net.Address, ip: []const u8) bool {
+            const b = std.net.Address.parseIp(ip, 0) catch return false;
+            return a.eql(b);
+        }
+    }.f;
+    // Single trusted proxy: client is the rightmost XFF entry.
+    try std.testing.expect(eq(resolveClientAddress(peer, "X-Forwarded-For: 1.2.3.4\r\nHost: x\r\n\r\n", 1), "1.2.3.4"));
+    // Client prepends a fake entry; the trusted proxy appends the real peer on the RIGHT.
+    try std.testing.expect(eq(resolveClientAddress(peer, "X-Forwarded-For: 9.9.9.9, 1.2.3.4\r\n\r\n", 1), "1.2.3.4"));
+    // Two trusted hops: skip one proxy from the right, client is the next entry.
+    try std.testing.expect(eq(resolveClientAddress(peer, "X-Forwarded-For: 1.2.3.4, 172.16.0.9\r\n\r\n", 2), "1.2.3.4"));
+    // Header name is case-insensitive.
+    try std.testing.expect(eq(resolveClientAddress(peer, "x-forwarded-for: 1.2.3.4\r\n\r\n", 1), "1.2.3.4"));
+    // IPv6 client.
+    try std.testing.expect(eq(resolveClientAddress(peer, "X-Forwarded-For: ::1\r\n\r\n", 1), "::1"));
+    // No XFF / too many hops / unparseable → fall back to the direct peer (fail-closed to proxy).
+    try std.testing.expect(eq(resolveClientAddress(peer, "Host: x\r\n\r\n", 1), "10.0.0.1"));
+    try std.testing.expect(eq(resolveClientAddress(peer, "X-Forwarded-For: 1.2.3.4\r\n\r\n", 5), "10.0.0.1"));
+    try std.testing.expect(eq(resolveClientAddress(peer, "X-Forwarded-For: not-an-ip\r\n\r\n", 1), "10.0.0.1"));
 }
