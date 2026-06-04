@@ -1350,3 +1350,77 @@ test "reorg undo-log: reconcile comparator detects planted drift" {
     try testing.expect(!(try reconcileEqual(allocator, &a, &b, false)));
     std.debug.print("✓ reconcile comparator detects planted drift (negative control)\n", .{});
 }
+
+// ============================================================================
+// Normalization enforcement (#19/#20): is_normalized is stored + filterable, and
+// non-normalized names are default-hidden (opt-in via includeUnnormalized).
+// ============================================================================
+
+fn filteredNameCount(allocator: std.mem.Allocator, database: *Database, filters: lib.storage.names.NameFilters) !usize {
+    const names = try lib.storage.names.getFilteredNames(database, filters, 0, 100, .desc, .created_at);
+    defer {
+        for (names) |*n| {
+            var nn = n.*;
+            nn.deinit(allocator);
+        }
+        allocator.free(names);
+    }
+    return names.len;
+}
+
+test "normalization: default-hides non-normalized names; opt-in shows them" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const owner = try Address.fromHex("0x00000000000000000000000000000000000000aa");
+
+    // A normalized name (is_normalized defaults true) and a non-normalized one.
+    var norm = try makeReorgName(allocator, "alice.eth", .v2, owner, 100);
+    defer norm.deinit(allocator);
+    try database.insertName(norm);
+
+    var weird = try makeReorgName(allocator, "Alice.eth", .v2, owner, 101);
+    defer weird.deinit(allocator);
+    weird.is_normalized = false;
+    try database.insertName(weird);
+
+    // Default: only the normalized name.
+    try testing.expectEqual(@as(usize, 1), try filteredNameCount(allocator, &database, .{ .owner = owner }));
+    // includeUnnormalized: both.
+    try testing.expectEqual(@as(usize, 2), try filteredNameCount(allocator, &database, .{ .owner = owner, .include_unnormalized = true }));
+    // isNormalized: false → only the non-normalized one (overrides default-hide).
+    try testing.expectEqual(@as(usize, 1), try filteredNameCount(allocator, &database, .{ .owner = owner, .is_normalized = false }));
+    // isNormalized: true → only the normalized one.
+    try testing.expectEqual(@as(usize, 1), try filteredNameCount(allocator, &database, .{ .owner = owner, .is_normalized = true }));
+
+    // The stored flag round-trips through getNameByNamehash (parseNameRow → isNormalized field).
+    const reread = (try database.getNameByNamehash(weird.namehash)) orelse return error.NameVanished;
+    var rr = reread;
+    defer rr.deinit(allocator);
+    try testing.expect(!rr.is_normalized);
+
+    // It must ALSO round-trip through getFilteredNames (parseNameRows — a separate SELECT
+    // + parser): under includeUnnormalized the returned Name carries the real flag, not the
+    // model default. (Regression guard for the SELECT/parser that initially omitted it.)
+    const listed = try lib.storage.names.getFilteredNames(&database, .{ .owner = owner, .include_unnormalized = true }, 0, 100, .desc, .created_at);
+    defer {
+        for (listed) |*n| {
+            var nn = n.*;
+            nn.deinit(allocator);
+        }
+        allocator.free(listed);
+    }
+    var saw_weird = false;
+    for (listed) |*n| {
+        if (std.mem.eql(u8, &n.namehash.bytes, &weird.namehash.bytes)) {
+            saw_weird = true;
+            try testing.expect(!n.is_normalized); // real stored value, via parseNameRows
+        }
+    }
+    try testing.expect(saw_weird);
+    std.debug.print("✓ non-normalized names default-hidden, opt-in via includeUnnormalized/isNormalized; flag persists through both SELECT paths\n", .{});
+}
