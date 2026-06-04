@@ -75,9 +75,12 @@ fn parseEACRoleRow(q: *Query, allocator: std.mem.Allocator) !models.EACRoleAssig
 /// Resolves the human-readable name via two paths:
 ///   1. Registry EAC (today's primary path): `contract_address` matches a registry row,
 ///      resource = token's canonical_id — joins to `names` by (canonical_id, registry).
-///   2. Resolver EAC (future-proofing): if/when resolver contracts emit `EACRolesChanged`
-///      where `resource = namehash`, the resolvers JOIN resolves to a name. No handler
-///      currently stores roles in this shape; the JOIN is a no-op on current data.
+///   2. Resolver EAC: resolver contracts DO emit `EACRolesChanged` (handleResolverEACRolesChanged),
+///      but with `resource = 0` (the EAC ROOT_RESOURCE) — contract-global admin roles, not
+///      per-namehash. Those correctly resolve to no name (resource 0 matches no namehash), so the
+///      resolvers JOIN is a no-op on them by design. The JOIN is future-proofing for a hypothetical
+///      per-namehash resolver EAC (`resource = namehash`); none is emitted today (verified on
+///      Sepolia 2026-06-02: all resolver EAC rows have resource 0).
 pub fn getRolesByResource(db: *Database, protocol: models.Protocol, resource: []const u8) ![]models.EACRoleAssignment {
     const sql =
         \\SELECT r.id, r.protocol, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp,
