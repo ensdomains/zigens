@@ -1172,6 +1172,9 @@ fn appendNameFilterConditions(
     }
     if (filters.resolver != null) try conditions.append(db.allocator, "resolver = ?");
     if (filters.registry != null) try conditions.append(db.allocator, "registry = ?");
+    if (filters.subregistry_pointer != null) {
+        try conditions.append(db.allocator, "EXISTS (SELECT 1 FROM registry_entries re WHERE re.protocol = names.protocol AND re.parent_registry = names.registry AND re.canonical_id = names.canonical_id AND re.subregistry = ?)");
+    }
     if (filters.migrated) |m| {
         try conditions.append(db.allocator, if (m) "migrated = 1" else "migrated = 0");
     }
@@ -1236,6 +1239,7 @@ fn bindNameFilters(q: *Query, filters: NameFilters) !void {
     if (filters.resolved_address) |addr| try q.bindAddress(addr);
     if (filters.resolver) |addr| try q.bindAddress(addr);
     if (filters.registry) |addr| try q.bindAddress(addr);
+    if (filters.subregistry_pointer) |addr| try q.bindAddress(addr);
     // migrated, has_subdomains contribute no binds (literal SQL)
     if (filters.subdomain_count_gt) |v| try q.bindInt64(v);
     if (filters.subdomain_count_lt) |v| try q.bindInt64(v);
@@ -1410,6 +1414,12 @@ pub const NameFilters = struct {
     resolver: ?Address = null,
     // Registry contract address filter (the contract that owns this name's label)
     registry: ?Address = null,
+    /// Inverse subregistry-pointer filter: match names whose CURRENT subregistry pointer
+    /// (the `registry_entries.subregistry` value for this name) equals this address. Powers
+    /// `RegistryInfo.referencedBy` — the names that use a registry as their subname registry.
+    /// Implemented as a correlated EXISTS join over `registry_entries`; there is no
+    /// subregistry column on `names`.
+    subregistry_pointer: ?Address = null,
     // Migration filter
     migrated: ?bool = null,
     // Subdomain filters (requires subquery)

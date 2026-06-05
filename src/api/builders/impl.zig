@@ -26,6 +26,8 @@ const fields = @import("../ens_fields.zig");
 const json_builder = @import("../json_builder.zig");
 const loaders = @import("../loaders.zig");
 const resolvers_mod = @import("../../storage/resolvers.zig");
+const registry_entries = @import("../../storage/registry_entries.zig");
+const admin = @import("../resolvers/admin.zig");
 const api_common = @import("../common.zig");
 
 /// Context for nested field resolution
@@ -1287,6 +1289,30 @@ fn domainParentHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: 
     return try nested_ctx.allocator.dupe(u8, "null");
 }
 
+/// Domain nested field handler: subregistry (the registry managing this domain's subnames).
+/// The pointer lives in `registry_entries` keyed by (parent_registry, canonical_id); a name's
+/// parent registry is its `registry` column. Resolves to the matching RegistryInfo, or null
+/// when no subregistry is set / the registry entity isn't indexed.
+fn domainSubregistryHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    const domain: *const models.Name = @ptrCast(@alignCast(ctx));
+    const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+
+    const sub = try registry_entries.getSubregistry(database, domain.protocol, domain.registry, domain.token_id);
+    if (sub.isZero()) return try nested_ctx.allocator.dupe(u8, "null");
+
+    const reg_opt = try database.getRegistry(domain.protocol, sub);
+    if (reg_opt) |reg_val| {
+        var reg = reg_val;
+        defer reg.deinit(nested_ctx.allocator);
+        return try admin.buildRegistryInfoJson(nested_ctx.allocator, database, &reg, field.selections, .{
+            .allocator = nested_ctx.allocator,
+            .database = nested_ctx.database,
+            .loaders = nested_ctx.loaders,
+        });
+    }
+    return try nested_ctx.allocator.dupe(u8, "null");
+}
+
 /// Domain nested field handler: subdomains
 fn domainSubdomainsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
     const domain: *const models.Name = @ptrCast(@alignCast(ctx));
@@ -1781,6 +1807,7 @@ const DomainBuildEntityConfig = json_builder.EntityConfig{
         .{ .name = "registrant", .handler = domainRegistrantHandler },
         .{ .name = "resolvedAddress", .handler = domainResolvedAddressHandler },
         .{ .name = "resolver", .handler = domainResolverHandler },
+        .{ .name = "subregistry", .handler = domainSubregistryHandler },
         .{ .name = "parent", .handler = domainParentHandler },
         .{ .name = "subdomains", .handler = domainSubdomainsHandler },
         .{ .name = "subdomainsCount", .handler = domainSubdomainsCountHandler },
