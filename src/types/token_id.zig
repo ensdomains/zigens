@@ -2,7 +2,7 @@ const std = @import("std");
 
 /// ENS V2 Token ID Utilities
 ///
-/// In ENS V2 (namechain), token IDs have a special structure:
+/// In ENS V2, token IDs have a special structure:
 /// - Token ID = Canonical ID | Token Version ID
 /// - Canonical ID = keccak256(label) XOR uint32(keccak256(label))
 /// - Token Version ID = 32-bit version number (0, 1, 2, ...)

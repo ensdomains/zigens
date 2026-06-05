@@ -62,7 +62,7 @@ pub const EventSignatures = struct {
     pub const token_regenerated_hash: Hash = eventHash(token_regenerated);
 
     /// ExpiryUpdated(uint256 indexed tokenId, uint64 newExpiry, address changedBy)
-    /// New event signature that replaces NameRenewed in current namechain deployment
+    /// New event signature that replaces NameRenewed in the current V2 deployment
     pub const expiry_updated = "ExpiryUpdated(uint256,uint64,address)";
     pub const expiry_updated_hash: Hash = eventHash(expiry_updated);
 
@@ -428,5 +428,3 @@ pub const EventSignatures = struct {
     pub const registry_created = "RegistryCreated()";
     pub const registry_created_hash: Hash = eventHash(registry_created);
 };
-
-

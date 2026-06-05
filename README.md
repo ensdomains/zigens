@@ -1,353 +1,195 @@
-# ENSv2 Indexer
+# ENS Indexer (zigens)
 
-A high-performance indexer for Ethereum Name Service v2 (ENSv2) written in Zig.
+A high-performance indexer for the Ethereum Name Service — **both ENS V1 (legacy) and ENS V2** —
+written in Zig on SQLite, with a subgraph-compatible GraphQL API.
+
+It follows ENS contract events, derives the current state of names, registrations, resolver records,
+roles and accounts, survives chain reorganizations, and serves everything over a GraphQL endpoint
+that works with existing ensjs / ENS-subgraph / Apollo clients.
 
 ## Features
 
-### Core Indexing
-- **Multi-chain Support**: Indexes both L1 (Ethereum) and L2 ENSv2 deployments
-- **Hierarchical Registry Tracking**: Follows the ENSv2 hierarchical registry model
-- **Dynamic Contract Discovery**: Uses ENSv2's on-chain registry events to automatically discover and index new subregistries and resolvers.
-- **Event Indexing**: Tracks all ENSv2 events:
-  - `NameRegistered` - New .eth registrations
-  - `NewSubname` - Subname creation
-  - `NameRenewed` - Name renewals
-  - `NameBurned` - Name burns
-  - `SubregistryUpdate` - Subregistry address changes
-  - `ResolverUpdate` - Resolver address changes
-  - `Transfer` - Name ownership transfers (ERC1155)
-  - `EACRolesChanged` - Extended access control role changes
-  - Migration events (ENSv1 → ENSv2)
-  - Ejection events (L2 ↔ L1)
-- **Resolver Data Indexing**: Tracks resolver record changes:
-  - `AddressChanged` - ETH and multi-coin addresses
-  - `TextChanged` - Text records (avatar, url, etc.)
-  - `ContentHashChanged` - Content hashes
-  - `ABIChanged`, `PubkeyChanged`, `NameChanged`, `InterfaceChanged`
+### Indexing
+- Indexes **ENS V1 (legacy registry, registrar, name wrapper)** and **ENS V2 (permissioned
+  registry)** side by side in one database.
+- Tracks registrations, ownership and transfers, resolver records (addresses, text, contenthash,
+  DNS, ABI, pubkey…), wrapper state and fuses, access-control roles, and reverse records.
+- Discovers new subregistries and resolvers automatically from on-chain events.
+- Recovers human-readable labels via a rainbow table (with a backfill tool for missing ones).
+- **Reorg-safe:** detects chain reorganizations and rolls the database back cleanly.
 
 ### GraphQL API
-- **Full GraphQL Support**: Query indexed data via GraphQL
-- **Relay-style Pagination**: Cursor-based pagination for large datasets
-- **Rich Filtering**: Filter by owner, name, registrant, etc.
-- **Nested Queries**: Fetch domains with resolvers, subdomains, events in single query
-- **Query Complexity Limits**: Built-in DoS protection
+- Subgraph-compatible schema — drop-in for many existing ENS clients.
+- Rich filtering, including `and` / `or` boolean conditions.
+- Both offset (`first`/`skip`) and Relay cursor pagination.
+- Query depth/cost limits and per-IP rate limiting for DoS protection.
+- Conformant with the GraphQL-over-HTTP spec, while staying backward-compatible with legacy clients.
 
-### Webhook System
-- **Event Notifications**: Real-time webhooks for ENS events
-- **Configurable**: Subscribe to specific event types
-- **Retry Logic**: Exponential backoff with configurable retries
-- **Reliable Delivery**: Queue-based delivery system
+### Webhooks & operations
+- Subscribe to event types and receive signed, automatically-retried HTTP deliveries.
+- Resumes from the last indexed block across restarts.
+- Optional Prometheus metrics and a health/status endpoint.
+- Docker images and Compose files for deployment.
 
-### Storage
-- **SQLite Database**: Efficient local storage
-- **Optimized Indexes**: Fast queries by name, owner, expiry, etc.
-- **Sync State Tracking**: Resumes from last synced block
-
-### Performance
-- **Optimized RPC Queries**: Multi-address batching with OR-topic matching
-  - 99% reduction in RPC calls vs naive polling
-  - Scales to thousands of resolvers/subregistries
-- **ENS Name Normalization**: Fast ENSIP-15 normalization with caching
-
-## Architecture
+## How it works
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Entry Points                          │
-├─────────────┬─────────────┬─────────────┬───────────────┤
-│ ensv2-api   │ensv2-indexer│ensv2-indexer│rainbow-backfill│
-│ (GraphQL)   │   (L1+L2)   │  -l1 / -l2  │ (label hash)  │
-└──────┬──────┴──────┬──────┴──────┬──────┴───────────────┘
-       │             │             │
-       ▼             ▼             ▼
-┌─────────────────────────────────────────────────────────┐
-│                   Shared Components                      │
-├─────────────────────────────────────────────────────────┤
-│  Storage Layer    │  RPC Client     │  Config/Env       │
-│  ├─ names.zig     │  ├─ Batch calls │  └─ .env files    │
-│  ├─ events.zig    │  ├─ Multi-addr  │                   │
-│  ├─ resolvers.zig │  └─ OR-topics   │                   │
-│  ├─ roles.zig     │                 │                   │
-│  └─ webhooks.zig  │                 │                   │
-└─────────────────────────────────────────────────────────┘
-                          │
-                          ▼
-                   ┌─────────────┐
-                   │   SQLite    │
-                   │   Database  │
-                   └─────────────┘
+   ensv2-indexer / -v1 / -v2            ensv2-api
+   ───────────────────────             ──────────
+   RPC client ──► event decode         GraphQL HTTP server
+        │           │                        │
+        ▼           ▼                        ▼
+   V1 / V2 event handlers             query → validate → resolve
+        │                                    │
+        └──────────────┬─────────────────────┘
+                       ▼
+                ┌──────────────┐
+                │    SQLite    │   (+ reorg-safe rollback,
+                │   database   │      webhook delivery queue)
+                └──────────────┘
 ```
 
-## Installation
+The indexer pulls logs over JSON-RPC, decodes them, and writes derived ENS state to SQLite. The API
+server reads from the same database. Chain reorgs are detected by block-hash tracking and undone
+atomically. See [`docs/`](docs/) for design notes (reorg handling, GraphQL conformance, V1 audit, …).
 
-### Prerequisites
-- Zig 0.15.x
-- Access to Ethereum L1/L2 RPC endpoints (Alchemy, Infura, etc.)
+## Build
 
-### Build
+Requires **Zig 0.15.2+** and an Ethereum/L2 JSON-RPC endpoint. (On macOS, prefix builds with
+`PKG_CONFIG_PATH="/opt/homebrew/opt/sqlite/lib/pkgconfig:$PKG_CONFIG_PATH"` so SQLite links.)
 
 ```bash
-# Clone the repository
-git clone https://github.com/ensdomains/ensv2-indexer.git
-cd ensv2-indexer
-
-# Build all binaries
-zig build
-
-# Run tests
-zig build test
+git clone <repo-url> && cd zigens
+zig build          # build all binaries
+zig build test     # run the test suite
 ```
 
 ### Binaries
 
 | Binary | Description |
 |--------|-------------|
-| `ensv2-indexer` | Main indexer (V1 + V2) |
-| `ensv2-indexer-v1` | V1-only indexer |
-| `ensv2-indexer-v2` | V2-only indexer |
-| `ensv2-api` | Standalone GraphQL API server |
-| `rainbow-backfill` | Rainbow table label backfill |
+| `ensv2-indexer` | Combined V1 + V2 indexer (can also serve the API) |
+| `ensv2-indexer-v1` / `-v2` | V1-only / V2-only indexer |
+| `ensv2-api` | Standalone GraphQL API server (read-only) |
+| `rainbow-backfill` | Resolve unknown `[0x…]` labels from the rainbow table |
 
 ## Configuration
 
-Configuration is done via environment variables. Create a `.env` file:
+Set via a `.env` file (see [`.env.example`](.env.example) for the full list). Common options:
 
-```bash
-# RPC URL
-RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_API_KEY
-
-# Network Configuration
-NETWORK=sepolia  # or mainnet
-START_BLOCK=0
-
-# Indexer Configuration
-POLL_INTERVAL=12
-BATCH_SIZE=1000
-MAX_BLOCKS_PER_REQUEST=1000
-
-# Rate Limiting
-RATE_LIMIT_PER_SECOND=10
-
-# Database
-DATABASE_PATH=./data/ens.db
-
-# API Server
-API_PORT=8080
-API_ENABLED=true
-
-# GraphQL Limits
-GRAPHQL_MAX_DEPTH=10
-GRAPHQL_MAX_COST=1000
-
-# Webhooks (optional)
-WEBHOOKS_ENABLED=false
-WEBHOOK_MAX_RETRIES=3
-WEBHOOK_DB_PATH=./data/webhooks.db
-```
-
-### Configuration Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `RPC_URL` | Ethereum RPC endpoint | Required |
-| `NETWORK` | Network name (sepolia, mainnet) | sepolia |
-| `START_BLOCK` | Block to start indexing from | 0 |
-| `POLL_INTERVAL` | Polling interval in seconds | 12 |
-| `BATCH_SIZE` | Blocks per batch | 1000 |
-| `DATABASE_PATH` | SQLite database file path | `./data/ens.db` |
-| `API_PORT` | API server port | 8080 |
-| `GRAPHQL_MAX_DEPTH` | Maximum GraphQL query nesting | 10 |
-| `GRAPHQL_MAX_COST` | Maximum query cost (DoS protection) | 1000 |
-| `RATE_LIMIT_PER_SECOND` | API rate limit per IP | 10 |
-| `WEBHOOKS_ENABLED` | Enable webhook system | false |
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `RPC_URL` | Ethereum / L2 JSON-RPC endpoint | `http://localhost:8545` |
+| `NETWORK` | `sepolia` or `mainnet` | `sepolia` |
+| `DATABASE_PATH` | SQLite database path | `./data/ens.db` |
+| `START_BLOCK` | First block to index | contract deployment block |
+| `API_PORT` | GraphQL API port | `8080` |
+| `GRAPHQL_MAX_DEPTH` / `GRAPHQL_MAX_COST` | Query DoS limits | `10` / `10000` |
+| `RATE_LIMIT_PER_SECOND` | RPC rate + API per-IP cap | `15` |
+| `WEBHOOKS_ENABLED` | Enable the webhook system | `false` |
 
 ## Usage
 
-### Running the Indexer
-
 ```bash
-# Run indexer (starts API server automatically)
+# Index (resumes from the last synced block, then follows the chain head)
 ./zig-out/bin/ensv2-indexer
 
-# Or run with custom database
-DATABASE_PATH=/tmp/ens.db ./zig-out/bin/ensv2-indexer
-
-# Run API server only (read-only, no indexing)
-./zig-out/bin/ensv2-api --port 8080
+# Serve the GraphQL API (read-only)
+./zig-out/bin/ensv2-api          # http://localhost:8080/graphql
 ```
 
-### GraphQL API
+`GET /graphql` opens the GraphiQL playground; `POST /graphql` runs queries.
 
-The API is available at `http://localhost:8080/graphql`
-
-#### Query Examples
+### GraphQL examples
 
 ```graphql
-# Get domain by name
+# Domain with resolver records and subdomains.
+# Note: `owner`/`registrant` are Account objects; `texts` returns record KEYS only —
+# use `text(key: "...")` for a value.
 query {
   domain(id: "tanrikulu.eth") {
-    name
-    namehash
-    owner
-    registrant
-    expiryDate
+    name expiryDate
+    owner { id }
     resolver {
       address
-      texts { key value }
-      addresses { coinType address }
+      texts
+      text(key: "avatar")
+      addresses { coinTypeBig address }
     }
-    subdomains(first: 10) {
-      name
-      owner
-    }
+    subdomains { name }
   }
 }
 
-# Get domains owned by address
+# Boolean filter: owner = X AND (name contains "dao" OR expiring before a date)
 query {
-  domains(where: { owner: "0x..." }, first: 20) {
-    name
-    expiryDate
+  domains(where: {
+    owner: "0x1111111111111111111111111111111111111111",
+    or: [{ name_contains: "dao" }, { expiryDate_lt: 1767225600 }]
+  }, first: 20) { name expiryDate }
+}
+
+# Cursor pagination (page 1; for the next page pass `after: <endCursor>` from pageInfo)
+query {
+  domainConnection(first: 10) {
+    edges { node { name owner { id } } cursor }
+    pageInfo { hasNextPage endCursor }
   }
 }
 
-# Get account with registrations
-query {
-  account(id: "0x...") {
-    domains { name }
-    registrations {
-      domain { name }
-      expiryDate
-      registrationDate
-    }
-  }
-}
-
-# Get recent events
-query {
-  events(first: 50, where: { type: "NameRegistered" }) {
-    type
-    blockNumber
-    transactionHash
-    domain { name }
-  }
-}
-
-# Cursor-based pagination
-query {
-  domainConnection(first: 10, after: "cursor...") {
-    edges {
-      node { name owner }
-      cursor
-    }
-    pageInfo {
-      hasNextPage
-      endCursor
-    }
-  }
-}
+# Indexing health
+query { _meta { block { number hash } hasIndexingErrors } }
 ```
 
-### Webhook Setup
+### Webhooks
 
-Webhooks are sent as HTTP POST requests with JSON payloads:
-
-```json
-{
-  "event_type": "NameRegistered",
-  "chain": "v2",
-  "block_number": 12345678,
-  "tx_hash": "0x...",
-  "name": "alice.eth",
-  "namehash": "0x...",
-  "data": {
-    "owner": "0x...",
-    "expires": 1735689600
-  }
-}
-```
-
-## Project Structure
-
-```
-ensv2-indexer/
-├── src/
-│   ├── main.zig              # Combined indexer + API entry
-│   ├── api_main.zig          # Standalone API entry
-│   ├── indexer_l1_main.zig   # L1-only indexer entry
-│   ├── config.zig            # Configuration loading
-│   ├── env.zig               # Environment variable parsing
-│   │
-│   ├── types/                # Core data types
-│   │   ├── address.zig       # Ethereum address
-│   │   ├── hash.zig          # Hash and namehash
-│   │   ├── token_id.zig      # ERC1155 token IDs
-│   │   └── models.zig        # Data models
-│   │
-│   ├── rpc/                  # RPC client
-│   │   └── client.zig        # Ethereum JSON-RPC (batching, multi-address)
-│   │
-│   ├── storage/              # Database layer
-│   │   ├── database.zig      # SQLite connection
-│   │   ├── names.zig         # Name/domain storage
-│   │   ├── events.zig        # Event storage
-│   │   ├── resolvers.zig     # Resolver data storage
-│   │   ├── roles.zig         # EAC roles storage
-│   │   ├── registrations.zig # Registration queries
-│   │   ├── webhooks.zig      # Webhook management
-│   │   └── sync.zig          # Sync state tracking
-│   │
-│   ├── indexer/              # Event indexing
-│   │   ├── indexer.zig       # Main indexer logic
-│   │   └── abi.zig           # ABI encoding/decoding
-│   │
-│   ├── api/                  # GraphQL API
-│   │   ├── server.zig        # HTTP server
-│   │   ├── handler.zig       # Request handler
-│   │   ├── resolvers/        # GraphQL resolvers
-│   │   └── introspection.json # Schema introspection
-│   │
-│   └── utils/                # Utilities
-│       ├── ens_normalize.zig # ENSIP-15 normalization
-│       ├── keccak.zig        # Keccak-256 hashing
-│       └── validation.zig    # Input validation
-│
-├── schema.graphql            # GraphQL schema definition
-├── build.zig                 # Build configuration
-├── build.zig.zon             # Dependencies
-└── .env.example              # Example configuration
-```
-
-## Testing
+Enable with `WEBHOOKS_ENABLED=true`, then register an endpoint:
 
 ```bash
-# Run all tests
-zig build test
-
-# Run specific test file
-zig test src/storage/events.zig
+curl -X POST http://localhost:8080/api/webhooks \
+  -H 'content-type: application/json' \
+  -d '{"url":"https://example.com/hook","event_types":["NameRegistered","Transfer"]}'
 ```
 
-## Documentation
+Deliveries are signed JSON POSTs (verify `X-Webhook-Signature` =
+`HMAC-SHA256(secret, "{X-Webhook-Timestamp}.{body}")`).
 
-### Architecture Docs
+## Project structure
 
-- **[schema.graphql](schema.graphql)** - GraphQL schema definition
-- **[architecture/](architecture/)** - Design documents
+```
+zigens/
+├── src/
+│   ├── indexer/   # event indexing (abi, V1/V2 handlers, discovery)
+│   ├── rpc/       # JSON-RPC client (batching, multi-address log queries)
+│   ├── storage/   # SQLite layer (names, resolvers, events, sync, reorg undo-log)
+│   ├── api/       # GraphQL server, handler, resolvers
+│   ├── lib/graphql/  # GraphQL parser, executor, complexity, pagination
+│   ├── webhooks/  # signed async delivery
+│   ├── rainbow/   # labelhash → label lookup
+│   ├── types/ utils/  # core types, ENSIP-15 normalization, helpers
+│   └── *_main.zig # indexer / API entry points
+├── schema.graphql       # GraphQL schema (source of truth)
+├── schema/              # SQLite schema
+├── tools/conformance/   # GraphQL spec conformance checks
+├── docs/                # design & audit notes
+└── Dockerfile, docker-compose*.yml
+```
 
-## Contributing
+## Testing & conformance
 
-Contributions are welcome! Please:
-1. Follow Zig coding conventions
-2. Add tests for new features
-3. Update documentation
-4. Run `zig fmt` before committing
+```bash
+zig build test                    # full suite (storage, GraphQL, indexer, integration, …)
+cd tools/conformance && npm install
+node schemacheck.mjs              # schema vs the graphql-js reference
+node audit.mjs http://localhost:8080/graphql   # GraphQL-over-HTTP transport audit
+```
+
+## Notes
+
+The API is **read-only** (no GraphQL mutations or subscriptions). The GraphQL **transport** is spec
+conformant and the schema validates against the `graphql-js` reference; the execution engine
+implements the subset of the GraphQL language spec that ENS clients use. Storage is SQLite; reorg
+rollback covers a 1000-block window.
 
 ## License
 
-MIT License - see LICENSE file for details
-
-## Acknowledgments
-
-- ENS v2 design by ENS Labs
-- Built with [Zig](https://ziglang.org/)
+MIT — see [LICENSE](LICENSE). ENS and ENS v2 design by ENS Labs; built with [Zig](https://ziglang.org/).
