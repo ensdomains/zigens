@@ -294,6 +294,9 @@ type Domain {
   """Resolver contract for this domain"""
   resolver: Resolver
 
+  """The registry contract that manages this domain's subnames — the value of the parent registry's `getSubregistry(label)` pointer, set from `SubregistryUpdated`. Null when no subregistry is set (or for V1 names). This is the registry whose `referencedBy` includes this domain."""
+  subregistry: RegistryInfo
+
   """ENS V1 Registry TTL (from `NewTTL` event). Null when never set or for V2 domains."""
   ttl: Int
 
@@ -1129,6 +1132,15 @@ type RegistryInfo {
 
   """Total label count for this registry."""
   labelCount: Int!
+
+  """Names whose CURRENT subregistry pointer is this contract — i.e. the names that use this registry as their subname registry (the inverse of `Domain.subregistry`; the registry-UI "Referenced by" relation). Legacy offset-based pagination; prefer `referencedByConnection`."""
+  referencedBy(first: Int, skip: Int, where: DomainFilter, orderBy: Domain_orderBy, orderDirection: OrderDirection): [Domain!]!
+
+  """Cursor-based version of `referencedBy`: names whose subregistry pointer is this contract (recommended)."""
+  referencedByConnection(first: Int, after: String, last: Int, before: String, where: DomainFilter, orderBy: Domain_orderBy, orderDirection: OrderDirection): DomainConnection!
+
+  """Total count of names whose subregistry pointer is this contract."""
+  referencedByCount: Int!
 
   """Events emitted by this registry contract (legacy offset-based)."""
   events(first: Int, skip: Int, where: EventFilter): [Event!]!
