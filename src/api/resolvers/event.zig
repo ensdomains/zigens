@@ -12,6 +12,72 @@ const builders = @import("../builders/builders.zig");
 const loaders = common.loaders;
 const NestedContext = builders.NestedContext;
 
+/// Parse an EventFilter argument list — the top-level `where:` object or a nested
+/// `and`/`or` element — into the WHERE-predicate fields of an `EventFilterOptions`.
+/// Recursive for the boolean groups. Allocations use the request arena (`ctx.allocator`),
+/// so list/address allocations need no explicit free. Query options (limit/order/sort)
+/// are set by the caller, not here.
+fn parseEventWhereArgs(where_args: []const parser.Argument, allocator: std.mem.Allocator) anyerror!db.EventFilterOptions {
+    var opts = db.EventFilterOptions{};
+    for (where_args) |a| {
+        if ((std.mem.eql(u8, a.name, "and") or std.mem.eql(u8, a.name, "or")) and a.value == .list) {
+            const is_and = std.mem.eql(u8, a.name, "and");
+            var group: std.ArrayList(db.EventFilterOptions) = .{};
+            errdefer group.deinit(allocator);
+            for (a.value.list) |item| {
+                if (item == .object) try group.append(allocator, try parseEventWhereArgs(item.object, allocator));
+            }
+            const slice = try group.toOwnedSlice(allocator);
+            if (is_and) {
+                opts.and_group = slice;
+            } else {
+                opts.or_group = slice;
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, a.name, "type_in") and a.value == .list) {
+            var list: std.ArrayList([]const u8) = .{};
+            errdefer list.deinit(allocator);
+            for (a.value.list) |item| {
+                if (item == .string) try list.append(allocator, item.string);
+            }
+            if (list.items.len > 0) opts.event_types = try list.toOwnedSlice(allocator);
+            continue;
+        }
+        if (std.mem.eql(u8, a.name, "type_not_in") and a.value == .list) {
+            var list: std.ArrayList([]const u8) = .{};
+            errdefer list.deinit(allocator);
+            for (a.value.list) |item| {
+                if (item == .string) try list.append(allocator, item.string);
+            }
+            if (list.items.len > 0) opts.event_types_not = try list.toOwnedSlice(allocator);
+            continue;
+        }
+        if (std.mem.eql(u8, a.name, "contractAddress") and a.value == .string) {
+            const addr = Address.fromHex(a.value.string) catch return error.InvalidContractAddress;
+            opts.contract_address = try addr.toHex(allocator);
+            continue;
+        }
+        if (std.mem.eql(u8, a.name, "protocol") and a.value == .string) {
+            opts.protocol = models.Protocol.fromString(a.value.string) catch return error.InvalidProtocol;
+            continue;
+        }
+        _ = common.matchStringArg(a, "type", &opts.event_type) or
+            common.matchStringArg(a, "type_not", &opts.event_type_not) or
+            common.matchStringArg(a, "domain", &opts.domain) or
+            common.matchStringArg(a, "namehash", &opts.namehash) or
+            common.matchIntArg(a, "blockNumber_gt", &opts.block_number_gt) or
+            common.matchIntArg(a, "blockNumber_gte", &opts.block_number_gte) or
+            common.matchIntArg(a, "blockNumber_lt", &opts.block_number_lt) or
+            common.matchIntArg(a, "blockNumber_lte", &opts.block_number_lte) or
+            common.matchIntArg(a, "timestamp_gt", &opts.timestamp_gt) or
+            common.matchIntArg(a, "timestamp_gte", &opts.timestamp_gte) or
+            common.matchIntArg(a, "timestamp_lt", &opts.timestamp_lt) or
+            common.matchIntArg(a, "timestamp_lte", &opts.timestamp_lte);
+    }
+    return opts;
+}
+
 pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
     const allocator = ctx.allocator;
@@ -31,62 +97,11 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
         1000, // max limit
     );
 
-    // Parse where filters
-    var filter_opts = db.EventFilterOptions{};
-
-    var event_types_list: std.ArrayList([]const u8) = .{};
-    defer event_types_list.deinit(allocator);
-
-    var event_types_not_list: std.ArrayList([]const u8) = .{};
-    defer event_types_not_list.deinit(allocator);
-
-    var normalized_contract_address: ?[]u8 = null;
-    defer if (normalized_contract_address) |addr| allocator.free(addr);
-
-    if (common.getObjectArg(field, "where")) |where_args| {
-        for (where_args) |a| {
-            if (std.mem.eql(u8, a.name, "type_in") and a.value == .list) {
-                for (a.value.list) |item| {
-                    if (item == .string) try event_types_list.append(allocator, item.string);
-                }
-                if (event_types_list.items.len > 0) filter_opts.event_types = event_types_list.items;
-                continue;
-            }
-            if (std.mem.eql(u8, a.name, "type_not_in") and a.value == .list) {
-                for (a.value.list) |item| {
-                    if (item == .string) try event_types_not_list.append(allocator, item.string);
-                }
-                if (event_types_not_list.items.len > 0) filter_opts.event_types_not = event_types_not_list.items;
-                continue;
-            }
-            if (std.mem.eql(u8, a.name, "contractAddress") and a.value == .string) {
-                // Normalize inline — needs allocation owned by the caller.
-                // Surface invalid input as an error rather than silently dropping the filter.
-                const addr = Address.fromHex(a.value.string) catch return error.InvalidContractAddress;
-                normalized_contract_address = try addr.toHex(allocator);
-                filter_opts.contract_address = normalized_contract_address;
-                continue;
-            }
-            if (std.mem.eql(u8, a.name, "protocol") and a.value == .string) {
-                // Surface invalid protocol as an error so a typo doesn't silently drop the filter.
-                filter_opts.protocol = models.Protocol.fromString(a.value.string) catch return error.InvalidProtocol;
-                continue;
-            }
-
-            _ = common.matchStringArg(a, "type", &filter_opts.event_type) or
-                common.matchStringArg(a, "type_not", &filter_opts.event_type_not) or
-                common.matchStringArg(a, "domain", &filter_opts.domain) or
-                common.matchStringArg(a, "namehash", &filter_opts.namehash) or
-                common.matchIntArg(a, "blockNumber_gt", &filter_opts.block_number_gt) or
-                common.matchIntArg(a, "blockNumber_gte", &filter_opts.block_number_gte) or
-                common.matchIntArg(a, "blockNumber_lt", &filter_opts.block_number_lt) or
-                common.matchIntArg(a, "blockNumber_lte", &filter_opts.block_number_lte) or
-                common.matchIntArg(a, "timestamp_gt", &filter_opts.timestamp_gt) or
-                common.matchIntArg(a, "timestamp_gte", &filter_opts.timestamp_gte) or
-                common.matchIntArg(a, "timestamp_lt", &filter_opts.timestamp_lt) or
-                common.matchIntArg(a, "timestamp_lte", &filter_opts.timestamp_lte);
-        }
-    }
+    // Parse where filters (incl. recursive and/or boolean tree).
+    var filter_opts = if (common.getObjectArg(field, "where")) |where_args|
+        try parseEventWhereArgs(where_args, allocator)
+    else
+        db.EventFilterOptions{};
 
     if (parser.getStringArg(field, "orderBy", null)) |order_by| {
         if (std.mem.eql(u8, order_by, "blockNumber")) filter_opts.sort_field = .block_number;
@@ -360,64 +375,12 @@ fn resolveEventsWithForced(ctx: parser.ExecutionContext, field: *const parser.Fi
 
     const first = (try common.parsePagination(field, 100)).first;
 
-    // Parse EventFilter if provided
-    var filter_opts = db.EventFilterOptions{
-        .limit = first,
-    };
-
-    // Temporary storage for event_types strings
-    var event_types_list: std.ArrayList([]const u8) = .{};
-    defer event_types_list.deinit(allocator);
-
-    var event_types_not_list: std.ArrayList([]const u8) = .{};
-    defer event_types_not_list.deinit(allocator);
-
-    // Temporary storage for normalized contract address (to handle checksummed addresses)
-    var normalized_contract_address: ?[]u8 = null;
-    defer if (normalized_contract_address) |addr| allocator.free(addr);
-
-    // Parse arguments
-    if (common.getObjectArg(field, "where")) |where_args| {
-        for (where_args) |a| {
-            if (std.mem.eql(u8, a.name, "type_in") and a.value == .list) {
-                for (a.value.list) |item| {
-                    if (item == .string) try event_types_list.append(allocator, item.string);
-                }
-                if (event_types_list.items.len > 0) filter_opts.event_types = event_types_list.items;
-                continue;
-            }
-            if (std.mem.eql(u8, a.name, "type_not_in") and a.value == .list) {
-                for (a.value.list) |item| {
-                    if (item == .string) try event_types_not_list.append(allocator, item.string);
-                }
-                if (event_types_not_list.items.len > 0) filter_opts.event_types_not = event_types_not_list.items;
-                continue;
-            }
-            if (std.mem.eql(u8, a.name, "contractAddress") and a.value == .string) {
-                const addr = Address.fromHex(a.value.string) catch return error.InvalidContractAddress;
-                normalized_contract_address = try addr.toHex(allocator);
-                filter_opts.contract_address = normalized_contract_address;
-                continue;
-            }
-            if (std.mem.eql(u8, a.name, "protocol") and a.value == .string) {
-                filter_opts.protocol = models.Protocol.fromString(a.value.string) catch return error.InvalidProtocol;
-                continue;
-            }
-
-            _ = common.matchStringArg(a, "type", &filter_opts.event_type) or
-                common.matchStringArg(a, "type_not", &filter_opts.event_type_not) or
-                common.matchStringArg(a, "domain", &filter_opts.domain) or
-                common.matchStringArg(a, "namehash", &filter_opts.namehash) or
-                common.matchIntArg(a, "blockNumber_gt", &filter_opts.block_number_gt) or
-                common.matchIntArg(a, "blockNumber_gte", &filter_opts.block_number_gte) or
-                common.matchIntArg(a, "blockNumber_lt", &filter_opts.block_number_lt) or
-                common.matchIntArg(a, "blockNumber_lte", &filter_opts.block_number_lte) or
-                common.matchIntArg(a, "timestamp_gt", &filter_opts.timestamp_gt) or
-                common.matchIntArg(a, "timestamp_gte", &filter_opts.timestamp_gte) or
-                common.matchIntArg(a, "timestamp_lt", &filter_opts.timestamp_lt) or
-                common.matchIntArg(a, "timestamp_lte", &filter_opts.timestamp_lte);
-        }
-    }
+    // Parse EventFilter (incl. recursive and/or boolean tree).
+    var filter_opts = if (common.getObjectArg(field, "where")) |where_args|
+        try parseEventWhereArgs(where_args, allocator)
+    else
+        db.EventFilterOptions{};
+    filter_opts.limit = first;
 
     // Subgraph-parity per-type top-level queries (transfers, textChangeds, …)
     // inject a fixed event_type that overrides any client-set `where.type`.

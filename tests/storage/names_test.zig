@@ -827,3 +827,116 @@ test "insertName ON CONFLICT preserves created_at and created_block" {
     try testing.expectEqual(@as(i64, 1800_000_000), stored_mut.registered_at);
     try testing.expectEqual(@as(u32, 1), stored_mut.token_version);
 }
+
+// ============================================================================
+// BOOLEAN FILTER TREE (and / or) — #25
+// ============================================================================
+
+test "getFilteredNames: or_group matches any sub-filter" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    _ = try helpers.createTestName(allocator, database, "alpha.eth", helpers.TEST_OWNER_1);
+    _ = try helpers.createTestName(allocator, database, "beta.eth", helpers.TEST_OWNER_1);
+    _ = try helpers.createTestName(allocator, database, "gamma.eth", helpers.TEST_OWNER_2);
+
+    const or_children = [_]Database.NameFilters{
+        .{ .name = "alpha.eth" },
+        .{ .name = "gamma.eth" },
+    };
+    const names = try database.getFilteredNames(.{ .or_group = &or_children }, 0, 100, .asc, .name);
+    defer {
+        for (names) |*n| n.deinit(allocator);
+        allocator.free(names);
+    }
+
+    try testing.expectEqual(@as(usize, 2), names.len);
+    try testing.expectEqualStrings("alpha.eth", names[0].name.?);
+    try testing.expectEqualStrings("gamma.eth", names[1].name.?);
+
+    // Count must agree (cursor pagination relies on it).
+    try testing.expectEqual(@as(usize, 2), try database.getFilteredNameCount(.{ .or_group = &or_children }));
+}
+
+test "getFilteredNames: scalar AND or_group  ->  owner AND (a OR b)" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    _ = try helpers.createTestName(allocator, database, "alpha.eth", helpers.TEST_OWNER_1);
+    _ = try helpers.createTestName(allocator, database, "beta.eth", helpers.TEST_OWNER_1);
+    _ = try helpers.createTestName(allocator, database, "gamma.eth", helpers.TEST_OWNER_2);
+
+    // owner=OWNER_1 AND (name~"alph" OR name~"bet") -> alpha, beta (gamma is OWNER_2).
+    // Also exercises mixed bind order: an Address bind (owner) before the OR's text binds.
+    const or_children = [_]Database.NameFilters{
+        .{ .name_contains = "alph" },
+        .{ .name_contains = "bet" },
+    };
+    const names = try database.getFilteredNames(.{ .owner = helpers.TEST_OWNER_1, .or_group = &or_children }, 0, 100, .asc, .name);
+    defer {
+        for (names) |*n| n.deinit(allocator);
+        allocator.free(names);
+    }
+
+    try testing.expectEqual(@as(usize, 2), names.len);
+    try testing.expectEqualStrings("alpha.eth", names[0].name.?);
+    try testing.expectEqualStrings("beta.eth", names[1].name.?);
+}
+
+test "getFilteredNames: and_group requires all sub-filters" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    _ = try helpers.createTestName(allocator, database, "alpha.eth", helpers.TEST_OWNER_1);
+    _ = try helpers.createTestName(allocator, database, "beta.eth", helpers.TEST_OWNER_1);
+    _ = try helpers.createTestName(allocator, database, "gamma.eth", helpers.TEST_OWNER_1);
+
+    // name~"a" AND name~"l" -> only alpha.eth (beta/gamma have no 'l').
+    const and_children = [_]Database.NameFilters{
+        .{ .name_contains = "a" },
+        .{ .name_contains = "l" },
+    };
+    const names = try database.getFilteredNames(.{ .and_group = &and_children }, 0, 100, .asc, .name);
+    defer {
+        for (names) |*n| n.deinit(allocator);
+        allocator.free(names);
+    }
+
+    try testing.expectEqual(@as(usize, 1), names.len);
+    try testing.expectEqualStrings("alpha.eth", names[0].name.?);
+}
+
+test "getFilteredNames: nested or within and (deep tree, bind order)" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    _ = try helpers.createTestName(allocator, database, "alpha.eth", helpers.TEST_OWNER_1);
+    _ = try helpers.createTestName(allocator, database, "beta.eth", helpers.TEST_OWNER_1);
+    _ = try helpers.createTestName(allocator, database, "gamma.eth", helpers.TEST_OWNER_2);
+
+    // (name~"a") AND ( owner=OWNER_2 OR name~"bet" )
+    //   alpha: O1, no "bet" -> excluded
+    //   beta:  O1, has "bet" -> included
+    //   gamma: O2 -> included
+    const inner_or = [_]Database.NameFilters{
+        .{ .owner = helpers.TEST_OWNER_2 },
+        .{ .name_contains = "bet" },
+    };
+    const and_children = [_]Database.NameFilters{
+        .{ .name_contains = "a" },
+        .{ .or_group = &inner_or },
+    };
+    const names = try database.getFilteredNames(.{ .and_group = &and_children }, 0, 100, .asc, .name);
+    defer {
+        for (names) |*n| n.deinit(allocator);
+        allocator.free(names);
+    }
+
+    try testing.expectEqual(@as(usize, 2), names.len);
+    try testing.expectEqualStrings("beta.eth", names[0].name.?);
+    try testing.expectEqualStrings("gamma.eth", names[1].name.?);
+}

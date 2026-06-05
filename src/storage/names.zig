@@ -1070,6 +1070,21 @@ fn appendNameFilterConditions(
     } else if (!filters.include_unnormalized) {
         try conditions.append(db.allocator, "is_normalized = 1");
     }
+    // User predicate tree (this node's scalars + recursive and/or). Default
+    // visibility above applies to the whole result set and is NOT injected into
+    // nested and/or nodes.
+    if (try buildNameNodeExpr(db, filters, allocated_strings)) |expr| {
+        try conditions.append(db.allocator, expr);
+    }
+}
+
+/// One filter node's scalar predicates (no default visibility, no and/or).
+fn appendNameScalarConditions(
+    db: *Database,
+    filters: NameFilters,
+    conditions: *std.ArrayList([]const u8),
+    allocated_strings: *std.ArrayList([]const u8),
+) !void {
     if (filters.owner != null) {
         try conditions.append(db.allocator, "owner = ?");
     }
@@ -1166,8 +1181,63 @@ fn appendNameFilterConditions(
     }
 }
 
-/// Bind values for `NameFilters` in the same order `appendNameFilterConditions` appends them.
-fn bindNameFilters(q: *Query, filters: NameFilters) !void {
+/// Recursively build one filter node's boolean SQL:
+///   (scalar AND scalar AND <and-child> AND (<or-child> OR <or-child>))
+/// Returns null when the node has no predicates. Allocated fragments are tracked in
+/// `allocated_strings` for the caller to free.
+fn buildNameNodeExpr(
+    db: *Database,
+    filters: NameFilters,
+    allocated_strings: *std.ArrayList([]const u8),
+) anyerror!?[]const u8 {
+    var parts: std.ArrayList([]const u8) = .{};
+    defer parts.deinit(db.allocator);
+
+    try appendNameScalarConditions(db, filters, &parts, allocated_strings);
+
+    if (filters.and_group) |children| {
+        for (children) |child| {
+            if (try buildNameNodeExpr(db, child, allocated_strings)) |sub| {
+                try parts.append(db.allocator, sub);
+            }
+        }
+    }
+    if (filters.or_group) |children| {
+        var or_parts: std.ArrayList([]const u8) = .{};
+        defer or_parts.deinit(db.allocator);
+        for (children) |child| {
+            if (try buildNameNodeExpr(db, child, allocated_strings)) |sub| {
+                try or_parts.append(db.allocator, sub);
+            }
+        }
+        if (or_parts.items.len > 0) {
+            const joined = try db_module.query.joinWrapped(db.allocator, or_parts.items, " OR ");
+            try allocated_strings.append(db.allocator, joined);
+            try parts.append(db.allocator, joined);
+        }
+    }
+
+    if (parts.items.len == 0) return null;
+    if (parts.items.len == 1) return parts.items[0];
+    const joined = try db_module.query.joinWrapped(db.allocator, parts.items, " AND ");
+    try allocated_strings.append(db.allocator, joined);
+    return joined;
+}
+
+/// Bind values for `NameFilters` in the same order the SQL is built: this node's
+/// scalars, then `and` children, then `or` children.
+fn bindNameFilters(q: *Query, filters: NameFilters) anyerror!void {
+    try bindNameScalars(q, filters);
+    if (filters.and_group) |children| {
+        for (children) |child| try bindNameFilters(q, child);
+    }
+    if (filters.or_group) |children| {
+        for (children) |child| try bindNameFilters(q, child);
+    }
+}
+
+/// Bind one node's scalar values in the same order `appendNameScalarConditions` appends.
+fn bindNameScalars(q: *Query, filters: NameFilters) !void {
     if (filters.owner) |o| try q.bindAddress(o);
     if (filters.owner_not) |o| try q.bindAddress(o);
     if (filters.owner_in) |owners| {
@@ -1404,6 +1474,12 @@ pub const NameFilters = struct {
     /// Exact normalization filter: when set, returns only rows matching it (overrides
     /// the default-hide). Maps to GraphQL `isNormalized: Boolean`.
     is_normalized: ?bool = null,
+    /// Subgraph-style boolean composition (GraphQL `and` / `or`). `and_group`: every
+    /// sub-filter must match (AND); `or_group`: any sub-filter matches (OR). Both nest
+    /// recursively. Default visibility (reachable/normalized/root) is applied once at the
+    /// top level only — it is NOT injected into nested nodes.
+    and_group: ?[]const NameFilters = null,
+    or_group: ?[]const NameFilters = null,
 };
 
 /// Get names with filters pushed down to DB query

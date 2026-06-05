@@ -963,15 +963,20 @@ input DomainFilter {
   hidden by default. Default false. Ignored when `isNormalized` is set.
   """
   includeUnnormalized: Boolean
-}
 
-"""Nested-relation filter on Account (subgraph parity). Used inside `DomainFilter.owner_`."""
-input AccountFilter {
-  """Match account by exact id (address)."""
-  id: String
+  """
+  Boolean AND: every sub-filter must match. Each element is a full DomainFilter,
+  nested recursively (subgraph parity). Combined with the other fields by AND.
+  """
+  and: [DomainFilter!]
 
-  """Match account by id in list."""
-  id_in: [String!]
+  """
+  Boolean OR: any sub-filter matches. Each element is a full DomainFilter, nested
+  recursively (subgraph parity). The OR group is AND-combined with sibling fields,
+  so `{ owner: X, or: [{...A}, {...B}] }` means `owner=X AND (A OR B)`. Default
+  visibility (reachable/normalized/non-root) is applied once to the whole result.
+  """
+  or: [DomainFilter!]
 }
 
 """Filter criteria for querying registrations"""
@@ -996,6 +1001,12 @@ input RegistrationFilter {
 
   """Filter by protocol (v1 or v2)"""
   protocol: String
+
+  """Boolean AND: every sub-filter must match. Each element is a full RegistrationFilter, nested recursively (subgraph parity)."""
+  and: [RegistrationFilter!]
+
+  """Boolean OR: any sub-filter matches. Each element is a full RegistrationFilter, nested recursively; the OR group is AND-combined with sibling fields."""
+  or: [RegistrationFilter!]
 }
 
 """Filter criteria for querying events"""
@@ -1047,6 +1058,12 @@ input EventFilter {
 
   """Filter by protocol (v1 or v2)"""
   protocol: String
+
+  """Boolean AND: every sub-filter must match. Each element is a full EventFilter, nested recursively (subgraph parity)."""
+  and: [EventFilter!]
+
+  """Boolean OR: any sub-filter matches. Each element is a full EventFilter, nested recursively; the OR group is AND-combined with sibling fields."""
+  or: [EventFilter!]
 }
 
 """EAC (Enhanced Access Control) role assignment"""
@@ -1076,7 +1093,6 @@ type EACRoleAssignment {
   name: String
 }
 
-"""Resolver information"""
 """Detailed resolver information with statistics"""
 type ResolverDetail {
   """Resolver contract address"""

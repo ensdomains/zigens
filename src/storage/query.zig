@@ -455,6 +455,20 @@ pub fn buildInClause(allocator: std.mem.Allocator, column: []const u8, op: []con
     return try out.toOwnedSlice(allocator);
 }
 
+/// "(a<sep>b<sep>c)" — wrap a joined list of SQL fragments in parentheses. Used by the
+/// recursive `and`/`or` boolean-filter builders (names/events/registrations).
+pub fn joinWrapped(allocator: std.mem.Allocator, items: []const []const u8, sep: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .{};
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, '(');
+    for (items, 0..) |it, i| {
+        if (i > 0) try buf.appendSlice(allocator, sep);
+        try buf.appendSlice(allocator, it);
+    }
+    try buf.append(allocator, ')');
+    return buf.toOwnedSlice(allocator);
+}
+
 /// Execute a simple statement with no parameters or results
 pub fn exec(database: *Database, sql: []const u8) !void {
     var q = try Query.init(database, sql);

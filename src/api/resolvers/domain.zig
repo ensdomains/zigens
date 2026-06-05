@@ -89,10 +89,14 @@ const ParsedDomainFilter = struct {
     include_unreachable: ?bool = null,
     is_normalized: ?bool = null,
     include_unnormalized: ?bool = null,
+    /// Subgraph-style boolean composition (`where: { and: [...], or: [...] }`).
+    /// Each element is a nested DomainFilter, parsed recursively.
+    and_filters: ?[]ParsedDomainFilter = null,
+    or_filters: ?[]ParsedDomainFilter = null,
 
-    /// Frees the heap-allocated slice fields (`*_in` lists) populated by the
-    /// parser. Scalar fields point into the caller-owned GraphQL arg buffer
-    /// and need no cleanup.
+    /// Frees the heap-allocated slice fields (`*_in` lists + nested and/or groups).
+    /// Scalar fields point into the caller-owned GraphQL arg buffer and need no
+    /// cleanup. (Request allocations are arena-backed, so this is belt-and-braces.)
     pub fn deinit(self: *ParsedDomainFilter, allocator: std.mem.Allocator) void {
         if (self.name_in) |s| allocator.free(s);
         if (self.name_not_in) |s| allocator.free(s);
@@ -100,6 +104,14 @@ const ParsedDomainFilter = struct {
         if (self.label_name_not_in) |s| allocator.free(s);
         if (self.owner_in) |s| allocator.free(s);
         if (self.owner_not_in) |s| allocator.free(s);
+        if (self.and_filters) |group| {
+            for (group) |*c| c.deinit(allocator);
+            allocator.free(group);
+        }
+        if (self.or_filters) |group| {
+            for (group) |*c| c.deinit(allocator);
+            allocator.free(group);
+        }
     }
 };
 
@@ -108,12 +120,38 @@ const ParsedDomainFilter = struct {
 /// schema validator at parse time, so the `or`-chain at the bottom discards
 /// match-misses silently.
 fn parseDomainWhere(field: *const parser.Field, allocator: std.mem.Allocator) !ParsedDomainFilter {
+    const where_args = common.getObjectArg(field, "where") orelse return ParsedDomainFilter{};
+    return parseWhereArgs(where_args, allocator);
+}
+
+/// Parse a DomainFilter argument list — the top-level `where:` object or a nested
+/// `and`/`or` element — into a `ParsedDomainFilter`. Recursive for the boolean groups.
+fn parseWhereArgs(where_args: []const parser.Argument, allocator: std.mem.Allocator) anyerror!ParsedDomainFilter {
     var out = ParsedDomainFilter{};
     errdefer out.deinit(allocator);
 
-    const where_args = common.getObjectArg(field, "where") orelse return out;
-
     for (where_args) |a| {
+        // Boolean composition: `and` / `or` are lists of nested DomainFilters (subgraph parity).
+        if ((std.mem.eql(u8, a.name, "and") or std.mem.eql(u8, a.name, "or")) and a.value == .list) {
+            const is_and = std.mem.eql(u8, a.name, "and");
+            var group: std.ArrayList(ParsedDomainFilter) = .{};
+            errdefer {
+                for (group.items) |*c| c.deinit(allocator);
+                group.deinit(allocator);
+            }
+            for (a.value.list) |item| {
+                if (item == .object) {
+                    try group.append(allocator, try parseWhereArgs(item.object, allocator));
+                }
+            }
+            const slice = try group.toOwnedSlice(allocator);
+            if (is_and) {
+                out.and_filters = slice;
+            } else {
+                out.or_filters = slice;
+            }
+            continue;
+        }
         // List-typed args allocate via the shared helpers in common.zig.
         if (std.mem.eql(u8, a.name, "owner_in")) {
             if (try common.parseAddressListArg(a, allocator)) |v| out.owner_in = v;
@@ -191,6 +229,62 @@ fn parseDomainWhere(field: *const parser.Field, allocator: std.mem.Allocator) !P
             common.matchBoolArg(a, "includeUnnormalized", &out.include_unnormalized);
     }
     return out;
+}
+
+/// Map a parsed DomainFilter (one node) to a storage `NameFilters`, recursively
+/// translating the `and`/`or` groups. Allocations are request-arena-backed.
+fn toNameFilters(p: *const ParsedDomainFilter, allocator: std.mem.Allocator) anyerror!db.NameFilters {
+    return db.NameFilters{
+        .owner = p.owner,
+        .owner_in = p.owner_in,
+        .owner_not = p.owner_not,
+        .owner_not_in = p.owner_not_in,
+        .name = p.name,
+        .name_in = p.name_in,
+        .name_not = p.name_not,
+        .name_not_in = p.name_not_in,
+        .name_contains = p.name_contains,
+        .name_contains_nocase = p.name_contains_nocase,
+        .name_not_contains = p.name_not_contains,
+        .name_starts_with = p.name_starts_with,
+        .name_starts_with_nocase = p.name_starts_with_nocase,
+        .name_ends_with = p.name_ends_with,
+        .name_ends_with_nocase = p.name_ends_with_nocase,
+        .label_name = p.label_name,
+        .label_name_not = p.label_name_not,
+        .label_name_in = p.label_name_in,
+        .label_name_not_in = p.label_name_not_in,
+        .label_name_contains = p.label_name_contains,
+        .label_name_contains_nocase = p.label_name_contains_nocase,
+        .label_name_not_contains = p.label_name_not_contains,
+        .label_name_starts_with = p.label_name_starts_with,
+        .label_name_starts_with_nocase = p.label_name_starts_with_nocase,
+        .label_name_ends_with = p.label_name_ends_with,
+        .label_name_ends_with_nocase = p.label_name_ends_with_nocase,
+        .expiry_gt = p.expiry_gt,
+        .expiry_gte = p.expiry_gte,
+        .expiry_lt = p.expiry_lt,
+        .expiry_lte = p.expiry_lte,
+        .resolved_address = p.resolved_address,
+        .resolver = p.resolver,
+        .migrated = p.migrated,
+        .has_subdomains = p.has_subdomains,
+        .subdomain_count_gt = p.subdomain_count_gt,
+        .subdomain_count_lt = p.subdomain_count_lt,
+        .include_unreachable = p.include_unreachable orelse false,
+        .include_unnormalized = p.include_unnormalized orelse false,
+        .is_normalized = p.is_normalized,
+        .and_group = try mapFilterGroup(p.and_filters, allocator),
+        .or_group = try mapFilterGroup(p.or_filters, allocator),
+    };
+}
+
+/// Map a parsed `and`/`or` group to a slice of storage `NameFilters` (or null).
+fn mapFilterGroup(group: ?[]const ParsedDomainFilter, allocator: std.mem.Allocator) anyerror!?[]const db.NameFilters {
+    const children = group orelse return null;
+    const arr = try allocator.alloc(db.NameFilters, children.len);
+    for (children, 0..) |*c, i| arr[i] = try toNameFilters(c, allocator);
+    return arr;
 }
 
 pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
@@ -271,7 +365,8 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
         filter_subdomain_count_gt == null and filter_subdomain_count_lt == null and
         filter_expiry_gt == null and filter_expiry_gte == null and
         filter_expiry_lt == null and filter_expiry_lte == null and
-        filter_migrated == null;
+        filter_migrated == null and
+        parsed.and_filters == null and parsed.or_filters == null;
 
     if (only_name_filter) {
         const exact_name = filter_name.?;
@@ -336,7 +431,8 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
         filter_expiry_gt != null or filter_expiry_gte != null or
         filter_expiry_lt != null or filter_expiry_lte != null or
         filter_migrated != null or include_unreachable or
-        include_unnormalized or parsed.is_normalized != null;
+        include_unnormalized or parsed.is_normalized != null or
+        parsed.and_filters != null or parsed.or_filters != null;
 
     // All filters pushed to DB - no need to over-fetch
     const fetch_limit: u32 = first;
@@ -387,6 +483,8 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
             .include_unreachable = include_unreachable,
             .include_unnormalized = include_unnormalized,
             .is_normalized = parsed.is_normalized,
+            .and_group = try mapFilterGroup(parsed.and_filters, allocator),
+            .or_group = try mapFilterGroup(parsed.or_filters, allocator),
         }, @intCast(skip), fetch_limit, order_dir, sort_field)
     else
         try database.getAllNamesWithOrder(null, @intCast(skip), fetch_limit, order_dir, sort_field);
@@ -525,6 +623,8 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         .include_unreachable = include_unreachable,
         .include_unnormalized = include_unnormalized,
         .is_normalized = parsed.is_normalized,
+        .and_group = try mapFilterGroup(parsed.and_filters, allocator),
+        .or_group = try mapFilterGroup(parsed.or_filters, allocator),
     };
 
     const has_filters = filter_name != null or filter_name_in != null or
@@ -546,7 +646,8 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         filter_expiry_gt != null or filter_expiry_gte != null or
         filter_expiry_lt != null or filter_expiry_lte != null or
         filter_migrated != null or include_unreachable or
-        include_unnormalized or parsed.is_normalized != null;
+        include_unnormalized or parsed.is_normalized != null or
+        parsed.and_filters != null or parsed.or_filters != null;
 
     // Check which top-level fields are requested
     var wants_edges = false;

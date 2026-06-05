@@ -208,6 +208,9 @@ pub const EventFilterOptions = struct {
     expiry_gte: ?i64 = null,
     expiry_lt: ?i64 = null,
     expiry_lte: ?i64 = null,
+    /// Subgraph-style boolean composition (GraphQL `and` / `or`), nesting recursively.
+    and_group: ?[]const EventFilterOptions = null,
+    or_group: ?[]const EventFilterOptions = null,
     limit: u32 = constants.Pagination.default_limit,
     skip: u32 = 0,
     order_dir: OrderDir = .desc,
@@ -218,6 +221,20 @@ pub const EventFilterOptions = struct {
 /// `conditions`. Dynamic IN-clause strings are tracked in `allocated_clauses` so the
 /// caller can free them after use. Kept in lockstep with `bindEventFilters`.
 fn appendEventFilterConditions(
+    db: *Database,
+    filter: EventFilterOptions,
+    conditions: *std.ArrayList([]const u8),
+    allocated_clauses: *std.ArrayList([]const u8),
+) !void {
+    // Events have no default-visibility filters — the whole WHERE is the user's
+    // predicate tree (this node's scalars + recursive and/or).
+    if (try buildEventNodeExpr(db, filter, allocated_clauses)) |expr| {
+        try conditions.append(db.allocator, expr);
+    }
+}
+
+/// One event-filter node's scalar predicates (no and/or).
+fn appendEventScalarConditions(
     db: *Database,
     filter: EventFilterOptions,
     conditions: *std.ArrayList([]const u8),
@@ -300,8 +317,52 @@ fn appendEventFilterConditions(
     if (filter.expiry_lte != null) try conditions.append(db.allocator, expiry_expr ++ " <= ?");
 }
 
-/// Bind values for `filter` in the same order `appendEventFilterConditions` appends them.
-fn bindEventFilters(q: *Query, filter: EventFilterOptions) !void {
+/// Recursively build one event-filter node's boolean SQL (scalars + and/or).
+fn buildEventNodeExpr(
+    db: *Database,
+    filter: EventFilterOptions,
+    allocated_clauses: *std.ArrayList([]const u8),
+) anyerror!?[]const u8 {
+    var parts: std.ArrayList([]const u8) = .{};
+    defer parts.deinit(db.allocator);
+    try appendEventScalarConditions(db, filter, &parts, allocated_clauses);
+    if (filter.and_group) |children| {
+        for (children) |child| {
+            if (try buildEventNodeExpr(db, child, allocated_clauses)) |sub| try parts.append(db.allocator, sub);
+        }
+    }
+    if (filter.or_group) |children| {
+        var or_parts: std.ArrayList([]const u8) = .{};
+        defer or_parts.deinit(db.allocator);
+        for (children) |child| {
+            if (try buildEventNodeExpr(db, child, allocated_clauses)) |sub| try or_parts.append(db.allocator, sub);
+        }
+        if (or_parts.items.len > 0) {
+            const joined = try db_module.query.joinWrapped(db.allocator, or_parts.items, " OR ");
+            try allocated_clauses.append(db.allocator, joined);
+            try parts.append(db.allocator, joined);
+        }
+    }
+    if (parts.items.len == 0) return null;
+    if (parts.items.len == 1) return parts.items[0];
+    const joined = try db_module.query.joinWrapped(db.allocator, parts.items, " AND ");
+    try allocated_clauses.append(db.allocator, joined);
+    return joined;
+}
+
+/// Bind values for `filter` in the same order the SQL is built: scalars, then and, then or.
+fn bindEventFilters(q: *Query, filter: EventFilterOptions) anyerror!void {
+    try bindEventScalars(q, filter);
+    if (filter.and_group) |children| {
+        for (children) |child| try bindEventFilters(q, child);
+    }
+    if (filter.or_group) |children| {
+        for (children) |child| try bindEventFilters(q, child);
+    }
+}
+
+/// Bind one node's scalars in the same order `appendEventScalarConditions` appends them.
+fn bindEventScalars(q: *Query, filter: EventFilterOptions) !void {
     if (filter.protocol) |c| try q.bindTextStatic(c.toString());
     if (filter.event_type) |t| try q.bindText(t);
     if (filter.event_type_not) |t| try q.bindText(t);

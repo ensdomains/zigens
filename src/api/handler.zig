@@ -107,8 +107,14 @@ pub const GraphQLHandler = struct {
         }
     }
 
-    /// Handle a GraphQL query with optional variables
-    pub fn handleQuery(self: *GraphQLHandler, query: []const u8, variables: ?std.json.Value, operation_name: ?[]const u8) ![]u8 {
+    /// Handle a GraphQL query with optional variables.
+    ///
+    /// `strict` mirrors the server's content negotiation (true when the client Accepts
+    /// `application/graphql-response+json`). It only gates spec-strict request-error
+    /// behavior that the legacy `application/json` contract must NOT see — currently the
+    /// variable-coercion check below. The error envelope itself is unchanged here; the
+    /// server strips the `data` entry for strict 4xx request errors.
+    pub fn handleQuery(self: *GraphQLHandler, query: []const u8, variables: ?std.json.Value, operation_name: ?[]const u8, strict: bool) ![]u8 {
         // Start timing for metrics
         var timer = metrics_mod.QueryTimer.start();
 
@@ -166,7 +172,45 @@ pub const GraphQLHandler = struct {
                 if (std.mem.eql(u8, f.name, "__schema")) return try self.handleIntrospectionQuery();
             }
             for (op.fields) |*f| {
-                if (std.mem.eql(u8, f.name, "__type")) return try self.handleTypeIntrospectionQuery(f);
+                if (std.mem.eql(u8, f.name, "__type")) return try self.handleTypeIntrospectionQuery(f, variables);
+            }
+        }
+
+        // Strict-mode variable coercion (GraphQL-over-HTTP spec): a request that declares a
+        // non-null variable but supplies it null — or omits it with no default — is a request
+        // error and MUST surface as 4xx. Legacy `application/json` clients keep the lenient
+        // 200 behavior (the audit's application/json variant requires 200), so this is gated
+        // on `strict`. Emitting VALIDATION_ERROR makes the server map it to 400.
+        if (strict) {
+            const coerce_op: ?*const parser.Operation = sel: {
+                if (operation_name) |nm| {
+                    for (document.operations) |*o| {
+                        if (o.name != null and std.mem.eql(u8, o.name.?, nm)) break :sel o;
+                    }
+                    break :sel null; // unknown named op — let the executor report it
+                }
+                if (document.operations.len == 1) break :sel &document.operations[0];
+                break :sel null; // multiple unnamed ops — let the executor report it
+            };
+            if (coerce_op) |op| {
+                for (op.variables) |vdef| {
+                    if (!vdef.required) continue;
+                    const provided: ?std.json.Value = if (variables) |vars|
+                        (if (vars == .object) vars.object.get(vdef.name) else null)
+                    else
+                        null;
+                    const violated = if (provided) |pv| pv == .null else (vdef.default_value == null);
+                    if (violated) {
+                        self.metrics.recordError();
+                        const msg = try std.fmt.allocPrint(
+                            self.allocator,
+                            "Variable \"${s}\" of required type \"{s}\" was not provided a non-null value",
+                            .{ vdef.name, vdef.type_name },
+                        );
+                        defer self.allocator.free(msg);
+                        return try self.buildErrorResponseWithCode(msg, ErrorCode.VALIDATION_ERROR);
+                    }
+                }
             }
         }
 
@@ -262,10 +306,30 @@ pub const GraphQLHandler = struct {
         return try self.allocator.dupe(u8, introspection_response);
     }
 
-    fn handleTypeIntrospectionQuery(self: *GraphQLHandler, field: *const parser.Field) ![]u8 {
-        // Read the requested type name from the parsed __type(name: "...") field.
-        const type_name = parser.getStringArg(field, "name", null) orelse
+    fn handleTypeIntrospectionQuery(self: *GraphQLHandler, field: *const parser.Field, variables: ?std.json.Value) ![]u8 {
+        // Read the requested type name from the parsed __type(name: ...) field. The literal
+        // form `__type(name: "Domain")` resolves via getStringArg; the variable form
+        // `__type(name: $name)` (used by the graphql-http conformance suite and by clients
+        // that parameterize introspection) is resolved here against the request variables.
+        const type_name = blk: {
+            if (parser.getStringArg(field, "name", null)) |literal| break :blk literal;
+            for (field.arguments) |*arg| {
+                if (!std.mem.eql(u8, arg.name, "name")) continue;
+                switch (arg.value) {
+                    .variable => |var_name| {
+                        if (variables) |vars| {
+                            if (vars == .object) {
+                                if (vars.object.get(var_name)) |jv| {
+                                    if (jv == .string) break :blk jv.string;
+                                }
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
             return try self.buildErrorResponseWithCode("Invalid __type query: missing name argument", ErrorCode.VALIDATION_ERROR);
+        };
 
         // Load and parse introspection data
         const introspection_json = @embedFile("introspection.json");
@@ -403,7 +467,7 @@ fn expectQueryReturnsData(query: []const u8, op_name: ?[]const u8) !void {
     var handler = try GraphQLHandler.init(allocator, &database, 10, 10000, false);
     defer handler.deinit();
 
-    const result = try handler.handleQuery(query, null, op_name);
+    const result = try handler.handleQuery(query, null, op_name, false);
     defer allocator.free(result);
 
     try testing.expect(std.mem.indexOf(u8, result, "\"data\"") != null);
@@ -431,7 +495,7 @@ test "handleQuery: real __schema query still returns introspection" {
     var handler = try GraphQLHandler.init(allocator, &database, 10, 10000, false);
     defer handler.deinit();
 
-    const result = try handler.handleQuery("{ __schema { queryType { name } } }", null, null);
+    const result = try handler.handleQuery("{ __schema { queryType { name } } }", null, null, false);
     defer allocator.free(result);
     try testing.expect(std.mem.indexOf(u8, result, "\"queryType\"") != null);
 }
@@ -443,12 +507,106 @@ test "handleQuery: real __type(name:) returns the requested type via parsed arg"
     var handler = try GraphQLHandler.init(allocator, &database, 10, 10000, false);
     defer handler.deinit();
 
-    const found = try handler.handleQuery("{ __type(name:\"Domain\"){ name kind } }", null, null);
+    const found = try handler.handleQuery("{ __type(name:\"Domain\"){ name kind } }", null, null, false);
     defer allocator.free(found);
     try testing.expect(std.mem.indexOf(u8, found, "\"__type\"") != null);
     try testing.expect(std.mem.indexOf(u8, found, "Domain") != null);
 
-    const missing = try handler.handleQuery("{ __type(name:\"NoSuchType\"){ name } }", null, null);
+    const missing = try handler.handleQuery("{ __type(name:\"NoSuchType\"){ name } }", null, null, false);
     defer allocator.free(missing);
     try testing.expectEqualStrings("{\"data\":{\"__type\":null}}", missing);
+}
+
+test "handleQuery: where with and/or boolean filter validates and executes (#25)" {
+    const allocator = testing.allocator;
+    var database = try db.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var handler = try GraphQLHandler.init(allocator, &database, 10, 10000, false);
+    defer handler.deinit();
+
+    // owner=X AND (name_contains a OR name_contains b) — nested DomainFilter via `or`.
+    const q = "{ domains(where:{ owner:\"0x1111111111111111111111111111111111111111\", or:[{name_contains:\"a\"},{name_contains:\"b\"}] }){ name } }";
+    const result = try handler.handleQuery(q, null, null, false);
+    defer allocator.free(result);
+    // Parsed + schema-validated + executed → a data response (empty list on an empty DB),
+    // NOT a validation/syntax error.
+    try testing.expect(std.mem.indexOf(u8, result, "\"data\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"errors\"") == null);
+    try testing.expect(std.mem.indexOf(u8, result, "domains") != null);
+}
+
+test "handleQuery: eventConnection where and/or validates and executes (#25)" {
+    const allocator = testing.allocator;
+    var database = try db.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var handler = try GraphQLHandler.init(allocator, &database, 10, 10000, false);
+    defer handler.deinit();
+
+    const q = "{ eventConnection(first:5, where:{ blockNumber_gt:0, or:[{type:\"Transfer\"},{type:\"NameRegistered\"}] }){ totalCount } }";
+    const result = try handler.handleQuery(q, null, null, false);
+    defer allocator.free(result);
+    try testing.expect(std.mem.indexOf(u8, result, "\"data\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"errors\"") == null);
+}
+
+test "handleQuery: registrationConnection where and/or validates and executes (#25)" {
+    const allocator = testing.allocator;
+    var database = try db.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var handler = try GraphQLHandler.init(allocator, &database, 10, 10000, false);
+    defer handler.deinit();
+
+    const q = "{ registrationConnection(first:5, where:{ and:[{protocol:\"v2\"},{or:[{registrant:\"0x1111111111111111111111111111111111111111\"}]}] }){ totalCount } }";
+    const result = try handler.handleQuery(q, null, null, false);
+    defer allocator.free(result);
+    try testing.expect(std.mem.indexOf(u8, result, "\"data\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"errors\"") == null);
+}
+
+test "handleQuery: __type(name: $name) resolves the type from variables (graphql-http 28B9)" {
+    const allocator = testing.allocator;
+    var database = try db.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var handler = try GraphQLHandler.init(allocator, &database, 10, 10000, false);
+    defer handler.deinit();
+
+    const vars = try std.json.parseFromSlice(std.json.Value, allocator, "{\"name\":\"Domain\"}", .{});
+    defer vars.deinit();
+
+    const result = try handler.handleQuery(
+        "query Type($name: String!) { __type(name: $name) { name } }",
+        vars.value,
+        null,
+        false,
+    );
+    defer allocator.free(result);
+    // A real data response for the requested type — NOT a "missing name argument" error.
+    try testing.expect(std.mem.indexOf(u8, result, "\"__type\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "Domain") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"errors\"") == null);
+}
+
+test "handleQuery: required variable given null errors only in strict mode (graphql-http 86EE/7B9B)" {
+    const allocator = testing.allocator;
+    var database = try db.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var handler = try GraphQLHandler.init(allocator, &database, 10, 10000, false);
+    defer handler.deinit();
+
+    const vars = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":null}", .{});
+    defer vars.deinit();
+    const q = "query CoerceFailure($id: ID!){ __typename }";
+
+    // Strict: a non-null variable supplied null is a request error -> VALIDATION_ERROR
+    // (the server then maps this to HTTP 400).
+    const strict_res = try handler.handleQuery(q, vars.value, null, true);
+    defer allocator.free(strict_res);
+    try testing.expect(std.mem.indexOf(u8, strict_res, "VALIDATION_ERROR") != null);
+
+    // Legacy: stays lenient — executes and returns data, no error (the 200 contract every
+    // existing application/json client relies on).
+    const legacy_res = try handler.handleQuery(q, vars.value, null, false);
+    defer allocator.free(legacy_res);
+    try testing.expect(std.mem.indexOf(u8, legacy_res, "\"errors\"") == null);
+    try testing.expect(std.mem.indexOf(u8, legacy_res, "\"data\"") != null);
 }

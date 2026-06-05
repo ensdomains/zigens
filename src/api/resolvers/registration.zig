@@ -32,17 +32,51 @@ const ParsedRegistrationFilter = struct {
     expiry_lt: ?i64 = null,
     expiry_lte: ?i64 = null,
     chain: ?models.Protocol = null,
+    and_filters: ?[]ParsedRegistrationFilter = null,
+    or_filters: ?[]ParsedRegistrationFilter = null,
 
     pub fn deinit(self: *ParsedRegistrationFilter, allocator: std.mem.Allocator) void {
         if (self.registrant_in) |s| allocator.free(s);
+        if (self.and_filters) |group| {
+            for (group) |*c| c.deinit(allocator);
+            allocator.free(group);
+        }
+        if (self.or_filters) |group| {
+            for (group) |*c| c.deinit(allocator);
+            allocator.free(group);
+        }
     }
 };
 
 fn parseRegistrationWhere(field: *const parser.Field, allocator: std.mem.Allocator) !ParsedRegistrationFilter {
+    const where_args = common.getObjectArg(field, "where") orelse return ParsedRegistrationFilter{};
+    return parseRegWhereArgs(where_args, allocator);
+}
+
+/// Parse a RegistrationFilter argument list (top-level `where:` or a nested `and`/`or`
+/// element) into a `ParsedRegistrationFilter`. Recursive for the boolean groups.
+fn parseRegWhereArgs(where_args: []const parser.Argument, allocator: std.mem.Allocator) anyerror!ParsedRegistrationFilter {
     var out = ParsedRegistrationFilter{};
     errdefer out.deinit(allocator);
-    const where_args = common.getObjectArg(field, "where") orelse return out;
     for (where_args) |a| {
+        if ((std.mem.eql(u8, a.name, "and") or std.mem.eql(u8, a.name, "or")) and a.value == .list) {
+            const is_and = std.mem.eql(u8, a.name, "and");
+            var group: std.ArrayList(ParsedRegistrationFilter) = .{};
+            errdefer {
+                for (group.items) |*c| c.deinit(allocator);
+                group.deinit(allocator);
+            }
+            for (a.value.list) |item| {
+                if (item == .object) try group.append(allocator, try parseRegWhereArgs(item.object, allocator));
+            }
+            const slice = try group.toOwnedSlice(allocator);
+            if (is_and) {
+                out.and_filters = slice;
+            } else {
+                out.or_filters = slice;
+            }
+            continue;
+        }
         if (std.mem.eql(u8, a.name, "protocol") and a.value == .string) {
             out.chain = models.Protocol.fromString(a.value.string) catch return error.InvalidProtocol;
             continue;
@@ -58,6 +92,29 @@ fn parseRegistrationWhere(field: *const parser.Field, allocator: std.mem.Allocat
             common.matchIntArg(a, "expiryDate_lte", &out.expiry_lte);
     }
     return out;
+}
+
+/// Map a parsed registration filter node to storage `RegistrationFilterOptions`,
+/// recursively translating the `and`/`or` groups. Allocations are request-arena-backed.
+fn toRegFilter(p: *const ParsedRegistrationFilter, allocator: std.mem.Allocator) anyerror!db.RegistrationFilterOptions {
+    return db.RegistrationFilterOptions{
+        .protocol = p.chain,
+        .registrant = p.registrant,
+        .registrant_in = p.registrant_in,
+        .expiry_gt = p.expiry_gt,
+        .expiry_gte = p.expiry_gte,
+        .expiry_lt = p.expiry_lt,
+        .expiry_lte = p.expiry_lte,
+        .and_group = try mapRegGroup(p.and_filters, allocator),
+        .or_group = try mapRegGroup(p.or_filters, allocator),
+    };
+}
+
+fn mapRegGroup(group: ?[]const ParsedRegistrationFilter, allocator: std.mem.Allocator) anyerror!?[]const db.RegistrationFilterOptions {
+    const children = group orelse return null;
+    const arr = try allocator.alloc(db.RegistrationFilterOptions, children.len);
+    for (children, 0..) |*c, i| arr[i] = try toRegFilter(c, allocator);
+    return arr;
 }
 
 /// Resolver for registrationConnection query (cursor-based pagination)
@@ -93,6 +150,8 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
         .expiry_gte = parsed.expiry_gte,
         .expiry_lt = parsed.expiry_lt,
         .expiry_lte = parsed.expiry_lte,
+        .and_group = try mapRegGroup(parsed.and_filters, allocator),
+        .or_group = try mapRegGroup(parsed.or_filters, allocator),
     };
 
     // Check which top-level fields are requested (for totalCount-only fast path)
@@ -332,6 +391,8 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
         .expiry_gte = parsed.expiry_gte,
         .expiry_lt = parsed.expiry_lt,
         .expiry_lte = parsed.expiry_lte,
+        .and_group = try mapRegGroup(parsed.and_filters, allocator),
+        .or_group = try mapRegGroup(parsed.or_filters, allocator),
     });
     defer {
         for (events_result) |*event| {

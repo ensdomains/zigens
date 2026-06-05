@@ -202,6 +202,9 @@ pub const RegistrationFilterOptions = struct {
     expiry_gte: ?i64 = null,
     expiry_lt: ?i64 = null,
     expiry_lte: ?i64 = null,
+    /// Subgraph-style boolean composition (GraphQL `and` / `or`), nesting recursively.
+    and_group: ?[]const RegistrationFilterOptions = null,
+    or_group: ?[]const RegistrationFilterOptions = null,
 };
 
 /// Map an EventSortField to a registrations-table column name. The events-table
@@ -219,6 +222,18 @@ fn sortColumn(sort_field: events.EventSortField) []const u8 {
 /// Append WHERE conditions for a registrations-table query. `allocated_clauses`
 /// owns dynamically-built IN clauses so the caller can free them.
 fn appendFilterConditions(
+    db: *Database,
+    filter: RegistrationFilterOptions,
+    conditions: *std.ArrayList([]const u8),
+    allocated_clauses: *std.ArrayList([]const u8),
+) !void {
+    if (try buildRegNodeExpr(db, filter, allocated_clauses)) |expr| {
+        try conditions.append(db.allocator, expr);
+    }
+}
+
+/// One registration-filter node's scalar predicates (no and/or).
+fn appendRegScalarConditions(
     db: *Database,
     filter: RegistrationFilterOptions,
     conditions: *std.ArrayList([]const u8),
@@ -247,9 +262,52 @@ fn appendFilterConditions(
     if (filter.expiry_lte != null) try conditions.append(db.allocator, "expiry <= ?");
 }
 
-/// Bind values for the conditions appended by `appendFilterConditions`. Order
-/// must match exactly.
-fn bindFilters(q: *db_module.Query, filter: RegistrationFilterOptions) !void {
+/// Recursively build one registration-filter node's boolean SQL (scalars + and/or).
+fn buildRegNodeExpr(
+    db: *Database,
+    filter: RegistrationFilterOptions,
+    allocated_clauses: *std.ArrayList([]const u8),
+) anyerror!?[]const u8 {
+    var parts: std.ArrayList([]const u8) = .{};
+    defer parts.deinit(db.allocator);
+    try appendRegScalarConditions(db, filter, &parts, allocated_clauses);
+    if (filter.and_group) |children| {
+        for (children) |child| {
+            if (try buildRegNodeExpr(db, child, allocated_clauses)) |sub| try parts.append(db.allocator, sub);
+        }
+    }
+    if (filter.or_group) |children| {
+        var or_parts: std.ArrayList([]const u8) = .{};
+        defer or_parts.deinit(db.allocator);
+        for (children) |child| {
+            if (try buildRegNodeExpr(db, child, allocated_clauses)) |sub| try or_parts.append(db.allocator, sub);
+        }
+        if (or_parts.items.len > 0) {
+            const joined = try db_module.query.joinWrapped(db.allocator, or_parts.items, " OR ");
+            try allocated_clauses.append(db.allocator, joined);
+            try parts.append(db.allocator, joined);
+        }
+    }
+    if (parts.items.len == 0) return null;
+    if (parts.items.len == 1) return parts.items[0];
+    const joined = try db_module.query.joinWrapped(db.allocator, parts.items, " AND ");
+    try allocated_clauses.append(db.allocator, joined);
+    return joined;
+}
+
+/// Bind values for `filter`: scalars, then and, then or (matches the SQL build order).
+fn bindFilters(q: *db_module.Query, filter: RegistrationFilterOptions) anyerror!void {
+    try bindRegScalars(q, filter);
+    if (filter.and_group) |children| {
+        for (children) |child| try bindFilters(q, child);
+    }
+    if (filter.or_group) |children| {
+        for (children) |child| try bindFilters(q, child);
+    }
+}
+
+/// Bind one node's scalars in the same order `appendRegScalarConditions` appends them.
+fn bindRegScalars(q: *db_module.Query, filter: RegistrationFilterOptions) !void {
     if (filter.protocol) |p| try q.bindTextStatic(p.toString());
     if (filter.registrant) |r| try q.bindText(r);
     if (filter.registrant_in) |list| {

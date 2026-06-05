@@ -4,6 +4,7 @@ const models = @import("../types/models.zig");
 const Hash = @import("../types/hash.zig").Hash;
 const Address = @import("../types/address.zig").Address;
 const graphql = @import("handler.zig");
+const parser = @import("../lib/graphql/parser.zig");
 const json_utils = @import("../utils/json.zig");
 const url_utils = @import("../utils/url.zig");
 const validation = @import("../utils/validation.zig");
@@ -46,6 +47,105 @@ fn resolveClientAddress(direct_peer: std.net.Address, header_data: []const u8, h
         return std.net.Address.parseIp(ip_str, 0) catch direct_peer;
     }
     return direct_peer;
+}
+
+/// GraphQL-over-HTTP content negotiation. Returns true only when the client explicitly
+/// Accepts `application/graphql-response+json` (the strict spec media type). Everything
+/// else — `application/json`, `*/*`, `text/html`, or no Accept header — keeps the legacy
+/// "always 200 + application/json, errors in body" contract that ensjs / subgraph clients
+/// rely on. No change is gated on anything but this opt-in header.
+fn acceptsResponseJson(request: []const u8) bool {
+    const accept = findHeaderValue(request, "accept") orelse return false;
+    return std.mem.indexOf(u8, accept, "application/graphql-response+json") != null;
+}
+
+fn graphqlContentType(strict: bool) []const u8 {
+    return if (strict) "application/graphql-response+json" else "application/json";
+}
+
+/// In strict mode, map a GraphQL response body to a GraphQL-over-HTTP status code:
+/// request / parse / validation failures -> 400; success and field-execution errors ->
+/// 200. Keyed off the stable `extensions.code` the handler emits. Only consulted in
+/// strict mode — the legacy path is always 200, so this never affects existing clients.
+fn strictStatus(body: []const u8) u16 {
+    const codes = [_][]const u8{
+        "\"code\":\"SYNTAX_ERROR\"",
+        "\"code\":\"VALIDATION_ERROR\"",
+        "\"code\":\"COMPLEXITY_LIMIT_EXCEEDED\"",
+        "\"code\":\"INVALID_ARGUMENT\"",
+    };
+    for (codes) |c| {
+        if (std.mem.indexOf(u8, body, c) != null) return 400;
+    }
+    return 200;
+}
+
+/// GraphQL-over-HTTP: a response to a request error (parse / validation, served as 4xx)
+/// MUST NOT carry a top-level `data` entry. The handler's error envelope always ends with
+/// the fixed suffix `,"data":null}`; for strict 4xx responses we drop it, yielding
+/// `{"errors":[...]}`. Returns a freshly-allocated body when stripped, otherwise a dupe of
+/// the input (caller always frees). Only ever called in strict mode, so the legacy
+/// application/json contract keeps `data:null` byte-for-byte.
+fn stripNullData(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    const suffix = ",\"data\":null}";
+    if (std.mem.endsWith(u8, body, suffix)) {
+        const head = body[0 .. body.len - suffix.len];
+        var out = try allocator.alloc(u8, head.len + 1);
+        @memcpy(out[0..head.len], head);
+        out[head.len] = '}';
+        return out;
+    }
+    return try allocator.dupe(u8, body);
+}
+
+/// Find a raw (still percent-encoded) query-string parameter value by key.
+fn getQueryParam(qs: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, qs, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
+    }
+    return null;
+}
+
+/// Decode an application/x-www-form-urlencoded component (`%XX` escapes, `+` for space).
+/// Malformed escapes are passed through verbatim.
+fn urlDecode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .{};
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        const c = input[i];
+        if (c == '+') {
+            try out.append(allocator, ' ');
+        } else if (c == '%' and i + 2 < input.len) {
+            const hi = std.fmt.charToDigit(input[i + 1], 16) catch {
+                try out.append(allocator, c);
+                continue;
+            };
+            const lo = std.fmt.charToDigit(input[i + 2], 16) catch {
+                try out.append(allocator, c);
+                continue;
+            };
+            try out.append(allocator, hi * 16 + lo);
+            i += 2;
+        } else {
+            try out.append(allocator, c);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// True if any operation in the query is a mutation. Used to reject mutations over GET per
+/// the GraphQL-over-HTTP spec (GET is for safe/idempotent queries only). A parse error
+/// returns false so the normal handler reports the syntax error instead.
+fn queryIsMutation(allocator: std.mem.Allocator, query: []const u8) bool {
+    var doc = parser.parseQuery(allocator, query) catch return false;
+    defer doc.deinit(allocator);
+    for (doc.operations) |op| {
+        if (op.type == .mutation) return true;
+    }
+    return false;
 }
 
 /// Simple JSON API Server for ENSv2 Indexer
@@ -280,7 +380,7 @@ pub const Server = struct {
             if (std.mem.eql(u8, method, "POST")) {
                 try self.handleGraphQLQuery(connection.stream, request);
             } else if (std.mem.eql(u8, method, "GET")) {
-                try self.handleGraphQLPlayground(connection.stream);
+                try self.handleGraphQLGet(connection.stream, path, request);
             } else {
                 try self.sendBadRequest(connection.stream, "Only GET and POST supported for GraphQL");
             }
@@ -506,38 +606,47 @@ pub const Server = struct {
     }
 
     fn handleGraphQLQuery(self: *Server, stream: std.net.Stream, request: []const u8) !void {
+        // GraphQL-over-HTTP content negotiation. Default (application/json, */*, or no
+        // Accept header) keeps the legacy contract every ensjs / subgraph client relies
+        // on: 200 + application/json with errors in the body. A client that explicitly
+        // Accepts `application/graphql-response+json` opts into spec status codes (4xx for
+        // request / parse / validation failures). The opt-in header is the only thing that
+        // changes behaviour, so existing clients are unaffected.
+        const strict = acceptsResponseJson(request);
+        const ct = graphqlContentType(strict);
+
         // Extract GraphQL query from POST body
         // Find the body after double newline
         const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse std.mem.indexOf(u8, request, "\n\n") orelse {
-            return try self.sendBadRequest(stream, "Invalid request format");
+            return try self.sendRequestError(stream, "Invalid request format", strict);
         };
 
         const body = request[body_start + 4 ..];
 
         // Parse JSON body to extract query and variables
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {
-            return try self.sendBadRequest(stream, "Invalid JSON body");
+            return try self.sendRequestError(stream, "Invalid JSON body", strict);
         };
         defer parsed.deinit();
 
         // Body must be a JSON object. Null, arrays, primitives, etc. would panic on .object access.
         if (parsed.value != .object) {
-            return try self.sendBadRequest(stream, "Request body must be a JSON object");
+            return try self.sendRequestError(stream, "Request body must be a JSON object", strict);
         }
 
         const query_value = parsed.value.object.get("query") orelse {
-            return try self.sendBadRequest(stream, "Query field required");
+            return try self.sendRequestError(stream, "Query field required", strict);
         };
 
         // Query must be a string. Integer/null/etc. would panic on .string access.
         if (query_value != .string) {
-            return try self.sendBadRequest(stream, "`query` field must be a string");
+            return try self.sendRequestError(stream, "`query` field must be a string", strict);
         }
         const query = query_value.string;
 
         // SECURITY: Validate GraphQL query length to prevent DoS attacks
         validation.validateGraphQLQuery(query) catch {
-            return try self.sendBadRequest(stream, "Invalid GraphQL query: length must be between 1 and 10000 characters");
+            return try self.sendRequestError(stream, "Invalid GraphQL query: length must be between 1 and 10000 characters", strict);
         };
 
         // Extract variables if present (optional)
@@ -549,6 +658,21 @@ pub const Server = struct {
         else
             null;
 
+        // Strict mode validates parameter types per the GraphQL-over-HTTP spec (400 on a
+        // wrong-typed variables/operationName/extensions). Legacy mode stays lenient —
+        // unchanged for existing clients, which never send malformed parameters anyway.
+        if (strict) {
+            if (variables_value) |v| {
+                if (v != .object and v != .null) return try self.sendRequestError(stream, "`variables` must be an object", strict);
+            }
+            if (parsed.value.object.get("operationName")) |ov| {
+                if (ov != .string and ov != .null) return try self.sendRequestError(stream, "`operationName` must be a string", strict);
+            }
+            if (parsed.value.object.get("extensions")) |ev| {
+                if (ev != .object and ev != .null) return try self.sendRequestError(stream, "`extensions` must be an object", strict);
+            }
+        }
+
         std.log.info("GraphQL query: {s}", .{query});
         if (variables_value) |v| {
             std.log.info("Variables provided: {any}", .{v});
@@ -558,10 +682,87 @@ pub const Server = struct {
         }
 
         // Handle the query with variables and operation name
-        const result = try self.graphql_handler.handleQuery(query, variables_value, operation_name);
+        const result = try self.graphql_handler.handleQuery(query, variables_value, operation_name, strict);
         defer self.allocator.free(result);
 
-        try self.sendJsonResponse(stream, 200, result);
+        // Legacy mode: always 200 (errors travel in the body) — unchanged. Strict mode:
+        // map the response to a spec status code (4xx for request/parse/validation errors)
+        // and drop the `data:null` entry the spec forbids on request errors.
+        const status: u16 = if (strict) strictStatus(result) else 200;
+        if (strict and status == 400) {
+            const stripped = try stripNullData(self.allocator, result);
+            defer self.allocator.free(stripped);
+            try self.sendGraphQLResponse(stream, status, stripped, ct);
+        } else {
+            try self.sendGraphQLResponse(stream, status, result, ct);
+        }
+    }
+
+    /// GraphQL-over-HTTP GET support. Bare `GET /graphql` serves the interactive playground
+    /// (unchanged). `GET /graphql?query=...&variables=...&operationName=...` executes the
+    /// query, reusing the same content negotiation, handler, and status mapping as POST.
+    /// Mutations are rejected with 4xx (this is a read-only indexer; GET must stay safe).
+    fn handleGraphQLGet(self: *Server, stream: std.net.Stream, path: []const u8, request: []const u8) !void {
+        const qmark = std.mem.indexOfScalar(u8, path, '?');
+        const query_enc: ?[]const u8 = if (qmark) |q| getQueryParam(path[q + 1 ..], "query") else null;
+
+        // No `?query=` → serve the playground, exactly as before.
+        if (query_enc == null) return try self.handleGraphQLPlayground(stream);
+
+        const strict = acceptsResponseJson(request);
+        const ct = graphqlContentType(strict);
+        const qs = path[qmark.? + 1 ..];
+
+        const query = try urlDecode(self.allocator, query_enc.?);
+        defer self.allocator.free(query);
+
+        validation.validateGraphQLQuery(query) catch {
+            return try self.sendRequestError(stream, "Invalid GraphQL query: length must be between 1 and 10000 characters", strict);
+        };
+
+        // GET MUST NOT execute mutations (GraphQL-over-HTTP). We have none anyway.
+        if (queryIsMutation(self.allocator, query)) {
+            return try self.sendRequestError(stream, "GET supports query operations only; use POST for mutations", strict);
+        }
+
+        // Optional URL-encoded JSON `variables`.
+        var variables_owned: ?std.json.Parsed(std.json.Value) = null;
+        defer if (variables_owned) |p| p.deinit();
+        var variables_value: ?std.json.Value = null;
+        if (getQueryParam(qs, "variables")) |vars_enc| {
+            const vars_json = try urlDecode(self.allocator, vars_enc);
+            defer self.allocator.free(vars_json);
+            const p = std.json.parseFromSlice(std.json.Value, self.allocator, vars_json, .{}) catch {
+                return try self.sendRequestError(stream, "`variables` must be a JSON object", strict);
+            };
+            if (p.value != .object and p.value != .null) {
+                p.deinit();
+                return try self.sendRequestError(stream, "`variables` must be a JSON object", strict);
+            }
+            variables_owned = p;
+            variables_value = p.value;
+        }
+
+        // Optional `operationName`.
+        var op_name_owned: ?[]u8 = null;
+        defer if (op_name_owned) |o| self.allocator.free(o);
+        var operation_name: ?[]const u8 = null;
+        if (getQueryParam(qs, "operationName")) |op_enc| {
+            op_name_owned = try urlDecode(self.allocator, op_enc);
+            operation_name = op_name_owned;
+        }
+
+        const result = try self.graphql_handler.handleQuery(query, variables_value, operation_name, strict);
+        defer self.allocator.free(result);
+
+        const status: u16 = if (strict) strictStatus(result) else 200;
+        if (strict and status == 400) {
+            const stripped = try stripNullData(self.allocator, result);
+            defer self.allocator.free(stripped);
+            try self.sendGraphQLResponse(stream, status, stripped, ct);
+        } else {
+            try self.sendGraphQLResponse(stream, status, result, ct);
+        }
     }
 
     fn handleGraphQLPlayground(self: *Server, stream: std.net.Stream) !void {
@@ -620,6 +821,44 @@ pub const Server = struct {
         defer self.allocator.free(response);
 
         try self.sendJsonResponse(stream, 400, response);
+    }
+
+    /// Write a GraphQL response with a content-negotiated Content-Type. Same wire format
+    /// as `sendJsonResponse` but the media type and status are caller-chosen (see the
+    /// content-negotiation logic in `handleGraphQLQuery`).
+    fn sendGraphQLResponse(self: *Server, stream: std.net.Stream, status: u16, body: []const u8, content_type: []const u8) !void {
+        const status_text = switch (status) {
+            200 => "OK",
+            400 => "Bad Request",
+            else => "Error",
+        };
+
+        var response: std.ArrayList(u8) = .{};
+        defer response.deinit(self.allocator);
+
+        const writer = response.writer(self.allocator);
+        try writer.print(
+            "HTTP/1.1 {d} {s}\r\n" ++
+                "Content-Type: {s}\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "Access-Control-Allow-Origin: *\r\n" ++
+                "\r\n" ++
+                "{s}",
+            .{ status, status_text, content_type, body.len, body },
+        );
+
+        _ = try stream.write(response.items);
+    }
+
+    /// Request-level error (malformed body / params). Legacy clients keep the existing
+    /// `{"error":...}` + application/json + 400 response (unchanged). Strict clients get
+    /// the GraphQL `{"errors":[...]}` envelope + application/graphql-response+json + 400.
+    /// `message` is a static, JSON-safe string (no escaping needed).
+    fn sendRequestError(self: *Server, stream: std.net.Stream, message: []const u8, strict: bool) !void {
+        if (!strict) return self.sendBadRequest(stream, message);
+        const body = try std.fmt.allocPrint(self.allocator, "{{\"errors\":[{{\"message\":\"{s}\"}}]}}", .{message});
+        defer self.allocator.free(body);
+        try self.sendGraphQLResponse(stream, 400, body, graphqlContentType(true));
     }
 
     fn sendRateLimited(self: *Server, stream: std.net.Stream) !void {
@@ -1927,4 +2166,28 @@ test "resolveClientAddress: X-Forwarded-For trusted-proxy resolution (spoof-resi
     try std.testing.expect(eq(resolveClientAddress(peer, "Host: x\r\n\r\n", 1), "10.0.0.1"));
     try std.testing.expect(eq(resolveClientAddress(peer, "X-Forwarded-For: 1.2.3.4\r\n\r\n", 5), "10.0.0.1"));
     try std.testing.expect(eq(resolveClientAddress(peer, "X-Forwarded-For: not-an-ip\r\n\r\n", 1), "10.0.0.1"));
+}
+
+test "content negotiation: only application/graphql-response+json is strict" {
+    // Legacy/default media types must NOT trigger strict mode (preserves client compat).
+    try std.testing.expect(!acceptsResponseJson("Accept: application/json\r\n\r\n"));
+    try std.testing.expect(!acceptsResponseJson("Accept: */*\r\n\r\n"));
+    try std.testing.expect(!acceptsResponseJson("Accept: text/html\r\n\r\n"));
+    try std.testing.expect(!acceptsResponseJson("Host: x\r\n\r\n")); // no Accept header
+    // Only the strict spec media type opts in.
+    try std.testing.expect(acceptsResponseJson("Accept: application/graphql-response+json\r\n\r\n"));
+    try std.testing.expect(acceptsResponseJson("accept: application/graphql-response+json, application/json\r\n\r\n"));
+
+    try std.testing.expectEqualStrings("application/json", graphqlContentType(false));
+    try std.testing.expectEqualStrings("application/graphql-response+json", graphqlContentType(true));
+}
+
+test "strictStatus: 400 for request/parse/validation codes, 200 otherwise" {
+    try std.testing.expectEqual(@as(u16, 200), strictStatus("{\"data\":{\"x\":1}}"));
+    try std.testing.expectEqual(@as(u16, 400), strictStatus("{\"errors\":[{\"extensions\":{\"code\":\"SYNTAX_ERROR\"}}],\"data\":null}"));
+    try std.testing.expectEqual(@as(u16, 400), strictStatus("{\"errors\":[{\"extensions\":{\"code\":\"VALIDATION_ERROR\"}}],\"data\":null}"));
+    try std.testing.expectEqual(@as(u16, 400), strictStatus("{\"errors\":[{\"extensions\":{\"code\":\"COMPLEXITY_LIMIT_EXCEEDED\"}}],\"data\":null}"));
+    try std.testing.expectEqual(@as(u16, 400), strictStatus("{\"errors\":[{\"extensions\":{\"code\":\"INVALID_ARGUMENT\"}}],\"data\":null}"));
+    // A field/execution error (no request-level code) stays 200 under the spec.
+    try std.testing.expectEqual(@as(u16, 200), strictStatus("{\"errors\":[{\"extensions\":{\"code\":\"INTERNAL_ERROR\"}}],\"data\":null}"));
 }
