@@ -1,0 +1,14 @@
+{
+  "name": "zigens-graphql-conformance",
+  "private": true,
+  "type": "module",
+  "description": "GraphQL spec-conformance checks for the zigens API: graphql-js schema/introspection diff + graphql-http over-HTTP audit.",
+  "scripts": {
+    "schema": "node schemacheck.mjs",
+    "audit": "node audit.mjs"
+  },
+  "dependencies": {
+    "graphql": "^16",
+    "graphql-http": "^1.22"
+  }
+}
