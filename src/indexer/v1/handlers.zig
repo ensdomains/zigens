@@ -84,11 +84,10 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
         var tx_buf: [66]u8 = undefined;
         const tx_hash_hex = log.transaction_hash.toHexBuf(&tx_buf);
 
-        var q = try Query.initCached(self.database,
-            \\INSERT OR IGNORE INTO temp_pre_migration_names
-            \\(protocol, namehash, label_hash, parent_node, owner, block_number, tx_hash, log_index, created_at)
-            \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        );
+        const upsert_sql = try self.database.upsertSql(self.database.allocator, "temp_pre_migration_names", &.{ "protocol", "namehash", "label_hash", "parent_node", "owner", "block_number", "tx_hash", "log_index", "created_at" }, .ignore);
+        defer self.database.allocator.free(upsert_sql);
+
+        var q = try Query.initCached(self.database, upsert_sql);
         defer q.deinit();
 
         try q.bindTextStatic(@tagName(protocol));

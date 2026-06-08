@@ -345,13 +345,47 @@ test "Dialect: upsert replace/ignore" {
     defer destroyTestDb(allocator, database);
     const d = database.dialect();
 
-    const replace_sql = try d.upsert(allocator, "names", &.{ "namehash", "owner" }, &.{"namehash"}, .replace);
+    const replace_sql = try d.upsert(allocator, "names", &.{ "namehash", "owner" }, &.{}, &.{"namehash"}, .replace);
     defer allocator.free(replace_sql);
     try testing.expectEqualStrings("INSERT OR REPLACE INTO \"names\" (\"namehash\", \"owner\") VALUES (?, ?)", replace_sql);
 
-    const ignore_sql = try d.upsert(allocator, "events", &.{"id"}, &.{}, .ignore);
+    const ignore_sql = try d.upsert(allocator, "events", &.{"id"}, &.{}, &.{}, .ignore);
     defer allocator.free(ignore_sql);
     try testing.expectEqualStrings("INSERT OR IGNORE INTO \"events\" (\"id\") VALUES (?)", ignore_sql);
+
+    // value_exprs: literals and wrappers stay inline (binds unchanged at call sites).
+    const expr_sql = try d.upsert(allocator, "name_history", &.{ "protocol", "change_type", "old_value", "log_index" }, &.{ "?", "'migration'", "NULL", "0" }, &.{}, .ignore);
+    defer allocator.free(expr_sql);
+    try testing.expectEqualStrings("INSERT OR IGNORE INTO \"name_history\" (\"protocol\", \"change_type\", \"old_value\", \"log_index\") VALUES (?, 'migration', NULL, 0)", expr_sql);
+
+    // insertSelect: verb + cols wrap the caller's SELECT body verbatim.
+    const sel_sql = try d.insertSelect(allocator, "resolvers", &.{ "protocol", "address" }, "SELECT n.protocol, n.resolver FROM names n WHERE n.resolver != ''", &.{}, .ignore);
+    defer allocator.free(sel_sql);
+    try testing.expectEqualStrings("INSERT OR IGNORE INTO \"resolvers\" (\"protocol\", \"address\") SELECT n.protocol, n.resolver FROM names n WHERE n.resolver != ''", sel_sql);
+}
+
+test "Database.upsertSql: resolves the schema conflict key + builds SQLite SQL" {
+    const allocator = testing.allocator;
+    const database = try createTestDb(allocator);
+    defer destroyTestDb(allocator, database);
+
+    // The conflict key (UNIQUE(protocol, resolver, namehash, key)) is resolved
+    // centrally; SQLite ignores it, so the emitted statement is the literal verb.
+    const sql = try database.upsertSql(allocator, "resolver_texts", &.{ "namehash", "resolver", "key", "value" }, .replace);
+    defer allocator.free(sql);
+    try testing.expectEqualStrings(
+        "INSERT OR REPLACE INTO \"resolver_texts\" (\"namehash\", \"resolver\", \"key\", \"value\") VALUES (?, ?, ?, ?)",
+        sql,
+    );
+
+    const ignore_sql = try database.upsertSql(allocator, "events", &.{ "tx_hash", "log_index" }, .ignore);
+    defer allocator.free(ignore_sql);
+    try testing.expectEqualStrings(
+        "INSERT OR IGNORE INTO \"events\" (\"tx_hash\", \"log_index\") VALUES (?, ?)",
+        ignore_sql,
+    );
+
+    try testing.expectError(error.UnknownUpsertTable, database.upsertSql(allocator, "not_a_table", &.{"x"}, .replace));
 }
 
 test "Dialect: returning / nowEpoch / jsonObject / jsonExtract" {

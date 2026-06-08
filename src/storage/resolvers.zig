@@ -32,11 +32,8 @@ pub fn upsertResolverEntity(
     timestamp: i64,
 ) !void {
     if (resolver_address.len == 0 or namehash.len == 0) return;
-    const sql =
-        \\INSERT OR IGNORE INTO resolvers
-        \\  (protocol, address, name, namehash, set_block, set_at)
-        \\VALUES (?, ?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "resolvers", &.{ "protocol", "address", "name", "namehash", "set_block", "set_at" }, .ignore);
+    defer db.allocator.free(sql);
     var q = try Query.initCached(db, sql);
     defer q.deinit();
     try q.bindTextStatic(protocol.toString());
@@ -172,21 +169,21 @@ pub fn backfillResolverEntitiesFromNames(db: *Database) !u64 {
     defer seed_q.deinit();
     const seed_block: i64 = if (try seed_q.step()) seed_q.getInt64(0) else 0;
 
-    const sql =
-        \\INSERT OR IGNORE INTO resolvers (protocol, address, name, namehash, set_block, set_at)
+    const select_body =
         \\SELECT n.protocol, n.resolver, n.name, n.namehash, ?, COALESCE(n.created_at, 0)
         \\FROM names n
         \\WHERE n.resolver IS NOT NULL
         \\  AND n.resolver != ''
         \\  AND n.resolver != '0x0000000000000000000000000000000000000000'
     ;
+    const sql = try db.insertSelectSql(db.allocator, "resolvers", &.{ "protocol", "address", "name", "namehash", "set_block", "set_at" }, select_body, .ignore);
+    defer db.allocator.free(sql);
     var q = try Query.init(db, sql);
     defer q.deinit();
     try q.bindInt64(seed_block);
     try q.exec();
     return try getResolverEntityCount(db);
 }
-
 
 pub fn storeResolverAddress(
     db: *Database,
@@ -199,11 +196,14 @@ pub fn storeResolverAddress(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_addresses
-        \\  (namehash, resolver, coin_type, address, protocol, block_number, transaction_hash, timestamp, context)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
-    ;
+    const sql = try db.upsertExprSql(
+        db.allocator,
+        "resolver_addresses",
+        &.{ "namehash", "resolver", "coin_type", "address", "protocol", "block_number", "transaction_hash", "timestamp", "context" },
+        &.{ "?", "?", "?", "?", "?", "?", "?", "?", "NULL" },
+        .replace,
+    );
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -231,11 +231,8 @@ pub fn storeResolverContentHash(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_contenthashes
-        \\  (namehash, resolver, contenthash, protocol, block_number, transaction_hash, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "resolver_contenthashes", &.{ "namehash", "resolver", "contenthash", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -263,11 +260,8 @@ pub fn storeResolverText(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_texts
-        \\  (namehash, resolver, key, value, protocol, block_number, transaction_hash, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "resolver_texts", &.{ "namehash", "resolver", "key", "value", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -824,12 +818,8 @@ pub fn storeResolverAuthorisation(
     log_index: u32,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_authorisations
-        \\  (protocol, namehash, resolver, owner, target, is_authorised,
-        \\   block_number, transaction_hash, log_index, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "resolver_authorisations", &.{ "protocol", "namehash", "resolver", "owner", "target", "is_authorised", "block_number", "transaction_hash", "log_index", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
     var q = try Query.init(db, sql);
     defer q.deinit();
     try q.bindTextStatic(protocol.toString());
@@ -860,12 +850,8 @@ pub fn storeResolverDnsRecord(
     log_index: u32,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_dns_records
-        \\  (protocol, namehash, resolver, dns_name, resource, record,
-        \\   block_number, transaction_hash, log_index, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "resolver_dns_records", &.{ "protocol", "namehash", "resolver", "dns_name", "resource", "record", "block_number", "transaction_hash", "log_index", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
     var q = try Query.init(db, sql);
     defer q.deinit();
     try q.bindTextStatic(protocol.toString());
@@ -918,12 +904,8 @@ pub fn storeResolverDnsZonehash(
     log_index: u32,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_dns_zonehashes
-        \\  (protocol, namehash, resolver, zonehash, last_zonehash,
-        \\   block_number, transaction_hash, log_index, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "resolver_dns_zonehashes", &.{ "protocol", "namehash", "resolver", "zonehash", "last_zonehash", "block_number", "transaction_hash", "log_index", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
     var q = try Query.init(db, sql);
     defer q.deinit();
     try q.bindTextStatic(protocol.toString());
@@ -948,11 +930,8 @@ pub fn storeResolverAlias(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_aliases
-        \\  (resolver, from_name, to_name, protocol, block_number, transaction_hash, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "resolver_aliases", &.{ "resolver", "from_name", "to_name", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -1201,11 +1180,8 @@ pub fn storeResolverPubkey(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_pubkeys
-        \\  (namehash, resolver, x, y, protocol, block_number, transaction_hash, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "resolver_pubkeys", &.{ "namehash", "resolver", "x", "y", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -1232,11 +1208,8 @@ pub fn storeResolverABI(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_abis
-        \\  (namehash, resolver, content_type, protocol, block_number, transaction_hash, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "resolver_abis", &.{ "namehash", "resolver", "content_type", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -1262,11 +1235,8 @@ pub fn storeResolverName(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_names
-        \\  (namehash, resolver, name, protocol, block_number, transaction_hash, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "resolver_names", &.{ "namehash", "resolver", "name", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -1293,11 +1263,8 @@ pub fn storeResolverInterface(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_interfaces
-        \\  (namehash, resolver, interface_id, implementer, protocol, block_number, transaction_hash, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "resolver_interfaces", &.{ "namehash", "resolver", "interface_id", "implementer", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -1324,11 +1291,8 @@ pub fn storeResolverVersion(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_versions
-        \\  (namehash, resolver, version, protocol, block_number, transaction_hash, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "resolver_versions", &.{ "namehash", "resolver", "version", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();

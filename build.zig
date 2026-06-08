@@ -87,6 +87,15 @@ pub fn build(b: *std.Build) void {
     });
     generate_schema.setCwd(b.path("."));
 
+    // Transpile the canonical SQLite schema into the Postgres schema so the two
+    // never drift; its guard fails the build on any unhandled SQLite construct.
+    const generate_pg_schema = b.addSystemCommand(&[_][]const u8{
+        "python3",
+        "tools/gen_pg_schema.py",
+    });
+    generate_pg_schema.setCwd(b.path("."));
+    b.getInstallStep().dependOn(&generate_pg_schema.step);
+
     // API server executable (standalone)
     const api_exe = b.addExecutable(.{
         .name = "ensv2-api",
@@ -515,6 +524,18 @@ pub fn build(b: *std.Build) void {
     const run_storage_query_tests = b.addRunArtifact(storage_query_tests);
     run_storage_query_tests.setCwd(b.path("."));
 
+    // Conflict-key map: the only guard on the schema-derived ON CONFLICT targets
+    // (SQLite ignores them, so they are invisible to behavioral tests).
+    const storage_schema_keys_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/storage/schema_keys.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_storage_schema_keys_tests = b.addRunArtifact(storage_schema_keys_tests);
+    run_storage_schema_keys_tests.setCwd(b.path("."));
+
     // Storage test step
     const storage_test_step = b.step("test-storage", "Run storage module tests");
     storage_test_step.dependOn(&run_storage_names_tests.step);
@@ -523,6 +544,7 @@ pub fn build(b: *std.Build) void {
     storage_test_step.dependOn(&run_storage_webhooks_tests.step);
     storage_test_step.dependOn(&run_storage_registry_entries_tests.step);
     storage_test_step.dependOn(&run_storage_query_tests.step);
+    storage_test_step.dependOn(&run_storage_schema_keys_tests.step);
 
     // Make the default test command run all tests
     test_step.dependOn(&run_filter_tests.step);

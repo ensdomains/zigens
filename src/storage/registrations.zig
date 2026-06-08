@@ -29,11 +29,14 @@ pub fn insertRegistration(
     log_index: u32,
     event_type: models.EventType,
 ) !void {
-    const sql =
-        \\INSERT OR IGNORE INTO registrations
-        \\(protocol, namehash, label, parent_name, registrant, registered_at, expiry, block_number, transaction_hash, log_index, event_type)
-        \\VALUES (?, ?, ?, ?, LOWER(?), ?, ?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertExprSql(
+        db.allocator,
+        "registrations",
+        &.{ "protocol", "namehash", "label", "parent_name", "registrant", "registered_at", "expiry", "block_number", "transaction_hash", "log_index", "event_type" },
+        &.{ "?", "?", "?", "?", "LOWER(?)", "?", "?", "?", "?", "?", "?" },
+        .ignore,
+    );
+    defer db.allocator.free(sql);
 
     var q = try db_module.Query.initCached(db, sql);
     defer q.deinit();

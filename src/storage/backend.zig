@@ -65,9 +65,16 @@ pub const Dialect = struct {
     placeholder: Placeholder,
     /// SQL expression yielding the current Unix epoch in seconds.
     nowEpoch: []const u8,
-    /// `INSERT OR REPLACE/IGNORE INTO t (cols) VALUES (?, …)` (SQLite) /
-    /// `INSERT INTO t (cols) VALUES (?, …) ON CONFLICT(conflict) DO UPDATE/NOTHING` (PG).
-    upsert: *const fn (allocator: std.mem.Allocator, table: []const u8, cols: []const []const u8, conflict_cols: []const []const u8, action: ConflictAction) anyerror![]u8,
+    /// `INSERT OR REPLACE/IGNORE INTO t (cols) VALUES (v, …)` (SQLite) /
+    /// `INSERT INTO t (cols) VALUES (v, …) ON CONFLICT(conflict) DO UPDATE/NOTHING` (PG).
+    /// `value_exprs` gives the SQL value expression per column (a `?` placeholder,
+    /// a literal like `'migration'`/`NULL`/`0`, or a wrapper like `LOWER(?)`); pass
+    /// an empty slice for the common all-`?` case (one placeholder per column).
+    upsert: *const fn (allocator: std.mem.Allocator, table: []const u8, cols: []const []const u8, value_exprs: []const []const u8, conflict_cols: []const []const u8, action: ConflictAction) anyerror![]u8,
+    /// `INSERT OR REPLACE/IGNORE INTO t (cols) <select_body>` (SQLite) /
+    /// `INSERT INTO t (cols) <select_body> ON CONFLICT(conflict) DO UPDATE/NOTHING` (PG).
+    /// `select_body` is the caller's `SELECT … FROM … [WHERE …]` (driver renumbers `?`).
+    insertSelect: *const fn (allocator: std.mem.Allocator, table: []const u8, cols: []const []const u8, select_body: []const u8, conflict_cols: []const []const u8, action: ConflictAction) anyerror![]u8,
     /// ` RETURNING <col>` clause.
     returning: *const fn (allocator: std.mem.Allocator, col: []const u8) anyerror![]u8,
     /// `json_object('c', alias."c", …)` (SQLite) / `jsonb_build_object(…)`/`to_jsonb` (PG).

@@ -984,6 +984,36 @@ flush + reorg rollback; the interface surfaces this honestly via `caps.savepoint
 modular seam and the portable reorg path with no second backend, de-risking everything before
 PostgreSQL work begins.
 
+### Implementation status (SQLite-only seam)
+
+- **Phase 0 — DONE.** `backend.zig` (SPI) + `drivers/sqlite.zig` (owns the `@cImport`, `SqliteConn`,
+  stmt cache, PRAGMA/serialized config); `Database` holds a `Backend`; `Query` is a compat alias for
+  `backend.Statement`; the driver owns the connection. Suite byte-identical green.
+- **Phase 1 — DONE.** `Tx`/`TxMode` guards; `transactions.zig`/`sync.zig` on them; every raw-C site
+  ported off `pub const c` (storage `ensip16`/`webhooks`/`unknown_labels`, plus `webhooks/manager.zig`
+  incl. its `RETURNING` clause branched on `caps.returning`, `indexer/label_backfill.zig`,
+  `indexer/v1/handlers.zig`); `last_insert_rowid` behind `db.lastInsertId()`. `pub const c` has no
+  consumers outside `drivers/`.
+- **Phase 2 — DONE (except reorg_undo, owned by Phase 3).**
+  - Dialect builders (`upsert`/`insertSelect`/`returning`/`jsonObject`/`jsonExtract`/`nowEpoch`/
+    `placeholder`) added, SQLite-emitting today's exact SQL; unit-tested. `upsert` takes per-column
+    `value_exprs` (empty ⇒ all `?`; else inline literals/`LOWER(?)`/`NULL`), so expression-bearing
+    upserts route with **zero bind-sequence changes**.
+  - `gen_pg_schema.py` transpiler (B1–B4 + AUTOINCREMENT→BIGSERIAL, `strftime`→`EXTRACT(EPOCH…)`, and
+    seed `INSERT OR IGNORE`→`ON CONFLICT DO NOTHING`) with a FORBIDDEN-token guard + table-count parity;
+    **wired into `build.zig`** (runs every build → drift guard). Generates `schema/postgres/…`.
+  - Conflict-key map `schema_keys.zig` + `Database.upsertSql`/`upsertExprSql`/`insertSelectSql`. **All
+    26** non-reorg `INSERT OR …` call sites routed: 21 pure-placeholder via `upsertSql`; 4 literal/
+    wrapper sites (`registrations` `LOWER(?)`, `v1/backfill.zig` ×2, `migrate()` root-row) +
+    `resolver_addresses`' `NULL` via `upsertExprSql`; the one `INSERT…SELECT`
+    (`backfillResolverEntitiesFromNames`) via `insertSelectSql`. Two review passes (memory + indexing
+    correctness) clean; full suite byte-identical green; all 25 conflict keys pinned.
+  - **Deferred to Phase 3:** all of `reorg_undo.zig` (restore/cursor/active builders) — the only
+    remaining live `INSERT OR …` sites — routed there holistically with `jsonExtract` +
+    `introspectColumns` casts.
+  - **Not done (intentional):** schema kept canonical at `schema/schema.sql` (the optional
+    `schema/sqlite/` move was skipped as disruptive churn).
+
 ---
 
 ## Risks & Mitigations
@@ -1043,9 +1073,15 @@ PostgreSQL work begins.
 
 ## Open Questions
 
-- Conflict-key source of truth for `dialect.upsert`: derive from schema PKs at startup
-  (drift-proof, small startup cost) or a static `table → conflict-cols` map in code (explicit, can
-  desync)?
+- ~~Conflict-key source of truth for `dialect.upsert`~~ — **RESOLVED (static map).** A comptime
+  `table → conflict-cols` map lives in `src/storage/schema_keys.zig` (`conflictColsFor`), consumed by
+  `Database.upsertSql(allocator, table, cols, action)`. Every in-scope table has exactly one
+  `UNIQUE(...)`/natural-PK constraint besides its autoincrement `id`, so the target is unambiguous and
+  derived directly from `schema/schema.sql`. SQLite ignores the key (the verb implies it), so it is
+  invisible to behavioural tests — its sole guard is the `schema_keys` unit test that pins **all 25
+  entries** and asserts the map has no extra/missing rows (wired into `test-storage`). Phase 4
+  validates the keys live against the Postgres catalog. Desync risk is therefore caught at build time
+  (count/pins) and at Phase-4 integration (real `ON CONFLICT`).
 - `BIGINT` (Postgres) vs `INTEGER` (SQLite) boundary values — keep numeric semantics identical for
   `u64` expiries mapped to `i64` (`safeU64ToI64`) and unsigned-ish columns across backends. (pg.zig
   accepts `i64` natively and `u64` "coerced if it fits", so the existing `safeU64ToI64` clamp is the

@@ -156,11 +156,15 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
         const namehash_hex = try namehash.toHex(self.allocator);
 
         history: {
-            var hq = Query.init(self.database,
-                \\INSERT OR IGNORE INTO name_history
-                \\(protocol, namehash, name, change_type, old_value, new_value, block_number, tx_hash, log_index, timestamp)
-                \\VALUES (?, ?, ?, 'migration', NULL, 'Migrated from temporary registrar', ?, ?, 0, ?)
+            const hsql = self.database.upsertExprSql(
+                self.database.allocator,
+                "name_history",
+                &.{ "protocol", "namehash", "name", "change_type", "old_value", "new_value", "block_number", "tx_hash", "log_index", "timestamp" },
+                &.{ "?", "?", "?", "'migration'", "NULL", "'Migrated from temporary registrar'", "?", "?", "0", "?" },
+                .ignore,
             ) catch break :history;
+            defer self.database.allocator.free(hsql);
+            var hq = Query.init(self.database, hsql) catch break :history;
             defer hq.deinit();
             hq.bindText("v1") catch break :history;
             hq.bindText(namehash_hex) catch break :history;
@@ -188,10 +192,15 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
 
     // Mark backfill as completed
     mark: {
-        var mq = Query.init(self.database,
-            \\INSERT OR REPLACE INTO backfill_status (task, completed, completed_at, records_processed)
-            \\VALUES ('pre_migration_names', 1, ?, ?)
+        const msql = self.database.upsertExprSql(
+            self.database.allocator,
+            "backfill_status",
+            &.{ "task", "completed", "completed_at", "records_processed" },
+            &.{ "'pre_migration_names'", "1", "?", "?" },
+            .replace,
         ) catch break :mark;
+        defer self.database.allocator.free(msql);
+        var mq = Query.init(self.database, msql) catch break :mark;
         defer mq.deinit();
         mq.bindInt64(std.time.timestamp()) catch break :mark;
         mq.bindInt64(@intCast(count)) catch break :mark;

@@ -112,11 +112,8 @@ pub fn storeTokenIdLabel(
     const db_module = @import("../storage/database.zig");
     const Query = db_module.Query;
 
-    const sql =
-        \\INSERT OR IGNORE INTO v1_labels
-        \\(token_id, label, namehash, first_seen_block, first_seen_tx, source)
-        \\VALUES (?, ?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "v1_labels", &.{ "token_id", "label", "namehash", "first_seen_block", "first_seen_tx", "source" }, .ignore);
+    defer db.allocator.free(sql);
 
     var q = try Query.initCached(db, sql);
     defer q.deinit();

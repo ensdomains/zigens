@@ -212,11 +212,10 @@ pub fn insertRegistry(db: *Database, registry: models.Registry) !void {
     // Use INSERT OR IGNORE to keep the FIRST SubregistryUpdate (when subregistry was established)
     // not later ones. This ensures created_block reflects when the parent->subregistry mapping
     // was first created, which is needed for correct temporal parent lookups.
-    var q = try Query.init(db,
-        \\INSERT OR IGNORE INTO registries
-        \\(address, protocol, name, namehash, parent_registry, created_block, created_at)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?)
-    );
+    const sql = try db.upsertSql(db.allocator, "registries", &.{ "address", "protocol", "name", "namehash", "parent_registry", "created_block", "created_at" }, .ignore);
+    defer db.allocator.free(sql);
+
+    var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(registry.address);

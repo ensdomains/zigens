@@ -1,0 +1,81 @@
+//! Single source of truth for each upsert table's conflict key.
+//!
+//! Every entry is the UNIQUE (or natural PRIMARY KEY) constraint that SQLite's
+//! `INSERT OR REPLACE`/`INSERT OR IGNORE` conflicts on, and that Postgres needs
+//! as its explicit `ON CONFLICT (...)` target. Derived directly from
+//! `schema/schema.sql`: each of these tables has exactly one such constraint
+//! (tables with an autoincrement `id` PK carry a separate single `UNIQUE(...)`),
+//! so the target is unambiguous. SQLite ignores the key (the verb implies it);
+//! it is load-bearing only for the Postgres backend.
+const std = @import("std");
+
+const conflict_keys = std.StaticStringMap([]const []const u8).initComptime(.{
+    .{ "sync_state", &[_][]const u8{"protocol"} },
+    .{ "block_hashes", &[_][]const u8{ "protocol", "block_number" } },
+    .{ "registries", &[_][]const u8{ "protocol", "address", "namehash" } },
+    .{ "names", &[_][]const u8{ "protocol", "namehash" } },
+    .{ "resolvers", &[_][]const u8{ "protocol", "namehash", "address" } },
+    .{ "resolver_addresses", &[_][]const u8{ "protocol", "resolver", "namehash", "coin_type" } },
+    .{ "resolver_contenthashes", &[_][]const u8{ "protocol", "resolver", "namehash" } },
+    .{ "resolver_texts", &[_][]const u8{ "protocol", "resolver", "namehash", "key" } },
+    .{ "resolver_aliases", &[_][]const u8{ "resolver", "from_name" } },
+    .{ "resolver_pubkeys", &[_][]const u8{ "protocol", "resolver", "namehash" } },
+    .{ "resolver_abis", &[_][]const u8{ "protocol", "resolver", "namehash", "content_type" } },
+    .{ "resolver_names", &[_][]const u8{ "protocol", "resolver", "namehash" } },
+    .{ "resolver_interfaces", &[_][]const u8{ "protocol", "resolver", "namehash", "interface_id" } },
+    .{ "resolver_authorisations", &[_][]const u8{ "protocol", "resolver", "namehash", "owner", "target" } },
+    .{ "resolver_dns_records", &[_][]const u8{ "protocol", "resolver", "namehash", "dns_name", "resource" } },
+    .{ "resolver_dns_zonehashes", &[_][]const u8{ "protocol", "resolver", "namehash" } },
+    .{ "resolver_versions", &[_][]const u8{ "resolver", "namehash" } },
+    .{ "events", &[_][]const u8{ "protocol", "tx_hash", "log_index" } },
+    .{ "approvals", &[_][]const u8{ "protocol", "token_id", "registry" } },
+    .{ "v1_labels", &[_][]const u8{"token_id"} },
+    .{ "name_history", &[_][]const u8{ "protocol", "namehash", "change_type", "block_number", "log_index" } },
+    .{ "temp_pre_migration_names", &[_][]const u8{ "protocol", "namehash" } },
+    .{ "backfill_status", &[_][]const u8{"task"} },
+    .{ "orphaned_registrations", &[_][]const u8{ "protocol", "tx_hash", "log_index" } },
+    .{ "registrations", &[_][]const u8{ "protocol", "transaction_hash", "log_index" } },
+});
+
+/// The conflict-key columns for `table`, or null if the table is not a known
+/// upsert target (callers turn this into `error.UnknownUpsertTable`).
+pub fn conflictColsFor(table: []const u8) ?[]const []const u8 {
+    return conflict_keys.get(table);
+}
+
+test "conflictColsFor matches every schema-derived key" {
+    // Pins all 25 entries against schema/schema.sql — the sole guard on these
+    // keys, since SQLite ignores them and only Postgres (Phase 4) exercises them.
+    const expected = .{
+        .{ "sync_state", &[_][]const u8{"protocol"} },
+        .{ "block_hashes", &[_][]const u8{ "protocol", "block_number" } },
+        .{ "registries", &[_][]const u8{ "protocol", "address", "namehash" } },
+        .{ "names", &[_][]const u8{ "protocol", "namehash" } },
+        .{ "resolvers", &[_][]const u8{ "protocol", "namehash", "address" } },
+        .{ "resolver_addresses", &[_][]const u8{ "protocol", "resolver", "namehash", "coin_type" } },
+        .{ "resolver_contenthashes", &[_][]const u8{ "protocol", "resolver", "namehash" } },
+        .{ "resolver_texts", &[_][]const u8{ "protocol", "resolver", "namehash", "key" } },
+        .{ "resolver_aliases", &[_][]const u8{ "resolver", "from_name" } },
+        .{ "resolver_pubkeys", &[_][]const u8{ "protocol", "resolver", "namehash" } },
+        .{ "resolver_abis", &[_][]const u8{ "protocol", "resolver", "namehash", "content_type" } },
+        .{ "resolver_names", &[_][]const u8{ "protocol", "resolver", "namehash" } },
+        .{ "resolver_interfaces", &[_][]const u8{ "protocol", "resolver", "namehash", "interface_id" } },
+        .{ "resolver_authorisations", &[_][]const u8{ "protocol", "resolver", "namehash", "owner", "target" } },
+        .{ "resolver_dns_records", &[_][]const u8{ "protocol", "resolver", "namehash", "dns_name", "resource" } },
+        .{ "resolver_dns_zonehashes", &[_][]const u8{ "protocol", "resolver", "namehash" } },
+        .{ "resolver_versions", &[_][]const u8{ "resolver", "namehash" } },
+        .{ "events", &[_][]const u8{ "protocol", "tx_hash", "log_index" } },
+        .{ "approvals", &[_][]const u8{ "protocol", "token_id", "registry" } },
+        .{ "v1_labels", &[_][]const u8{"token_id"} },
+        .{ "name_history", &[_][]const u8{ "protocol", "namehash", "change_type", "block_number", "log_index" } },
+        .{ "temp_pre_migration_names", &[_][]const u8{ "protocol", "namehash" } },
+        .{ "backfill_status", &[_][]const u8{"task"} },
+        .{ "orphaned_registrations", &[_][]const u8{ "protocol", "tx_hash", "log_index" } },
+        .{ "registrations", &[_][]const u8{ "protocol", "transaction_hash", "log_index" } },
+    };
+    inline for (expected) |e| {
+        try std.testing.expectEqualDeep(@as(?[]const []const u8, e[1]), conflictColsFor(e[0]));
+    }
+    try std.testing.expectEqual(@as(usize, expected.len), conflict_keys.keys().len);
+    try std.testing.expectEqual(@as(?[]const []const u8, null), conflictColsFor("no_such_table"));
+}

@@ -54,12 +54,8 @@ fn parseEventRow(q: *Query, allocator: std.mem.Allocator) !models.Event {
 // ============================================================================
 
 pub fn insertEvent(db: *Database, event: models.Event) !void {
-    const sql =
-        \\INSERT OR IGNORE INTO events
-        \\(event_type, protocol, block_number, tx_hash, log_index, contract_address,
-        \\ name, namehash, data, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "events", &.{ "event_type", "protocol", "block_number", "tx_hash", "log_index", "contract_address", "name", "namehash", "data", "timestamp" }, .ignore);
+    defer db.allocator.free(sql);
 
     var q = try Query.initCached(db, sql);
     defer q.deinit();
@@ -585,11 +581,8 @@ pub fn updateApprovalTokenId(db: *Database, old_token_id: []const u8, new_token_
 }
 
 pub fn insertApproval(db: *Database, protocol: models.Protocol, token_id: u256, owner: Address, approved: Address, block_number: u64, tx_hash: Hash, registry: Address) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO approvals
-        \\(protocol, token_id, owner, approved, block_number, tx_hash, timestamp, registry)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "approvals", &.{ "protocol", "token_id", "owner", "approved", "block_number", "tx_hash", "timestamp", "registry" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.initCached(db, sql);
     defer q.deinit();

@@ -48,6 +48,7 @@ pub const Query = query.Query;
 // `Database.backend.vtable`.
 const backend_mod = @import("backend.zig");
 const sqlite_driver = @import("drivers/sqlite.zig");
+const schema_keys = @import("schema_keys.zig");
 /// RAII transaction guard + mode, re-exported for storage modules.
 pub const Tx = backend_mod.Tx;
 pub const TxMode = backend_mod.TxMode;
@@ -250,26 +251,33 @@ pub const Database = struct {
                 \\WHERE namehash = '0x0000000000000000000000000000000000000000000000000000000000000000'
                 \\  AND parent_namehash = ''
             );
-            try self.exec(
-                \\INSERT OR IGNORE INTO names (
-                \\  protocol, name, namehash, label, label_hash,
-                \\  parent_name, parent_namehash, registry, owner, resolver,
-                \\  token_id, canonical_id, token_version,
-                \\  created_block, created_at, updated_block, updated_at
-                \\) VALUES (
-                \\  'v1', '',
-                \\  '0x0000000000000000000000000000000000000000000000000000000000000000',
-                \\  '',
-                \\  '0x0000000000000000000000000000000000000000000000000000000000000000',
-                \\  '',
-                \\  '0x0000000000000000000000000000000000000000000000000000000000000000',
-                \\  '0x0000000000000000000000000000000000000000',
-                \\  '0x0000000000000000000000000000000000000000',
-                \\  '0x0000000000000000000000000000000000000000',
-                \\  '0', '0', 0,
-                \\  0, 0, 0, 0
-                \\)
+            const root_sql = try self.upsertExprSql(
+                self.allocator,
+                "names",
+                &.{ "protocol", "name", "namehash", "label", "label_hash", "parent_name", "parent_namehash", "registry", "owner", "resolver", "token_id", "canonical_id", "token_version", "created_block", "created_at", "updated_block", "updated_at" },
+                &.{
+                    "'v1'",
+                    "''",
+                    "'0x0000000000000000000000000000000000000000000000000000000000000000'",
+                    "''",
+                    "'0x0000000000000000000000000000000000000000000000000000000000000000'",
+                    "''",
+                    "'0x0000000000000000000000000000000000000000000000000000000000000000'",
+                    "'0x0000000000000000000000000000000000000000'",
+                    "'0x0000000000000000000000000000000000000000'",
+                    "'0x0000000000000000000000000000000000000000'",
+                    "'0'",
+                    "'0'",
+                    "0",
+                    "0",
+                    "0",
+                    "0",
+                    "0",
+                },
+                .ignore,
             );
+            defer self.allocator.free(root_sql);
+            try self.exec(root_sql);
         }
     }
 
@@ -338,6 +346,51 @@ pub const Database = struct {
     /// The active backend's SQL-dialect builders.
     pub fn dialect(self: *Database) *const backend_mod.Dialect {
         return self.backend.dialect;
+    }
+
+    /// Build a backend-appropriate upsert statement for `table`, inserting
+    /// `cols` (in bind order) with `action` on conflict. The caller owns the
+    /// returned SQL and must free it after preparing. The conflict key is
+    /// resolved centrally from the schema (the Postgres `ON CONFLICT` target;
+    /// ignored by SQLite, whose verb implies it).
+    pub fn upsertSql(
+        self: *Database,
+        allocator: std.mem.Allocator,
+        table: []const u8,
+        cols: []const []const u8,
+        action: backend_mod.ConflictAction,
+    ) ![]u8 {
+        const conflict_cols = schema_keys.conflictColsFor(table) orelse return error.UnknownUpsertTable;
+        return self.backend.dialect.upsert(allocator, table, cols, &.{}, conflict_cols, action);
+    }
+
+    /// Like `upsertSql`, but each column's value is given by `value_exprs[i]` — a
+    /// `?` placeholder, a SQL literal (`'migration'`/`NULL`/`0`), or a wrapper
+    /// (`LOWER(?)`). For upserts whose original `VALUES` mixed binds with literals.
+    pub fn upsertExprSql(
+        self: *Database,
+        allocator: std.mem.Allocator,
+        table: []const u8,
+        cols: []const []const u8,
+        value_exprs: []const []const u8,
+        action: backend_mod.ConflictAction,
+    ) ![]u8 {
+        const conflict_cols = schema_keys.conflictColsFor(table) orelse return error.UnknownUpsertTable;
+        return self.backend.dialect.upsert(allocator, table, cols, value_exprs, conflict_cols, action);
+    }
+
+    /// Backend-appropriate `INSERT … <select_body>` upsert (no `VALUES`). For the
+    /// one-time `INSERT OR IGNORE … SELECT` seeding paths. Caller owns the result.
+    pub fn insertSelectSql(
+        self: *Database,
+        allocator: std.mem.Allocator,
+        table: []const u8,
+        cols: []const []const u8,
+        select_body: []const u8,
+        action: backend_mod.ConflictAction,
+    ) ![]u8 {
+        const conflict_cols = schema_keys.conflictColsFor(table) orelse return error.UnknownUpsertTable;
+        return self.backend.dialect.insertSelect(allocator, table, cols, select_body, conflict_cols, action);
     }
 
     // ========================================================================

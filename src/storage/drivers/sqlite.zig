@@ -254,27 +254,44 @@ fn appendQuotedIdent(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), iden
     try buf.append(allocator, '"');
 }
 
-fn dialectUpsert(allocator: std.mem.Allocator, table: []const u8, cols: []const []const u8, conflict_cols: []const []const u8, action: backend.ConflictAction) anyerror![]u8 {
-    // SQLite INSERT OR REPLACE/IGNORE does not take a conflict-key list.
-    _ = conflict_cols;
-    var buf: std.ArrayList(u8) = .{};
-    errdefer buf.deinit(allocator);
+fn appendInsertInto(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), table: []const u8, cols: []const []const u8, action: backend.ConflictAction) !void {
     try buf.appendSlice(allocator, switch (action) {
         .replace => "INSERT OR REPLACE INTO ",
         .ignore => "INSERT OR IGNORE INTO ",
     });
-    try appendQuotedIdent(allocator, &buf, table);
+    try appendQuotedIdent(allocator, buf, table);
     try buf.appendSlice(allocator, " (");
     for (cols, 0..) |col, i| {
         if (i > 0) try buf.appendSlice(allocator, ", ");
-        try appendQuotedIdent(allocator, &buf, col);
-    }
-    try buf.appendSlice(allocator, ") VALUES (");
-    for (cols, 0..) |_, i| {
-        if (i > 0) try buf.appendSlice(allocator, ", ");
-        try buf.append(allocator, '?');
+        try appendQuotedIdent(allocator, buf, col);
     }
     try buf.append(allocator, ')');
+}
+
+fn dialectUpsert(allocator: std.mem.Allocator, table: []const u8, cols: []const []const u8, value_exprs: []const []const u8, conflict_cols: []const []const u8, action: backend.ConflictAction) anyerror![]u8 {
+    // SQLite INSERT OR REPLACE/IGNORE does not take a conflict-key list.
+    _ = conflict_cols;
+    std.debug.assert(value_exprs.len == 0 or value_exprs.len == cols.len);
+    var buf: std.ArrayList(u8) = .{};
+    errdefer buf.deinit(allocator);
+    try appendInsertInto(allocator, &buf, table, cols, action);
+    try buf.appendSlice(allocator, " VALUES (");
+    for (cols, 0..) |_, i| {
+        if (i > 0) try buf.appendSlice(allocator, ", ");
+        try buf.appendSlice(allocator, if (value_exprs.len == 0) "?" else value_exprs[i]);
+    }
+    try buf.append(allocator, ')');
+    return buf.toOwnedSlice(allocator);
+}
+
+fn dialectInsertSelect(allocator: std.mem.Allocator, table: []const u8, cols: []const []const u8, select_body: []const u8, conflict_cols: []const []const u8, action: backend.ConflictAction) anyerror![]u8 {
+    // SQLite INSERT OR REPLACE/IGNORE does not take a conflict-key list.
+    _ = conflict_cols;
+    var buf: std.ArrayList(u8) = .{};
+    errdefer buf.deinit(allocator);
+    try appendInsertInto(allocator, &buf, table, cols, action);
+    try buf.append(allocator, ' ');
+    try buf.appendSlice(allocator, select_body);
     return buf.toOwnedSlice(allocator);
 }
 
@@ -302,6 +319,7 @@ pub const sqlite_dialect = backend.Dialect{
     .placeholder = .qmark,
     .nowEpoch = "strftime('%s', 'now')",
     .upsert = dialectUpsert,
+    .insertSelect = dialectInsertSelect,
     .returning = dialectReturning,
     .jsonObject = dialectJsonObject,
     .jsonExtract = dialectJsonExtract,

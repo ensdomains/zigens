@@ -33,10 +33,8 @@ pub fn getSyncState(db: *Database, protocol: models.Protocol) !?u64 {
 }
 
 pub fn setSyncState(db: *Database, protocol: models.Protocol, block: u64) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO sync_state (protocol, last_synced_block, last_synced_at)
-        \\VALUES (?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "sync_state", &.{ "protocol", "last_synced_block", "last_synced_at" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -49,11 +47,8 @@ pub fn setSyncState(db: *Database, protocol: models.Protocol, block: u64) !void 
 }
 
 pub fn storeBlockHash(db: *Database, protocol: models.Protocol, block_number: u64, block_hash: Hash, parent_hash: Hash) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO block_hashes
-        \\(protocol, block_number, block_hash, parent_hash, timestamp)
-        \\VALUES (?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "block_hashes", &.{ "protocol", "block_number", "block_hash", "parent_hash", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.initCached(db, sql);
     defer q.deinit();
@@ -550,11 +545,8 @@ pub fn insertOrphanedRegistration(
     tx_hash: Hash,
     log_index: u32,
 ) !void {
-    const sql =
-        \\INSERT OR IGNORE INTO orphaned_registrations
-        \\(protocol, subregistry_address, token_id, label, expiry, owner, block_number, tx_hash, log_index, created_at)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "orphaned_registrations", &.{ "protocol", "subregistry_address", "token_id", "label", "expiry", "owner", "block_number", "tx_hash", "log_index", "created_at" }, .ignore);
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();
