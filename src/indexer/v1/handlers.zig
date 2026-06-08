@@ -252,7 +252,7 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
     // Still record unresolved labels for backfill (calldata decoding may find them later)
     if (resolved_label == null) {
         unknown_labels_storage.insertUnknownLabel(
-            self.database.db.?,
+            self.database,
             null,
             log.transaction_hash,
             labelhash,

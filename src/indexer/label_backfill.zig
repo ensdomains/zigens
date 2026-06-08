@@ -63,7 +63,7 @@ pub const LabelBackfill = struct {
             // Get batch of unknown labels (query already excludes attempts >= 3)
             const unknown_labels = try unknown_labels_storage.getUnknownLabelsForBackfill(
                 self.allocator,
-                self.database.db.?,
+                self.database,
                 BATCH_SIZE,
             );
             defer {
@@ -93,7 +93,7 @@ pub const LabelBackfill = struct {
         }
 
         if (iteration >= MAX_ITERATIONS) {
-            const remaining = unknown_labels_storage.getUnknownLabelCount(self.database.db.?) catch 0;
+            const remaining = unknown_labels_storage.getUnknownLabelCount(self.database) catch 0;
             std.log.info(
                 "Reached MAX_ITERATIONS ({d}) for unknown-label backfill; {d} labels still pending (attempts<3). Will resume on next sync cycle.",
                 .{ MAX_ITERATIONS, remaining },
@@ -136,13 +136,13 @@ pub const LabelBackfill = struct {
                     std.log.warn("Failed to create addr.reverse name for labelhash={s}: {}", .{ label.labelhash, err });
                 };
 
-                try unknown_labels_storage.deleteUnknownLabel(self.database.db.?, label.id);
+                try unknown_labels_storage.deleteUnknownLabel(self.database, label.id);
                 resolved_count += 1;
             } else {
                 // Owner address didn't match — mark as failed (no point retrying via RPC)
-                unknown_labels_storage.incrementBackfillAttempt(self.database.db.?, label.id) catch {};
-                unknown_labels_storage.incrementBackfillAttempt(self.database.db.?, label.id) catch {};
-                unknown_labels_storage.incrementBackfillAttempt(self.database.db.?, label.id) catch {};
+                unknown_labels_storage.incrementBackfillAttempt(self.database, label.id) catch {};
+                unknown_labels_storage.incrementBackfillAttempt(self.database, label.id) catch {};
+                unknown_labels_storage.incrementBackfillAttempt(self.database, label.id) catch {};
             }
         }
 
@@ -178,7 +178,7 @@ pub const LabelBackfill = struct {
                     };
 
                     // Delete from unknown_labels (successfully resolved)
-                    try unknown_labels_storage.deleteUnknownLabel(self.database.db.?, label.id);
+                    try unknown_labels_storage.deleteUnknownLabel(self.database, label.id);
 
                     resolved_count += 1;
                 }
@@ -229,7 +229,7 @@ pub const LabelBackfill = struct {
             std.log.err("Failed to fetch transactions batch: {}", .{err});
             // Increment attempt counters for remaining labels
             for (remaining_labels.items) |label| {
-                unknown_labels_storage.incrementBackfillAttempt(self.database.db.?, label.id) catch {};
+                unknown_labels_storage.incrementBackfillAttempt(self.database, label.id) catch {};
             }
             return resolved_count;
         };
@@ -248,7 +248,7 @@ pub const LabelBackfill = struct {
             // This tries both direct setSubnode calls and multicall patterns
             const maybe_label_text = CalldataDecoder.decodeLabelFromCalldata(self.allocator, tx.input) catch |err| {
                 std.log.warn("Failed to decode calldata for tx {s}: {}", .{ label.transaction_hash, err });
-                try unknown_labels_storage.incrementBackfillAttempt(self.database.db.?, label.id);
+                try unknown_labels_storage.incrementBackfillAttempt(self.database, label.id);
                 continue;
             };
 
@@ -276,7 +276,7 @@ pub const LabelBackfill = struct {
                 };
 
                 // Delete from unknown_labels (successfully resolved)
-                try unknown_labels_storage.deleteUnknownLabel(self.database.db.?, label.id);
+                try unknown_labels_storage.deleteUnknownLabel(self.database, label.id);
 
                 resolved_count += 1;
             } else {
@@ -285,7 +285,7 @@ pub const LabelBackfill = struct {
                     label.transaction_hash,
                     label.labelhash,
                 });
-                try unknown_labels_storage.incrementBackfillAttempt(self.database.db.?, label.id);
+                try unknown_labels_storage.incrementBackfillAttempt(self.database, label.id);
             }
         }
 
@@ -368,7 +368,7 @@ pub const LabelBackfill = struct {
 
     /// Get statistics about unknown labels
     pub fn getStats(self: *LabelBackfill) !BackfillStats {
-        const total = try unknown_labels_storage.getUnknownLabelCount(self.database.db.?);
+        const total = try unknown_labels_storage.getUnknownLabelCount(self.database);
 
         // Get count by attempt ranges
         const query =
