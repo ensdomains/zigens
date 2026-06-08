@@ -46,6 +46,12 @@ pub const ResolverEntitySortField = resolvers.ResolverEntitySortField;
 pub const query = @import("query.zig");
 pub const Query = query.Query;
 
+// Backend SPI + statement-seam driver (Phase 0: SQLite). Connection lifecycle
+// (open/close), exec, and prepare are owned by the driver and dispatched through
+// `Database.backend.vtable`.
+const backend_mod = @import("backend.zig");
+const sqlite_driver = @import("drivers/sqlite.zig");
+
 // SQLITE_TRANSIENT - For Zig 0.15.1, we can't use the C constant due to alignment issues
 // Instead, we use null which tells SQLite to make a copy of the string
 // This is functionally equivalent to SQLITE_TRANSIENT for our use case
@@ -55,8 +61,14 @@ pub inline fn SQLITE_TRANSIENT() c.sqlite3_destructor_type {
 
 pub const Database = struct {
     allocator: std.mem.Allocator,
+    /// Active backend (Phase 0: SQLite). exec/prepare/close dispatch through its
+    /// vtable. The connection state below is owned by the driver via these fields.
+    backend: backend_mod.Backend,
+    /// Raw SQLite handle. Transitional: still accessed directly by not-yet-ported
+    /// raw-C consumers (webhooks, ensip16, manager, …); removed in Phase 1.
     db: ?*c.sqlite3,
-    /// Prepared statement cache: maps SQL string → pre-compiled sqlite3_stmt
+    /// Prepared statement cache: maps SQL string → pre-compiled sqlite3_stmt.
+    /// Owned/finalized by the SQLite driver (see drivers/sqlite.zig close()).
     stmt_cache: std.StringHashMap(*c.sqlite3_stmt),
     /// EIP-155 chain ID for entity-ID formatting (`{chainId}-{protocol}-…`).
     /// Set by callers via `setChainId` after init; defaults to 0 so the build
@@ -140,37 +152,17 @@ pub const Database = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !Database {
-        var db: ?*c.sqlite3 = null;
-
-        const path_z = try allocator.dupeZ(u8, path);
-        defer allocator.free(path_z);
-
-        const result = c.sqlite3_open(path_z.ptr, &db);
-        if (result != c.SQLITE_OK) {
-            std.log.err("Failed to open database: {s}", .{c.sqlite3_errmsg(db)});
-            return error.DatabaseOpenFailed;
-        }
-
+        const handle = try sqlite_driver.openConnection(allocator, path);
         var database = Database{
             .allocator = allocator,
-            .db = db,
+            .backend = .{ .vtable = &sqlite_driver.vtable },
+            .db = handle,
             .stmt_cache = std.StringHashMap(*c.sqlite3_stmt).init(allocator),
         };
 
-        // Enable WAL mode for better concurrency (allows concurrent reads during writes)
-        try database.exec("PRAGMA journal_mode=WAL;");
-
-        // Performance and reliability PRAGMAs (values from constants.zig)
-        try database.exec(std.fmt.comptimePrint("PRAGMA busy_timeout = {d};", .{constants.SQLite.busy_timeout_ms}));
-        try database.exec("PRAGMA synchronous = NORMAL;"); // Faster writes (safe with WAL)
-        try database.exec(std.fmt.comptimePrint("PRAGMA cache_size = {d};", .{constants.SQLite.cache_size_kb}));
-        try database.exec("PRAGMA foreign_keys = ON;"); // Enable foreign key constraints
-        try database.exec("PRAGMA temp_store = memory;"); // Use RAM for temp tables
-        // Required by the reorg undo-log: derived tables (resolver records, approvals,
-        // …) are rewritten with INSERT OR REPLACE, whose implicit row delete only fires
-        // the AFTER DELETE capture trigger when recursive triggers are enabled. Without
-        // this, in-place overwrites would silently bypass undo capture (see reorg_undo.zig).
-        try database.exec("PRAGMA recursive_triggers = ON;");
+        // Connection PRAGMAs (incl. recursive_triggers, load-bearing for the reorg
+        // undo-log). Owned by the driver.
+        try sqlite_driver.applyPragmas(&database);
 
         // Load and apply the consolidated schema from schema/schema.sql.
         // The expected workflow for schema changes is to re-index from scratch
@@ -294,34 +286,17 @@ pub const Database = struct {
 
     /// Initialize database without auto-loading schemas (for custom schema directories)
     pub fn initWithoutSchema(allocator: std.mem.Allocator, path: []const u8) !Database {
-        var db: ?*c.sqlite3 = null;
-
-        const path_z = try allocator.dupeZ(u8, path);
-        defer allocator.free(path_z);
-
-        const result = c.sqlite3_open(path_z.ptr, &db);
-        if (result != c.SQLITE_OK) {
-            std.log.err("Failed to open database: {s}", .{c.sqlite3_errmsg(db)});
-            return error.DatabaseOpenFailed;
-        }
-
+        const handle = try sqlite_driver.openConnection(allocator, path);
         var database = Database{
             .allocator = allocator,
-            .db = db,
+            .backend = .{ .vtable = &sqlite_driver.vtable },
+            .db = handle,
             .stmt_cache = std.StringHashMap(*c.sqlite3_stmt).init(allocator),
         };
 
-        // Enable WAL mode for better concurrency
-        try database.exec("PRAGMA journal_mode=WAL;");
-
-        // Performance and reliability PRAGMAs (values from constants.zig)
-        try database.exec(std.fmt.comptimePrint("PRAGMA busy_timeout = {d};", .{constants.SQLite.busy_timeout_ms}));
-        try database.exec("PRAGMA synchronous = NORMAL;");
-        try database.exec(std.fmt.comptimePrint("PRAGMA cache_size = {d};", .{constants.SQLite.cache_size_kb}));
-        try database.exec("PRAGMA foreign_keys = ON;");
-        try database.exec("PRAGMA temp_store = memory;");
-        // Match the writer connection (see init): harmless on this read-only path.
-        try database.exec("PRAGMA recursive_triggers = ON;");
+        // Same connection PRAGMAs as init (recursive_triggers is harmless on this
+        // read-only path); matches the writer connection.
+        try sqlite_driver.applyPragmas(&database);
 
         // Intentionally no `migrate()` here. The API is a read-only consumer of
         // a DB that the indexer is the sole writer of. Running migrate from the
@@ -333,17 +308,7 @@ pub const Database = struct {
     }
 
     pub fn deinit(self: *Database) void {
-        // Finalize all cached prepared statements and free their keys
-        var it = self.stmt_cache.iterator();
-        while (it.next()) |entry| {
-            _ = c.sqlite3_finalize(entry.value_ptr.*);
-            self.allocator.free(entry.key_ptr.*);
-        }
-        self.stmt_cache.deinit();
-
-        if (self.db) |db| {
-            _ = c.sqlite3_close(db);
-        }
+        self.backend.vtable.close(self);
     }
 
     /// Check if a table exists in the database
@@ -365,29 +330,20 @@ pub const Database = struct {
         return (q.step() catch return false);
     }
 
+    /// Execute a parameterless statement, dispatched through the backend.
     pub fn exec(self: *Database, sql: []const u8) !void {
-        const sql_z = try self.allocator.dupeZ(u8, sql);
-        defer self.allocator.free(sql_z);
+        return self.backend.vtable.execRaw(self, sql);
+    }
 
-        var err_msg: [*c]u8 = null;
-        const result = c.sqlite3_exec(self.db, sql_z.ptr, null, null, &err_msg);
+    /// Prepare a statement through the active backend (Phase 0: SQLite).
+    /// Returns a backend-agnostic `Query` (= `backend.Statement`).
+    pub fn prepare(self: *Database, sql: []const u8) !query.Query {
+        return self.backend.vtable.prepare(self, sql, false);
+    }
 
-        if (result != c.SQLITE_OK) {
-            defer c.sqlite3_free(err_msg);
-
-            // Gracefully handle "duplicate column" errors from ALTER TABLE ADD COLUMN
-            // These occur when schema migrations have already been applied
-            if (err_msg != null) {
-                const err_str = std.mem.span(err_msg);
-                if (std.mem.indexOf(u8, err_str, "duplicate column name") != null) {
-                    std.log.debug("Skipping duplicate column: {s}", .{err_msg});
-                    return; // Silently ignore duplicate column errors
-                }
-            }
-
-            std.log.err("SQL error: {s}", .{err_msg});
-            return error.SqlExecFailed;
-        }
+    /// Prepare a statement using the per-`Database` prepared-statement cache.
+    pub fn prepareCached(self: *Database, sql: []const u8) !query.Query {
+        return self.backend.vtable.prepare(self, sql, true);
     }
 
     // ========================================================================

@@ -1,0 +1,293 @@
+//! Pluggable database-backend SPI.
+//!
+//! Phase 0 introduces the *statement* seam: every storage module talks to a
+//! backend-agnostic `Statement` whose primitive operations dispatch through a
+//! `StmtVTable`. The SQLite implementation lives in `drivers/sqlite.zig`. This
+//! is the seam a second backend (PostgreSQL) and third-party backends plug
+//! into; the broader `Backend`/`Pool`/`Dialect` surface is layered on in later
+//! phases (see docs/postgresql-migration-plan.md).
+//!
+//! `Statement` is a drop-in for the old `Query`: same sequential 1-based bind
+//! cursor, same index-based column reads, same `SQLITE_STATIC` + tracked-copy
+//! bind lifetime — so the storage modules change only their import.
+
+const std = @import("std");
+const Database = @import("database.zig").Database;
+const Address = @import("../types/address.zig").Address;
+const Hash = @import("../types/hash.zig").Hash;
+
+/// Max number of bound strings tracked per statement (preserves the old
+/// `Query` bound-string lifetime model: copies bound `SQLITE_STATIC` and freed
+/// on reset/deinit).
+const MAX_BOUND_STRINGS = 32;
+
+/// Outcome of stepping a statement, mapped from the backend's native result.
+pub const StepOutcome = enum { row, done, failed };
+
+/// Placeholder style a backend accepts. Phase 0 is SQLite-only (`?`); the
+/// Postgres driver renumbers to `$N`. Carried here for the Phase-4 SPI.
+pub const Placeholder = enum { qmark, dollar };
+
+/// Backend feature flags, consulted by callers/dialect without RTTI. Defined
+/// now as the SPI contract; wired when the second backend lands.
+pub const Capabilities = struct {
+    placeholder: Placeholder = .qmark,
+    returning: bool = true,
+    savepoints: bool = true,
+    server_side_undo: bool = true,
+    pooled: bool = false,
+};
+
+/// Connection access mode for the Phase-4 `Pool`; defined here as part of the SPI.
+pub const AccessMode = enum { writer, reader };
+
+/// Connection-level operations a backend provides — the seam for opening,
+/// closing, raw exec, and prepare. `db` is the owning session; Phase 0 keeps
+/// the SQLite connection state (`db`/`stmt_cache`) on `Database` as transitional
+/// fields, so the driver fns read it from there. The runtime backend *selection*
+/// and per-connection ctx land with the second backend (Phase 4).
+pub const VTable = struct {
+    close: *const fn (db: *Database) void,
+    execRaw: *const fn (db: *Database, sql: []const u8) anyerror!void,
+    prepare: *const fn (db: *Database, sql: []const u8, cached: bool) anyerror!Statement,
+};
+
+/// The backend handle held by `Database`. Phase 0 ships only the SQLite vtable.
+pub const Backend = struct {
+    vtable: *const VTable,
+};
+
+/// The primitive statement operations a backend must provide. The SQLite impl
+/// is `drivers/sqlite.zig`. `ctx` is the backend's opaque per-statement handle
+/// (for SQLite, the `sqlite3_stmt`). Text binds are `SQLITE_STATIC`-style: the
+/// pointer must remain valid until `step`/`exec`; `Statement` owns that via its
+/// tracked-copy buffer.
+pub const StmtVTable = struct {
+    bindText: *const fn (ctx: *anyopaque, idx: c_int, ptr: [*]const u8, len: usize) bool,
+    bindInt64: *const fn (ctx: *anyopaque, idx: c_int, value: i64) bool,
+    bindInt: *const fn (ctx: *anyopaque, idx: c_int, value: i32) bool,
+    bindNull: *const fn (ctx: *anyopaque, idx: c_int) bool,
+    exec: *const fn (ctx: *anyopaque) bool,
+    step: *const fn (ctx: *anyopaque) StepOutcome,
+    changes: *const fn (ctx: *anyopaque) u32,
+    columnIsNull: *const fn (ctx: *anyopaque, col: c_int) bool,
+    columnText: *const fn (ctx: *anyopaque, col: c_int) ?[]const u8,
+    columnInt64: *const fn (ctx: *anyopaque, col: c_int) i64,
+    columnInt: *const fn (ctx: *anyopaque, col: c_int) i32,
+    lastError: *const fn (ctx: *anyopaque) [:0]const u8,
+    reset: *const fn (ctx: *anyopaque) void,
+    finalize: *const fn (ctx: *anyopaque) void,
+};
+
+/// Backend-agnostic prepared statement. Drop-in replacement for the old
+/// `Query`. Obtain one via `init`/`initCached` (which forward to
+/// `Database.prepare`/`prepareCached`, dispatching to the active driver).
+pub const Statement = struct {
+    ctx: *anyopaque,
+    vtable: *const StmtVTable,
+    allocator: std.mem.Allocator,
+    param_idx: c_int = 1,
+    /// Cached statements are reset (not finalized) on deinit; the cache owns them.
+    is_cached: bool = false,
+    /// Tracked bound-string copies, freed on reset/deinit (SQLITE_STATIC model).
+    bound_strings: [MAX_BOUND_STRINGS]?[]u8 = [_]?[]u8{null} ** MAX_BOUND_STRINGS,
+    bound_string_count: usize = 0,
+
+    pub fn init(database: *Database, sql: []const u8) !Statement {
+        return database.prepare(sql);
+    }
+
+    pub fn initCached(database: *Database, sql: []const u8) !Statement {
+        return database.prepareCached(sql);
+    }
+
+    pub fn deinit(self: *Statement) void {
+        self.freeBoundStrings();
+        if (self.is_cached) {
+            self.vtable.reset(self.ctx);
+        } else {
+            self.vtable.finalize(self.ctx);
+        }
+    }
+
+    pub fn reset(self: *Statement) void {
+        self.freeBoundStrings();
+        self.vtable.reset(self.ctx);
+        self.param_idx = 1;
+    }
+
+    fn freeBoundStrings(self: *Statement) void {
+        for (self.bound_strings[0..self.bound_string_count]) |maybe_str| {
+            if (maybe_str) |str| self.allocator.free(str);
+        }
+        self.bound_string_count = 0;
+        self.bound_strings = [_]?[]u8{null} ** MAX_BOUND_STRINGS;
+    }
+
+    fn trackBoundString(self: *Statement, str: []u8) void {
+        if (self.bound_string_count < MAX_BOUND_STRINGS) {
+            self.bound_strings[self.bound_string_count] = str;
+            self.bound_string_count += 1;
+        } else {
+            std.log.warn("Statement: exceeded max bound strings, freeing immediately", .{});
+            self.allocator.free(str);
+        }
+    }
+
+    // ── Parameter binding ──────────────────────────────────────────────────
+
+    pub fn bindText(self: *Statement, value: []const u8) !void {
+        const copy = try self.allocator.dupe(u8, value);
+        self.trackBoundString(copy);
+        try self.bindTrackedText(copy);
+    }
+
+    /// Bind text with caller-guaranteed static lifetime (no copy).
+    pub fn bindTextStatic(self: *Statement, value: []const u8) !void {
+        if (!self.vtable.bindText(self.ctx, self.param_idx, value.ptr, value.len)) {
+            std.log.err("Failed to bind static text parameter: {s}", .{self.vtable.lastError(self.ctx)});
+            return error.BindFailed;
+        }
+        self.param_idx += 1;
+    }
+
+    fn bindTrackedText(self: *Statement, value: []u8) !void {
+        if (!self.vtable.bindText(self.ctx, self.param_idx, value.ptr, value.len)) {
+            std.log.err("Failed to bind tracked text parameter: {s}", .{self.vtable.lastError(self.ctx)});
+            return error.BindFailed;
+        }
+        self.param_idx += 1;
+    }
+
+    pub fn bindInt64(self: *Statement, value: i64) !void {
+        if (!self.vtable.bindInt64(self.ctx, self.param_idx, value)) {
+            std.log.err("Failed to bind int64 parameter: {s}", .{self.vtable.lastError(self.ctx)});
+            return error.BindFailed;
+        }
+        self.param_idx += 1;
+    }
+
+    pub fn bindInt(self: *Statement, value: i32) !void {
+        if (!self.vtable.bindInt(self.ctx, self.param_idx, value)) {
+            std.log.err("Failed to bind int parameter: {s}", .{self.vtable.lastError(self.ctx)});
+            return error.BindFailed;
+        }
+        self.param_idx += 1;
+    }
+
+    pub fn bindNull(self: *Statement) !void {
+        if (!self.vtable.bindNull(self.ctx, self.param_idx)) {
+            std.log.err("Failed to bind null parameter: {s}", .{self.vtable.lastError(self.ctx)});
+            return error.BindFailed;
+        }
+        self.param_idx += 1;
+    }
+
+    pub fn bindAddress(self: *Statement, addr: Address) !void {
+        const hex = try addr.toHex(self.allocator);
+        self.trackBoundString(hex);
+        try self.bindTrackedText(hex);
+    }
+
+    pub fn bindHash(self: *Statement, hash: Hash) !void {
+        const hex = try hash.toHex(self.allocator);
+        self.trackBoundString(hex);
+        try self.bindTrackedText(hex);
+    }
+
+    pub fn bindAddressBuf(self: *Statement, addr: Address) !void {
+        var buf: [42]u8 = undefined;
+        _ = addr.toHexBuf(&buf);
+        const copy = try self.allocator.dupe(u8, &buf);
+        self.trackBoundString(copy);
+        try self.bindTrackedText(copy);
+    }
+
+    pub fn bindHashBuf(self: *Statement, hash: Hash) !void {
+        var buf: [66]u8 = undefined;
+        _ = hash.toHexBuf(&buf);
+        const copy = try self.allocator.dupe(u8, &buf);
+        self.trackBoundString(copy);
+        try self.bindTrackedText(copy);
+    }
+
+    pub fn bindOptionalText(self: *Statement, value: ?[]const u8) !void {
+        if (value) |v| try self.bindText(v) else try self.bindNull();
+    }
+
+    pub fn bindOptionalInt64(self: *Statement, value: ?i64) !void {
+        if (value) |v| try self.bindInt64(v) else try self.bindNull();
+    }
+
+    pub fn bindOptionalHash(self: *Statement, hash: ?Hash) !void {
+        if (hash) |h| try self.bindHash(h) else try self.bindNull();
+    }
+
+    // ── Execution ──────────────────────────────────────────────────────────
+
+    pub fn exec(self: *Statement) !void {
+        if (!self.vtable.exec(self.ctx)) {
+            std.log.err("Failed to execute query: {s}", .{self.vtable.lastError(self.ctx)});
+            return error.ExecFailed;
+        }
+    }
+
+    pub fn step(self: *Statement) !bool {
+        return switch (self.vtable.step(self.ctx)) {
+            .row => true,
+            .done => false,
+            .failed => {
+                std.log.err("Failed to step query: {s}", .{self.vtable.lastError(self.ctx)});
+                return error.StepFailed;
+            },
+        };
+    }
+
+    pub fn changes(self: *Statement) u32 {
+        return self.vtable.changes(self.ctx);
+    }
+
+    // ── Result extraction ────────────────────────────────────────────────────
+
+    /// Caller owns the returned memory; null if the column is NULL.
+    pub fn getText(self: *Statement, col: usize) !?[]u8 {
+        const slice = self.vtable.columnText(self.ctx, @intCast(col)) orelse return null;
+        return try self.allocator.dupe(u8, slice);
+    }
+
+    /// Borrowed slice valid only until the next step()/reset()/deinit().
+    pub fn getTextSlice(self: *Statement, col: usize) ?[]const u8 {
+        return self.vtable.columnText(self.ctx, @intCast(col));
+    }
+
+    pub fn getInt64(self: *Statement, col: usize) i64 {
+        return self.vtable.columnInt64(self.ctx, @intCast(col));
+    }
+
+    pub fn getInt(self: *Statement, col: usize) i32 {
+        return self.vtable.columnInt(self.ctx, @intCast(col));
+    }
+
+    pub fn getBool(self: *Statement, col: usize) bool {
+        return self.vtable.columnInt(self.ctx, @intCast(col)) != 0;
+    }
+
+    pub fn getOptionalInt64(self: *Statement, col: usize) ?i64 {
+        if (self.vtable.columnIsNull(self.ctx, @intCast(col))) return null;
+        return self.vtable.columnInt64(self.ctx, @intCast(col));
+    }
+
+    pub fn isNull(self: *Statement, col: usize) bool {
+        return self.vtable.columnIsNull(self.ctx, @intCast(col));
+    }
+
+    pub fn getAddress(self: *Statement, col: usize) !?Address {
+        const text = self.getTextSlice(col) orelse return null;
+        return Address.fromHex(text) catch null;
+    }
+
+    pub fn getHash(self: *Statement, col: usize) !?Hash {
+        const text = self.getTextSlice(col) orelse return null;
+        return Hash.fromHex(text) catch null;
+    }
+};
