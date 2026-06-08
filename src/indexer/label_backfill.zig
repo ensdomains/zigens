@@ -1,7 +1,6 @@
 const std = @import("std");
 const rpc = @import("../rpc/client.zig");
 const db_module = @import("../storage/database.zig");
-const c = db_module.c;
 const unknown_labels_storage = @import("../storage/unknown_labels.zig");
 const v1_names = @import("../utils/v1_names.zig");
 const CalldataDecoder = @import("../utils/calldata_decoder.zig").CalldataDecoder;
@@ -13,11 +12,6 @@ const ens_normalize = @import("../utils/ens_normalize.zig");
 const Rainbow = @import("../rainbow/rainbow.zig").Rainbow;
 const constants = @import("../constants.zig");
 const Keccak256 = std.crypto.hash.sha3.Keccak256;
-
-// SQLITE_TRANSIENT constant
-inline fn SQLITE_TRANSIENT() c.sqlite3_destructor_type {
-    return null;
-}
 
 /// Backfill unknown subdomain labels by fetching transaction calldata
 /// and extracting label text from setSubnode* function calls
@@ -194,19 +188,14 @@ pub const LabelBackfill = struct {
             // Skip addr.reverse entries (already resolved or marked failed in step 0)
             if (std.mem.eql(u8, label.parent_node, addr_reverse_hex)) continue;
 
-            // Check if this label was already resolved by rainbow
-            const exists_query = "SELECT COUNT(*) FROM unknown_labels WHERE id = ?";
-            var stmt: ?*c.sqlite3_stmt = null;
-            const rc = c.sqlite3_prepare_v2(self.database.db.?, exists_query.ptr, @intCast(exists_query.len), &stmt, null);
-            if (rc == c.SQLITE_OK) {
-                _ = c.sqlite3_bind_int64(stmt.?, 1, label.id);
-                if (c.sqlite3_step(stmt.?) == c.SQLITE_ROW) {
-                    const count = c.sqlite3_column_int64(stmt.?, 0);
-                    if (count > 0) {
-                        try remaining_labels.append(self.allocator, label);
-                    }
+            // Check if this label was already resolved by rainbow (best-effort).
+            var q = db_module.Query.init(self.database, "SELECT COUNT(*) FROM unknown_labels WHERE id = ?") catch continue;
+            defer q.deinit();
+            q.bindInt64(label.id) catch continue;
+            if (q.step() catch false) {
+                if (q.getInt64(0) > 0) {
+                    try remaining_labels.append(self.allocator, label);
                 }
-                _ = c.sqlite3_finalize(stmt);
             }
         }
 
@@ -379,23 +368,15 @@ pub const LabelBackfill = struct {
             \\FROM unknown_labels
         ;
 
-        var stmt: ?*c.sqlite3_stmt = null;
-        const rc = c.sqlite3_prepare_v2(self.database.db.?, query.ptr, @intCast(query.len), &stmt, null);
-        if (rc != c.SQLITE_OK) {
-            return error.DatabaseError;
-        }
-        defer _ = c.sqlite3_finalize(stmt);
-
-        const step_rc = c.sqlite3_step(stmt);
-        if (step_rc != c.SQLITE_ROW) {
-            return error.DatabaseError;
-        }
+        var q = db_module.Query.init(self.database, query) catch return error.DatabaseError;
+        defer q.deinit();
+        if (!(q.step() catch return error.DatabaseError)) return error.DatabaseError;
 
         return BackfillStats{
             .total = total,
-            .pending = @intCast(c.sqlite3_column_int64(stmt, 0)),
-            .retrying = @intCast(c.sqlite3_column_int64(stmt, 1)),
-            .failed = @intCast(c.sqlite3_column_int64(stmt, 2)),
+            .pending = @intCast(q.getInt64(0)),
+            .retrying = @intCast(q.getInt64(1)),
+            .failed = @intCast(q.getInt64(2)),
         };
     }
 };

@@ -1731,24 +1731,17 @@ fn healLabelsFromDNSName(self: *Indexer, name_bytes: []const u8, wrapped_node: H
         }
 
         // Also delete from unknown_labels if resolved
-        deleteUnknownLabelByNamehash(self.database.db.?, &current_namehash) catch {};
+        deleteUnknownLabelByNamehash(self.database, &current_namehash) catch {};
     }
 }
 
-/// Delete unknown_labels entry by namehash (after healing from DNS name)
-fn deleteUnknownLabelByNamehash(sqlite_db: *db.c.sqlite3, namehash_bytes: *const [32]u8) !void {
+/// Delete unknown_labels entry by namehash (after healing from DNS name). Best-effort.
+fn deleteUnknownLabelByNamehash(database: *db.Database, namehash_bytes: *const [32]u8) !void {
     const namehash = Hash{ .bytes = namehash_bytes.* };
-    var buf: [66]u8 = undefined;
-    const namehash_hex = namehash.toHexBuf(&buf);
-
-    const query = "DELETE FROM unknown_labels WHERE namehash = ?";
-    var stmt: ?*db.c.sqlite3_stmt = null;
-    const rc = db.c.sqlite3_prepare_v2(sqlite_db, query.ptr, @intCast(query.len), &stmt, null);
-    if (rc != db.c.SQLITE_OK) return;
-    defer _ = db.c.sqlite3_finalize(stmt);
-
-    _ = db.c.sqlite3_bind_text(stmt, 1, namehash_hex.ptr, @intCast(namehash_hex.len), null);
-    _ = db.c.sqlite3_step(stmt);
+    var q = db.Query.init(database, "DELETE FROM unknown_labels WHERE namehash = ?") catch return;
+    defer q.deinit();
+    q.bindHash(namehash) catch return;
+    q.exec() catch return;
 }
 
 /// Apply a NameWrapper ERC1155 ownership change for a single token id.
