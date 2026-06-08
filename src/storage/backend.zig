@@ -52,20 +52,23 @@ pub const TxMode = enum { deferred, immediate };
 /// fields, so the driver fns read it from there. The runtime backend *selection*
 /// and per-connection ctx land with the second backend (Phase 4).
 pub const VTable = struct {
-    close: *const fn (db: *Database) void,
-    execRaw: *const fn (db: *Database, sql: []const u8) anyerror!void,
-    prepare: *const fn (db: *Database, sql: []const u8, cached: bool) anyerror!Statement,
-    begin: *const fn (db: *Database, mode: TxMode) anyerror!void,
-    commit: *const fn (db: *Database) anyerror!void,
+    close: *const fn (ctx: *anyopaque) void,
+    execRaw: *const fn (ctx: *anyopaque, sql: []const u8) anyerror!void,
+    prepare: *const fn (ctx: *anyopaque, sql: []const u8, cached: bool) anyerror!Statement,
+    begin: *const fn (ctx: *anyopaque, mode: TxMode) anyerror!void,
+    commit: *const fn (ctx: *anyopaque) anyerror!void,
     /// Rollback is best-effort and logs (not returns) on failure — a failed
     /// rollback is logged CRITICAL, matching the old `rollbackTransaction`.
-    rollback: *const fn (db: *Database) void,
+    rollback: *const fn (ctx: *anyopaque) void,
     /// ROWID of the most recent successful INSERT on this connection.
-    lastInsertId: *const fn (db: *Database) i64,
+    lastInsertId: *const fn (ctx: *anyopaque) i64,
 };
 
-/// The backend handle held by `Database`. Phase 0 ships only the SQLite vtable.
+/// The backend handle held by `Database`: an opaque pointer to the driver's
+/// connection state (`ptr`) + its vtable. The raw connection handle lives inside
+/// `ptr` (for SQLite, a `drivers/sqlite.zig` `SqliteConn`), never on `Database`.
 pub const Backend = struct {
+    ptr: *anyopaque,
     vtable: *const VTable,
 };
 
@@ -78,17 +81,17 @@ pub const Tx = struct {
     committed: bool = false,
 
     pub fn begin(db: *Database, mode: TxMode) !Tx {
-        try db.backend.vtable.begin(db, mode);
+        try db.backend.vtable.begin(db.backend.ptr, mode);
         return .{ .db = db };
     }
 
     pub fn commit(self: *Tx) !void {
-        try self.db.backend.vtable.commit(self.db);
+        try self.db.backend.vtable.commit(self.db.backend.ptr);
         self.committed = true;
     }
 
     pub fn deinit(self: *Tx) void {
-        if (!self.committed) self.db.backend.vtable.rollback(self.db);
+        if (!self.committed) self.db.backend.vtable.rollback(self.db.backend.ptr);
     }
 };
 

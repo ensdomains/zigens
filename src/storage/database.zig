@@ -1,7 +1,4 @@
 const std = @import("std");
-pub const c = @cImport({
-    @cInclude("sqlite3.h");
-});
 const constants = @import("../constants.zig");
 const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
@@ -57,24 +54,12 @@ pub const TxMode = backend_mod.TxMode;
 /// SQLite serialized-mode setup; call once at process start before any DB open.
 pub const configureSqliteThreadSafety = sqlite_driver.configureSerialized;
 
-// SQLITE_TRANSIENT - For Zig 0.15.1, we can't use the C constant due to alignment issues
-// Instead, we use null which tells SQLite to make a copy of the string
-// This is functionally equivalent to SQLITE_TRANSIENT for our use case
-pub inline fn SQLITE_TRANSIENT() c.sqlite3_destructor_type {
-    return null;
-}
-
 pub const Database = struct {
     allocator: std.mem.Allocator,
-    /// Active backend (Phase 0: SQLite). exec/prepare/close dispatch through its
-    /// vtable. The connection state below is owned by the driver via these fields.
+    /// Active backend. exec/prepare/begin/commit/close dispatch through its
+    /// vtable; the connection state (handle + statement cache) lives inside the
+    /// backend's driver, not on `Database`.
     backend: backend_mod.Backend,
-    /// Raw SQLite handle. Transitional: still accessed directly by not-yet-ported
-    /// raw-C consumers (webhooks, ensip16, manager, …); removed in Phase 1.
-    db: ?*c.sqlite3,
-    /// Prepared statement cache: maps SQL string → pre-compiled sqlite3_stmt.
-    /// Owned/finalized by the SQLite driver (see drivers/sqlite.zig close()).
-    stmt_cache: std.StringHashMap(*c.sqlite3_stmt),
     /// EIP-155 chain ID for entity-ID formatting (`{chainId}-{protocol}-…`).
     /// Set by callers via `setChainId` after init; defaults to 0 so the build
     /// fails loudly if a path forgets to populate it (the emitted id would be
@@ -157,17 +142,13 @@ pub const Database = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !Database {
-        const handle = try sqlite_driver.openConnection(allocator, path);
+        // The driver opens the connection (+ applies PRAGMAs, incl. recursive_triggers,
+        // load-bearing for the reorg undo-log) and owns the connection state.
         var database = Database{
             .allocator = allocator,
-            .backend = .{ .vtable = &sqlite_driver.vtable },
-            .db = handle,
-            .stmt_cache = std.StringHashMap(*c.sqlite3_stmt).init(allocator),
+            .backend = try sqlite_driver.open(allocator, path),
         };
-
-        // Connection PRAGMAs (incl. recursive_triggers, load-bearing for the reorg
-        // undo-log). Owned by the driver.
-        try sqlite_driver.applyPragmas(&database);
+        errdefer database.deinit();
 
         // Load and apply the consolidated schema from schema/schema.sql.
         // The expected workflow for schema changes is to re-index from scratch
@@ -291,17 +272,12 @@ pub const Database = struct {
 
     /// Initialize database without auto-loading schemas (for custom schema directories)
     pub fn initWithoutSchema(allocator: std.mem.Allocator, path: []const u8) !Database {
-        const handle = try sqlite_driver.openConnection(allocator, path);
-        var database = Database{
+        // Driver opens + applies the same PRAGMAs as init (recursive_triggers is
+        // harmless on this read-only path).
+        const database = Database{
             .allocator = allocator,
-            .backend = .{ .vtable = &sqlite_driver.vtable },
-            .db = handle,
-            .stmt_cache = std.StringHashMap(*c.sqlite3_stmt).init(allocator),
+            .backend = try sqlite_driver.open(allocator, path),
         };
-
-        // Same connection PRAGMAs as init (recursive_triggers is harmless on this
-        // read-only path); matches the writer connection.
-        try sqlite_driver.applyPragmas(&database);
 
         // Intentionally no `migrate()` here. The API is a read-only consumer of
         // a DB that the indexer is the sole writer of. Running migrate from the
@@ -313,7 +289,7 @@ pub const Database = struct {
     }
 
     pub fn deinit(self: *Database) void {
-        self.backend.vtable.close(self);
+        self.backend.vtable.close(self.backend.ptr);
     }
 
     /// Check if a table exists in the database
@@ -337,23 +313,23 @@ pub const Database = struct {
 
     /// Execute a parameterless statement, dispatched through the backend.
     pub fn exec(self: *Database, sql: []const u8) !void {
-        return self.backend.vtable.execRaw(self, sql);
+        return self.backend.vtable.execRaw(self.backend.ptr, sql);
     }
 
     /// Prepare a statement through the active backend (Phase 0: SQLite).
     /// Returns a backend-agnostic `Query` (= `backend.Statement`).
     pub fn prepare(self: *Database, sql: []const u8) !query.Query {
-        return self.backend.vtable.prepare(self, sql, false);
+        return self.backend.vtable.prepare(self.backend.ptr, sql, false);
     }
 
     /// Prepare a statement using the per-`Database` prepared-statement cache.
     pub fn prepareCached(self: *Database, sql: []const u8) !query.Query {
-        return self.backend.vtable.prepare(self, sql, true);
+        return self.backend.vtable.prepare(self.backend.ptr, sql, true);
     }
 
     /// ROWID of the most recent successful INSERT on this connection.
     pub fn lastInsertId(self: *Database) i64 {
-        return self.backend.vtable.lastInsertId(self);
+        return self.backend.vtable.lastInsertId(self.backend.ptr);
     }
 
     // ========================================================================

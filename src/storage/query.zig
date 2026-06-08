@@ -17,7 +17,6 @@
 const std = @import("std");
 const db_module = @import("database.zig");
 const Database = db_module.Database;
-pub const c = db_module.c;
 const backend = @import("backend.zig");
 
 /// Backend-agnostic prepared statement. Defined in `backend.zig`; aliased here
