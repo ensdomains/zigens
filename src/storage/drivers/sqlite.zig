@@ -100,6 +100,17 @@ pub fn openConnection(allocator: std.mem.Allocator, path: []const u8) !?*c.sqlit
     return db;
 }
 
+/// Configure SQLite for serialized (thread-safe) mode. Must be called once at
+/// process start, BEFORE opening any connection (it is a global pre-init option).
+pub fn configureSerialized() void {
+    const rc = c.sqlite3_config(c.SQLITE_CONFIG_SERIALIZED);
+    if (rc == c.SQLITE_OK) {
+        std.log.info("SQLite configured for serialized (thread-safe) mode", .{});
+    } else {
+        std.log.warn("Failed to configure SQLite thread safety: {d}", .{rc});
+    }
+}
+
 /// Apply the standard connection PRAGMAs (WAL, busy_timeout, synchronous,
 /// cache_size, foreign_keys, temp_store, recursive_triggers). `recursive_triggers`
 /// is load-bearing for the reorg undo-log (see reorg_undo.zig).

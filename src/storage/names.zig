@@ -4,7 +4,6 @@ const std = @import("std");
 const testing = std.testing;
 const db_module = @import("database.zig");
 const Database = db_module.Database;
-const c = db_module.c;
 const Query = db_module.Query;
 const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;

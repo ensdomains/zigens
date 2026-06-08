@@ -54,6 +54,8 @@ const sqlite_driver = @import("drivers/sqlite.zig");
 /// RAII transaction guard + mode, re-exported for storage modules.
 pub const Tx = backend_mod.Tx;
 pub const TxMode = backend_mod.TxMode;
+/// SQLite serialized-mode setup; call once at process start before any DB open.
+pub const configureSqliteThreadSafety = sqlite_driver.configureSerialized;
 
 // SQLITE_TRANSIENT - For Zig 0.15.1, we can't use the C constant due to alignment issues
 // Instead, we use null which tells SQLite to make a copy of the string

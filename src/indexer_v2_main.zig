@@ -11,12 +11,7 @@ pub const std_options: std.Options = .{
 
 pub fn main() !void {
     // Configure SQLite for thread safety BEFORE any other operations
-    const sqlite_result = db.c.sqlite3_config(db.c.SQLITE_CONFIG_SERIALIZED);
-    if (sqlite_result == db.c.SQLITE_OK) {
-        std.log.info("SQLite configured for serialized (thread-safe) mode", .{});
-    } else {
-        std.log.warn("Failed to configure SQLite thread safety: {d}", .{sqlite_result});
-    }
+    db.configureSqliteThreadSafety();
 
     // Use thread-safe GPA configuration
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};

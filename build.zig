@@ -497,6 +497,24 @@ pub fn build(b: *std.Build) void {
     const run_storage_registry_entries_tests = b.addRunArtifact(storage_registry_entries_tests);
     run_storage_registry_entries_tests.setCwd(b.path("."));
 
+    // Query abstraction tests (the backend statement seam) — uses the `lib`
+    // module (in-memory DB via Database.initWithoutSchema).
+    const storage_query_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/storage/query_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "lib", .module = lib_mod },
+            },
+        }),
+    });
+    storage_query_tests.linkLibC();
+    storage_query_tests.linkSystemLibrary("sqlite3");
+
+    const run_storage_query_tests = b.addRunArtifact(storage_query_tests);
+    run_storage_query_tests.setCwd(b.path("."));
+
     // Storage test step
     const storage_test_step = b.step("test-storage", "Run storage module tests");
     storage_test_step.dependOn(&run_storage_names_tests.step);
@@ -504,6 +522,7 @@ pub fn build(b: *std.Build) void {
     storage_test_step.dependOn(&run_storage_roles_tests.step);
     storage_test_step.dependOn(&run_storage_webhooks_tests.step);
     storage_test_step.dependOn(&run_storage_registry_entries_tests.step);
+    storage_test_step.dependOn(&run_storage_query_tests.step);
 
     // Make the default test command run all tests
     test_step.dependOn(&run_filter_tests.step);

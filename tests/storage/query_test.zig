@@ -1,30 +1,19 @@
-/// Tests for the Query executor abstraction
+/// Tests for the Query executor abstraction (the backend statement seam).
 const std = @import("std");
 const testing = std.testing;
-const query = @import("query.zig");
-const Query = query.Query;
-const db_module = @import("database.zig");
-const Database = db_module.Database;
-const c = db_module.c;
-const Address = @import("../types/address.zig").Address;
-const Hash = @import("../types/hash.zig").Hash;
+const lib = @import("lib");
+const Query = lib.storage.Query;
+const Database = lib.Database;
+const Address = lib.Address;
+const Hash = lib.Hash;
+// Module-level helpers (exec/queryOne/queryText) live in the query module.
+const query = lib.storage.database.query;
 
 /// Test helper: Create an in-memory database
 fn createTestDb(allocator: std.mem.Allocator) !*Database {
     const database = try allocator.create(Database);
     errdefer allocator.destroy(database);
-
-    var db: ?*c.sqlite3 = null;
-    const result = c.sqlite3_open(":memory:", &db);
-    if (result != c.SQLITE_OK) {
-        return error.DatabaseOpenFailed;
-    }
-
-    database.* = Database{
-        .allocator = allocator,
-        .db = db,
-    };
-
+    database.* = try Database.initWithoutSchema(allocator, ":memory:");
     return database;
 }
 
