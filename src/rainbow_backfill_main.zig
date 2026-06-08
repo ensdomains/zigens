@@ -3,18 +3,7 @@ const db = @import("storage/database.zig");
 const Rainbow = @import("rainbow/rainbow.zig").Rainbow;
 const Hash = @import("types/hash.zig").Hash;
 const v1_names = @import("utils/v1_names.zig");
-
-const c = db.c;
-
-const UnknownLabel = struct {
-    id: i64,
-    labelhash: []const u8,
-    namehash: []const u8,
-    parent_node: []const u8,
-    owner: []const u8,
-    transaction_hash: []const u8,
-    block_number: i64,
-};
+const unknown_labels_storage = @import("storage/unknown_labels.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
@@ -62,7 +51,7 @@ pub fn main() !void {
     defer database.deinit();
 
     // Count unknown labels
-    const total_unknown = try countUnknownLabels(database.db.?);
+    const total_unknown = try unknown_labels_storage.getUnknownLabelCount(&database);
     std.log.info("Total unknown labels: {d}", .{total_unknown});
 
     if (total_unknown == 0) {
@@ -86,15 +75,9 @@ pub fn main() !void {
     var total_processed: u64 = 0;
 
     while (true) {
-        const unknown_labels = try getUnknownLabelsBatch(allocator, database.db.?, batch_size);
+        const unknown_labels = try unknown_labels_storage.getUnknownLabelsForBackfill(allocator, &database, batch_size);
         defer {
-            for (unknown_labels) |label| {
-                allocator.free(label.labelhash);
-                allocator.free(label.namehash);
-                allocator.free(label.parent_node);
-                allocator.free(label.owner);
-                allocator.free(label.transaction_hash);
-            }
+            for (unknown_labels) |label| unknown_labels_storage.freeUnknownLabel(allocator, label);
             allocator.free(unknown_labels);
         }
 
@@ -138,7 +121,7 @@ pub fn main() !void {
                     };
 
                     // Delete from unknown_labels
-                    deleteUnknownLabel(database.db.?, label.id) catch |err| {
+                    unknown_labels_storage.deleteUnknownLabel(&database, label.id) catch |err| {
                         std.log.err("Failed to delete unknown label: {}", .{err});
                     };
                 }
@@ -149,7 +132,7 @@ pub fn main() !void {
 
                 if (!dry_run) {
                     // Increment backfill attempt
-                    incrementBackfillAttempt(database.db.?, label.id) catch {};
+                    unknown_labels_storage.incrementBackfillAttempt(&database, label.id) catch {};
                 }
             }
         }
@@ -184,93 +167,4 @@ fn printUsage() void {
         \\  --help              Show this help
         \\
     , .{});
-}
-
-fn countUnknownLabels(db_conn: *c.sqlite3) !u64 {
-    const query = "SELECT COUNT(*) FROM unknown_labels WHERE backfill_attempts < 3";
-    var stmt: ?*c.sqlite3_stmt = null;
-
-    if (c.sqlite3_prepare_v2(db_conn, query.ptr, @intCast(query.len), &stmt, null) != c.SQLITE_OK) {
-        return error.SqliteError;
-    }
-    defer _ = c.sqlite3_finalize(stmt);
-
-    if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        return @intCast(c.sqlite3_column_int64(stmt, 0));
-    }
-    return 0;
-}
-
-fn getUnknownLabelsBatch(allocator: std.mem.Allocator, db_conn: *c.sqlite3, limit: u32) ![]UnknownLabel {
-    const query =
-        \\SELECT id, labelhash, namehash, parent_node, owner, transaction_hash, block_number
-        \\FROM unknown_labels
-        \\WHERE backfill_attempts < 3
-        \\ORDER BY created_at ASC
-        \\LIMIT ?
-    ;
-
-    var stmt: ?*c.sqlite3_stmt = null;
-    if (c.sqlite3_prepare_v2(db_conn, query.ptr, @intCast(query.len), &stmt, null) != c.SQLITE_OK) {
-        return error.SqliteError;
-    }
-    defer _ = c.sqlite3_finalize(stmt);
-
-    _ = c.sqlite3_bind_int(stmt, 1, @intCast(limit));
-
-    var results: std.ArrayList(UnknownLabel) = .{};
-    errdefer {
-        for (results.items) |item| {
-            allocator.free(item.labelhash);
-            allocator.free(item.namehash);
-            allocator.free(item.parent_node);
-            allocator.free(item.owner);
-            allocator.free(item.transaction_hash);
-        }
-        results.deinit(allocator);
-    }
-
-    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        const label = UnknownLabel{
-            .id = c.sqlite3_column_int64(stmt, 0),
-            .labelhash = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 1))),
-            .namehash = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 2))),
-            .parent_node = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 3))),
-            .owner = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 4))),
-            .transaction_hash = try allocator.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 5))),
-            .block_number = c.sqlite3_column_int64(stmt, 6),
-        };
-        try results.append(allocator, label);
-    }
-
-    return try results.toOwnedSlice(allocator);
-}
-
-fn deleteUnknownLabel(db_conn: *c.sqlite3, id: i64) !void {
-    const query = "DELETE FROM unknown_labels WHERE id = ?";
-    var stmt: ?*c.sqlite3_stmt = null;
-
-    if (c.sqlite3_prepare_v2(db_conn, query.ptr, @intCast(query.len), &stmt, null) != c.SQLITE_OK) {
-        return error.SqliteError;
-    }
-    defer _ = c.sqlite3_finalize(stmt);
-
-    _ = c.sqlite3_bind_int64(stmt, 1, id);
-
-    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
-        return error.SqliteError;
-    }
-}
-
-fn incrementBackfillAttempt(db_conn: *c.sqlite3, id: i64) !void {
-    const query = "UPDATE unknown_labels SET backfill_attempts = backfill_attempts + 1, last_backfill_attempt = strftime('%s', 'now') WHERE id = ?";
-    var stmt: ?*c.sqlite3_stmt = null;
-
-    if (c.sqlite3_prepare_v2(db_conn, query.ptr, @intCast(query.len), &stmt, null) != c.SQLITE_OK) {
-        return error.SqliteError;
-    }
-    defer _ = c.sqlite3_finalize(stmt);
-
-    _ = c.sqlite3_bind_int64(stmt, 1, id);
-    _ = c.sqlite3_step(stmt);
 }
