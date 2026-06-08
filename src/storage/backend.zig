@@ -41,6 +41,11 @@ pub const Capabilities = struct {
 /// Connection access mode for the Phase-4 `Pool`; defined here as part of the SPI.
 pub const AccessMode = enum { writer, reader };
 
+/// Transaction mode. `immediate` takes a write lock up front (SQLite
+/// `BEGIN IMMEDIATE`); `deferred` is a plain `BEGIN`. On Postgres both map to a
+/// plain `BEGIN` (it locks lazily and isolation handles serialization).
+pub const TxMode = enum { deferred, immediate };
+
 /// Connection-level operations a backend provides — the seam for opening,
 /// closing, raw exec, and prepare. `db` is the owning session; Phase 0 keeps
 /// the SQLite connection state (`db`/`stmt_cache`) on `Database` as transitional
@@ -50,11 +55,39 @@ pub const VTable = struct {
     close: *const fn (db: *Database) void,
     execRaw: *const fn (db: *Database, sql: []const u8) anyerror!void,
     prepare: *const fn (db: *Database, sql: []const u8, cached: bool) anyerror!Statement,
+    begin: *const fn (db: *Database, mode: TxMode) anyerror!void,
+    commit: *const fn (db: *Database) anyerror!void,
+    /// Rollback is best-effort and logs (not returns) on failure — a failed
+    /// rollback is logged CRITICAL, matching the old `rollbackTransaction`.
+    rollback: *const fn (db: *Database) void,
 };
 
 /// The backend handle held by `Database`. Phase 0 ships only the SQLite vtable.
 pub const Backend = struct {
     vtable: *const VTable,
+};
+
+/// RAII transaction guard. `begin` opens the transaction; `commit` finalizes it;
+/// `deinit` rolls back if `commit` was not called — so the idiom is:
+/// `var tx = try Tx.begin(db, .immediate); defer tx.deinit(); … ; try tx.commit();`
+/// (equivalent to the old `errdefer db.exec("ROLLBACK")` pattern).
+pub const Tx = struct {
+    db: *Database,
+    committed: bool = false,
+
+    pub fn begin(db: *Database, mode: TxMode) !Tx {
+        try db.backend.vtable.begin(db, mode);
+        return .{ .db = db };
+    }
+
+    pub fn commit(self: *Tx) !void {
+        try self.db.backend.vtable.commit(self.db);
+        self.committed = true;
+    }
+
+    pub fn deinit(self: *Tx) void {
+        if (!self.committed) self.db.backend.vtable.rollback(self.db);
+    }
 };
 
 /// The primitive statement operations a backend must provide. The SQLite impl

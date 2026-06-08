@@ -1,34 +1,24 @@
-const std = @import("std");
 const db_module = @import("database.zig");
 const Database = db_module.Database;
-const c = db_module.c;
 
 // ============================================================================
-// TRANSACTION OPERATIONS (3 functions)
+// TRANSACTION OPERATIONS
 // ============================================================================
+//
+// Thin wrappers that dispatch through the backend vtable, preserving the
+// `db.beginTransaction()` / `commitTransaction()` / `rollbackTransaction()`
+// call-site API (used by the indexer's batch loop). The `Tx` RAII guard in
+// backend.zig is the preferred form for new code.
 
-/// Batch insert/update for memory efficiency
+/// Begin a deferred transaction (batch insert/update for memory efficiency).
 pub fn beginTransaction(db: *Database) !void {
-    const sql = "BEGIN TRANSACTION";
-    if (c.sqlite3_exec(db.db, sql, null, null, null) != c.SQLITE_OK) {
-        std.log.err("Failed to begin transaction: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.BeginTransactionFailed;
-    }
+    return db.backend.vtable.begin(db, .deferred);
 }
 
 pub fn commitTransaction(db: *Database) !void {
-    const sql = "COMMIT";
-    if (c.sqlite3_exec(db.db, sql, null, null, null) != c.SQLITE_OK) {
-        std.log.err("Failed to commit transaction: {s}", .{c.sqlite3_errmsg(db.db)});
-        return error.CommitFailed;
-    }
-    std.log.debug("Transaction committed successfully", .{});
+    return db.backend.vtable.commit(db);
 }
 
 pub fn rollbackTransaction(db: *Database) void {
-    const sql = "ROLLBACK";
-    const result = c.sqlite3_exec(db.db, sql, null, null, null);
-    if (result != c.SQLITE_OK) {
-        std.log.err("CRITICAL: Failed to rollback transaction: {s}", .{c.sqlite3_errmsg(db.db)});
-    }
+    db.backend.vtable.rollback(db);
 }

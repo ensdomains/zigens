@@ -149,11 +149,39 @@ fn execRaw(database: *Database, sql: []const u8) anyerror!void {
     }
 }
 
+fn begin(database: *Database, mode: backend.TxMode) anyerror!void {
+    const sql = switch (mode) {
+        .deferred => "BEGIN TRANSACTION",
+        .immediate => "BEGIN IMMEDIATE TRANSACTION",
+    };
+    if (c.sqlite3_exec(database.db, sql, null, null, null) != c.SQLITE_OK) {
+        std.log.err("Failed to begin transaction: {s}", .{c.sqlite3_errmsg(database.db)});
+        return error.BeginTransactionFailed;
+    }
+}
+
+fn commit(database: *Database) anyerror!void {
+    if (c.sqlite3_exec(database.db, "COMMIT", null, null, null) != c.SQLITE_OK) {
+        std.log.err("Failed to commit transaction: {s}", .{c.sqlite3_errmsg(database.db)});
+        return error.CommitFailed;
+    }
+    std.log.debug("Transaction committed successfully", .{});
+}
+
+fn rollback(database: *Database) void {
+    if (c.sqlite3_exec(database.db, "ROLLBACK", null, null, null) != c.SQLITE_OK) {
+        std.log.err("CRITICAL: Failed to rollback transaction: {s}", .{c.sqlite3_errmsg(database.db)});
+    }
+}
+
 /// The connection-level vtable `Database` dispatches through.
 pub const vtable = backend.VTable{
     .close = close,
     .execRaw = execRaw,
     .prepare = prepare,
+    .begin = begin,
+    .commit = commit,
+    .rollback = rollback,
 };
 
 pub const stmt_vtable = backend.StmtVTable{

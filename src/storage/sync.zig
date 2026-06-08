@@ -112,10 +112,9 @@ pub fn rollbackToBlock(db: *Database, protocol: models.Protocol, block_number: u
 
     // Atomicity: the entire rollback runs in one transaction. A crash or error
     // mid-rollback must leave the DB at its pre-rollback state, never half-rolled.
-    try db.exec("BEGIN IMMEDIATE TRANSACTION");
-    errdefer db.exec("ROLLBACK") catch |rb_err| {
-        std.log.err("CRITICAL: failed to ROLLBACK reorg transaction after error: {}", .{rb_err});
-    };
+    // The Tx guard rolls back on any early-error return; commit() below seals it.
+    var tx = try db_module.Tx.begin(db, .immediate);
+    defer tx.deinit();
 
     // Reverse in-place mutations FIRST: clear the cursor so the restore writes don't
     // self-capture, then reverse-apply every undo entry with block > N. This must run
@@ -235,7 +234,7 @@ pub fn rollbackToBlock(db: *Database, protocol: models.Protocol, block_number: u
     // Update sync state
     try db.setSyncState(protocol, block_number);
 
-    try db.exec("COMMIT");
+    try tx.commit();
 
     std.log.warn("Rolled back {s} to block {d} (atomic; in-place updates reversed via undo-log + created-after rows removed)", .{ protocol_str, block_number });
 }
@@ -475,13 +474,10 @@ pub fn deleteDataAfterBlock(db: *Database, block_number: u64) !void {
         .{ .name = "resolver_authorisations", .block_col = "block_number" },
     };
 
-    // Begin transaction for atomic cleanup
-    try db.exec("BEGIN TRANSACTION");
-    errdefer {
-        db.exec("ROLLBACK") catch |err| {
-            std.log.err("CRITICAL: Failed to rollback transaction during cleanup error: {}", .{err});
-        };
-    }
+    // Begin transaction for atomic cleanup. The Tx guard rolls back on any
+    // early-error return; commit() below seals it.
+    var tx = try db_module.Tx.begin(db, .deferred);
+    defer tx.deinit();
 
     // Reverse in-place mutations after the block for BOTH protocols (this path is
     // protocol-agnostic), so --clean is clean-at-N equivalent and no stale undo
@@ -515,7 +511,7 @@ pub fn deleteDataAfterBlock(db: *Database, block_number: u64) !void {
     // both protocols) — no explicit column-predicate cleanup needed.
 
     // Commit transaction
-    try db.exec("COMMIT");
+    try tx.commit();
     std.log.info("Data cleanup complete", .{});
 }
 
