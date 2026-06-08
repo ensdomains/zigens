@@ -349,6 +349,11 @@ pub const Database = struct {
         return self.backend.vtable.prepare(self, sql, true);
     }
 
+    /// ROWID of the most recent successful INSERT on this connection.
+    pub fn lastInsertId(self: *Database) i64 {
+        return self.backend.vtable.lastInsertId(self);
+    }
+
     // ========================================================================
     // BULK SYNC INDEX MANAGEMENT
     // ========================================================================

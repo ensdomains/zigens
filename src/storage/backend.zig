@@ -60,6 +60,8 @@ pub const VTable = struct {
     /// Rollback is best-effort and logs (not returns) on failure — a failed
     /// rollback is logged CRITICAL, matching the old `rollbackTransaction`.
     rollback: *const fn (db: *Database) void,
+    /// ROWID of the most recent successful INSERT on this connection.
+    lastInsertId: *const fn (db: *Database) i64,
 };
 
 /// The backend handle held by `Database`. Phase 0 ships only the SQLite vtable.

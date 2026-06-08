@@ -3,12 +3,6 @@ const models = @import("../types/models.zig");
 const db = @import("../storage/database.zig");
 const json_utils = @import("../utils/json.zig");
 
-// SQLITE_TRANSIENT - For Zig 0.15.1, we can't use the C constant due to alignment issues
-// Instead, we use null which tells SQLite to make a copy of the string
-inline fn SQLITE_TRANSIENT() db.c.sqlite3_destructor_type {
-    return null;
-}
-
 /// Generate a 32-byte random HMAC secret, hex-encoded (64 chars + "0x"-style prefix omitted).
 /// Caller owns the returned slice. Use `std.crypto.random` for cryptographically secure bytes.
 pub fn generateWebhookSecret(allocator: std.mem.Allocator) ![]u8 {
@@ -256,19 +250,14 @@ pub const WebhookManager = struct {
         self.db_mutex.lock();
         defer self.db_mutex.unlock();
 
-        const sql = "UPDATE webhook_queue SET status = 'pending', updated_at = ? WHERE status = 'processing' AND updated_at < ?";
-        const sql_z = try self.allocator.dupeZ(u8, sql);
-        defer self.allocator.free(sql_z);
+        // Best-effort: any failure silently returns (matches prior behaviour).
+        var q = db.Query.init(self.database, "UPDATE webhook_queue SET status = 'pending', updated_at = ? WHERE status = 'processing' AND updated_at < ?") catch return;
+        defer q.deinit();
+        q.bindInt64(now) catch return;
+        q.bindInt64(cutoff) catch return;
+        q.exec() catch return;
 
-        var stmt: ?*db.c.sqlite3_stmt = null;
-        if (db.c.sqlite3_prepare_v2(self.database.db, sql_z.ptr, -1, &stmt, null) != db.c.SQLITE_OK) return;
-        defer _ = db.c.sqlite3_finalize(stmt);
-
-        _ = db.c.sqlite3_bind_int64(stmt, 1, now);
-        _ = db.c.sqlite3_bind_int64(stmt, 2, cutoff);
-        _ = db.c.sqlite3_step(stmt);
-
-        const reclaimed = db.c.sqlite3_changes(self.database.db);
+        const reclaimed = q.changes();
         if (reclaimed > 0) {
             std.log.info("Reclaimed {d} webhook delivery row(s) stuck in 'processing'", .{reclaimed});
         }
@@ -413,34 +402,21 @@ pub const WebhookManager = struct {
             \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ;
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
-        defer self.allocator.free(sql_z);
+        var q = try db.Query.init(self.database, sql);
+        defer q.deinit();
 
-        var stmt: ?*db.c.sqlite3_stmt = null;
-        _ = db.c.sqlite3_prepare_v2(self.database.db, sql_z.ptr, -1, &stmt, null);
-        defer _ = db.c.sqlite3_finalize(stmt);
-
-        const tx_hex = try event.tx_hash.toHex(self.allocator);
-        defer self.allocator.free(tx_hex);
-        const contract_hex = try event.contract_address.toHex(self.allocator);
-        defer self.allocator.free(contract_hex);
-
-        _ = db.c.sqlite3_bind_int64(stmt, 1, @intCast(webhook_id));
-        _ = db.c.sqlite3_bind_text(stmt, 2, webhook_url.ptr, @intCast(webhook_url.len), SQLITE_TRANSIENT());
-        _ = db.c.sqlite3_bind_text(stmt, 3, webhook_secret.ptr, @intCast(webhook_secret.len), SQLITE_TRANSIENT());
-        _ = db.c.sqlite3_bind_text(stmt, 4, event.event_type.toString().ptr, @intCast(event.event_type.toString().len), SQLITE_TRANSIENT());
-        _ = db.c.sqlite3_bind_text(stmt, 5, event.protocol.toString().ptr, @intCast(event.protocol.toString().len), SQLITE_TRANSIENT());
-        _ = db.c.sqlite3_bind_int64(stmt, 6, @intCast(event.block_number));
-        _ = db.c.sqlite3_bind_text(stmt, 7, tx_hex.ptr, @intCast(tx_hex.len), SQLITE_TRANSIENT());
-        _ = db.c.sqlite3_bind_text(stmt, 8, contract_hex.ptr, @intCast(contract_hex.len), SQLITE_TRANSIENT());
-        _ = db.c.sqlite3_bind_text(stmt, 9, payload.ptr, @intCast(payload.len), SQLITE_TRANSIENT());
-        _ = db.c.sqlite3_bind_int64(stmt, 10, event.timestamp);
-        _ = db.c.sqlite3_bind_int64(stmt, 11, std.time.timestamp()); // Can send immediately
-
-        if (db.c.sqlite3_step(stmt) != db.c.SQLITE_DONE) {
-            std.log.err("Failed to enqueue webhook: {s}", .{db.c.sqlite3_errmsg(self.database.db)});
-            return error.EnqueueFailed;
-        }
+        try q.bindInt64(@intCast(webhook_id));
+        try q.bindText(webhook_url);
+        try q.bindText(webhook_secret);
+        try q.bindTextStatic(event.event_type.toString());
+        try q.bindTextStatic(event.protocol.toString());
+        try q.bindInt64(@intCast(event.block_number));
+        try q.bindHash(event.tx_hash);
+        try q.bindAddress(event.contract_address);
+        try q.bindText(payload);
+        try q.bindInt64(event.timestamp);
+        try q.bindInt64(std.time.timestamp()); // Can send immediately
+        try q.exec();
 
         std.log.debug("Enqueued webhook for {s}: {s}", .{ sanitizeUrlForLog(webhook_url), event.event_type.toString() });
     }
@@ -495,29 +471,22 @@ pub const WebhookManager = struct {
                 \\RETURNING id, webhook_url, webhook_secret, payload, retry_count
             ;
 
-            const sql_z = try self.allocator.dupeZ(u8, sql);
-            defer self.allocator.free(sql_z);
+            var q = try db.Query.init(self.database, sql);
+            defer q.deinit();
 
-            var stmt: ?*db.c.sqlite3_stmt = null;
-            _ = db.c.sqlite3_prepare_v2(self.database.db, sql_z.ptr, -1, &stmt, null);
-            defer _ = db.c.sqlite3_finalize(stmt);
+            try q.bindInt64(now);
+            try q.bindInt64(now);
 
-            _ = db.c.sqlite3_bind_int64(stmt, 1, now);
-            _ = db.c.sqlite3_bind_int64(stmt, 2, now);
+            while (try q.step()) {
+                const queue_id: u64 = @intCast(q.getInt64(0));
+                const retry_count: u32 = @intCast(q.getInt(4));
 
-            while (db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW) {
-                const queue_id: u64 = @intCast(db.c.sqlite3_column_int64(stmt, 0));
-                const webhook_url_span = std.mem.span(db.c.sqlite3_column_text(stmt, 1));
-                const webhook_secret_span = std.mem.span(db.c.sqlite3_column_text(stmt, 2));
-                const payload_span = std.mem.span(db.c.sqlite3_column_text(stmt, 3));
-                const retry_count: u32 = @intCast(db.c.sqlite3_column_int(stmt, 4));
-
-                // IMPORTANT: Copy strings before releasing mutex/finalizing statement
-                const webhook_url = try self.allocator.dupe(u8, webhook_url_span);
+                // IMPORTANT: copy strings before the next step / statement teardown.
+                const webhook_url = try self.allocator.dupe(u8, q.getTextSlice(1) orelse "");
                 errdefer self.allocator.free(webhook_url);
-                const webhook_secret = try self.allocator.dupe(u8, webhook_secret_span);
+                const webhook_secret = try self.allocator.dupe(u8, q.getTextSlice(2) orelse "");
                 errdefer self.allocator.free(webhook_secret);
-                const payload = try self.allocator.dupe(u8, payload_span);
+                const payload = try self.allocator.dupe(u8, q.getTextSlice(3) orelse "");
                 errdefer self.allocator.free(payload);
 
                 try jobs.append(self.allocator, .{
@@ -580,20 +549,11 @@ pub const WebhookManager = struct {
         self.db_mutex.lock();
         defer self.db_mutex.unlock();
 
-        const sql = "UPDATE webhook_queue SET status = 'delivered', updated_at = ? WHERE id = ?";
-        const sql_z = try self.allocator.dupeZ(u8, sql);
-        defer self.allocator.free(sql_z);
-
-        var stmt: ?*db.c.sqlite3_stmt = null;
-        _ = db.c.sqlite3_prepare_v2(self.database.db, sql_z.ptr, -1, &stmt, null);
-        defer _ = db.c.sqlite3_finalize(stmt);
-
-        _ = db.c.sqlite3_bind_int64(stmt, 1, std.time.timestamp());
-        _ = db.c.sqlite3_bind_int64(stmt, 2, @intCast(queue_id));
-
-        if (db.c.sqlite3_step(stmt) != db.c.SQLITE_DONE) {
-            return error.UpdateFailed;
-        }
+        var q = try db.Query.init(self.database, "UPDATE webhook_queue SET status = 'delivered', updated_at = ? WHERE id = ?");
+        defer q.deinit();
+        try q.bindInt64(std.time.timestamp());
+        try q.bindInt64(@intCast(queue_id));
+        try q.exec();
 
         std.log.debug("Marked webhook id={d} as delivered", .{queue_id});
     }
@@ -617,23 +577,15 @@ pub const WebhookManager = struct {
             \\SET status = ?, retry_count = ?, next_retry_at = ?, updated_at = ?, last_attempt_at = ?
             \\WHERE id = ?
         ;
-        const sql_z = try self.allocator.dupeZ(u8, sql);
-        defer self.allocator.free(sql_z);
-
-        var stmt: ?*db.c.sqlite3_stmt = null;
-        _ = db.c.sqlite3_prepare_v2(self.database.db, sql_z.ptr, -1, &stmt, null);
-        defer _ = db.c.sqlite3_finalize(stmt);
-
-        _ = db.c.sqlite3_bind_text(stmt, 1, status.ptr, @intCast(status.len), SQLITE_TRANSIENT());
-        _ = db.c.sqlite3_bind_int(stmt, 2, @intCast(new_retry_count));
-        _ = db.c.sqlite3_bind_int64(stmt, 3, next_retry_at);
-        _ = db.c.sqlite3_bind_int64(stmt, 4, std.time.timestamp());
-        _ = db.c.sqlite3_bind_int64(stmt, 5, std.time.timestamp());
-        _ = db.c.sqlite3_bind_int64(stmt, 6, @intCast(queue_id));
-
-        if (db.c.sqlite3_step(stmt) != db.c.SQLITE_DONE) {
-            return error.UpdateFailed;
-        }
+        var q = try db.Query.init(self.database, sql);
+        defer q.deinit();
+        try q.bindTextStatic(status);
+        try q.bindInt(@intCast(new_retry_count));
+        try q.bindInt64(next_retry_at);
+        try q.bindInt64(std.time.timestamp());
+        try q.bindInt64(std.time.timestamp());
+        try q.bindInt64(@intCast(queue_id));
+        try q.exec();
 
         if (new_retry_count >= self.max_retries) {
             std.log.warn("Webhook id={d} permanently failed after {d} attempts", .{ queue_id, new_retry_count });
@@ -871,41 +823,23 @@ pub const WebhookManager = struct {
         // Clean up delivered webhooks
         {
             const cutoff = now - (@as(i64, delivered_retention_days) * 86400);
-            const sql = "DELETE FROM webhook_queue WHERE status = 'delivered' AND created_at < ?";
-            const sql_z = try self.allocator.dupeZ(u8, sql);
-            defer self.allocator.free(sql_z);
-
-            var stmt: ?*db.c.sqlite3_stmt = null;
-            if (db.c.sqlite3_prepare_v2(self.database.db, sql_z.ptr, -1, &stmt, null) != db.c.SQLITE_OK) {
-                return error.PrepareFailed;
-            }
-            defer _ = db.c.sqlite3_finalize(stmt);
-
-            _ = db.c.sqlite3_bind_int64(stmt, 1, cutoff);
-
-            if (db.c.sqlite3_step(stmt) == db.c.SQLITE_DONE) {
-                stats.delivered_removed = @intCast(db.c.sqlite3_changes(self.database.db));
-            }
+            var q = try db.Query.init(self.database, "DELETE FROM webhook_queue WHERE status = 'delivered' AND created_at < ?");
+            defer q.deinit();
+            try q.bindInt64(cutoff);
+            if (q.exec()) |_| {
+                stats.delivered_removed = @intCast(q.changes());
+            } else |_| {}
         }
 
         // Clean up failed webhooks
         {
             const cutoff = now - (@as(i64, failed_retention_days) * 86400);
-            const sql = "DELETE FROM webhook_queue WHERE status = 'failed' AND created_at < ?";
-            const sql_z = try self.allocator.dupeZ(u8, sql);
-            defer self.allocator.free(sql_z);
-
-            var stmt: ?*db.c.sqlite3_stmt = null;
-            if (db.c.sqlite3_prepare_v2(self.database.db, sql_z.ptr, -1, &stmt, null) != db.c.SQLITE_OK) {
-                return error.PrepareFailed;
-            }
-            defer _ = db.c.sqlite3_finalize(stmt);
-
-            _ = db.c.sqlite3_bind_int64(stmt, 1, cutoff);
-
-            if (db.c.sqlite3_step(stmt) == db.c.SQLITE_DONE) {
-                stats.failed_removed = @intCast(db.c.sqlite3_changes(self.database.db));
-            }
+            var q = try db.Query.init(self.database, "DELETE FROM webhook_queue WHERE status = 'failed' AND created_at < ?");
+            defer q.deinit();
+            try q.bindInt64(cutoff);
+            if (q.exec()) |_| {
+                stats.failed_removed = @intCast(q.changes());
+            } else |_| {}
         }
 
         if (stats.delivered_removed > 0 or stats.failed_removed > 0) {

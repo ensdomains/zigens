@@ -174,6 +174,10 @@ fn rollback(database: *Database) void {
     }
 }
 
+fn lastInsertId(database: *Database) i64 {
+    return c.sqlite3_last_insert_rowid(database.db);
+}
+
 /// The connection-level vtable `Database` dispatches through.
 pub const vtable = backend.VTable{
     .close = close,
@@ -182,6 +186,7 @@ pub const vtable = backend.VTable{
     .begin = begin,
     .commit = commit,
     .rollback = rollback,
+    .lastInsertId = lastInsertId,
 };
 
 pub const stmt_vtable = backend.StmtVTable{
