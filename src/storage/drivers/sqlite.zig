@@ -246,6 +246,67 @@ pub const vtable = backend.VTable{
     .lastInsertId = lastInsertId,
 };
 
+// ── SQL dialect builders (emit today's exact SQLite SQL) ────────────────────
+
+fn appendQuotedIdent(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), ident: []const u8) !void {
+    try buf.append(allocator, '"');
+    try buf.appendSlice(allocator, ident);
+    try buf.append(allocator, '"');
+}
+
+fn dialectUpsert(allocator: std.mem.Allocator, table: []const u8, cols: []const []const u8, conflict_cols: []const []const u8, action: backend.ConflictAction) anyerror![]u8 {
+    // SQLite INSERT OR REPLACE/IGNORE does not take a conflict-key list.
+    _ = conflict_cols;
+    var buf: std.ArrayList(u8) = .{};
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, switch (action) {
+        .replace => "INSERT OR REPLACE INTO ",
+        .ignore => "INSERT OR IGNORE INTO ",
+    });
+    try appendQuotedIdent(allocator, &buf, table);
+    try buf.appendSlice(allocator, " (");
+    for (cols, 0..) |col, i| {
+        if (i > 0) try buf.appendSlice(allocator, ", ");
+        try appendQuotedIdent(allocator, &buf, col);
+    }
+    try buf.appendSlice(allocator, ") VALUES (");
+    for (cols, 0..) |_, i| {
+        if (i > 0) try buf.appendSlice(allocator, ", ");
+        try buf.append(allocator, '?');
+    }
+    try buf.append(allocator, ')');
+    return buf.toOwnedSlice(allocator);
+}
+
+fn dialectReturning(allocator: std.mem.Allocator, col: []const u8) anyerror![]u8 {
+    return std.fmt.allocPrint(allocator, " RETURNING {s}", .{col});
+}
+
+fn dialectJsonObject(allocator: std.mem.Allocator, cols: []const []const u8, alias: []const u8) anyerror![]u8 {
+    var buf: std.ArrayList(u8) = .{};
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "json_object(");
+    for (cols, 0..) |col, i| {
+        if (i > 0) try buf.appendSlice(allocator, ", ");
+        try buf.writer(allocator).print("'{s}', {s}.\"{s}\"", .{ col, alias, col });
+    }
+    try buf.append(allocator, ')');
+    return buf.toOwnedSlice(allocator);
+}
+
+fn dialectJsonExtract(allocator: std.mem.Allocator, src: []const u8, col: []const u8) anyerror![]u8 {
+    return std.fmt.allocPrint(allocator, "json_extract({s}, '$.{s}')", .{ src, col });
+}
+
+pub const sqlite_dialect = backend.Dialect{
+    .placeholder = .qmark,
+    .nowEpoch = "strftime('%s', 'now')",
+    .upsert = dialectUpsert,
+    .returning = dialectReturning,
+    .jsonObject = dialectJsonObject,
+    .jsonExtract = dialectJsonExtract,
+};
+
 // ── Open / global config ────────────────────────────────────────────────────
 
 /// Apply the standard connection PRAGMAs (WAL, busy_timeout, synchronous,
@@ -284,7 +345,7 @@ pub fn open(allocator: std.mem.Allocator, path: []const u8) !backend.Backend {
     }
 
     try applyPragmas(conn);
-    return backend.Backend{ .ptr = conn, .vtable = &vtable };
+    return backend.Backend{ .ptr = conn, .vtable = &vtable, .dialect = &sqlite_dialect };
 }
 
 /// Configure SQLite for serialized (thread-safe) mode. Must be called once at

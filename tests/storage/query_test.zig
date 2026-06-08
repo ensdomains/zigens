@@ -334,3 +334,44 @@ test "query.queryText convenience function" {
     defer if (result) |r| allocator.free(r);
     try testing.expectEqualStrings("hello world", result.?);
 }
+
+// ============================================================================
+// DIALECT BUILDER TESTS (SQLite emits today's exact SQL)
+// ============================================================================
+
+test "Dialect: upsert replace/ignore" {
+    const allocator = testing.allocator;
+    const database = try createTestDb(allocator);
+    defer destroyTestDb(allocator, database);
+    const d = database.dialect();
+
+    const replace_sql = try d.upsert(allocator, "names", &.{ "namehash", "owner" }, &.{"namehash"}, .replace);
+    defer allocator.free(replace_sql);
+    try testing.expectEqualStrings("INSERT OR REPLACE INTO \"names\" (\"namehash\", \"owner\") VALUES (?, ?)", replace_sql);
+
+    const ignore_sql = try d.upsert(allocator, "events", &.{"id"}, &.{}, .ignore);
+    defer allocator.free(ignore_sql);
+    try testing.expectEqualStrings("INSERT OR IGNORE INTO \"events\" (\"id\") VALUES (?)", ignore_sql);
+}
+
+test "Dialect: returning / nowEpoch / jsonObject / jsonExtract" {
+    const allocator = testing.allocator;
+    const database = try createTestDb(allocator);
+    defer destroyTestDb(allocator, database);
+    const d = database.dialect();
+
+    try testing.expectEqual(@as(@TypeOf(d.placeholder), .qmark), d.placeholder);
+    try testing.expectEqualStrings("strftime('%s', 'now')", d.nowEpoch);
+
+    const ret = try d.returning(allocator, "id");
+    defer allocator.free(ret);
+    try testing.expectEqualStrings(" RETURNING id", ret);
+
+    const obj = try d.jsonObject(allocator, &.{ "protocol", "namehash" }, "OLD");
+    defer allocator.free(obj);
+    try testing.expectEqualStrings("json_object('protocol', OLD.\"protocol\", 'namehash', OLD.\"namehash\")", obj);
+
+    const ext = try d.jsonExtract(allocator, "?1", "owner");
+    defer allocator.free(ext);
+    try testing.expectEqualStrings("json_extract(?1, '$.owner')", ext);
+}

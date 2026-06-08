@@ -46,6 +46,37 @@ pub const AccessMode = enum { writer, reader };
 /// plain `BEGIN` (it locks lazily and isolation handles serialization).
 pub const TxMode = enum { deferred, immediate };
 
+/// Upsert conflict behaviour: `.replace` overwrites the conflicting row,
+/// `.ignore` keeps it. (SQLite `INSERT OR REPLACE`/`OR IGNORE`; Postgres
+/// `ON CONFLICT … DO UPDATE`/`DO NOTHING`.)
+pub const ConflictAction = enum { replace, ignore };
+
+/// Per-backend SQL-fragment builders for the handful of constructs that differ
+/// between SQLite and PostgreSQL. Storage code keeps writing `?` placeholders
+/// (the Postgres driver renumbers them to `$N` at prepare time); only the
+/// *semantic* divergences below go through these builders. Each builder returns
+/// an allocator-owned slice the caller frees. The SQLite `Dialect` emits exactly
+/// today's SQL, so routing a call site through it is behaviour-neutral.
+///
+/// (`introspectColumns` — PRAGMA table_info vs information_schema.columns — is
+/// added when the reorg undo-log is routed through the dialect; it needs the
+/// connection, unlike these pure builders.)
+pub const Dialect = struct {
+    placeholder: Placeholder,
+    /// SQL expression yielding the current Unix epoch in seconds.
+    nowEpoch: []const u8,
+    /// `INSERT OR REPLACE/IGNORE INTO t (cols) VALUES (?, …)` (SQLite) /
+    /// `INSERT INTO t (cols) VALUES (?, …) ON CONFLICT(conflict) DO UPDATE/NOTHING` (PG).
+    upsert: *const fn (allocator: std.mem.Allocator, table: []const u8, cols: []const []const u8, conflict_cols: []const []const u8, action: ConflictAction) anyerror![]u8,
+    /// ` RETURNING <col>` clause.
+    returning: *const fn (allocator: std.mem.Allocator, col: []const u8) anyerror![]u8,
+    /// `json_object('c', alias."c", …)` (SQLite) / `jsonb_build_object(…)`/`to_jsonb` (PG).
+    jsonObject: *const fn (allocator: std.mem.Allocator, cols: []const []const u8, alias: []const u8) anyerror![]u8,
+    /// Extract a JSON object field by name: `json_extract(src, '$.col')` (SQLite) /
+    /// `(src::jsonb ->> 'col')` (PG).
+    jsonExtract: *const fn (allocator: std.mem.Allocator, src: []const u8, col: []const u8) anyerror![]u8,
+};
+
 /// Connection-level operations a backend provides — the seam for opening,
 /// closing, raw exec, and prepare. `db` is the owning session; Phase 0 keeps
 /// the SQLite connection state (`db`/`stmt_cache`) on `Database` as transitional
@@ -70,6 +101,8 @@ pub const VTable = struct {
 pub const Backend = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// SQL-dialect builders for this backend (static per backend).
+    dialect: *const Dialect,
 };
 
 /// RAII transaction guard. `begin` opens the transaction; `commit` finalizes it;

@@ -51,6 +51,9 @@ const sqlite_driver = @import("drivers/sqlite.zig");
 /// RAII transaction guard + mode, re-exported for storage modules.
 pub const Tx = backend_mod.Tx;
 pub const TxMode = backend_mod.TxMode;
+/// SQL-dialect builders, re-exported for storage modules.
+pub const Dialect = backend_mod.Dialect;
+pub const ConflictAction = backend_mod.ConflictAction;
 /// SQLite serialized-mode setup; call once at process start before any DB open.
 pub const configureSqliteThreadSafety = sqlite_driver.configureSerialized;
 
@@ -330,6 +333,11 @@ pub const Database = struct {
     /// ROWID of the most recent successful INSERT on this connection.
     pub fn lastInsertId(self: *Database) i64 {
         return self.backend.vtable.lastInsertId(self.backend.ptr);
+    }
+
+    /// The active backend's SQL-dialect builders.
+    pub fn dialect(self: *Database) *const backend_mod.Dialect {
+        return self.backend.dialect;
     }
 
     // ========================================================================
