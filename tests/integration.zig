@@ -10,13 +10,44 @@ const Database = lib.Database;
 const namehash = lib.namehash;
 const keccak256 = lib.keccak256;
 
+/// Per-test database. SQLite (:memory:) by default; when TEST_BACKEND=postgres, opens the
+/// local `ensv2_test` in a fresh, UNIQUELY-NAMED schema set as the connection's search_path.
+/// Each call gets its own schema, so tests that hold two databases at once (the reorg
+/// reconcile tests) stay isolated — unlike `public`, which they'd clobber. The schema name
+/// is monotonic across the binary's sequential tests; DROP IF EXISTS makes re-runs idempotent.
+var pg_schema_seq: usize = 0;
+
+fn testDb(allocator: std.mem.Allocator) !Database {
+    const want_pg = blk: {
+        const v = std.process.getEnvVarOwned(allocator, "TEST_BACKEND") catch break :blk false;
+        defer allocator.free(v);
+        break :blk std.ascii.eqlIgnoreCase(v, "postgres");
+    };
+    if (!want_pg) return Database.init(allocator, ":memory:");
+
+    const be = try lib.storage.postgres.open(allocator, .{ .database = "ensv2_test", .password = "postgres" });
+    // Close `be` on any failure before initWithBackend takes ownership (it closes `be`
+    // itself on its own error, so don't double-close after handing it over).
+    pg_schema_seq += 1;
+    const setup = std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS it_{d} CASCADE; CREATE SCHEMA it_{d}; SET search_path TO it_{d}", .{ pg_schema_seq, pg_schema_seq, pg_schema_seq }) catch |err| {
+        be.vtable.close(be.ptr);
+        return err;
+    };
+    defer allocator.free(setup);
+    be.vtable.execRaw(be.ptr, setup) catch |err| {
+        be.vtable.close(be.ptr);
+        return err;
+    };
+    return Database.initWithBackend(allocator, be); // loads schema/postgres into search_path + reorg
+}
+
 test "Database integration - full workflow" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     // Create in-memory database
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     // Test 1: Insert a registry
@@ -211,7 +242,7 @@ test "Multiple name insertions and queries" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     const names = [_][]const u8{ "alice.eth", "bob.eth", "charlie.eth" };
@@ -364,7 +395,7 @@ test "reorg rollback deletes derived state created after the block" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     // Insert a name created at block 200
@@ -512,7 +543,7 @@ fn expectInPlaceOwnerReversed(protocol: models.Protocol) !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     const owner_a = try Address.fromHex("0x00000000000000000000000000000000000000aa");
@@ -574,7 +605,7 @@ test "reorg undo-log: uncaptured PCC materialize survives a later reorg" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     // Block 100: create the wrapped name (INSERT — not captured).
@@ -609,7 +640,7 @@ test "reorg undo-log: PCC materialize WITH the cursor armed is wrongly reverted 
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     try lib.storage.reorg_undo.setCursor(&database, .v1, 100);
@@ -652,7 +683,7 @@ test "reorg undo-log: unknown_labels post-N insert removed, pre-N kept (cascade 
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     const tx = try keccak256(allocator, "tx");
@@ -700,7 +731,7 @@ test "reorg undo-log: registrations renew (in-place expiry update) reversed on r
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     const nh = try namehash(allocator, "renew.eth");
@@ -733,7 +764,7 @@ test "reorg undo-log: orphaned_registrations pre-N row deleted post-N is restore
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     const subreg = "0x00000000000000000000000000000000000000e5";
@@ -807,7 +838,7 @@ test "reorg undo-log: created-after removed AND updated pre-reorg restored toget
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     const owner_a = try Address.fromHex("0x00000000000000000000000000000000000000aa");
@@ -842,7 +873,7 @@ test "reorg undo-log: rollback is idempotent" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     const owner_a = try Address.fromHex("0x00000000000000000000000000000000000000aa");
@@ -877,7 +908,7 @@ test "reorg undo-log re-inserts a resolver record cleared after the reorg block"
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     const nh = try namehash(allocator, "foo.eth");
@@ -905,7 +936,7 @@ test "reorg undo-log restores exact state-as-of-N across multiple updates" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     const a = try Address.fromHex("0x00000000000000000000000000000000000000aa");
@@ -938,7 +969,7 @@ test "reorg undo-log: rolling back one protocol leaves the other untouched" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     const a = try Address.fromHex("0x00000000000000000000000000000000000000aa");
@@ -979,7 +1010,7 @@ test "where.name filter combined with isMigrated respects both" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     // Insert two names with the same label but different migrated status... wait, they can't have
@@ -1100,7 +1131,7 @@ test "reorg undo-log reverses a resolver text OVERWRITE (INSERT OR REPLACE)" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     const nh = try namehash(allocator, "foo.eth");
@@ -1134,7 +1165,7 @@ test "reorg undo-log: reverse_records overwrite reversed + post-N insert removed
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     const addr_x = try Address.fromHex("0x00000000000000000000000000000000000000a1");
@@ -1167,7 +1198,7 @@ test "reorg undo-log: resolver_authorisations post-N insert removed" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     const nh = try namehash(allocator, "foo.eth");
@@ -1190,7 +1221,7 @@ test "reorg undo-log: registrations + registry_entries post-N inserts removed" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     const nh_keep = try namehash(allocator, "keep.eth");
@@ -1223,7 +1254,7 @@ test "reorg undo-log: accounts first-seen-after-N removed, pre-N kept" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     const a_keep = "0x00000000000000000000000000000000000000a1";
@@ -1255,7 +1286,7 @@ test "reorg undo-log: accounts seen-flag flip reversed via reorg_active" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     const addr = "0x00000000000000000000000000000000000000b7";
@@ -1291,7 +1322,7 @@ test "reorg undo-log: per-protocol rollback preserves the other protocol's accou
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     const v2_only = "0x00000000000000000000000000000000000000e1";
@@ -1317,7 +1348,7 @@ test "reorg undo-log: shared account — v2 reorg clears only seen_v2, keeps the
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     const addr = "0x00000000000000000000000000000000000000e2";
@@ -1344,7 +1375,7 @@ test "reorg undo-log: v1_controllers wound back on reorg" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     const c_old = try Address.fromHex("0x00000000000000000000000000000000000000c1");
@@ -1382,7 +1413,7 @@ test "reorg undo-log: v1_controllers remove-then-readd straddling N restores rem
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     const c = try Address.fromHex("0x00000000000000000000000000000000000000c3");
@@ -1452,14 +1483,14 @@ fn dumpTable(allocator: std.mem.Allocator, db: *Database, table: []const u8) ![]
         cols.deinit(allocator);
     }
     {
-        const pragma = try std.fmt.allocPrint(allocator, "PRAGMA table_info(\"{s}\")", .{table});
-        defer allocator.free(pragma);
-        var pq = try lib.storage.Query.init(db, pragma);
-        defer pq.deinit();
-        while (try pq.step()) {
-            const name = pq.getTextSlice(1) orelse continue;
-            if (reconcileIgnored(name)) continue;
-            try cols.append(allocator, try allocator.dupe(u8, name));
+        // Dialect-agnostic column list (SQLite PRAGMA / PG information_schema), in
+        // definition order on both backends — so the dump is comparable across two DBs of
+        // the same backend.
+        const info = try db.introspectColumns(allocator, table);
+        defer lib.storage.backend.freeColumnInfo(allocator, info);
+        for (info) |col| {
+            if (reconcileIgnored(col.name)) continue;
+            try cols.append(allocator, try allocator.dupe(u8, col.name));
         }
     }
 
@@ -1570,11 +1601,11 @@ test "reorg undo-log: rollback(N) equals a clean build at N across all entity ta
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var clean = try Database.init(allocator, ":memory:");
+    var clean = try testDb(allocator);
     defer clean.deinit();
     try applyReconcileBaseline(allocator, &clean);
 
-    var reorged = try Database.init(allocator, ":memory:");
+    var reorged = try testDb(allocator);
     defer reorged.deinit();
     try applyReconcileBaseline(allocator, &reorged);
     try applyReconcileReorged(allocator, &reorged);
@@ -1593,11 +1624,11 @@ test "reorg undo-log: reconcile comparator detects planted drift" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var a = try Database.init(allocator, ":memory:");
+    var a = try testDb(allocator);
     defer a.deinit();
     try applyReconcileBaseline(allocator, &a);
 
-    var b = try Database.init(allocator, ":memory:");
+    var b = try testDb(allocator);
     defer b.deinit();
     try applyReconcileBaseline(allocator, &b);
     // Plant one extra in-place change in b only.
@@ -1630,7 +1661,7 @@ test "normalization: default-hides non-normalized names; opt-in shows them" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try Database.init(allocator, ":memory:");
+    var database = try testDb(allocator);
     defer database.deinit();
 
     const owner = try Address.fromHex("0x00000000000000000000000000000000000000aa");

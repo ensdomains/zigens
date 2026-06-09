@@ -195,15 +195,21 @@ fn introspectColumns(ctx: *anyopaque, allocator: std.mem.Allocator, table: []con
     // information_schema columns are domain types (sql_identifier/character_data over
     // varchar; cardinal_number over int4). pg.zig's native row.get is OID-strict, so
     // cast to plain text/bigint to match the []const u8 / i64 decoders exactly.
+    // Scope to the connection's active schema (current_schema() = first existing schema in
+    // search_path) rather than a hardcoded 'public', so a connection using a non-default
+    // search_path (e.g. per-test isolation schemas) introspects its OWN tables. The PK
+    // subquery is constrained to the same schema so a same-named table elsewhere can't leak
+    // a wrong PK position.
     const sql =
         \\SELECT c.column_name::text, c.data_type::text,
         \\       COALESCE((SELECT kcu.ordinal_position FROM information_schema.table_constraints tc
         \\                 JOIN information_schema.key_column_usage kcu
-        \\                   ON kcu.constraint_name = tc.constraint_name
-        \\                 WHERE tc.table_name = c.table_name AND tc.constraint_type = 'PRIMARY KEY'
+        \\                   ON kcu.constraint_name = tc.constraint_name AND kcu.table_schema = tc.table_schema
+        \\                 WHERE tc.table_name = c.table_name AND tc.table_schema = c.table_schema
+        \\                   AND tc.constraint_type = 'PRIMARY KEY'
         \\                   AND kcu.column_name = c.column_name), 0)::bigint
         \\FROM information_schema.columns c
-        \\WHERE c.table_name = $1 AND c.table_schema = 'public'
+        \\WHERE c.table_name = $1 AND c.table_schema = COALESCE(current_schema(), 'public')
         \\ORDER BY c.ordinal_position
     ;
     var result = try self.conn.query(sql, .{table});

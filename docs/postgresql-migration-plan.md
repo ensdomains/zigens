@@ -1318,9 +1318,31 @@ PostgreSQL work begins.
   expressions are ~4 bytes shorter per JSON fragment). One pre-existing, never-triggered edge recorded:
   `CAST(<non-numeric string> AS INTEGER)` is lenient on SQLite (→0) but errors on PG — moot because
   `data.$.expiry`/`$.duration` are always JSON integers from the indexer.
-  **Remaining breadth:** the big `tests/integration.zig` suite still calls `Database.init(:memory:)`
-  directly (not the backend-aware helper), so retargeting it at PG — plus a real end-to-end indexer run
-  on PG — is the last step before lifting the experimental-backend warning.
+  **Integration suite retargeted at PostgreSQL: 35/35 (SQLite still 35/35).** `tests/integration.zig`'s
+  30 inline `Database.init(:memory:)` calls now route through a backend-aware `testDb(allocator)`; the
+  new `test-integration-pg` lane (TEST_BACKEND=postgres) runs the whole suite on PG. Because several
+  tests hold TWO databases at once (the reorg reconcile comparator: clean-build-at-N vs rollback(N)),
+  each PG test gets its OWN uniquely-named schema via `SET search_path TO it_N` (monotonic per
+  sequential test; DROP IF EXISTS makes re-runs idempotent) — `public` would have them clobber each
+  other. This **proves reorg rollback on PG end-to-end**: the reconcile comparator byte-compares
+  rollback(N) against a clean build at N across every entity table (accounts/reverse_records/resolver_*/
+  registrations/registry_entries/orphaned_registrations/unknown_labels, multi-protocol isolation, the
+  op-`I` reversals, the PCC-materialize cases) — far stronger than the Finding-A unit test. Two
+  production fixes this required: (a) `introspectColumns` was hardcoded to `table_schema = 'public'`,
+  so a non-default search_path introspected the wrong schema (and `hasTable` saw leftover `public`
+  tables → `loadSchemaFiles` skipped); now `table_schema = COALESCE(current_schema(), 'public')` with
+  the PK subquery constrained to the same schema (also fixes a latent cross-schema PK-leak); for a
+  normal production connection `current_schema()` = `public`, so it's semantically identical there
+  (driver/storage PG lanes still 16/16 + 132/132). (b) the reconcile `dumpTable` helper used SQLite
+  `PRAGMA table_info` → now the dialect-agnostic `db.introspectColumns`. Correctness-reviewed: the
+  change is a strict improvement; the only note is that the content-ordered reconcile comparator can't
+  catch a multi-column `pk_pos`-*ordering* regression — harmless because every multi-column conflict
+  target comes from the pinned `schema_keys.conflictColsFor` (which overrides the `pk_pos`-derived
+  order); the `pk_pos` fallback is only reached by single-column natural-key tables.
+  **PostgreSQL is now validated across the entire test surface** — driver (test-pg 16/16), storage
+  suites (test-storage-pg 132/132), and integration incl. the reorg reconcile (test-integration-pg
+  35/35). The last item before lifting the experimental-backend warning is a real end-to-end indexer
+  run against live Sepolia RPC writing to PG (operational validation, not a code gap).
   The **network-independent slice is done + unit-tested**: `src/storage/drivers/postgres_dialect.zig`
   — the PG `Dialect` (`ON CONFLICT` upsert/insertSelect over non-key cols with the all-key→`DO NOTHING`
   edge; `(src::jsonb ->> 'col')::cast` jsonExtract; `jsonb_build_object`; `EXTRACT(EPOCH…)`;

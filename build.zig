@@ -223,6 +223,14 @@ pub fn build(b: *std.Build) void {
     const integration_test_step = b.step("test-integration", "Run integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
 
+    // Cross-backend: re-run the integration suite against PostgreSQL (TEST_BACKEND=postgres
+    // makes testDb open ensv2_test in a fresh per-test schema). Requires a live Postgres.
+    const run_integration_pg = b.addRunArtifact(integration_tests);
+    run_integration_pg.setCwd(b.path("."));
+    run_integration_pg.setEnvironmentVariable("TEST_BACKEND", "postgres");
+    const integration_pg_step = b.step("test-integration-pg", "Run integration tests against PostgreSQL");
+    integration_pg_step.dependOn(&run_integration_pg.step);
+
     // GraphQL parser tests
     const graphql_tests = b.addTest(.{
         .root_module = b.createModule(.{
