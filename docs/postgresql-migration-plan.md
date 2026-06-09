@@ -1136,6 +1136,78 @@ PostgreSQL work begins.
   end (not just hand-written probe SQL). Constructed `Database` directly (`.{ .allocator, .backend }`)
   rather than refactoring core `Database.init`/`loadSchemaFiles` for a backend seam yet — that wiring
   (`initWithBackend` + `selectBackend`/`DATABASE_URL`) remains the next Phase-4 step.
+  **`Database.initWithBackend` landed — the shared bootstrap now runs on PG end-to-end
+  (test-pg 10/10).** `init(allocator, path)` is a thin SQLite wrapper over the new
+  `initWithBackend(allocator, backend)`; both backends share one path
+  (loadSchemaFiles → migrate → reorg_undo.ensureSchema → installTriggers), each step made
+  internally dialect-aware: (a) `isPostgres()` = `dialect.placeholder == .dollar`;
+  (b) `hasTable` rewritten dialect-agnostic via `introspectColumns` (empty ⇒ absent on both
+  backends — replaces the `sqlite_master` query); (c) `loadSchemaFiles` picks `schema/postgres/`
+  vs `schema/`; (d) `migrate()` gates the SQLite-legacy in-place upgrades (the `is_normalized`
+  ADD COLUMN, the `columnExists`-driven legacy `accounts` reshape) behind `!isPostgres()`, while
+  the `CREATE TABLE IF NOT EXISTS`/index/backfill/synthetic-root-insert steps run on both;
+  (e) `reorg_undo.ensureSchema` branches to BIGSERIAL/BIGINT, and `installTriggers` execs the
+  generated PL/pgSQL `pgTriggerInstallSql` on PG (vs the per-table CREATE TRIGGER loop on SQLite).
+  The headline test bootstraps a PG-backed `Database` via `initWithBackend`, round-trips
+  `insertName`, then arms the v2 cursor and UPDATEs `names` — proving the **generated Postgres
+  reorg-trigger DDL actually fires** (first live execution; capture row written with op `U`,
+  `to_jsonb(OLD)` holding the pre-update row). Two reviewers (memory + correctness) ran on the diff.
+  **Driver capability added — materialized result sets.** Surfaced by `initWithBackend`'s migrate:
+  `backfillFromExistingData` (and much of the storage/indexer layer) iterates one query while
+  issuing others per row — fine on SQLite (many live statements per connection), but a single
+  pinned PG connection cannot hold a live server-side cursor and prepare concurrently
+  (`UnexpectedDBMessage`). The PG driver's read path now **materializes** every result set into
+  owned memory on `execute()` (a `union(enum){null,int,text}` per column, decoded via pg.zig's
+  own getters) and releases the `pg.Result`/connection immediately; `step()`/getters read from the
+  buffer. This decouples `Statement` lifetime from connection state and is the general fix for the
+  nested-query pattern. Also fixed: `introspectColumns` casts the information_schema domain columns
+  to `::text`/`::bigint` (pg.zig's native `row.get` is OID-strict), and a **statement-arena leak**
+  (memory-reviewer Finding 1) where `doExecute` set `executed=true` *before* `execute()`, routing a
+  failed execute into the no-op `freeRows` branch instead of `stmt.deinit()` — now flagged only after
+  a successful execute, with a regression test (failed execute + deinit under the leak allocator).
+  **Deferred to the dedicated "reorg rollback on PG" increment** (needs the replay round-trip test
+  rig; none of these is reached by a wired path today since no binary calls `initWithBackend` with PG
+  yet): (A — *headline*, correctness-reviewer) `getRestoreSql` (+ the op-`I` PK delete) build the
+  restore upsert's `ON CONFLICT` target from `pk_pos > 0`, which on PG is the synthetic
+  `id BIGSERIAL`, not the business `UNIQUE` key. SQLite's `INSERT OR REPLACE` resolves a conflict on
+  *any* unique constraint, but PG's explicit `ON CONFLICT ("id")` only catches an `id` collision — so
+  a delete-then-reinsert-same-key straddling N (the live row holds the business key under a *new*
+  `id`) raises a `unique_violation` and **aborts the PG rollback** where SQLite recovers. Fix: on PG,
+  target `schema_keys.conflictColsFor(table)` and drop `id` from the restored columns. (C) the PG
+  trigger generator emits `CREATE TRIGGER` for every PROTECTED/REORG_ACTIVE table with no per-table
+  existence guard (the SQLite loop has `tableExists`); safe on the init path (full schema loaded
+  first) but add a guard for a future PG replay re-install. (D) `changes()` is still stubbed to 0 on
+  PG — not used on any init/migrate/reorg-replay path, but must be implemented (CommandComplete tag
+  count) before live PG *indexing* writers (which branch on affected-row counts) are enabled.
+  Still next: `selectBackend` + `config.backend_kind`/`DATABASE_URL` + the PG-URL parser, then wiring
+  the indexer/API mains to `initWithBackend(selectBackend(cfg))`, then the reorg-rollback-on-PG lane.
+  **`selectBackend` + config-driven open landed (test-pg 13/13).** `config.Config` gains
+  `backend_kind: BackendKind{sqlite,postgres}` (default sqlite) + `database_url: ?[]const u8`, parsed in
+  `fromEnv`: explicit `DATABASE_BACKEND` wins (unrecognized → `log.warn` + fall through), else inferred
+  from a `postgres://`/`postgresql://` `DATABASE_URL` scheme, else sqlite (so existing SQLite deployments
+  are untouched). A new **`src/storage/db_open.zig`** holds `selectBackend(allocator, kind, sqlite_path,
+  database_url) !Backend` (sqlite → `sqlite_driver.open(path)`; postgres → `parseUrl` → `postgres.open`;
+  postgres-without-URL is a hard `error.MissingDatabaseUrl`, no silent fallback) and
+  `openFromConfig(allocator, cfg) !Database` = `initWithBackend(selectBackend(cfg…))`. **Layering:**
+  db_open is deliberately *not* imported by `database.zig`, so the core storage layer (compiled into every
+  binary) stays free of the `pg` dependency — only code that opens a config-selected DB (this module, via
+  lib or a future main) pulls in pg.zig; the exe modules/build.zig are untouched this increment.
+  **`postgres.parseUrl`** parses `postgres://[user[:password]@]host[:port]/database[?…]` borrowing slices
+  from the URL (open() dupes them); userinfo splits on the *first* `:` (passwords may contain `:`),
+  authority on the *last* `@` (passwords may contain `@`), host:port on the *last* `:` — RFC/libpq-correct;
+  panic-free on all malformed inputs (adversarially fuzzed: every bad URL returns a typed error, never an
+  out-of-bounds slice). Percent-encoding + IPv6 literals are unsupported (documented; clean error, not a
+  panic). **`postgres.open` now OWNS its connection params** — `pg.Pool.init` only copies the opts struct
+  (dupes host only under TLS, which is off), so it *borrows* host/username/password/database for the pool's
+  lifetime; open() dupes all four into PgConn-owned memory and `close()` frees them after `pool.deinit()`,
+  making the Backend self-contained (no hidden ConnectOpts/URL-lifetime dependency). Tests: `parseUrl`
+  (happy + `:`/`@`-in-password + empty-authority default + scheme/port/missing-db errors), `selectBackend`
+  (sqlite + postgres dispatch + missing-URL error), and `openFromConfig(Config postgres)` → bootstrapped
+  PG Database with an `insertName` round-trip. Two reviewers clean (memory: open()/close() errdefer chain
+  frees each duped string exactly once on every failure interleaving, no leak/double-free; adversarial:
+  parser correct + panic-free, no silent postgres→sqlite fallback). Still next: wire the indexer/API mains
+  to `openFromConfig` (+ add `pg` to the exe modules in build.zig) — gated behind the reorg-rollback-on-PG
+  fix (Finding A) and a real `changes()` before live PG *indexing* is enabled.
   The **network-independent slice is done + unit-tested**: `src/storage/drivers/postgres_dialect.zig`
   — the PG `Dialect` (`ON CONFLICT` upsert/insertSelect over non-key cols with the all-key→`DO NOTHING`
   edge; `(src::jsonb ->> 'col')::cast` jsonExtract; `jsonb_build_object`; `EXTRACT(EPOCH…)`;

@@ -49,7 +49,61 @@ const PgConn = struct {
     allocator: std.mem.Allocator,
     pool: *pg.Pool,
     conn: *pg.Conn, // single writer connection, pinned for this Backend's lifetime
+    // Owned copies of the connection params. pg.Pool only copies the opts STRUCT, not the
+    // strings (it dupes host only when TLS is on), so it borrows these for its lifetime —
+    // we own them here and free them in close() after the pool is torn down. This makes
+    // the Backend self-contained (independent of the caller's ConnectOpts/URL lifetime).
+    host: []u8,
+    username: []u8,
+    password: ?[]u8,
+    database: []u8,
 };
+
+/// Parse `postgres://[user[:password]@]host[:port]/database[?...]` into ConnectOpts.
+/// The returned string fields BORROW from `url` (open() dupes them into the Backend),
+/// so `url` need only outlive this call, not the Backend. Percent-encoding is not
+/// decoded and IPv6 host literals are unsupported — neither appears in our setups.
+pub fn parseUrl(url: []const u8) !ConnectOpts {
+    var rest = url;
+    if (std.mem.startsWith(u8, rest, "postgresql://")) {
+        rest = rest["postgresql://".len..];
+    } else if (std.mem.startsWith(u8, rest, "postgres://")) {
+        rest = rest["postgres://".len..];
+    } else {
+        return error.InvalidPostgresUrl;
+    }
+
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.MissingDatabase;
+    const authority = rest[0..slash];
+    var db = rest[slash + 1 ..];
+    if (std.mem.indexOfScalar(u8, db, '?')) |q| db = db[0..q];
+    if (db.len == 0) return error.MissingDatabase;
+
+    var opts = ConnectOpts{ .database = db };
+
+    var hostport = authority;
+    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| {
+        const userinfo = authority[0..at];
+        hostport = authority[at + 1 ..];
+        if (userinfo.len > 0) {
+            if (std.mem.indexOfScalar(u8, userinfo, ':')) |colon| {
+                opts.username = userinfo[0..colon];
+                opts.password = userinfo[colon + 1 ..];
+            } else {
+                opts.username = userinfo;
+            }
+        }
+    }
+    if (hostport.len > 0) {
+        if (std.mem.lastIndexOfScalar(u8, hostport, ':')) |colon| {
+            opts.host = hostport[0..colon];
+            opts.port = std.fmt.parseInt(u16, hostport[colon + 1 ..], 10) catch return error.InvalidPort;
+        } else {
+            opts.host = hostport;
+        }
+    }
+    return opts;
+}
 
 inline fn asConn(ctx: *anyopaque) *PgConn {
     return @ptrCast(@alignCast(ctx));
@@ -58,10 +112,20 @@ inline fn asConn(ctx: *anyopaque) *PgConn {
 /// Open a PostgreSQL backend: one pinned connection from a size-1 pool. Caller owns
 /// the returned `Backend` and must `close` it via `vtable.close`.
 pub fn open(allocator: std.mem.Allocator, opts: ConnectOpts) !backend.Backend {
+    // Own the connection params (pg.Pool borrows them) — freed in close() after teardown.
+    const host = try allocator.dupe(u8, opts.host);
+    errdefer allocator.free(host);
+    const username = try allocator.dupe(u8, opts.username);
+    errdefer allocator.free(username);
+    const password: ?[]u8 = if (opts.password) |p| try allocator.dupe(u8, p) else null;
+    errdefer if (password) |p| allocator.free(p);
+    const database = try allocator.dupe(u8, opts.database);
+    errdefer allocator.free(database);
+
     const pool = try pg.Pool.init(allocator, .{
         .size = opts.pool_size,
-        .connect = .{ .host = opts.host, .port = opts.port },
-        .auth = .{ .username = opts.username, .password = opts.password, .database = opts.database },
+        .connect = .{ .host = host, .port = opts.port },
+        .auth = .{ .username = username, .password = password, .database = database },
     });
     errdefer pool.deinit();
 
@@ -69,7 +133,15 @@ pub fn open(allocator: std.mem.Allocator, opts: ConnectOpts) !backend.Backend {
     errdefer pool.release(conn);
 
     const self = try allocator.create(PgConn);
-    self.* = .{ .allocator = allocator, .pool = pool, .conn = conn };
+    self.* = .{
+        .allocator = allocator,
+        .pool = pool,
+        .conn = conn,
+        .host = host,
+        .username = username,
+        .password = password,
+        .database = database,
+    };
 
     return backend.Backend{ .ptr = self, .vtable = &vtable, .dialect = &pg_dialect_mod.pg_dialect };
 }
@@ -77,7 +149,11 @@ pub fn open(allocator: std.mem.Allocator, opts: ConnectOpts) !backend.Backend {
 fn close(ctx: *anyopaque) void {
     const self = asConn(ctx);
     self.pool.release(self.conn);
-    self.pool.deinit();
+    self.pool.deinit(); // tears down all connections — params no longer referenced after this
+    self.allocator.free(self.host);
+    self.allocator.free(self.username);
+    if (self.password) |p| self.allocator.free(p);
+    self.allocator.free(self.database);
     self.allocator.destroy(self);
 }
 
@@ -116,13 +192,16 @@ fn lastInsertId(ctx: *anyopaque) i64 {
 
 fn introspectColumns(ctx: *anyopaque, allocator: std.mem.Allocator, table: []const u8) anyerror![]ColumnInfo {
     const self = asConn(ctx);
+    // information_schema columns are domain types (sql_identifier/character_data over
+    // varchar; cardinal_number over int4). pg.zig's native row.get is OID-strict, so
+    // cast to plain text/bigint to match the []const u8 / i64 decoders exactly.
     const sql =
-        \\SELECT c.column_name, c.data_type,
+        \\SELECT c.column_name::text, c.data_type::text,
         \\       COALESCE((SELECT kcu.ordinal_position FROM information_schema.table_constraints tc
         \\                 JOIN information_schema.key_column_usage kcu
         \\                   ON kcu.constraint_name = tc.constraint_name
         \\                 WHERE tc.table_name = c.table_name AND tc.constraint_type = 'PRIMARY KEY'
-        \\                   AND kcu.column_name = c.column_name), 0)
+        \\                   AND kcu.column_name = c.column_name), 0)::bigint
         \\FROM information_schema.columns c
         \\WHERE c.table_name = $1 AND c.table_schema = 'public'
         \\ORDER BY c.ordinal_position
@@ -179,16 +258,44 @@ pub const vtable = backend.VTable{
 
 // ── Statement ─────────────────────────────────────────────────────────────────
 
+// A single materialized column value. Decoded eagerly at execute() time using pg.zig's
+// own getters (so we never re-implement the binary wire format), then owned by the
+// statement's allocator. Materializing the whole result set up front is what lets a
+// Statement release the connection immediately — the storage/indexer layer routinely
+// iterates one query while issuing others, which a single pinned PG connection cannot do
+// with a live server-side cursor (SQLite allows many concurrent live statements; PG does
+// not). See finalize/doExecute.
+const MatValue = union(enum) {
+    null,
+    int: i64,
+    text: []u8, // owned
+};
+const MatRow = []MatValue;
+
 const PgStmt = struct {
     allocator: std.mem.Allocator,
     sql: []u8, // owned (renumbered)
     stmt: pg.Stmt,
     executed: bool = false,
-    result: ?*pg.Result = null,
-    row: ?pg.Row = null,
+    // Materialized rows (owned). `cursor` is the next row step() will return; `cur` is
+    // the row most recently returned (what the column getters read from).
+    rows: []MatRow = &.{},
+    cursor: usize = 0,
+    cur: ?MatRow = null,
     last_err: [256]u8 = undefined,
     last_err_len: usize = 0,
 };
+
+fn freeRows(allocator: std.mem.Allocator, rows: []MatRow) void {
+    for (rows) |row| {
+        for (row) |v| switch (v) {
+            .text => |t| allocator.free(t),
+            else => {},
+        };
+        allocator.free(row);
+    }
+    allocator.free(rows);
+}
 
 inline fn asStmt(ctx: *anyopaque) *PgStmt {
     return @ptrCast(@alignCast(ctx));
@@ -239,10 +346,69 @@ fn bindNull(ctx: *anyopaque, idx: c_int) bool {
     return true;
 }
 
+fn materializeValue(allocator: std.mem.Allocator, row: pg.Row, c: usize) !MatValue {
+    if (row.values[c].is_null) return .null;
+    // Integer-class OIDs decode through pg.zig's own getters (no binary-format
+    // re-implementation); everything else (text/varchar/bpchar/name/json/bytea) is the
+    // raw bytes, which for text formats is exactly the string we want.
+    return switch (row.oids[c]) {
+        OID.int2 => .{ .int = @intCast(row.get(i16, c) catch 0) },
+        OID.int4 => .{ .int = @intCast(row.get(i32, c) catch 0) },
+        OID.int8 => .{ .int = row.get(i64, c) catch 0 },
+        OID.bool_ => .{ .int = @intFromBool(row.get(bool, c) catch false) },
+        else => .{ .text = try allocator.dupe(u8, row.values[c].data) },
+    };
+}
+
+fn materializeRow(allocator: std.mem.Allocator, row: pg.Row) !MatRow {
+    const n = row.values.len;
+    const out = try allocator.alloc(MatValue, n);
+    errdefer allocator.free(out);
+    var i: usize = 0;
+    errdefer for (out[0..i]) |v| switch (v) {
+        .text => |t| allocator.free(t),
+        else => {},
+    };
+    while (i < n) : (i += 1) out[i] = try materializeValue(allocator, row, i);
+    return out;
+}
+
 fn doExecute(self: *PgStmt) !void {
     if (self.executed) return;
-    self.result = try self.stmt.execute();
+    // Mark executed only AFTER a successful execute(): on error the Stmt arena is NOT
+    // transferred to a Result (pg.zig contract), so it must be freed via stmt.deinit() in
+    // finalize — which only happens on the executed==false branch. Setting the flag first
+    // would route a failed execute into the freeRows branch and leak the arena.
+    const result = try self.stmt.execute();
     self.executed = true;
+    // Copy every row into owned memory, then release the result — which returns the
+    // pinned connection to idle so the next statement can run. This is what makes the
+    // "iterate query A while issuing query B per row" pattern (pervasive in the storage
+    // layer, e.g. backfillFromExistingData) work on a single-connection PG backend.
+    defer result.deinit();
+    var list: std.ArrayList(MatRow) = .{};
+    errdefer {
+        for (list.items) |row| {
+            for (row) |v| switch (v) {
+                .text => |t| self.allocator.free(t),
+                else => {},
+            };
+            self.allocator.free(row);
+        }
+        list.deinit(self.allocator);
+    }
+    while (try result.next()) |row| {
+        const mr = try materializeRow(self.allocator, row);
+        errdefer {
+            for (mr) |v| switch (v) {
+                .text => |t| self.allocator.free(t),
+                else => {},
+            };
+            self.allocator.free(mr);
+        }
+        try list.append(self.allocator, mr);
+    }
+    self.rows = try list.toOwnedSlice(self.allocator);
 }
 
 fn exec(ctx: *anyopaque) bool {
@@ -251,12 +417,7 @@ fn exec(ctx: *anyopaque) bool {
         recordErr(self, "execute: {}", .{err});
         return false;
     };
-    // No rows to read; drain so the connection can be reused.
-    if (self.result) |res| res.drain() catch |err| {
-        recordErr(self, "drain: {}", .{err});
-        return false;
-    };
-    return true;
+    return true; // materialized (0 rows for INSERT/UPDATE/DDL); connection already idle
 }
 
 fn step(ctx: *anyopaque) StepOutcome {
@@ -265,12 +426,13 @@ fn step(ctx: *anyopaque) StepOutcome {
         recordErr(self, "execute: {}", .{err});
         return .failed;
     };
-    const res = self.result orelse return .failed;
-    self.row = res.next() catch |err| {
-        recordErr(self, "next: {}", .{err});
-        return .failed;
-    };
-    return if (self.row == null) .done else .row;
+    if (self.cursor >= self.rows.len) {
+        self.cur = null;
+        return .done;
+    }
+    self.cur = self.rows[self.cursor];
+    self.cursor += 1;
+    return .row;
 }
 
 fn changes(ctx: *anyopaque) u32 {
@@ -282,31 +444,29 @@ fn changes(ctx: *anyopaque) u32 {
 
 fn columnIsNull(ctx: *anyopaque, col: c_int) bool {
     const self = asStmt(ctx);
-    const row = self.row orelse return true;
-    return row.values[@intCast(col)].is_null;
+    const row = self.cur orelse return true;
+    return switch (row[@intCast(col)]) {
+        .null => true,
+        else => false,
+    };
 }
 
 fn columnText(ctx: *anyopaque, col: c_int) ?[]const u8 {
     const self = asStmt(ctx);
-    const row = self.row orelse return null;
-    const c: usize = @intCast(col);
-    if (row.values[c].is_null) return null;
-    // Text-typed columns (incl. our hex hash/address TEXT) decode straight to the bytes.
-    return row.get([]const u8, c) catch null;
+    const row = self.cur orelse return null;
+    return switch (row[@intCast(col)]) {
+        .text => |t| t,
+        else => null,
+    };
 }
 
-/// Read an integer column regardless of its PG width (coercing getter).
+/// Read an integer column (already coerced to i64 at materialize time per the column OID).
 fn columnInt64(ctx: *anyopaque, col: c_int) i64 {
     const self = asStmt(ctx);
-    const row = self.row orelse return 0;
-    const c: usize = @intCast(col);
-    if (row.values[c].is_null) return 0;
-    return switch (row.oids[c]) {
-        OID.int2 => @intCast(row.get(i16, c) catch return 0),
-        OID.int4 => @intCast(row.get(i32, c) catch return 0),
-        OID.int8 => row.get(i64, c) catch 0,
-        OID.bool_ => @intFromBool(row.get(bool, c) catch return 0),
-        else => row.get(i64, c) catch 0,
+    const row = self.cur orelse return 0;
+    return switch (row[@intCast(col)]) {
+        .int => |n| n,
+        else => 0,
     };
 }
 
@@ -329,13 +489,9 @@ fn reset(ctx: *anyopaque) void {
 fn finalize(ctx: *anyopaque) void {
     const self = asStmt(ctx);
     if (self.executed) {
-        if (self.result) |res| {
-            // Drain any rows the caller didn't iterate so the connection returns to
-            // idle (a no-op if already exhausted); deinit then frees the arena that
-            // execute() transferred to the Result.
-            res.drain() catch {};
-            res.deinit();
-        }
+        // The result set was materialized + the pg.Result (and its arena) released back
+        // in doExecute; only the owned row buffers remain to free here.
+        freeRows(self.allocator, self.rows);
     } else {
         self.stmt.deinit(); // never executed (e.g. bind error) — free the prepared stmt
     }

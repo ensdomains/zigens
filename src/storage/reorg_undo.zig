@@ -56,6 +56,35 @@ pub const PROTECTED_TABLES = [_][]const u8{
 
 /// Create the undo-log + cursor tables (idempotent). Called from Database.init.
 pub fn ensureSchema(db: *Database) !void {
+    if (db.isPostgres()) {
+        // Same three tables, Postgres DDL: BIGSERIAL for the surrogate key (vs SQLite's
+        // INTEGER PRIMARY KEY AUTOINCREMENT) and explicit BIGINT for block numbers.
+        try db.exec(
+            \\CREATE TABLE IF NOT EXISTS reorg_undo (
+            \\  id BIGSERIAL PRIMARY KEY,
+            \\  protocol TEXT NOT NULL,
+            \\  block_number BIGINT NOT NULL,
+            \\  table_name TEXT NOT NULL,
+            \\  op TEXT NOT NULL,
+            \\  old_row TEXT NOT NULL
+            \\);
+        );
+        try db.exec("CREATE INDEX IF NOT EXISTS idx_reorg_undo_lookup ON reorg_undo(protocol, block_number)");
+        try db.exec(
+            \\CREATE TABLE IF NOT EXISTS reorg_cursor (
+            \\  protocol TEXT PRIMARY KEY,
+            \\  block_number BIGINT NOT NULL
+            \\);
+        );
+        try db.exec(
+            \\CREATE TABLE IF NOT EXISTS reorg_active (
+            \\  id BIGINT PRIMARY KEY CHECK (id = 1),
+            \\  protocol TEXT NOT NULL,
+            \\  block_number BIGINT NOT NULL
+            \\);
+        );
+        return;
+    }
     try db.exec(
         \\CREATE TABLE IF NOT EXISTS reorg_undo (
         \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,6 +158,16 @@ fn rowJson(allocator: std.mem.Allocator, cols: [][]u8, alias: []const u8) ![]u8 
 /// Idempotent (CREATE TRIGGER IF NOT EXISTS). Must run AFTER the tables exist and be
 /// re-run if a protected table is dropped/recreated (e.g. replay rebuilds `names`).
 pub fn installTriggers(db: *Database) !void {
+    if (db.isPostgres()) {
+        // Postgres can't gate triggers on a subquery WHEN, so the cursor/active-context
+        // gate lives in two shared PL/pgSQL functions; the per-table FOR EACH ROW triggers
+        // cover the same {U,D} (protected) / {I,U,D} (active) ops as the SQLite triggers.
+        // Multi-statement DDL execs through the simple-query protocol in one call.
+        const sql = try pgTriggerInstallSql(db.allocator);
+        defer db.allocator.free(sql);
+        try db.exec(sql);
+        return;
+    }
     const allocator = db.allocator;
     for (PROTECTED_TABLES) |table| {
         if (!try tableExists(db, table)) continue;

@@ -2,10 +2,18 @@ const std = @import("std");
 const env_mod = @import("env.zig");
 const contracts = @import("contracts.zig");
 
+/// Which storage backend to open. Defaults to SQLite so existing deployments are
+/// unaffected; selected via DATABASE_BACKEND or inferred from a postgres:// DATABASE_URL.
+pub const BackendKind = enum { sqlite, postgres };
+
 pub const Config = struct {
     allocator: std.mem.Allocator,
     rpc_url: []const u8,
     database_path: []const u8,
+    /// Active storage backend. SQLite uses `database_path`; Postgres uses `database_url`.
+    backend_kind: BackendKind,
+    /// Postgres connection URL (`postgres://user:pass@host:port/db`); null on SQLite.
+    database_url: ?[]const u8,
     network: contracts.Network,
     start_block: u64,
     end_block: ?u64, // null means index continuously
@@ -43,10 +51,33 @@ pub const Config = struct {
         const v1_contract_addrs = try contracts.getContractAddresses(network);
         const v2_contract_addrs = try contracts.getContractAddresses(network);
 
+        // DATABASE_URL (Postgres) is owned; backend_kind is the explicit DATABASE_BACKEND
+        // if set, else inferred from a postgres:// URL scheme, else SQLite.
+        const database_url: ?[]const u8 = blk: {
+            const u = env_mod.getEnv(&env_map, "DATABASE_URL", "");
+            if (u.len == 0) break :blk null;
+            break :blk try allocator.dupe(u8, u);
+        };
+        errdefer if (database_url) |u| allocator.free(u);
+        const backend_kind: BackendKind = blk: {
+            const be = env_mod.getEnv(&env_map, "DATABASE_BACKEND", "");
+            if (be.len > 0) {
+                if (std.ascii.eqlIgnoreCase(be, "postgres") or std.ascii.eqlIgnoreCase(be, "postgresql")) break :blk .postgres;
+                if (std.ascii.eqlIgnoreCase(be, "sqlite")) break :blk .sqlite;
+                std.log.warn("Unknown DATABASE_BACKEND '{s}'; inferring from DATABASE_URL or defaulting to sqlite", .{be});
+            }
+            if (database_url) |u| {
+                if (std.mem.startsWith(u8, u, "postgres://") or std.mem.startsWith(u8, u, "postgresql://")) break :blk .postgres;
+            }
+            break :blk .sqlite;
+        };
+
         return Config{
             .allocator = allocator,
             .rpc_url = try allocator.dupe(u8, env_mod.getEnv(&env_map, "RPC_URL", "http://localhost:8545")),
             .database_path = try allocator.dupe(u8, env_mod.getEnv(&env_map, "DATABASE_PATH", "./data/ens.db")),
+            .backend_kind = backend_kind,
+            .database_url = database_url,
             .network = network,
             .v1_contracts = v1_contract_addrs,
             .v2_contracts = v2_contract_addrs,
@@ -105,6 +136,7 @@ pub const Config = struct {
     pub fn deinit(self: *Config) void {
         self.allocator.free(self.rpc_url);
         self.allocator.free(self.database_path);
+        if (self.database_url) |url| self.allocator.free(url);
         self.allocator.free(self.webhook_db_path);
         self.allocator.free(self.rainbow_path);
         if (self.webhook_admin_username) |user| {

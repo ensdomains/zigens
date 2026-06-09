@@ -18,7 +18,11 @@ pub const storage = struct {
     pub const reorg_undo = @import("storage/reorg_undo.zig");
     pub const v1_controllers = @import("storage/v1_controllers.zig");
     pub const unknown_labels = @import("storage/unknown_labels.zig");
+    pub const db_open = @import("storage/db_open.zig");
 };
+
+pub const config = @import("config.zig");
+pub const contracts = @import("contracts.zig");
 
 pub const types = struct {
     pub const models = @import("types/models.zig");
