@@ -69,11 +69,17 @@ pub fn insertWebhook(db: *Database, webhook: models.Webhook) !u64 {
     const event_types_json = try serializeEventTypes(db.allocator, webhook.event_types);
     defer db.allocator.free(event_types_json);
 
-    var q = try Query.init(db,
+    // Postgres has no last_insert_rowid; use INSERT … RETURNING id (read via step()).
+    // SQLite keeps its proven exec() + lastInsertId() path unchanged.
+    const ret_clause: []const u8 = if (db.isPostgres()) " RETURNING id" else "";
+    const sql = try std.fmt.allocPrint(db.allocator,
         \\INSERT INTO webhooks
         \\(url, secret, event_types, active, max_retries, created_at)
-        \\VALUES (?, ?, ?, ?, ?, ?)
-    );
+        \\VALUES (?, ?, ?, ?, ?, ?){s}
+    , .{ret_clause});
+    defer db.allocator.free(sql);
+
+    var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindText(webhook.url);
@@ -82,8 +88,12 @@ pub fn insertWebhook(db: *Database, webhook: models.Webhook) !u64 {
     try q.bindInt(if (webhook.active) 1 else 0);
     try q.bindInt(@intCast(webhook.max_retries));
     try q.bindInt64(webhook.created_at);
-    try q.exec();
 
+    if (db.isPostgres()) {
+        if (!try q.step()) return error.WebhookInsertFailed;
+        return @intCast(q.getInt64(0)); // RETURNING id
+    }
+    try q.exec();
     return @intCast(db.lastInsertId());
 }
 

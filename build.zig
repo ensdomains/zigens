@@ -615,6 +615,25 @@ pub fn build(b: *std.Build) void {
     storage_test_step.dependOn(&run_storage_schema_keys_tests.step);
     storage_test_step.dependOn(&run_storage_pg_dialect_tests.step);
 
+    // Cross-backend lane: re-run the storage suites against PostgreSQL. TEST_BACKEND=postgres
+    // makes helpers.createTestDatabase open the local ensv2_test and reset its schema per
+    // test. Reuses the same compiled test binaries — just a second run with the env set.
+    // Requires a live Postgres (like test-pg); not part of the default `test` step.
+    const storage_pg_test_step = b.step("test-storage-pg", "Run storage suites against PostgreSQL");
+    for ([_]*std.Build.Step.Compile{
+        storage_names_tests,
+        storage_resolvers_tests,
+        storage_roles_tests,
+        storage_registry_entries_tests,
+        storage_query_tests,
+        storage_webhooks_tests,
+    }) |compile| {
+        const run = b.addRunArtifact(compile);
+        run.setCwd(b.path("."));
+        run.setEnvironmentVariable("TEST_BACKEND", "postgres");
+        storage_pg_test_step.dependOn(&run.step);
+    }
+
     // Make the default test command run all tests
     test_step.dependOn(&run_filter_tests.step);
     test_step.dependOn(&run_json_writer_tests.step);

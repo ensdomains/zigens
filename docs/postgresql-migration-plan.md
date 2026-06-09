@@ -1258,6 +1258,56 @@ PostgreSQL work begins.
   improvement (prior behavior was an *unconditional* abort). Any future change that populates
   `unknown_labels.name_id` must revisit the names-restore id handling. Remaining for live PG
   *indexing*: only Finding D (`changes()` affected-row count) now.
+  **Finding D FIXED — `changes()` returns the real affected-row count on PG (test-pg 16/16).**
+  pg.zig's `Result` consumes and discards the `CommandComplete` row count, and there is no public
+  API on `Result`/`Stmt` to recover it for a prepared statement (audited the full surface). So the
+  driver's `exec()` now drains the response directly off the pinned connection — `stmt.execute()`
+  then a `self.conn.read()` loop capturing the count from the `CommandComplete` tag
+  (`affectedFromCommandTag`: trailing digit-run, NUL-tolerant — actually more robust than pg.zig's
+  own `rowsAffected`), then `result.deinit()`. This is a faithful copy of pg.zig's internal
+  `conn.execOpts` drain (which also calls `conn.read()` directly; the "should not be called
+  directly" note is app-facing guidance, not a correctness constraint). The materializing
+  `step()`/read path is unchanged and `changes()` is 0 there (matches SQLite's `changes()`-after-
+  SELECT). Leak-safe (executed flag set only after a successful execute, mirroring the earlier
+  fix; both error paths — in-`execute` and in-drain — leave the conn idle with no double-`Z` and
+  free the Result arena exactly once). New driver test asserts INSERT 3 / UPDATE 2 / UPDATE 0
+  (the `registrations.zig if changes()==0` control-flow case) / DELETE 1, plus a clean follow-on
+  SELECT proving the manual drain doesn't desync the connection. Two reviewers clean (memory:
+  no leak/UAF/double-free; protocol: no desync, count correct, no safer API missed); one parity
+  nit applied (`else` branch now marks the conn `.fail` via `conn.unexpectedDBMessage`).
+  **Phase 4 is now feature-complete for both read and write paths on PostgreSQL** — every gate
+  that blocked live PG *indexing* (Finding A reorg rollback, Finding D affected-rows) is closed.
+  What remains is breadth, not capability: a full cross-backend run of the storage/integration
+  suites against PG and a real end-to-end indexer run on PG (the experimental warn stays until a
+  maintainer signs off on that broader validation).
+  **Cross-backend storage-suite run: 130/130 on PostgreSQL (SQLite still 510/510).** Made
+  `helpers.createTestDatabase` backend-aware (`TEST_BACKEND=postgres` → open `ensv2_test`, reset
+  `public` per test for isolation, `initWithBackend` + PG webhooks 001) and added a
+  `test-storage-pg` build lane that re-runs the six storage suites (names/resolvers/roles/query/
+  registry_entries/webhooks — 130 tests) against PG by reusing the compiled binaries with the env
+  set. The run surfaced and fixed four real SQLite-isms in the storage write path (each a no-op or
+  behavior-neutral on SQLite — full suite stays 510/510):
+  (1) the webhooks `002` `ALTER … ADD COLUMN secret` is a SQLite-legacy idempotent backfill that
+  errors on PG (001 already has the column); the PG test helper loads only 001.
+  (2) `webhooks.insertWebhook` used `lastInsertId()` (SQLite rowid; the PG stub returns -1 →
+  `@intCast` panic) → now `INSERT … RETURNING id` read via `step()` on PG (SQLite keeps its
+  `exec()`+`lastInsertId()` path).
+  (3) scalar two-arg `MAX(a,b)`/`MIN(a,b)` (accounts upsert, known_subregistries/known_resolvers
+  upserts, `updateDomainExpiryIfGreater`) is SQLite-only; PG needs `GREATEST`/`LEAST` (its MAX/MIN
+  are aggregate-only). Added `Dialect.scalar_max`/`scalar_min` (MAX/MIN vs GREATEST/LEAST — same
+  `FN(a,b)` call syntax, all call-site args non-null so the NULL-handling difference is moot) and
+  routed the sites through it (dynamic SQL, still statement-cached by content on both backends).
+  (4) in PG's `ON CONFLICT DO UPDATE SET col = FN(col, excluded.col)`, the unqualified existing
+  `col` is ambiguous with `excluded` → table-qualify it (`accounts.col`, `known_resolvers.col`);
+  SQLite accepts the qualified form too. (Also fixed a latent double-close in the PG test-helper
+  setup error path.) Storage tests run under the leak-detecting testing.allocator, so 130/130 also
+  clears the new dynamic-SQL allocations.
+  **Identified-but-not-yet-exercised PG gaps** (not hit by the storage lane; tracked for the
+  remaining breadth work): `events.zig`'s JSON-data filter/sort uses raw `json_extract` (route via
+  `dialect.jsonExtract`) — covered by events_test, not the storage suites; `unknown_labels.zig`'s
+  backfill-attempt `UPDATE` uses `strftime('%s','now')` (use `dialect.nowEpoch`); and the big
+  `tests/integration.zig` suite still calls `Database.init(:memory:)` directly (not routed through
+  the backend-aware helper), so retargeting it at PG is a further step.
   The **network-independent slice is done + unit-tested**: `src/storage/drivers/postgres_dialect.zig`
   — the PG `Dialect` (`ON CONFLICT` upsert/insertSelect over non-key cols with the all-key→`DO NOTHING`
   edge; `(src::jsonb ->> 'col')::cast` jsonExtract; `jsonb_build_object`; `EXTRACT(EPOCH…)`;

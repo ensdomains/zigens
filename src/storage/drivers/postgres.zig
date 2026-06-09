@@ -241,7 +241,7 @@ fn prepare(ctx: *anyopaque, sql: []const u8, cached: bool) anyerror!Statement {
     errdefer stmt.deinit();
 
     const ps = try self.allocator.create(PgStmt);
-    ps.* = .{ .allocator = self.allocator, .sql = renumbered, .stmt = stmt };
+    ps.* = .{ .allocator = self.allocator, .conn = self.conn, .sql = renumbered, .stmt = stmt };
     return Statement{ .ctx = ps, .vtable = &stmt_vtable, .allocator = self.allocator };
 }
 
@@ -274,6 +274,7 @@ const MatRow = []MatValue;
 
 const PgStmt = struct {
     allocator: std.mem.Allocator,
+    conn: *pg.Conn, // borrowed (the pinned connection) — used by exec()'s affected-row drain
     sql: []u8, // owned (renumbered)
     stmt: pg.Stmt,
     executed: bool = false,
@@ -282,9 +283,24 @@ const PgStmt = struct {
     rows: []MatRow = &.{},
     cursor: usize = 0,
     cur: ?MatRow = null,
+    // Affected-row count from the last exec()'s CommandComplete (changes()). 0 for the
+    // step()/read path, which never feeds changes() in the storage layer.
+    affected: i64 = 0,
     last_err: [256]u8 = undefined,
     last_err_len: usize = 0,
 };
+
+/// Extract the affected-row count from a CommandComplete tag ("UPDATE 3", "INSERT 0 5",
+/// "DELETE 2", possibly NUL-terminated): the trailing run of digits. Mirrors pg.zig's
+/// proto.CommandComplete.rowsAffected without reaching into its non-public proto module.
+fn affectedFromCommandTag(data: []const u8) i64 {
+    var end = data.len;
+    while (end > 0 and !std.ascii.isDigit(data[end - 1])) end -= 1; // strip NUL / trailing non-digits
+    if (end == 0) return 0; // e.g. "CREATE TABLE" — no count
+    var start = end;
+    while (start > 0 and std.ascii.isDigit(data[start - 1])) start -= 1;
+    return std.fmt.parseInt(i64, data[start..end], 10) catch 0;
+}
 
 fn freeRows(allocator: std.mem.Allocator, rows: []MatRow) void {
     for (rows) |row| {
@@ -411,13 +427,44 @@ fn doExecute(self: *PgStmt) !void {
     self.rows = try list.toOwnedSlice(self.allocator);
 }
 
+// Execute a write (INSERT/UPDATE/DELETE/DDL) and capture its affected-row count. Unlike
+// the materializing step() path, this drains the response directly off the connection so
+// the CommandComplete tag's row count survives (pg.zig's Result.next() consumes and
+// discards it). Writes return no DataRows, so there is nothing to decode — any 'D' is just
+// counted, mirroring pg.zig's own conn.exec drain. Reads-then-deinit (the natural order):
+// all messages are consumed in-flow, then result.deinit() ends the reader flow.
+fn doExec(self: *PgStmt) !void {
+    if (self.executed) return;
+    const result = try self.stmt.execute(); // leak-safe: flag set only after success
+    self.executed = true;
+    defer result.deinit();
+
+    var affected: i64 = 0;
+    while (true) {
+        const msg = self.conn.read() catch |err| {
+            if (err == error.PG) self.conn.readyForQuery() catch {}; // drain to ReadyForQuery
+            return err;
+        };
+        switch (msg.type) {
+            'C' => affected = affectedFromCommandTag(msg.data), // CommandComplete
+            'D' => affected += 1, // DataRow (only with RETURNING; we don't keep them)
+            'T' => affected = 0, // RowDescription resets, like conn.exec
+            'Z' => break, // ReadyForQuery — read() set the conn back to idle
+            // Unreachable against a conformant server; mark the conn failed (parity with
+            // pg.zig's unexpectedDBMessage) so a desynced connection isn't reused.
+            else => return self.conn.unexpectedDBMessage(),
+        }
+    }
+    self.affected = affected;
+}
+
 fn exec(ctx: *anyopaque) bool {
     const self = asStmt(ctx);
-    doExecute(self) catch |err| {
+    doExec(self) catch |err| {
         recordErr(self, "execute: {}", .{err});
         return false;
     };
-    return true; // materialized (0 rows for INSERT/UPDATE/DDL); connection already idle
+    return true; // connection drained back to idle; affected-row count captured
 }
 
 fn step(ctx: *anyopaque) StepOutcome {
@@ -436,10 +483,12 @@ fn step(ctx: *anyopaque) StepOutcome {
 }
 
 fn changes(ctx: *anyopaque) u32 {
-    _ = ctx;
-    // TODO(phase4): surface CommandComplete affected-row count; not yet exposed by the
-    // Result we hold. Callers that gate on changes() are validated in the A/B lane.
-    return 0;
+    const self = asStmt(ctx);
+    // Affected rows from the last exec()'s CommandComplete. Negative is impossible for a
+    // row count; clamp defensively. 0 on the read path (matches SQLite, where changes()
+    // after a SELECT is 0).
+    if (self.affected <= 0) return 0;
+    return std.math.cast(u32, self.affected) orelse std.math.maxInt(u32);
 }
 
 fn columnIsNull(ctx: *anyopaque, col: c_int) bool {

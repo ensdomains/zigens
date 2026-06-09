@@ -20,15 +20,22 @@ pub fn upsertAccount(
     timestamp: i64,
 ) !void {
     if (address.len == 0) return;
-    const sql =
+    // Scalar MAX/MIN over two values: MAX/MIN on SQLite, GREATEST/LEAST on Postgres
+    // (all args here are NOT NULL columns, so the NULL-handling difference is moot). The
+    // existing value is table-qualified (accounts.col) because Postgres rejects an
+    // unqualified column in DO UPDATE as ambiguous with `excluded`; SQLite accepts the
+    // qualified form too. Cached by SQL content on both backends.
+    const d = db.dialect();
+    const sql = try std.fmt.allocPrint(db.allocator,
         \\INSERT INTO accounts (address, seen_v1, seen_v2, first_seen_block, first_seen_timestamp)
         \\VALUES (?, ?, ?, ?, ?)
         \\ON CONFLICT(address) DO UPDATE SET
-        \\  seen_v1 = MAX(seen_v1, excluded.seen_v1),
-        \\  seen_v2 = MAX(seen_v2, excluded.seen_v2),
-        \\  first_seen_block = MIN(first_seen_block, excluded.first_seen_block),
-        \\  first_seen_timestamp = MIN(first_seen_timestamp, excluded.first_seen_timestamp)
-    ;
+        \\  seen_v1 = {s}(accounts.seen_v1, excluded.seen_v1),
+        \\  seen_v2 = {s}(accounts.seen_v2, excluded.seen_v2),
+        \\  first_seen_block = {s}(accounts.first_seen_block, excluded.first_seen_block),
+        \\  first_seen_timestamp = {s}(accounts.first_seen_timestamp, excluded.first_seen_timestamp)
+    , .{ d.scalar_max, d.scalar_max, d.scalar_min, d.scalar_min });
+    defer db.allocator.free(sql);
     var q = try Query.initCached(db, sql);
     defer q.deinit();
     const is_v1: i64 = if (protocol == .v1) 1 else 0;

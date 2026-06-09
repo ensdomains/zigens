@@ -351,6 +351,8 @@ fn dialectJsonExtract(allocator: std.mem.Allocator, src: []const u8, col: []cons
 pub const sqlite_dialect = backend.Dialect{
     .placeholder = .qmark,
     .nowEpoch = "strftime('%s', 'now')",
+    .scalar_max = "MAX",
+    .scalar_min = "MIN",
     .upsert = dialectUpsert,
     .insertSelect = dialectInsertSelect,
     .returning = dialectReturning,

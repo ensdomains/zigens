@@ -334,12 +334,13 @@ pub fn registerSubregistry(
     first_seen_block: u64,
     last_indexed_block: u64,
 ) !void {
-    const sql =
+    const sql = try std.fmt.allocPrint(db.allocator,
         \\INSERT INTO known_subregistries (protocol, address, first_seen_block, last_indexed_block)
         \\VALUES (?, ?, ?, ?)
         \\ON CONFLICT(protocol, address) DO UPDATE SET
-        \\  last_indexed_block = MAX(last_indexed_block, excluded.last_indexed_block)
-    ;
+        \\  last_indexed_block = {s}(known_subregistries.last_indexed_block, excluded.last_indexed_block)
+    , .{db.dialect().scalar_max}); // MAX (SQLite) / GREATEST (Postgres); table-qualify the existing
+    defer db.allocator.free(sql); // value — Postgres rejects an unqualified col in DO UPDATE as ambiguous.
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -354,12 +355,13 @@ pub fn registerSubregistry(
 
 /// Register or update a known resolver
 pub fn registerResolver(db: *Database, protocol: models.Protocol, address: []const u8, block_number: u64) !void {
-    const sql =
+    const sql = try std.fmt.allocPrint(db.allocator,
         \\INSERT INTO known_resolvers (protocol, address, first_seen_block, last_indexed_block)
         \\VALUES (?, ?, ?, ?)
         \\ON CONFLICT(protocol, address) DO UPDATE SET
-        \\  last_indexed_block = MAX(last_indexed_block, excluded.last_indexed_block)
-    ;
+        \\  last_indexed_block = {s}(known_resolvers.last_indexed_block, excluded.last_indexed_block)
+    , .{db.dialect().scalar_max}); // MAX (SQLite) / GREATEST (Postgres); table-qualify the existing
+    defer db.allocator.free(sql); // value — Postgres rejects an unqualified col in DO UPDATE as ambiguous.
 
     var q = try Query.initCached(db, sql);
     defer q.deinit();

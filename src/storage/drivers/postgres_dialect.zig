@@ -122,6 +122,8 @@ fn dialectJsonExtract(allocator: std.mem.Allocator, src: []const u8, col: []cons
 pub const pg_dialect = backend.Dialect{
     .placeholder = .dollar,
     .nowEpoch = "EXTRACT(EPOCH FROM now())::bigint",
+    .scalar_max = "GREATEST",
+    .scalar_min = "LEAST",
     .upsert = dialectUpsert,
     .insertSelect = dialectInsertSelect,
     .returning = dialectReturning,

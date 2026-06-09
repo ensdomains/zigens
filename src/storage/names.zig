@@ -732,12 +732,14 @@ pub fn updateNameWrapperExpiry(db: *Database, namehash: Hash, expiry: u64) !void
 /// That edge case is fine: `NameWrapped` on a name we never saw via Registry
 /// will simply skip the mirror until the Registry row materializes.
 pub fn updateDomainExpiryIfGreater(db: *Database, namehash: Hash, new_expiry: i64) !void {
-    var q = try Query.initCached(db,
+    const sql = try std.fmt.allocPrint(db.allocator,
         \\UPDATE names
-        \\SET expiry = MAX(COALESCE(expiry, 0), ?),
+        \\SET expiry = {s}(COALESCE(expiry, 0), ?),
         \\    updated_at = ?
         \\WHERE namehash = ?
-    );
+    , .{db.dialect().scalar_max}); // MAX (SQLite) / GREATEST (Postgres); args non-null via COALESCE
+    defer db.allocator.free(sql);
+    var q = try Query.initCached(db, sql);
     defer q.deinit();
     try q.bindInt64(new_expiry);
     try q.bindInt64(std.time.timestamp());

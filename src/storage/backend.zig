@@ -65,6 +65,13 @@ pub const Dialect = struct {
     placeholder: Placeholder,
     /// SQL expression yielding the current Unix epoch in seconds.
     nowEpoch: []const u8,
+    /// Two-argument scalar max/min function NAME. SQLite's `MAX`/`MIN` are scalar for 2+
+    /// args; Postgres needs `GREATEST`/`LEAST` (its `MAX`/`MIN` are aggregate-only). Call
+    /// syntax `FN(a, b)` is identical, so this is just the name. NULL-handling differs
+    /// (SQLite `MAX` → NULL if any arg NULL; `GREATEST` ignores NULLs) — only safe where
+    /// every argument is non-null, which holds at all current call sites.
+    scalar_max: []const u8,
+    scalar_min: []const u8,
     /// `INSERT OR REPLACE/IGNORE INTO t (cols) VALUES (v, …)` (SQLite) /
     /// `INSERT INTO t (cols) VALUES (v, …) ON CONFLICT(conflict) DO UPDATE/NOTHING` (PG).
     /// `value_exprs` gives the SQL value expression per column (a `?` placeholder,

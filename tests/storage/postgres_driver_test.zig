@@ -201,6 +201,60 @@ test "postgres driver: failed execute frees the statement and leaves the connect
     try be.vtable.execRaw(be.ptr, "DROP TABLE drv_fail");
 }
 
+// Finding D: exec() captures the CommandComplete affected-row count (changes()), and the
+// manual drain leaves the pinned connection clean for the next statement. Covers the
+// distinct counts the storage layer depends on — including the 0-rows case that
+// registrations.zig gates control flow on (`if changes() == 0`).
+test "postgres driver: exec captures affected-row count (changes) and leaves conn clean" {
+    var be = openBe() catch return error.SkipZigTest;
+    defer be.vtable.close(be.ptr);
+
+    try be.vtable.execRaw(be.ptr, "DROP TABLE IF EXISTS drv_cnt");
+    try be.vtable.execRaw(be.ptr, "CREATE TABLE drv_cnt (id INT PRIMARY KEY, v INT)");
+
+    // INSERT 3 rows → "INSERT 0 3".
+    {
+        var st = try be.vtable.prepare(be.ptr, "INSERT INTO drv_cnt (id, v) VALUES (1,10),(2,10),(3,20)", false);
+        defer st.deinit();
+        try st.exec();
+        try testing.expectEqual(@as(u32, 3), st.changes());
+    }
+    // UPDATE 2 matching rows.
+    {
+        var st = try be.vtable.prepare(be.ptr, "UPDATE drv_cnt SET v = 99 WHERE v = ?", false);
+        defer st.deinit();
+        try st.bindInt(10);
+        try st.exec();
+        try testing.expectEqual(@as(u32, 2), st.changes());
+    }
+    // UPDATE matching 0 rows — the control-flow case (registrations.zig `== 0`).
+    {
+        var st = try be.vtable.prepare(be.ptr, "UPDATE drv_cnt SET v = 1 WHERE v = ?", false);
+        defer st.deinit();
+        try st.bindInt(12345);
+        try st.exec();
+        try testing.expectEqual(@as(u32, 0), st.changes());
+    }
+    // DELETE 1 row.
+    {
+        var st = try be.vtable.prepare(be.ptr, "DELETE FROM drv_cnt WHERE id = ?", false);
+        defer st.deinit();
+        try st.bindInt(3);
+        try st.exec();
+        try testing.expectEqual(@as(u32, 1), st.changes());
+    }
+    // Connection is clean after the drains: a SELECT reads the expected surviving count.
+    {
+        var st = try be.vtable.prepare(be.ptr, "SELECT COUNT(*) FROM drv_cnt", false);
+        defer st.deinit();
+        try testing.expect(try st.step());
+        try testing.expectEqual(@as(i64, 2), st.getInt64(0)); // 3 inserted − 1 deleted
+        try testing.expect(!try st.step());
+    }
+
+    try be.vtable.execRaw(be.ptr, "DROP TABLE drv_cnt");
+}
+
 // introspectColumns (used by the dialect-agnostic hasTable + the SQLite reorg
 // trigger generator) against live PG. The information_schema columns are domain
 // types, so the driver casts column_name/data_type to ::text and the PK position to

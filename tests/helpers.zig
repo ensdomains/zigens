@@ -8,17 +8,53 @@ const Address = lib.Address;
 const Hash = lib.Hash;
 const models = lib.models;
 
-/// Create an in-memory test database with schema loaded
+/// Create a test database with schema loaded. SQLite (in-memory) by default; when
+/// TEST_BACKEND=postgres, opens the local `ensv2_test` Postgres and resets `public` to a
+/// fresh schema per call (PG shares one database, and the test runner is sequential within
+/// a binary, so a per-call DROP SCHEMA gives each test the same isolation a fresh `:memory:`
+/// gives SQLite). This is what lets the existing storage suites run cross-backend.
 pub fn createTestDatabase(allocator: std.mem.Allocator) !*Database {
     const database = try allocator.create(Database);
     errdefer allocator.destroy(database);
 
-    database.* = try Database.init(allocator, ":memory:");
-
-    // Create webhooks table (loaded from separate schema directory in production)
-    try createWebhooksSchema(database);
+    if (wantPostgresBackend(allocator)) {
+        const be = try lib.storage.postgres.open(allocator, .{ .database = "ensv2_test", .password = "postgres" });
+        // Close `be` directly only while we still own it (before initWithBackend takes
+        // ownership). On a DROP failure here, nothing else has a reference to it.
+        be.vtable.execRaw(be.ptr, "DROP SCHEMA public CASCADE; CREATE SCHEMA public") catch |err| {
+            be.vtable.close(be.ptr);
+            return err;
+        };
+        // initWithBackend takes ownership of `be` and closes it on its own failure; once it
+        // succeeds, `database` owns it, so a later failure must go through database.deinit()
+        // (NOT a second be.close — that would double-close).
+        database.* = try Database.initWithBackend(allocator, be); // loads schema/postgres + migrate + reorg
+        errdefer database.deinit();
+        try createWebhooksSchemaPg(database);
+    } else {
+        database.* = try Database.init(allocator, ":memory:");
+        // Create webhooks table (loaded from separate schema directory in production)
+        try createWebhooksSchema(database);
+    }
 
     return database;
+}
+
+/// True when the suite is being run against Postgres (TEST_BACKEND=postgres).
+fn wantPostgresBackend(allocator: std.mem.Allocator) bool {
+    const v = std.process.getEnvVarOwned(allocator, "TEST_BACKEND") catch return false;
+    defer allocator.free(v);
+    return std.ascii.eqlIgnoreCase(v, "postgres");
+}
+
+/// Postgres webhooks schema (generated transpile of the SQLite DDL). Only 001 (the base
+/// schema) is applied: 002 is a SQLite-legacy `ALTER TABLE … ADD COLUMN secret` backfill
+/// that's redundant on a fresh PG DB (001 already has the column) and — unlike SQLite's
+/// exec, which swallows "duplicate column" — errors on Postgres.
+fn createWebhooksSchemaPg(database: *Database) !void {
+    const sql = try std.fs.cwd().readFileAlloc(database.allocator, "schema/postgres/webhooks/001_webhooks.sql", 1 << 20);
+    defer database.allocator.free(sql);
+    try database.exec(sql);
 }
 
 /// Create webhooks schema for tests
