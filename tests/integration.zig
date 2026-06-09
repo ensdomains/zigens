@@ -545,6 +545,263 @@ test "reorg undo-log reverses an in-place owner update (v1)" {
     std.debug.print("✓ v1 in-place owner update reversed on reorg (B→A)\n", .{});
 }
 
+// Seed a wrapped V1 name whose wrapper_expiry (with the PARENT_CANNOT_CONTROL
+// fuse) exceeds its current expiry, so materializePccDomainExpiry will mirror it.
+fn seedWrappedPccName(allocator: std.mem.Allocator, database: *Database, name: []const u8, block: u64) !Hash {
+    var n = try makeReorgName(allocator, name, .v1, try Address.fromHex("0x00000000000000000000000000000000000000aa"), block);
+    defer n.deinit(allocator);
+    n.is_wrapped = true;
+    n.wrapper_fuses = try allocator.dupe(u8, "65536"); // 0x10000 = PARENT_CANNOT_CONTROL
+    n.wrapper_expiry = 2000000000;
+    n.expiry = 1000000000; // below wrapper_expiry, so materialize raises it
+    try database.insertName(n);
+    return n.namehash;
+}
+
+fn nameExpiry(database: *Database, allocator: std.mem.Allocator, nh: Hash) !u64 {
+    var n = (try database.getNameByNamehash(nh)) orelse return error.NameVanished;
+    defer n.deinit(allocator);
+    return n.expiry;
+}
+
+// W4: the one-shot PCC Domain.expiry mirror is a derived recompute, not block
+// processing — Indexer.materializePccUncaptured disarms the reorg cursor around
+// it (reorg_undo.clearCursor) so it never self-captures. This test mirrors that
+// disarm and asserts a later reorg does NOT revert the materialized expiry, while
+// a genuinely-captured mutation in the same window IS reversed.
+test "reorg undo-log: uncaptured PCC materialize survives a later reorg" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    // Block 100: create the wrapped name (INSERT — not captured).
+    try lib.storage.reorg_undo.setCursor(&database, .v1, 100);
+    const nh = try seedWrappedPccName(allocator, &database, "wrapped.eth", 100);
+    try testing.expectEqual(@as(u64, 1000000000), try nameExpiry(&database, allocator, nh));
+
+    // The fix: disarm the cursor (as Indexer.materializePccUncaptured does), then
+    // run the one-shot materialize. No undo row is captured for this UPDATE.
+    try lib.storage.reorg_undo.clearCursor(&database, .v1);
+    try testing.expectEqual(@as(u32, 1), try database.materializePccDomainExpiry());
+    try testing.expectEqual(@as(u64, 2000000000), try nameExpiry(&database, allocator, nh));
+
+    // Re-arm and make a genuinely-captured mutation at block 200.
+    const owner_b = try Address.fromHex("0x00000000000000000000000000000000000000bb");
+    try lib.storage.reorg_undo.setCursor(&database, .v1, 200);
+    try database.updateNameOwner(nh, owner_b);
+
+    // Reorg to 150: the owner update reverses (proves rollback ran), but the
+    // materialized expiry is untouched (it was never captured).
+    try lib.storage.sync.rollbackToBlock(&database, .v1, 150);
+    try testing.expectEqualSlices(u8, &(try Address.fromHex("0x00000000000000000000000000000000000000aa")).bytes, &(try ownerOf(allocator, &database, nh)).bytes);
+    try testing.expectEqual(@as(u64, 2000000000), try nameExpiry(&database, allocator, nh));
+    std.debug.print("✓ uncaptured PCC materialize survives a later reorg (expiry kept)\n", .{});
+}
+
+// Control proving the test above is non-vacuous and documenting the bug W4 fixes:
+// if the materialize runs with the cursor still armed (the pre-fix behaviour), the
+// UPDATE IS captured and a later reorg wrongly reverts expiry to its pre-mirror value.
+test "reorg undo-log: PCC materialize WITH the cursor armed is wrongly reverted (pre-fix control)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    try lib.storage.reorg_undo.setCursor(&database, .v1, 100);
+    const nh = try seedWrappedPccName(allocator, &database, "wrapped.eth", 100);
+
+    // Cursor left armed at 200 (as the unfixed indexer leaves it), then materialize
+    // → the UPDATE is captured, tagged block 200.
+    try lib.storage.reorg_undo.setCursor(&database, .v1, 200);
+    try testing.expectEqual(@as(u32, 1), try database.materializePccDomainExpiry());
+    try testing.expectEqual(@as(u64, 2000000000), try nameExpiry(&database, allocator, nh));
+
+    // Reorg to 150 replays the captured undo row → expiry reverts to its pre-mirror
+    // value. This is exactly the regression W4's disarm prevents.
+    try lib.storage.sync.rollbackToBlock(&database, .v1, 150);
+    try testing.expectEqual(@as(u64, 1000000000), try nameExpiry(&database, allocator, nh));
+    std.debug.print("✓ control: armed-cursor materialize is reverted by reorg (the W4 bug)\n", .{});
+}
+
+fn unknownLabelCount(database: *Database) !i64 {
+    var q = try lib.storage.Query.init(database, "SELECT COUNT(*) FROM unknown_labels");
+    defer q.deinit();
+    _ = try q.step();
+    return q.getInt64(0);
+}
+
+fn firstUnknownLabelBlock(database: *Database) !i64 {
+    var q = try lib.storage.Query.init(database, "SELECT block_number FROM unknown_labels");
+    defer q.deinit();
+    if (!try q.step()) return error.NoUnknownLabel;
+    return q.getInt64(0);
+}
+
+// W6: unknown_labels lacks a `protocol` column and (before this fix) was in no
+// reorg trigger array, so a post-N row whose `name_id` is null or points at a
+// pre-N name had no rollback delete path (no `ON DELETE CASCADE`, no created-block
+// delete) and persisted as a stale row. Adding it to REORG_ACTIVE_TABLES captures
+// its inserts (op-'I'), so replayUndo deletes the post-N row by id on rollback.
+test "reorg undo-log: unknown_labels post-N insert removed, pre-N kept (cascade gap)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const tx = try keccak256(allocator, "tx");
+    const owner = try Address.fromHex("0x00000000000000000000000000000000000000c9");
+    const parent = try namehash(allocator, "eth");
+    const lh_keep = try keccak256(allocator, "keep");
+    const lh_drop = try keccak256(allocator, "drop");
+    const nh_keep = try namehash(allocator, "keep.eth");
+    const nh_drop = try namehash(allocator, "drop.eth");
+
+    // Block 100 (pre-N): an unresolved label discovered at/before N — must survive.
+    // name_id is null, so ON DELETE CASCADE can never reach it.
+    try lib.storage.reorg_undo.setCursor(&database, .v1, 100);
+    try lib.storage.unknown_labels.insertUnknownLabel(&database, null, tx, lh_keep, nh_keep, parent, owner, 100);
+
+    // Block 200 (post-N): a label discovered after N — must be removed on rollback.
+    try lib.storage.reorg_undo.setCursor(&database, .v1, 200);
+    try lib.storage.unknown_labels.insertUnknownLabel(&database, null, tx, lh_drop, nh_drop, parent, owner, 200);
+
+    try testing.expectEqual(@as(i64, 2), try unknownLabelCount(&database));
+
+    // Reorg to 150: the block-200 op-'I' capture is reversed (deleted by id); the
+    // block-100 row (tagged ≤ 150) is untouched.
+    try lib.storage.sync.rollbackToBlock(&database, .v1, 150);
+
+    try testing.expectEqual(@as(i64, 1), try unknownLabelCount(&database));
+    try testing.expectEqual(@as(i64, 100), try firstUnknownLabelBlock(&database));
+    std.debug.print("✓ unknown_labels post-N insert removed on reorg, pre-N kept\n", .{});
+}
+
+fn registrationExpiry(database: *Database) !i64 {
+    var q = try lib.storage.Query.init(database, "SELECT expiry FROM registrations");
+    defer q.deinit();
+    if (!try q.step()) return error.NoRegistration;
+    return q.getInt64(0);
+}
+
+// W5: `registrations` is already in PROTECTED_TABLES, so its in-place expiry
+// renewal (an UPDATE to a pre-N row) is captured and reversed on rollback. This
+// guards that protection at runtime (the comptime coverage assert in sync.zig
+// guards it at build time). A renewal that lands after the reorg block must not
+// survive a rollback to before it.
+test "reorg undo-log: registrations renew (in-place expiry update) reversed on reorg" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const nh = try namehash(allocator, "renew.eth");
+    const registrant = try Address.fromHex("0x00000000000000000000000000000000000000d4");
+    const tx = try Hash.fromHex("0x0000000000000000000000000000000000000000000000000000000000000def");
+
+    // Block 100 (pre-N): registered with expiry 1e9 (INSERT — not captured).
+    try lib.storage.reorg_undo.setCursor(&database, .v1, 100);
+    try database.insertRegistration(.v1, nh, "renew", "eth", registrant, 1700000100, 1000000000, 100, tx, 0, .name_registered);
+    // Block 200 (post-N): renewed to expiry 2e9 (in-place UPDATE — captured at 200).
+    try lib.storage.reorg_undo.setCursor(&database, .v1, 200);
+    try database.updateRegistrationExpiry(.v1, nh, 2000000000);
+    try testing.expectEqual(@as(i64, 2000000000), try registrationExpiry(&database));
+
+    // Reorg to 150: the renewal is reversed; expiry returns to its as-of-N value.
+    try lib.storage.sync.rollbackToBlock(&database, .v1, 150);
+    try testing.expectEqual(@as(i64, 1000000000), try registrationExpiry(&database));
+    std.debug.print("✓ registrations renew reversed on reorg (expiry 2e9→1e9)\n", .{});
+}
+
+// W7-discovered gap: orphaned_registrations is a deferred-registration queue whose
+// rows are deleted in place when a subregistry is discovered (processOrphanedRegistrations
+// promotes them to names, then deleteOrphanedRegistrations). It was NOT reorg-captured, so
+// an orphan queued at/before N and resolved-then-deleted after N was lost on rollback (the
+// pre-N source NameRegistered is never re-processed on re-sync → a name goes missing). The
+// coverage guard forced the fix: orphaned_registrations is now a PROTECTED table, so the
+// post-N delete of the pre-N orphan is captured and reversed.
+test "reorg undo-log: orphaned_registrations pre-N row deleted post-N is restored on rollback" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const subreg = "0x00000000000000000000000000000000000000e5";
+    const owner = try Address.fromHex("0x00000000000000000000000000000000000000e6");
+    const tx = try Hash.fromHex("0x0000000000000000000000000000000000000000000000000000000000000e57");
+
+    // Block 100 (pre-N): an orphan is queued (subregistry not yet known).
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 100);
+    try database.insertOrphanedRegistration(.v2, subreg, 42, "orphanlabel", 0, owner, 100, tx, 0);
+    try testing.expectEqual(@as(i64, 1), try countAll(&database, "orphaned_registrations"));
+
+    // Block 200 (post-N): the subregistry is discovered → the orphan is resolved and
+    // deleted (captured as op-'D' now that the table is PROTECTED).
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
+    try database.deleteOrphanedRegistrations(.v2, subreg);
+    try testing.expectEqual(@as(i64, 0), try countAll(&database, "orphaned_registrations"));
+
+    // Reorg to 150: the post-N deletion of the pre-N orphan is reversed — the orphan
+    // returns so re-sync can re-resolve it (without the fix it stayed lost).
+    try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
+    try testing.expectEqual(@as(i64, 1), try countAll(&database, "orphaned_registrations"));
+    std.debug.print("✓ orphaned_registrations pre-N delete-after-N reversed on reorg\n", .{});
+}
+
+// W10: the Postgres reorg triggers are generated (as DDL strings) from the same
+// PROTECTED_TABLES / REORG_ACTIVE_TABLES the SQLite triggers use. Pure string gen —
+// executed against a real Postgres only in Phase 4 — so this golden test pins the
+// settled design: two generic PL/pgSQL functions (cursor gate in the body, to_jsonb
+// snapshot, op via TG_ARGV), the SQLite-matching trigger-name scheme, protected {U,D}
+// vs active {I,U,D}, and that the per-table counts track the arrays.
+test "reorg undo-log: pgTriggerInstallSql generates the settled Postgres trigger DDL" {
+    const allocator = testing.allocator;
+    const sql = try lib.storage.reorg_undo.pgTriggerInstallSql(allocator);
+    defer allocator.free(sql);
+
+    const has = struct {
+        fn f(hay: []const u8, needle: []const u8) bool {
+            return std.mem.indexOf(u8, hay, needle) != null;
+        }
+    }.f;
+
+    // Two generic PL/pgSQL capture functions.
+    try testing.expect(has(sql, "CREATE OR REPLACE FUNCTION reorg_capture_protocol() RETURNS trigger"));
+    try testing.expect(has(sql, "CREATE OR REPLACE FUNCTION reorg_capture_active() RETURNS trigger"));
+    // Cursor/active gate lives in the body (PG WHEN forbids subqueries) + to_jsonb snapshot.
+    try testing.expect(has(sql, "SELECT block_number INTO cur_block FROM reorg_cursor WHERE protocol = OLD.protocol"));
+    try testing.expect(has(sql, "to_jsonb(OLD)::text"));
+    try testing.expect(has(sql, "to_jsonb(CASE WHEN TG_OP = 'INSERT' THEN NEW ELSE OLD END)::text"));
+    // The op letter is derived from the firing event so it can't disagree with it.
+    try testing.expect(has(sql, "LEFT(TG_OP, 1)"));
+    // Representative protected triggers: UPDATE+DELETE only, SQLite-matching name scheme.
+    try testing.expect(has(sql, "CREATE TRIGGER \"names_reorg_undo_u\" AFTER UPDATE ON \"names\" FOR EACH ROW EXECUTE FUNCTION reorg_capture_protocol();"));
+    try testing.expect(has(sql, "CREATE TRIGGER \"names_reorg_undo_d\" AFTER DELETE ON \"names\" FOR EACH ROW EXECUTE FUNCTION reorg_capture_protocol();"));
+    // The orphaned_registrations fix is reflected (now a PROTECTED table).
+    try testing.expect(has(sql, "CREATE TRIGGER \"orphaned_registrations_reorg_undo_u\" AFTER UPDATE ON \"orphaned_registrations\""));
+    // Representative reorg_active triggers: INSERT+UPDATE+DELETE via reorg_capture_active.
+    try testing.expect(has(sql, "CREATE TRIGGER \"accounts_reorg_undo_i\" AFTER INSERT ON \"accounts\" FOR EACH ROW EXECUTE FUNCTION reorg_capture_active();"));
+    try testing.expect(has(sql, "CREATE TRIGGER \"unknown_labels_reorg_undo_d\" AFTER DELETE ON \"unknown_labels\" FOR EACH ROW EXECUTE FUNCTION reorg_capture_active();"));
+    // Protected tables get NO AFTER INSERT trigger (inserts handled by created-after delete).
+    try testing.expect(std.mem.indexOf(u8, sql, "\"names_reorg_undo_i\"") == null);
+    // Every CREATE TRIGGER is paired with an idempotent DROP, and counts track the arrays.
+    const expected = lib.storage.reorg_undo.PROTECTED_TABLES.len * 2 + lib.storage.reorg_undo.REORG_ACTIVE_TABLES.len * 3;
+    try testing.expectEqual(expected, std.mem.count(u8, sql, "CREATE TRIGGER "));
+    try testing.expectEqual(expected, std.mem.count(u8, sql, "DROP TRIGGER IF EXISTS "));
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, sql, "CREATE OR REPLACE FUNCTION "));
+    std.debug.print("✓ pgTriggerInstallSql: {d} triggers + 2 capture functions\n", .{std.mem.count(u8, sql, "CREATE TRIGGER ")});
+}
+
 test "reorg undo-log: created-after removed AND updated pre-reorg restored together" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();

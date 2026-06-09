@@ -2,6 +2,7 @@
 /// Re-exports all components needed for testing
 pub const storage = struct {
     pub const database = @import("storage/database.zig");
+    pub const backend = @import("storage/backend.zig");
     pub const Database = database.Database;
     pub const Query = database.Query;
 
@@ -14,6 +15,7 @@ pub const storage = struct {
     pub const sync = @import("storage/sync.zig");
     pub const reorg_undo = @import("storage/reorg_undo.zig");
     pub const v1_controllers = @import("storage/v1_controllers.zig");
+    pub const unknown_labels = @import("storage/unknown_labels.zig");
 };
 
 pub const types = struct {

@@ -739,36 +739,43 @@ the conflict path and AFTER INSERT only on the no-conflict path — they partiti
 double-capturing; **(3)** `FOR EACH ROW` fires once **per affected row**, so bulk multi-row statements
 are each captured.
 
-**Two generic trigger functions** (one `CREATE OR REPLACE` each, reused by every trigger):
+**Two generic trigger functions** (one `CREATE OR REPLACE` each, reused by every trigger). This is
+the exact form `reorg_undo.pgTriggerInstallSql` emits (kept in lockstep with the code — the
+golden-string test in `tests/integration.zig` pins it). The op letter is `LEFT(TG_OP, 1)` (⇒ I/U/D),
+derived from the firing event so it can never disagree with the trigger's event. `OLD.protocol` is a
+direct field read (matching the SQLite trigger's `OLD.protocol`; both backends require — and the
+coverage guard enforces — that every protected table has a `protocol` column):
 
 ```sql
--- protected tables (all have a `protocol` column); op from TG_OP ∈ {UPDATE,DELETE}
-CREATE OR REPLACE FUNCTION reorg_capture_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE v_protocol text; v_block bigint;
+-- protected tables (all have a `protocol` column); op = LEFT(TG_OP, 1) over {UPDATE,DELETE}
+CREATE OR REPLACE FUNCTION reorg_capture_protocol() RETURNS trigger AS $$
+DECLARE
+  cur_block bigint;
 BEGIN
-  v_protocol := to_jsonb(OLD) ->> 'protocol';          -- generic read; NULL (never raises) if absent
-  IF v_protocol IS NULL THEN RETURN NULL; END IF;
-  SELECT block_number INTO v_block FROM reorg_cursor WHERE protocol = v_protocol;  -- gate in BODY (fact 1)
-  IF v_block IS NULL THEN RETURN NULL; END IF;          -- no cursor armed ⇒ backfill/replay ⇒ no self-capture
-  INSERT INTO reorg_undo(protocol, block_number, table_name, op, old_row)
-  VALUES (v_protocol, v_block, TG_TABLE_NAME,
-          CASE TG_OP WHEN 'UPDATE' THEN 'U' WHEN 'DELETE' THEN 'D' END,
-          to_jsonb(OLD)::text);                          -- whole-row snapshot, keyed by column name
+  SELECT block_number INTO cur_block FROM reorg_cursor WHERE protocol = OLD.protocol;  -- gate in BODY (fact 1)
+  IF cur_block IS NOT NULL THEN                          -- no cursor armed ⇒ backfill/replay ⇒ no self-capture
+    INSERT INTO reorg_undo (protocol, block_number, table_name, op, old_row)
+    VALUES (OLD.protocol, cur_block, TG_TABLE_NAME, LEFT(TG_OP, 1), to_jsonb(OLD)::text);
+  END IF;
   RETURN NULL;                                           -- AFTER trigger return is ignored
-END; $$;
+END;
+$$ LANGUAGE plpgsql;
 
--- active tables (accounts, v1_controllers — no `protocol` col); tagged from the single-row reorg_active
-CREATE OR REPLACE FUNCTION reorg_capture_active() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE v_protocol text; v_block bigint;
+-- active tables (accounts, v1_controllers, unknown_labels — no `protocol` col); tagged from reorg_active
+CREATE OR REPLACE FUNCTION reorg_capture_active() RETURNS trigger AS $$
+DECLARE
+  act_protocol text;
+  act_block bigint;
 BEGIN
-  SELECT protocol, block_number INTO v_protocol, v_block FROM reorg_active WHERE id = 1;
-  IF v_protocol IS NULL THEN RETURN NULL; END IF;
-  INSERT INTO reorg_undo(protocol, block_number, table_name, op, old_row)
-  VALUES (v_protocol, v_block, TG_TABLE_NAME,
-          CASE TG_OP WHEN 'INSERT' THEN 'I' WHEN 'UPDATE' THEN 'U' ELSE 'D' END,
-          (CASE WHEN TG_OP = 'INSERT' THEN to_jsonb(NEW) ELSE to_jsonb(OLD) END)::text);
+  SELECT protocol, block_number INTO act_protocol, act_block FROM reorg_active WHERE id = 1;
+  IF FOUND THEN
+    INSERT INTO reorg_undo (protocol, block_number, table_name, op, old_row)
+    VALUES (act_protocol, act_block, TG_TABLE_NAME, LEFT(TG_OP, 1),
+            to_jsonb(CASE WHEN TG_OP = 'INSERT' THEN NEW ELSE OLD END)::text);
+  END IF;
   RETURN NULL;
-END; $$;
+END;
+$$ LANGUAGE plpgsql;
 ```
 
 **Trigger generation** (`installPgTriggers`, from the same arrays; PG has no `CREATE TRIGGER IF NOT
@@ -1013,6 +1020,81 @@ PostgreSQL work begins.
     `introspectColumns` casts.
   - **Not done (intentional):** schema kept canonical at `schema/schema.sql` (the optional
     `schema/sqlite/` move was skipped as disruptive churn).
+- **Phase 3 — IN PROGRESS.** Sequenced into independently-verifiable, behaviour-neutral increments
+  (each build-green + full-suite-green, mirroring Phase 2). The unit of work is SQLite-only since no
+  PG driver exists yet (Phase 4); PG-only pieces are *built and unit-tested now* but only *run* under
+  Phase 4 (golden-string generators, cast threaded as a SQLite no-op). Corrected facts from the
+  understanding pass: **`registrations` is already in `PROTECTED_TABLES`** (the "Bug 3 / unprotected"
+  claim was false — it collapses to a regression-test guard); **`unknown_labels` is genuinely absent**
+  from both trigger arrays (the `ON DELETE CASCADE` rollback gap is real).
+  - **W1 — DONE.** `introspectColumns` added as a connection-bound `VTable`/`Database` op (NOT the
+    conn-less `Dialect`), `ColumnInfo{name,sql_type,pk_pos}` + `freeColumnInfo` in `backend.zig`,
+    SQLite impl = `PRAGMA table_info`; `reorg_undo.getColumns`/`pkColumn` reimplemented on it
+    (behaviour-neutral). Snapshot test; both reviewers clean.
+  - **W2 — DONE.** `Dialect.jsonExtract` gained `cast_type: ?[]const u8` (SQLite ignores it; PG appends
+    `::<type>` because `->>` yields text). Golden-string test proves SQLite output unchanged.
+  - **W3 — DONE.** Routed `reorg_undo.zig`'s SQL through the dialect, behaviour-neutral on SQLite
+    (proven by the exact-reconcile invariant + empirical byte-equivalence of the restore SQL incl.
+    composite-PK `resolver_versions`). `getRestoreSql`→`introspectColumns` + `dialect.upsert(value_exprs
+    = jsonExtract-per-col)` with the table's PK (all `pk_pos>0` cols) as the conflict target and each
+    column's type threaded as the PG `->>` cast; `setCursor`'s two IOR→`dialect.upsert` (reorg_cursor
+    conflict=protocol, reorg_active conflict=id, `1` literal preserved via `value_exprs`); the three
+    op-`I` `json_extract` sites in `replayUndo`→`dialect.jsonExtract` (the single-PK delete now casts by
+    the PK's type — closes a latent PG text-vs-bigint bug for `unknown_labels.id`). Retired the now-dead
+    `pkColumn`. Trigger *bodies* + `rowJson` stay raw SQLite (PG triggers are W10). Verified: the
+    one-shot post-sync backfills run cursor-disarmed (W4 synergy) so the new W6 `unknown_labels`
+    UPDATE/DELETE triggers don't self-capture — documented as an invariant at the backfill block. Both
+    reviewers clean.
+  - **W4 — DONE (bug).** `Indexer.materializePccUncaptured` disarms the cursor (`reorg_undo.clearCursor`)
+    around the one-shot bulk `UPDATE names` (`names.zig:767`) and re-arms lazily via
+    `invalidateReorgCursor`. Not merely bloat: a captured row would wrongly revert the PCC expiry
+    mirror on a later reorg. Bonus: also stops backfill's `updateNameCreationDateIfEarlier`/
+    `backfillUnknownLabels` from over-capturing. Tests: positive (survives reorg) + non-vacuous pre-fix
+    control. Both reviewers clean.
+  - **W6 — DONE (bug).** Added `unknown_labels` to `REORG_ACTIVE_TABLES` (single `id` PK, no `protocol`
+    col, `name_id` FK→`names` `ON DELETE CASCADE`). op-`I` reversal removes post-N rows with no cascade
+    path. Cascade-vs-replay ordering proven safe (recursive_triggers gives the child a lower undo id;
+    replayUndo walks id DESC, parent-first); production `name_id` is always null so the cascade never
+    reaches it. Bonus: also fixes permanent loss of DNS-healing deletes on rollback. Confirmed the
+    *only* `ON DELETE CASCADE` FK in the schema → no other gap of this class. Non-vacuous test; both
+    reviewers clean.
+  - **W5 — DONE (guard).** Renew-then-reorg regression test for `registrations` (already PROTECTED).
+  - **W7/W8 — DONE (comptime coverage guards).** `sync.zig` rollback delete-lists hoisted to
+    module-level `pub const` (single source of truth) and a `comptime` block asserts both directions:
+    **(G1)** every rollback-deleted table is reorg-captured or explicitly insert-only-waived; **(G2)**
+    every `PROTECTED` table is also in a rollback delete-list (so updates *and* post-N inserts are
+    both handled; `REORG_ACTIVE` exempt — op-`I` removes their inserts). Replaces the brittle external
+    grep-lint with robust in-language guards; both smoke-tested to fire on an injected gap. The guard
+    **immediately caught two real latent gaps** by forcing honest waiver classification:
+    - **`orphaned_registrations` — FIXED.** Not insert-only (`deleteOrphanedRegistrations` deletes a
+      resolved orphan in place). A pre-N orphan resolved post-N was permanently lost on rollback (the
+      pre-N source `NameRegistered` never re-processes). Added to `PROTECTED_TABLES` (has `protocol`,
+      single `id` PK) → op-`D` capture/restore; composes correctly with the `block_number` delete for
+      all create/delete-block combos. Non-vacuous straddle test; reviewer-confirmed.
+    - **`events` — accepted waiver, now honest.** `updatePlaceholderEventsByName` patches the
+      denormalized `name`/`namehash` in place. Deliberately NOT captured (canonical `data` JSON
+      untouched, idempotent self-heal on re-sync, and its no-protocol-filter `UPDATE` would make
+      capture cross-protocol-ambiguous); residual = a reorged-out resolving event leaves a stale
+      derived column. Documented in the waiver + [[events-placeholder-patch-reorg-waiver]] rather than
+      mis-labelled "append-only". The other waivers (block_hashes, name_history, resolvers) verified
+      genuinely insert-only.
+  - **W7/W8 — coverage lints** (comptime sync-delete ⊆ trigger-arrays; CI grep golden ~60-site
+    inventory) — land AFTER W5/W6 so the protected set is correct.
+  - **W10 — DONE (scaffolding).** `reorg_undo.pgTriggerInstallSql` generates the two generic PL/pgSQL
+    capture functions + per-table FOR EACH ROW triggers from `PROTECTED_TABLES`/`REORG_ACTIVE_TABLES`
+    (cursor gate in the body; `to_jsonb(OLD/NEW)::text` snapshot; op = `LEFT(TG_OP, 1)` so it can't
+    disagree with the firing event; trigger names match the SQLite scheme; protected {U,D}, active
+    {I,U,D}; idempotent CREATE OR REPLACE + DROP/CREATE). Golden-string test pins it (53 triggers + 2
+    functions). Pure string-gen — the PG driver *executes* it in Phase 4. Correctness reviewer PASS;
+    the settled-design doc was updated to match the emitted SQL exactly (no drift).
+  - **W11 — DONE (folded).** New reorg regression tests live in `tests/integration.zig` alongside the
+    existing reorg suite (no separate `test-reorg` root needed).
+  - **W9 — deferred (PG-only scaffolding):** `mutateProtected`/`coverage_map`/`captureBefore` write-path
+    fallback is only needed by a `server_side_undo=false` third-party backend; both shipped backends use
+    `server_side_undo=true` (triggers). Not required for the SQLite or Postgres ship path.
+  - **Defer to Phase 4:** PG `introspectColumns` (`information_schema`), `::type` cast *emission* +
+    round-trip, `installPgTriggers` *execution*, cross-backend A/B Lane 2 (H1 decode-and-canonicalize),
+    and the optional W9 write-path fallback if a third-party backend ever sets `server_side_undo=false`.
 
 ---
 

@@ -80,9 +80,30 @@ pub const Dialect = struct {
     /// `json_object('c', alias."c", …)` (SQLite) / `jsonb_build_object(…)`/`to_jsonb` (PG).
     jsonObject: *const fn (allocator: std.mem.Allocator, cols: []const []const u8, alias: []const u8) anyerror![]u8,
     /// Extract a JSON object field by name: `json_extract(src, '$.col')` (SQLite) /
-    /// `(src::jsonb ->> 'col')` (PG).
-    jsonExtract: *const fn (allocator: std.mem.Allocator, src: []const u8, col: []const u8) anyerror![]u8,
+    /// `(src::jsonb ->> 'col')` (PG). `cast_type` (when non-null) requests a typed
+    /// result — SQLite is dynamically typed and ignores it; Postgres (Phase 4)
+    /// appends `::<cast_type>` because `->>` always yields `text`.
+    jsonExtract: *const fn (allocator: std.mem.Allocator, src: []const u8, col: []const u8, cast_type: ?[]const u8) anyerror![]u8,
 };
+
+/// A column as seen by `introspectColumns`: its name, declared SQL type (may be
+/// empty for SQLite's untyped columns), and 1-based position in the primary key
+/// (0 = not part of the PK). Caller owns `name`/`sql_type`; free via
+/// `freeColumnInfo`.
+pub const ColumnInfo = struct {
+    name: []const u8,
+    sql_type: []const u8,
+    pk_pos: i64,
+};
+
+/// Free a `[]ColumnInfo` returned by `introspectColumns`.
+pub fn freeColumnInfo(allocator: std.mem.Allocator, cols: []ColumnInfo) void {
+    for (cols) |col| {
+        allocator.free(col.name);
+        allocator.free(col.sql_type);
+    }
+    allocator.free(cols);
+}
 
 /// Connection-level operations a backend provides — the seam for opening,
 /// closing, raw exec, and prepare. `db` is the owning session; Phase 0 keeps
@@ -100,6 +121,11 @@ pub const VTable = struct {
     rollback: *const fn (ctx: *anyopaque) void,
     /// ROWID of the most recent successful INSERT on this connection.
     lastInsertId: *const fn (ctx: *anyopaque) i64,
+    /// Column metadata for `table` (name, declared type, PK position) — the
+    /// connection-bound counterpart to the conn-less `Dialect` builders, since it
+    /// must query the live schema. SQLite: `PRAGMA table_info`; Postgres (Phase 4):
+    /// `information_schema`. Caller owns the result (`freeColumnInfo`).
+    introspectColumns: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, table: []const u8) anyerror![]ColumnInfo,
 };
 
 /// The backend handle held by `Database`: an opaque pointer to the driver's

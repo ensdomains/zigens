@@ -236,6 +236,36 @@ fn close(ctx: *anyopaque) void {
     allocator.destroy(conn);
 }
 
+/// Column metadata via `PRAGMA table_info`: col 1 = name, col 2 = declared type,
+/// col 5 = pk position (0 = not part of PK). `table` comes from trusted callers
+/// (PROTECTED_TABLES etc.), so interpolating it into the PRAGMA is safe.
+fn introspectColumns(ctx: *anyopaque, allocator: std.mem.Allocator, table: []const u8) anyerror![]backend.ColumnInfo {
+    const sql = try std.fmt.allocPrint(allocator, "PRAGMA table_info(\"{s}\")", .{table});
+    defer allocator.free(sql);
+
+    var stmt = try prepare(ctx, sql, false);
+    defer stmt.deinit();
+
+    var list: std.ArrayList(backend.ColumnInfo) = .{};
+    errdefer {
+        for (list.items) |col| {
+            allocator.free(col.name);
+            allocator.free(col.sql_type);
+        }
+        list.deinit(allocator);
+    }
+    while (try stmt.step()) {
+        const name = stmt.getTextSlice(1) orelse continue;
+        const sql_type = stmt.getTextSlice(2) orelse "";
+        const name_copy = try allocator.dupe(u8, name);
+        errdefer allocator.free(name_copy);
+        const type_copy = try allocator.dupe(u8, sql_type);
+        errdefer allocator.free(type_copy);
+        try list.append(allocator, .{ .name = name_copy, .sql_type = type_copy, .pk_pos = stmt.getInt64(5) });
+    }
+    return list.toOwnedSlice(allocator);
+}
+
 pub const vtable = backend.VTable{
     .close = close,
     .execRaw = execRaw,
@@ -244,6 +274,7 @@ pub const vtable = backend.VTable{
     .commit = commit,
     .rollback = rollback,
     .lastInsertId = lastInsertId,
+    .introspectColumns = introspectColumns,
 };
 
 // ── SQL dialect builders (emit today's exact SQLite SQL) ────────────────────
@@ -311,7 +342,9 @@ fn dialectJsonObject(allocator: std.mem.Allocator, cols: []const []const u8, ali
     return buf.toOwnedSlice(allocator);
 }
 
-fn dialectJsonExtract(allocator: std.mem.Allocator, src: []const u8, col: []const u8) anyerror![]u8 {
+fn dialectJsonExtract(allocator: std.mem.Allocator, src: []const u8, col: []const u8, cast_type: ?[]const u8) anyerror![]u8 {
+    // SQLite is dynamically typed; the requested cast is a Postgres concern.
+    _ = cast_type;
     return std.fmt.allocPrint(allocator, "json_extract({s}, '$.{s}')", .{ src, col });
 }
 

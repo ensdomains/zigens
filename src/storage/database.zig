@@ -348,6 +348,13 @@ pub const Database = struct {
         return self.backend.dialect;
     }
 
+    /// Column metadata (name, declared type, PK position) for `table`, queried
+    /// from the live schema via the backend. Caller owns the result and frees it
+    /// with `backend.freeColumnInfo`.
+    pub fn introspectColumns(self: *Database, allocator: std.mem.Allocator, table: []const u8) ![]backend_mod.ColumnInfo {
+        return self.backend.vtable.introspectColumns(self.backend.ptr, allocator, table);
+    }
+
     /// Build a backend-appropriate upsert statement for `table`, inserting
     /// `cols` (in bind order) with `action` on conflict. The caller owns the
     /// returned SQL and must free it after preparing. The conflict key is

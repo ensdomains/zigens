@@ -7,6 +7,103 @@ const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
 const reorg_undo = @import("reorg_undo.zig");
 
+// ── Reorg rollback delete-lists ────────────────────────────────────────────────
+// Single source of truth for the tables whose post-N rows `rollbackToBlock` deletes.
+// The comptime coverage guard below cross-checks them against the reorg trigger
+// arrays so a new rollback delete can't silently bypass undo capture.
+
+/// Deleted by `(protocol, block_number > N)` — insert-only logs + derived tables alike.
+pub const reorg_rollback_by_block_number = [_][]const u8{
+    "events",
+    "block_hashes",
+    "orphaned_registrations",
+    "resolver_addresses",
+    "resolver_contenthashes",
+    "resolver_texts",
+    "resolver_aliases",
+    "resolver_pubkeys",
+    "resolver_abis",
+    "resolver_names",
+    "resolver_interfaces",
+    "resolver_versions",
+    "resolver_dns_records",
+    "resolver_dns_zonehashes",
+    "resolver_authorisations",
+    "reverse_records",
+    "approvals",
+    "eac_roles",
+    "resolver_metadata",
+    "resolver_approvals",
+    "registrations",
+    "name_history",
+};
+
+/// Deleted by `(protocol, created_block > N)`.
+pub const reorg_rollback_by_created_block = [_][]const u8{ "names", "registries" };
+
+/// Deleted by `(protocol, <col> > N)` for a non-`block_number` block column.
+pub const reorg_rollback_by_other_col = [_]struct { name: []const u8, col: []const u8 }{
+    .{ .name = "registry_entries", .col = "updated_block" },
+    .{ .name = "resolvers", .col = "set_block" },
+};
+
+/// Tables deleted on rollback that need NO undo capture: they are insert-only (rows
+/// are only inserted then post-N-deleted — no in-place UPDATE / clear-DELETE of a
+/// pre-N row to reverse). Everything else deleted on rollback MUST be captured by a
+/// reorg trigger (`reorg_undo.PROTECTED_TABLES` ∪ `REORG_ACTIVE_TABLES`).
+const reorg_capture_waived = [_][]const u8{
+    // events: rows are append-only EXCEPT the denormalized name/namehash columns, which
+    // updatePlaceholderEventsByName (names.zig) patches in place once a placeholder name
+    // resolves. Deliberately NOT reorg-captured: the canonical `data` JSON is untouched,
+    // the patch is idempotent and self-heals on re-sync (the resolving event re-fires),
+    // and its `WHERE name=?` (no protocol filter) would make undo capture cross-protocol-
+    // ambiguous. Residual (accepted): if the resolving event is itself reorged out, a
+    // pre-N event row keeps the resolved value in those two derived columns. See
+    // [[events-placeholder-patch-reorg-waiver]].
+    "events",
+    "block_hashes", // append-only block-hash chain (insert + retention-prune only)
+    "name_history", // append-only change log (INSERT only; no in-place mutation)
+    "resolvers", // resolver entity table: insert-only (set_block, INSERT OR IGNORE keeps first); attribute records live in the PROTECTED resolver_* tables
+};
+
+fn reorgCovered(comptime name: []const u8) bool {
+    for (reorg_undo.PROTECTED_TABLES ++ reorg_undo.REORG_ACTIVE_TABLES ++ reorg_capture_waived) |t| {
+        if (std.mem.eql(u8, t, name)) return true;
+    }
+    return false;
+}
+
+fn inRollbackDeleteList(comptime name: []const u8) bool {
+    for (reorg_rollback_by_block_number ++ reorg_rollback_by_created_block) |t| {
+        if (std.mem.eql(u8, t, name)) return true;
+    }
+    for (reorg_rollback_by_other_col) |t| {
+        if (std.mem.eql(u8, t.name, name)) return true;
+    }
+    return false;
+}
+
+comptime {
+    @setEvalBranchQuota(100000);
+    // Guard 1 — every table whose post-N rows `rollbackToBlock` deletes must be either
+    // reorg-captured or explicitly waived as insert-only. Catches "added a rollback
+    // delete but forgot the trigger array" (the 2026-06-02 regression class).
+    for (reorg_rollback_by_block_number ++ reorg_rollback_by_created_block) |t| {
+        if (!reorgCovered(t)) @compileError("reorg coverage gap: '" ++ t ++ "' is deleted on rollback but neither reorg-captured nor waived as insert-only (see sync.zig reorg_capture_waived)");
+    }
+    for (reorg_rollback_by_other_col) |t| {
+        if (!reorgCovered(t.name)) @compileError("reorg coverage gap: '" ++ t.name ++ "' is deleted on rollback but neither reorg-captured nor waived");
+    }
+    // Guard 2 (symmetric) — every PROTECTED table (whose in-place updates are captured)
+    // must ALSO have its post-N inserts deleted by a rollback list; otherwise a reorg
+    // reverses updates but leaves genuinely-new rows behind. REORG_ACTIVE tables are
+    // exempt: replayUndo's op-'I' handler removes their post-N inserts (no protocol
+    // column ⇒ no created-after delete).
+    for (reorg_undo.PROTECTED_TABLES) |t| {
+        if (!inRollbackDeleteList(t)) @compileError("reorg coverage gap: PROTECTED table '" ++ t ++ "' has its updates captured but its post-N inserts are never deleted on rollback (add it to a sync.zig reorg_rollback_* list)");
+    }
+}
+
 /// Safely convert u64 expiry to i64 for SQLite storage.
 /// Values exceeding i64::max are mapped to 0 (never expires).
 fn safeU64ToI64(val: u64) i64 {
@@ -118,13 +215,14 @@ pub fn rollbackToBlock(db: *Database, protocol: models.Protocol, block_number: u
     try reorg_undo.clearCursor(db, protocol);
     try reorg_undo.replayUndo(db, protocol, block_number);
 
-    // Insert-only tables: delete anything after the block
-    const insert_only_tables = [_][]const u8{
-        "events",
-        "block_hashes",
-    };
-
-    inline for (insert_only_tables) |table| {
+    // Delete rows created after N, keyed by block_number (insert-only logs + derived
+    // tables alike). replayUndo above already reversed in-place overwrites of pre-N
+    // rows, restoring their as-of-N block_number, so these deletes remove only
+    // genuinely-new rows. If a table is missing from the schema, Query.init (preparing
+    // the DELETE) fails at the `try` boundary and bubbles up — reorg rollback is not
+    // safe to continue on partial failure. The set is the comptime-guarded
+    // `reorg_rollback_by_block_number` (see the coverage assert at module scope).
+    inline for (reorg_rollback_by_block_number) |table| {
         const sql = "DELETE FROM " ++ table ++ " WHERE protocol = ? AND block_number > ?";
         var q = try Query.init(db, sql);
         defer q.deinit();
@@ -135,59 +233,8 @@ pub fn rollbackToBlock(db: *Database, protocol: models.Protocol, block_number: u
 
     // Derived-state tables keyed by created_block: delete rows created after the block.
     // Updates to rows created <= block_number will be re-derived when re-syncing.
-    const derived_tables_by_created_block = [_][]const u8{
-        "names",
-        "registries",
-    };
-
-    inline for (derived_tables_by_created_block) |table| {
+    inline for (reorg_rollback_by_created_block) |table| {
         const sql = "DELETE FROM " ++ table ++ " WHERE protocol = ? AND created_block > ?";
-        var q = try Query.init(db, sql);
-        defer q.deinit();
-        try q.bindTextStatic(protocol_str);
-        try q.bindInt64(block_i64);
-        try q.exec();
-    }
-
-    // orphaned_registrations uses block_number
-    {
-        const sql = "DELETE FROM orphaned_registrations WHERE protocol = ? AND block_number > ?";
-        var q = try Query.init(db, sql);
-        defer q.deinit();
-        try q.bindTextStatic(protocol_str);
-        try q.bindInt64(block_i64);
-        try q.exec();
-    }
-
-    // Derived tables keyed by block_number with protocol: delete rows created after N.
-    // (replayUndo above already reversed in-place overwrites of pre-N rows, restoring
-    // their as-of-N block_number, so these deletes only remove genuinely-new rows.)
-    // If a table is missing from the schema, Query.init (preparing the DELETE) will fail
-    // at the `try` boundary and bubble up — reorg rollback is not safe to continue on partial failure.
-    const block_number_tables = [_][]const u8{
-        "resolver_addresses",
-        "resolver_contenthashes",
-        "resolver_texts",
-        "resolver_aliases",
-        "resolver_pubkeys",
-        "resolver_abis",
-        "resolver_names",
-        "resolver_interfaces",
-        "resolver_versions",
-        "resolver_dns_records",
-        "resolver_dns_zonehashes",
-        "resolver_authorisations",
-        "reverse_records",
-        "approvals",
-        "eac_roles",
-        "resolver_metadata",
-        "resolver_approvals",
-        "registrations",
-        "name_history",
-    };
-
-    inline for (block_number_tables) |table| {
-        const sql = "DELETE FROM " ++ table ++ " WHERE protocol = ? AND block_number > ?";
         var q = try Query.init(db, sql);
         defer q.deinit();
         try q.bindTextStatic(protocol_str);
@@ -197,13 +244,8 @@ pub fn rollbackToBlock(db: *Database, protocol: models.Protocol, block_number: u
 
     // Tables keyed by a non-`block_number` block column: same created-after delete,
     // different column. registry_entries → updated_block; resolvers (insert-only entity
-    // table) → set_block. replayUndo above restored pre-N rows to their as-of-N value, so
-    // these remove only genuinely-new rows.
-    const other_block_col_tables = [_]struct { name: []const u8, col: []const u8 }{
-        .{ .name = "registry_entries", .col = "updated_block" },
-        .{ .name = "resolvers", .col = "set_block" },
-    };
-    inline for (other_block_col_tables) |t| {
+    // table) → set_block.
+    inline for (reorg_rollback_by_other_col) |t| {
         const sql = "DELETE FROM " ++ t.name ++ " WHERE protocol = ? AND " ++ t.col ++ " > ?";
         var q = try Query.init(db, sql);
         defer q.deinit();

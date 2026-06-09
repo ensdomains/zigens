@@ -21,6 +21,7 @@
 ///     reconstructed from `PRAGMA table_info`, then prunes those undo rows.
 const std = @import("std");
 const db_module = @import("database.zig");
+const backend = @import("backend.zig");
 const Database = db_module.Database;
 const Query = db_module.Query;
 const models = @import("../types/models.zig");
@@ -32,6 +33,7 @@ pub const PROTECTED_TABLES = [_][]const u8{
     "names",
     "registries",
     "registrations",
+    "orphaned_registrations",
     "registry_entries",
     "approvals",
     "eac_roles",
@@ -85,24 +87,20 @@ pub fn ensureSchema(db: *Database) !void {
     );
 }
 
-/// Read a table's column names via PRAGMA table_info. Caller owns the returned
-/// slice and each string. Table names come from PROTECTED_TABLES (trusted), so
-/// string interpolation here is safe.
+/// Read a table's column names via the backend's schema introspection. Caller
+/// owns the returned slice and each string. Table names come from
+/// PROTECTED_TABLES (trusted).
 fn getColumns(db: *Database, allocator: std.mem.Allocator, table: []const u8) ![][]u8 {
-    const sql = try std.fmt.allocPrint(allocator, "PRAGMA table_info(\"{s}\")", .{table});
-    defer allocator.free(sql);
-
-    var q = try Query.init(db, sql);
-    defer q.deinit();
+    const info = try db.introspectColumns(allocator, table);
+    defer backend.freeColumnInfo(allocator, info);
 
     var cols: std.ArrayList([]u8) = .{};
     errdefer {
         for (cols.items) |c| allocator.free(c);
         cols.deinit(allocator);
     }
-    while (try q.step()) {
-        const name = q.getTextSlice(1) orelse continue; // col 1 = name
-        try cols.append(allocator, try allocator.dupe(u8, name));
+    for (info) |col| {
+        try cols.append(allocator, try allocator.dupe(u8, col.name));
     }
     return cols.toOwnedSlice(allocator);
 }
@@ -110,22 +108,6 @@ fn getColumns(db: *Database, allocator: std.mem.Allocator, table: []const u8) ![
 fn freeColumns(allocator: std.mem.Allocator, cols: [][]u8) void {
     for (cols) |c| allocator.free(c);
     allocator.free(cols);
-}
-
-/// Name of the (single-column) primary key of `table`, from PRAGMA table_info. Used to
-/// reverse an op-'I' capture by deleting the after-N row by its key. Caller owns it.
-fn pkColumn(db: *Database, allocator: std.mem.Allocator, table: []const u8) ![]u8 {
-    const sql = try std.fmt.allocPrint(allocator, "PRAGMA table_info(\"{s}\")", .{table});
-    defer allocator.free(sql);
-    var q = try Query.init(db, sql);
-    defer q.deinit();
-    while (try q.step()) {
-        if (q.getInt64(5) > 0) { // col 5 = pk position (0 = not part of pk)
-            const name = q.getTextSlice(1) orelse continue;
-            return allocator.dupe(u8, name);
-        }
-    }
-    return error.NoPrimaryKey;
 }
 
 /// Build `json_object('c1', <alias>."c1", ...)` over every column. `alias` is OLD
@@ -167,8 +149,12 @@ pub fn installTriggers(db: *Database) !void {
 
 /// Derived tables that lack a `protocol` column and so are captured via reorg_active
 /// rather than the generic OLD.protocol triggers. `accounts` is cross-protocol (its row
-/// is shared by v1+v2); `v1_controllers` is V1-only. Both have a single-column PK.
-pub const REORG_ACTIVE_TABLES = [_][]const u8{ "accounts", "v1_controllers" };
+/// is shared by v1+v2); `v1_controllers` is V1-only; `unknown_labels` is an unresolved-
+/// label queue (`name_id` FK to `names` `ON DELETE CASCADE`). Each has a single-column
+/// PK (`id`/`address`). Without `unknown_labels` here, a post-N row whose `name_id` is
+/// null or points at a pre-N name has no rollback delete path (no cascade, no created-
+/// block delete) and persists as a stale row; the op-`I` reversal removes it.
+pub const REORG_ACTIVE_TABLES = [_][]const u8{ "accounts", "v1_controllers", "unknown_labels" };
 
 /// reorg_active-keyed triggers for a no-`protocol`-column table. UPDATE/DELETE capture
 /// OLD; INSERT captures NEW (op 'I'). Capturing the INSERT lets a rollback retire a row
@@ -227,18 +213,99 @@ fn tableExists(db: *Database, table: []const u8) !bool {
     return try q.step();
 }
 
+// ── Postgres trigger installation (generated; executed by the PG driver in Phase 4) ──
+// Mirror of the SQLite triggers above, expressed as two generic PL/pgSQL functions plus
+// per-table FOR EACH ROW triggers. Postgres can't gate a trigger's WHEN on a subquery,
+// so the cursor/active-context gate lives in the function body. The row snapshot is
+// `to_jsonb(OLD/NEW)::text` (whole row, vs SQLite's per-column json_object — both yield a
+// column-keyed JSON object that replayUndo extracts the same way per backend). The op
+// letter is derived from the firing event (`LEFT(TG_OP, 1)` ⇒ I/U/D), so it can never
+// disagree with the trigger's event. Trigger names match the SQLite
+// `"<t>_reorg_undo_<i|u|d>"` scheme so the two backends are interchangeable. Protected
+// tables capture {U,D}; reorg_active tables capture {I,U,D}. See the settled design in
+// docs/postgresql-migration-plan.md ("Postgres trigger design").
+
+const PG_CAPTURE_PROTOCOL_FN =
+    \\CREATE OR REPLACE FUNCTION reorg_capture_protocol() RETURNS trigger AS $$
+    \\DECLARE
+    \\  cur_block bigint;
+    \\BEGIN
+    \\  SELECT block_number INTO cur_block FROM reorg_cursor WHERE protocol = OLD.protocol;
+    \\  IF cur_block IS NOT NULL THEN
+    \\    INSERT INTO reorg_undo (protocol, block_number, table_name, op, old_row)
+    \\    VALUES (OLD.protocol, cur_block, TG_TABLE_NAME, LEFT(TG_OP, 1), to_jsonb(OLD)::text);
+    \\  END IF;
+    \\  RETURN NULL;
+    \\END;
+    \\$$ LANGUAGE plpgsql;
+    \\
+;
+
+const PG_CAPTURE_ACTIVE_FN =
+    \\CREATE OR REPLACE FUNCTION reorg_capture_active() RETURNS trigger AS $$
+    \\DECLARE
+    \\  act_protocol text;
+    \\  act_block bigint;
+    \\BEGIN
+    \\  SELECT protocol, block_number INTO act_protocol, act_block FROM reorg_active WHERE id = 1;
+    \\  IF FOUND THEN
+    \\    INSERT INTO reorg_undo (protocol, block_number, table_name, op, old_row)
+    \\    VALUES (act_protocol, act_block, TG_TABLE_NAME, LEFT(TG_OP, 1),
+    \\            to_jsonb(CASE WHEN TG_OP = 'INSERT' THEN NEW ELSE OLD END)::text);
+    \\  END IF;
+    \\  RETURN NULL;
+    \\END;
+    \\$$ LANGUAGE plpgsql;
+    \\
+;
+
+fn appendPgTrigger(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), table: []const u8, suffix: []const u8, event: []const u8, func: []const u8) !void {
+    try buf.writer(allocator).print(
+        \\DROP TRIGGER IF EXISTS "{s}_reorg_undo_{s}" ON "{s}";
+        \\CREATE TRIGGER "{s}_reorg_undo_{s}" AFTER {s} ON "{s}" FOR EACH ROW EXECUTE FUNCTION {s}();
+        \\
+    , .{ table, suffix, table, table, suffix, event, table, func });
+}
+
+/// Generate the full Postgres reorg-trigger DDL — the two PL/pgSQL capture functions
+/// plus per-table FOR EACH ROW triggers built from PROTECTED_TABLES / REORG_ACTIVE_TABLES.
+/// Pure string generation (no connection); the Postgres driver executes it at schema-install
+/// time in Phase 4. Idempotent (CREATE OR REPLACE FUNCTION + DROP/CREATE TRIGGER). Caller
+/// owns the returned SQL.
+pub fn pgTriggerInstallSql(allocator: std.mem.Allocator) ![]u8 {
+    var buf: std.ArrayList(u8) = .{};
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, PG_CAPTURE_PROTOCOL_FN);
+    try buf.appendSlice(allocator, PG_CAPTURE_ACTIVE_FN);
+    for (PROTECTED_TABLES) |table| {
+        try appendPgTrigger(allocator, &buf, table, "u", "UPDATE", "reorg_capture_protocol");
+        try appendPgTrigger(allocator, &buf, table, "d", "DELETE", "reorg_capture_protocol");
+    }
+    for (REORG_ACTIVE_TABLES) |table| {
+        try appendPgTrigger(allocator, &buf, table, "i", "INSERT", "reorg_capture_active");
+        try appendPgTrigger(allocator, &buf, table, "u", "UPDATE", "reorg_capture_active");
+        try appendPgTrigger(allocator, &buf, table, "d", "DELETE", "reorg_capture_active");
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
 /// Set the block currently being processed for `protocol`. Enables undo capture
 /// (both the per-protocol cursor for generic tables and the single-row active
 /// context for cross-protocol tables like accounts).
 pub fn setCursor(db: *Database, protocol: models.Protocol, block_number: u64) !void {
+    const dialect = db.dialect();
     {
-        var q = try Query.initCached(db, "INSERT OR REPLACE INTO reorg_cursor(protocol, block_number) VALUES (?, ?)");
+        const sql = try dialect.upsert(db.allocator, "reorg_cursor", &.{ "protocol", "block_number" }, &.{}, &.{"protocol"}, .replace);
+        defer db.allocator.free(sql);
+        var q = try Query.initCached(db, sql);
         defer q.deinit();
         try q.bindTextStatic(protocol.toString());
         try q.bindInt64(@intCast(block_number));
         try q.exec();
     }
-    var qa = try Query.initCached(db, "INSERT OR REPLACE INTO reorg_active(id, protocol, block_number) VALUES (1, ?, ?)");
+    const sql = try dialect.upsert(db.allocator, "reorg_active", &.{ "id", "protocol", "block_number" }, &.{ "1", "?", "?" }, &.{"id"}, .replace);
+    defer db.allocator.free(sql);
+    var qa = try Query.initCached(db, sql);
     defer qa.deinit();
     try qa.bindTextStatic(protocol.toString());
     try qa.bindInt64(@intCast(block_number));
@@ -313,31 +380,42 @@ pub fn replayUndo(db: *Database, protocol: models.Protocol, block_number: u64) !
         if (std.mem.eql(u8, e.op, "I")) {
             // A row first-created after N (op 'I', from a reorg_active table's INSERT
             // trigger). Reverse it by retiring only this rollback's contribution.
+            const dialect = db.dialect();
             if (std.mem.eql(u8, e.table, "accounts")) {
                 // accounts is cross-protocol (shared address key): clear only THIS
                 // protocol's seen flag, then drop the row only if the other protocol
                 // never saw it — so an independent per-protocol rollback never deletes an
                 // account the still-synced protocol established.
                 const this_seen = if (protocol == .v1) "seen_v1" else "seen_v2";
-                const upd = try std.fmt.allocPrint(allocator, "UPDATE \"{s}\" SET {s} = 0 WHERE address = json_extract(?1, '$.address')", .{ e.table, this_seen });
+                const addr = try dialect.jsonExtract(allocator, "?1", "address", null); // text key, no cast
+                defer allocator.free(addr);
+                const upd = try std.fmt.allocPrint(allocator, "UPDATE \"{s}\" SET {s} = 0 WHERE address = {s}", .{ e.table, this_seen, addr });
                 defer allocator.free(upd);
                 var uq = try Query.init(db, upd);
                 defer uq.deinit();
                 try uq.bindText(e.old_row);
                 try uq.exec();
 
-                const del = try std.fmt.allocPrint(allocator, "DELETE FROM \"{s}\" WHERE address = json_extract(?1, '$.address') AND seen_v1 = 0 AND seen_v2 = 0", .{e.table});
+                const del = try std.fmt.allocPrint(allocator, "DELETE FROM \"{s}\" WHERE address = {s} AND seen_v1 = 0 AND seen_v2 = 0", .{ e.table, addr });
                 defer allocator.free(del);
                 var dq = try Query.init(db, del);
                 defer dq.deinit();
                 try dq.bindText(e.old_row);
                 try dq.exec();
             } else {
-                // Single-protocol reorg_active table (v1_controllers): the row did not
-                // exist at N, so delete it by primary key.
-                const pk = try pkColumn(db, allocator, e.table);
-                defer allocator.free(pk);
-                const del = try std.fmt.allocPrint(allocator, "DELETE FROM \"{s}\" WHERE \"{s}\" = json_extract(?1, '$.{s}')", .{ e.table, pk, pk });
+                // Single-protocol reorg_active table (v1_controllers, unknown_labels):
+                // the row did not exist at N, so delete it by primary key. The PK's
+                // declared type is the Postgres `->>` cast — numeric PKs like
+                // unknown_labels.id need it; SQLite ignores the cast.
+                const info = try db.introspectColumns(allocator, e.table);
+                defer backend.freeColumnInfo(allocator, info);
+                const pk = for (info) |col| {
+                    if (col.pk_pos > 0) break col;
+                } else return error.NoPrimaryKey;
+                const cast: ?[]const u8 = if (pk.sql_type.len == 0) null else pk.sql_type;
+                const key_expr = try dialect.jsonExtract(allocator, "?1", pk.name, cast);
+                defer allocator.free(key_expr);
+                const del = try std.fmt.allocPrint(allocator, "DELETE FROM \"{s}\" WHERE \"{s}\" = {s}", .{ e.table, pk.name, key_expr });
                 defer allocator.free(del);
                 var dq = try Query.init(db, del);
                 defer dq.deinit();
@@ -364,29 +442,41 @@ pub fn replayUndo(db: *Database, protocol: models.Protocol, block_number: u64) !
 fn getRestoreSql(db: *Database, allocator: std.mem.Allocator, cache: *std.StringHashMap([]u8), table: []const u8) ![]u8 {
     if (cache.get(table)) |sql| return sql;
 
-    const cols = try getColumns(db, allocator, table);
-    defer freeColumns(allocator, cols);
+    // Read column names, per-column value expressions, and the PK conflict target
+    // from the live schema, so new columns are restored automatically. Each value
+    // expr extracts the column from the captured JSON snapshot (`?1`); on Postgres
+    // the column's declared type becomes the `->>` cast (SQLite ignores it). The
+    // restore overwrites the existing row by PRIMARY KEY (ON CONFLICT target on PG;
+    // implicit for SQLite's INSERT OR REPLACE).
+    const info = try db.introspectColumns(allocator, table);
+    defer backend.freeColumnInfo(allocator, info);
 
-    var sql: std.ArrayList(u8) = .{};
-    errdefer sql.deinit(allocator);
-    try sql.writer(allocator).print("INSERT OR REPLACE INTO \"{s}\" (", .{table});
-    for (cols, 0..) |c, i| {
-        if (i > 0) try sql.appendSlice(allocator, ", ");
-        try sql.writer(allocator).print("\"{s}\"", .{c});
+    const col_names = try allocator.alloc([]const u8, info.len);
+    defer allocator.free(col_names);
+    const value_exprs = try allocator.alloc([]const u8, info.len);
+    var built: usize = 0;
+    defer {
+        for (value_exprs[0..built]) |e| allocator.free(e);
+        allocator.free(value_exprs);
     }
-    try sql.appendSlice(allocator, ") VALUES (");
-    for (cols, 0..) |c, i| {
-        if (i > 0) try sql.appendSlice(allocator, ", ");
-        try sql.writer(allocator).print("json_extract(?1, '$.{s}')", .{c});
-    }
-    try sql.appendSlice(allocator, ")");
+    var pk_cols: std.ArrayList([]const u8) = .{};
+    defer pk_cols.deinit(allocator);
 
-    const owned = try sql.toOwnedSlice(allocator);
-    errdefer allocator.free(owned);
+    const dialect = db.dialect();
+    for (info, 0..) |col, i| {
+        col_names[i] = col.name;
+        const cast: ?[]const u8 = if (col.sql_type.len == 0) null else col.sql_type;
+        value_exprs[i] = try dialect.jsonExtract(allocator, "?1", col.name, cast);
+        built += 1;
+        if (col.pk_pos > 0) try pk_cols.append(allocator, col.name);
+    }
+
+    const sql = try dialect.upsert(allocator, table, col_names, value_exprs, pk_cols.items, .replace);
+    errdefer allocator.free(sql);
     const key = try allocator.dupe(u8, table);
     errdefer allocator.free(key);
-    try cache.put(key, owned);
-    return owned;
+    try cache.put(key, sql);
+    return sql;
 }
 
 /// Prune undo entries older than `keep_from_block` (retention housekeeping).

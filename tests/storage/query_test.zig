@@ -405,7 +405,39 @@ test "Dialect: returning / nowEpoch / jsonObject / jsonExtract" {
     defer allocator.free(obj);
     try testing.expectEqualStrings("json_object('protocol', OLD.\"protocol\", 'namehash', OLD.\"namehash\")", obj);
 
-    const ext = try d.jsonExtract(allocator, "?1", "owner");
+    // cast_type is a Postgres concern; SQLite ignores it (same output either way).
+    const ext = try d.jsonExtract(allocator, "?1", "owner", null);
     defer allocator.free(ext);
     try testing.expectEqualStrings("json_extract(?1, '$.owner')", ext);
+
+    const ext_cast = try d.jsonExtract(allocator, "?1", "expiry", "bigint");
+    defer allocator.free(ext_cast);
+    try testing.expectEqualStrings("json_extract(?1, '$.expiry')", ext_cast);
+}
+
+test "Database.introspectColumns: names, declared types, and PK position" {
+    const allocator = testing.allocator;
+    const database = try createTestDb(allocator);
+    defer destroyTestDb(allocator, database);
+
+    try database.exec(
+        \\CREATE TABLE introspect_t (
+        \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\  name TEXT NOT NULL,
+        \\  count INTEGER
+        \\)
+    );
+
+    const cols = try database.introspectColumns(allocator, "introspect_t");
+    defer lib.storage.backend.freeColumnInfo(allocator, cols);
+
+    try testing.expectEqual(@as(usize, 3), cols.len);
+    try testing.expectEqualStrings("id", cols[0].name);
+    try testing.expectEqualStrings("INTEGER", cols[0].sql_type);
+    try testing.expect(cols[0].pk_pos > 0); // id is the primary key
+    try testing.expectEqualStrings("name", cols[1].name);
+    try testing.expectEqualStrings("TEXT", cols[1].sql_type);
+    try testing.expectEqual(@as(i64, 0), cols[1].pk_pos); // not part of PK
+    try testing.expectEqualStrings("count", cols[2].name);
+    try testing.expectEqual(@as(i64, 0), cols[2].pk_pos);
 }

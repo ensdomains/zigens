@@ -679,12 +679,9 @@ pub const Indexer = struct {
                 // mirror in handleV1NameWrapped/FusesSet/ExpiryExtended needs to
                 // read existing wrapper state, which the write_buffer can't
                 // service during bulk sync. Run a one-shot bulk UPDATE now that
-                // the buffer is flushed and indexes are restored.
-                const pcc_rows = self.database.materializePccDomainExpiry() catch |err| blk: {
-                    std.log.warn("materializePccDomainExpiry failed: {}", .{err});
-                    break :blk 0;
-                };
-                std.log.info("PCC Domain.expiry mirror materialized: {d} row(s) updated", .{pcc_rows});
+                // the buffer is flushed and indexes are restored (cursor disarmed
+                // so it doesn't self-capture into the reorg undo-log).
+                self.materializePccUncaptured();
 
                 if (self.webhook_manager) |wm| {
                     std.log.info("Initial sync complete - starting 8 webhook workers", .{});
@@ -741,11 +738,7 @@ pub const Indexer = struct {
                     // the write_buffer can't service during bulk sync. Run a
                     // one-shot bulk UPDATE now that the buffer is flushed.
                     if (protocol == .v1) {
-                        const pcc_rows = self.database.materializePccDomainExpiry() catch |err| blk: {
-                            std.log.warn("materializePccDomainExpiry failed: {}", .{err});
-                            break :blk 0;
-                        };
-                        std.log.info("PCC Domain.expiry mirror materialized: {d} row(s) updated", .{pcc_rows});
+                        self.materializePccUncaptured();
                     }
 
                     if (self.webhook_manager) |wm| {
@@ -753,7 +746,12 @@ pub const Indexer = struct {
                         try wm.startWorkers(1);
                     }
 
-                    // Backfill pre-migration names after initial sync completes
+                    // Backfill pre-migration names after initial sync completes.
+                    // INVARIANT: the reorg cursor is disarmed here — materializePccUncaptured
+                    // above cleared it and nothing re-arms it until the next indexProtocol —
+                    // so these one-shot backfills (which UPDATE/DELETE protected & reorg_active
+                    // tables, incl. unknown_labels) do NOT self-capture into the undo-log, per the
+                    // backfill-doesn't-capture rule. Keep any new backfill inside this disarmed block.
                     if (protocol == .v1) {
                         std.log.info("Running pre-migration names backfill...", .{});
                         self.backfillPreMigrationNames() catch |err| {
@@ -843,6 +841,25 @@ pub const Indexer = struct {
     pub fn invalidateReorgCursor(self: *Indexer) void {
         self.reorg_cursor_block = -1;
         self.reorg_cursor_proto = -1;
+    }
+
+    /// Run the one-shot PCC Domain.expiry mirror with reorg-undo capture DISARMED.
+    /// `materializePccDomainExpiry` is a derived bulk recompute (not block
+    /// processing), so it must not self-capture: a captured undo row would, on a
+    /// later reorg, wrongly revert the mirror back to its pre-materialize expiry.
+    /// We disarm the cursor exactly like backfill/replay (reorg_undo.clearCursor)
+    /// and re-arm lazily — `invalidateReorgCursor` makes the next markEventBlock
+    /// re-set the DB cursor. Wrapped names are V1-only (NameWrapper).
+    fn materializePccUncaptured(self: *Indexer) void {
+        reorg_undo.clearCursor(self.database, .v1) catch |err| {
+            std.log.warn("reorg undo-log: failed to disarm cursor before PCC materialize: {}", .{err});
+        };
+        defer self.invalidateReorgCursor();
+        const pcc_rows = self.database.materializePccDomainExpiry() catch |err| {
+            std.log.warn("materializePccDomainExpiry failed: {}", .{err});
+            return;
+        };
+        std.log.info("PCC Domain.expiry mirror materialized: {d} row(s) updated", .{pcc_rows});
     }
 
     /// True if the stored hash for `block_number` still matches the protocol, or no hash is stored.
