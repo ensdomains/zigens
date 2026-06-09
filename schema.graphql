@@ -374,6 +374,14 @@ type Domain {
   """Count of events associated with this domain"""
   eventsCount: Int!
 
+  """
+  Number of distinct accounts holding any label-scoped role on this label,
+  matched by the label's canonical (version-independent) token id and its
+  registry. Excludes the registry-wide root/admin role and empty role bitmaps,
+  so it reflects only roles tied to this individual label.
+  """
+  roleHolderCount: Int!
+
   """V1 NameWrapper wrapped-domain record. Null for V2 or unwrapped domains."""
   wrappedDomain: WrappedDomain
 

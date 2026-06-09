@@ -309,6 +309,49 @@ pub fn getRoleCountFiltered(db: *Database, filters: RoleCountFilters) !usize {
     return 0;
 }
 
+/// Count distinct accounts holding any label-scoped role on a single label,
+/// keyed by the label's canonical (version-stripped) token id.
+///
+/// A role's `resource` is the token's `canonical_id` and its `contract_address`
+/// is the registry that owns the label, so the join key is
+/// `(canonical_id, registry)` — version-independent, matching the same shape
+/// used by `getRolesByResource`. Empty role bitmaps are excluded (mirroring the
+/// portal's `if (roleBitmap === 0n) continue`), since grant-then-revoke or
+/// backfill can leave a row with an all-zero bitmap. A label's `canonical_id` is
+/// non-zero, so the registry-wide root role (resource = 0x0…0) is naturally
+/// excluded by the resource match. This replaces the client-side
+/// fetch-all-roles + group-by-resource counting previously done in the portal.
+///
+/// `role_bitmap` is always stored as the fixed-width `0x` + 64-hex form (see
+/// `handlers_registry` EACRolesChanged), so the only zero representation is the
+/// all-zeros literal compared below.
+const ZERO_ROLE_BITMAP = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+pub fn getLabelRoleHolderCount(
+    db: *Database,
+    protocol: models.Protocol,
+    canonical_id_hex: []const u8,
+    registry: Address,
+) !usize {
+    const sql =
+        \\SELECT COUNT(DISTINCT account)
+        \\FROM eac_roles
+        \\WHERE protocol = ? AND resource = ? AND contract_address = ?
+        \\  AND role_bitmap != ?
+    ;
+
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+
+    try q.bindTextStatic(protocol.toString());
+    try q.bindText(canonical_id_hex);
+    try q.bindAddress(registry);
+    try q.bindTextStatic(ZERO_ROLE_BITMAP);
+
+    if (try q.step()) return @intCast(q.getInt64(0));
+    return 0;
+}
+
 /// Delete role assignment (when all roles revoked)
 pub fn deleteEACRole(db: *Database, protocol: models.Protocol, resource: []const u8, account: Address, contract_address: Address) !void {
     const sql = "DELETE FROM eac_roles WHERE protocol = ? AND resource = ? AND account = ? AND contract_address = ?";
