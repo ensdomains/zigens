@@ -478,3 +478,37 @@ test "postgres openFromConfig: Config(postgres) → bootstrapped Database" {
 
     std.debug.print("✓ openFromConfig(Config postgres) bootstrapped a working PG Database\n", .{});
 }
+
+// The API's read path: openFromConfigReadonly connects to an already-bootstrapped PG DB
+// WITHOUT running schema/migrate (mirrors initWithoutSchema), and the dialect-aware
+// checkIntegrity (PG → SELECT 1) works. Writer bootstraps + inserts; a second read-only
+// handle reads it back.
+test "postgres openFromConfigReadonly: connects without bootstrap, checkIntegrity + read work" {
+    const a = testing.allocator;
+    const cfg = pgTestConfig() catch return error.SkipZigTest;
+    const nh = try namehash(a, "alice.eth");
+
+    // Writer: bootstrap (fresh schema) + insert one name, then close.
+    {
+        var raw = openBe() catch return error.SkipZigTest;
+        defer raw.vtable.close(raw.ptr);
+        try raw.vtable.execRaw(raw.ptr, "DROP SCHEMA public CASCADE; CREATE SCHEMA public");
+    }
+    {
+        var w = db_open.openFromConfig(a, cfg) catch return error.SkipZigTest;
+        defer w.deinit();
+        var n = try makeName(a, nh, try Address.fromHex("0x00000000000000000000000000000000000000bb"));
+        defer n.deinit(a);
+        try w.insertName(n);
+    }
+
+    // Read-only open: no bootstrap, integrity probe + read succeed against the live PG.
+    var ro = try db_open.openFromConfigReadonly(a, cfg);
+    defer ro.deinit();
+    try testing.expect(try ro.checkIntegrity()); // PG path: SELECT 1
+    var got = (try ro.getNameByNamehash(nh)) orelse return error.NameNotFound;
+    defer got.deinit(a);
+    try testing.expectEqualStrings("alice.eth", got.name.?);
+
+    std.debug.print("✓ openFromConfigReadonly read an existing PG row without bootstrapping\n", .{});
+}

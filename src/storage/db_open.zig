@@ -36,3 +36,15 @@ pub fn openFromConfig(allocator: std.mem.Allocator, cfg: config.Config) !Databas
     const be = try selectBackend(allocator, cfg.backend_kind, cfg.database_path, cfg.database_url);
     return Database.initWithBackend(allocator, be);
 }
+
+/// Config-driven read-only open: select the backend per `cfg` but SKIP schema bootstrap
+/// (no loadSchemaFiles/migrate/reorg-install) — the cross-backend equivalent of
+/// `Database.initWithoutSchema`. Used by the API server, a read-only consumer of a DB the
+/// indexer is the sole writer of; running migrate here would take a startup write lock
+/// that collides with a running indexer. Caller owns the Database (deinit closes it).
+pub fn openFromConfigReadonly(allocator: std.mem.Allocator, cfg: config.Config) !Database {
+    return .{
+        .allocator = allocator,
+        .backend = try selectBackend(allocator, cfg.backend_kind, cfg.database_path, cfg.database_url),
+    };
+}

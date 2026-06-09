@@ -294,6 +294,14 @@ pub fn pruneOldBlockHashes(db: *Database, protocol: models.Protocol, current_blo
 
 /// Verify database integrity (uses quick_check for performance on large databases)
 pub fn checkIntegrity(db: *Database) !bool {
+    if (db.isPostgres()) {
+        // Postgres has no PRAGMA quick_check; a successful trivial query is the
+        // connectivity/liveness probe (deep page verification is the server's job).
+        var q = try Query.init(db, "SELECT 1");
+        defer q.deinit();
+        return try q.step();
+    }
+
     const sql = "PRAGMA quick_check";
 
     var q = try Query.init(db, sql);

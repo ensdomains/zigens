@@ -1205,9 +1205,29 @@ PostgreSQL work begins.
   (sqlite + postgres dispatch + missing-URL error), and `openFromConfig(Config postgres)` → bootstrapped
   PG Database with an `insertName` round-trip. Two reviewers clean (memory: open()/close() errdefer chain
   frees each duped string exactly once on every failure interleaving, no leak/double-free; adversarial:
-  parser correct + panic-free, no silent postgres→sqlite fallback). Still next: wire the indexer/API mains
-  to `openFromConfig` (+ add `pg` to the exe modules in build.zig) — gated behind the reorg-rollback-on-PG
-  fix (Finding A) and a real `changes()` before live PG *indexing* is enabled.
+  parser correct + panic-free, no silent postgres→sqlite fallback).
+  **Mains wired to config-driven open (test-pg 14/14; the real `ensv2-api` binary connects to live PG).**
+  The three indexer mains switched `Database.init(cfg.database_path)` → `db_open.openFromConfig(cfg)` (full
+  bootstrap) + an experimental-PG `log.warn`; `api_main` switched `initWithoutSchema(cfg.database_path)` →
+  the new `db_open.openFromConfigReadonly(cfg)` (selectBackend + bare `Database`, NO bootstrap/migrate — the
+  API is a read-only consumer and must not take a startup write lock that collides with the indexer; the
+  no-write-lock invariant is preserved on both backends). `sync.checkIntegrity` gained a PG branch
+  (`SELECT 1` liveness probe vs SQLite's `PRAGMA quick_check` page-integrity check — an intentional,
+  in-code-documented asymmetry: deep verification is the server's job on PG). `build.zig` adds the `pg`
+  module to exactly the 6 modules that root at a `db_open`-importing main (indexer/v1/v2 exes, api exe,
+  unit_tests, api_tests); `database.zig` stays pg-free so the storage core and non-main targets
+  (`indexer_test`, tools) don't pull pg. **SQLite is exactly behavior-neutral** for existing deployments
+  (no `DATABASE_BACKEND`/`DATABASE_URL` ⇒ `backend_kind=.sqlite` ⇒ `selectBackend(.sqlite, database_path,
+  null)` ⇒ the same `sqlite_driver.open` + same bootstrap as before — full suite stays 510/510). The
+  startup DB log is now backend-aware (`sqlite <path>` vs `postgres (via DATABASE_URL)` — never logs the
+  URL/password). Runtime-validated: `ensv2-api` started with `DATABASE_BACKEND=postgres` +
+  `DATABASE_URL=…ensv2_test` logged "Database connected" + "API server listening", and a
+  `openFromConfigReadonly` test reads a row a writer bootstrapped, without bootstrapping itself. A general
+  adversarial review confirmed SQLite neutrality + the read-only invariant + correct build-target coverage.
+  **Phase 4 backend seam is now complete end-to-end** (driver → dialect → schema → reorg → init →
+  selectBackend → config → mains). Remaining before live PG *indexing* in production: the
+  reorg-rollback-on-PG fix (Finding A — `getRestoreSql` keying on `id` vs the business key) and a real
+  `changes()` (Finding D); the experimental warn gates operators until then.
   The **network-independent slice is done + unit-tested**: `src/storage/drivers/postgres_dialect.zig`
   — the PG `Dialect` (`ON CONFLICT` upsert/insertSelect over non-key cols with the all-key→`DO NOTHING`
   edge; `(src::jsonb ->> 'col')::cast` jsonExtract; `jsonb_build_object`; `EXTRACT(EPOCH…)`;

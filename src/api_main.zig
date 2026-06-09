@@ -2,6 +2,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const api = @import("api/server.zig");
 const db = @import("storage/database.zig");
+const db_open = @import("storage/db_open.zig");
 const ens_normalize = @import("ens_normalize");
 
 pub fn main() !void {
@@ -38,13 +39,17 @@ pub fn main() !void {
     }
 
     std.log.info("ENSv2 API Server starting...", .{});
-    std.log.info("Database: {s}", .{cfg.database_path});
+    switch (cfg.backend_kind) {
+        .sqlite => std.log.info("Database: sqlite {s}", .{cfg.database_path}),
+        .postgres => std.log.info("Database: postgres (via DATABASE_URL)", .{}),
+    }
     std.log.info("Port: {d}", .{cfg.api_port});
     std.log.info("GraphQL Max Depth: {d}", .{cfg.graphql_max_depth});
     std.log.info("GraphQL Max Cost: {d}", .{cfg.graphql_max_cost});
 
-    // Initialize database (read-only for API - skip schema loading)
-    var database = try db.Database.initWithoutSchema(allocator, cfg.database_path);
+    // Initialize database (read-only for API - skip schema loading). Backend selected by
+    // config: SQLite path or DATABASE_URL. No bootstrap/migrate — the indexer owns writes.
+    var database = try db_open.openFromConfigReadonly(allocator, cfg);
     defer database.deinit();
     database.setChainId(cfg.network.chainId());
 

@@ -2,6 +2,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const indexer = @import("indexer/indexer.zig");
 const db = @import("storage/database.zig");
+const db_open = @import("storage/db_open.zig");
 
 // Configure logging: filter debug logs, use file redirection in production
 // Run with: ./ensv2-indexer-v1 > logs/indexer.log 2>&1 &
@@ -85,12 +86,18 @@ pub fn main() !void {
     std.log.info("Network: {s}", .{cfg.network.toString()});
     std.log.info("Database: {s}", .{cfg.database_path});
 
-    // Initialize database
-    var database = try db.Database.init(allocator, cfg.database_path);
+    // Initialize database (backend selected by config: SQLite path or DATABASE_URL).
+    if (cfg.backend_kind == .postgres) {
+        std.log.warn("PostgreSQL backend is EXPERIMENTAL for indexing (reorg rollback + affected-row counts incomplete); not recommended for production yet.", .{});
+    }
+    var database = try db_open.openFromConfig(allocator, cfg);
     defer database.deinit();
     database.setChainId(cfg.network.chainId());
 
-    std.log.info("Database initialized at: {s}", .{cfg.database_path});
+    switch (cfg.backend_kind) {
+        .sqlite => std.log.info("Database initialized: sqlite {s}", .{cfg.database_path}),
+        .postgres => std.log.info("Database initialized: postgres (via DATABASE_URL)", .{}),
+    }
 
     // In backfill mode, disable status server and webhooks to avoid DB lock contention
     if (mode == .backfill) {

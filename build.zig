@@ -45,6 +45,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
                 .{ .name = "eth", .module = eth_module },
+                .{ .name = "pg", .module = pg_module },
             },
         }),
     });
@@ -62,6 +63,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
                 .{ .name = "eth", .module = eth_module },
+                .{ .name = "pg", .module = pg_module },
             },
         }),
     });
@@ -79,6 +81,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
                 .{ .name = "eth", .module = eth_module },
+                .{ .name = "pg", .module = pg_module },
             },
         }),
     });
@@ -113,6 +116,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
+                .{ .name = "pg", .module = pg_module },
             },
         }),
     });
@@ -177,6 +181,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
                 .{ .name = "eth", .module = eth_module },
+                .{ .name = "pg", .module = pg_module },
             },
         }),
     });
@@ -329,6 +334,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
+                .{ .name = "pg", .module = pg_module },
             },
         }),
     });
