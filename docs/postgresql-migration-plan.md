@@ -1118,6 +1118,11 @@ PostgreSQL work begins.
   step (robust in a tx); real `changes()` (affected-rows, currently stubbed 0); optional prepared-stmt
   caching; then `applySchema`/`installPgTriggers` execution, `selectBackend`/config/`DATABASE_URL`, and
   the cross-backend A/B-parity lane.
+  **Schema transpilation validated end-to-end (test-pg 6/6):** the transpiled `schema/postgres/schema.sql`
+  (all 38 tables, BIGSERIAL, the seed `INSERT…ON CONFLICT DO NOTHING`, the `->>` expression index) loads
+  cleanly into a real PostgreSQL 17 after `DROP SCHEMA public CASCADE`, and a PG-dialect `ON CONFLICT DO
+  UPDATE` upsert round-trips on the real `sync_state` table (overwrites by PK, no duplicate) through the
+  full driver path — so the Phase-2 `gen_pg_schema.py` output is confirmed valid Postgres.
   The **network-independent slice is done + unit-tested**: `src/storage/drivers/postgres_dialect.zig`
   — the PG `Dialect` (`ON CONFLICT` upsert/insertSelect over non-key cols with the all-key→`DO NOTHING`
   edge; `(src::jsonb ->> 'col')::cast` jsonExtract; `jsonb_build_object`; `EXTRACT(EPOCH…)`;

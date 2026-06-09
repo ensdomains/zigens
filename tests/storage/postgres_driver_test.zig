@@ -91,3 +91,42 @@ test "postgres driver: begin/commit keeps a row, begin/rollback drops one" {
 // NOTE: introspectColumns (used by the reorg replay path, not core CRUD) is
 // implemented but its live test is deferred pending a conn-state/draining
 // investigation (the SELECT-then-reuse interaction with the held connection).
+
+// End-to-end: the transpiled Postgres schema (gen_pg_schema.py output) loads into a
+// real PostgreSQL, and a PG-dialect ON CONFLICT upsert round-trips on a real ENS table
+// through the driver. Proves the schema transpilation is valid PG and the dialect's
+// DO UPDATE overwrites (not duplicates) on the actual primary key.
+test "postgres: transpiled schema loads + PG-dialect upsert round-trips on sync_state" {
+    var be = openBe() catch return error.SkipZigTest;
+    defer be.vtable.close(be.ptr);
+    const a = testing.allocator;
+    const pgd = lib.storage.postgres_dialect.pg_dialect;
+
+    // Clean slate so every CREATE in the schema is actually validated this run.
+    try be.vtable.execRaw(be.ptr, "DROP SCHEMA public CASCADE; CREATE SCHEMA public");
+
+    const schema_sql = try std.fs.cwd().readFileAlloc(a, "schema/postgres/schema.sql", 1 << 20);
+    defer a.free(schema_sql);
+    try be.vtable.execRaw(be.ptr, schema_sql);
+
+    const cols = [_][]const u8{ "protocol", "last_synced_block", "last_synced_at" };
+    // Two upserts on the same protocol: the 2nd must overwrite via ON CONFLICT DO UPDATE.
+    inline for ([_]i64{ 12345, 99999 }) |block| {
+        const sql = try pgd.upsert(a, "sync_state", &cols, &.{}, &.{"protocol"}, .replace);
+        defer a.free(sql);
+        var st = try be.vtable.prepare(be.ptr, sql, false);
+        defer st.deinit();
+        try st.bindText("v1");
+        try st.bindInt64(block);
+        try st.bindInt64(1700000000);
+        try st.exec();
+    }
+
+    var st = try be.vtable.prepare(be.ptr, "SELECT last_synced_block, (SELECT COUNT(*) FROM sync_state) FROM sync_state WHERE protocol = ?", false);
+    defer st.deinit();
+    try st.bindText("v1");
+    try testing.expect(try st.step());
+    try testing.expectEqual(@as(i64, 99999), st.getInt64(0)); // overwritten, not the first value
+    try testing.expectEqual(@as(i64, 1), st.getInt64(1)); // exactly one row — no duplicate insert
+    try testing.expect(!try st.step());
+}
