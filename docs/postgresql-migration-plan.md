@@ -1341,8 +1341,25 @@ PostgreSQL work begins.
   order); the `pk_pos` fallback is only reached by single-column natural-key tables.
   **PostgreSQL is now validated across the entire test surface** — driver (test-pg 16/16), storage
   suites (test-storage-pg 132/132), and integration incl. the reorg reconcile (test-integration-pg
-  35/35). The last item before lifting the experimental-backend warning is a real end-to-end indexer
-  run against live Sepolia RPC writing to PG (operational validation, not a code gap).
+  35/35).
+  **End-to-end indexer run on PG — DONE, and it found a real bug.** `ensv2-indexer`
+  (DATABASE_BACKEND=postgres) against live Sepolia: bootstrapped PG (loaded schema/postgres, migrate,
+  reorg triggers), indexed a 300-block V1 range, committed the batch transaction, and wrote real data
+  to PG (names=1, registries=2, block_hashes=1, sync_state v1→10893510) — no crash, no PG error; V2
+  then began its subregistry backfill (the 7.5M-block backfill is why a full continuous run doesn't
+  terminate quickly in-sandbox). **The bug it surfaced:** `storage/transactions.zig`'s
+  begin/commit/rollback wrappers passed `db` (the `*Database`) to the vtable instead of
+  `db.backend.ptr` (the driver connection — what the `Tx` guard and every other call site pass). The
+  wrong pointer's field offsets landed benignly on SQLite (the bug was latent/masked) but cast to a
+  garbage `*pg.Conn` on Postgres → segfault at `conn.begin`. Fixed to pass `db.backend.ptr`; the
+  combined indexer then runs cleanly on BOTH backends (SQLite reaches the same "Synced v1" checkpoint),
+  and the full suite stays 512/512 (tests exercise the already-correct `Tx` guard, not the wrappers —
+  which is why only the live indexer caught it). **Out of scope / pre-existing:** `ensv2-indexer-v1`
+  (the V1-only binary) crashes with an Illegal-instruction at indexing start on BOTH backends, in the
+  `startSingleProtocol` path this migration never touched — a pre-existing, PG-unrelated bug to
+  investigate separately. The experimental-backend warning stays pending a longer real production sync
+  (a range with actual registrations end-to-end, and the V1-only-binary crash) — but the PG backend is
+  now functionally complete and end-to-end-proven for the main `ensv2-indexer`.
   The **network-independent slice is done + unit-tested**: `src/storage/drivers/postgres_dialect.zig`
   — the PG `Dialect` (`ON CONFLICT` upsert/insertSelect over non-key cols with the all-key→`DO NOTHING`
   edge; `(src::jsonb ->> 'col')::cast` jsonExtract; `jsonb_build_object`; `EXTRACT(EPOCH…)`;
