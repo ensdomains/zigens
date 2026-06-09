@@ -40,6 +40,13 @@
             .url = "git+https://github.com/StrobeLabs/eth.zig#757ac11ee5e6bf489aa82ff5db05f4b1fca09a21",
             .hash = "eth_zig-0.3.0-efEm-i65QgC_yawMMg1E1xrc3E8yTZsAlfhj0wJjPyMe",
         },
+        // PostgreSQL driver (Phase 4). Pinned to the zig-0.15 branch HEAD commit.
+        // Resolved from the package cache by hash (zig's git fetcher can't CONNECT-tunnel
+        // the sandbox proxy; the tarball was cached via curl + `zig fetch`).
+        .pg = .{
+            .url = "https://github.com/karlseguin/pg.zig/archive/78d52e52e7baabb5873df1a065d90a34fb174804.tar.gz",
+            .hash = "pg-0.0.0-Wp_7gU5zBgA4Ngj0opG4QGWPBjUzVZ8WT07s_uu64cC1",
+        },
     },
     .paths = .{
         "build.zig",

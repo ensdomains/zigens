@@ -1095,6 +1095,25 @@ PostgreSQL work begins.
   - **Defer to Phase 4:** PG `introspectColumns` (`information_schema`), `::type` cast *emission* +
     round-trip, `installPgTriggers` *execution*, cross-backend A/B Lane 2 (H1 decode-and-canonicalize),
     and the optional W9 write-path fallback if a third-party backend ever sets `server_side_undo=false`.
+- **Phase 4 — STARTED; pg.zig integrated, driver next.** The sandbox proxy actually *allows* github +
+  the Docker registry — the blocker was that zig's package fetcher can't CONNECT-tunnel the proxy. Cached
+  `pg.zig` (pinned `78d52e5`, zig-0.15) + its deps `buffer`/`metrics` via `curl` + `zig fetch`, added `pg`
+  to `build.zig.zon`/`build.zig`, and a smoke test confirms **pg.zig compiles under Zig 0.15.2** (TLS off
+  ⇒ `PlainStream`, no openssl/libc). See [[zig-fetch-proxy-workaround]]. A **live PostgreSQL 17** is set
+  up (apt; `127.0.0.1:5432`, `ensv2_test`, scram-sha-256; persisted in CLAUDE_ENV_FILE — see
+  [[local-postgres-setup]]) and **verified end-to-end**: `zig build test-pg` has pg.zig connect over TCP
+  and round-trip a typed query (2/2 pass, no skip). Remaining: **`drivers/postgres.zig`** itself
+  (Conn/Stmt/Row + pool with txn pinning + `?`→`$N` at prepare + coercing getters +
+  `applySchema`/`installPgTriggers`), then `selectBackend`/config/`DATABASE_URL` and the A/B-parity lane.
+  The **network-independent slice is done + unit-tested**: `src/storage/drivers/postgres_dialect.zig`
+  — the PG `Dialect` (`ON CONFLICT` upsert/insertSelect over non-key cols with the all-key→`DO NOTHING`
+  edge; `(src::jsonb ->> 'col')::cast` jsonExtract; `jsonb_build_object`; `EXTRACT(EPOCH…)`;
+  `placeholder = .dollar`) + the literal-aware `?`→`$N` lexer (`renumberPlaceholders`: bare `?`
+  auto-numbers, explicit `?N` preserved so the reorg restore's single `?1` stays one param, `?` inside
+  `'…'`/`"…"` skipped). 11 golden tests; both reviewers clean (lexer fuzzed 20k iterations; the
+  id-preservation divergence vs SQLite's delete+reinsert assessed unobservable — no FK references the
+  `.replace` tables' autoincrement ids). The eventual `drivers/postgres.zig` wires `pg_dialect` +
+  `renumberPlaceholders` into its `Backend`/prepare.
 
 ---
 

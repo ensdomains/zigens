@@ -20,6 +20,14 @@ pub fn build(b: *std.Build) void {
     });
     const eth_module = eth_dep.module("eth");
 
+    // PostgreSQL driver dependency (Phase 4). TLS is opt-in (off by default → no
+    // openssl/libc linkage), which suits a local/containerized test Postgres.
+    const pg_dep = b.dependency("pg", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const pg_module = pg_dep.module("pg");
+
     // Create GraphQL library module for use by test files
     const graphql_lib_mod = b.createModule(.{
         .root_source_file = b.path("src/lib/graphql/graphql.zig"),
@@ -524,6 +532,41 @@ pub fn build(b: *std.Build) void {
     const run_storage_query_tests = b.addRunArtifact(storage_query_tests);
     run_storage_query_tests.setCwd(b.path("."));
 
+    // PostgreSQL dialect + placeholder-lexer golden tests (pure string-gen; no pg.zig
+    // and no running Postgres — validates the Phase-4 dialect against fixed expectations).
+    const storage_pg_dialect_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/storage/postgres_dialect_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "lib", .module = lib_mod },
+            },
+        }),
+    });
+    storage_pg_dialect_tests.linkLibC();
+    storage_pg_dialect_tests.linkSystemLibrary("sqlite3");
+    const run_storage_pg_dialect_tests = b.addRunArtifact(storage_pg_dialect_tests);
+    run_storage_pg_dialect_tests.setCwd(b.path("."));
+
+    // Phase 4 dependency-integration gate: pg.zig compiles + its API imports under
+    // Zig 0.15.2 (TLS off ⇒ no openssl/libc). Its own `test-pg` step (not in the
+    // default `test`) until the real driver + a live Postgres land.
+    const pg_smoke_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/pg_smoke_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "pg", .module = pg_module },
+            },
+        }),
+    });
+    const run_pg_smoke_tests = b.addRunArtifact(pg_smoke_tests);
+    run_pg_smoke_tests.setCwd(b.path("."));
+    const pg_test_step = b.step("test-pg", "Run PostgreSQL driver/dependency tests (Phase 4)");
+    pg_test_step.dependOn(&run_pg_smoke_tests.step);
+
     // Conflict-key map: the only guard on the schema-derived ON CONFLICT targets
     // (SQLite ignores them, so they are invisible to behavioral tests).
     const storage_schema_keys_tests = b.addTest(.{
@@ -545,6 +588,7 @@ pub fn build(b: *std.Build) void {
     storage_test_step.dependOn(&run_storage_registry_entries_tests.step);
     storage_test_step.dependOn(&run_storage_query_tests.step);
     storage_test_step.dependOn(&run_storage_schema_keys_tests.step);
+    storage_test_step.dependOn(&run_storage_pg_dialect_tests.step);
 
     // Make the default test command run all tests
     test_step.dependOn(&run_filter_tests.step);
