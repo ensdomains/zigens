@@ -25,6 +25,7 @@ const backend = @import("backend.zig");
 const Database = db_module.Database;
 const Query = db_module.Query;
 const models = @import("../types/models.zig");
+const schema_keys = @import("schema_keys.zig");
 
 /// The mutation surface that needs undo coverage: every derived table mutated in
 /// place (UPDATE) or via clear-DELETE. Inserts are covered by sync.zig's deletes.
@@ -510,7 +511,18 @@ fn getRestoreSql(db: *Database, allocator: std.mem.Allocator, cache: *std.String
         if (col.pk_pos > 0) try pk_cols.append(allocator, col.name);
     }
 
-    const sql = try dialect.upsert(allocator, table, col_names, value_exprs, pk_cols.items, .replace);
+    // Postgres conflicts on the EXPLICIT target, so the restore must use the business
+    // UNIQUE key — otherwise a delete-then-reinsert-same-key within the reorg window
+    // (the live row carries the business key under a fresh surrogate `id`) raises a
+    // unique_violation on that constraint that an `ON CONFLICT (id)` can't catch, and
+    // aborts the rollback. conflictColsFor covers every reorg-captured table that has a
+    // surrogate `id` PK + a separate business UNIQUE; the `orelse pk_cols` fallback is
+    // reached only by the natural-key reorg_active tables whose PK IS the unique key
+    // (accounts → address, v1_controllers → controller_address). SQLite ignores
+    // conflict_cols (INSERT OR REPLACE conflicts on any unique), so this is a no-op
+    // there — the SQLite restore SQL is unchanged.
+    const conflict_cols = schema_keys.conflictColsFor(table) orelse pk_cols.items;
+    const sql = try dialect.upsert(allocator, table, col_names, value_exprs, conflict_cols, .replace);
     errdefer allocator.free(sql);
     const key = try allocator.dupe(u8, table);
     errdefer allocator.free(key);

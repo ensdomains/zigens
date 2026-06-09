@@ -512,3 +512,62 @@ test "postgres openFromConfigReadonly: connects without bootstrap, checkIntegrit
 
     std.debug.print("✓ openFromConfigReadonly read an existing PG row without bootstrapping\n", .{});
 }
+
+// Finding A regression: a protected row DELETEd then re-INSERTed under the SAME business
+// key within a reorg window. The live row now carries the business key under a FRESH
+// surrogate id; replayUndo's restore must conflict on the business UNIQUE (protocol,
+// namehash) — not the synthetic id — or Postgres raises a unique_violation that
+// `ON CONFLICT (id)` can't catch and ABORTS the rollback (where SQLite's INSERT OR
+// REPLACE recovers). Proves the rollback succeeds and restores the pre-reorg row (incl id).
+test "postgres reorg: delete-then-reinsert-same-key rolls back without aborting (Finding A)" {
+    const a = testing.allocator;
+    const reorg = lib.storage.reorg_undo;
+
+    {
+        var raw = openBe() catch return error.SkipZigTest;
+        defer raw.vtable.close(raw.ptr);
+        try raw.vtable.execRaw(raw.ptr, "DROP SCHEMA public CASCADE; CREATE SCHEMA public");
+    }
+    const cfg = pgTestConfig() catch return error.SkipZigTest;
+    var db = db_open.openFromConfig(a, cfg) catch return error.SkipZigTest;
+    defer db.deinit();
+
+    const nh = try namehash(a, "alice.eth");
+    const owner_x = try Address.fromHex("0x00000000000000000000000000000000000000bb");
+    const owner_y = try Address.fromHex("0x00000000000000000000000000000000000000cc");
+
+    // Pre-reorg state (no cursor → not captured): insert alice with owner X; record its id.
+    var n = try makeName(a, nh, owner_x);
+    defer n.deinit(a);
+    try db.insertName(n);
+    const id_before = try selectAliceId(&db);
+
+    // Arm capture at block 100, then DELETE alice (captures op D of the owner-X row) and
+    // re-INSERT the same (protocol, namehash) with owner Y — a brand-new surrogate id,
+    // NOT captured (protected tables don't capture INSERT).
+    try reorg.setCursor(&db, .v2, 100);
+    try db.exec("DELETE FROM names WHERE label = 'alice'");
+    n.owner = owner_y;
+    try db.insertName(n);
+    const id_reinserted = try selectAliceId(&db);
+    try testing.expect(id_reinserted != id_before); // fresh surrogate id
+
+    // Roll back everything after block 99. The restore conflicts on (protocol, namehash):
+    // it must NOT abort, and must bring the row back to its pre-reorg state.
+    try reorg.clearCursor(&db, .v2);
+    try reorg.replayUndo(&db, .v2, 99);
+
+    var got = (try db.getNameByNamehash(nh)) orelse return error.NameNotFound;
+    defer got.deinit(a);
+    try testing.expectEqualSlices(u8, &owner_x.bytes, &got.owner.bytes); // restored OLD owner
+    try testing.expectEqual(id_before, try selectAliceId(&db)); // restored OLD surrogate id
+
+    std.debug.print("✓ reorg delete+reinsert-same-key rolled back cleanly on PG (Finding A fixed)\n", .{});
+}
+
+fn selectAliceId(db: *lib.Database) !i64 {
+    var st = try db.backend.vtable.prepare(db.backend.ptr, "SELECT id FROM names WHERE label = 'alice'", false);
+    defer st.deinit();
+    if (!try st.step()) return error.AliceMissing;
+    return st.getInt64(0);
+}

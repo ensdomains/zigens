@@ -1228,6 +1228,36 @@ PostgreSQL work begins.
   selectBackend → config → mains). Remaining before live PG *indexing* in production: the
   reorg-rollback-on-PG fix (Finding A — `getRestoreSql` keying on `id` vs the business key) and a real
   `changes()` (Finding D); the experimental warn gates operators until then.
+  **Finding A FIXED — reorg rollback no longer aborts on Postgres (test-pg 15/15).**
+  `reorg_undo.getRestoreSql` now derives the restore's `ON CONFLICT` target from
+  `schema_keys.conflictColsFor(table) orelse pk_cols` instead of the introspected PK. The bug:
+  on PG the restore conflicted on the surrogate `id BIGSERIAL`, so a row DELETEd then
+  reINSERTed under the same business key within a reorg window (live row carries the key under a
+  fresh `id`) raised a `unique_violation` on the business UNIQUE that `ON CONFLICT (id)` can't
+  catch → aborted the whole rollback (SQLite's `INSERT OR REPLACE` conflicts on *any* unique, so
+  it recovered). The fix is a **no-op for SQLite** (its `dialectUpsert` ignores conflict_cols), so
+  the SQLite restore SQL is byte-identical and existing reorg behavior is unchanged (full suite
+  510/510). **Coverage:** `conflictColsFor` gained the 6 reorg-captured tables that have a
+  surrogate `id` PK + a separate business UNIQUE and weren't already dialect-upsert sites —
+  `registry_entries`, `eac_roles`, `resolver_metadata`, `resolver_approvals`, `reverse_records`
+  (inline `UNIQUE`), and `unknown_labels` (a reorg_active table whose uniqueness is a
+  `CREATE UNIQUE INDEX(labelhash, parent_node)`, both NOT NULL; ON CONFLICT infers the index). All
+  22 PROTECTED + 3 REORG_ACTIVE tables now resolve correctly: every surrogate-id+UNIQUE table via
+  its business key, and only the natural-PK reorg_active tables (`accounts`→address,
+  `v1_controllers`→controller_address) via the PK fallback. The 6 PG UNIQUE constraints were
+  verified present in `schema/postgres/schema.sql`. A new PG regression test reproduces the exact
+  delete-then-reinsert-same-key scenario on `names` and asserts the rollback succeeds and restores
+  the pre-reorg row including its surrogate `id`. Two reviewers ran (memory: no leak/UAF — the
+  conflict_cols slice is static or borrowed and consumed synchronously by `dialect.upsert`;
+  correctness: coverage complete, op-`I` delete unchanged + still correct, SQLite neutral).
+  **Boundary noted** (the schema's only FK is `unknown_labels.name_id → names(id) ON DELETE
+  CASCADE`): the `names` restore's `id = excluded.id` could reassign `names.id` on a same-key
+  reinsert, which would `foreign_key_violation` if a live child referenced the new id — but
+  `unknown_labels.name_id` is always NULL in practice (the sole `insertUnknownLabel` site passes
+  null), so the CASCADE never fires and the residual is theoretical. The fix is a strict
+  improvement (prior behavior was an *unconditional* abort). Any future change that populates
+  `unknown_labels.name_id` must revisit the names-restore id handling. Remaining for live PG
+  *indexing*: only Finding D (`changes()` affected-row count) now.
   The **network-independent slice is done + unit-tested**: `src/storage/drivers/postgres_dialect.zig`
   — the PG `Dialect` (`ON CONFLICT` upsert/insertSelect over non-key cols with the all-key→`DO NOTHING`
   edge; `(src::jsonb ->> 'col')::cast` jsonExtract; `jsonb_build_object`; `EXTRACT(EPOCH…)`;

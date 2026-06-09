@@ -1,4 +1,4 @@
-//! Single source of truth for each upsert table's conflict key.
+//! Single source of truth for each table's `ON CONFLICT` target.
 //!
 //! Every entry is the UNIQUE (or natural PRIMARY KEY) constraint that SQLite's
 //! `INSERT OR REPLACE`/`INSERT OR IGNORE` conflicts on, and that Postgres needs
@@ -7,6 +7,14 @@
 //! (tables with an autoincrement `id` PK carry a separate single `UNIQUE(...)`),
 //! so the target is unambiguous. SQLite ignores the key (the verb implies it);
 //! it is load-bearing only for the Postgres backend.
+//!
+//! Used by two consumers: the dialect upsert call sites, AND the reorg-undo restore
+//! (`reorg_undo.getRestoreSql`). The latter is why the last group below — protected
+//! tables that are NOT dialect-upsert sites but ARE reorg-captured — must be present:
+//! their restore must conflict on the business UNIQUE, not the surrogate `id`, or a
+//! reorg that deletes-then-reinserts the same key would abort with a unique_violation
+//! on Postgres (SQLite's `INSERT OR REPLACE` conflicts on any unique constraint, so it
+//! never hit this).
 const std = @import("std");
 
 const conflict_keys = std.StaticStringMap([]const []const u8).initComptime(.{
@@ -35,6 +43,17 @@ const conflict_keys = std.StaticStringMap([]const []const u8).initComptime(.{
     .{ "backfill_status", &[_][]const u8{"task"} },
     .{ "orphaned_registrations", &[_][]const u8{ "protocol", "tx_hash", "log_index" } },
     .{ "registrations", &[_][]const u8{ "protocol", "transaction_hash", "log_index" } },
+    // Reorg-captured tables that are NOT dialect-upsert sites — present here solely so
+    // getRestoreSql conflicts on the business UNIQUE (not the surrogate `id`). The first
+    // five are PROTECTED tables with an inline `UNIQUE(...)`; `unknown_labels` is a
+    // reorg_active table whose uniqueness is a separate `CREATE UNIQUE INDEX` (both cols
+    // NOT NULL, so no NULL-distinct surprise) — ON CONFLICT infers the index fine.
+    .{ "registry_entries", &[_][]const u8{ "protocol", "parent_registry", "canonical_id" } },
+    .{ "eac_roles", &[_][]const u8{ "protocol", "resource", "account", "contract_address" } },
+    .{ "resolver_metadata", &[_][]const u8{ "protocol", "resolver" } },
+    .{ "resolver_approvals", &[_][]const u8{ "protocol", "resolver", "namehash", "context", "delegate" } },
+    .{ "reverse_records", &[_][]const u8{ "protocol", "address" } },
+    .{ "unknown_labels", &[_][]const u8{ "labelhash", "parent_node" } },
 });
 
 /// The conflict-key columns for `table`, or null if the table is not a known
@@ -72,6 +91,12 @@ test "conflictColsFor matches every schema-derived key" {
         .{ "backfill_status", &[_][]const u8{"task"} },
         .{ "orphaned_registrations", &[_][]const u8{ "protocol", "tx_hash", "log_index" } },
         .{ "registrations", &[_][]const u8{ "protocol", "transaction_hash", "log_index" } },
+        .{ "registry_entries", &[_][]const u8{ "protocol", "parent_registry", "canonical_id" } },
+        .{ "eac_roles", &[_][]const u8{ "protocol", "resource", "account", "contract_address" } },
+        .{ "resolver_metadata", &[_][]const u8{ "protocol", "resolver" } },
+        .{ "resolver_approvals", &[_][]const u8{ "protocol", "resolver", "namehash", "context", "delegate" } },
+        .{ "reverse_records", &[_][]const u8{ "protocol", "address" } },
+        .{ "unknown_labels", &[_][]const u8{ "labelhash", "parent_node" } },
     };
     inline for (expected) |e| {
         try std.testing.expectEqualDeep(@as(?[]const []const u8, e[1]), conflictColsFor(e[0]));
