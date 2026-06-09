@@ -4,6 +4,7 @@ pub const storage = struct {
     pub const database = @import("storage/database.zig");
     pub const backend = @import("storage/backend.zig");
     pub const postgres_dialect = @import("storage/drivers/postgres_dialect.zig");
+    pub const postgres = @import("storage/drivers/postgres.zig");
     pub const Database = database.Database;
     pub const Query = database.Query;
 

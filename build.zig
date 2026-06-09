@@ -195,6 +195,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "eth", .module = eth_module },
+            .{ .name = "pg", .module = pg_module },
         },
     });
 
@@ -564,8 +565,26 @@ pub fn build(b: *std.Build) void {
     });
     const run_pg_smoke_tests = b.addRunArtifact(pg_smoke_tests);
     run_pg_smoke_tests.setCwd(b.path("."));
+
+    // Live PostgreSQL backend-driver tests (the Backend/Statement SPI on pg.zig).
+    const pg_driver_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/storage/postgres_driver_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "lib", .module = lib_mod },
+            },
+        }),
+    });
+    pg_driver_tests.linkLibC();
+    pg_driver_tests.linkSystemLibrary("sqlite3");
+    const run_pg_driver_tests = b.addRunArtifact(pg_driver_tests);
+    run_pg_driver_tests.setCwd(b.path("."));
+
     const pg_test_step = b.step("test-pg", "Run PostgreSQL driver/dependency tests (Phase 4)");
     pg_test_step.dependOn(&run_pg_smoke_tests.step);
+    pg_test_step.dependOn(&run_pg_driver_tests.step);
 
     // Conflict-key map: the only guard on the schema-derived ON CONFLICT targets
     // (SQLite ignores them, so they are invisible to behavioral tests).

@@ -42,3 +42,43 @@ test "pg.zig connects to the live Postgres and round-trips a typed query" {
     try std.testing.expectEqual(@as(i32, 42), try row.get(i32, 0));
     try std.testing.expectEqualStrings("ensv2", try row.get([]const u8, 1));
 }
+
+// De-risk the Backend/StmtVTable adapter: validate pg.zig's LOW-LEVEL prepared-
+// statement primitives (conn.prepare → sequential stmt.bind → execute → Result.next
+// → Row.get) + lifetimes — exactly what drivers/postgres.zig will adapt onto.
+test "pg.zig low-level prepare/bind/execute/iterate round-trip" {
+    const allocator = std.testing.allocator;
+    var pool = pg.Pool.init(allocator, .{
+        .size = 1,
+        .connect = .{ .host = "127.0.0.1", .port = 5432 },
+        .auth = .{ .username = "postgres", .password = "postgres", .database = "ensv2_test" },
+    }) catch return error.SkipZigTest;
+    defer pool.deinit();
+    var conn = pool.acquire() catch return error.SkipZigTest;
+    defer pool.release(conn);
+
+    _ = try conn.exec("CREATE TEMP TABLE pgz_probe (a text, b bigint, c smallint)", .{});
+
+    {
+        // execute() transfers the stmt's arena to the Result, so we free the Result,
+        // not the stmt (stmt.deinit only on a pre-execute error path).
+        var stmt = try conn.prepare("INSERT INTO pgz_probe (a, b, c) VALUES ($1, $2, $3)");
+        try stmt.bind(@as([]const u8, "hello"));
+        try stmt.bind(@as(i64, 42));
+        try stmt.bind(@as(i16, 7));
+        var res = try stmt.execute();
+        try res.drain(); // no rows to read, but the conn must be drained before reuse
+        res.deinit();
+    }
+    {
+        var stmt = try conn.prepare("SELECT a, b, c FROM pgz_probe WHERE b = $1");
+        try stmt.bind(@as(i64, 42));
+        var res = try stmt.execute();
+        defer res.deinit();
+        const r = (try res.next()) orelse return error.NoRow;
+        try std.testing.expectEqualStrings("hello", try r.get([]const u8, 0));
+        try std.testing.expectEqual(@as(i64, 42), try r.get(i64, 1));
+        try std.testing.expectEqual(@as(i16, 7), try r.get(i16, 2));
+        try std.testing.expect((try res.next()) == null);
+    }
+}

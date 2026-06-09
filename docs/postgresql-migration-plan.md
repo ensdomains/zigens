@@ -1102,9 +1102,22 @@ PostgreSQL work begins.
   ⇒ `PlainStream`, no openssl/libc). See [[zig-fetch-proxy-workaround]]. A **live PostgreSQL 17** is set
   up (apt; `127.0.0.1:5432`, `ensv2_test`, scram-sha-256; persisted in CLAUDE_ENV_FILE — see
   [[local-postgres-setup]]) and **verified end-to-end**: `zig build test-pg` has pg.zig connect over TCP
-  and round-trip a typed query (2/2 pass, no skip). Remaining: **`drivers/postgres.zig`** itself
-  (Conn/Stmt/Row + pool with txn pinning + `?`→`$N` at prepare + coercing getters +
-  `applySchema`/`installPgTriggers`), then `selectBackend`/config/`DATABASE_URL` and the A/B-parity lane.
+  and round-trip a typed query, AND the low-level prepared-statement path the driver adapts onto
+  (`conn.prepare` → sequential `stmt.bind` → `execute` → `Result.next` → `Row.get`) with the ownership
+  rules pinned (see [[pgzig-api-verified]]): execute transfers the Stmt arena to the Result (no
+  `stmt.deinit` after); the Result must be drained before connection reuse; `bind` OID-coerces ints and
+  takes the bare `null` for NULL. **`drivers/postgres.zig` now exists and is live-validated** against the
+  local PG (`tests/storage/postgres_driver_test.zig`, `test-pg` 5/5 green): the `VTable`/`StmtVTable` on
+  pg.zig — `open`/`close` (size-1 pool, pinned conn), `execRaw`, `?`→`$N` at prepare via
+  `renumberPlaceholders`, sequential binds (`bindText`/`Int64`/`Int`/`Null`), drain-aware exec/step,
+  **OID-dispatching coercing getters** (`columnInt64`/`Int` read int2/int4/int8/bool via `row.oids[col]`;
+  `columnText` for text), NULL handling, and `begin`/`commit`/`rollback`. Verified round-trip:
+  prepared INSERT (+NULL) → SELECT with bound param → typed/coerced reads; and a tx commit-keeps /
+  rollback-drops. Remaining driver refinements: `introspectColumns` live-validation (its query needs a
+  conn-state fix — used by reorg replay, not core CRUD); `finalize` should fully drain after a *partial*
+  step (robust in a tx); real `changes()` (affected-rows, currently stubbed 0); optional prepared-stmt
+  caching; then `applySchema`/`installPgTriggers` execution, `selectBackend`/config/`DATABASE_URL`, and
+  the cross-backend A/B-parity lane.
   The **network-independent slice is done + unit-tested**: `src/storage/drivers/postgres_dialect.zig`
   — the PG `Dialect` (`ON CONFLICT` upsert/insertSelect over non-key cols with the all-key→`DO NOTHING`
   edge; `(src::jsonb ->> 'col')::cast` jsonExtract; `jsonb_build_object`; `EXTRACT(EPOCH…)`;
