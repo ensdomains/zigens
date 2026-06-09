@@ -1302,12 +1302,25 @@ PostgreSQL work begins.
   SQLite accepts the qualified form too. (Also fixed a latent double-close in the PG test-helper
   setup error path.) Storage tests run under the leak-detecting testing.allocator, so 130/130 also
   clears the new dynamic-SQL allocations.
-  **Identified-but-not-yet-exercised PG gaps** (not hit by the storage lane; tracked for the
-  remaining breadth work): `events.zig`'s JSON-data filter/sort uses raw `json_extract` (route via
-  `dialect.jsonExtract`) — covered by events_test, not the storage suites; `unknown_labels.zig`'s
-  backfill-attempt `UPDATE` uses `strftime('%s','now')` (use `dialect.nowEpoch`); and the big
-  `tests/integration.zig` suite still calls `Database.init(:memory:)` directly (not routed through
-  the backend-aware helper), so retargeting it at PG is a further step.
+  **events `json_extract` + `unknown_labels` `strftime` FIXED + cross-backend tested (SQLite
+  test-storage 144/144; PG test-storage-pg 132/132).** The events filter/sort query builder routed
+  its raw `json_extract(data,'$.x')` through `dialect.jsonExtract(data, x, null)` wrapped in explicit
+  `CAST(… AS INTEGER)` / `LOWER(…)` (new helpers `jsonDataInt`/`jsonDataLower`/`expirySortExpr`) — the
+  explicit CAST keeps the SQLite form byte-identical and is valid PG; the `.expiry` sort + the
+  registration-style expiry filter (with/without the `$.expiration` fallback) are both dialect-built.
+  `EventSortField.toSql()` returns `""` for `.expiry` (built via `expirySortExpr` instead). bind order
+  is unchanged (the JSON expressions carry no placeholders). `unknown_labels.incrementBackfillAttempt`
+  swapped `strftime('%s','now')` → `dialect.nowEpoch`. New cross-backend tests (in names_test, run in
+  both lanes) assert the data_json_owner filter, expiry ascending sort, and `expiry_gte` filter on both
+  backends, plus the backfill-attempt now-epoch UPDATE. Two reviewers clean (memory: all intermediates
+  freed once, clause ownership single-owner; correctness: SQLite byte-equivalent, PG correct, bind
+  order preserved, the `[2048]u8` ORDER-BY buffer is actually *less* pressured on PG since its
+  expressions are ~4 bytes shorter per JSON fragment). One pre-existing, never-triggered edge recorded:
+  `CAST(<non-numeric string> AS INTEGER)` is lenient on SQLite (→0) but errors on PG — moot because
+  `data.$.expiry`/`$.duration` are always JSON integers from the indexer.
+  **Remaining breadth:** the big `tests/integration.zig` suite still calls `Database.init(:memory:)`
+  directly (not the backend-aware helper), so retargeting it at PG — plus a real end-to-end indexer run
+  on PG — is the last step before lifting the experimental-backend warning.
   The **network-independent slice is done + unit-tested**: `src/storage/drivers/postgres_dialect.zig`
   — the PG `Dialect` (`ON CONFLICT` upsert/insertSelect over non-key cols with the all-key→`DO NOTHING`
   edge; `(src::jsonb ->> 'col')::cast` jsonExtract; `jsonb_build_object`; `EXTRACT(EPOCH…)`;

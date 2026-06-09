@@ -10,6 +10,8 @@ const Address = lib.Address;
 const Hash = lib.Hash;
 const namehash_fn = lib.namehash;
 const labelhash_fn = lib.labelhash;
+const events = lib.storage.events;
+const unknown_labels = lib.storage.unknown_labels;
 
 // ============================================================================
 // REGISTRY OPERATIONS
@@ -939,4 +941,72 @@ test "getFilteredNames: nested or within and (deep tree, bind order)" {
     try testing.expectEqual(@as(usize, 2), names.len);
     try testing.expectEqualStrings("beta.eth", names[0].name.?);
     try testing.expectEqualStrings("gamma.eth", names[1].name.?);
+}
+
+// ============================================================================
+// CROSS-BACKEND: events JSON-data filters/sort + unknown_labels now-epoch.
+// These exercise the dialect-routed json_extract → (data::jsonb ->> 'x') and
+// strftime → EXTRACT(EPOCH) ports. Runs on SQLite (test-storage/test) and, via
+// the backend-aware helpers.createTestDatabase, on Postgres (test-storage-pg).
+// ============================================================================
+
+fn insertJsonEvent(db: *Database, block: u64, data: []const u8) !void {
+    try events.insertEvent(db, .{
+        .protocol = .v2,
+        .event_type = .name_registered,
+        .block_number = block,
+        .tx_hash = helpers.randomHash(),
+        .log_index = 0,
+        .contract_address = Address.zero,
+        .name = null,
+        .namehash = null,
+        .data = data,
+        .timestamp = 1700000000,
+    });
+}
+
+fn freeEvents(allocator: std.mem.Allocator, evs: []models.Event) void {
+    for (evs) |*e| e.deinit(allocator);
+    allocator.free(evs);
+}
+
+test "events JSON-data owner filter + expiry sort/filter are dialect-routed" {
+    const allocator = testing.allocator;
+    const db = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, db);
+
+    try insertJsonEvent(db, 10, "{\"owner\":\"0xAAA\",\"expiry\":200}");
+    try insertJsonEvent(db, 11, "{\"owner\":\"0xbbb\",\"expiry\":100}");
+
+    // data_json_owner: LOWER(<json owner>) = LOWER(?) — case-insensitive → only block 10.
+    {
+        const res = try events.getEventsFiltered(db, .{ .data_json_owner = "0xaaa" });
+        defer freeEvents(allocator, res);
+        try testing.expectEqual(@as(usize, 1), res.len);
+        try testing.expectEqual(@as(u64, 10), res[0].block_number);
+    }
+    // expiry sort ascending: COALESCE(CAST(<json expiry> AS INTEGER), …) → 100 (block 11) first.
+    {
+        const res = try events.getEventsFiltered(db, .{ .sort_field = .expiry, .order_dir = .asc });
+        defer freeEvents(allocator, res);
+        try testing.expectEqual(@as(usize, 2), res.len);
+        try testing.expectEqual(@as(u64, 11), res[0].block_number);
+        try testing.expectEqual(@as(u64, 10), res[1].block_number);
+    }
+    // expiry filter: expiry >= 150 → only block 10 (expiry 200).
+    {
+        const res = try events.getEventsFiltered(db, .{ .expiry_gte = 150 });
+        defer freeEvents(allocator, res);
+        try testing.expectEqual(@as(usize, 1), res.len);
+        try testing.expectEqual(@as(u64, 10), res[0].block_number);
+    }
+}
+
+test "unknown_labels.incrementBackfillAttempt uses the dialect now-epoch" {
+    const allocator = testing.allocator;
+    const db = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, db);
+    // The UPDATE runs (matching zero rows for a non-existent id) — what matters is that the
+    // now-epoch expression (strftime on SQLite, EXTRACT(EPOCH FROM now()) on PG) prepares + executes.
+    try unknown_labels.incrementBackfillAttempt(db, 999);
 }

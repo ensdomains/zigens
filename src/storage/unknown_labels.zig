@@ -125,12 +125,16 @@ pub fn getUnknownLabelsForBackfill(
 
 /// Increment backfill attempt counter for an unknown label
 pub fn incrementBackfillAttempt(db: *Database, id: i64) !void {
-    var q = try Query.init(db,
+    // `strftime('%s','now')` is SQLite-only; dialect.nowEpoch is the portable current-epoch
+    // expression (strftime on SQLite, EXTRACT(EPOCH FROM now())::bigint on Postgres).
+    const sql = try std.fmt.allocPrint(db.allocator,
         \\UPDATE unknown_labels
         \\SET backfill_attempts = backfill_attempts + 1,
-        \\    last_backfill_attempt = strftime('%s', 'now')
+        \\    last_backfill_attempt = {s}
         \\WHERE id = ?
-    );
+    , .{db.dialect().nowEpoch});
+    defer db.allocator.free(sql);
+    var q = try Query.init(db, sql);
     defer q.deinit();
     try q.bindInt64(id);
     try q.exec();

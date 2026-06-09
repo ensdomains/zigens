@@ -94,15 +94,50 @@ pub const EventSortField = enum {
     /// sorting in memory.
     expiry,
 
+    /// Non-JSON sort columns (valid verbatim on both backends). `.expiry` extracts JSON
+    /// data fields, so it is dialect-dependent and built via `expirySortExpr` instead.
     pub fn toSql(self: EventSortField) []const u8 {
         return switch (self) {
             .block_number => "block_number",
             .timestamp => "timestamp",
             .name => "name",
-            .expiry => "COALESCE(CAST(json_extract(data, '$.expiry') AS INTEGER), CAST(json_extract(data, '$.expiration') AS INTEGER), timestamp + CAST(json_extract(data, '$.duration') AS INTEGER))",
+            .expiry => "", // built dialect-aware by expirySortExpr; never used directly
         };
     }
 };
+
+/// `CAST(<json data.$.field> AS INTEGER)` — portable numeric JSON access. SQLite:
+/// `CAST(json_extract(data,'$.field') AS INTEGER)` (unchanged); Postgres:
+/// `CAST((data::jsonb ->> 'field') AS INTEGER)`. The explicit CAST (cast_type=null on
+/// jsonExtract) keeps the SQLite form identical and is valid on both. Caller owns result.
+fn jsonDataInt(db: *Database, field: []const u8) ![]u8 {
+    const je = try db.dialect().jsonExtract(db.allocator, "data", field, null);
+    defer db.allocator.free(je);
+    return std.fmt.allocPrint(db.allocator, "CAST({s} AS INTEGER)", .{je});
+}
+
+/// `LOWER(<json data.$.field>)` — portable case-folded text access. Caller owns result.
+fn jsonDataLower(db: *Database, field: []const u8) ![]u8 {
+    const je = try db.dialect().jsonExtract(db.allocator, "data", field, null);
+    defer db.allocator.free(je);
+    return std.fmt.allocPrint(db.allocator, "LOWER({s})", .{je});
+}
+
+/// Dialect-aware expiry ordering/filtering expression: the registration expiry from
+/// `data.$.expiry`/`$.expiration`, else `timestamp + data.$.duration`. `with_expiration`
+/// includes the `$.expiration` fallback (the sort does; the filter doesn't). Caller owns.
+fn expirySortExpr(db: *Database, with_expiration: bool) ![]u8 {
+    const expiry = try jsonDataInt(db, "expiry");
+    defer db.allocator.free(expiry);
+    const duration = try jsonDataInt(db, "duration");
+    defer db.allocator.free(duration);
+    if (with_expiration) {
+        const expiration = try jsonDataInt(db, "expiration");
+        defer db.allocator.free(expiration);
+        return std.fmt.allocPrint(db.allocator, "COALESCE({s}, {s}, timestamp + {s})", .{ expiry, expiration, duration });
+    }
+    return std.fmt.allocPrint(db.allocator, "COALESCE({s}, timestamp + {s})", .{ expiry, duration });
+}
 
 pub fn getRecentEvents(db: *Database, protocol: ?models.Protocol, event_type: ?models.EventType, limit: u32) ![]models.Event {
     return getRecentEventsWithOrder(db, protocol, event_type, limit, .desc);
@@ -290,12 +325,18 @@ fn appendEventScalarConditions(
     if (filter.timestamp_lt != null) try conditions.append(db.allocator, "timestamp < ?");
     if (filter.timestamp_lte != null) try conditions.append(db.allocator, "timestamp <= ?");
     if (filter.data_json_owner != null) {
-        try conditions.append(db.allocator, "LOWER(json_extract(data, '$.owner')) = LOWER(?)");
+        const owner_lower = try jsonDataLower(db, "owner");
+        defer db.allocator.free(owner_lower);
+        const clause = try std.fmt.allocPrint(db.allocator, "{s} = LOWER(?)", .{owner_lower});
+        try allocated_clauses.append(db.allocator, clause);
+        try conditions.append(db.allocator, clause);
     }
     if (filter.data_json_owners != null and filter.data_json_owners.?.len > 0) {
+        const owner_lower = try jsonDataLower(db, "owner");
+        defer db.allocator.free(owner_lower);
         var in_parts: std.ArrayList(u8) = .{};
         defer in_parts.deinit(db.allocator);
-        try in_parts.appendSlice(db.allocator, "LOWER(json_extract(data, '$.owner')) IN (");
+        try in_parts.writer(db.allocator).print("{s} IN (", .{owner_lower});
         for (filter.data_json_owners.?, 0..) |_, i| {
             if (i > 0) try in_parts.append(db.allocator, ',');
             try in_parts.appendSlice(db.allocator, "LOWER(?)");
@@ -305,12 +346,27 @@ fn appendEventScalarConditions(
         try allocated_clauses.append(db.allocator, clause);
         try conditions.append(db.allocator, clause);
     }
-    // Registration-style expiry filter (V2: data.$.expiry; V1: timestamp + data.$.duration)
-    const expiry_expr = "COALESCE(CAST(json_extract(data, '$.expiry') AS INTEGER), timestamp + CAST(json_extract(data, '$.duration') AS INTEGER))";
-    if (filter.expiry_gt != null) try conditions.append(db.allocator, expiry_expr ++ " > ?");
-    if (filter.expiry_gte != null) try conditions.append(db.allocator, expiry_expr ++ " >= ?");
-    if (filter.expiry_lt != null) try conditions.append(db.allocator, expiry_expr ++ " < ?");
-    if (filter.expiry_lte != null) try conditions.append(db.allocator, expiry_expr ++ " <= ?");
+    // Registration-style expiry filter (V2: data.$.expiry; V1: timestamp + data.$.duration).
+    if (filter.expiry_gt != null or filter.expiry_gte != null or filter.expiry_lt != null or filter.expiry_lte != null) {
+        const expiry_expr = try expirySortExpr(db, false); // filter omits the $.expiration fallback
+        defer db.allocator.free(expiry_expr);
+        if (filter.expiry_gt != null) try appendExpiryCond(db, conditions, allocated_clauses, expiry_expr, ">");
+        if (filter.expiry_gte != null) try appendExpiryCond(db, conditions, allocated_clauses, expiry_expr, ">=");
+        if (filter.expiry_lt != null) try appendExpiryCond(db, conditions, allocated_clauses, expiry_expr, "<");
+        if (filter.expiry_lte != null) try appendExpiryCond(db, conditions, allocated_clauses, expiry_expr, "<=");
+    }
+}
+
+fn appendExpiryCond(
+    db: *Database,
+    conditions: *std.ArrayList([]const u8),
+    allocated_clauses: *std.ArrayList([]const u8),
+    expiry_expr: []const u8,
+    op: []const u8,
+) !void {
+    const clause = try std.fmt.allocPrint(db.allocator, "{s} {s} ?", .{ expiry_expr, op });
+    try allocated_clauses.append(db.allocator, clause);
+    try conditions.append(db.allocator, clause);
 }
 
 /// Recursively build one event-filter node's boolean SQL (scalars + and/or).
@@ -497,7 +553,11 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     @memcpy(sql_buf[sql_len..][0..order_by_prefix.len], order_by_prefix);
     sql_len += order_by_prefix.len;
 
-    const sort_col = filter.sort_field.toSql();
+    // `.expiry` extracts JSON data fields, so it's dialect-dependent (built here); the
+    // other sort columns are plain column names valid verbatim on both backends.
+    const expiry_sort: ?[]u8 = if (filter.sort_field == .expiry) try expirySortExpr(db, true) else null;
+    defer if (expiry_sort) |e| db.allocator.free(e);
+    const sort_col = expiry_sort orelse filter.sort_field.toSql();
     @memcpy(sql_buf[sql_len..][0..sort_col.len], sort_col);
     sql_len += sort_col.len;
 
