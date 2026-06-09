@@ -1107,7 +1107,7 @@ PostgreSQL work begins.
   rules pinned (see [[pgzig-api-verified]]): execute transfers the Stmt arena to the Result (no
   `stmt.deinit` after); the Result must be drained before connection reuse; `bind` OID-coerces ints and
   takes the bare `null` for NULL. **`drivers/postgres.zig` now exists and is live-validated** against the
-  local PG (`tests/storage/postgres_driver_test.zig`, `test-pg` 5/5 green): the `VTable`/`StmtVTable` on
+  local PG (`tests/storage/postgres_driver_test.zig`, `test-pg` 7/7 green): the `VTable`/`StmtVTable` on
   pg.zig — `open`/`close` (size-1 pool, pinned conn), `execRaw`, `?`→`$N` at prepare via
   `renumberPlaceholders`, sequential binds (`bindText`/`Int64`/`Int`/`Null`), drain-aware exec/step,
   **OID-dispatching coercing getters** (`columnInt64`/`Int` read int2/int4/int8/bool via `row.oids[col]`;
@@ -1123,6 +1123,19 @@ PostgreSQL work begins.
   cleanly into a real PostgreSQL 17 after `DROP SCHEMA public CASCADE`, and a PG-dialect `ON CONFLICT DO
   UPDATE` upsert round-trips on the real `sync_state` table (overwrites by PK, no duplicate) through the
   full driver path — so the Phase-2 `gen_pg_schema.py` output is confirmed valid Postgres.
+  **First cross-backend A/B parity proven (test-pg 7/7):** the real storage `insertName` (the 33-column
+  `INSERT … ON CONFLICT(protocol,namehash) DO UPDATE SET col = excluded.col` upsert — already
+  dialect-agnostic, *not* a Phase-2 `INSERT OR REPLACE` routing site since `excluded.` upsert is valid on
+  both SQLite ≥3.24 and Postgres) and `getNameByNamehash` (the 33-column read through the coercing getters)
+  run against a **PG-backed `Database` constructed directly** over the live backend with
+  `schema/postgres/schema.sql` loaded, and the round-tripped `models.Name` is asserted **identical to the
+  SQLite baseline** across the full type spread — TEXT (`name`/`label`/`owner` addr-hex), BIGINT
+  (`expiry` u64, `created_block`), SMALLINT↔`bool` (`is_wrapped`/`migrated`/`is_normalized`), u256-as-TEXT
+  (`token_id`), and nullable BIGINT (`wrapper_expiry` `?i64`). This is the first proof that production
+  storage code — driver + PG dialect + OID-coercing getters — behaves identically on both backends end to
+  end (not just hand-written probe SQL). Constructed `Database` directly (`.{ .allocator, .backend }`)
+  rather than refactoring core `Database.init`/`loadSchemaFiles` for a backend seam yet — that wiring
+  (`initWithBackend` + `selectBackend`/`DATABASE_URL`) remains the next Phase-4 step.
   The **network-independent slice is done + unit-tested**: `src/storage/drivers/postgres_dialect.zig`
   — the PG `Dialect` (`ON CONFLICT` upsert/insertSelect over non-key cols with the all-key→`DO NOTHING`
   edge; `(src::jsonb ->> 'col')::cast` jsonExtract; `jsonb_build_object`; `EXTRACT(EPOCH…)`;
