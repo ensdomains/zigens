@@ -1127,3 +1127,32 @@ test "resolver approvals: context filter matches exactly; null means any" {
     }
     try testing.expectEqual(@as(usize, 1), only_a.len);
 }
+
+test "named resources: upsert per (resolver,resource) updates in place; reader orders by block" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const resolver = helpers.TEST_RESOLVER;
+    const res_a = "0x00000000000000000000000000000000000000000000000000000000000000a1";
+    const res_b = "0x00000000000000000000000000000000000000000000000000000000000000b2";
+
+    try database.upsertNamedResource(.v2, resolver, res_a, "text", "url", -1, "alice.eth", 100, helpers.randomHash(), 0);
+    // Re-announce of the same resource (e.g. re-index): updates, no second row.
+    try database.upsertNamedResource(.v2, resolver, res_a, "text", "url", -1, "alice.eth", 100, helpers.randomHash(), 0);
+    try database.upsertNamedResource(.v2, resolver, res_b, "addr", "", 60, "bob.eth", 101, helpers.randomHash(), 1);
+
+    const rows = try database.getNamedResources(allocator, .v2, resolver);
+    defer {
+        for (rows) |*r| r.deinit(allocator);
+        allocator.free(rows);
+    }
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings(res_a, rows[0].resource);
+    try testing.expectEqualStrings("text", rows[0].record_kind);
+    try testing.expectEqualStrings("url", rows[0].record_key);
+    try testing.expectEqualStrings("alice.eth", rows[0].name);
+    try testing.expectEqual(@as(i64, -1), rows[0].coin_type);
+    try testing.expectEqualStrings("addr", rows[1].record_kind);
+    try testing.expectEqual(@as(i64, 60), rows[1].coin_type);
+}

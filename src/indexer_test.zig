@@ -61,3 +61,19 @@ test "Approved event signature matches the deployed PublicResolver topic" {
     _ = try std.fmt.hexToBytes(&expect_bytes, "f0ddb3b04746704017f9aa8bd728fcc2c1d11675041205350018915f5e4750a0");
     try std.testing.expectEqualSlices(u8, &expect_bytes, &abi.EventSignatures.approved_hash.bytes);
 }
+
+test "Named*Resource signatures match the contracts-v2 PermissionedResolver topics" {
+    const abi = @import("indexer/abi.zig");
+    const cases = .{
+        .{ abi.EventSignatures.named_resource_hash, "737038e72be1d204e2c7336c20bff2169d9dffe11face28c5969af4ecce04f67" },
+        .{ abi.EventSignatures.named_text_resource_hash, "ab228e072dd20e63d6891264ea8f6a2459e6852ab494b707970f978ba630859c" },
+        .{ abi.EventSignatures.named_data_resource_hash, "db7aa4f21d01358b79d5574f3f3f6805f4f97606c53cb70598063387352206ac" },
+        .{ abi.EventSignatures.named_addr_resource_hash, "2fe6caf984256b1a1844b92f52cf88703e829b07ce397a6c7fcf1f779db7a185" },
+    };
+    inline for (cases) |case| {
+        var expect_bytes: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&expect_bytes, case[1]);
+        const got: [32]u8 = case[0].bytes;
+        try std.testing.expectEqualSlices(u8, &expect_bytes, &got);
+    }
+}

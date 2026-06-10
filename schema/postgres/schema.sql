@@ -489,6 +489,29 @@ CREATE INDEX IF NOT EXISTS idx_resolver_approvals_namehash ON resolver_approvals
 CREATE INDEX IF NOT EXISTS idx_resolver_approvals_delegate ON resolver_approvals(protocol, delegate);
 CREATE INDEX IF NOT EXISTS idx_resolver_approvals_context ON resolver_approvals(protocol, context);
 
+-- Resource-naming discovery (PermissionedResolver Named*Resource events): maps
+-- an EAC resource id to the name/record it guards on a resolver. Emitted once,
+-- on the first role grant for a resource. One row per (resolver, resource);
+-- record_key/coin_type are attributes ('' / -1 when not applicable), so the
+-- UNIQUE key has no nullable columns (SQL NULLs never conflict).
+CREATE TABLE IF NOT EXISTS resolver_named_resources (
+  id BIGSERIAL PRIMARY KEY,
+  protocol TEXT NOT NULL,
+  resolver TEXT NOT NULL,
+  resource TEXT NOT NULL,
+  record_kind TEXT NOT NULL,
+  record_key TEXT NOT NULL DEFAULT '',
+  coin_type BIGINT NOT NULL DEFAULT -1,
+  name TEXT NOT NULL,
+  block_number BIGINT NOT NULL,
+  transaction_hash TEXT NOT NULL,
+  log_index BIGINT NOT NULL,
+  timestamp BIGINT NOT NULL,
+  UNIQUE(protocol, resolver, resource)
+);
+
+CREATE INDEX IF NOT EXISTS idx_named_resources_resolver ON resolver_named_resources(protocol, resolver);
+
 
 -- ============================================================================
 -- EVENTS

@@ -554,6 +554,80 @@ pub fn handleApproved(self: *Indexer, protocol: models.Protocol, resolver: Addre
     try utils.emitEvent(self, protocol, log, .resolver_update, domain_name, namehash, event_data);
 }
 
+/// Shared body for the four PermissionedResolver Named*Resource events —
+/// resource-naming discovery for the EAC permission model, emitted on the
+/// FIRST role grant for a resource. topics[1] is the resource id (stored as
+/// its 32-byte hex); the name rides in data DNS-encoded (decode failures fold
+/// to null → warn + skip, matching the other DNS consumers).
+fn handleNamedResourceKind(
+    self: *Indexer,
+    protocol: models.Protocol,
+    resolver: Address,
+    log: rpc.Log,
+    record_kind: []const u8,
+    record_key: []const u8,
+    coin_type: i64,
+    name_bytes: []const u8,
+) !void {
+    if (log.topics.len < 2) return error.InvalidTopicCount;
+    var resource_buf: [66]u8 = undefined;
+    const resource_hex = log.topics[1].toHexBuf(&resource_buf);
+
+    const name = (try dns.decodeDNSNameToString(self.allocator, name_bytes)) orelse {
+        std.log.warn("NamedResource({s}): failed to decode DNS-encoded name for resource {s}", .{ record_kind, resource_hex });
+        return;
+    };
+    defer self.allocator.free(name);
+
+    self.database.upsertNamedResource(
+        protocol,
+        resolver,
+        resource_hex,
+        record_kind,
+        record_key,
+        coin_type,
+        name,
+        log.block_number,
+        log.transaction_hash,
+        log.log_index,
+    ) catch |err| {
+        std.log.warn("Failed to store named resource: {}", .{err});
+    };
+}
+
+/// NamedResource(uint256 indexed resource, bytes name)
+pub fn handleNamedResource(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
+    const data_values = try abi.decodeValues(log.data, &.{.bytes}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    try handleNamedResourceKind(self, protocol, resolver, log, "name", "", -1, data_values[0].bytes);
+}
+
+/// NamedTextResource(uint256 indexed resource, bytes name, bytes32 indexed keyHash, string key)
+pub fn handleNamedTextResource(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
+    const data_values = try abi.decodeValues(log.data, &.{ .bytes, .string }, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    try handleNamedResourceKind(self, protocol, resolver, log, "text", data_values[1].string, -1, data_values[0].bytes);
+}
+
+/// NamedDataResource(uint256 indexed resource, bytes name, bytes32 indexed keyHash, string key)
+pub fn handleNamedDataResource(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
+    const data_values = try abi.decodeValues(log.data, &.{ .bytes, .string }, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    try handleNamedResourceKind(self, protocol, resolver, log, "data", data_values[1].string, -1, data_values[0].bytes);
+}
+
+/// NamedAddrResource(uint256 indexed resource, bytes name, uint256 indexed coinType)
+pub fn handleNamedAddrResource(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
+    if (log.topics.len < 3) return error.InvalidTopicCount;
+    // ENSIP-11 coin types fit i64 in practice; anything larger stores the -1
+    // sentinel rather than truncating silently.
+    const raw: u256 = std.mem.readInt(u256, &log.topics[2].bytes, .big);
+    const coin_type: i64 = std.math.cast(i64, raw) orelse -1;
+    const data_values = try abi.decodeValues(log.data, &.{.bytes}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    try handleNamedResourceKind(self, protocol, resolver, log, "addr", "", coin_type, data_values[0].bytes);
+}
+
 /// Convert a byte slice to a `0x`-prefixed lowercase hex string. Caller owns
 /// the returned slice. Used for ENSIP-17 DNS record payloads.
 fn bytesToHexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {

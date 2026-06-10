@@ -52,6 +52,7 @@ pub const PROTECTED_TABLES = [_][]const u8{
     "resolver_dns_records",
     "resolver_dns_zonehashes",
     "resolver_authorisations",
+    "resolver_named_resources",
     "reverse_records",
 };
 

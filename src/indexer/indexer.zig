@@ -512,6 +512,10 @@ pub const Indexer = struct {
         .{ .event_hash = abi.EventSignatures.version_changed_hash, .handler = handleVersionChanged, .name = "VersionChanged" },
         .{ .event_hash = abi.EventSignatures.alias_changed_hash, .handler = handleAliasChanged, .name = "AliasChanged" },
         .{ .event_hash = abi.EventSignatures.eac_roles_changed_hash, .handler = handleResolverEACRolesChanged, .name = "EACRolesChanged" },
+        .{ .event_hash = abi.EventSignatures.named_resource_hash, .handler = handleNamedResource, .name = "NamedResource" },
+        .{ .event_hash = abi.EventSignatures.named_text_resource_hash, .handler = handleNamedTextResource, .name = "NamedTextResource" },
+        .{ .event_hash = abi.EventSignatures.named_data_resource_hash, .handler = handleNamedDataResource, .name = "NamedDataResource" },
+        .{ .event_hash = abi.EventSignatures.named_addr_resource_hash, .handler = handleNamedAddrResource, .name = "NamedAddrResource" },
     };
 
     // ========================================================================
@@ -1139,6 +1143,10 @@ pub const Indexer = struct {
     pub const handleLegacyTextChanged = handlers_v2_resolver.handleLegacyTextChanged;
     pub const handleAuthorisationChanged = handlers_v2_resolver.handleAuthorisationChanged;
     pub const handleApproved = handlers_v2_resolver.handleApproved;
+    pub const handleNamedResource = handlers_v2_resolver.handleNamedResource;
+    pub const handleNamedTextResource = handlers_v2_resolver.handleNamedTextResource;
+    pub const handleNamedDataResource = handlers_v2_resolver.handleNamedDataResource;
+    pub const handleNamedAddrResource = handlers_v2_resolver.handleNamedAddrResource;
     pub const handleDnsRecordChanged = handlers_v2_resolver.handleDnsRecordChanged;
     pub const handleDnsRecordDeleted = handlers_v2_resolver.handleDnsRecordDeleted;
     pub const handleDnsZonehashChanged = handlers_v2_resolver.handleDnsZonehashChanged;

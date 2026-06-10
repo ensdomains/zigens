@@ -34,6 +34,7 @@ pub const reorg_rollback_by_block_number = [_][]const u8{
     "eac_roles",
     "resolver_metadata",
     "resolver_approvals",
+    "resolver_named_resources",
     "registrations",
     "name_history",
 };

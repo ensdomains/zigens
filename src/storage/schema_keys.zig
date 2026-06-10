@@ -52,6 +52,7 @@ const conflict_keys = std.StaticStringMap([]const []const u8).initComptime(.{
     .{ "eac_roles", &[_][]const u8{ "protocol", "resource", "account", "contract_address" } },
     .{ "resolver_metadata", &[_][]const u8{ "protocol", "resolver" } },
     .{ "resolver_approvals", &[_][]const u8{ "protocol", "resolver", "namehash", "context", "delegate" } },
+    .{ "resolver_named_resources", &[_][]const u8{ "protocol", "resolver", "resource" } },
     .{ "reverse_records", &[_][]const u8{ "protocol", "address" } },
     .{ "unknown_labels", &[_][]const u8{ "labelhash", "parent_node" } },
 });
@@ -95,6 +96,7 @@ test "conflictColsFor matches every schema-derived key" {
         .{ "eac_roles", &[_][]const u8{ "protocol", "resource", "account", "contract_address" } },
         .{ "resolver_metadata", &[_][]const u8{ "protocol", "resolver" } },
         .{ "resolver_approvals", &[_][]const u8{ "protocol", "resolver", "namehash", "context", "delegate" } },
+        .{ "resolver_named_resources", &[_][]const u8{ "protocol", "resolver", "resource" } },
         .{ "reverse_records", &[_][]const u8{ "protocol", "address" } },
         .{ "unknown_labels", &[_][]const u8{ "labelhash", "parent_node" } },
     };
