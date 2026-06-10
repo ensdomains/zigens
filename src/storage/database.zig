@@ -845,6 +845,7 @@ pub const Database = struct {
     // Registry entries module — on-chain Entry mirror & reachability cascade
     pub const upsertRegistryEntrySubregistry = registry_entries.upsertSubregistry;
     pub const getRegistryEntrySubregistry = registry_entries.getSubregistry;
+    pub const getRegistryEntryLiveParents = registry_entries.getLiveParents;
     pub const collectSubregistrySubtree = registry_entries.collectSubtreeRooted;
     pub const setRegistriesReachability = registry_entries.setRegistriesReachability;
     pub const markNameUnreachableByNamehash = registry_entries.markNameUnreachableByNamehash;

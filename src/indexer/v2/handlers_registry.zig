@@ -12,6 +12,7 @@ const Address = @import("../../types/address.zig").Address;
 const unicode = @import("../../utils/unicode.zig");
 const Indexer = @import("../indexer.zig").Indexer;
 const utils = @import("../utils.zig");
+const registry_entries = @import("../../storage/registry_entries.zig");
 const json_utils = @import("../../utils/json.zig");
 
 // `handleSubregistryUpdate` (2-arg `SubregistryUpdate(uint256,address)`) was
@@ -292,7 +293,7 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
             }
 
             if (try rq.step()) {
-                std.log.warn("Multi-parent subregistry detected: address={s} has >1 parent at block {d}; this breaks the current lookup assumption", .{ registry_hex, log.block_number });
+                warnIfLiveMultiParent(self, protocol, registry_hex, log.block_number);
             }
         } else {
             // No parent found for this subregistry at this block
@@ -1230,7 +1231,7 @@ pub fn handleLabelRegistered(self: *Indexer, protocol: models.Protocol, log: rpc
             }
             // Warn if the V2 per-name-subregistry invariant is broken
             if (try rq.step()) {
-                std.log.warn("Multi-parent subregistry detected: address={s} has >1 parent at block {d}; this breaks the current lookup assumption", .{ registry_hex, log.block_number });
+                warnIfLiveMultiParent(self, protocol, registry_hex, log.block_number);
             }
         } else {
             std.log.debug("LabelRegistered: orphaning {s} - no parent found for subregistry {s} at block {d}", .{
@@ -1458,7 +1459,7 @@ pub fn handleLabelReserved(self: *Indexer, protocol: models.Protocol, log: rpc.L
                 parent_namehash = try Hash.fromHex(namehash_hex);
             }
             if (try rq.step()) {
-                std.log.warn("Multi-parent subregistry detected in LabelReserved: address={s} has >1 parent at block {d}", .{ registry_hex, log.block_number });
+                warnIfLiveMultiParent(self, protocol, registry_hex, log.block_number);
             }
         }
     }
@@ -1959,4 +1960,30 @@ pub fn handleResolverUpdated(self: *Indexer, protocol: models.Protocol, log: rpc
     const event_name = try self.allocator.dupe(u8, name_str);
 
     try utils.emitEvent(self, protocol, log, .resolver_updated, event_name, namehash_opt, event_data);
+}
+
+/// Audit #37: the parent reverse-lookup above reads `registries`, which is
+/// append-only HISTORY — a benign sequential repoint (old parent already
+/// cascade-invalidated before the new one registered) leaves >1 historical row
+/// and used to fire a false-positive warning. Gate on the `registry_entries`
+/// live mirror instead: only a registry with more than one entry CURRENTLY
+/// pointing at it is a true simultaneous multi-parent (a VerifiableFactory
+/// one-instance-per-name deployment-convention violation). Best-effort: a
+/// probe failure must not break event processing.
+fn warnIfLiveMultiParent(self: *Indexer, protocol: models.Protocol, registry_hex: []const u8, block_number: u64) void {
+    const parents = registry_entries.getLiveParents(self.database, self.allocator, protocol, registry_hex) catch |err| {
+        std.log.debug("multi-parent live-mirror probe failed for {s}: {}", .{ registry_hex, err });
+        return;
+    };
+    defer registry_entries.freeLiveParents(self.allocator, parents);
+    if (parents.len <= 1) return; // benign repoint: history has >1 parent, live mirror does not
+    std.log.warn("Multi-parent subregistry detected: address={s} has {d} live parents at block {d} (parent={s} canonical_id={s} vs parent={s} canonical_id={s}); one-instance-per-name deployment convention violated", .{
+        registry_hex,
+        parents.len,
+        block_number,
+        parents[0].parent_registry,
+        parents[0].canonical_id,
+        parents[1].parent_registry,
+        parents[1].canonical_id,
+    });
 }

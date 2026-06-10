@@ -22,6 +22,65 @@ fn formatU256HexBuf(buf: *[66]u8, value: u256) []const u8 {
     return std.fmt.bufPrint(buf, "0x{x:0>64}", .{value}) catch unreachable;
 }
 
+/// One live (parent_registry, canonical_id) entry currently pointing at a
+/// subregistry. Strings are allocator-owned; free via `freeLiveParents`.
+pub const LiveParent = struct {
+    parent_registry: []u8,
+    canonical_id: []u8,
+};
+
+pub fn freeLiveParents(allocator: std.mem.Allocator, parents: []LiveParent) void {
+    for (parents) |p| {
+        allocator.free(p.parent_registry);
+        allocator.free(p.canonical_id);
+    }
+    allocator.free(parents);
+}
+
+/// Live parents of `subregistry_hex` in the on-chain Entry mirror: the
+/// (parent_registry, canonical_id) rows whose pointer CURRENTLY targets it.
+/// The `registries` reverse-lookup the handlers use is append-only history, so
+/// it over-counts after benign sequential repoints; this is the live truth
+/// that gates the "Multi-parent subregistry" warning (audit #37) — > 1 row
+/// here is a TRUE simultaneous multi-parent (a VerifiableFactory
+/// one-instance-per-name deployment-convention violation). LIMIT 3: the
+/// warning needs "more than one" plus the two conflicting pairs, not the full
+/// set. Uses idx_registry_entries_subregistry. Caller frees via
+/// `freeLiveParents`.
+pub fn getLiveParents(
+    db: *Database,
+    allocator: std.mem.Allocator,
+    protocol: models.Protocol,
+    subregistry_hex: []const u8,
+) ![]LiveParent {
+    var q = try Query.initCached(db,
+        \\SELECT parent_registry, canonical_id FROM registry_entries
+        \\WHERE protocol = ? AND subregistry = ?
+        \\ORDER BY updated_block DESC
+        \\LIMIT 3
+    );
+    defer q.deinit();
+    try q.bindTextStatic(protocol.toString());
+    try q.bindText(subregistry_hex);
+
+    var parents: std.ArrayList(LiveParent) = .{};
+    errdefer {
+        for (parents.items) |p| {
+            allocator.free(p.parent_registry);
+            allocator.free(p.canonical_id);
+        }
+        parents.deinit(allocator);
+    }
+    while (try q.step()) {
+        const parent = try allocator.dupe(u8, q.getTextSlice(0) orelse continue);
+        errdefer allocator.free(parent);
+        const canonical = try allocator.dupe(u8, q.getTextSlice(1) orelse continue);
+        errdefer allocator.free(canonical);
+        try parents.append(allocator, .{ .parent_registry = parent, .canonical_id = canonical });
+    }
+    return parents.toOwnedSlice(allocator);
+}
+
 /// Upsert the subregistry pointer for a parent label's entry. Returns the
 /// *previous* pointer (Address.zero if no row existed) so the handler can
 /// decide whether to cascade-invalidate descendants.

@@ -370,3 +370,70 @@ test "getSubdomains excludes unreachable rows by default" {
     }
     try testing.expectEqual(@as(usize, 0), subs.len);
 }
+
+// ============================================================================
+// Audit #37: the "Multi-parent subregistry" warning is gated on the
+// registry_entries LIVE mirror (getLiveParents), not the append-only
+// `registries` history the handlers' reverse-lookup reads. These pin the
+// gate's decision input for both sides: a true simultaneous multi-parent
+// yields both conflicting pairs; a benign sequential repoint yields one.
+// ============================================================================
+
+test "getLiveParents: true simultaneous multi-parent returns both conflicting pairs" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const PARENT_2 = Address{ .bytes = [_]u8{0xE8} ** 20 };
+
+    // Two different (parent, canonical_id) entries point at SUB_A at once —
+    // the VerifiableFactory one-instance-per-name convention violation.
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_A, 1000, 1700000000);
+    _ = try database.upsertRegistryEntrySubregistry(.v2, PARENT_2, ONE_CANONICAL_ID, SUB_A, 1001, 1700000001);
+
+    var sub_hex_buf: [42]u8 = undefined;
+    const sub_hex = SUB_A.toHexBuf(&sub_hex_buf);
+    const parents = try database.getRegistryEntryLiveParents(allocator, .v2, sub_hex);
+    defer lib.storage.registry_entries.freeLiveParents(allocator, parents);
+
+    try testing.expectEqual(@as(usize, 2), parents.len);
+    var parent1_hex_buf: [42]u8 = undefined;
+    var parent2_hex_buf: [42]u8 = undefined;
+    const p1 = ETH_REGISTRY.toHexBuf(&parent1_hex_buf);
+    const p2 = PARENT_2.toHexBuf(&parent2_hex_buf);
+    // Newest-first (updated_block DESC): PARENT_2 then ETH_REGISTRY.
+    try testing.expectEqualStrings(p2, parents[0].parent_registry);
+    try testing.expectEqualStrings(p1, parents[1].parent_registry);
+    try testing.expect(parents[0].canonical_id.len == 66);
+}
+
+test "getLiveParents: benign sequential repoint leaves exactly one live parent" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const PARENT_2 = Address{ .bytes = [_]u8{0xE8} ** 20 };
+
+    // History: ETH_REGISTRY pointed at SUB_A, then repointed away to SUB_B
+    // (in-place entry update); later PARENT_2 claims SUB_A. The `registries`
+    // table would now show two historical parents for SUB_A (the old
+    // false-positive); the live mirror must show exactly one.
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_A, 1000, 1700000000);
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_B, 1010, 1700000010);
+    _ = try database.upsertRegistryEntrySubregistry(.v2, PARENT_2, ONE_CANONICAL_ID, SUB_A, 1020, 1700000020);
+
+    var sub_hex_buf: [42]u8 = undefined;
+    const sub_hex = SUB_A.toHexBuf(&sub_hex_buf);
+    const parents = try database.getRegistryEntryLiveParents(allocator, .v2, sub_hex);
+    defer lib.storage.registry_entries.freeLiveParents(allocator, parents);
+
+    try testing.expectEqual(@as(usize, 1), parents.len);
+    var parent2_hex_buf: [42]u8 = undefined;
+    try testing.expectEqualStrings(PARENT_2.toHexBuf(&parent2_hex_buf), parents[0].parent_registry);
+
+    // And after the only live parent also repoints away, zero remain.
+    _ = try database.upsertRegistryEntrySubregistry(.v2, PARENT_2, ONE_CANONICAL_ID, SUB_B, 1030, 1700000030);
+    const none = try database.getRegistryEntryLiveParents(allocator, .v2, sub_hex);
+    defer lib.storage.registry_entries.freeLiveParents(allocator, none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
