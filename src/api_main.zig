@@ -2,7 +2,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const api = @import("api/server.zig");
 const db = @import("storage/database.zig");
-const db_open = @import("storage/db_open.zig");
+const pool_mod = @import("storage/pool.zig");
 const ens_normalize = @import("ens_normalize");
 
 pub fn main() !void {
@@ -47,20 +47,32 @@ pub fn main() !void {
     std.log.info("GraphQL Max Depth: {d}", .{cfg.graphql_max_depth});
     std.log.info("GraphQL Max Cost: {d}", .{cfg.graphql_max_cost});
 
-    // Initialize database (read-only for API - skip schema loading). Backend selected by
-    // config: SQLite path or DATABASE_URL. No bootstrap/migrate — the indexer owns writes.
-    var database = try db_open.openFromConfigReadonly(allocator, cfg);
-    defer database.deinit();
-    database.setChainId(cfg.network.chainId());
+    // Read-only session pool (skip schema loading — the indexer owns writes):
+    // DATABASE_POOL_SIZE independent sessions acquired per request. Sessions are
+    // never shared across threads — SQLite gets N read connections to the file
+    // (:memory: pins to 1), and a single pinned pg connection is not
+    // concurrent-safe under the API's thread-per-request model.
+    var db_pool = try pool_mod.Pool.open(allocator, .{
+        .kind = cfg.backend_kind,
+        .sqlite_path = cfg.database_path,
+        .database_url = cfg.database_url,
+        .size = cfg.database_pool_size,
+        .chain_id = cfg.network.chainId(),
+    });
+    defer db_pool.deinit();
 
     // Check database integrity
-    const integrity_ok = try database.checkIntegrity();
-    if (!integrity_ok) {
-        std.log.err("Database integrity check failed!", .{});
-        return error.DatabaseCorrupted;
+    {
+        const session = try db_pool.acquire();
+        defer db_pool.release(session);
+        const integrity_ok = try session.checkIntegrity();
+        if (!integrity_ok) {
+            std.log.err("Database integrity check failed!", .{});
+            return error.DatabaseCorrupted;
+        }
     }
 
-    std.log.info("Database connected", .{});
+    std.log.info("Database connected ({d} session{s})", .{ db_pool.sessions.len, if (db_pool.sessions.len == 1) "" else "s" });
 
     // Eagerly initialize ENS normalizer to avoid cold-start latency on first query
     std.log.info("Initializing ENS name normalizer...", .{});
@@ -70,7 +82,7 @@ pub fn main() !void {
     // Start API server with complexity limits and metrics from config
     // Only pass webhook_db_path if webhooks are enabled
     const webhook_path: ?[]const u8 = if (cfg.webhooks_enabled) cfg.webhook_db_path else null;
-    var server = try api.Server.init(allocator, &database, webhook_path, cfg.api_port, cfg.graphql_max_depth, cfg.graphql_max_cost, cfg.metrics_enabled, cfg.rate_limit_per_second, cfg.webhook_admin_username, cfg.webhook_admin_password, cfg.trusted_proxy_hops);
+    var server = try api.Server.init(allocator, &db_pool, webhook_path, cfg.api_port, cfg.graphql_max_depth, cfg.graphql_max_cost, cfg.metrics_enabled, cfg.rate_limit_per_second, cfg.webhook_admin_username, cfg.webhook_admin_password, cfg.trusted_proxy_hops);
     defer server.deinit();
 
     if (cfg.webhook_admin_username != null and cfg.webhook_admin_password != null) {

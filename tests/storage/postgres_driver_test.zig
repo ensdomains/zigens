@@ -31,6 +31,7 @@ fn pgTestConfig() !config.Config {
         .database_path = ":memory:",
         .backend_kind = .postgres,
         .database_url = PG_TEST_URL,
+        .database_pool_size = 10,
         .network = net,
         .start_block = 0,
         .end_block = null,

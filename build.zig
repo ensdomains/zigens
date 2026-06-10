@@ -231,6 +231,15 @@ pub fn build(b: *std.Build) void {
     const integration_pg_step = b.step("test-integration-pg", "Run integration tests against PostgreSQL");
     integration_pg_step.dependOn(&run_integration_pg.step);
 
+    // Forced write-path undo fallback: the SAME integration suite (incl. the reorg
+    // reconcile + rollback regressions) with SQLite doctored to server_side_undo=false
+    // — proves the application-side capture is restore-equivalent to the triggers.
+    const run_integration_fallback = b.addRunArtifact(integration_tests);
+    run_integration_fallback.setCwd(b.path("."));
+    run_integration_fallback.setEnvironmentVariable("TEST_FORCE_WRITE_PATH_UNDO", "1");
+    const integration_fallback_step = b.step("test-integration-fallback", "Run integration tests with forced write-path undo capture");
+    integration_fallback_step.dependOn(&run_integration_fallback.step);
+
     // GraphQL parser tests
     const graphql_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -612,6 +621,44 @@ pub fn build(b: *std.Build) void {
     const run_storage_schema_keys_tests = b.addRunArtifact(storage_schema_keys_tests);
     run_storage_schema_keys_tests.setCwd(b.path("."));
 
+    // Driver-conformance suite: the executable spec for the backend SPI
+    // (docs/backend-spi.md). Runs against SQLite here and against PostgreSQL
+    // in the test-storage-pg lane — both shipped drivers must pass it, and a
+    // third-party driver passing it satisfies the published contract.
+    const backend_conformance_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/storage/backend_conformance_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "helpers", .module = helpers_mod },
+                .{ .name = "lib", .module = lib_mod },
+            },
+        }),
+    });
+    backend_conformance_tests.linkLibC();
+    backend_conformance_tests.linkSystemLibrary("sqlite3");
+    const run_backend_conformance_tests = b.addRunArtifact(backend_conformance_tests);
+    run_backend_conformance_tests.setCwd(b.path("."));
+
+    // Session-pool tests: degenerate SQLite semantics here; the real multi-session
+    // pool (distinct sessions, exhaustion blocking, concurrent queries) runs in the
+    // test-storage-pg lane.
+    const pool_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/storage/pool_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "lib", .module = lib_mod },
+            },
+        }),
+    });
+    pool_tests.linkLibC();
+    pool_tests.linkSystemLibrary("sqlite3");
+    const run_pool_tests = b.addRunArtifact(pool_tests);
+    run_pool_tests.setCwd(b.path("."));
+
     // Storage test step
     const storage_test_step = b.step("test-storage", "Run storage module tests");
     storage_test_step.dependOn(&run_storage_names_tests.step);
@@ -622,6 +669,8 @@ pub fn build(b: *std.Build) void {
     storage_test_step.dependOn(&run_storage_query_tests.step);
     storage_test_step.dependOn(&run_storage_schema_keys_tests.step);
     storage_test_step.dependOn(&run_storage_pg_dialect_tests.step);
+    storage_test_step.dependOn(&run_backend_conformance_tests.step);
+    storage_test_step.dependOn(&run_pool_tests.step);
 
     // Cross-backend lane: re-run the storage suites against PostgreSQL. TEST_BACKEND=postgres
     // makes helpers.createTestDatabase open the local ensv2_test and reset its schema per
@@ -635,6 +684,8 @@ pub fn build(b: *std.Build) void {
         storage_registry_entries_tests,
         storage_query_tests,
         storage_webhooks_tests,
+        backend_conformance_tests,
+        pool_tests,
     }) |compile| {
         const run = b.addRunArtifact(compile);
         run.setCwd(b.path("."));
@@ -655,6 +706,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_storage_roles_tests.step);
     test_step.dependOn(&run_storage_webhooks_tests.step);
     test_step.dependOn(&run_storage_registry_entries_tests.step);
+    test_step.dependOn(&run_backend_conformance_tests.step);
+    test_step.dependOn(&run_pool_tests.step);
     test_step.dependOn(&run_normalize_tests.step);
     test_step.dependOn(&run_indexer_tests.step);
 }

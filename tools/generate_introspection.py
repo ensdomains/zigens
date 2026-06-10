@@ -543,7 +543,7 @@ def main() -> None:
 
     introspection = parse_graphql_schema(schema_text)
 
-    # Defensive write: this sandbox's virtiofs mount can intermittently corrupt large
+    # Defensive write: some filesystems (e.g. virtiofs mounts) can intermittently corrupt large
     # writes (a NUL byte at a 32 KiB block boundary), which would make Zig's strict
     # `@embedFile` JSON parser reject the introspection at startup. Write, read back, and
     # verify it round-trips as valid NUL-free JSON; retry a few times before failing loud.

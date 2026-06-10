@@ -1,5 +1,6 @@
 const std = @import("std");
 const db = @import("../storage/database.zig");
+const pool_mod = @import("../storage/pool.zig");
 const models = @import("../types/models.zig");
 const Hash = @import("../types/hash.zig").Hash;
 const Address = @import("../types/address.zig").Address;
@@ -152,7 +153,7 @@ fn queryIsMutation(allocator: std.mem.Allocator, query: []const u8) bool {
 /// Provides REST endpoints and GraphQL for querying indexed data
 pub const Server = struct {
     allocator: std.mem.Allocator,
-    database: *db.Database,
+    pool: *pool_mod.Pool,
     webhook_database: ?*db.Database, // Optional - only initialized if webhooks enabled
     port: u16,
     server: ?std.net.Server,
@@ -165,7 +166,7 @@ pub const Server = struct {
     /// client IP (see handleConnection / resolveClientAddress).
     trusted_proxy_hops: u32,
 
-    pub fn init(allocator: std.mem.Allocator, database: *db.Database, webhook_db_path: ?[]const u8, port: u16, complexity_max_depth: u32, complexity_max_cost: u32, metrics_enabled: bool, rate_limit_per_second: u32, webhook_admin_username: ?[]const u8, webhook_admin_password: ?[]const u8, trusted_proxy_hops: u32) !Server {
+    pub fn init(allocator: std.mem.Allocator, pool: *pool_mod.Pool, webhook_db_path: ?[]const u8, port: u16, complexity_max_depth: u32, complexity_max_cost: u32, metrics_enabled: bool, rate_limit_per_second: u32, webhook_admin_username: ?[]const u8, webhook_admin_password: ?[]const u8, trusted_proxy_hops: u32) !Server {
         // Only open webhook database if path is provided (webhooks enabled)
         var webhook_db: ?*db.Database = null;
         if (webhook_db_path) |path| {
@@ -181,11 +182,11 @@ pub const Server = struct {
 
         return .{
             .allocator = allocator,
-            .database = database,
+            .pool = pool,
             .webhook_database = webhook_db,
             .port = port,
             .server = null,
-            .graphql_handler = try graphql.GraphQLHandler.init(allocator, database, complexity_max_depth, complexity_max_cost, metrics_enabled),
+            .graphql_handler = try graphql.GraphQLHandler.init(allocator, complexity_max_depth, complexity_max_cost, metrics_enabled),
             .rate_limiter = PerIpRateLimiter.init(allocator, rate_limit * 2, rate_limit, 100_000),
             .webhook_admin_username = webhook_admin_username,
             .webhook_admin_password = webhook_admin_password,
@@ -448,11 +449,13 @@ pub const Server = struct {
         const nh = try @import("../types/hash.zig").namehash(self.allocator, name);
 
         // Query database
-        const name_record = try self.database.getNameByNamehash(nh);
+        const database = try self.pool.acquire();
+        defer self.pool.release(database);
+        const name_record = try database.getNameByNamehash(nh);
 
         if (name_record) |record| {
             var record_copy = record;
-            defer record_copy.deinit(self.allocator);
+            defer record_copy.deinit(database.allocator);
 
             // Build JSON response
             var response_buf: std.ArrayList(u8) = .{};
@@ -516,12 +519,14 @@ pub const Server = struct {
         };
 
         // Query database for all names owned by this address
-        const names = try self.database.getNamesByOwner(owner, 100); // Limit to 100 names
+        const database = try self.pool.acquire();
+        defer self.pool.release(database);
+        const names = try database.getNamesByOwner(owner, 100); // Limit to 100 names
         defer {
             for (names) |*name| {
-                name.deinit(self.allocator);
+                name.deinit(database.allocator);
             }
-            self.allocator.free(names);
+            database.allocator.free(names);
         }
 
         // Build JSON response
@@ -547,12 +552,14 @@ pub const Server = struct {
 
     fn handleEventsQuery(self: *Server, stream: std.net.Stream) !void {
         // Query recent events from database (last 50)
-        const events = try self.database.getRecentEvents(null, null, 50);
+        const database = try self.pool.acquire();
+        defer self.pool.release(database);
+        const events = try database.getRecentEvents(null, null, 50);
         defer {
             for (events) |*event| {
-                event.deinit(self.allocator);
+                event.deinit(database.allocator);
             }
-            self.allocator.free(events);
+            database.allocator.free(events);
         }
 
         // Build JSON response
@@ -682,7 +689,13 @@ pub const Server = struct {
         }
 
         // Handle the query with variables and operation name
-        const result = try self.graphql_handler.handleQuery(query, variables_value, operation_name, strict);
+        // Block-scope the session so it returns to the pool before response
+        // serialization and the (possibly slow) socket write to the client.
+        const result = blk: {
+            const database = try self.pool.acquire();
+            defer self.pool.release(database);
+            break :blk try self.graphql_handler.handleQuery(database, query, variables_value, operation_name, strict);
+        };
         defer self.allocator.free(result);
 
         // Legacy mode: always 200 (errors travel in the body) — unchanged. Strict mode:
@@ -752,7 +765,13 @@ pub const Server = struct {
             operation_name = op_name_owned;
         }
 
-        const result = try self.graphql_handler.handleQuery(query, variables_value, operation_name, strict);
+        // Block-scope the session so it returns to the pool before response
+        // serialization and the (possibly slow) socket write to the client.
+        const result = blk: {
+            const database = try self.pool.acquire();
+            defer self.pool.release(database);
+            break :blk try self.graphql_handler.handleQuery(database, query, variables_value, operation_name, strict);
+        };
         defer self.allocator.free(result);
 
         const status: u16 = if (strict) strictStatus(result) else 200;
@@ -2135,10 +2154,10 @@ test "Server init" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try db.Database.init(allocator, ":memory:");
-    defer database.deinit();
+    var pool = try pool_mod.Pool.open(allocator, .{ .kind = .sqlite, .sqlite_path = ":memory:" });
+    defer pool.deinit();
 
-    var server = try Server.init(allocator, &database, null, 8080, 10, 1000, false, 100, null, null, 0);
+    var server = try Server.init(allocator, &pool, null, 8080, 10, 1000, false, 100, null, null, 0);
     defer server.deinit();
 
     try std.testing.expect(server.port == 8080);

@@ -5,6 +5,7 @@ pub const storage = struct {
     pub const backend = @import("storage/backend.zig");
     pub const postgres_dialect = @import("storage/drivers/postgres_dialect.zig");
     pub const postgres = @import("storage/drivers/postgres.zig");
+    pub const sqlite = @import("storage/drivers/sqlite.zig");
     pub const Database = database.Database;
     pub const Query = database.Query;
 
@@ -18,7 +19,9 @@ pub const storage = struct {
     pub const reorg_undo = @import("storage/reorg_undo.zig");
     pub const v1_controllers = @import("storage/v1_controllers.zig");
     pub const unknown_labels = @import("storage/unknown_labels.zig");
+    pub const registry_entries = @import("storage/registry_entries.zig");
     pub const db_open = @import("storage/db_open.zig");
+    pub const pool = @import("storage/pool.zig");
 };
 
 pub const config = @import("config.zig");

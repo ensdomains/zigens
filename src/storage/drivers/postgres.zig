@@ -143,8 +143,16 @@ pub fn open(allocator: std.mem.Allocator, opts: ConnectOpts) !backend.Backend {
         .database = database,
     };
 
-    return backend.Backend{ .ptr = self, .vtable = &vtable, .dialect = &pg_dialect_mod.pg_dialect };
+    return backend.Backend{ .ptr = self, .vtable = &vtable, .dialect = &pg_dialect_mod.pg_dialect, .caps = capabilities };
 }
+
+pub const capabilities = backend.Capabilities{
+    .placeholder = .dollar,
+    .returning = true,
+    .savepoints = true,
+    .server_side_undo = true,
+    .pooled = true,
+};
 
 fn close(ctx: *anyopaque) void {
     const self = asConn(ctx);
@@ -241,7 +249,10 @@ fn prepare(ctx: *anyopaque, sql: []const u8, cached: bool) anyerror!Statement {
     errdefer self.allocator.free(renumbered);
 
     var stmt = self.conn.prepare(renumbered) catch |err| {
-        std.log.err("postgres prepare failed: {}\nSQL: {s}", .{ err, renumbered });
+        // warn, not err: the caller receives error.PrepareFailed and reports with
+        // its own context (and the conformance suite exercises this path — the
+        // default test runner fails any test that emits an err-level log).
+        std.log.warn("postgres prepare failed: {}\nSQL: {s}", .{ err, renumbered });
         return error.PrepareFailed;
     };
     errdefer stmt.deinit();
@@ -378,6 +389,14 @@ fn materializeValue(allocator: std.mem.Allocator, row: pg.Row, c: usize) !MatVal
         OID.int4 => .{ .int = @intCast(row.get(i32, c) catch 0) },
         OID.int8 => .{ .int = row.get(i64, c) catch 0 },
         OID.bool_ => .{ .int = @intFromBool(row.get(bool, c) catch false) },
+        OID.jsonb => {
+            // jsonb binary format = 1-byte version header (currently 1) + JSON
+            // text. Strip the header so columnText yields parseable JSON, like
+            // SQLite's json_object and PG's plain `json` type (OID 114) do.
+            const data = row.values[c].data;
+            const body = if (data.len > 0 and data[0] == 1) data[1..] else data;
+            return .{ .text = try allocator.dupe(u8, body) };
+        },
         else => .{ .text = try allocator.dupe(u8, row.values[c].data) },
     };
 }

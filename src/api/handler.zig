@@ -16,18 +16,19 @@ const schema_validator_mod = @import("schema_validator.zig");
 
 pub const GraphQLHandler = struct {
     allocator: std.mem.Allocator,
-    database: *db.Database,
     executor: parser.Executor,
     schema_validator: schema_validator_mod.SchemaValidator,
     complexity_max_depth: u32,
     complexity_max_cost: u32,
     metrics: metrics_mod.Metrics,
 
-    pub fn init(allocator: std.mem.Allocator, database: *db.Database, max_depth: u32, max_cost: u32, metrics_enabled: bool) !GraphQLHandler {
-        // Create execution context (loaders are set per-request, not globally)
+    pub fn init(allocator: std.mem.Allocator, max_depth: u32, max_cost: u32, metrics_enabled: bool) !GraphQLHandler {
+        // Create execution context. The database is per-request: handleQuery sets it
+        // on its stack copy of the executor (pool session) before any resolver runs,
+        // so this template value is never read.
         const ctx = parser.ExecutionContext{
             .allocator = allocator,
-            .database = @ptrCast(database),
+            .database = undefined,
             .loaders = null, // Will be set per request for request-scoped caching
         };
 
@@ -80,7 +81,6 @@ pub const GraphQLHandler = struct {
 
         return .{
             .allocator = allocator,
-            .database = database,
             .executor = executor,
             .schema_validator = schema_validator,
             .complexity_max_depth = max_depth,
@@ -114,7 +114,7 @@ pub const GraphQLHandler = struct {
     /// behavior that the legacy `application/json` contract must NOT see — currently the
     /// variable-coercion check below. The error envelope itself is unchanged here; the
     /// server strips the `data` entry for strict 4xx request errors.
-    pub fn handleQuery(self: *GraphQLHandler, query: []const u8, variables: ?std.json.Value, operation_name: ?[]const u8, strict: bool) ![]u8 {
+    pub fn handleQuery(self: *GraphQLHandler, database: *db.Database, query: []const u8, variables: ?std.json.Value, operation_name: ?[]const u8, strict: bool) ![]u8 {
         // Start timing for metrics
         var timer = metrics_mod.QueryTimer.start();
 
@@ -133,7 +133,7 @@ pub const GraphQLHandler = struct {
 
         // Create request-scoped DataLoader context for batching and caching
         const dataloader_mod = @import("loaders.zig");
-        var loader_context = try dataloader_mod.LoaderContext.init(request_alloc, self.database);
+        var loader_context = try dataloader_mod.LoaderContext.init(request_alloc, database);
         defer loader_context.deinit();
 
         // Create a per-request executor copy to avoid race conditions when
@@ -143,6 +143,7 @@ pub const GraphQLHandler = struct {
         var request_executor = self.executor;
         request_executor.allocator = request_alloc;
         request_executor.context.allocator = request_alloc;
+        request_executor.context.database = @ptrCast(database);
         request_executor.context.loaders = @ptrCast(loader_context);
 
         // Parse the query using the arena allocator
@@ -464,10 +465,10 @@ fn expectQueryReturnsData(query: []const u8, op_name: ?[]const u8) !void {
     const allocator = testing.allocator;
     var database = try db.Database.init(allocator, ":memory:");
     defer database.deinit();
-    var handler = try GraphQLHandler.init(allocator, &database, 10, 10000, false);
+    var handler = try GraphQLHandler.init(allocator, 10, 10000, false);
     defer handler.deinit();
 
-    const result = try handler.handleQuery(query, null, op_name, false);
+    const result = try handler.handleQuery(&database, query, null, op_name, false);
     defer allocator.free(result);
 
     try testing.expect(std.mem.indexOf(u8, result, "\"data\"") != null);
@@ -492,10 +493,10 @@ test "handleQuery: real __schema query still returns introspection" {
     const allocator = testing.allocator;
     var database = try db.Database.init(allocator, ":memory:");
     defer database.deinit();
-    var handler = try GraphQLHandler.init(allocator, &database, 10, 10000, false);
+    var handler = try GraphQLHandler.init(allocator, 10, 10000, false);
     defer handler.deinit();
 
-    const result = try handler.handleQuery("{ __schema { queryType { name } } }", null, null, false);
+    const result = try handler.handleQuery(&database, "{ __schema { queryType { name } } }", null, null, false);
     defer allocator.free(result);
     try testing.expect(std.mem.indexOf(u8, result, "\"queryType\"") != null);
 }
@@ -504,15 +505,15 @@ test "handleQuery: real __type(name:) returns the requested type via parsed arg"
     const allocator = testing.allocator;
     var database = try db.Database.init(allocator, ":memory:");
     defer database.deinit();
-    var handler = try GraphQLHandler.init(allocator, &database, 10, 10000, false);
+    var handler = try GraphQLHandler.init(allocator, 10, 10000, false);
     defer handler.deinit();
 
-    const found = try handler.handleQuery("{ __type(name:\"Domain\"){ name kind } }", null, null, false);
+    const found = try handler.handleQuery(&database, "{ __type(name:\"Domain\"){ name kind } }", null, null, false);
     defer allocator.free(found);
     try testing.expect(std.mem.indexOf(u8, found, "\"__type\"") != null);
     try testing.expect(std.mem.indexOf(u8, found, "Domain") != null);
 
-    const missing = try handler.handleQuery("{ __type(name:\"NoSuchType\"){ name } }", null, null, false);
+    const missing = try handler.handleQuery(&database, "{ __type(name:\"NoSuchType\"){ name } }", null, null, false);
     defer allocator.free(missing);
     try testing.expectEqualStrings("{\"data\":{\"__type\":null}}", missing);
 }
@@ -521,12 +522,12 @@ test "handleQuery: where with and/or boolean filter validates and executes (#25)
     const allocator = testing.allocator;
     var database = try db.Database.init(allocator, ":memory:");
     defer database.deinit();
-    var handler = try GraphQLHandler.init(allocator, &database, 10, 10000, false);
+    var handler = try GraphQLHandler.init(allocator, 10, 10000, false);
     defer handler.deinit();
 
     // owner=X AND (name_contains a OR name_contains b) — nested DomainFilter via `or`.
     const q = "{ domains(where:{ owner:\"0x1111111111111111111111111111111111111111\", or:[{name_contains:\"a\"},{name_contains:\"b\"}] }){ name } }";
-    const result = try handler.handleQuery(q, null, null, false);
+    const result = try handler.handleQuery(&database, q, null, null, false);
     defer allocator.free(result);
     // Parsed + schema-validated + executed → a data response (empty list on an empty DB),
     // NOT a validation/syntax error.
@@ -539,11 +540,11 @@ test "handleQuery: eventConnection where and/or validates and executes (#25)" {
     const allocator = testing.allocator;
     var database = try db.Database.init(allocator, ":memory:");
     defer database.deinit();
-    var handler = try GraphQLHandler.init(allocator, &database, 10, 10000, false);
+    var handler = try GraphQLHandler.init(allocator, 10, 10000, false);
     defer handler.deinit();
 
     const q = "{ eventConnection(first:5, where:{ blockNumber_gt:0, or:[{type:\"Transfer\"},{type:\"NameRegistered\"}] }){ totalCount } }";
-    const result = try handler.handleQuery(q, null, null, false);
+    const result = try handler.handleQuery(&database, q, null, null, false);
     defer allocator.free(result);
     try testing.expect(std.mem.indexOf(u8, result, "\"data\"") != null);
     try testing.expect(std.mem.indexOf(u8, result, "\"errors\"") == null);
@@ -553,11 +554,11 @@ test "handleQuery: registrationConnection where and/or validates and executes (#
     const allocator = testing.allocator;
     var database = try db.Database.init(allocator, ":memory:");
     defer database.deinit();
-    var handler = try GraphQLHandler.init(allocator, &database, 10, 10000, false);
+    var handler = try GraphQLHandler.init(allocator, 10, 10000, false);
     defer handler.deinit();
 
     const q = "{ registrationConnection(first:5, where:{ and:[{protocol:\"v2\"},{or:[{registrant:\"0x1111111111111111111111111111111111111111\"}]}] }){ totalCount } }";
-    const result = try handler.handleQuery(q, null, null, false);
+    const result = try handler.handleQuery(&database, q, null, null, false);
     defer allocator.free(result);
     try testing.expect(std.mem.indexOf(u8, result, "\"data\"") != null);
     try testing.expect(std.mem.indexOf(u8, result, "\"errors\"") == null);
@@ -567,13 +568,14 @@ test "handleQuery: __type(name: $name) resolves the type from variables (graphql
     const allocator = testing.allocator;
     var database = try db.Database.init(allocator, ":memory:");
     defer database.deinit();
-    var handler = try GraphQLHandler.init(allocator, &database, 10, 10000, false);
+    var handler = try GraphQLHandler.init(allocator, 10, 10000, false);
     defer handler.deinit();
 
     const vars = try std.json.parseFromSlice(std.json.Value, allocator, "{\"name\":\"Domain\"}", .{});
     defer vars.deinit();
 
     const result = try handler.handleQuery(
+        &database,
         "query Type($name: String!) { __type(name: $name) { name } }",
         vars.value,
         null,
@@ -590,7 +592,7 @@ test "handleQuery: required variable given null errors only in strict mode (grap
     const allocator = testing.allocator;
     var database = try db.Database.init(allocator, ":memory:");
     defer database.deinit();
-    var handler = try GraphQLHandler.init(allocator, &database, 10, 10000, false);
+    var handler = try GraphQLHandler.init(allocator, 10, 10000, false);
     defer handler.deinit();
 
     const vars = try std.json.parseFromSlice(std.json.Value, allocator, "{\"id\":null}", .{});
@@ -599,13 +601,13 @@ test "handleQuery: required variable given null errors only in strict mode (grap
 
     // Strict: a non-null variable supplied null is a request error -> VALIDATION_ERROR
     // (the server then maps this to HTTP 400).
-    const strict_res = try handler.handleQuery(q, vars.value, null, true);
+    const strict_res = try handler.handleQuery(&database, q, vars.value, null, true);
     defer allocator.free(strict_res);
     try testing.expect(std.mem.indexOf(u8, strict_res, "VALIDATION_ERROR") != null);
 
     // Legacy: stays lenient — executes and returns data, no error (the 200 contract every
     // existing application/json client relies on).
-    const legacy_res = try handler.handleQuery(q, vars.value, null, false);
+    const legacy_res = try handler.handleQuery(&database, q, vars.value, null, false);
     defer allocator.free(legacy_res);
     try testing.expect(std.mem.indexOf(u8, legacy_res, "\"errors\"") == null);
     try testing.expect(std.mem.indexOf(u8, legacy_res, "\"data\"") != null);

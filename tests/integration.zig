@@ -23,7 +23,22 @@ fn testDb(allocator: std.mem.Allocator) !Database {
         defer allocator.free(v);
         break :blk std.ascii.eqlIgnoreCase(v, "postgres");
     };
-    if (!want_pg) return Database.init(allocator, ":memory:");
+    if (!want_pg) {
+        const force_fallback = blk: {
+            const v = std.process.getEnvVarOwned(allocator, "TEST_FORCE_WRITE_PATH_UNDO") catch break :blk false;
+            defer allocator.free(v);
+            break :blk std.mem.eql(u8, v, "1");
+        };
+        if (force_fallback) {
+            // Forced-fallback lane (test-integration-fallback): no capture
+            // triggers; the storage mutators' write-path capture must keep the
+            // reorg suite green.
+            var be = try lib.storage.sqlite.open(allocator, ":memory:");
+            be.caps.server_side_undo = false;
+            return Database.initWithBackend(allocator, be);
+        }
+        return Database.init(allocator, ":memory:");
+    }
 
     const be = try lib.storage.postgres.open(allocator, .{ .database = "ensv2_test", .password = "postgres" });
     // Close `be` on any failure before initWithBackend takes ownership (it closes `be`
@@ -1711,4 +1726,128 @@ test "normalization: default-hides non-normalized names; opt-in shows them" {
     }
     try testing.expect(saw_weird);
     std.debug.print("✓ non-normalized names default-hidden, opt-in via includeUnnormalized/isNormalized; flag persists through both SELECT paths\n", .{});
+}
+
+// ============================================================================
+// Reorg undo-log: adversarial hard sites (plan "A/B Lane 3"). Each part runs in
+// BOTH lanes — trigger capture (test-integration) and write-path capture
+// (test-integration-fallback) — and pins the four sites the rest of the suite
+// did not reach: the dynamic-IN-list reachability flip (the only runtime-binder
+// capture), the names delete with unknown_labels cascade children, the
+// key-scoped resolver_texts delete, and the created_block lowering that defeats
+// the created-after delete net.
+// ============================================================================
+
+test "reorg undo-log: bulk reachability flip is reverted (dynamic IN-list capture)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try testDb(allocator);
+    defer database.deinit();
+
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 100);
+    var n = try makeReorgName(allocator, "reach.eth", .v2, try Address.fromHex("0x00000000000000000000000000000000000000aa"), 100);
+    defer n.deinit(allocator);
+    n.is_reachable = true;
+    try database.insertName(n);
+
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
+    const registries = [_]Address{n.registry};
+    const flipped = try lib.storage.registry_entries.setRegistriesReachability(&database, .v2, &registries, false, 200, 1700000200);
+    try testing.expectEqual(@as(u64, 1), flipped);
+    {
+        var got = (try database.getNameByNamehash(n.namehash)) orelse return error.NameVanished;
+        defer got.deinit(allocator);
+        try testing.expect(!got.is_reachable);
+    }
+
+    try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
+    var got = (try database.getNameByNamehash(n.namehash)) orelse return error.NameVanished;
+    defer got.deinit(allocator);
+    try testing.expect(got.is_reachable);
+}
+
+test "reorg undo-log: names delete restores unknown_labels cascade children" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try testDb(allocator);
+    defer database.deinit();
+
+    try lib.storage.reorg_undo.setCursor(&database, .v1, 100);
+    var n = try makeReorgName(allocator, "gcparent.eth", .v1, try Address.fromHex("0x00000000000000000000000000000000000000aa"), 100);
+    defer n.deinit(allocator);
+    try database.insertName(n);
+
+    const name_id: i64 = blk: {
+        var q = try lib.storage.Query.init(&database, "SELECT id FROM names WHERE namehash = ?");
+        defer q.deinit();
+        try q.bindHash(n.namehash);
+        try testing.expect(try q.step());
+        break :blk q.getInt64(0);
+    };
+    try lib.storage.unknown_labels.insertUnknownLabel(&database, name_id, try namehash(allocator, "txh"), try keccak256(allocator, "lbl"), n.namehash, n.parent_namehash, n.owner, 100);
+    try testing.expectEqual(@as(i64, 1), try unknownLabelCount(&database));
+
+    // Block 200: delete the parent — the FK cascade removes the child row too.
+    try lib.storage.reorg_undo.setCursor(&database, .v1, 200);
+    try lib.storage.names.deleteNameByNamehash(&database, n.namehash);
+    try testing.expectEqual(@as(i64, 0), try unknownLabelCount(&database));
+    try testing.expect((try database.getNameByNamehash(n.namehash)) == null);
+
+    // Rollback to 150: parent restored (same surrogate id) AND the cascade
+    // child restored — the class the explicit cascade capture exists for.
+    try lib.storage.sync.rollbackToBlock(&database, .v1, 150);
+    var got = (try database.getNameByNamehash(n.namehash)) orelse return error.NameVanished;
+    defer got.deinit(allocator);
+    try testing.expectEqual(@as(i64, 1), try unknownLabelCount(&database));
+}
+
+test "reorg undo-log: key-scoped resolver text delete and created_block lowering revert" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try testDb(allocator);
+    defer database.deinit();
+
+    const resolver = try Address.fromHex("0x00000000000000000000000000000000000000cc");
+    const nh = try namehash(allocator, "texty.eth");
+
+    // Block 100: text record exists.
+    try lib.storage.reorg_undo.setCursor(&database, .v1, 100);
+    try lib.storage.resolvers.storeResolverText(&database, nh, resolver, "url", "https://a", .v1, 100, try namehash(allocator, "t1"), 1700000100);
+
+    // Block 200: empty-value TextChanged clears just that key (4-term WHERE).
+    try lib.storage.reorg_undo.setCursor(&database, .v1, 200);
+    try lib.storage.resolvers.deleteResolverText(&database, .v1, nh, resolver, "url");
+    {
+        var q = try lib.storage.Query.init(&database, "SELECT value FROM resolver_texts WHERE namehash = ? AND key = 'url'");
+        defer q.deinit();
+        try q.bindHash(nh);
+        try testing.expect(!(try q.step()));
+    }
+
+    // Also at block 200: a name created AFTER N gets its created_block lowered
+    // below N — without undo capture the created_block>N delete would miss it.
+    var n = try makeReorgName(allocator, "lowered.eth", .v1, try Address.fromHex("0x00000000000000000000000000000000000000aa"), 180);
+    defer n.deinit(allocator);
+    try database.insertName(n);
+    try lib.storage.names.updateNameCreationDateIfEarlier(&database, n.namehash, 50, 1700000050);
+
+    try lib.storage.sync.rollbackToBlock(&database, .v1, 150);
+
+    // Text record restored with its original value.
+    {
+        var q = try lib.storage.Query.init(&database, "SELECT value FROM resolver_texts WHERE namehash = ? AND key = 'url'");
+        defer q.deinit();
+        try q.bindHash(nh);
+        try testing.expect(try q.step());
+        try testing.expectEqualStrings("https://a", q.getTextSlice(0).?);
+    }
+    // The lowered name is GONE: replay restored created_block=180, then the
+    // created-after delete removed it — rollback ≡ clean-sync-at-150.
+    try testing.expect((try database.getNameByNamehash(n.namehash)) == null);
 }

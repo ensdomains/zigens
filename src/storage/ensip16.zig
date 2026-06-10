@@ -1,5 +1,6 @@
 const std = @import("std");
 const db_module = @import("database.zig");
+const reorg_undo = @import("reorg_undo.zig");
 const Database = db_module.Database;
 const Query = db_module.Query;
 const models = @import("../types/models.zig");
@@ -12,6 +13,7 @@ const Hash = @import("../types/hash.zig").Hash;
 
 /// Upsert resolver metadata (GraphQL endpoint for offchain data)
 pub fn upsertResolverMetadata(db: *Database, protocol: models.Protocol, resolver: Address, graphql_url: []const u8, block_number: u64, tx_hash: Hash) !void {
+    try reorg_undo.captureUpsert(db, "resolver_metadata", .{ protocol, resolver });
     var q = try Query.init(db,
         \\INSERT INTO resolver_metadata
         \\(protocol, resolver, graphql_url, block_number, transaction_hash, timestamp)
@@ -103,6 +105,7 @@ pub fn getAllResolverMetadata(db: *Database, protocol: models.Protocol) ![]model
 
 /// Insert or update resolver approval/delegation
 pub fn upsertResolverApproval(db: *Database, protocol: models.Protocol, resolver: Address, namehash: Hash, context: ?[]const u8, delegate: Address, approved: bool, block_number: u64, tx_hash: Hash, log_index: u32) !void {
+    try reorg_undo.captureUpsert(db, "resolver_approvals", .{ protocol, resolver, namehash, context, delegate });
     var q = try Query.init(db,
         \\INSERT INTO resolver_approvals
         \\(protocol, resolver, namehash, context, delegate, approved, block_number, transaction_hash, log_index, timestamp)

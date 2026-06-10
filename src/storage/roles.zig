@@ -1,5 +1,6 @@
 const std = @import("std");
 const db_module = @import("database.zig");
+const reorg_undo = @import("reorg_undo.zig");
 const Database = db_module.Database;
 const Query = db_module.Query;
 const models = @import("../types/models.zig");
@@ -12,6 +13,7 @@ const Hash = @import("../types/hash.zig").Hash;
 
 /// Insert or update EAC role assignment
 pub fn upsertEACRole(db: *Database, protocol: models.Protocol, resource: []const u8, account: Address, role_bitmap: []const u8, block_number: u64, tx_hash: Hash, log_index: u32, contract_address: Address) !void {
+    try reorg_undo.captureUpsert(db, "eac_roles", .{ protocol, resource, account, contract_address });
     const sql =
         \\INSERT INTO eac_roles
         \\(protocol, resource, account, role_bitmap, block_number, transaction_hash, log_index, timestamp, contract_address)
@@ -314,6 +316,7 @@ pub fn getRoleCountFiltered(db: *Database, filters: RoleCountFilters) !usize {
 
 /// Delete role assignment (when all roles revoked)
 pub fn deleteEACRole(db: *Database, protocol: models.Protocol, resource: []const u8, account: Address, contract_address: Address) !void {
+    try reorg_undo.captureWhere(db, "eac_roles", "D", "protocol = ? AND resource = ? AND account = ? AND contract_address = ?", .{ protocol, resource, account, contract_address });
     const sql = "DELETE FROM eac_roles WHERE protocol = ? AND resource = ? AND account = ? AND contract_address = ?";
 
     var q = try Query.init(db, sql);

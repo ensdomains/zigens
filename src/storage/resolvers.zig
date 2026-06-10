@@ -1,5 +1,6 @@
 const std = @import("std");
 const db_module = @import("database.zig");
+const reorg_undo = @import("reorg_undo.zig");
 const Database = db_module.Database;
 const Query = db_module.Query;
 const models = @import("../types/models.zig");
@@ -196,6 +197,7 @@ pub fn storeResolverAddress(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
+    try reorg_undo.captureUpsert(db, "resolver_addresses", .{ protocol, resolver, namehash, coin_type });
     const sql = try db.upsertExprSql(
         db.allocator,
         "resolver_addresses",
@@ -231,6 +233,7 @@ pub fn storeResolverContentHash(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
+    try reorg_undo.captureUpsert(db, "resolver_contenthashes", .{ protocol, resolver, namehash });
     const sql = try db.upsertSql(db.allocator, "resolver_contenthashes", &.{ "namehash", "resolver", "contenthash", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
     defer db.allocator.free(sql);
 
@@ -260,6 +263,7 @@ pub fn storeResolverText(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
+    try reorg_undo.captureUpsert(db, "resolver_texts", .{ protocol, resolver, namehash, key });
     const sql = try db.upsertSql(db.allocator, "resolver_texts", &.{ "namehash", "resolver", "key", "value", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
     defer db.allocator.free(sql);
 
@@ -316,6 +320,7 @@ pub const CoinAddress = struct {
 /// `namehash` column before this is called (which `handleLabelRegistered`
 /// does in the line just above the call site).
 pub fn applyLatestResolverFromEvents(db: *Database, protocol: models.Protocol, namehash: Hash) !void {
+    try reorg_undo.captureWhere(db, "names", "U", "protocol = ? AND namehash = ? AND (resolver IS NULL OR resolver = '0x0000000000000000000000000000000000000000') AND EXISTS (SELECT 1 FROM events WHERE event_type = 'ResolverUpdated' AND protocol = ? AND namehash = ? AND json_extract(data, '$.resolver') IS NOT NULL)", .{ protocol, namehash, protocol, namehash });
     var q = try Query.initCached(db,
         \\UPDATE names
         \\SET resolver = (
@@ -706,6 +711,7 @@ pub fn getResolversByOwner(db: *Database, protocol: models.Protocol, owner: Addr
 // ============================================================================
 
 pub fn deleteResolverAddresses(db: *Database, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "resolver_addresses", "D", "namehash = ? AND resolver = ?", .{ namehash, resolver });
     const sql = "DELETE FROM resolver_addresses WHERE namehash = ? AND resolver = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -715,6 +721,7 @@ pub fn deleteResolverAddresses(db: *Database, namehash: Hash, resolver: Address)
 }
 
 pub fn deleteResolverContentHash(db: *Database, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "resolver_contenthashes", "D", "namehash = ? AND resolver = ?", .{ namehash, resolver });
     const sql = "DELETE FROM resolver_contenthashes WHERE namehash = ? AND resolver = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -724,6 +731,7 @@ pub fn deleteResolverContentHash(db: *Database, namehash: Hash, resolver: Addres
 }
 
 pub fn deleteResolverTexts(db: *Database, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "resolver_texts", "D", "namehash = ? AND resolver = ?", .{ namehash, resolver });
     const sql = "DELETE FROM resolver_texts WHERE namehash = ? AND resolver = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -733,6 +741,7 @@ pub fn deleteResolverTexts(db: *Database, namehash: Hash, resolver: Address) !vo
 }
 
 pub fn deleteResolverAlias(db: *Database, resolver: Address, from_name: []const u8) !void {
+    try reorg_undo.captureWhere(db, "resolver_aliases", "D", "resolver = ? AND from_name = ?", .{ resolver, from_name });
     const sql = "DELETE FROM resolver_aliases WHERE resolver = ? AND from_name = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -742,6 +751,7 @@ pub fn deleteResolverAlias(db: *Database, resolver: Address, from_name: []const 
 }
 
 pub fn deleteResolverPubkeys(db: *Database, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "resolver_pubkeys", "D", "namehash = ? AND resolver = ?", .{ namehash, resolver });
     const sql = "DELETE FROM resolver_pubkeys WHERE namehash = ? AND resolver = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -751,6 +761,7 @@ pub fn deleteResolverPubkeys(db: *Database, namehash: Hash, resolver: Address) !
 }
 
 pub fn deleteResolverAbis(db: *Database, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "resolver_abis", "D", "namehash = ? AND resolver = ?", .{ namehash, resolver });
     const sql = "DELETE FROM resolver_abis WHERE namehash = ? AND resolver = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -760,6 +771,7 @@ pub fn deleteResolverAbis(db: *Database, namehash: Hash, resolver: Address) !voi
 }
 
 pub fn deleteResolverNames(db: *Database, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "resolver_names", "D", "namehash = ? AND resolver = ?", .{ namehash, resolver });
     const sql = "DELETE FROM resolver_names WHERE namehash = ? AND resolver = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -769,6 +781,7 @@ pub fn deleteResolverNames(db: *Database, namehash: Hash, resolver: Address) !vo
 }
 
 pub fn deleteResolverInterfaces(db: *Database, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "resolver_interfaces", "D", "namehash = ? AND resolver = ?", .{ namehash, resolver });
     const sql = "DELETE FROM resolver_interfaces WHERE namehash = ? AND resolver = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -790,6 +803,7 @@ pub fn deleteResolverText(
     resolver: Address,
     key: []const u8,
 ) !void {
+    try reorg_undo.captureWhere(db, "resolver_texts", "D", "protocol = ? AND namehash = ? AND resolver = ? AND key = ?", .{ protocol, namehash, resolver, key });
     const sql =
         \\DELETE FROM resolver_texts
         \\WHERE protocol = ? AND namehash = ? AND resolver = ? AND key = ?
@@ -818,6 +832,7 @@ pub fn storeResolverAuthorisation(
     log_index: u32,
     timestamp: i64,
 ) !void {
+    try reorg_undo.captureUpsert(db, "resolver_authorisations", .{ protocol, resolver, namehash, owner, target });
     const sql = try db.upsertSql(db.allocator, "resolver_authorisations", &.{ "protocol", "namehash", "resolver", "owner", "target", "is_authorised", "block_number", "transaction_hash", "log_index", "timestamp" }, .replace);
     defer db.allocator.free(sql);
     var q = try Query.init(db, sql);
@@ -850,6 +865,7 @@ pub fn storeResolverDnsRecord(
     log_index: u32,
     timestamp: i64,
 ) !void {
+    try reorg_undo.captureUpsert(db, "resolver_dns_records", .{ protocol, resolver, namehash, dns_name, resource });
     const sql = try db.upsertSql(db.allocator, "resolver_dns_records", &.{ "protocol", "namehash", "resolver", "dns_name", "resource", "record", "block_number", "transaction_hash", "log_index", "timestamp" }, .replace);
     defer db.allocator.free(sql);
     var q = try Query.init(db, sql);
@@ -876,6 +892,7 @@ pub fn deleteResolverDnsRecord(
     dns_name: []const u8,
     resource: u16,
 ) !void {
+    try reorg_undo.captureWhere(db, "resolver_dns_records", "D", "protocol = ? AND namehash = ? AND resolver = ? AND dns_name = ? AND resource = ?", .{ protocol, namehash, resolver, dns_name, resource });
     const sql =
         \\DELETE FROM resolver_dns_records
         \\WHERE protocol = ? AND namehash = ? AND resolver = ?
@@ -904,6 +921,7 @@ pub fn storeResolverDnsZonehash(
     log_index: u32,
     timestamp: i64,
 ) !void {
+    try reorg_undo.captureUpsert(db, "resolver_dns_zonehashes", .{ protocol, resolver, namehash });
     const sql = try db.upsertSql(db.allocator, "resolver_dns_zonehashes", &.{ "protocol", "namehash", "resolver", "zonehash", "last_zonehash", "block_number", "transaction_hash", "log_index", "timestamp" }, .replace);
     defer db.allocator.free(sql);
     var q = try Query.init(db, sql);
@@ -930,6 +948,7 @@ pub fn storeResolverAlias(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
+    try reorg_undo.captureUpsert(db, "resolver_aliases", .{ resolver, from_name });
     const sql = try db.upsertSql(db.allocator, "resolver_aliases", &.{ "resolver", "from_name", "to_name", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
     defer db.allocator.free(sql);
 
@@ -1180,6 +1199,7 @@ pub fn storeResolverPubkey(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
+    try reorg_undo.captureUpsert(db, "resolver_pubkeys", .{ protocol, resolver, namehash });
     const sql = try db.upsertSql(db.allocator, "resolver_pubkeys", &.{ "namehash", "resolver", "x", "y", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
     defer db.allocator.free(sql);
 
@@ -1208,6 +1228,7 @@ pub fn storeResolverABI(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
+    try reorg_undo.captureUpsert(db, "resolver_abis", .{ protocol, resolver, namehash, content_type });
     const sql = try db.upsertSql(db.allocator, "resolver_abis", &.{ "namehash", "resolver", "content_type", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
     defer db.allocator.free(sql);
 
@@ -1235,6 +1256,7 @@ pub fn storeResolverName(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
+    try reorg_undo.captureUpsert(db, "resolver_names", .{ protocol, resolver, namehash });
     const sql = try db.upsertSql(db.allocator, "resolver_names", &.{ "namehash", "resolver", "name", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
     defer db.allocator.free(sql);
 
@@ -1263,6 +1285,7 @@ pub fn storeResolverInterface(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
+    try reorg_undo.captureUpsert(db, "resolver_interfaces", .{ protocol, resolver, namehash, interface_id });
     const sql = try db.upsertSql(db.allocator, "resolver_interfaces", &.{ "namehash", "resolver", "interface_id", "implementer", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
     defer db.allocator.free(sql);
 
@@ -1291,6 +1314,7 @@ pub fn storeResolverVersion(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
+    try reorg_undo.captureUpsert(db, "resolver_versions", .{ resolver, namehash });
     const sql = try db.upsertSql(db.allocator, "resolver_versions", &.{ "namehash", "resolver", "version", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
     defer db.allocator.free(sql);
 
@@ -1428,6 +1452,7 @@ pub fn upsertReverseRecord(
     log_index: u32,
     timestamp: i64,
 ) !void {
+    try reorg_undo.captureWhere(db, "reverse_records", "U", "protocol = ? AND address = LOWER(?)", .{ protocol, address });
     var q = try Query.initCached(db,
         \\INSERT INTO reverse_records
         \\  (protocol, address, namehash, block_number, transaction_hash, log_index, timestamp)

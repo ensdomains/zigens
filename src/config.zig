@@ -14,6 +14,9 @@ pub const Config = struct {
     backend_kind: BackendKind,
     /// Postgres connection URL (`postgres://user:pass@host:port/db`); null on SQLite.
     database_url: ?[]const u8,
+    /// Reader-session count for the API's connection pool. Ignored on SQLite
+    /// (the pool is degenerate — one shared serialized connection).
+    database_pool_size: u32,
     network: contracts.Network,
     start_block: u64,
     end_block: ?u64, // null means index continuously
@@ -105,6 +108,7 @@ pub const Config = struct {
                     break :blk env_mod.getEnvInt(&env_map, u16, "STATUS_PORT", 0);
                 }
             },
+            .database_pool_size = env_mod.getEnvInt(&env_map, u32, "DATABASE_POOL_SIZE", 10),
             .webhooks_enabled = env_mod.getEnvBool(&env_map, "WEBHOOKS_ENABLED", false),
             .webhook_max_retries = env_mod.getEnvInt(&env_map, u32, "WEBHOOK_MAX_RETRIES", 3),
             .webhook_db_path = try allocator.dupe(u8, env_mod.getEnv(&env_map, "WEBHOOK_DB_PATH", "./data/webhooks.db")),

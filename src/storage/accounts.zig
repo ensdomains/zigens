@@ -1,5 +1,6 @@
 const std = @import("std");
 const db_module = @import("database.zig");
+const reorg_undo = @import("reorg_undo.zig");
 const Database = db_module.Database;
 const Query = db_module.Query;
 const models = @import("../types/models.zig");
@@ -20,6 +21,8 @@ pub fn upsertAccount(
     timestamp: i64,
 ) !void {
     if (address.len == 0) return;
+    const existed = try reorg_undo.activeRowExists(db, "accounts", "address = ?", .{address});
+    if (existed) try reorg_undo.captureActiveWhere(db, "accounts", "U", "address = ?", .{address});
     // Scalar MAX/MIN over two values: MAX/MIN on SQLite, GREATEST/LEAST on Postgres
     // (all args here are NOT NULL columns, so the NULL-handling difference is moot). The
     // existing value is table-qualified (accounts.col) because Postgres rejects an
@@ -46,6 +49,7 @@ pub fn upsertAccount(
     try q.bindInt64(@intCast(block_number));
     try q.bindInt64(timestamp);
     try q.exec();
+    if (!existed) try reorg_undo.captureActiveWhere(db, "accounts", "I", "address = ?", .{address});
 }
 
 pub fn getAccountCount(db: *Database) !u64 {

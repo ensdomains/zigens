@@ -1,6 +1,7 @@
 const std = @import("std");
 const constants = @import("../constants.zig");
 const db_module = @import("database.zig");
+const reorg_undo = @import("reorg_undo.zig");
 const Database = db_module.Database;
 const Query = db_module.Query;
 const models = @import("../types/models.zig");
@@ -628,6 +629,7 @@ pub fn getEventsByDomain(db: *Database, domain_name: []const u8, limit: u32) ![]
 /// Update token_id for all approvals when a token is regenerated.
 /// Scoped by registry to avoid cross-registry collisions.
 pub fn updateApprovalTokenId(db: *Database, old_token_id: []const u8, new_token_id: []const u8, registry: Address) !void {
+    try reorg_undo.captureWhere(db, "approvals", "U", "token_id = ? AND registry = ?", .{ old_token_id, registry });
     const sql = "UPDATE approvals SET token_id = ? WHERE token_id = ? AND registry = ?";
 
     var q = try Query.initCached(db, sql);
@@ -649,6 +651,7 @@ pub fn insertApproval(db: *Database, protocol: models.Protocol, token_id: u256, 
 
     const token_id_str = try std.fmt.allocPrint(db.allocator, "{d}", .{token_id});
     defer db.allocator.free(token_id_str);
+    try reorg_undo.captureUpsert(db, "approvals", .{ protocol, token_id_str, registry });
 
     try q.bindTextStatic(protocol.toString());
     try q.bindText(token_id_str);

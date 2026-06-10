@@ -1,5 +1,6 @@
 const std = @import("std");
 const db_module = @import("database.zig");
+const reorg_undo = @import("reorg_undo.zig");
 const Database = db_module.Database;
 const Query = db_module.Query;
 const Hash = @import("../types/hash.zig").Hash;
@@ -31,6 +32,7 @@ pub fn insertUnknownLabel(
     owner: Address,
     block_number: u64,
 ) !void {
+    const existed = try reorg_undo.activeRowExists(db, "unknown_labels", "labelhash = ? AND parent_node = ?", .{ labelhash, parent_node });
     var q = try Query.init(db,
         \\INSERT INTO unknown_labels (
         \\  name_id,
@@ -53,6 +55,7 @@ pub fn insertUnknownLabel(
     try q.bindAddress(owner);
     try q.bindInt64(@intCast(block_number));
     try q.exec();
+    if (!existed) try reorg_undo.captureActiveWhere(db, "unknown_labels", "I", "labelhash = ? AND parent_node = ?", .{ labelhash, parent_node });
 }
 
 /// Get all unknown labels that need backfill (limited attempts).
@@ -127,6 +130,7 @@ pub fn getUnknownLabelsForBackfill(
 pub fn incrementBackfillAttempt(db: *Database, id: i64) !void {
     // `strftime('%s','now')` is SQLite-only; dialect.nowEpoch is the portable current-epoch
     // expression (strftime on SQLite, EXTRACT(EPOCH FROM now())::bigint on Postgres).
+    try reorg_undo.captureActiveWhere(db, "unknown_labels", "U", "id = ?", .{id});
     const sql = try std.fmt.allocPrint(db.allocator,
         \\UPDATE unknown_labels
         \\SET backfill_attempts = backfill_attempts + 1,
@@ -142,6 +146,7 @@ pub fn incrementBackfillAttempt(db: *Database, id: i64) !void {
 
 /// Delete an unknown label record after successful backfill
 pub fn deleteUnknownLabel(db: *Database, id: i64) !void {
+    try reorg_undo.captureActiveWhere(db, "unknown_labels", "D", "id = ?", .{id});
     var q = try Query.init(db, "DELETE FROM unknown_labels WHERE id = ?");
     defer q.deinit();
     try q.bindInt64(id);

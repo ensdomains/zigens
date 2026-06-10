@@ -84,7 +84,14 @@ def process(src: pathlib.Path, dst: pathlib.Path) -> int:
     if n_src != n_out:
         sys.exit(f"gen_pg_schema: table-count mismatch in {src} ({n_src} -> {n_out})")
     dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_text(HEADER.format(src=src.as_posix()) + out)
+    # Header records the source as a repo-relative path (machine-independent —
+    # an absolute path would bake the build host's directory layout into a
+    # committed file and churn on every machine).
+    try:
+        src_label = src.resolve().relative_to(pathlib.Path.cwd()).as_posix()
+    except ValueError:
+        src_label = src.as_posix()
+    dst.write_text(HEADER.format(src=src_label) + out)
     return n_src
 
 

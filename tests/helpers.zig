@@ -31,6 +31,15 @@ pub fn createTestDatabase(allocator: std.mem.Allocator) !*Database {
         database.* = try Database.initWithBackend(allocator, be); // loads schema/postgres + migrate + reorg
         errdefer database.deinit();
         try createWebhooksSchemaPg(database);
+    } else if (forceWritePathUndo()) {
+        // Forced-fallback lane (test-integration-fallback): SQLite with
+        // server_side_undo doctored to false — no capture triggers; the storage
+        // mutators' write-path capture must keep the reorg suite green.
+        var be = try lib.storage.sqlite.open(allocator, ":memory:");
+        be.caps.server_side_undo = false;
+        database.* = try Database.initWithBackend(allocator, be);
+        errdefer database.deinit();
+        try createWebhooksSchema(database);
     } else {
         database.* = try Database.init(allocator, ":memory:");
         // Create webhooks table (loaded from separate schema directory in production)
@@ -38,6 +47,14 @@ pub fn createTestDatabase(allocator: std.mem.Allocator) !*Database {
     }
 
     return database;
+}
+
+/// True when the suite must force SQLite onto the write-path undo fallback
+/// (TEST_FORCE_WRITE_PATH_UNDO=1 — the test-integration-fallback lane).
+fn forceWritePathUndo() bool {
+    const v = std.process.getEnvVarOwned(std.heap.page_allocator, "TEST_FORCE_WRITE_PATH_UNDO") catch return false;
+    defer std.heap.page_allocator.free(v);
+    return std.mem.eql(u8, v, "1");
 }
 
 /// True when the suite is being run against Postgres (TEST_BACKEND=postgres).

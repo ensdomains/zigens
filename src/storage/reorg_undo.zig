@@ -416,59 +416,19 @@ pub fn replayUndo(db: *Database, protocol: models.Protocol, block_number: u64) !
         }
     }
 
+    // Two passes: `unknown_labels` rows are FK children of `names`
+    // (`name_id … ON DELETE CASCADE`). PostgreSQL's cascade fires the child
+    // capture AFTER the parent's (SQLite's recursive triggers fire it before),
+    // so a plain id-DESC walk can restore a child before its parent exists and
+    // hit the immediate FK. Restoring every other table first makes the order
+    // backend-independent; within each pass the newest-first walk is preserved.
     for (entries.items) |e| {
-        if (std.mem.eql(u8, e.op, "I")) {
-            // A row first-created after N (op 'I', from a reorg_active table's INSERT
-            // trigger). Reverse it by retiring only this rollback's contribution.
-            const dialect = db.dialect();
-            if (std.mem.eql(u8, e.table, "accounts")) {
-                // accounts is cross-protocol (shared address key): clear only THIS
-                // protocol's seen flag, then drop the row only if the other protocol
-                // never saw it — so an independent per-protocol rollback never deletes an
-                // account the still-synced protocol established.
-                const this_seen = if (protocol == .v1) "seen_v1" else "seen_v2";
-                const addr = try dialect.jsonExtract(allocator, "?1", "address", null); // text key, no cast
-                defer allocator.free(addr);
-                const upd = try std.fmt.allocPrint(allocator, "UPDATE \"{s}\" SET {s} = 0 WHERE address = {s}", .{ e.table, this_seen, addr });
-                defer allocator.free(upd);
-                var uq = try Query.init(db, upd);
-                defer uq.deinit();
-                try uq.bindText(e.old_row);
-                try uq.exec();
-
-                const del = try std.fmt.allocPrint(allocator, "DELETE FROM \"{s}\" WHERE address = {s} AND seen_v1 = 0 AND seen_v2 = 0", .{ e.table, addr });
-                defer allocator.free(del);
-                var dq = try Query.init(db, del);
-                defer dq.deinit();
-                try dq.bindText(e.old_row);
-                try dq.exec();
-            } else {
-                // Single-protocol reorg_active table (v1_controllers, unknown_labels):
-                // the row did not exist at N, so delete it by primary key. The PK's
-                // declared type is the Postgres `->>` cast — numeric PKs like
-                // unknown_labels.id need it; SQLite ignores the cast.
-                const info = try db.introspectColumns(allocator, e.table);
-                defer backend.freeColumnInfo(allocator, info);
-                const pk = for (info) |col| {
-                    if (col.pk_pos > 0) break col;
-                } else return error.NoPrimaryKey;
-                const cast: ?[]const u8 = if (pk.sql_type.len == 0) null else pk.sql_type;
-                const key_expr = try dialect.jsonExtract(allocator, "?1", pk.name, cast);
-                defer allocator.free(key_expr);
-                const del = try std.fmt.allocPrint(allocator, "DELETE FROM \"{s}\" WHERE \"{s}\" = {s}", .{ e.table, pk.name, key_expr });
-                defer allocator.free(del);
-                var dq = try Query.init(db, del);
-                defer dq.deinit();
-                try dq.bindText(e.old_row);
-                try dq.exec();
-            }
-            continue;
-        }
-        const sql = try getRestoreSql(db, allocator, &restore_sql, e.table);
-        var rq = try Query.init(db, sql);
-        defer rq.deinit();
-        try rq.bindText(e.old_row); // ?1
-        try rq.exec();
+        if (std.mem.eql(u8, e.table, "unknown_labels")) continue;
+        try replayEntry(db, allocator, &restore_sql, protocol, e);
+    }
+    for (entries.items) |e| {
+        if (!std.mem.eql(u8, e.table, "unknown_labels")) continue;
+        try replayEntry(db, allocator, &restore_sql, protocol, e);
     }
 
     // Drop the replayed undo entries.
@@ -477,6 +437,63 @@ pub fn replayUndo(db: *Database, protocol: models.Protocol, block_number: u64) !
     try del.bindTextStatic(protocol.toString());
     try del.bindInt64(@intCast(block_number));
     try del.exec();
+}
+
+/// Reverse-apply one captured undo entry (op 'I' retire / 'U'-'D' restore).
+/// Factored out of replayUndo so the two-pass FK-ordered walk reuses it.
+fn replayEntry(db: *Database, allocator: std.mem.Allocator, restore_sql: *std.StringHashMap([]u8), protocol: models.Protocol, e: anytype) !void {
+    if (std.mem.eql(u8, e.op, "I")) {
+        // A row first-created after N (op 'I', from a reorg_active table's INSERT
+        // trigger). Reverse it by retiring only this rollback's contribution.
+        const dialect = db.dialect();
+        if (std.mem.eql(u8, e.table, "accounts")) {
+            // accounts is cross-protocol (shared address key): clear only THIS
+            // protocol's seen flag, then drop the row only if the other protocol
+            // never saw it — so an independent per-protocol rollback never deletes an
+            // account the still-synced protocol established.
+            const this_seen = if (protocol == .v1) "seen_v1" else "seen_v2";
+            const addr = try dialect.jsonExtract(allocator, "?1", "address", null); // text key, no cast
+            defer allocator.free(addr);
+            const upd = try std.fmt.allocPrint(allocator, "UPDATE \"{s}\" SET {s} = 0 WHERE address = {s}", .{ e.table, this_seen, addr });
+            defer allocator.free(upd);
+            var uq = try Query.init(db, upd);
+            defer uq.deinit();
+            try uq.bindText(e.old_row);
+            try uq.exec();
+
+            const del = try std.fmt.allocPrint(allocator, "DELETE FROM \"{s}\" WHERE address = {s} AND seen_v1 = 0 AND seen_v2 = 0", .{ e.table, addr });
+            defer allocator.free(del);
+            var dq = try Query.init(db, del);
+            defer dq.deinit();
+            try dq.bindText(e.old_row);
+            try dq.exec();
+        } else {
+            // Single-protocol reorg_active table (v1_controllers, unknown_labels):
+            // the row did not exist at N, so delete it by primary key. The PK's
+            // declared type is the Postgres `->>` cast — numeric PKs like
+            // unknown_labels.id need it; SQLite ignores the cast.
+            const info = try db.introspectColumns(allocator, e.table);
+            defer backend.freeColumnInfo(allocator, info);
+            const pk = for (info) |col| {
+                if (col.pk_pos > 0) break col;
+            } else return error.NoPrimaryKey;
+            const cast: ?[]const u8 = if (pk.sql_type.len == 0) null else pk.sql_type;
+            const key_expr = try dialect.jsonExtract(allocator, "?1", pk.name, cast);
+            defer allocator.free(key_expr);
+            const del = try std.fmt.allocPrint(allocator, "DELETE FROM \"{s}\" WHERE \"{s}\" = {s}", .{ e.table, pk.name, key_expr });
+            defer allocator.free(del);
+            var dq = try Query.init(db, del);
+            defer dq.deinit();
+            try dq.bindText(e.old_row);
+            try dq.exec();
+        }
+        return;
+    }
+    const sql = try getRestoreSql(db, allocator, restore_sql, e.table);
+    var rq = try Query.init(db, sql);
+    defer rq.deinit();
+    try rq.bindText(e.old_row); // ?1
+    try rq.exec();
 }
 
 fn getRestoreSql(db: *Database, allocator: std.mem.Allocator, cache: *std.StringHashMap([]u8), table: []const u8) ![]u8 {
@@ -537,4 +554,146 @@ pub fn pruneBelow(db: *Database, protocol: models.Protocol, keep_from_block: u64
     try q.bindTextStatic(protocol.toString());
     try q.bindInt64(@intCast(keep_from_block));
     try q.exec();
+}
+
+// ── Write-path capture (the `server_side_undo = false` fallback) ─────────────
+// Application-side replacement for the AFTER-trigger capture above, for backends
+// without triggers. Each helper is a no-op (single bool check) on the shipped
+// backends (`server_side_undo = true`); when active it mirrors the trigger
+// semantics exactly with ONE atomic INSERT…SELECT per mutation:
+//   - protected tables: per-row cursor gate (`reorg_cursor` for the row's own
+//     protocol), op 'U'/'D', OLD-row snapshot via dialect.jsonObject over the
+//     introspected columns — multi-row WHEREs capture every matched row, like
+//     FOR EACH ROW triggers;
+//   - active tables (no protocol column): gated on the single-row reorg_active
+//     context, op 'I'/'U'/'D'.
+// Call the helper IMMEDIATELY BEFORE the mutation it shadows (op-'I' for active
+// tables immediately AFTER the insert), inside the same transaction. The WHERE
+// must be the same predicate the mutation uses; the forced-fallback CI lane
+// (test-integration-fallback) is the behavioral guard that the two stay in sync.
+// NOTE: SQLite's `ON DELETE CASCADE` does NOT route through these helpers — the
+// one cascading FK (unknown_labels.name_id → names.id) is captured explicitly
+// at the names-delete sites.
+
+inline fn writePathActive(db: *Database) bool {
+    return !db.backend.caps.server_side_undo;
+}
+
+fn bindOne(q: *Query, value: anytype) !void {
+    const T = @TypeOf(value);
+    if (T == models.Protocol) return q.bindText(value.toString());
+    if (T == @import("../types/hash.zig").Hash) return q.bindHashBuf(value);
+    if (T == @import("../types/address.zig").Address) return q.bindAddressBuf(value);
+    switch (@typeInfo(T)) {
+        .int, .comptime_int => return q.bindInt64(@intCast(value)),
+        .optional => return if (value) |v| bindOne(q, v) else q.bindNull(),
+        .pointer, .array => return q.bindText(value),
+        else => @compileError("unsupported capture bind type: " ++ @typeName(T)),
+    }
+}
+
+fn bindAll(q: *Query, args: anytype) !void {
+    inline for (args) |a| try bindOne(q, a);
+}
+
+/// `json_object(...)`-style snapshot expression over every column of `table`,
+/// aliased `t`, via the backend's dialect. Caller frees.
+fn captureJson(db: *Database, allocator: std.mem.Allocator, table: []const u8) ![]u8 {
+    const cols = try getColumns(db, allocator, table);
+    defer freeColumns(allocator, cols);
+    const ccols = try allocator.alloc([]const u8, cols.len);
+    defer allocator.free(ccols);
+    for (cols, 0..) |c, i| ccols[i] = c;
+    return db.dialect().jsonObject(allocator, ccols, "t");
+}
+
+/// Write-path capture for a PROTECTED table (has a `protocol` column): snapshot
+/// every row matching `where` as op `op` ('U' or 'D'), gated per row on the
+/// cursor for that row's protocol — the application-side mirror of the AFTER
+/// UPDATE/DELETE triggers. `args` binds the `where` placeholders in order.
+pub fn captureWhere(db: *Database, table: []const u8, op: []const u8, where: []const u8, args: anytype) !void {
+    if (!writePathActive(db)) return;
+    try captureWhereBinder(db, table, op, where, struct {
+        args: @TypeOf(args),
+        pub fn bind(self: @This(), q: *Query) !void {
+            try bindAll(q, self.args);
+        }
+    }{ .args = args });
+}
+
+/// Like `captureWhere` but with a caller-supplied binder (`fn bind(self, *Query) !void`)
+/// for sites whose placeholder count is only known at runtime (dynamic IN-lists).
+pub fn captureWhereBinder(db: *Database, table: []const u8, op: []const u8, where: []const u8, binder: anytype) !void {
+    if (!writePathActive(db)) return;
+    const allocator = db.allocator;
+    const jobj = try captureJson(db, allocator, table);
+    defer allocator.free(jobj);
+    const sql = try std.fmt.allocPrint(allocator,
+        \\INSERT INTO reorg_undo (protocol, block_number, table_name, op, old_row)
+        \\SELECT t."protocol", (SELECT block_number FROM reorg_cursor WHERE protocol = t."protocol"),
+        \\       '{s}', '{s}', {s}
+        \\FROM "{s}" t
+        \\WHERE ({s}) AND EXISTS (SELECT 1 FROM reorg_cursor WHERE protocol = t."protocol")
+    , .{ table, op, jobj, table, where });
+    defer allocator.free(sql);
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+    try binder.bind(&q);
+    try q.exec();
+}
+
+/// Write-path capture for a protected-table upsert (`.replace` / ON CONFLICT DO
+/// UPDATE): snapshot the pre-existing conflicting row (op 'U'; 0 rows when the
+/// insert is brand-new — those are reversed by sync.zig's created-after deletes).
+/// The WHERE is the table's pinned conflict key; `args` binds its columns in
+/// schema_keys order.
+pub fn captureUpsert(db: *Database, comptime table: []const u8, args: anytype) !void {
+    if (!writePathActive(db)) return;
+    const where = comptime blk: {
+        const conflict = schema_keys.conflictColsFor(table) orelse
+            @compileError("no conflict key pinned for table: " ++ table);
+        var w: []const u8 = "";
+        for (conflict, 0..) |c, i| {
+            w = w ++ (if (i > 0) " AND " else "") ++ "\"" ++ c ++ "\" = ?";
+        }
+        break :blk w;
+    };
+    try captureWhere(db, table, "U", where, args);
+}
+
+/// Write-path capture for an ACTIVE table (no `protocol` column): snapshot rows
+/// matching `where` as op `op` ('I' for the row just inserted, 'U'/'D' for the
+/// pre-image), tagged from the single-row reorg_active context — the mirror of
+/// the reorg_active triggers. Call with op "I" AFTER the insert, others BEFORE.
+pub fn captureActiveWhere(db: *Database, table: []const u8, op: []const u8, where: []const u8, args: anytype) !void {
+    if (!writePathActive(db)) return;
+    const allocator = db.allocator;
+    const jobj = try captureJson(db, allocator, table);
+    defer allocator.free(jobj);
+    const sql = try std.fmt.allocPrint(allocator,
+        \\INSERT INTO reorg_undo (protocol, block_number, table_name, op, old_row)
+        \\SELECT (SELECT protocol FROM reorg_active WHERE id = 1),
+        \\       (SELECT block_number FROM reorg_active WHERE id = 1),
+        \\       '{s}', '{s}', {s}
+        \\FROM "{s}" t
+        \\WHERE ({s}) AND EXISTS (SELECT 1 FROM reorg_active WHERE id = 1)
+    , .{ table, op, jobj, table, where });
+    defer allocator.free(sql);
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+    try bindAll(&q, args);
+    try q.exec();
+}
+
+/// Existence probe for an active-table upsert's I-vs-U branch discrimination.
+/// Returns false (without querying) when write-path capture is inactive — the
+/// result is only consumed by capture calls that no-op in that case.
+pub fn activeRowExists(db: *Database, table: []const u8, where: []const u8, args: anytype) !bool {
+    if (!writePathActive(db)) return false;
+    const sql = try std.fmt.allocPrint(db.allocator, "SELECT 1 FROM \"{s}\" t WHERE {s}", .{ table, where });
+    defer db.allocator.free(sql);
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+    try bindAll(&q, args);
+    return try q.step();
 }

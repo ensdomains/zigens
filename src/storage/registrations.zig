@@ -1,6 +1,7 @@
 const std = @import("std");
 const constants = @import("../constants.zig");
 const db_module = @import("database.zig");
+const reorg_undo = @import("reorg_undo.zig");
 const Database = db_module.Database;
 const Hash = @import("../types/hash.zig").Hash;
 const Address = @import("../types/address.zig").Address;
@@ -80,6 +81,7 @@ pub fn updateRegistrationExpiry(
     namehash: Hash,
     new_expiry: i64,
 ) !void {
+    try reorg_undo.captureWhere(db, "registrations", "U", "protocol = ? AND namehash = ?", .{ protocol, namehash });
     var q = try db_module.Query.initCached(db,
         \\UPDATE registrations SET expiry = ? WHERE protocol = ? AND namehash = ?
     );
@@ -104,6 +106,7 @@ pub fn updateRegistrationRegistrant(
     namehash: Hash,
     new_registrant: Address,
 ) !void {
+    try reorg_undo.captureWhere(db, "registrations", "U", "protocol = ? AND namehash = ?", .{ protocol, namehash });
     var q = try db_module.Query.initCached(db,
         \\UPDATE registrations SET registrant = LOWER(?) WHERE protocol = ? AND namehash = ?
     );
@@ -135,6 +138,7 @@ pub fn updateRegistrationEconomics(
     premium: u256,
     referrer: ?Hash,
 ) !void {
+    try reorg_undo.captureWhere(db, "registrations", "U", "protocol = ? AND namehash = ?", .{ protocol, namehash });
     const sql =
         \\UPDATE registrations
         \\SET base_cost = ?, premium = ?, label_name = ?, referrer = ?

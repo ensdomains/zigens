@@ -581,13 +581,7 @@ fn backfillSubregistryEvents(self: *Indexer, protocol: models.Protocol, client: 
 
     std.log.info("  Backfilling subregistry {s} events from block {d} to {d}", .{ subreg_hex, from_block, to_block });
 
-    // Build ENS event topic array for OR matching
-    var ens_event_topics: [Indexer.SUBREGISTRY_ENS_EVENTS.len]Hash = undefined;
-    inline for (Indexer.SUBREGISTRY_ENS_EVENTS, 0..) |event_cfg, i| {
-        ens_event_topics[i] = event_cfg.event_hash;
-    }
-
-    // Also include TransferSingle
+    // Combined topic array (ENS events + TransferSingle) for OR matching
     const all_topics_len = Indexer.SUBREGISTRY_ENS_EVENTS.len + 1;
     var all_topics: [all_topics_len]Hash = undefined;
     inline for (Indexer.SUBREGISTRY_ENS_EVENTS, 0..) |event_cfg, i| {
@@ -595,52 +589,103 @@ fn backfillSubregistryEvents(self: *Indexer, protocol: models.Protocol, client: 
     }
     all_topics[Indexer.SUBREGISTRY_ENS_EVENTS.len] = Indexer.SUBREGISTRY_TRANSFER_EVENT.event_hash;
 
-    // Query specifically for this subregistry's address (no false positives)
-    const logs = try client.getLogsMultiAddress(.{
-        .from_block = from_block,
-        .to_block = to_block,
-        .addresses = &[_]Address{subreg_addr},
-        .topic0_or = &all_topics,
-    });
-    defer {
-        for (logs) |*log| {
-            log.deinit(self.allocator);
-        }
-        self.allocator.free(logs);
-    }
-
-    if (logs.len == 0) {
-        std.log.info("  No historical events found for subregistry {s}", .{subreg_hex});
-        return;
-    }
+    // Adaptive chunking over the (potentially huge) historical range, mirroring the
+    // main subregistry scan in indexSubregistryEvents STEP 1: a single getLogs over
+    // millions of blocks is rejected by most RPCs (block-range cap), so chunk it and
+    // shrink-on-error. The query is address-filtered, so false positives are impossible.
+    const BACKFILL_MAX_CHUNK: u64 = 10000;
+    const BACKFILL_MIN_CHUNK: u64 = 500;
 
     var processed: usize = 0;
-    for (logs) |log| {
-        if (log.topics.len == 0) continue;
+    var chunk_size: u64 = BACKFILL_MAX_CHUNK;
+    var chunk_from = from_block;
 
-        const event_sig = log.topics[0];
+    while (chunk_from <= to_block) {
+        var retry_chunk_size = chunk_size;
 
-        // Check ENS-specific events first
-        inline for (Indexer.SUBREGISTRY_ENS_EVENTS) |event_cfg| {
-            if (event_sig.eql(event_cfg.event_hash)) {
-                event_cfg.handler(self, protocol, log) catch |err| {
-                    std.log.warn("  Backfill handler error for subregistry {s}: {}", .{ subreg_hex, err });
+        // Retry loop with adaptive chunk size
+        const logs = while (retry_chunk_size >= BACKFILL_MIN_CHUNK) {
+            const chunk_to = @min(chunk_from + retry_chunk_size - 1, to_block);
+
+            const result = client.getLogsMultiAddress(.{
+                .from_block = chunk_from,
+                .to_block = chunk_to,
+                .addresses = &[_]Address{subreg_addr},
+                .topic0_or = &all_topics,
+            }) catch |err| {
+                const new_size = retry_chunk_size / 2;
+                std.log.info("    Backfill chunk {d}-{d} too large ({any}), reducing to {d} blocks", .{ chunk_from, chunk_to, err, new_size });
+                retry_chunk_size = new_size;
+                std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
+                continue;
+            };
+
+            // Success - remember the working size for the next chunk
+            chunk_size = retry_chunk_size;
+            break result;
+        } else {
+            // All retries failed - skip this range and try to continue
+            std.log.warn("    Backfill for subregistry {s} failed at block {d} even with min chunk, skipping ahead", .{ subreg_hex, chunk_from });
+            chunk_from += BACKFILL_MIN_CHUNK;
+            chunk_size = BACKFILL_MIN_CHUNK * 2;
+            continue;
+        };
+
+        defer {
+            for (logs) |*log| {
+                log.deinit(self.allocator);
+            }
+            self.allocator.free(logs);
+        }
+
+        for (logs) |log| {
+            if (log.topics.len == 0) continue;
+
+            const event_sig = log.topics[0];
+
+            // Check ENS-specific events first
+            inline for (Indexer.SUBREGISTRY_ENS_EVENTS) |event_cfg| {
+                if (event_sig.eql(event_cfg.event_hash)) {
+                    event_cfg.handler(self, protocol, log) catch |err| {
+                        std.log.warn("  Backfill handler error for subregistry {s}: {}", .{ subreg_hex, err });
+                    };
+                    processed += 1;
+                    break;
+                }
+            }
+
+            // Check TransferSingle
+            if (event_sig.eql(Indexer.SUBREGISTRY_TRANSFER_EVENT.event_hash)) {
+                Indexer.SUBREGISTRY_TRANSFER_EVENT.handler(self, protocol, log) catch |err| {
+                    std.log.warn("  Backfill transfer error for subregistry {s}: {}", .{ subreg_hex, err });
                 };
                 processed += 1;
-                break;
             }
         }
 
-        // Check TransferSingle
-        if (event_sig.eql(Indexer.SUBREGISTRY_TRANSFER_EVENT.event_hash)) {
-            Indexer.SUBREGISTRY_TRANSFER_EVENT.handler(self, protocol, log) catch |err| {
-                std.log.warn("  Backfill transfer error for subregistry {s}: {}", .{ subreg_hex, err });
-            };
-            processed += 1;
+        // Move to next chunk
+        chunk_from += chunk_size;
+
+        // Gradually increase chunk size back toward max after success (+25%, min +500)
+        if (chunk_size < BACKFILL_MAX_CHUNK) {
+            const increase = @max(chunk_size / 4, 500);
+            const new_size = @min(chunk_size + increase, BACKFILL_MAX_CHUNK);
+            if (new_size > chunk_size) {
+                chunk_size = new_size;
+            }
+        }
+
+        // Rate limit between chunks
+        if (chunk_from <= to_block) {
+            std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
         }
     }
 
-    std.log.info("  Backfilled {d} historical events for subregistry {s}", .{ processed, subreg_hex });
+    if (processed == 0) {
+        std.log.info("  No historical events found for subregistry {s}", .{subreg_hex});
+    } else {
+        std.log.info("  Backfilled {d} historical events for subregistry {s}", .{ processed, subreg_hex });
+    }
 }
 
 /// Combined Phase 1 fetch: EthRegistry + ETHRegistrar + Datastore events in a single batch RPC call.

@@ -673,6 +673,7 @@ pub fn getOrphanedRegistrations(db: *Database, protocol: models.Protocol, subreg
 
 /// Delete orphaned registrations after they've been processed
 pub fn deleteOrphanedRegistrations(db: *Database, protocol: models.Protocol, subregistry_address: []const u8) !void {
+    try reorg_undo.captureWhere(db, "orphaned_registrations", "D", "protocol = ? AND subregistry_address = ?", .{ protocol, subregistry_address });
     const sql = "DELETE FROM orphaned_registrations WHERE protocol = ? AND subregistry_address = ?";
 
     var q = try Query.init(db, sql);

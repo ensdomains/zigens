@@ -10,6 +10,7 @@
 /// sourced through it as unreachable.
 const std = @import("std");
 const db_module = @import("database.zig");
+const reorg_undo = @import("reorg_undo.zig");
 const Database = db_module.Database;
 const Query = db_module.Query;
 const models = @import("../types/models.zig");
@@ -39,6 +40,7 @@ pub fn upsertSubregistry(
 
     const previous = try getSubregistry(db, protocol, parent_registry, token_id);
 
+    try reorg_undo.captureUpsert(db, "registry_entries", .{ protocol, parent_registry, canonical_hex });
     var q = try Query.initCached(db,
         \\INSERT INTO registry_entries
         \\  (protocol, parent_registry, canonical_id, subregistry, updated_block, updated_at)
@@ -162,38 +164,57 @@ pub fn setRegistriesReachability(
 ) !u64 {
     if (registries.len == 0) return 0;
 
-    var sql_buf: std.ArrayList(u8) = .{};
-    defer sql_buf.deinit(db.allocator);
+    // Chunked: each registry address is a tracked text bind, and Statement caps
+    // tracked binds at 32 (error.TooManyBoundParams beyond that) — large
+    // collectSubtreeRooted subtrees must therefore split the IN-list. The
+    // write-path undo capture mirrors each chunk's exact predicate.
+    const CHUNK: usize = 24;
+    var total: u64 = 0;
+    var off: usize = 0;
+    while (off < registries.len) : (off += CHUNK) {
+        const chunk = registries[off..@min(off + CHUNK, registries.len)];
 
-    if (reachable) {
-        try sql_buf.appendSlice(
-            db.allocator,
-            "UPDATE names SET is_reachable = 1, unreachable_since = NULL, updated_block = ?, updated_at = ? " ++
-                "WHERE protocol = ? AND is_reachable = 0 AND registry IN (",
-        );
-    } else {
-        try sql_buf.appendSlice(
-            db.allocator,
-            "UPDATE names SET is_reachable = 0, unreachable_since = ?, updated_block = ?, updated_at = ? " ++
-                "WHERE protocol = ? AND is_reachable = 1 AND registry IN (",
-        );
+        var where_buf: std.ArrayList(u8) = .{};
+        defer where_buf.deinit(db.allocator);
+        try where_buf.appendSlice(db.allocator, if (reachable)
+            "protocol = ? AND is_reachable = 0 AND registry IN ("
+        else
+            "protocol = ? AND is_reachable = 1 AND registry IN (");
+        for (chunk, 0..) |_, i| {
+            if (i > 0) try where_buf.appendSlice(db.allocator, ", ");
+            try where_buf.append(db.allocator, '?');
+        }
+        try where_buf.append(db.allocator, ')');
+
+        const Binder = struct {
+            protocol: models.Protocol,
+            registries: []const Address,
+            pub fn bind(self: @This(), cq: *Query) !void {
+                try cq.bindText(self.protocol.toString());
+                for (self.registries) |r| try cq.bindAddressBuf(r);
+            }
+        };
+        try reorg_undo.captureWhereBinder(db, "names", "U", where_buf.items, Binder{ .protocol = protocol, .registries = chunk });
+
+        var sql_buf: std.ArrayList(u8) = .{};
+        defer sql_buf.deinit(db.allocator);
+        try sql_buf.appendSlice(db.allocator, if (reachable)
+            "UPDATE names SET is_reachable = 1, unreachable_since = NULL, updated_block = ?, updated_at = ? WHERE "
+        else
+            "UPDATE names SET is_reachable = 0, unreachable_since = ?, updated_block = ?, updated_at = ? WHERE ");
+        try sql_buf.appendSlice(db.allocator, where_buf.items);
+
+        var q = try Query.init(db, sql_buf.items);
+        defer q.deinit();
+        if (!reachable) try q.bindInt64(block_timestamp);
+        try q.bindInt64(@intCast(block_number));
+        try q.bindInt64(block_timestamp);
+        try q.bindTextStatic(protocol.toString());
+        for (chunk) |r| try q.bindAddress(r);
+        try q.exec();
+        total += @intCast(q.changes());
     }
-    for (registries, 0..) |_, i| {
-        if (i > 0) try sql_buf.appendSlice(db.allocator, ", ");
-        try sql_buf.append(db.allocator, '?');
-    }
-    try sql_buf.append(db.allocator, ')');
-
-    var q = try Query.init(db, sql_buf.items);
-    defer q.deinit();
-
-    if (!reachable) try q.bindInt64(block_timestamp);
-    try q.bindInt64(@intCast(block_number));
-    try q.bindInt64(block_timestamp);
-    try q.bindTextStatic(protocol.toString());
-    for (registries) |r| try q.bindAddress(r);
-    try q.exec();
-    return @intCast(q.changes());
+    return total;
 }
 
 /// Soft-delete a single name by namehash (sets is_reachable = 0). Used by
@@ -206,6 +227,7 @@ pub fn markNameUnreachableByNamehash(
     block_number: u64,
     block_timestamp: i64,
 ) !void {
+    try reorg_undo.captureWhere(db, "names", "U", "protocol = ? AND namehash = ?", .{ protocol, namehash });
     var q = try Query.initCached(db,
         \\UPDATE names SET is_reachable = 0, unreachable_since = ?, updated_block = ?, updated_at = ?
         \\WHERE protocol = ? AND namehash = ?

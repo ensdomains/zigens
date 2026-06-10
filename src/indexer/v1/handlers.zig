@@ -1737,6 +1737,11 @@ fn healLabelsFromDNSName(self: *Indexer, name_bytes: []const u8, wrapped_node: H
 /// Delete unknown_labels entry by namehash (after healing from DNS name). Best-effort.
 fn deleteUnknownLabelByNamehash(database: *db.Database, namehash_bytes: *const [32]u8) !void {
     const namehash = Hash{ .bytes = namehash_bytes.* };
+    const reorg_undo = @import("../../storage/reorg_undo.zig");
+    // Best-effort like the rest of this fn — but if capture fails, SKIP the
+    // delete: an uncaptured delete breaks rollback ≡ clean-sync in the
+    // write-path lane (triggers are atomic with the statement; mirror that).
+    reorg_undo.captureActiveWhere(database, "unknown_labels", "D", "namehash = ?", .{namehash}) catch return;
     var q = db.Query.init(database, "DELETE FROM unknown_labels WHERE namehash = ?") catch return;
     defer q.deinit();
     q.bindHash(namehash) catch return;

@@ -167,6 +167,14 @@ pub const Database = struct {
         };
         errdefer database.deinit();
 
+        // Backends without in-engine undo capture (server_side_undo=false) use
+        // the application write-path fallback: the storage mutators capture
+        // pre-images via reorg_undo.captureWhere/captureUpsert/captureActive*
+        // (no triggers installed below). See docs/backend-spi.md.
+        if (!be.caps.server_side_undo) {
+            std.log.info("backend has no server-side undo triggers; write-path reorg capture active", .{});
+        }
+
         // Load and apply the consolidated schema. The expected workflow for schema
         // changes is to re-index from scratch — schema.sql defines the final shape of
         // every table. The `migrate()` scaffold is kept as a thin hook so future
@@ -179,7 +187,7 @@ pub const Database = struct {
         // reverse in-place mutations. Generated from the live schema; gated by
         // reorg_cursor (no capture unless the indexer sets the current block).
         try reorg_undo.ensureSchema(&database);
-        try reorg_undo.installTriggers(&database);
+        if (be.caps.server_side_undo) try reorg_undo.installTriggers(&database);
 
         return database;
     }
@@ -271,6 +279,9 @@ pub const Database = struct {
             // has the current shape. The DELETE-key on (namehash, parent_namehash='')
             // makes the fixup idempotent — once corrected, the predicate matches
             // nothing on subsequent boots.
+            // (No undo capture: migrate() runs before reorg_undo.ensureSchema, and
+            // no cursor can exist during bootstrap — the trigger path captures
+            // nothing here either, since triggers install after migrate.)
             try self.exec(
                 \\DELETE FROM names
                 \\WHERE namehash = '0x0000000000000000000000000000000000000000000000000000000000000000'
@@ -374,6 +385,10 @@ pub const Database = struct {
     /// The active backend's SQL-dialect builders.
     pub fn dialect(self: *Database) *const backend_mod.Dialect {
         return self.backend.dialect;
+    }
+
+    pub fn caps(self: *Database) backend_mod.Capabilities {
+        return self.backend.caps;
     }
 
     /// True when the active backend is PostgreSQL. The dialect's placeholder style

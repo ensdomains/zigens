@@ -28,13 +28,31 @@ pub const StepOutcome = enum { row, done, failed };
 /// Postgres driver renumbers to `$N`. Carried here for the Phase-4 SPI.
 pub const Placeholder = enum { qmark, dollar };
 
-/// Backend feature flags, consulted by callers/dialect without RTTI. Defined
-/// now as the SPI contract; wired when the second backend lands.
+/// Backend feature flags, consulted by callers without RTTI. Each driver
+/// declares its capabilities statically and carries them on its `Backend`.
+///
+/// `server_side_undo` is load-bearing for reorg correctness. `true` means the
+/// backend provides in-engine capture (triggers) for the reorg undo-log,
+/// installed by `Database.initWithBackend`'s bootstrap — declare it ONLY if
+/// trigger capture really exists, or reorg rollback is silently broken.
+/// `false` activates the application write-path fallback: no triggers are
+/// installed and the storage mutators capture pre-images themselves
+/// (reorg_undo.captureWhere/captureUpsert/captureActive*). The fallback covers
+/// exactly the instrumented mutators in src/storage/ (+ the v1 handler heal) —
+/// raw SQL on protected tables outside them is NOT captured. Conformance gate:
+/// `zig build test-integration-fallback` (the full reorg suite with SQLite
+/// forced to `false`). Both shipped drivers declare `true`.
 pub const Capabilities = struct {
     placeholder: Placeholder = .qmark,
+    /// Supports the `RETURNING` clause (used unconditionally by the webhook
+    /// queue's race-free claim UPDATE).
     returning: bool = true,
+    /// Supports `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` inside a transaction.
     savepoints: bool = true,
+    /// In-engine (trigger-based) reorg undo capture. See struct doc.
     server_side_undo: bool = true,
+    /// The driver manages its connection through an internal pool (reconnect
+    /// support); the `Backend` still exposes a single pinned session.
     pooled: bool = false,
 };
 
@@ -143,6 +161,8 @@ pub const Backend = struct {
     vtable: *const VTable,
     /// SQL-dialect builders for this backend (static per backend).
     dialect: *const Dialect,
+    /// Feature flags for this backend (static per backend).
+    caps: Capabilities,
 };
 
 /// RAII transaction guard. `begin` opens the transaction; `commit` finalizes it;
@@ -235,21 +255,23 @@ pub const Statement = struct {
         self.bound_strings = [_]?[]u8{null} ** MAX_BOUND_STRINGS;
     }
 
-    fn trackBoundString(self: *Statement, str: []u8) void {
-        if (self.bound_string_count < MAX_BOUND_STRINGS) {
-            self.bound_strings[self.bound_string_count] = str;
-            self.bound_string_count += 1;
-        } else {
-            std.log.warn("Statement: exceeded max bound strings, freeing immediately", .{});
+    fn trackBoundString(self: *Statement, str: []u8) !void {
+        // Fail loudly: the old behavior freed the copy and bound the dangling
+        // pointer (use-after-free at step/exec). Callers with legitimately
+        // large parameter lists must chunk (see setRegistriesReachability).
+        if (self.bound_string_count >= MAX_BOUND_STRINGS) {
             self.allocator.free(str);
+            return error.TooManyBoundParams;
         }
+        self.bound_strings[self.bound_string_count] = str;
+        self.bound_string_count += 1;
     }
 
     // ── Parameter binding ──────────────────────────────────────────────────
 
     pub fn bindText(self: *Statement, value: []const u8) !void {
         const copy = try self.allocator.dupe(u8, value);
-        self.trackBoundString(copy);
+        try self.trackBoundString(copy);
         try self.bindTrackedText(copy);
     }
 
@@ -296,13 +318,13 @@ pub const Statement = struct {
 
     pub fn bindAddress(self: *Statement, addr: Address) !void {
         const hex = try addr.toHex(self.allocator);
-        self.trackBoundString(hex);
+        try self.trackBoundString(hex);
         try self.bindTrackedText(hex);
     }
 
     pub fn bindHash(self: *Statement, hash: Hash) !void {
         const hex = try hash.toHex(self.allocator);
-        self.trackBoundString(hex);
+        try self.trackBoundString(hex);
         try self.bindTrackedText(hex);
     }
 
@@ -310,7 +332,7 @@ pub const Statement = struct {
         var buf: [42]u8 = undefined;
         _ = addr.toHexBuf(&buf);
         const copy = try self.allocator.dupe(u8, &buf);
-        self.trackBoundString(copy);
+        try self.trackBoundString(copy);
         try self.bindTrackedText(copy);
     }
 
@@ -318,7 +340,7 @@ pub const Statement = struct {
         var buf: [66]u8 = undefined;
         _ = hash.toHexBuf(&buf);
         const copy = try self.allocator.dupe(u8, &buf);
-        self.trackBoundString(copy);
+        try self.trackBoundString(copy);
         try self.bindTrackedText(copy);
     }
 

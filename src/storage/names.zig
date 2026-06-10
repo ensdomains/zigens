@@ -3,6 +3,7 @@
 const std = @import("std");
 const testing = std.testing;
 const db_module = @import("database.zig");
+const reorg_undo = @import("reorg_undo.zig");
 const Database = db_module.Database;
 const Query = db_module.Query;
 const models = @import("../types/models.zig");
@@ -233,6 +234,7 @@ pub fn insertRegistry(db: *Database, registry: models.Registry) !void {
 /// placeholder in their name/namehash columns (see updatePlaceholderEventsByName for event payload
 /// handling — we only patch the indexed columns, not the raw JSON data blob).
 pub fn updateRegistryPlaceholderName(db: *Database, placeholder_name: []const u8, actual_name: []const u8, namehash: Hash) !u32 {
+    try reorg_undo.captureWhere(db, "registries", "U", "name = ?", .{placeholder_name});
     var reg_q = try Query.init(db, "UPDATE registries SET name = ?, namehash = ? WHERE name = ?");
     defer reg_q.deinit();
     try reg_q.bindText(actual_name);
@@ -241,6 +243,7 @@ pub fn updateRegistryPlaceholderName(db: *Database, placeholder_name: []const u8
     try reg_q.exec();
     const registry_changes = reg_q.changes();
 
+    try reorg_undo.captureWhere(db, "names", "U", "parent_name = ?", .{placeholder_name});
     var names_q = try Query.init(db,
         \\UPDATE names
         \\SET parent_name = ?,
@@ -374,6 +377,7 @@ pub fn getRegistry(db: *Database, protocol: models.Protocol, address: Address) !
 // ============================================================================
 
 pub fn insertName(db: *Database, name: models.Name) !void {
+    try reorg_undo.captureUpsert(db, "names", .{ name.protocol, name.namehash });
     var q = try Query.initCached(db,
         \\INSERT INTO names
         \\(namehash, name, label, label_hash, parent_name, parent_namehash, protocol,
@@ -469,6 +473,7 @@ pub fn insertName(db: *Database, name: models.Name) !void {
 /// pre-2020 Registry (0x314159…) or the canonical post-2020 Registry.
 /// No-op when no row exists for `namehash`.
 pub fn updateNameIsLegacy(db: *Database, namehash: Hash, is_legacy: bool) !void {
+    try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     var q = try Query.initCached(db, "UPDATE names SET is_legacy = ?, updated_at = ? WHERE namehash = ?");
     defer q.deinit();
     try q.bindInt(if (is_legacy) 1 else 0);
@@ -479,6 +484,7 @@ pub fn updateNameIsLegacy(db: *Database, namehash: Hash, is_legacy: bool) !void 
 
 /// Update name expiry (for renewals)
 pub fn updateNameExpiry(db: *Database, namehash: Hash, expiry: u64) !void {
+    try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     var q = try Query.initCached(db, "UPDATE names SET expiry = ?, updated_at = ? WHERE namehash = ?");
     defer q.deinit();
 
@@ -490,6 +496,7 @@ pub fn updateNameExpiry(db: *Database, namehash: Hash, expiry: u64) !void {
 
 /// Update name owner (for transfers)
 pub fn updateNameOwner(db: *Database, namehash: Hash, new_owner: Address) !void {
+    try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     var q = try Query.initCached(db, "UPDATE names SET owner = ?, updated_at = ? WHERE namehash = ?");
     defer q.deinit();
 
@@ -504,6 +511,7 @@ pub fn updateNameOwner(db: *Database, namehash: Hash, new_owner: Address) !void 
 /// have been transferred to a V1→V2 migration controller (which is functionally
 /// "no longer ownable on V1").
 pub fn markNameMigrated(db: *Database, namehash: Hash, controller: Address) !void {
+    try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     var q = try Query.initCached(db, "UPDATE names SET owner = ?, migrated = 1, updated_at = ? WHERE namehash = ?");
     defer q.deinit();
 
@@ -515,6 +523,7 @@ pub fn markNameMigrated(db: *Database, namehash: Hash, controller: Address) !voi
 
 /// Update name resolver
 pub fn updateNameResolver(db: *Database, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     var q = try Query.initCached(db, "UPDATE names SET resolver = ?, updated_at = ? WHERE namehash = ?");
     defer q.deinit();
 
@@ -529,6 +538,7 @@ pub fn updateNameResolver(db: *Database, namehash: Hash, resolver: Address) !voi
 /// — both indicate "no resolution available right now". No-op if the row
 /// doesn't exist.
 pub fn updateResolvedAddressToNull(db: *Database, namehash: Hash) !void {
+    try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     var q = try Query.initCached(db, "UPDATE names SET resolved_address = NULL, updated_at = ? WHERE namehash = ?");
     defer q.deinit();
 
@@ -541,6 +551,7 @@ pub fn updateResolvedAddressToNull(db: *Database, namehash: Hash) !void {
 /// No-op if no row exists with this namehash — consistent with NewResolver:
 /// V1 NewTTL on a non-existent name has nothing to attach to.
 pub fn updateNameTTL(db: *Database, namehash: Hash, ttl: u64) !void {
+    try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     var q = try Query.initCached(db, "UPDATE names SET ttl = ?, updated_at = ? WHERE namehash = ?");
     defer q.deinit();
 
@@ -552,6 +563,8 @@ pub fn updateNameTTL(db: *Database, namehash: Hash, ttl: u64) !void {
 
 /// Delete a name by its namehash (registry-safe: only deletes the exact name)
 pub fn deleteNameByNamehash(db: *Database, namehash: Hash) !void {
+    try reorg_undo.captureActiveWhere(db, "unknown_labels", "D", "name_id IN (SELECT id FROM names WHERE namehash = ?)", .{namehash});
+    try reorg_undo.captureWhere(db, "names", "D", "namehash = ?", .{namehash});
     var q = try Query.initCached(db, "DELETE FROM names WHERE namehash = ?");
     defer q.deinit();
 
@@ -631,6 +644,7 @@ pub fn updateNameTokenIdByNamehash(db: *Database, namehash: Hash, new_token_id: 
     const token_id_utils = @import("../types/token_id.zig");
     const token_version = token_id_utils.getTokenVersion(new_token_id);
 
+    try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     var q = try Query.initCached(db, "UPDATE names SET token_id = ?, token_version = ?, updated_at = ? WHERE namehash = ?");
     defer q.deinit();
 
@@ -646,6 +660,7 @@ pub fn updateNameTokenIdByNamehash(db: *Database, namehash: Hash, new_token_id: 
 
 /// Update wrapper state for a name
 pub fn updateNameWrapperState(db: *Database, namehash: Hash, fuses: u32, expiry: u64) !void {
+    try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     var q = try Query.initCached(db,
         \\UPDATE names SET is_wrapped = 1, wrapper_fuses = ?, wrapper_expiry = ?,
         \\updated_at = ? WHERE namehash = ?
@@ -669,6 +684,7 @@ pub fn updateNameWrapperState(db: *Database, namehash: Hash, fuses: u32, expiry:
 /// unless the parent is the .eth registrar (in which case the registration's
 /// expiry remains canonical).
 pub fn clearNameExpiry(db: *Database, namehash: Hash) !void {
+    try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     var q = try Query.initCached(db,
         \\UPDATE names SET expiry = NULL, updated_at = ? WHERE namehash = ?
     );
@@ -681,6 +697,7 @@ pub fn clearNameExpiry(db: *Database, namehash: Hash) !void {
 
 /// Clear wrapper state for a name (unwrap)
 pub fn updateNameUnwrapperState(db: *Database, namehash: Hash) !void {
+    try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     var q = try Query.initCached(db,
         \\UPDATE names SET is_wrapped = 0, wrapper_fuses = NULL, wrapper_expiry = NULL,
         \\updated_at = ? WHERE namehash = ?
@@ -694,6 +711,7 @@ pub fn updateNameUnwrapperState(db: *Database, namehash: Hash) !void {
 
 /// Update wrapper fuses only
 pub fn updateNameWrapperFuses(db: *Database, namehash: Hash, fuses: u32) !void {
+    try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     var q = try Query.initCached(db,
         \\UPDATE names SET wrapper_fuses = ?, updated_at = ? WHERE namehash = ?
     );
@@ -710,6 +728,7 @@ pub fn updateNameWrapperFuses(db: *Database, namehash: Hash, fuses: u32) !void {
 
 /// Update wrapper expiry only
 pub fn updateNameWrapperExpiry(db: *Database, namehash: Hash, expiry: u64) !void {
+    try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     var q = try Query.initCached(db,
         \\UPDATE names SET wrapper_expiry = ?, updated_at = ? WHERE namehash = ?
     );
@@ -732,6 +751,7 @@ pub fn updateNameWrapperExpiry(db: *Database, namehash: Hash, expiry: u64) !void
 /// That edge case is fine: `NameWrapped` on a name we never saw via Registry
 /// will simply skip the mirror until the Registry row materializes.
 pub fn updateDomainExpiryIfGreater(db: *Database, namehash: Hash, new_expiry: i64) !void {
+    try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     const sql = try std.fmt.allocPrint(db.allocator,
         \\UPDATE names
         \\SET expiry = {s}(COALESCE(expiry, 0), ?),
@@ -768,6 +788,7 @@ pub fn updateDomainExpiryIfGreater(db: *Database, namehash: Hash, new_expiry: i6
 /// Returns the number of rows updated.
 pub fn materializePccDomainExpiry(db: *Database) !u32 {
     const PARENT_CANNOT_CONTROL: i64 = 0x10000;
+    try reorg_undo.captureWhere(db, "names", "U", "is_wrapped = 1 AND wrapper_expiry IS NOT NULL AND wrapper_fuses IS NOT NULL AND wrapper_fuses != '' AND (CAST(wrapper_fuses AS INTEGER) & ?) != 0 AND wrapper_expiry > COALESCE(expiry, 0)", .{PARENT_CANNOT_CONTROL});
     var q = try Query.init(db,
         \\UPDATE names
         \\SET expiry = wrapper_expiry,
@@ -790,6 +811,7 @@ pub fn materializePccDomainExpiry(db: *Database) !u32 {
 /// `is_normalized` is recomputed by the caller (indexer layer, which has the
 /// ENSIP-15 lib) now that the plaintext label/name is known.
 pub fn updateNameLabel(database: *Database, namehash: Hash, label: []const u8, name: []const u8, is_normalized: bool) !void {
+    try reorg_undo.captureWhere(database, "names", "U", "namehash = ?", .{namehash});
     var q = try Query.initCached(database,
         \\UPDATE names SET label = ?, name = ?, is_normalized = ?
         \\WHERE namehash = ?
@@ -805,6 +827,7 @@ pub fn updateNameLabel(database: *Database, namehash: Hash, label: []const u8, n
 
 /// Update creation date if the new block is earlier (for backfill scenarios)
 pub fn updateNameCreationDateIfEarlier(db: *Database, namehash: Hash, block_number: u64, created_at: i64) !void {
+    try reorg_undo.captureWhere(db, "names", "U", "namehash = ? AND created_block > ?", .{ namehash, block_number });
     var q = try Query.initCached(db,
         \\UPDATE names SET created_block = ?, created_at = ?
         \\WHERE namehash = ? AND created_block > ?

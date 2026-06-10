@@ -111,9 +111,6 @@ pub fn main() !void {
     std.log.info("Rate limit: {d} req/s", .{cfg.rate_limit_per_second});
 
     // Initialize database (backend selected by config: SQLite path or DATABASE_URL).
-    if (cfg.backend_kind == .postgres) {
-        std.log.warn("PostgreSQL backend is EXPERIMENTAL for indexing (reorg rollback + affected-row counts incomplete); not recommended for production yet.", .{});
-    }
     var database = try db_open.openFromConfig(allocator, cfg);
     defer database.deinit();
     database.setChainId(cfg.network.chainId());
