@@ -14,25 +14,33 @@ comptime {
     _ = @import("types/token_id.zig");
 }
 
-const handlers_resolver = @import("indexer/v2/handlers_resolver.zig");
+const dns = @import("utils/dns.zig");
 const token_id = @import("types/token_id.zig");
 
 fn expectDns(a: std.mem.Allocator, wire: []const u8, want: []const u8) !void {
-    const got = try handlers_resolver.decodeDnsWireFormat(a, wire);
+    const got = (try dns.decodeDNSNameToString(a, wire)) orelse return error.TestUnexpectedResult;
     defer a.free(got);
     try std.testing.expectEqualStrings(want, got);
 }
 
-test "decodeDnsWireFormat: DNS wire-format → dotted name" {
+// Pins the semantics the V2 resolver handlers rely on after the duplicate
+// decoder was folded into utils/dns.zig: identical dotted-name output on valid
+// (and tolerated-malformed) input, and null — never a decode error — on
+// rejected input, which the call sites turn into warn/skip via `orelse`.
+test "decodeDNSNameToString: DNS wire-format → dotted name; failures fold to null" {
     const a = std.testing.allocator;
     try expectDns(a, "\x03eth\x00", "eth");
     try expectDns(a, "\x05alice\x03eth\x00", "alice.eth");
     try expectDns(a, "\x03sub\x05alice\x03eth\x00", "sub.alice.eth");
     // A missing root terminator still decodes (the loop ends at data.len).
     try expectDns(a, "\x03eth", "eth");
-    // Empty input and a label length running past the buffer are rejected.
-    try std.testing.expectError(error.EmptyDnsData, handlers_resolver.decodeDnsWireFormat(a, ""));
-    try std.testing.expectError(error.InvalidDnsWireFormat, handlers_resolver.decodeDnsWireFormat(a, "\x05ab"));
+    // Bytes after the root terminator are ignored, not an error.
+    try expectDns(a, "\x03eth\x00junk", "eth");
+    // Rejected inputs fold to null: empty, label running past the buffer,
+    // and a bare root terminator (no labels).
+    try std.testing.expectEqual(@as(?[]const u8, null), try dns.decodeDNSNameToString(a, ""));
+    try std.testing.expectEqual(@as(?[]const u8, null), try dns.decodeDNSNameToString(a, "\x05ab"));
+    try std.testing.expectEqual(@as(?[]const u8, null), try dns.decodeDNSNameToString(a, "\x00"));
 }
 
 test "getCanonicalId: clears the low 32 version bits (EAC/token-id stability)" {

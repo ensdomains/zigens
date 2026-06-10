@@ -1146,7 +1146,6 @@ pub const Indexer = struct {
     pub const handleInterfaceChanged = handlers_v2_resolver.handleInterfaceChanged;
     pub const handleVersionChanged = handlers_v2_resolver.handleVersionChanged;
     pub const handleAliasChanged = handlers_v2_resolver.handleAliasChanged;
-    pub const decodeDnsWireFormat = handlers_v2_resolver.decodeDnsWireFormat;
     pub const handleResolverEACRolesChanged = handlers_v2_resolver.handleResolverEACRolesChanged;
 
     // V1 event handlers (extracted to handlers_v1.zig)

@@ -1,3 +1,26 @@
+//! Hand-written JSON-RPC client — CUSTOM FOR CAUSE (audit #51, settled 2026-06-06).
+//!
+//! Migrating this onto eth.zig's provider (we already use its ABI decoding at
+//! 45 sites) was investigated against eth.zig v0.3.0 source and rejected: the
+//! indexer depends on four properties its RPC layer lacks —
+//!   1. JSON-RPC BATCHING: `HttpTransport.request` (http_transport.zig:47) is
+//!      single-call; we batch up to ~11 eth_getLogs per HTTP request
+//!      (getLogsBatch/getLogsMultiAddressBatch/getTransactionsByHashBatch).
+//!   2. ADDRESS-ARRAY FILTERS: its `LogFilter.address` (json_rpc.zig:181) is a
+//!      single string; getLogsMultiAddress needs address arrays + topic0 OR.
+//!   3. ERROR TAXONOMY: its provider swallows RPC error code/message; the
+//!      adaptive chunking here branches on RpcError vs StreamTooLong vs
+//!      transient HttpError (see retry/backoff below).
+//!   4. RESPONSE CAP: max_response_bytes (50 MB) is what produces
+//!      StreamTooLong for the halve-on-error loops; eth.zig fetches unbounded.
+//! Also: eth.zig's Log has no `block_timestamp` (the Alchemy extension we use
+//! to avoid block fetches), and any second transport would bypass
+//! `drainIdleHttpConnections` — the Zig 0.15.2 std.http pool-poisoning
+//! workaround — reintroducing that failure through the second pool.
+//!
+//! REVISIT when: eth.zig grows batch + filter-arrays + surfaced RPC errors +
+//! a response cap (upstream-able), AND Zig 0.16's std.Io http rewrite lands
+//! (removes the drain workaround). Until then this file is deliberate.
 const std = @import("std");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;

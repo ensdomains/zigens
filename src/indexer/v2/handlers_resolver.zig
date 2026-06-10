@@ -10,6 +10,7 @@ const Indexer = @import("../indexer.zig").Indexer;
 const utils = @import("../utils.zig");
 const unicode = @import("../../utils/unicode.zig");
 const json_utils = @import("../../utils/json.zig");
+const dns = @import("../../utils/dns.zig");
 
 /// Handle legacy AddrChanged event (2017 Public Resolver)
 /// AddrChanged(bytes32 indexed node, address a)
@@ -983,8 +984,8 @@ pub fn handleAliasChanged(self: *Indexer, protocol: models.Protocol, resolver: A
     const to_dns_bytes = data_values[1].bytes;
 
     // Decode DNS wire format to human-readable names
-    const from_name = decodeDnsWireFormat(self.allocator, from_dns_bytes) catch |err| {
-        std.log.warn("AliasChanged: failed to decode fromName DNS wire format: {}", .{err});
+    const from_name = (try dns.decodeDNSNameToString(self.allocator, from_dns_bytes)) orelse {
+        std.log.warn("AliasChanged: failed to decode fromName DNS wire format", .{});
         return;
     };
     defer self.allocator.free(from_name);
@@ -1003,8 +1004,8 @@ pub fn handleAliasChanged(self: *Indexer, protocol: models.Protocol, resolver: A
             std.log.warn("Failed to delete resolver alias: {}", .{err});
         };
     } else {
-        const to_name = decodeDnsWireFormat(self.allocator, to_dns_bytes) catch |err| {
-            std.log.warn("AliasChanged: failed to decode toName DNS wire format: {}", .{err});
+        const to_name = (try dns.decodeDNSNameToString(self.allocator, to_dns_bytes)) orelse {
+            std.log.warn("AliasChanged: failed to decode toName DNS wire format", .{});
             return;
         };
         defer self.allocator.free(to_name);
@@ -1037,7 +1038,7 @@ pub fn handleAliasChanged(self: *Indexer, protocol: models.Protocol, resolver: A
     defer self.allocator.free(escaped_from);
 
     // For event data, include raw toName even if empty
-    const to_name_for_event = decodeDnsWireFormat(self.allocator, to_dns_bytes) catch
+    const to_name_for_event = (try dns.decodeDNSNameToString(self.allocator, to_dns_bytes)) orelse
         try self.allocator.dupe(u8, "");
     defer self.allocator.free(to_name_for_event);
 
@@ -1058,47 +1059,4 @@ pub fn handleAliasChanged(self: *Indexer, protocol: models.Protocol, resolver: A
 pub fn handleResolverEACRolesChanged(self: *Indexer, protocol: models.Protocol, _resolver: Address, log: rpc.Log) !void {
     _ = _resolver;
     try Indexer.handleEACRolesChanged(self, protocol, log);
-}
-
-/// Decode DNS wire format to human-readable domain name
-/// e.g., \x03eth\x00 → "eth", \x05alice\x03eth\x00 → "alice.eth"
-pub fn decodeDnsWireFormat(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
-    if (data.len == 0) return error.EmptyDnsData;
-
-    var parts: std.ArrayList([]const u8) = .{};
-    defer parts.deinit(allocator);
-
-    var pos: usize = 0;
-    while (pos < data.len) {
-        const label_len = data[pos];
-        if (label_len == 0) break; // Root label terminator
-
-        pos += 1;
-        if (pos + label_len > data.len) return error.InvalidDnsWireFormat;
-
-        try parts.append(allocator, data[pos .. pos + label_len]);
-        pos += label_len;
-    }
-
-    if (parts.items.len == 0) return error.EmptyDnsName;
-
-    // Calculate total length: sum of labels + dots between them
-    var total_len: usize = 0;
-    for (parts.items) |part| {
-        total_len += part.len;
-    }
-    total_len += parts.items.len - 1; // dots
-
-    var result = try allocator.alloc(u8, total_len);
-    var offset: usize = 0;
-    for (parts.items, 0..) |part, i| {
-        @memcpy(result[offset .. offset + part.len], part);
-        offset += part.len;
-        if (i < parts.items.len - 1) {
-            result[offset] = '.';
-            offset += 1;
-        }
-    }
-
-    return result;
 }
