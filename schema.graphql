@@ -1121,6 +1121,33 @@ type ResolverDetail {
 
   """Events emitted by this resolver contract"""
   events(first: Int = 100): [Event!]!
+
+  """Resource-name associations announced by this resolver (EAC resource naming; emitted on the first role grant per resource)"""
+  namedResources: [NamedResourceEntry!]!
+}
+
+"""An EAC resource id and the name/record it guards on a resolver (from the Named*Resource discovery events)"""
+type NamedResourceEntry {
+  """Protocol the association was indexed under"""
+  protocol: String!
+
+  """EAC resource id (32-byte hex)"""
+  resource: String!
+
+  """Which record kind the resource guards: name | text | data | addr"""
+  recordKind: String!
+
+  """Text/data record key ('' for name/addr kinds)"""
+  recordKey: String!
+
+  """Coin type for addr-kind resources as a decimal string (ENSIP-11-safe; "-1" when not applicable)"""
+  coinType: String!
+
+  """The dotted name the resource is associated with"""
+  name: String!
+
+  """Block the association was announced at"""
+  blockNumber: Int!
 }
 
 """Registry information"""

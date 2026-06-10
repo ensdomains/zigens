@@ -36,6 +36,7 @@ const accounts = @import("accounts.zig");
 pub const AccountFilters = accounts.AccountFilters;
 pub const AccountSortField = accounts.AccountSortField;
 pub const Account = accounts.Account;
+pub const NamedResource = named_resources.NamedResource;
 pub const ResolverEntity = resolvers.ResolverEntity;
 pub const ResolverEntityFilters = resolvers.ResolverEntityFilters;
 pub const ResolverEntitySortField = resolvers.ResolverEntitySortField;

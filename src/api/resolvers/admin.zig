@@ -675,6 +675,32 @@ fn buildResolverJson(
             }
             try json.appendSlice(allocator, "]");
             first = false;
+        } else if (std.mem.eql(u8, sel.name, "namedResources")) {
+            try json.appendSlice(allocator, "\"");
+            try json.appendSlice(allocator, output_key);
+            try json.appendSlice(allocator, "\":[");
+            var emitted: usize = 0;
+            inline for (.{ models.Protocol.v2, models.Protocol.v1 }) |proto| {
+                const rows = try database.getNamedResources(allocator, proto, resolver_addr);
+                defer {
+                    for (rows) |*r| r.deinit(allocator);
+                    allocator.free(rows);
+                }
+                for (rows) |*row| {
+                    if (emitted > 0) try json.appendSlice(allocator, ",");
+                    emitted += 1;
+                    var fctx = NamedResourceFieldCtx{ .protocol = proto.toString(), .row = row };
+                    const handler = FieldHandler{
+                        .handleFn = handleNamedResourceField,
+                        .context = @ptrCast(&fctx),
+                    };
+                    const row_json = try buildJsonWithFields(allocator, sel.selections, handler);
+                    defer allocator.free(row_json);
+                    try json.appendSlice(allocator, row_json);
+                }
+            }
+            try json.appendSlice(allocator, "]");
+            first = false;
         } else if (std.mem.eql(u8, sel.name, "events")) {
             const limit_arg = parser.getIntArg(sel, "first", null) orelse 100;
             const limit: u32 = @intCast(@min(limit_arg, 1000));
@@ -757,6 +783,47 @@ fn buildJsonWithFields(
 
     try json.appendSlice(allocator, "}");
     return try allocator.dupe(u8, json.items);
+}
+
+const NamedResourceFieldCtx = struct {
+    protocol: []const u8,
+    row: *const db.NamedResource,
+};
+
+/// NamedResourceEntry field handler
+fn handleNamedResourceField(ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+    const c: *const NamedResourceFieldCtx = @ptrCast(@alignCast(ctx));
+    if (std.mem.eql(u8, field_name, "protocol")) {
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, c.protocol });
+        return true;
+    } else if (std.mem.eql(u8, field_name, "resource")) {
+        const escaped = try json_utils.escapeString(allocator, c.row.resource);
+        defer allocator.free(escaped);
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
+        return true;
+    } else if (std.mem.eql(u8, field_name, "recordKind")) {
+        const escaped = try json_utils.escapeString(allocator, c.row.record_kind);
+        defer allocator.free(escaped);
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
+        return true;
+    } else if (std.mem.eql(u8, field_name, "recordKey")) {
+        const escaped = try json_utils.escapeString(allocator, c.row.record_key);
+        defer allocator.free(escaped);
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
+        return true;
+    } else if (std.mem.eql(u8, field_name, "coinType")) {
+        try writer.print("\"{s}\":\"{d}\"", .{ output_key, c.row.coin_type });
+        return true;
+    } else if (std.mem.eql(u8, field_name, "name")) {
+        const escaped = try json_utils.escapeString(allocator, c.row.name);
+        defer allocator.free(escaped);
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
+        return true;
+    } else if (std.mem.eql(u8, field_name, "blockNumber")) {
+        try writer.print("\"{s}\":{d}", .{ output_key, c.row.block_number });
+        return true;
+    }
+    return false;
 }
 
 /// EACRole field handler

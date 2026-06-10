@@ -612,3 +612,29 @@ test "handleQuery: required variable given null errors only in strict mode (grap
     try testing.expect(std.mem.indexOf(u8, legacy_res, "\"errors\"") == null);
     try testing.expect(std.mem.indexOf(u8, legacy_res, "\"data\"") != null);
 }
+
+test "handleQuery: resolver namedResources returns seeded associations" {
+    const allocator = testing.allocator;
+    var database = try db.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var handler = try GraphQLHandler.init(allocator, 10, 10000, false);
+    defer handler.deinit();
+
+    const Address = @import("../types/address.zig").Address;
+    const Hash = @import("../types/hash.zig").Hash;
+    const resolver = try Address.fromHex("0x00000000000000000000000000000000000000cc");
+    try database.upsertNamedResource(.v2, resolver, "0x00000000000000000000000000000000000000000000000000000000000000a1", "text", "url", -1, "alice.eth", 123, Hash{ .bytes = [_]u8{1} ** 32 }, 0);
+
+    const result = try handler.handleQuery(&database,
+        \\{ resolver(id: "0x00000000000000000000000000000000000000cc") { namedResources { protocol resource recordKind recordKey coinType name blockNumber } } }
+    , null, null, false);
+    defer allocator.free(result);
+
+    try testing.expect(std.mem.indexOf(u8, result, "\"recordKind\":\"text\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"recordKey\":\"url\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"name\":\"alice.eth\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"coinType\":\"-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"protocol\":\"v2\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"blockNumber\":123") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "00000000000000a1") != null);
+}
