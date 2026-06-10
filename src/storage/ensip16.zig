@@ -11,7 +11,16 @@ const Hash = @import("../types/hash.zig").Hash;
 // ENSIP-16: RESOLVER METADATA OPERATIONS (3 functions)
 // ============================================================================
 
-/// Upsert resolver metadata (GraphQL endpoint for offchain data)
+/// Upsert resolver metadata (GraphQL endpoint for offchain data).
+///
+/// NO WRITER EXISTS YET — and that is a verified fact, not an oversight
+/// (2026-06-06): neither the deployed Sepolia V2 resolvers (full topic sweep
+/// over every known resolver since deployment) nor the contracts-v2 resolver
+/// sources define any on-chain metadata/graphql-url event; ENSIP-16 specifies
+/// an offchain discovery convention. This write path + the read surface
+/// (GraphQL `metadata` query) are kept for the day an on-chain signal ships.
+/// Its sibling `upsertResolverApproval` IS wired (the PublicResolver
+/// `Approved` event via handleApproved).
 pub fn upsertResolverMetadata(db: *Database, protocol: models.Protocol, resolver: Address, graphql_url: []const u8, block_number: u64, tx_hash: Hash) !void {
     try reorg_undo.captureUpsert(db, "resolver_metadata", .{ protocol, resolver });
     var q = try Query.init(db,
@@ -137,13 +146,17 @@ pub fn isApprovedFor(db: *Database, protocol: models.Protocol, resolver: Address
     var q = try Query.init(db,
         \\SELECT approved
         \\FROM resolver_approvals
-        \\WHERE protocol = ? AND resolver = ? AND namehash = ? AND context IS ? AND delegate = ?
+        \\WHERE protocol = ? AND resolver = ? AND namehash = ?
+        \\  AND ((CAST(? AS TEXT) IS NULL AND context IS NULL) OR context = ?) AND delegate = ?
     );
     defer q.deinit();
 
+    // `context IS ?` is SQLite-only (PG allows only the literal IS NULL), so
+    // portable NULL-or-equal needs the context bound twice.
     try q.bindTextStatic(protocol.toString());
     try q.bindAddress(resolver);
     try q.bindHash(namehash);
+    try q.bindOptionalText(context);
     try q.bindOptionalText(context);
     try q.bindAddress(delegate);
 
@@ -159,7 +172,7 @@ pub fn getApprovalsForName(db: *Database, protocol: models.Protocol, namehash: H
     var q = try Query.init(db,
         \\SELECT id, protocol, resolver, namehash, context, delegate, approved, block_number, transaction_hash, log_index, timestamp
         \\FROM resolver_approvals
-        \\WHERE protocol = ? AND namehash = ? AND (context IS ? OR ? IS NULL)
+        \\WHERE protocol = ? AND namehash = ? AND (CAST(? AS TEXT) IS NULL OR context = ?)
         \\ORDER BY timestamp DESC
     );
     defer q.deinit();

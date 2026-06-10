@@ -501,6 +501,7 @@ pub const Indexer = struct {
         .{ .event_hash = abi.EventSignatures.text_changed_hash, .handler = handleTextChanged, .name = "TextChanged" },
         .{ .event_hash = abi.EventSignatures.legacy_text_changed_hash, .handler = handleLegacyTextChanged, .name = "TextChanged (legacy)" },
         .{ .event_hash = abi.EventSignatures.authorisation_changed_hash, .handler = handleAuthorisationChanged, .name = "AuthorisationChanged" },
+        .{ .event_hash = abi.EventSignatures.approved_hash, .handler = handleApproved, .name = "Approved" },
         .{ .event_hash = abi.EventSignatures.dns_record_changed_hash, .handler = handleDnsRecordChanged, .name = "DNSRecordChanged" },
         .{ .event_hash = abi.EventSignatures.dns_record_deleted_hash, .handler = handleDnsRecordDeleted, .name = "DNSRecordDeleted" },
         .{ .event_hash = abi.EventSignatures.dns_zonehash_changed_hash, .handler = handleDnsZonehashChanged, .name = "DNSZonehashChanged" },
@@ -1137,6 +1138,7 @@ pub const Indexer = struct {
     pub const handleTextChanged = handlers_v2_resolver.handleTextChanged;
     pub const handleLegacyTextChanged = handlers_v2_resolver.handleLegacyTextChanged;
     pub const handleAuthorisationChanged = handlers_v2_resolver.handleAuthorisationChanged;
+    pub const handleApproved = handlers_v2_resolver.handleApproved;
     pub const handleDnsRecordChanged = handlers_v2_resolver.handleDnsRecordChanged;
     pub const handleDnsRecordDeleted = handlers_v2_resolver.handleDnsRecordDeleted;
     pub const handleDnsZonehashChanged = handlers_v2_resolver.handleDnsZonehashChanged;

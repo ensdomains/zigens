@@ -168,6 +168,12 @@ pub const EventSignatures = struct {
     pub const authorisation_changed = "AuthorisationChanged(bytes32,address,address,bool)";
     pub const authorisation_changed_hash: Hash = eventHash(authorisation_changed);
 
+    /// Approved(address owner, bytes32 indexed node, address indexed delegate, bool indexed approved)
+    /// Per-name delegate approval (PublicResolver 2023+); the modern successor
+    /// to AuthorisationChanged. Feeds resolver_approvals (context = NULL).
+    pub const approved = "Approved(address,bytes32,address,bool)";
+    pub const approved_hash: Hash = eventHash(approved);
+
     /// DNSRecordChanged(bytes32 indexed node, bytes name, uint16 resource, bytes record)
     /// ENSIP-17 DNS resolver event — V1 PublicResolver + V2 PublicResolverV2.
     pub const dns_record_changed = "DNSRecordChanged(bytes32,bytes,uint16,bytes)";

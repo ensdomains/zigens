@@ -492,6 +492,68 @@ pub fn handleAuthorisationChanged(self: *Indexer, protocol: models.Protocol, res
     try utils.emitEvent(self, protocol, log, .resolver_update, domain_name, namehash, event_data);
 }
 
+/// Approved(address owner, bytes32 indexed node, address indexed delegate, bool indexed approved)
+/// Per-name delegate approval (PublicResolver 2023+) — the modern successor to
+/// AuthorisationChanged. `owner` rides in data; node/delegate/approved are
+/// indexed. Stored with context = "" (NOT NULL): SQL NULLs never conflict, so a
+/// NULL context would insert a fresh row per event — duplicates on re-index and
+/// no in-place revoke. Empty string keeps the UNIQUE key live; the nullable
+/// column itself is reserved for future context-scoped approval variants.
+pub fn handleApproved(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
+    if (log.topics.len < 4) return error.InvalidTopicCount;
+    var namehash = log.topics[1];
+
+    var delegate = Address{ .bytes = undefined };
+    @memcpy(&delegate.bytes, log.topics[2].bytes[12..32]);
+    const approved = log.topics[3].bytes[31] != 0;
+
+    // owner is the single non-indexed word.
+    var owner = Address.zero;
+    if (log.data.len >= 32) {
+        @memcpy(&owner.bytes, log.data[12..32]);
+    }
+
+    if (!try utils.resolveNamehash(self, &namehash, resolver, "Approved")) return;
+
+    self.database.upsertResolverApproval(
+        protocol,
+        resolver,
+        namehash,
+        "",
+        delegate,
+        approved,
+        log.block_number,
+        log.transaction_hash,
+        log.log_index,
+    ) catch |err| {
+        std.log.warn("Failed to store resolver approval: {}", .{err});
+    };
+
+    const nh_hex = try namehash.toHex(self.allocator);
+    defer self.allocator.free(nh_hex);
+    const resolver_hex = try resolver.toHex(self.allocator);
+    defer self.allocator.free(resolver_hex);
+    const owner_hex = try owner.toHex(self.allocator);
+    defer self.allocator.free(owner_hex);
+    const delegate_hex = try delegate.toHex(self.allocator);
+    defer self.allocator.free(delegate_hex);
+
+    const event_data = try std.fmt.allocPrint(
+        self.allocator,
+        "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"owner\":\"{s}\",\"delegate\":\"{s}\",\"approved\":{s}}}",
+        .{
+            nh_hex,
+            resolver_hex,
+            owner_hex,
+            delegate_hex,
+            if (approved) "true" else "false",
+        },
+    );
+
+    const domain_name = self.getNameFromNamehash(namehash);
+    try utils.emitEvent(self, protocol, log, .resolver_update, domain_name, namehash, event_data);
+}
+
 /// Convert a byte slice to a `0x`-prefixed lowercase hex string. Caller owns
 /// the returned slice. Used for ENSIP-17 DNS record payloads.
 fn bytesToHexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {

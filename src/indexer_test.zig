@@ -52,3 +52,12 @@ test "getCanonicalId: clears the low 32 version bits (EAC/token-id stability)" {
     try std.testing.expectEqual(high << 32, token_id.getCanonicalId(high << 32));
     try std.testing.expectEqual(@as(u256, 0), token_id.getCanonicalId(0));
 }
+
+test "Approved event signature matches the deployed PublicResolver topic" {
+    // Externally verified topic0 (keccak of the canonical signature); guards
+    // the signature string in abi.zig against drift.
+    const abi = @import("indexer/abi.zig");
+    var expect_bytes: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expect_bytes, "f0ddb3b04746704017f9aa8bd728fcc2c1d11675041205350018915f5e4750a0");
+    try std.testing.expectEqualSlices(u8, &expect_bytes, &abi.EventSignatures.approved_hash.bytes);
+}

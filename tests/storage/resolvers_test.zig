@@ -1063,3 +1063,67 @@ test "getFilteredNameCount with resolver filter" {
 
     try testing.expectEqual(@as(usize, 2), count);
 }
+
+// ============================================================================
+// Resolver approvals (the Approved event's write path, stored with context=""
+// so the UNIQUE key conflicts and re-indexing stays idempotent — SQL NULLs
+// never conflict). Readers use portable NULL-or-equal context matching
+// (`context IS ?` is SQLite-only; PostgreSQL rejects it).
+// ============================================================================
+
+test "resolver approvals: upsert + revoke flip in place and read back" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const resolver = helpers.TEST_RESOLVER;
+    const delegate = helpers.TEST_OWNER_2;
+    const nh = helpers.randomHash();
+
+    try database.upsertResolverApproval(.v2, resolver, nh, "", delegate, true, 100, helpers.randomHash(), 0);
+    try testing.expect(try database.isApprovedFor(.v2, resolver, nh, "", delegate));
+
+    // Revoke: same (protocol,resolver,namehash,context,delegate) key — must
+    // UPDATE the row, not insert a second one.
+    try database.upsertResolverApproval(.v2, resolver, nh, "", delegate, false, 101, helpers.randomHash(), 1);
+    try testing.expect(!try database.isApprovedFor(.v2, resolver, nh, "", delegate));
+
+    const approvals = try database.getApprovalsForName(.v2, nh, null);
+    defer {
+        for (approvals) |*a| a.deinit(allocator);
+        allocator.free(approvals);
+    }
+    try testing.expectEqual(@as(usize, 1), approvals.len);
+    try testing.expect(!approvals[0].approved);
+    try testing.expectEqualStrings("", approvals[0].context.?);
+}
+
+test "resolver approvals: context filter matches exactly; null means any" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const resolver = helpers.TEST_RESOLVER;
+    const delegate = helpers.TEST_OWNER_2;
+    const nh = helpers.randomHash();
+
+    try database.upsertResolverApproval(.v2, resolver, nh, "", delegate, true, 100, helpers.randomHash(), 0);
+    try database.upsertResolverApproval(.v2, resolver, nh, "ctx-a", delegate, true, 101, helpers.randomHash(), 1);
+
+    try testing.expect(try database.isApprovedFor(.v2, resolver, nh, "ctx-a", delegate));
+    try testing.expect(!try database.isApprovedFor(.v2, resolver, nh, "ctx-b", delegate));
+
+    const all = try database.getApprovalsForName(.v2, nh, null);
+    defer {
+        for (all) |*a| a.deinit(allocator);
+        allocator.free(all);
+    }
+    try testing.expectEqual(@as(usize, 2), all.len);
+
+    const only_a = try database.getApprovalsForName(.v2, nh, "ctx-a");
+    defer {
+        for (only_a) |*a| a.deinit(allocator);
+        allocator.free(only_a);
+    }
+    try testing.expectEqual(@as(usize, 1), only_a.len);
+}
