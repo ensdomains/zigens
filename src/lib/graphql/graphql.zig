@@ -5,7 +5,6 @@
 //! - Query executor with resolver pattern
 //! - Relay-spec cursor pagination
 //! - Query complexity analysis for DoS protection
-//! - Generic DataLoader for batching
 //! - Table-driven field definitions
 //! - JSON response building
 //!
@@ -22,8 +21,6 @@
 //! var analyzer = graphql.ComplexityAnalyzer.init(allocator, .{});
 //! const analysis = try analyzer.analyzeDocument(&doc);
 //!
-//! // Use DataLoader for batching
-//! const loader = try graphql.DataLoader(Key, Value).init(allocator, batchFn);
 //! defer loader.deinit();
 //! ```
 
@@ -37,7 +34,6 @@ pub const parser = @import("parser.zig");
 pub const pagination = @import("pagination.zig");
 pub const complexity = @import("complexity.zig");
 pub const metrics = @import("metrics.zig");
-pub const dataloader = @import("dataloader.zig");
 pub const fields = @import("fields.zig");
 pub const json_builder = @import("json_builder.zig");
 
@@ -102,11 +98,7 @@ pub const ComplexityAnalyzer = complexity.ComplexityAnalyzer;
 // DataLoader Types
 // ============================================================================
 
-/// Generic DataLoader for batching and caching
-pub const DataLoader = dataloader.DataLoader;
-
 /// Cache statistics
-pub const CacheStats = dataloader.CacheStats;
 
 // ============================================================================
 // Field Definition Types

@@ -176,23 +176,8 @@ pub const Client = struct {
     allocator: std.mem.Allocator,
     rpc_url: []const u8,
     request_id: std.atomic.Value(u64),
+    /// Borrowed: the caller owns the http.Client (every consumer shares one).
     http_client: *std.http.Client,
-    owns_http_client: bool,
-
-    pub fn init(allocator: std.mem.Allocator, rpc_url: []const u8) !*Client {
-        const http_client = try allocator.create(std.http.Client);
-        http_client.* = std.http.Client{ .allocator = allocator };
-
-        const client = try allocator.create(Client);
-        client.* = .{
-            .allocator = allocator,
-            .rpc_url = rpc_url,
-            .request_id = std.atomic.Value(u64).init(1),
-            .http_client = http_client,
-            .owns_http_client = true,
-        };
-        return client;
-    }
 
     pub fn initWithSharedHttpClient(allocator: std.mem.Allocator, rpc_url: []const u8, http_client: *std.http.Client) !*Client {
         const client = try allocator.create(Client);
@@ -201,16 +186,11 @@ pub const Client = struct {
             .rpc_url = rpc_url,
             .request_id = std.atomic.Value(u64).init(1),
             .http_client = http_client,
-            .owns_http_client = false,
         };
         return client;
     }
 
     pub fn deinit(self: *Client) void {
-        if (self.owns_http_client) {
-            self.http_client.deinit();
-            self.allocator.destroy(self.http_client);
-        }
         self.allocator.destroy(self);
     }
 
