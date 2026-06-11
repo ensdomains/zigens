@@ -601,7 +601,7 @@ type Registration {
   referrer: String
 }
 
-"""Typed payload for `Transfer` events. Spans V1 BaseRegistrar ERC721 (`tokenId` numeric), V1 NameWrapper ERC1155 (`id` is the wrapped namehash, with `operator`/`value`), and V2 registry transfers."""
+"""Typed payload for `Transfer` events. Spans V1 BaseRegistrar ERC721 (`tokenId` numeric), V1 NameWrapper ERC1155 (`id` is the wrapped namehash, with `operator`/`value`), V2 registry transfers, ERC1155 `TransferBatch` summaries (`count`), and V1 Registry `NewOwner` rows (`parentNode`/`labelhash`/`subdomain`/`owner`)."""
 type TransferData {
   """Sender address."""
   from: String
@@ -613,6 +613,16 @@ type TransferData {
   value: String
   """ERC1155 operator address (V1 NameWrapper / V2 only)."""
   operator: String
+  """ERC1155 TransferBatch: number of tokens in the batch (per-token id/value are not stored)."""
+  count: Int
+  """V1 Registry NewOwner rows: parent node namehash."""
+  parentNode: String
+  """V1 Registry NewOwner rows: labelhash of the subdomain label."""
+  labelhash: String
+  """V1 Registry NewOwner rows: namehash of the created/reassigned subdomain node."""
+  subdomain: String
+  """V1 Registry NewOwner rows: new owner address."""
+  owner: String
 }
 
 """Typed payload for `NameRegistered` events (V1 BaseRegistrar + ETHController variants)."""

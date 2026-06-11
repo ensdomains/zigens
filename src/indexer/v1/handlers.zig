@@ -101,6 +101,14 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
         try q.bindInt64(std.time.timestamp());
         try q.exec();
 
+        // Sibling parity: Transfer/NewResolver/NewTTL emit events rows in this
+        // era; NewOwner silently didn't - the events feed had a hole for the
+        // most common pre-migration event (readiness review, 2026-06-06).
+        const pre_event_data = try std.fmt.allocPrint(self.allocator, "{{\"parentNode\":\"{s}\",\"labelhash\":\"{s}\",\"subdomain\":\"{s}\",\"owner\":\"{s}\"}}", .{
+            parent_hex, labelhash_hex, subdomain_hex, owner_hex,
+        });
+        try utils.emitEvent(self, protocol, log, .transfer, null, subdomain_namehash, pre_event_data);
+
         return;
     }
 
@@ -1086,11 +1094,13 @@ pub fn handleV1BaseRegistrarNameRenewed(self: *Indexer, protocol: models.Protoco
         // Compute the namehash for this name
         const namehash = v1_names.computeEthNamehash(label);
 
-        // Update the name's expiry
+        // Update the name's expiry. Renewal-specific: wrapped rows keep their
+        // grace-inclusive stored expiry (direct registrar renews emit no
+        // ExpiryExtended, so nothing else would re-add the 90d).
         if (self.write_buffer.active) {
-            try self.write_buffer.updateNameExpiry(namehash, @truncate(expires));
+            try self.write_buffer.updateV1RenewalExpiry(namehash, @truncate(expires));
         } else {
-            try names_storage.updateNameExpiry(self.database, namehash, @truncate(expires));
+            try names_storage.updateV1RenewalExpiry(self.database, namehash, @truncate(expires));
         }
 
         // Subgraph parity (`Registrar.ts:271`): the Registration row's expiry

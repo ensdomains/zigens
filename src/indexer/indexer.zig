@@ -855,7 +855,8 @@ pub const Indexer = struct {
     /// We disarm the cursor exactly like backfill/replay (reorg_undo.clearCursor)
     /// and re-arm lazily — `invalidateReorgCursor` makes the next markEventBlock
     /// re-set the DB cursor. Wrapped names are V1-only (NameWrapper).
-    fn materializePccUncaptured(self: *Indexer) void {
+    /// Pub: replay.zig runs it as its post-rebuild pass (step 7d).
+    pub fn materializePccUncaptured(self: *Indexer) void {
         reorg_undo.clearCursor(self.database, .v1) catch |err| {
             std.log.warn("reorg undo-log: failed to disarm cursor before PCC materialize: {}", .{err});
         };
@@ -1095,13 +1096,27 @@ pub const Indexer = struct {
             // Note: V1→V2 migration is detected in handleLabelRegistered via sender address
             try self.indexTransferEvents(protocol, client, from_block, to_block);
 
-            // Phase 4: Resolver events (depends on names + resolvers being set)
-            try self.indexResolverEvents(protocol, client, from_block, to_block);
-
             // Phase 5: V2 reverse registrar events. Independent of names — populates
             // the reverse_records table so primary-name lookups don't have to scan
             // the events feed.
             try self.indexV2ReverseRegistrarEvents(protocol, client, from_block, to_block);
+        }
+
+        // === RESOLVER RECORD EVENTS (V1 and V2) ===
+        // Depends on names + resolvers being set, so it runs after both protocol
+        // phases. Deliberately OUTSIDE the V2 gate: on mainnet (v2_deployment = 0)
+        // the V2 branch never runs, and keeping resolver indexing inside it meant
+        // mainnet indexed ZERO resolver records (text/addr/contenthash/...) — the
+        // 2026-06-06 readiness-review disqualifier. Discovery comes from V1
+        // NewResolver / V2 ResolverUpdated registering known_resolvers, so this
+        // single pass serves both protocols. The V1 leg additionally requires
+        // protocol == .v1: on mainnet the combined indexer's .v2 pass also sees
+        // should_index_v1 = true, and without the protocol check it would crawl
+        // V1-era ranges under protocol = 'v2' — correct today only because V2
+        // resolver discovery finds nothing there, and one stray v2
+        // known_resolvers row would flip it to indexing V1 logs as 'v2'.
+        if ((should_index_v1 and protocol == .v1) or should_index_v2) {
+            try self.indexResolverEvents(protocol, client, from_block, to_block);
         }
     }
 

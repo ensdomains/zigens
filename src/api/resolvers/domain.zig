@@ -36,7 +36,9 @@ pub fn mapDomainOrderBy(order_by: ?[]const u8) db.NameSortField {
     const field_name = order_by orelse return .created_at;
     if (std.mem.eql(u8, field_name, "name")) return .name;
     if (std.mem.eql(u8, field_name, "createdAt")) return .created_at;
-    if (std.mem.eql(u8, field_name, "expiryDate")) return .expiry;
+    // Grace-inclusive, matching the expiryDate value and expiryDate_* filters —
+    // a raw-expiry sort would disagree with displayed values by up to 90d.
+    if (std.mem.eql(u8, field_name, "expiryDate")) return .expiry_effective;
     if (std.mem.eql(u8, field_name, "registrationDate")) return .registered_at;
     return .created_at;
 }
@@ -85,6 +87,10 @@ const ParsedDomainFilter = struct {
     expiry_gte: ?i64 = null,
     expiry_lt: ?i64 = null,
     expiry_lte: ?i64 = null,
+    expiry_date_gt: ?i64 = null,
+    expiry_date_gte: ?i64 = null,
+    expiry_date_lt: ?i64 = null,
+    expiry_date_lte: ?i64 = null,
     migrated: ?bool = null,
     include_unreachable: ?bool = null,
     is_normalized: ?bool = null,
@@ -218,11 +224,12 @@ fn parseWhereArgs(where_args: []const parser.Argument, allocator: std.mem.Alloca
             common.matchIntArg(a, "expiry_gte", &out.expiry_gte) or
             common.matchIntArg(a, "expiry_lt", &out.expiry_lt) or
             common.matchIntArg(a, "expiry_lte", &out.expiry_lte) or
-            // Subgraph-parity aliases — populate the same filter slots as expiry_*.
-            common.matchIntArg(a, "expiryDate_gt", &out.expiry_gt) or
-            common.matchIntArg(a, "expiryDate_gte", &out.expiry_gte) or
-            common.matchIntArg(a, "expiryDate_lt", &out.expiry_lt) or
-            common.matchIntArg(a, "expiryDate_lte", &out.expiry_lte) or
+            // Subgraph-parity: expiryDate_* compares the grace-inclusive value
+            // (effectiveDomainExpiry semantics), unlike the bare expiry_* slots.
+            common.matchIntArg(a, "expiryDate_gt", &out.expiry_date_gt) or
+            common.matchIntArg(a, "expiryDate_gte", &out.expiry_date_gte) or
+            common.matchIntArg(a, "expiryDate_lt", &out.expiry_date_lt) or
+            common.matchIntArg(a, "expiryDate_lte", &out.expiry_date_lte) or
             common.matchBoolArg(a, "isMigrated", &out.migrated) or
             common.matchBoolArg(a, "includeUnreachable", &out.include_unreachable) or
             common.matchBoolArg(a, "isNormalized", &out.is_normalized) or
@@ -263,6 +270,10 @@ fn toNameFilters(p: *const ParsedDomainFilter, allocator: std.mem.Allocator) any
         .label_name_ends_with_nocase = p.label_name_ends_with_nocase,
         .expiry_gt = p.expiry_gt,
         .expiry_gte = p.expiry_gte,
+        .expiry_date_gt = p.expiry_date_gt,
+        .expiry_date_gte = p.expiry_date_gte,
+        .expiry_date_lt = p.expiry_date_lt,
+        .expiry_date_lte = p.expiry_date_lte,
         .expiry_lt = p.expiry_lt,
         .expiry_lte = p.expiry_lte,
         .resolved_address = p.resolved_address,
@@ -333,6 +344,10 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
     const filter_expiry_gte = parsed.expiry_gte;
     const filter_expiry_lt = parsed.expiry_lt;
     const filter_expiry_lte = parsed.expiry_lte;
+    const filter_expiry_date_gt = parsed.expiry_date_gt;
+    const filter_expiry_date_gte = parsed.expiry_date_gte;
+    const filter_expiry_date_lt = parsed.expiry_date_lt;
+    const filter_expiry_date_lte = parsed.expiry_date_lte;
     const filter_migrated = parsed.migrated;
 
     const include_unreachable = parsed.include_unreachable orelse false;
@@ -365,6 +380,8 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
         filter_subdomain_count_gt == null and filter_subdomain_count_lt == null and
         filter_expiry_gt == null and filter_expiry_gte == null and
         filter_expiry_lt == null and filter_expiry_lte == null and
+        filter_expiry_date_gt == null and filter_expiry_date_gte == null and
+        filter_expiry_date_lt == null and filter_expiry_date_lte == null and
         filter_migrated == null and
         parsed.and_filters == null and parsed.or_filters == null;
 
@@ -430,6 +447,8 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
         filter_subdomain_count_gt != null or filter_subdomain_count_lt != null or
         filter_expiry_gt != null or filter_expiry_gte != null or
         filter_expiry_lt != null or filter_expiry_lte != null or
+        filter_expiry_date_gt != null or filter_expiry_date_gte != null or
+        filter_expiry_date_lt != null or filter_expiry_date_lte != null or
         filter_migrated != null or include_unreachable or
         include_unnormalized or parsed.is_normalized != null or
         parsed.and_filters != null or parsed.or_filters != null;
@@ -474,6 +493,10 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
             .expiry_gte = filter_expiry_gte,
             .expiry_lt = filter_expiry_lt,
             .expiry_lte = filter_expiry_lte,
+            .expiry_date_gt = filter_expiry_date_gt,
+            .expiry_date_gte = filter_expiry_date_gte,
+            .expiry_date_lt = filter_expiry_date_lt,
+            .expiry_date_lte = filter_expiry_date_lte,
             .resolved_address = filter_resolved_address,
             .resolver = filter_resolver,
             .migrated = filter_migrated,
@@ -578,6 +601,10 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
     const filter_expiry_gte = parsed.expiry_gte;
     const filter_expiry_lt = parsed.expiry_lt;
     const filter_expiry_lte = parsed.expiry_lte;
+    const filter_expiry_date_gt = parsed.expiry_date_gt;
+    const filter_expiry_date_gte = parsed.expiry_date_gte;
+    const filter_expiry_date_lt = parsed.expiry_date_lt;
+    const filter_expiry_date_lte = parsed.expiry_date_lte;
     const filter_migrated = parsed.migrated;
 
     const include_unreachable = parsed.include_unreachable orelse false;
@@ -614,6 +641,10 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         .expiry_gte = filter_expiry_gte,
         .expiry_lt = filter_expiry_lt,
         .expiry_lte = filter_expiry_lte,
+        .expiry_date_gt = filter_expiry_date_gt,
+        .expiry_date_gte = filter_expiry_date_gte,
+        .expiry_date_lt = filter_expiry_date_lt,
+        .expiry_date_lte = filter_expiry_date_lte,
         .resolved_address = filter_resolved_address,
         .resolver = filter_resolver,
         .migrated = filter_migrated,
@@ -645,6 +676,8 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         filter_subdomain_count_gt != null or filter_subdomain_count_lt != null or
         filter_expiry_gt != null or filter_expiry_gte != null or
         filter_expiry_lt != null or filter_expiry_lte != null or
+        filter_expiry_date_gt != null or filter_expiry_date_gte != null or
+        filter_expiry_date_lt != null or filter_expiry_date_lte != null or
         filter_migrated != null or include_unreachable or
         include_unnormalized or parsed.is_normalized != null or
         parsed.and_filters != null or parsed.or_filters != null;

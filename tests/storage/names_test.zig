@@ -12,6 +12,7 @@ const namehash_fn = lib.namehash;
 const labelhash_fn = lib.labelhash;
 const events = lib.storage.events;
 const unknown_labels = lib.storage.unknown_labels;
+const names_storage = lib.storage.names;
 
 // ============================================================================
 // REGISTRY OPERATIONS
@@ -296,7 +297,6 @@ test "updateNameWrapperState with expiry > i64::max stores as 0" {
 
     const nh = try helpers.createTestName(allocator, database, "wrapped.eth", helpers.TEST_OWNER_1);
 
-    const names_storage = @import("lib").storage.names;
     const huge_expiry: u64 = @as(u64, @intCast(std.math.maxInt(i64))) + 1;
     try names_storage.updateNameWrapperState(database, nh, 196608, huge_expiry);
 
@@ -316,7 +316,6 @@ test "updateNameWrapperExpiry with expiry > i64::max stores as 0" {
 
     const nh = try helpers.createTestName(allocator, database, "wrapexp.eth", helpers.TEST_OWNER_1);
 
-    const names_storage = @import("lib").storage.names;
     // First wrap the name
     try names_storage.updateNameWrapperState(database, nh, 196608, 1800000000);
 
@@ -1009,4 +1008,224 @@ test "unknown_labels.incrementBackfillAttempt uses the dialect now-epoch" {
     // The UPDATE runs (matching zero rows for a non-existent id) — what matters is that the
     // now-epoch expression (strftime on SQLite, EXTRACT(EPOCH FROM now()) on PG) prepares + executes.
     try unknown_labels.incrementBackfillAttempt(db, 999);
+}
+
+// ============================================================================
+// Grace-aware expiryDate_* filters (subgraph parity): the compared value adds
+// 90d (7776000s) for UNWRAPPED V1 .eth 2LDs only — mirroring
+// ens_fields.effectiveDomainExpiry. Bare expiry_* filters stay raw.
+// ============================================================================
+
+fn mkExpiryName(allocator: std.mem.Allocator, name: []const u8, protocol: models.Protocol, expiry: u64, wrapped: bool) !models.Name {
+    return models.Name{
+        .name = name,
+        .namehash = try lib.namehash(allocator, name),
+        .label = name[0 .. std.mem.indexOfScalar(u8, name, '.') orelse name.len],
+        .label_hash = try lib.keccak256(allocator, name),
+        .parent_name = "eth",
+        .parent_namehash = try lib.namehash(allocator, "eth"),
+        .protocol = protocol,
+        .registry = Address.zero,
+        .owner = helpers.TEST_OWNER_1,
+        .registrant = helpers.TEST_OWNER_1,
+        .resolver = Address.zero,
+        .token_id = 0,
+        .canonical_id = 0,
+        .token_version = 1,
+        .expiry = expiry,
+        .registry_locked = false,
+        .migrated = false,
+        .created_block = 100,
+        .created_at = 1700000000,
+        .registered_at = 1700000000,
+        .updated_block = 100,
+        .updated_at = 1700000000,
+        .is_wrapped = wrapped,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = (protocol == .v1),
+        .v1_label_hash = null,
+    };
+}
+
+test "getFilteredNames: expiryDate_* filters are grace-aware, expiry_* stay raw" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    try database.insertName(try mkExpiryName(allocator, "plainv1.eth", .v1, 1000, false));
+    try database.insertName(try mkExpiryName(allocator, "wrappedv1.eth", .v1, 1000, true));
+    try database.insertName(try mkExpiryName(allocator, "plainv2.eth", .v2, 1000, false));
+
+    // Grace-aware: only the unwrapped V1 2LD compares as 1000 + 7776000.
+    {
+        const names = try database.getFilteredNames(.{ .expiry_date_gt = 1_000_000 }, 0, 100, .asc, .name);
+        defer {
+            for (names) |*n| n.deinit(allocator);
+            allocator.free(names);
+        }
+        try testing.expectEqual(@as(usize, 1), names.len);
+        try testing.expectEqualStrings("plainv1.eth", names[0].name.?);
+    }
+    // Bare expiry_* is raw: nothing stored exceeds 1,000,000.
+    {
+        const names = try database.getFilteredNames(.{ .expiry_gt = 1_000_000 }, 0, 100, .asc, .name);
+        defer {
+            for (names) |*n| n.deinit(allocator);
+            allocator.free(names);
+        }
+        try testing.expectEqual(@as(usize, 0), names.len);
+    }
+    // Grace-aware lte: wrapped V1 (already grace-inclusive in storage) and V2
+    // compare at their stored 1000; the unwrapped V1 2LD is excluded.
+    {
+        const names = try database.getFilteredNames(.{ .expiry_date_lte = 1000 }, 0, 100, .asc, .name);
+        defer {
+            for (names) |*n| n.deinit(allocator);
+            allocator.free(names);
+        }
+        try testing.expectEqual(@as(usize, 2), names.len);
+    }
+    // Grace-aware ordering: ascending effective expiry sorts the unwrapped V1
+    // 2LD (1000 + grace) last even though all three rows store expiry = 1000.
+    {
+        const names = try database.getFilteredNames(.{}, 0, 100, .asc, .expiry_effective);
+        defer {
+            for (names) |*n| n.deinit(allocator);
+            allocator.free(names);
+        }
+        try testing.expectEqual(@as(usize, 3), names.len);
+        try testing.expectEqualStrings("plainv1.eth", names[2].name.?);
+    }
+}
+
+test "updateV1RenewalExpiry: wrapped rows keep the grace-inclusive expiry" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const grace = 7776000;
+    const plain = try mkExpiryName(allocator, "renewplain.eth", .v1, 1000, false);
+    const wrapped = try mkExpiryName(allocator, "renewwrapped.eth", .v1, 1000 + grace, true);
+    try database.insertName(plain);
+    try database.insertName(wrapped);
+
+    // Direct BaseRegistrar renew carries the bare registrar expires value.
+    try names_storage.updateV1RenewalExpiry(database, plain.namehash, 2000);
+    try names_storage.updateV1RenewalExpiry(database, wrapped.namehash, 2000);
+
+    {
+        const name_opt = try database.getNameByNamehash(plain.namehash);
+        try testing.expect(name_opt != null);
+        var name = name_opt.?;
+        defer name.deinit(allocator);
+        try testing.expectEqual(@as(u64, 2000), name.expiry);
+    }
+    {
+        const name_opt = try database.getNameByNamehash(wrapped.namehash);
+        try testing.expect(name_opt != null);
+        var name = name_opt.?;
+        defer name.deinit(allocator);
+        try testing.expectEqual(@as(u64, 2000 + grace), name.expiry);
+    }
+
+    // Never-expires sentinel: expires > maxInt(i64) clamps to 0 and must NOT
+    // gain grace on wrapped rows (0 + 90d would read as "expired in 1970").
+    try names_storage.updateV1RenewalExpiry(database, wrapped.namehash, std.math.maxInt(u64));
+    {
+        const name_opt = try database.getNameByNamehash(wrapped.namehash);
+        try testing.expect(name_opt != null);
+        var name = name_opt.?;
+        defer name.deinit(allocator);
+        try testing.expectEqual(@as(u64, 0), name.expiry);
+    }
+
+    // Near-max i64: + 90d would overflow BIGINT — also treated as never-expires.
+    try names_storage.updateV1RenewalExpiry(database, wrapped.namehash, @as(u64, std.math.maxInt(i64)) - 100);
+    {
+        const name_opt = try database.getNameByNamehash(wrapped.namehash);
+        try testing.expect(name_opt != null);
+        var name = name_opt.?;
+        defer name.deinit(allocator);
+        try testing.expectEqual(@as(u64, 0), name.expiry);
+    }
+}
+
+test "updateV1RenewalExpiry: only the v1 row of a shared namehash changes" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const v1_row = try mkExpiryName(allocator, "dualproto.eth", .v1, 1000, false);
+    const v2_row = try mkExpiryName(allocator, "dualproto.eth", .v2, 5000, false);
+    try database.insertName(v1_row);
+    try database.insertName(v2_row);
+
+    try names_storage.updateV1RenewalExpiry(database, v1_row.namehash, 2000);
+
+    {
+        const name_opt = try database.getNameByNamehashAndProtocol(v1_row.namehash, .v1);
+        try testing.expect(name_opt != null);
+        var name = name_opt.?;
+        defer name.deinit(allocator);
+        try testing.expectEqual(@as(u64, 2000), name.expiry);
+    }
+    {
+        const name_opt = try database.getNameByNamehashAndProtocol(v2_row.namehash, .v2);
+        try testing.expect(name_opt != null);
+        var name = name_opt.?;
+        defer name.deinit(allocator);
+        try testing.expectEqual(@as(u64, 5000), name.expiry);
+    }
+}
+
+test "updateNameUnwrapperState re-bases .eth 2LD expiry from registrations" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const grace = 7776000;
+    const wrapped = try mkExpiryName(allocator, "unwraprebase.eth", .v1, 1000 + grace, true);
+    try database.insertName(wrapped);
+    try lib.storage.registrations.insertRegistration(
+        database,
+        .v1,
+        wrapped.namehash,
+        "unwraprebase",
+        "eth",
+        helpers.TEST_OWNER_1,
+        1700000000,
+        1000,
+        100,
+        wrapped.namehash,
+        0,
+        .name_registered,
+    );
+
+    try names_storage.updateNameUnwrapperState(database, wrapped.namehash);
+
+    const name_opt = try database.getNameByNamehash(wrapped.namehash);
+    try testing.expect(name_opt != null);
+    var name = name_opt.?;
+    defer name.deinit(allocator);
+    try testing.expect(!name.is_wrapped);
+    try testing.expectEqual(@as(u64, 1000), name.expiry);
+}
+
+test "expiry_date filters tolerate a near-max stored expiry" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // Pre-guard, `expiry + 7776000` on this row overflowed BIGINT on PG and
+    // failed every expiryDate-filtered query; the bound makes it compare raw.
+    try database.insertName(try mkExpiryName(allocator, "poisoned.eth", .v1, std.math.maxInt(i64), false));
+
+    const names = try database.getFilteredNames(.{ .expiry_date_gt = 0 }, 0, 100, .asc, .expiry_effective);
+    defer {
+        for (names) |*n| n.deinit(allocator);
+        allocator.free(names);
+    }
+    try testing.expectEqual(@as(usize, 1), names.len);
+    try testing.expectEqualStrings("poisoned.eth", names[0].name.?);
 }

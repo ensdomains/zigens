@@ -95,6 +95,8 @@ pub fn replayEventsToRebuildNames(self: *Indexer) !void {
 
     // ── Step 5: Clear names + backfill_status ──
     // DROP + CREATE is orders of magnitude faster than DELETE on millions of rows.
+    // Must mirror the names DDL in schema/schema.sql — insertName binds every
+    // column, so a missing one here fails every insert during replay.
     std.log.info("Dropping and recreating names table...", .{});
     try database.exec("DROP TABLE IF EXISTS names");
     try database.exec(
@@ -127,6 +129,12 @@ pub fn replayEventsToRebuildNames(self: *Indexer) !void {
         \\  v1_label_hash TEXT DEFAULT NULL,
         \\  registrant TEXT,
         \\  registered_at INTEGER,
+        \\  is_reachable INTEGER NOT NULL DEFAULT 1,
+        \\  unreachable_since INTEGER,
+        \\  ttl INTEGER,
+        \\  is_legacy INTEGER NOT NULL DEFAULT 0,
+        \\  resolved_address TEXT DEFAULT NULL,
+        \\  is_normalized INTEGER NOT NULL DEFAULT 1,
         \\  UNIQUE(protocol, namehash)
         \\)
     );
@@ -217,6 +225,13 @@ pub fn replayEventsToRebuildNames(self: *Indexer) !void {
     backfill_mod.backfillMissingEth2LDNames(self) catch |err| {
         std.log.warn("backfillMissingEth2LDNames failed: {}", .{err});
     };
+
+    // 7d: PCC fuse → Domain.expiry mirror. The replay wrapper handlers write
+    // only wrapper_* fields, so without this pass wrapped-but-never-renewed
+    // .eth 2LDs would end replay with bare expiry — which the wrapped read
+    // path serves as-is, 90d short. The live indexer only runs it at
+    // initial-sync completion, which an API-only deployment never reaches.
+    self.materializePccUncaptured();
 
     // ── Summary ──
     const name_count = blk: {
@@ -585,7 +600,7 @@ fn replayBaseRegistrarRenewal(self: *Indexer, q: *Query) !void {
 
     if (try self.getCachedV1Label(token_id_hex)) |label| {
         const namehash = v1_names.computeEthNamehash(label);
-        names_storage.updateNameExpiry(self.database, namehash, expires) catch {};
+        names_storage.updateV1RenewalExpiry(self.database, namehash, expires) catch {};
     }
 }
 

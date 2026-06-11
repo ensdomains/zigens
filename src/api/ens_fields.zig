@@ -531,9 +531,30 @@ pub fn effectiveDomainExpiry(name: anytype) i64 {
     const base: i64 = @intCast(name.expiry);
     if (name.protocol != .v1) return base;
     if (name.expiry == 0) return base;
+    // Wrapped names already store a grace-inclusive value: the PCC mirror
+    // copies wrapper_expiry (= BaseRegistrar.expires + 90d per the NameWrapper
+    // contract) into names.expiry — adding grace again double-counted it.
+    if (name.is_wrapped) return base;
     const parent = name.parent_name orelse return base;
     if (!std.mem.eql(u8, parent, "eth")) return base;
-    return base + V1_GRACE_PERIOD_SECONDS;
+    // Saturating: a poisoned near-max stored expiry must not panic the builder.
+    return base +| V1_GRACE_PERIOD_SECONDS;
+}
+
+test "effectiveDomainExpiry: grace only for unwrapped V1 .eth 2LDs" {
+    const Probe = struct {
+        expiry: u64,
+        protocol: models.Protocol,
+        parent_name: ?[]const u8,
+        is_wrapped: bool,
+    };
+    const grace = V1_GRACE_PERIOD_SECONDS;
+    try std.testing.expectEqual(@as(i64, 1000 + grace), effectiveDomainExpiry(Probe{ .expiry = 1000, .protocol = .v1, .parent_name = "eth", .is_wrapped = false }));
+    // Wrapped: stored value is already grace-inclusive — no second helping.
+    try std.testing.expectEqual(@as(i64, 1000), effectiveDomainExpiry(Probe{ .expiry = 1000, .protocol = .v1, .parent_name = "eth", .is_wrapped = true }));
+    try std.testing.expectEqual(@as(i64, 1000), effectiveDomainExpiry(Probe{ .expiry = 1000, .protocol = .v2, .parent_name = "eth", .is_wrapped = false }));
+    try std.testing.expectEqual(@as(i64, 1000), effectiveDomainExpiry(Probe{ .expiry = 1000, .protocol = .v1, .parent_name = "xyz", .is_wrapped = false }));
+    try std.testing.expectEqual(@as(i64, 0), effectiveDomainExpiry(Probe{ .expiry = 0, .protocol = .v1, .parent_name = "eth", .is_wrapped = false }));
 }
 
 /// Name/Domain field definitions table (for simple queries)

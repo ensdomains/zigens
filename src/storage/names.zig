@@ -494,6 +494,30 @@ pub fn updateNameExpiry(db: *Database, namehash: Hash, expiry: u64) !void {
     try q.exec();
 }
 
+/// Expiry update for BaseRegistrar NameRenewed (V1 .eth 2LDs only). Wrapped rows
+/// store the grace-inclusive wrapper value (registrar expires + 90d); writing the
+/// bare registrar value there would silently shrink expiryDate by the grace period
+/// on direct registrar renewals, where no ExpiryExtended fires to re-sync it.
+/// The `> 0` guard preserves the safeU64ToI64 never-expires sentinel (0) — grace
+/// must not turn it into a 1970 expiry. The protocol predicate keeps a
+/// same-namehash V2 row from being stomped (names is UNIQUE(protocol, namehash)).
+pub fn updateV1RenewalExpiry(db: *Database, namehash: Hash, expires: u64) !void {
+    try reorg_undo.captureWhere(db, "names", "U", "namehash = ? AND protocol = 'v1'", .{namehash});
+    var q = try Query.initCached(db, "UPDATE names SET expiry = CASE WHEN is_wrapped = 1 AND ? > 0 THEN ? + 7776000 ELSE ? END, updated_at = ? WHERE namehash = ? AND protocol = 'v1'");
+    defer q.deinit();
+
+    // Within 90d of i64 max the grace addition would overflow (PG errors,
+    // SQLite degrades to REAL); such a value means never-expires in practice.
+    const v = safeU64ToI64(expires);
+    const base = if (v > std.math.maxInt(i64) - 7776000) 0 else v;
+    try q.bindInt64(base);
+    try q.bindInt64(base);
+    try q.bindInt64(base);
+    try q.bindInt64(std.time.timestamp());
+    try q.bindHashBuf(namehash);
+    try q.exec();
+}
+
 /// Update name owner (for transfers)
 pub fn updateNameOwner(db: *Database, namehash: Hash, new_owner: Address) !void {
     try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
@@ -698,8 +722,17 @@ pub fn clearNameExpiry(db: *Database, namehash: Hash) !void {
 /// Clear wrapper state for a name (unwrap)
 pub fn updateNameUnwrapperState(db: *Database, namehash: Hash) !void {
     try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
+    // Re-base .eth 2LD expiry to the bare registrar value on unwrap: while
+    // wrapped, names.expiry may hold the grace-inclusive wrapper value (PCC
+    // mirror / updateV1RenewalExpiry). The unwrapped read path re-adds the 90d
+    // grace, so leaving the inflated value would over-report expiryDate by
+    // 180d. registrations stores the bare expires (subgraph Registration
+    // parity); rows without one (temp-registrar era) keep their value.
     var q = try Query.initCached(db,
         \\UPDATE names SET is_wrapped = 0, wrapper_fuses = NULL, wrapper_expiry = NULL,
+        \\expiry = CASE WHEN protocol = 'v1' AND parent_name = 'eth'
+        \\  THEN COALESCE((SELECT MAX(r.expiry) FROM registrations r WHERE r.protocol = names.protocol AND r.namehash = names.namehash), expiry)
+        \\  ELSE expiry END,
         \\updated_at = ? WHERE namehash = ?
     );
     defer q.deinit();
@@ -1054,14 +1087,23 @@ pub const NameSortField = enum {
     created_at,
     name,
     expiry,
+    /// Grace-inclusive expiry (Domain.expiryDate ordering) — must agree with
+    /// the expiry_date_* filter CASE and effectiveDomainExpiry, otherwise sort
+    /// order and displayed values diverge by up to 90d in mixed result sets.
+    expiry_effective,
     registered_at,
 
     pub fn toSql(self: NameSortField) []const u8 {
+        return self.toSqlQualified("");
+    }
+
+    pub fn toSqlQualified(self: NameSortField, comptime alias: []const u8) []const u8 {
         return switch (self) {
-            .created_at => "created_at",
-            .name => "name",
-            .expiry => "expiry",
-            .registered_at => "registered_at",
+            .created_at => alias ++ "created_at",
+            .name => alias ++ "name",
+            .expiry => alias ++ "expiry",
+            .expiry_effective => "CASE WHEN " ++ alias ++ "protocol = 'v1' AND " ++ alias ++ "parent_name = 'eth' AND " ++ alias ++ "is_wrapped = 0 AND " ++ alias ++ "expiry > 0 AND " ++ alias ++ "expiry <= 9223372036846999807 THEN " ++ alias ++ "expiry + 7776000 ELSE " ++ alias ++ "expiry END",
+            .registered_at => alias ++ "registered_at",
         };
     }
 };
@@ -1182,6 +1224,15 @@ fn appendNameScalarConditions(
     if (filters.expiry_gte != null) try conditions.append(db.allocator, "expiry >= ?");
     if (filters.expiry_lt != null) try conditions.append(db.allocator, "expiry < ?");
     if (filters.expiry_lte != null) try conditions.append(db.allocator, "expiry <= ?");
+    // Grace-aware variants backing the subgraph `expiryDate_*` filters: the
+    // compared value mirrors effectiveDomainExpiry (ens_fields.zig) — bare
+    // stored expiry plus 90d (7776000s) for unwrapped V1 .eth 2LDs only.
+    // The maxInt(i64)-7776000 bound keeps one near-max row from overflowing
+    // the addition as BIGINT on PG (whole query errors; SQLite degrades to REAL).
+    if (filters.expiry_date_gt != null) try conditions.append(db.allocator, "CASE WHEN protocol = 'v1' AND parent_name = 'eth' AND is_wrapped = 0 AND expiry > 0 AND expiry <= 9223372036846999807 THEN expiry + 7776000 ELSE expiry END > ?");
+    if (filters.expiry_date_gte != null) try conditions.append(db.allocator, "CASE WHEN protocol = 'v1' AND parent_name = 'eth' AND is_wrapped = 0 AND expiry > 0 AND expiry <= 9223372036846999807 THEN expiry + 7776000 ELSE expiry END >= ?");
+    if (filters.expiry_date_lt != null) try conditions.append(db.allocator, "CASE WHEN protocol = 'v1' AND parent_name = 'eth' AND is_wrapped = 0 AND expiry > 0 AND expiry <= 9223372036846999807 THEN expiry + 7776000 ELSE expiry END < ?");
+    if (filters.expiry_date_lte != null) try conditions.append(db.allocator, "CASE WHEN protocol = 'v1' AND parent_name = 'eth' AND is_wrapped = 0 AND expiry > 0 AND expiry <= 9223372036846999807 THEN expiry + 7776000 ELSE expiry END <= ?");
     if (filters.resolved_address != null) {
         try conditions.append(db.allocator, "namehash IN (SELECT namehash FROM resolver_addresses WHERE address = ?)");
     }
@@ -1303,6 +1354,10 @@ fn bindNameScalars(q: *Query, filters: NameFilters) !void {
     if (filters.expiry_gte) |v| try q.bindInt64(v);
     if (filters.expiry_lt) |v| try q.bindInt64(v);
     if (filters.expiry_lte) |v| try q.bindInt64(v);
+    if (filters.expiry_date_gt) |v| try q.bindInt64(v);
+    if (filters.expiry_date_gte) |v| try q.bindInt64(v);
+    if (filters.expiry_date_lt) |v| try q.bindInt64(v);
+    if (filters.expiry_date_lte) |v| try q.bindInt64(v);
     if (filters.resolved_address) |addr| try q.bindAddress(addr);
     if (filters.resolver) |addr| try q.bindAddress(addr);
     if (filters.registry) |addr| try q.bindAddress(addr);
@@ -1321,7 +1376,8 @@ pub fn countRowsBeforeNamehash(
     order_dir: OrderDir,
     filters: NameFilters,
 ) !u32 {
-    const field = sort_field.toSql();
+    const field_outer = sort_field.toSqlQualified("names.");
+    const field_cursor = sort_field.toSqlQualified("c.");
     // "before" means "would appear earlier in the result set" — depends on sort direction:
     //   DESC sort: row A is before row B if A.field > B.field OR (A.field == B.field AND A.namehash > B.namehash)
     //   ASC sort:  row A is before row B if A.field < B.field OR (A.field == B.field AND A.namehash < B.namehash)
@@ -1353,8 +1409,8 @@ pub fn countRowsBeforeNamehash(
     const op = if (order_dir == .desc) ">" else "<";
     const sql = try std.fmt.allocPrint(
         db.allocator,
-        "SELECT COUNT(*) FROM names WHERE EXISTS (SELECT 1 FROM names c WHERE c.namehash = ? AND (names.{s} {s} c.{s} OR (names.{s} = c.{s} AND names.namehash {s} c.namehash))){s}",
-        .{ field, op, field, field, field, op, filter_clause.items },
+        "SELECT COUNT(*) FROM names WHERE EXISTS (SELECT 1 FROM names c WHERE c.namehash = ? AND ({s} {s} {s} OR ({s} = {s} AND names.namehash {s} c.namehash))){s}",
+        .{ field_outer, op, field_cursor, field_outer, field_cursor, op, filter_clause.items },
     );
     defer db.allocator.free(sql);
 
@@ -1441,6 +1497,12 @@ pub fn getAllNames(db: *Database, owner: ?Address, skip: u32, limit: u32) ![]mod
 
 /// Filter options for querying names
 pub const NameFilters = struct {
+    // Grace-aware expiry comparisons (subgraph `expiryDate_*`; see the CASE in
+    // the condition builder). Distinct from the bare `expiry_*` slots.
+    expiry_date_gt: ?i64 = null,
+    expiry_date_gte: ?i64 = null,
+    expiry_date_lt: ?i64 = null,
+    expiry_date_lte: ?i64 = null,
     // Owner filters
     owner: ?Address = null,
     owner_in: ?[]const Address = null,

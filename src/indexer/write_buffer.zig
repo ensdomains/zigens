@@ -166,19 +166,26 @@ pub const WriteBuffer = struct {
         }
     }
 
-    /// Buffer an expiry update.
-    pub fn updateNameExpiry(self: *WriteBuffer, namehash: Hash, expiry: u64) !void {
+    /// Buffer a BaseRegistrar renewal expiry update. Rows already in the DB
+    /// flush through names_storage.updateV1RenewalExpiry (grace-aware CASE for
+    /// wrapped rows); records buffered this chunk store the bare value.
+    pub fn updateV1RenewalExpiry(self: *WriteBuffer, namehash: Hash, expires: u64) !void {
         const key = namehash.bytes;
         const gop = try self.names.getOrPut(key);
 
         if (gop.found_existing) {
             if (gop.value_ptr.is_new) {
-                gop.value_ptr.record.?.expiry = expiry;
+                // Bare registrar value, even when the buffered record is
+                // wrapped: grace for wrapped rows comes from the post-sync PCC
+                // materialize pass (the buffer is only active during bulk
+                // sync). Pre-applying it here double-counted after an unwrap
+                // later in the same chunk — the in-memory unwrap can't re-base.
+                gop.value_ptr.record.?.expiry = expires;
             } else {
-                gop.value_ptr.expiry = expiry;
+                gop.value_ptr.expiry = expires;
             }
         } else {
-            gop.value_ptr.* = .{ .is_new = false, .expiry = expiry };
+            gop.value_ptr.* = .{ .is_new = false, .expiry = expires };
         }
     }
 
@@ -348,7 +355,7 @@ pub const WriteBuffer = struct {
                     try names_storage.updateNameOwner(db, namehash, owner);
                 }
                 if (bn.expiry) |expiry| {
-                    try names_storage.updateNameExpiry(db, namehash, expiry);
+                    try names_storage.updateV1RenewalExpiry(db, namehash, expiry);
                 }
                 if (bn.resolver) |resolver| {
                     try names_storage.updateNameResolver(db, namehash, resolver);

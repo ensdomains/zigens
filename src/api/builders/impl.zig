@@ -141,6 +141,14 @@ fn eventAsTransferHandler(ctx: *anyopaque, field: *const parser.Field, nested_ct
         try writeOptStringField(&out, allocator, &first, "value", s);
     }
     try writeOptStringField(&out, allocator, &first, "operator", json_utils.extractStringField(data, "operator"));
+    // ERC1155 TransferBatch rows summarise the batch as `count` instead of id/value.
+    try writeOptIntField(&out, allocator, &first, "count", json_utils.extractIntField(data, "count"));
+    // V1 Registry NewOwner rows are stored as `Transfer` (subgraph feed parity)
+    // with a node-shaped payload — surface it instead of an empty object (N3).
+    try writeOptStringField(&out, allocator, &first, "parentNode", json_utils.extractStringField(data, "parentNode"));
+    try writeOptStringField(&out, allocator, &first, "labelhash", json_utils.extractStringField(data, "labelhash"));
+    try writeOptStringField(&out, allocator, &first, "subdomain", json_utils.extractStringField(data, "subdomain"));
+    try writeOptStringField(&out, allocator, &first, "owner", json_utils.extractStringField(data, "owner"));
 
     try out.append(allocator, '}');
     return try out.toOwnedSlice(allocator);
@@ -1547,7 +1555,9 @@ fn domainExpiryDateHandler(ctx: *anyopaque, field: *const parser.Field, nested_c
     _ = field;
     const domain: *const models.Name = @ptrCast(@alignCast(ctx));
     if (fields.hasValidExpiry(domain.expiry)) {
-        return try std.fmt.allocPrint(nested_ctx.allocator, "{d}", .{domain.expiry});
+        // Subgraph parity: grace-inclusive for unwrapped V1 .eth 2LDs (the
+        // schema docstring promises this; bare expires lives on Registration).
+        return try std.fmt.allocPrint(nested_ctx.allocator, "{d}", .{fields.effectiveDomainExpiry(domain.*)});
     }
     return try nested_ctx.allocator.dupe(u8, "null");
 }

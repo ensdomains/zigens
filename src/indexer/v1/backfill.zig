@@ -29,12 +29,17 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
 
     std.log.info("Starting pre-migration names backfill...", .{});
 
-    // Query to join temp_pre_migration_names with v1_labels to resolve labels
+    // Query to join temp_pre_migration_names with v1_labels to resolve labels.
+    // Only .eth-parented rows are reconstructible from a bare label: the Name
+    // below is built as `<label>.eth` with its namehash recomputed against the
+    // .eth node, so a temp row with any other parent (cross-parent labelhash
+    // matches are possible) would be silently mis-attributed to `.eth`.
     const query_sql =
         \\SELECT t.namehash, t.label_hash, t.parent_node, t.owner, t.block_number,
         \\       t.tx_hash, t.log_index, t.created_at, v.label
         \\FROM temp_pre_migration_names t
         \\JOIN v1_labels v ON t.label_hash = v.token_id
+        \\WHERE t.parent_node = '0x93cdeb708b7545dc668eb9280176169d1c33cfd8ed6f04690a0bcc88a93fc4ae'
     ;
 
     var q = try Query.init(self.database, query_sql);
@@ -120,6 +125,10 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
             .wrapper_expiry = null,
             .is_v1_name = true,
             .v1_label_hash = v1_label_hash,
+            // Provenance: every temp_pre_migration_names row came from the
+            // legacy 0x314159 registry (the only pre-migration fetch source);
+            // the default false mislabeled backfilled rows as new-registry.
+            .is_legacy = true,
         };
 
         // Check if name already exists (from V1 events processed during sync)
