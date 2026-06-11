@@ -3,6 +3,7 @@
 /// Used by `--backfill` CLI mode: clears names, replays all events in order,
 /// and re-derives name records using the same storage functions as live indexing.
 const std = @import("std");
+const ens_name = @import("../utils/ens_name.zig");
 const constants = @import("../constants.zig");
 const db_module = @import("../storage/database.zig");
 const Query = db_module.Query;
@@ -392,11 +393,7 @@ fn replayNewOwner(self: *Indexer, q: *Query) !void {
         parent_name_str = parent_record.name;
     }
 
-    // Construct full name
-    const full_name = if (parent_name_str) |pn|
-        try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, pn })
-    else
-        try self.allocator.dupe(u8, label_str);
+    const full_name = try ens_name.join(self.allocator, label_str, parent_name_str);
     defer self.allocator.free(full_name);
 
     // Create or update

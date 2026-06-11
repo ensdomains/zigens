@@ -1,4 +1,5 @@
 const std = @import("std");
+const ens_name = @import("../utils/ens_name.zig");
 const rpc = @import("../rpc/client.zig");
 const db_module = @import("../storage/database.zig");
 const c = db_module.c;
@@ -350,11 +351,7 @@ pub const LabelBackfill = struct {
             }
             defer if (parent_record_to_free) |*pr| pr.deinit(self.allocator);
 
-            // Construct full name
-            const full_name = if (parent_name_str) |pn|
-                try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_text, pn })
-            else
-                try self.allocator.dupe(u8, label_text);
+            const full_name = try ens_name.join(self.allocator, label_text, parent_name_str);
             defer self.allocator.free(full_name);
 
             try names_storage.updateNameLabel(self.database, namehash, label_text, full_name);
