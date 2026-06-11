@@ -1,4 +1,5 @@
 const std = @import("std");
+const ens_name = @import("../../utils/ens_name.zig");
 const constants = @import("../../constants.zig");
 const models = @import("../../types/models.zig");
 // ABI decoding migrated to eth.zig-backed shim. Old `../abi.zig` kept for fallback.
@@ -168,11 +169,7 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
         parent_name_str = parent_record.name;
     }
 
-    // Construct the full name
-    const full_name = if (parent_name_str) |pn|
-        try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, pn })
-    else
-        try self.allocator.dupe(u8, label_str);
+    const full_name = try ens_name.join(self.allocator, label_str, parent_name_str);
     defer self.allocator.free(full_name);
 
     std.log.debug("V1 NewOwner subdomain: {s} (namehash={s})", .{ full_name, subdomain_hex });

@@ -1,4 +1,5 @@
 const std = @import("std");
+const ens_name = @import("../../utils/ens_name.zig");
 const models = @import("../../types/models.zig");
 // ABI decoding migrated from hand-rolled `../abi.zig` to eth.zig-backed
 // `../abi_eth.zig`. The old module is kept for fallback. EventSignatures still
@@ -30,8 +31,7 @@ pub fn processOrphanedRegistration(
     const hash_mod = @import("../../types/hash.zig");
     const token_id_utils = @import("../../types/token_id.zig");
 
-    // Compute full name: label.parent_name
-    const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ orphan.label, parent_name });
+    const full_name = try ens_name.join(self.allocator, orphan.label, parent_name);
     defer self.allocator.free(full_name);
 
     const namehash = try hash_mod.namehash(self.allocator, full_name);
@@ -316,8 +316,7 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
     }
     defer if (parent_name_allocated) self.allocator.free(parent_name);
 
-    // Compute full name: label.parent_name
-    const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
+    const full_name = try ens_name.join(self.allocator, label_str, parent_name);
     defer self.allocator.free(full_name);
     const namehash = try @import("../../types/hash.zig").namehash(self.allocator, full_name);
 
@@ -329,7 +328,7 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
     const canonical_id = token_id_utils.getCanonicalId(token_id);
     const token_version = token_id_utils.getTokenVersion(token_id);
 
-    const name_str_dup = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
+    const name_str_dup = try self.allocator.dupe(u8, full_name);
     defer self.allocator.free(name_str_dup);
 
     const label_dup = try self.allocator.dupe(u8, label_str);
@@ -417,7 +416,7 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
         expiration,
     });
 
-    const event_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
+    const event_name = try ens_name.join(self.allocator, label_str, parent_name);
 
     try utils.emitEvent(self, protocol, log, .name_registered, event_name, namehash, event_data);
 }
@@ -1252,7 +1251,7 @@ pub fn handleLabelRegistered(self: *Indexer, protocol: models.Protocol, log: rpc
     }
     defer if (parent_name_allocated) self.allocator.free(parent_name);
 
-    const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
+    const full_name = try ens_name.join(self.allocator, label_str, parent_name);
     defer self.allocator.free(full_name);
 
     const namehash_val = try @import("../../types/hash.zig").namehash(self.allocator, full_name);
@@ -1464,7 +1463,7 @@ pub fn handleLabelReserved(self: *Indexer, protocol: models.Protocol, log: rpc.L
     }
     defer if (parent_name_allocated) self.allocator.free(parent_name);
 
-    const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
+    const full_name = try ens_name.join(self.allocator, label_str, parent_name);
     defer self.allocator.free(full_name);
 
     const namehash_val = try @import("../../types/hash.zig").namehash(self.allocator, full_name);
