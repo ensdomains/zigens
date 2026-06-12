@@ -161,6 +161,20 @@ CREATE TABLE IF NOT EXISTS names (
   -- 0 = non-normalized or unknown label. Default-filtered out of GraphQL listings
   -- unless includeUnnormalized is passed (mirrors is_reachable).
   is_normalized BIGINT NOT NULL DEFAULT 1,
+  -- Grace-inclusive expiry (subgraph `Domain.expiryDate`): bare stored expiry
+  -- plus the 90d (7776000s) registrar grace for UNWRAPPED V1 .eth 2LDs only
+  -- (wrapped rows already store the grace-inclusive wrapper value). This is the
+  -- single SQL source of the rule that backs the `expiryDate`/`expiryDate_*`
+  -- filters and ordering; a STORED generated column keeps it sargable via
+  -- idx_names_expiry_effective (the old inline CASE defeated idx_names_expiry).
+  -- Mirrors ens_fields.effectiveDomainExpiry on the read/serialization side.
+  -- The maxInt(i64)-7776000 upper bound stops a near-max expiry from overflowing
+  -- the addition (PG BIGINT errors; SQLite would silently widen to REAL).
+  expiry_effective BIGINT GENERATED ALWAYS AS (
+    CASE WHEN protocol = 'v1' AND parent_name = 'eth' AND is_wrapped = 0
+           AND expiry > 0 AND expiry <= 9223372036846999807
+         THEN expiry + 7776000 ELSE expiry END
+  ) STORED,
   UNIQUE(protocol, namehash)
 );
 
@@ -171,6 +185,7 @@ CREATE INDEX IF NOT EXISTS idx_names_owner ON names(owner);
 CREATE INDEX IF NOT EXISTS idx_names_token_id ON names(token_id);
 CREATE INDEX IF NOT EXISTS idx_names_canonical_id ON names(canonical_id);
 CREATE INDEX IF NOT EXISTS idx_names_expiry ON names(expiry);
+CREATE INDEX IF NOT EXISTS idx_names_expiry_effective ON names(expiry_effective);
 CREATE INDEX IF NOT EXISTS idx_names_registry ON names(protocol, registry);
 CREATE INDEX IF NOT EXISTS idx_names_resolver ON names(protocol, resolver);
 CREATE INDEX IF NOT EXISTS idx_names_created_block ON names(protocol, created_block);

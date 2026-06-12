@@ -119,6 +119,12 @@ pub const ColumnInfo = struct {
     name: []const u8,
     sql_type: []const u8,
     pk_pos: i64,
+    /// True for DB-computed columns (GENERATED ALWAYS AS ... STORED). They cannot
+    /// be written, so the reorg undo-log must exclude them from capture/restore —
+    /// they recompute from the base columns automatically. SQLite's PRAGMA
+    /// table_info never lists generated columns (so this stays false there); the
+    /// Postgres information_schema query sets it from `is_generated`.
+    is_generated: bool = false,
 };
 
 /// Free a `[]ColumnInfo` returned by `introspectColumns`.

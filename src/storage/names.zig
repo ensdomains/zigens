@@ -1087,9 +1087,10 @@ pub const NameSortField = enum {
     created_at,
     name,
     expiry,
-    /// Grace-inclusive expiry (Domain.expiryDate ordering) — must agree with
-    /// the expiry_date_* filter CASE and effectiveDomainExpiry, otherwise sort
-    /// order and displayed values diverge by up to 90d in mixed result sets.
+    /// Grace-inclusive expiry (Domain.expiryDate ordering). Backed by the STORED
+    /// generated `expiry_effective` column (schema.sql) so it stays index-backed
+    /// (idx_names_expiry_effective) and matches the expiry_date_* filters and
+    /// ens_fields.effectiveDomainExpiry by construction — one SQL source of truth.
     expiry_effective,
     registered_at,
 
@@ -1102,7 +1103,7 @@ pub const NameSortField = enum {
             .created_at => alias ++ "created_at",
             .name => alias ++ "name",
             .expiry => alias ++ "expiry",
-            .expiry_effective => "CASE WHEN " ++ alias ++ "protocol = 'v1' AND " ++ alias ++ "parent_name = 'eth' AND " ++ alias ++ "is_wrapped = 0 AND " ++ alias ++ "expiry > 0 AND " ++ alias ++ "expiry <= 9223372036846999807 THEN " ++ alias ++ "expiry + 7776000 ELSE " ++ alias ++ "expiry END",
+            .expiry_effective => alias ++ "expiry_effective",
             .registered_at => alias ++ "registered_at",
         };
     }
@@ -1224,15 +1225,14 @@ fn appendNameScalarConditions(
     if (filters.expiry_gte != null) try conditions.append(db.allocator, "expiry >= ?");
     if (filters.expiry_lt != null) try conditions.append(db.allocator, "expiry < ?");
     if (filters.expiry_lte != null) try conditions.append(db.allocator, "expiry <= ?");
-    // Grace-aware variants backing the subgraph `expiryDate_*` filters: the
-    // compared value mirrors effectiveDomainExpiry (ens_fields.zig) — bare
-    // stored expiry plus 90d (7776000s) for unwrapped V1 .eth 2LDs only.
-    // The maxInt(i64)-7776000 bound keeps one near-max row from overflowing
-    // the addition as BIGINT on PG (whole query errors; SQLite degrades to REAL).
-    if (filters.expiry_date_gt != null) try conditions.append(db.allocator, "CASE WHEN protocol = 'v1' AND parent_name = 'eth' AND is_wrapped = 0 AND expiry > 0 AND expiry <= 9223372036846999807 THEN expiry + 7776000 ELSE expiry END > ?");
-    if (filters.expiry_date_gte != null) try conditions.append(db.allocator, "CASE WHEN protocol = 'v1' AND parent_name = 'eth' AND is_wrapped = 0 AND expiry > 0 AND expiry <= 9223372036846999807 THEN expiry + 7776000 ELSE expiry END >= ?");
-    if (filters.expiry_date_lt != null) try conditions.append(db.allocator, "CASE WHEN protocol = 'v1' AND parent_name = 'eth' AND is_wrapped = 0 AND expiry > 0 AND expiry <= 9223372036846999807 THEN expiry + 7776000 ELSE expiry END < ?");
-    if (filters.expiry_date_lte != null) try conditions.append(db.allocator, "CASE WHEN protocol = 'v1' AND parent_name = 'eth' AND is_wrapped = 0 AND expiry > 0 AND expiry <= 9223372036846999807 THEN expiry + 7776000 ELSE expiry END <= ?");
+    // Grace-aware variants backing the subgraph `expiryDate_*` filters. Compared
+    // against the STORED generated `expiry_effective` column (schema.sql) — the
+    // single source of the grace rule — so these stay sargable on
+    // idx_names_expiry_effective instead of full-scanning an inline CASE.
+    if (filters.expiry_date_gt != null) try conditions.append(db.allocator, "expiry_effective > ?");
+    if (filters.expiry_date_gte != null) try conditions.append(db.allocator, "expiry_effective >= ?");
+    if (filters.expiry_date_lt != null) try conditions.append(db.allocator, "expiry_effective < ?");
+    if (filters.expiry_date_lte != null) try conditions.append(db.allocator, "expiry_effective <= ?");
     if (filters.resolved_address != null) {
         try conditions.append(db.allocator, "namehash IN (SELECT namehash FROM resolver_addresses WHERE address = ?)");
     }

@@ -215,7 +215,8 @@ fn introspectColumns(ctx: *anyopaque, allocator: std.mem.Allocator, table: []con
         \\                   ON kcu.constraint_name = tc.constraint_name AND kcu.table_schema = tc.table_schema
         \\                 WHERE tc.table_name = c.table_name AND tc.table_schema = c.table_schema
         \\                   AND tc.constraint_type = 'PRIMARY KEY'
-        \\                   AND kcu.column_name = c.column_name), 0)::bigint
+        \\                   AND kcu.column_name = c.column_name), 0)::bigint,
+        \\       c.is_generated::text
         \\FROM information_schema.columns c
         \\WHERE c.table_name = $1 AND c.table_schema = COALESCE(current_schema(), 'public')
         \\ORDER BY c.ordinal_position
@@ -236,7 +237,10 @@ fn introspectColumns(ctx: *anyopaque, allocator: std.mem.Allocator, table: []con
         errdefer allocator.free(name);
         const sql_type = try allocator.dupe(u8, try row.get([]const u8, 1));
         errdefer allocator.free(sql_type);
-        try list.append(allocator, .{ .name = name, .sql_type = sql_type, .pk_pos = try row.get(i64, 2) });
+        // information_schema.columns.is_generated is 'ALWAYS' for GENERATED columns,
+        // 'NEVER' otherwise. (SQLite's table_info omits generated columns entirely.)
+        const is_generated = std.mem.eql(u8, try row.get([]const u8, 3), "ALWAYS");
+        try list.append(allocator, .{ .name = name, .sql_type = sql_type, .pk_pos = try row.get(i64, 2), .is_generated = is_generated });
     }
     return list.toOwnedSlice(allocator);
 }

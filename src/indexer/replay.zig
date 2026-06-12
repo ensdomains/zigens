@@ -94,52 +94,19 @@ pub fn replayEventsToRebuildNames(self: *Indexer) !void {
     try dropNamesIndexes(database);
 
     // ── Step 5: Clear names + backfill_status ──
-    // DROP + CREATE is orders of magnitude faster than DELETE on millions of rows.
-    // Must mirror the names DDL in schema/schema.sql — insertName binds every
-    // column, so a missing one here fails every insert during replay.
-    std.log.info("Dropping and recreating names table...", .{});
-    try database.exec("DROP TABLE IF EXISTS names");
-    try database.exec(
-        \\CREATE TABLE names (
-        \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
-        \\  protocol TEXT NOT NULL,
-        \\  name TEXT NOT NULL,
-        \\  namehash TEXT NOT NULL,
-        \\  label TEXT NOT NULL,
-        \\  label_hash TEXT NOT NULL,
-        \\  parent_name TEXT NOT NULL,
-        \\  parent_namehash TEXT NOT NULL,
-        \\  registry TEXT NOT NULL,
-        \\  owner TEXT NOT NULL,
-        \\  resolver TEXT,
-        \\  token_id TEXT NOT NULL,
-        \\  canonical_id TEXT NOT NULL,
-        \\  token_version INTEGER NOT NULL,
-        \\  expiry INTEGER,
-        \\  registry_locked INTEGER NOT NULL DEFAULT 0,
-        \\  migrated INTEGER NOT NULL DEFAULT 0,
-        \\  created_block INTEGER NOT NULL,
-        \\  created_at INTEGER NOT NULL,
-        \\  updated_block INTEGER NOT NULL,
-        \\  updated_at INTEGER NOT NULL,
-        \\  is_wrapped INTEGER NOT NULL DEFAULT 0,
-        \\  wrapper_fuses TEXT DEFAULT NULL,
-        \\  wrapper_expiry INTEGER DEFAULT NULL,
-        \\  is_v1_name INTEGER NOT NULL DEFAULT 0,
-        \\  v1_label_hash TEXT DEFAULT NULL,
-        \\  registrant TEXT,
-        \\  registered_at INTEGER,
-        \\  is_reachable INTEGER NOT NULL DEFAULT 1,
-        \\  unreachable_since INTEGER,
-        \\  ttl INTEGER,
-        \\  is_legacy INTEGER NOT NULL DEFAULT 0,
-        \\  resolved_address TEXT DEFAULT NULL,
-        \\  is_normalized INTEGER NOT NULL DEFAULT 1,
-        \\  UNIQUE(protocol, namehash)
-        \\)
-    );
-    // Keep the namehash index — it's the primary lookup key used during replay
-    try database.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_names_namehash ON names(namehash)");
+    // DELETE, not DROP+CREATE: the canonical names schema lives only in
+    // schema/schema.sql (and its generated Postgres twin). A hand-maintained
+    // CREATE TABLE copy here drifts — it has already silently lost columns
+    // (the generated `expiry_effective` among them), and insertName binds
+    // against the live schema, so a missing column breaks every replay insert
+    // or, for a generated column, leaves queries referencing a column the
+    // rebuilt table lacks. Clearing rows keeps the real table — every column,
+    // its generated columns, indexes, and UNIQUE(protocol, namehash) (which
+    // insertName's upsert needs) — and the reorg triggers (no cursor is armed
+    // during replay, so the bulk DELETE captures nothing). Bulk-load speed is
+    // preserved by the dropNamesIndexes/createNamesIndexes pair below.
+    std.log.info("Clearing names table...", .{});
+    try database.exec("DELETE FROM names");
     try database.exec("DELETE FROM backfill_status");
 
     // ── Step 5: Bulk-load v1_labels into the in-memory cache ──
@@ -743,8 +710,10 @@ fn createNamesIndexes(database: *db_module.Database) !void {
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_is_wrapped ON names(is_wrapped)");
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_is_v1_name ON names(is_v1_name)");
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_wrapper_expiry ON names(wrapper_expiry)");
-    // Keep namehash unique index (primary lookup key, always needed)
-    try database.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_names_namehash ON names(namehash)");
+    // Namehash lookup index — non-unique, matching schema/schema.sql (the real
+    // key is UNIQUE(protocol, namehash); namehash alone repeats across protocols
+    // for V1->V2 migrated names). No-op now that DELETE keeps the live indexes.
+    try database.exec("CREATE INDEX IF NOT EXISTS idx_names_namehash ON names(namehash)");
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_token_id ON names(token_id)");
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_canonical_id ON names(canonical_id)");
     const elapsed = std.time.milliTimestamp() - timer;

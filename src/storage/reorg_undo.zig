@@ -131,6 +131,11 @@ fn getColumns(db: *Database, allocator: std.mem.Allocator, table: []const u8) ![
         cols.deinit(allocator);
     }
     for (info) |col| {
+        // Skip DB-computed columns: they can't be written, so neither the capture
+        // snapshot nor the restore INSERT may name them — they recompute from the
+        // base columns on restore. (SQLite's table_info already omits these, so
+        // this only bites on Postgres, whose information_schema lists them.)
+        if (col.is_generated) continue;
         try cols.append(allocator, try allocator.dupe(u8, col.name));
     }
     return cols.toOwnedSlice(allocator);
@@ -521,10 +526,15 @@ fn getRestoreSql(db: *Database, allocator: std.mem.Allocator, cache: *std.String
     defer pk_cols.deinit(allocator);
 
     const dialect = db.dialect();
-    for (info, 0..) |col, i| {
-        col_names[i] = col.name;
+    for (info) |col| {
+        // Skip DB-computed columns: PG rejects naming a generated column in the
+        // restore INSERT ("cannot insert into generated column"); it recomputes
+        // from the restored base columns. (SQLite's introspectColumns omits them,
+        // so `built` simply tracks the written count on both backends.)
+        if (col.is_generated) continue;
+        col_names[built] = col.name;
         const cast: ?[]const u8 = if (col.sql_type.len == 0) null else col.sql_type;
-        value_exprs[i] = try dialect.jsonExtract(allocator, "?1", col.name, cast);
+        value_exprs[built] = try dialect.jsonExtract(allocator, "?1", col.name, cast);
         built += 1;
         if (col.pk_pos > 0) try pk_cols.append(allocator, col.name);
     }
@@ -540,7 +550,7 @@ fn getRestoreSql(db: *Database, allocator: std.mem.Allocator, cache: *std.String
     // conflict_cols (INSERT OR REPLACE conflicts on any unique), so this is a no-op
     // there — the SQLite restore SQL is unchanged.
     const conflict_cols = schema_keys.conflictColsFor(table) orelse pk_cols.items;
-    const sql = try dialect.upsert(allocator, table, col_names, value_exprs, conflict_cols, .replace);
+    const sql = try dialect.upsert(allocator, table, col_names[0..built], value_exprs[0..built], conflict_cols, .replace);
     errdefer allocator.free(sql);
     const key = try allocator.dupe(u8, table);
     errdefer allocator.free(key);
