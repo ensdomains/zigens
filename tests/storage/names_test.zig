@@ -1229,3 +1229,113 @@ test "expiry_date filters tolerate a near-max stored expiry" {
     try testing.expectEqual(@as(usize, 1), names.len);
     try testing.expectEqualStrings("poisoned.eth", names[0].name.?);
 }
+
+test "insertName coerces null parent_name to empty string (NOT NULL invariant)" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // A root TLD as the V1 NewOwner path builds it: parent_name null in-memory.
+    // The column is NOT NULL, so storage must coerce to "" rather than abort.
+    const nh = try namehash_fn(allocator, "eth");
+    try database.insertName(models.Name{
+        .protocol = .v1,
+        .name = "eth",
+        .namehash = nh,
+        .label = "eth",
+        .label_hash = try labelhash_fn(allocator, "eth"),
+        .parent_name = null,
+        .parent_namehash = Hash.zero,
+        .registry = Address.zero,
+        .owner = helpers.TEST_OWNER_1,
+        .registrant = helpers.TEST_OWNER_1,
+        .resolver = Address.zero,
+        .token_id = 0,
+        .canonical_id = 0,
+        .token_version = 1,
+        .expiry = 0,
+        .registry_locked = false,
+        .migrated = false,
+        .created_block = 1,
+        .created_at = 1,
+        .registered_at = 1,
+        .updated_block = 1,
+        .updated_at = 1,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = true,
+        .v1_label_hash = null,
+    });
+
+    const got = try database.getNameByNamehash(nh);
+    try testing.expect(got != null);
+    var n = got.?;
+    defer n.deinit(allocator);
+    // Read back as "" (the read path also coerces), never a stray null.
+    try testing.expectEqualStrings("", n.parent_name orelse "NULL_LEAKED");
+    try testing.expectEqualStrings("eth", n.name.?);
+}
+
+test "updateNameLabel is protocol-scoped: a v1 heal leaves the same-namehash v2 row intact" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // Same namehash under both protocols (a V1->V2 migrated name).
+    const nh = try namehash_fn(allocator, "shared.eth");
+    const parent_nh = try namehash_fn(allocator, "eth");
+    const base = models.Name{
+        .protocol = .v1,
+        .name = "[placeholder].eth",
+        .namehash = nh,
+        .label = "[placeholder]",
+        .label_hash = try labelhash_fn(allocator, "shared"),
+        .parent_name = "eth",
+        .parent_namehash = parent_nh,
+        .registry = Address.zero,
+        .owner = helpers.TEST_OWNER_1,
+        .registrant = helpers.TEST_OWNER_1,
+        .resolver = Address.zero,
+        .token_id = 0,
+        .canonical_id = 0,
+        .token_version = 1,
+        .expiry = 0,
+        .registry_locked = false,
+        .migrated = false,
+        .created_block = 1,
+        .created_at = 1,
+        .registered_at = 1,
+        .updated_block = 1,
+        .updated_at = 1,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = true,
+        .v1_label_hash = null,
+    };
+    try database.insertName(base);
+    var v2 = base;
+    v2.protocol = .v2;
+    v2.name = "shared.eth";
+    v2.label = "shared";
+    try database.insertName(v2);
+
+    // Heal only the v1 row.
+    try lib.storage.names.updateNameLabel(database, .v1, nh, "shared", "shared.eth", true);
+
+    const v1_got = try database.getNameByNamehashAndProtocol(nh, .v1);
+    try testing.expect(v1_got != null);
+    var v1n = v1_got.?;
+    defer v1n.deinit(allocator);
+    try testing.expectEqualStrings("shared", v1n.label.?);
+
+    // The v2 row must be untouched (no protocol predicate would have clobbered it,
+    // but here it stays as-is).
+    const v2_got = try database.getNameByNamehashAndProtocol(nh, .v2);
+    try testing.expect(v2_got != null);
+    var v2n = v2_got.?;
+    defer v2n.deinit(allocator);
+    try testing.expectEqualStrings("shared", v2n.label.?);
+    try testing.expectEqualStrings("shared.eth", v2n.name.?);
+}

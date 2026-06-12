@@ -821,6 +821,7 @@ pub const Database = struct {
     pub const getTotalRoleCount = roles.getTotalRoleCount;
     pub const getRoleCountFiltered = roles.getRoleCountFiltered;
     pub const RoleCountFilters = roles.RoleCountFilters;
+    pub const getLabelRoleHolderCount = roles.getLabelRoleHolderCount;
 
     // ENSIP-16 module (7 functions)
     pub const upsertResolverMetadata = ensip16.upsertResolverMetadata;
@@ -851,6 +852,8 @@ pub const Database = struct {
     pub const getRegistryEntrySubregistry = registry_entries.getSubregistry;
     pub const getRegistryEntryLiveParents = registry_entries.getLiveParents;
     pub const collectSubregistrySubtree = registry_entries.collectSubtreeRooted;
+    pub const isRegistryReachable = registry_entries.isRegistryReachable;
+    pub const reconcileV2Reachability = registry_entries.reconcileV2Reachability;
     pub const setRegistriesReachability = registry_entries.setRegistriesReachability;
     pub const markNameUnreachableByNamehash = registry_entries.markNameUnreachableByNamehash;
 

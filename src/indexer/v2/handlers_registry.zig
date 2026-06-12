@@ -1,4 +1,5 @@
 const std = @import("std");
+const ens_name = @import("../../utils/ens_name.zig");
 const models = @import("../../types/models.zig");
 // ABI decoding migrated from hand-rolled `../abi.zig` to eth.zig-backed
 // `../abi_eth.zig`. The old module is kept for fallback. EventSignatures still
@@ -9,7 +10,6 @@ const db = @import("../../storage/database.zig");
 const Query = db.Query;
 const Hash = @import("../../types/hash.zig").Hash;
 const Address = @import("../../types/address.zig").Address;
-const unicode = @import("../../utils/unicode.zig");
 const Indexer = @import("../indexer.zig").Indexer;
 const utils = @import("../utils.zig");
 const registry_entries = @import("../../storage/registry_entries.zig");
@@ -31,8 +31,7 @@ pub fn processOrphanedRegistration(
     const hash_mod = @import("../../types/hash.zig");
     const token_id_utils = @import("../../types/token_id.zig");
 
-    // Compute full name: label.parent_name
-    const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ orphan.label, parent_name });
+    const full_name = try ens_name.join(self.allocator, orphan.label, parent_name);
     defer self.allocator.free(full_name);
 
     const namehash = try hash_mod.namehash(self.allocator, full_name);
@@ -242,7 +241,7 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
     const expiration: u256 = data_values[1].uint256;
     const registered_by = Address{ .bytes = data_values[2].address };
 
-    unicode.validateName(label_str) catch |err| {
+    ens_name.validateLabel(label_str) catch |err| {
         std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
         return;
     };
@@ -317,8 +316,7 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
     }
     defer if (parent_name_allocated) self.allocator.free(parent_name);
 
-    // Compute full name: label.parent_name
-    const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
+    const full_name = try ens_name.join(self.allocator, label_str, parent_name);
     defer self.allocator.free(full_name);
     const namehash = try @import("../../types/hash.zig").namehash(self.allocator, full_name);
 
@@ -330,7 +328,7 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
     const canonical_id = token_id_utils.getCanonicalId(token_id);
     const token_version = token_id_utils.getTokenVersion(token_id);
 
-    const name_str_dup = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
+    const name_str_dup = try self.allocator.dupe(u8, full_name);
     defer self.allocator.free(name_str_dup);
 
     const label_dup = try self.allocator.dupe(u8, label_str);
@@ -418,8 +416,11 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
         expiration,
     });
 
-    const event_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
+    const event_name = try ens_name.join(self.allocator, label_str, parent_name);
 
+    // event_data and event_name transfer to emitEvent, which is their sole owner
+    // (insertEventAndNotify frees both on every path) — no errdefer here, matching
+    // every other emit site in this file; an errdefer would double-free on a DB error.
     try utils.emitEvent(self, protocol, log, .name_registered, event_name, namehash, event_data);
 }
 
@@ -574,7 +575,7 @@ pub fn handleETHNameRegistered(self: *Indexer, protocol: models.Protocol, log: r
     const base_price = data_values[7].uint256;
     const premium = data_values[8].uint256;
 
-    unicode.validateName(label_str) catch |err| {
+    ens_name.validateLabel(label_str) catch |err| {
         std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
         return;
     };
@@ -733,7 +734,7 @@ pub fn handleETHNameRenewed(self: *Indexer, protocol: models.Protocol, log: rpc.
     const referrer = Hash{ .bytes = data_values[4].fixed_bytes.data };
     const base_price = data_values[5].uint256;
 
-    unicode.validateName(label_str) catch |err| {
+    ens_name.validateLabel(label_str) catch |err| {
         std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
         return;
     };
@@ -1183,7 +1184,7 @@ pub fn handleLabelRegistered(self: *Indexer, protocol: models.Protocol, log: rpc
     const owner = Address{ .bytes = data_values[1].address };
     const expiry: u64 = @truncate(data_values[2].uint256);
 
-    unicode.validateName(label_str) catch |err| {
+    ens_name.validateLabel(label_str) catch |err| {
         std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
         return;
     };
@@ -1253,7 +1254,7 @@ pub fn handleLabelRegistered(self: *Indexer, protocol: models.Protocol, log: rpc
     }
     defer if (parent_name_allocated) self.allocator.free(parent_name);
 
-    const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
+    const full_name = try ens_name.join(self.allocator, label_str, parent_name);
     defer self.allocator.free(full_name);
 
     const namehash_val = try @import("../../types/hash.zig").namehash(self.allocator, full_name);
@@ -1419,7 +1420,7 @@ pub fn handleLabelReserved(self: *Indexer, protocol: models.Protocol, log: rpc.L
     const label_str = data_values[0].string;
     const expiry: u64 = @truncate(data_values[1].uint256);
 
-    unicode.validateName(label_str) catch |err| {
+    ens_name.validateLabel(label_str) catch |err| {
         std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
         return;
     };
@@ -1465,7 +1466,7 @@ pub fn handleLabelReserved(self: *Indexer, protocol: models.Protocol, log: rpc.L
     }
     defer if (parent_name_allocated) self.allocator.free(parent_name);
 
-    const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
+    const full_name = try ens_name.join(self.allocator, label_str, parent_name);
     defer self.allocator.free(full_name);
 
     const namehash_val = try @import("../../types/hash.zig").namehash(self.allocator, full_name);

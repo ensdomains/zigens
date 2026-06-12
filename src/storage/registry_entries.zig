@@ -81,6 +81,59 @@ pub fn getLiveParents(
     return parents.toOwnedSlice(allocator);
 }
 
+/// The single tree-derived definition of V2 reachability: a source `registry`
+/// is reachable iff it is (or chains up to) a root registry through the CURRENT
+/// subregistry edges. Walks UP — from `registry`, find the parents whose live
+/// `registry_entries` pointer targets it, and recurse until a root is hit.
+///
+/// A name is reachable iff its registry is. This is the upward dual of the
+/// downward repoint cascade (`collectSubtreeRooted` + `setRegistriesReachability`)
+/// and shares its source of truth (the `registry_entries` mirror), so both stay
+/// consistent. Order-independent: it reads the live mirror, so a name registered
+/// into a subregistry whose parent already repointed away (the phase-ordering
+/// "born orphaned" case the cascade cannot see) is correctly unreachable, at any
+/// chain depth. Visited-set guards against pointer cycles.
+pub fn isRegistryReachable(
+    db: *Database,
+    allocator: std.mem.Allocator,
+    protocol: models.Protocol,
+    registry: Address,
+    roots: []const Address,
+) !bool {
+    for (roots) |r| if (registry.eql(r)) return true;
+
+    var seen: std.AutoHashMap(Address, void) = .init(allocator);
+    defer seen.deinit();
+    var frontier: std.ArrayList(Address) = .{};
+    defer frontier.deinit(allocator);
+    try seen.put(registry, {});
+    try frontier.append(allocator, registry);
+
+    while (frontier.items.len > 0) {
+        const cur = frontier.swapRemove(frontier.items.len - 1);
+        var cur_buf: [42]u8 = undefined;
+        const cur_hex = cur.toHexBuf(&cur_buf);
+
+        var q = try Query.initCached(db,
+            \\SELECT DISTINCT parent_registry FROM registry_entries
+            \\WHERE protocol = ? AND subregistry = ?
+        );
+        defer q.deinit();
+        try q.bindTextStatic(protocol.toString());
+        try q.bindText(cur_hex);
+
+        while (try q.step()) {
+            const parent_str = q.getTextSlice(0) orelse continue;
+            const parent = Address.fromHex(parent_str) catch continue;
+            for (roots) |r| if (parent.eql(r)) return true;
+            if (seen.contains(parent)) continue;
+            try seen.put(parent, {});
+            try frontier.append(allocator, parent);
+        }
+    }
+    return false;
+}
+
 /// Upsert the subregistry pointer for a parent label's entry. Returns the
 /// *previous* pointer (Address.zero if no row existed) so the handler can
 /// decide whether to cascade-invalidate descendants.
@@ -274,6 +327,51 @@ pub fn setRegistriesReachability(
         total += @intCast(q.changes());
     }
     return total;
+}
+
+/// Order-independent reachability authority: recompute reachability for every V2
+/// name from the CURRENT registry tree and mark unreachable any whose source
+/// registry no longer chains up to a root. The per-event repoint cascade and the
+/// insert-time check are fast incremental approximations, but both are fragile
+/// against the indexer's phase/chunk ordering — a repoint cascade can run in an
+/// earlier phase than the child registration it should invalidate, so the child
+/// is left reachable. This recomputes from the final tree state, so it is correct
+/// regardless of the order events were processed in, and self-heals such gaps.
+///
+/// Only flips reachable -> unreachable (the tree-orphan direction). Reactivation
+/// is deliberately left to the explicit re-link cascade, which has the context to
+/// tell a genuine subregistry re-link apart from an unrelated soft-delete
+/// (LabelUnregistered / expiry) — blindly forcing reachable here would resurrect
+/// those. Cheap: it evaluates the small set of distinct V2 registries (not names),
+/// and the bulk UPDATE only touches rows whose flag actually flips.
+pub fn reconcileV2Reachability(
+    db: *Database,
+    allocator: std.mem.Allocator,
+    roots: []const Address,
+    block_number: u64,
+    block_timestamp: i64,
+) !u64 {
+    var regs: std.ArrayList(Address) = .{};
+    defer regs.deinit(allocator);
+    {
+        var q = try Query.initCached(db, "SELECT DISTINCT registry FROM names WHERE protocol = 'v2'");
+        defer q.deinit();
+        while (try q.step()) {
+            const r_str = q.getTextSlice(0) orelse continue;
+            const r = Address.fromHex(r_str) catch continue;
+            try regs.append(allocator, r);
+        }
+    }
+
+    var orphaned: std.ArrayList(Address) = .{};
+    defer orphaned.deinit(allocator);
+    for (regs.items) |r| {
+        const reachable = isRegistryReachable(db, allocator, .v2, r, roots) catch true;
+        if (!reachable) try orphaned.append(allocator, r);
+    }
+
+    if (orphaned.items.len == 0) return 0;
+    return try setRegistriesReachability(db, .v2, orphaned.items, false, block_number, block_timestamp);
 }
 
 /// Soft-delete a single name by namehash (sets is_reachable = 0). Used by

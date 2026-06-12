@@ -687,6 +687,7 @@ pub const Indexer = struct {
                 // the buffer is flushed and indexes are restored (cursor disarmed
                 // so it doesn't self-capture into the reorg undo-log).
                 self.materializePccUncaptured();
+                self.reconcileReachabilityUncaptured();
 
                 if (self.webhook_manager) |wm| {
                     std.log.info("Initial sync complete - starting 8 webhook workers", .{});
@@ -744,6 +745,9 @@ pub const Indexer = struct {
                     // one-shot bulk UPDATE now that the buffer is flushed.
                     if (protocol == .v1) {
                         self.materializePccUncaptured();
+                    }
+                    if (protocol == .v2) {
+                        self.reconcileReachabilityUncaptured();
                     }
 
                     if (self.webhook_manager) |wm| {
@@ -819,6 +823,21 @@ pub const Indexer = struct {
     pub fn insertName(self: *Indexer, name: models.Name) !void {
         var n = name;
         n.is_normalized = ens_normalize.nameIsNormalized(self.allocator, n.name);
+        // Reachability is derived from the registry tree: a V2 name is reachable
+        // iff its source registry chains up to a root through the current
+        // subregistry edges. Evaluating it at this insert chokepoint (the one
+        // shared with is_normalized) covers the phase-ordering case the repoint
+        // cascade can't — a name registered into a subregistry whose parent
+        // already repointed away. V1 names have no subregistry tree, so they keep
+        // the default (reachable). On a transient lookup error, leave the default
+        // rather than block the insert.
+        if (n.protocol == .v2) {
+            const roots = [_]Address{ self.config.v2_contracts.eth_registry, self.config.v2_contracts.root_registry };
+            n.is_reachable = self.database.isRegistryReachable(self.allocator, n.protocol, n.registry, &roots) catch |err| blk: {
+                std.log.warn("isRegistryReachable failed for {any}: {} (assuming reachable)", .{ n.registry, err });
+                break :blk n.is_reachable;
+            };
+        }
         try self.database.insertName(n);
     }
 
@@ -866,6 +885,26 @@ pub const Indexer = struct {
             return;
         };
         std.log.info("PCC Domain.expiry mirror materialized: {d} row(s) updated", .{pcc_rows});
+    }
+
+    /// One-shot, order-independent V2 reachability reconciliation, run at
+    /// initial-sync completion (cursor disarmed so it doesn't self-capture, like
+    /// materializePccUncaptured). Recomputes reachability from the final registry
+    /// tree, healing names left wrongly-reachable by a repoint cascade that ran in
+    /// an earlier phase/chunk than the child registration. V2-only (V1 has no
+    /// subregistry tree).
+    pub fn reconcileReachabilityUncaptured(self: *Indexer) void {
+        reorg_undo.clearCursor(self.database, .v2) catch |err| {
+            std.log.warn("reorg undo-log: failed to disarm cursor before reachability reconcile: {}", .{err});
+        };
+        defer self.invalidateReorgCursor();
+        const head = self.database.getSyncState(.v2) catch null orelse 0;
+        const roots = [_]Address{ self.config.v2_contracts.eth_registry, self.config.v2_contracts.root_registry };
+        const fixed = self.database.reconcileV2Reachability(self.allocator, &roots, head, std.time.timestamp()) catch |err| {
+            std.log.warn("reconcileV2Reachability failed: {}", .{err});
+            return;
+        };
+        std.log.info("V2 reachability reconciled: {d} name(s) marked unreachable", .{fixed});
     }
 
     /// True if the stored hash for `block_number` still matches the protocol, or no hash is stored.

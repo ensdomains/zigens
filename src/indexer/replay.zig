@@ -3,6 +3,7 @@
 /// Used by `--backfill` CLI mode: clears names, replays all events in order,
 /// and re-derives name records using the same storage functions as live indexing.
 const std = @import("std");
+const ens_name = @import("../utils/ens_name.zig");
 const constants = @import("../constants.zig");
 const db_module = @import("../storage/database.zig");
 const Query = db_module.Query;
@@ -380,11 +381,7 @@ fn replayNewOwner(self: *Indexer, q: *Query) !void {
         parent_name_str = parent_record.name;
     }
 
-    // Construct full name
-    const full_name = if (parent_name_str) |pn|
-        try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, pn })
-    else
-        try self.allocator.dupe(u8, label_str);
+    const full_name = try ens_name.join(self.allocator, label_str, parent_name_str);
     defer self.allocator.free(full_name);
 
     // Create or update
@@ -397,7 +394,8 @@ fn replayNewOwner(self: *Indexer, q: *Query) !void {
 
         const name_copy = try self.allocator.dupe(u8, full_name);
         const label_copy = try self.allocator.dupe(u8, label_str);
-        const parent_copy = if (parent_name_str) |pn| try self.allocator.dupe(u8, pn) else null;
+        // Root parent is the empty string, never null. See ens_name.ROOT_PARENT.
+        const parent_copy = try self.allocator.dupe(u8, parent_name_str orelse ens_name.ROOT_PARENT);
 
         var name = models.Name{
             .protocol = .v1,
@@ -412,7 +410,10 @@ fn replayNewOwner(self: *Indexer, q: *Query) !void {
             .registrant = owner,
             .resolver = Address.zero,
             .token_id = 0,
-            .canonical_id = 0,
+            // Parity with the live handler (handleV1NewOwner): V1 rows have no
+            // version bits, so the namehash is the canonical_id — replaying 0
+            // here would make canonical_id lookups ambiguous after a --backfill.
+            .canonical_id = std.mem.readInt(u256, &subdomain_namehash.bytes, .big),
             .token_version = 0,
             .expiry = 0,
             .registry_locked = false,

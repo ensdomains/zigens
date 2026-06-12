@@ -437,3 +437,126 @@ test "getLiveParents: benign sequential repoint leaves exactly one live parent" 
     defer lib.storage.registry_entries.freeLiveParents(allocator, none);
     try testing.expectEqual(@as(usize, 0), none.len);
 }
+
+test "subregistry_pointer filter: getFilteredNames returns names referencing a registry (RegistryInfo.referencedBy)" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const PARENT = Address{ .bytes = [_]u8{0xE7} ** 20 }; // registry that minted these names
+    const TARGET = Address{ .bytes = [_]u8{0x46} ** 20 }; // the subregistry under test
+    const OTHER = Address{ .bytes = [_]u8{0xCC} ** 20 };
+
+    const t1: u256 = 0x1111111111111111111111111111111111111111111111111111111100000000;
+    const t2: u256 = 0x2222222222222222222222222222222222222222222222222222222200000000;
+    const t3: u256 = 0x3333333333333333333333333333333333333333333333333333333300000000;
+    const mask = ~@as(u256, 0xFFFFFFFF);
+
+    // refuse.eth and loker.eth point at TARGET; other.eth points elsewhere.
+    _ = try insertChildName(allocator, database, "refuse", "eth", PARENT, OWNER_1, t1);
+    _ = try insertChildName(allocator, database, "loker", "eth", PARENT, OWNER_1, t2);
+    _ = try insertChildName(allocator, database, "other", "eth", PARENT, OWNER_1, t3);
+    _ = try database.upsertRegistryEntrySubregistry(.v2, PARENT, t1 & mask, TARGET, 1000, 1700000000);
+    _ = try database.upsertRegistryEntrySubregistry(.v2, PARENT, t2 & mask, TARGET, 1000, 1700000000);
+    _ = try database.upsertRegistryEntrySubregistry(.v2, PARENT, t3 & mask, OTHER, 1000, 1700000000);
+
+    // Inverse lookup: exactly the two names that point at TARGET; one at OTHER.
+    try testing.expectEqual(@as(usize, 2), try database.getFilteredNameCount(.{ .subregistry_pointer = TARGET }));
+    try testing.expectEqual(@as(usize, 1), try database.getFilteredNameCount(.{ .subregistry_pointer = OTHER }));
+
+    const names = try database.getFilteredNames(.{ .subregistry_pointer = TARGET }, 0, 50, .desc, .created_at);
+    defer {
+        for (names) |*n| {
+            var m = n.*;
+            m.deinit(allocator);
+        }
+        allocator.free(names);
+    }
+    try testing.expectEqual(@as(usize, 2), names.len);
+    for (names) |n| {
+        const nm = n.name.?;
+        try testing.expect(std.mem.eql(u8, nm, "refuse.eth") or std.mem.eql(u8, nm, "loker.eth"));
+    }
+
+    // Composes with a `where` predicate: narrows the inverse set.
+    try testing.expectEqual(@as(usize, 1), try database.getFilteredNameCount(.{ .subregistry_pointer = TARGET, .name = "refuse.eth" }));
+}
+
+// ============================================================================
+// Tree-derived reachability: isRegistryReachable (the canonical upward walk)
+// and reconcileV2Reachability (the order-independent authority that backstops
+// the per-event cascade against the indexer's phase/chunk ordering).
+// ============================================================================
+
+test "isRegistryReachable: root, reachable subregistry, and orphaned (incl. deep chain)" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+    const roots = [_]Address{ETH_REGISTRY};
+
+    // A root is always reachable, even with no edges.
+    try testing.expect(try database.isRegistryReachable(allocator, .v2, ETH_REGISTRY, &roots));
+
+    // fresh.eth → SUB_A → SUB_A1 (a 2-level chain), both reachable from the root.
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_A, 1000, 1700000000);
+    _ = try database.upsertRegistryEntrySubregistry(.v2, SUB_A, 0x2200, SUB_A1, 1001, 1700000060);
+    try testing.expect(try database.isRegistryReachable(allocator, .v2, SUB_A, &roots));
+    try testing.expect(try database.isRegistryReachable(allocator, .v2, SUB_A1, &roots));
+
+    // A registry nothing points to is unreachable.
+    try testing.expect(!try database.isRegistryReachable(allocator, .v2, SUB_B, &roots));
+
+    // Repoint fresh.eth away from SUB_A: the WHOLE SUB_A subtree (SUB_A and the
+    // deeper SUB_A1) is now unreachable. A single-level "is it pointed-to by
+    // anyone" check would wrongly call SUB_A1 reachable — SUB_A still points to
+    // it — which is exactly the band-aid this upward walk avoids.
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_B, 1002, 1700000120);
+    try testing.expect(!try database.isRegistryReachable(allocator, .v2, SUB_A, &roots));
+    try testing.expect(!try database.isRegistryReachable(allocator, .v2, SUB_A1, &roots));
+}
+
+test "reconcileV2Reachability heals an orphan the repoint cascade never marked (phase-ordering gap)" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+    const roots = [_]Address{ETH_REGISTRY};
+    const OTHER_CANONICAL_ID: u256 = 0xC2C2C2C2C2C2C2C2C2C2C2C2C2C2C2C2C2C2C2C2C2C2C2C2C2C2C2C2_00000000;
+
+    // foo.fresh.eth registered under SUB_A while fresh.eth → SUB_A (reachable).
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_A, 1000, 1700000000);
+    const foo_nh = try insertChildName(allocator, database, "foo", "fresh.eth", SUB_A, OWNER_1, 0x1100);
+    // bar.other.eth under SUB_B, which stays reachable throughout.
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, OTHER_CANONICAL_ID, SUB_B, 1001, 1700000060);
+    const bar_nh = try insertChildName(allocator, database, "bar", "other.eth", SUB_B, OWNER_1, 0x2200);
+
+    // fresh.eth repoints away from SUB_A — but the per-event cascade does NOT run
+    // (the phase/chunk case: the repoint was processed before foo was inserted),
+    // so foo is left wrongly reachable.
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_B, 1002, 1700000120);
+    {
+        const before = try database.getNameByNamehash(foo_nh);
+        try testing.expect(before != null);
+        var n = before.?;
+        defer n.deinit(allocator);
+        try testing.expect(n.is_reachable); // still wrongly reachable
+    }
+
+    // The order-independent reconciliation recomputes from the final tree and
+    // marks exactly the one orphaned-subtree name unreachable.
+    const fixed = try database.reconcileV2Reachability(allocator, &roots, 1003, 1700000180);
+    try testing.expectEqual(@as(u64, 1), fixed);
+
+    {
+        const f = try database.getNameByNamehash(foo_nh);
+        var n = f.?;
+        defer n.deinit(allocator);
+        try testing.expect(!n.is_reachable); // foo (under orphaned SUB_A) now unreachable
+        try testing.expectEqual(@as(i64, 1700000180), n.unreachable_since.?);
+    }
+    {
+        const b = try database.getNameByNamehash(bar_nh);
+        var n = b.?;
+        defer n.deinit(allocator);
+        try testing.expect(n.is_reachable); // bar (under reachable SUB_B) untouched
+    }
+}

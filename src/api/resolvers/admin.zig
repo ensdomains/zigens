@@ -941,7 +941,7 @@ fn nestedSkip(field: *const parser.Field) u32 {
 /// Build a Registry JSON object handling each requested field. Nested fields
 /// run their own DB queries; scalar fields use `handleRegistryField` for
 /// formatting (so the scalar logic stays in one place).
-fn buildRegistryInfoJson(
+pub fn buildRegistryInfoJson(
     allocator: std.mem.Allocator,
     database: *db.Database,
     registry: *const models.Registry,
@@ -992,16 +992,33 @@ fn writeRegistryField(
         return true;
     }
     if (std.mem.eql(u8, sel.name, "labels")) {
-        try writeRegistryLabels(allocator, database, registry, sel, output_key, writer, ctx);
+        try writeRegistryNameList(allocator, database, sel, output_key, writer, ctx, .{ .registry = registry.address });
         return true;
     }
     if (std.mem.eql(u8, sel.name, "labelConnection")) {
-        try writeRegistryLabelConnection(allocator, database, registry, sel, output_key, writer, ctx);
+        try writeRegistryNameConnection(allocator, database, sel, output_key, writer, ctx, .{ .registry = registry.address });
         return true;
     }
     if (std.mem.eql(u8, sel.name, "labelCount")) {
         const count = try database.getFilteredNameCount(.{
             .registry = registry.address,
+        });
+        try writer.print("\"{s}\":{d}", .{ output_key, count });
+        return true;
+    }
+    // Inverse of `labels`: names whose CURRENT subregistry pointer is this registry —
+    // i.e. the names that use this contract as their subname registry ("Referenced by").
+    if (std.mem.eql(u8, sel.name, "referencedBy")) {
+        try writeRegistryNameList(allocator, database, sel, output_key, writer, ctx, .{ .subregistry_pointer = registry.address });
+        return true;
+    }
+    if (std.mem.eql(u8, sel.name, "referencedByConnection")) {
+        try writeRegistryNameConnection(allocator, database, sel, output_key, writer, ctx, .{ .subregistry_pointer = registry.address });
+        return true;
+    }
+    if (std.mem.eql(u8, sel.name, "referencedByCount")) {
+        const count = try database.getFilteredNameCount(.{
+            .subregistry_pointer = registry.address,
         });
         try writer.print("\"{s}\":{d}", .{ output_key, count });
         return true;
@@ -1136,19 +1153,20 @@ fn applyEventsWhere(sel: *const parser.Field, filter: *db.EventFilterOptions) vo
     }
 }
 
-/// `labels` = names whose `registry` column matches this contract address.
-/// Reuses `getFilteredNames` so caller-supplied `where` filters compose with
-/// the registry pin.
-fn writeRegistryLabels(
+/// Write a Domain list for a registry-scoped relation. `base_filters` pins the relation:
+/// `.registry` for `labels` (names minted in this registry), `.subregistry_pointer` for
+/// `referencedBy` (names that use this registry as their subname registry). Caller-supplied
+/// `where` filters compose on top via `getFilteredNames`.
+fn writeRegistryNameList(
     allocator: std.mem.Allocator,
     database: *db.Database,
-    registry: *const models.Registry,
     sel: *const parser.Field,
     output_key: []const u8,
     writer: std.ArrayList(u8).Writer,
     ctx: parser.ExecutionContext,
+    base_filters: db.NameFilters,
 ) !void {
-    var filters = db.NameFilters{ .registry = registry.address };
+    var filters = base_filters;
     try applyLabelsWhere(sel, &filters);
 
     const limit = nestedLimit(sel);
@@ -1343,19 +1361,19 @@ fn writeConnectionPageInfo(
     try writer.writeAll("}");
 }
 
-fn writeRegistryLabelConnection(
+fn writeRegistryNameConnection(
     allocator: std.mem.Allocator,
     database: *db.Database,
-    registry: *const models.Registry,
     sel: *const parser.Field,
     output_key: []const u8,
     writer: std.ArrayList(u8).Writer,
     ctx: parser.ExecutionContext,
+    base_filters: db.NameFilters,
 ) !void {
     const params = try parseConnectionParams(sel);
     const wants = detectConnectionWants(sel);
 
-    var filters = db.NameFilters{ .registry = registry.address };
+    var filters = base_filters;
     try applyLabelsWhere(sel, &filters);
 
     try writer.print("\"{s}\":{{", .{output_key});
