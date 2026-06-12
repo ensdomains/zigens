@@ -425,7 +425,10 @@ pub fn insertName(db: *Database, name: models.Name) !void {
     try q.bindOptionalText(name.name);
     try q.bindOptionalText(name.label);
     try q.bindHash(name.label_hash);
-    try q.bindOptionalText(name.parent_name);
+    // parent_name is NOT NULL: a root child is the empty string, never SQL NULL.
+    // Coerce here so the schema invariant holds for every caller (a null would
+    // otherwise abort the insert on the NOT NULL constraint). See ens_name.ROOT_PARENT.
+    try q.bindText(name.parent_name orelse "");
     try q.bindHash(name.parent_namehash);
     try q.bindTextStatic(name.protocol.toString());
     try q.bindAddress(name.registry);
@@ -795,17 +798,20 @@ pub fn materializePccDomainExpiry(db: *Database) !u32 {
     return q.changes();
 }
 
-/// Update label and name fields for a name record (used by label healing)
-pub fn updateNameLabel(database: *Database, namehash: Hash, label: []const u8, name: []const u8) !void {
+/// Update label and name fields for a name record (used by label healing).
+/// Scoped by protocol: names is UNIQUE(protocol, namehash), so a V1 heal must
+/// not overwrite a same-namehashed V2 row (e.g. a V1->V2 migrated name).
+pub fn updateNameLabel(database: *Database, protocol: models.Protocol, namehash: Hash, label: []const u8, name: []const u8) !void {
     var q = try Query.initCached(database,
         \\UPDATE names SET label = ?, name = ?
-        \\WHERE namehash = ?
+        \\WHERE namehash = ? AND protocol = ?
     );
     defer q.deinit();
 
     try q.bindText(label);
     try q.bindText(name);
     try q.bindHash(namehash);
+    try q.bindTextStatic(protocol.toString());
     try q.exec();
 }
 

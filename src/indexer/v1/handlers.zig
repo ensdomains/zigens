@@ -200,7 +200,10 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
         // Create new name record
         const name_copy = try self.allocator.dupe(u8, full_name);
         const label_copy = try self.allocator.dupe(u8, label_str);
-        const parent_copy = if (parent_name_str) |pn| try self.allocator.dupe(u8, pn) else null;
+        // Root parent is the empty string, never null (parent_name is NOT NULL,
+        // and the subdomain join `sub.parent_name = parent.name` must match the
+        // root row's empty name). See ens_name.ROOT_PARENT.
+        const parent_copy = try self.allocator.dupe(u8, parent_name_str orelse ens_name.ROOT_PARENT);
 
         // V1 names have no version bits — use the namehash as canonical_id so each
         // V1 row has a unique identifier. The previous code wrote canonical_id=0
@@ -1238,7 +1241,7 @@ fn writeControllerRegistration(
         const full_name = std.fmt.allocPrint(self.allocator, "{s}.eth", .{name}) catch null;
         if (full_name) |fn_str| {
             defer self.allocator.free(fn_str);
-            names_storage.updateNameLabel(self.database, namehash, name, fn_str) catch |err| {
+            names_storage.updateNameLabel(self.database, protocol, namehash, name, fn_str) catch |err| {
                 std.log.debug("updateNameLabel failed (placeholder will heal via backfillMissingEth2LDNames): {}", .{err});
             };
         }
@@ -1652,7 +1655,7 @@ fn healLabelsFromDNSName(self: *Indexer, name_bytes: []const u8, wrapped_node: H
                 (existing.name != null and std.mem.indexOf(u8, existing.name.?, "[") != null);
 
             if (needs_label_heal or needs_name_heal) {
-                try names_storage.updateNameLabel(self.database, wrapped_node, labels[0], name_str);
+                try names_storage.updateNameLabel(self.database, .v1, wrapped_node, labels[0], name_str);
                 std.log.info("Healed name from NameWrapped DNS: {s}", .{name_str});
             }
         }
@@ -1721,7 +1724,7 @@ fn healLabelsFromDNSName(self: *Indexer, name_bytes: []const u8, wrapped_node: H
                 (existing.label != null and existing.label.?[0] == '[');
 
             if (needs_heal) {
-                try names_storage.updateNameLabel(self.database, node_hash, label, level_name);
+                try names_storage.updateNameLabel(self.database, .v1, node_hash, label, level_name);
                 std.log.info("Healed parent name from NameWrapped DNS: {s} (label={s})", .{ level_name, label });
             }
         }

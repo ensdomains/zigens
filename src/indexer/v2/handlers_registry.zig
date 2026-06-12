@@ -10,7 +10,6 @@ const db = @import("../../storage/database.zig");
 const Query = db.Query;
 const Hash = @import("../../types/hash.zig").Hash;
 const Address = @import("../../types/address.zig").Address;
-const unicode = @import("../../utils/unicode.zig");
 const Indexer = @import("../indexer.zig").Indexer;
 const utils = @import("../utils.zig");
 const json_utils = @import("../../utils/json.zig");
@@ -241,7 +240,7 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
     const expiration: u256 = data_values[1].uint256;
     const registered_by = Address{ .bytes = data_values[2].address };
 
-    unicode.validateName(label_str) catch |err| {
+    ens_name.validateLabel(label_str) catch |err| {
         std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
         return;
     };
@@ -418,6 +417,9 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
 
     const event_name = try ens_name.join(self.allocator, label_str, parent_name);
 
+    // event_data and event_name transfer to emitEvent, which is their sole owner
+    // (insertEventAndNotify frees both on every path) — no errdefer here, matching
+    // every other emit site in this file; an errdefer would double-free on a DB error.
     try utils.emitEvent(self, protocol, log, .name_registered, event_name, namehash, event_data);
 }
 
@@ -572,7 +574,7 @@ pub fn handleETHNameRegistered(self: *Indexer, protocol: models.Protocol, log: r
     const base_price = data_values[7].uint256;
     const premium = data_values[8].uint256;
 
-    unicode.validateName(label_str) catch |err| {
+    ens_name.validateLabel(label_str) catch |err| {
         std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
         return;
     };
@@ -731,7 +733,7 @@ pub fn handleETHNameRenewed(self: *Indexer, protocol: models.Protocol, log: rpc.
     const referrer = Hash{ .bytes = data_values[4].fixed_bytes.data };
     const base_price = data_values[5].uint256;
 
-    unicode.validateName(label_str) catch |err| {
+    ens_name.validateLabel(label_str) catch |err| {
         std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
         return;
     };
@@ -1181,7 +1183,7 @@ pub fn handleLabelRegistered(self: *Indexer, protocol: models.Protocol, log: rpc
     const owner = Address{ .bytes = data_values[1].address };
     const expiry: u64 = @truncate(data_values[2].uint256);
 
-    unicode.validateName(label_str) catch |err| {
+    ens_name.validateLabel(label_str) catch |err| {
         std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
         return;
     };
@@ -1417,7 +1419,7 @@ pub fn handleLabelReserved(self: *Indexer, protocol: models.Protocol, log: rpc.L
     const label_str = data_values[0].string;
     const expiry: u64 = @truncate(data_values[1].uint256);
 
-    unicode.validateName(label_str) catch |err| {
+    ens_name.validateLabel(label_str) catch |err| {
         std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
         return;
     };
