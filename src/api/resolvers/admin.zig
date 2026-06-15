@@ -549,7 +549,7 @@ fn buildResolverJson(
     try json.appendSlice(allocator, "{");
 
     var first = true;
-    for (selections) |*sel| {
+    for (selections, 0..) |*sel, idx| {
         const output_key = sel.alias orelse sel.name;
 
         if (!first) try json.appendSlice(allocator, ",");
@@ -706,6 +706,24 @@ fn buildResolverJson(
                 try json.appendSlice(allocator, evt_json);
             }
             try json.appendSlice(allocator, "]");
+            first = false;
+        } else {
+            // Record-level fields (texts/addresses/coinTypes/contentHash/domain/
+            // addr/text/pubkey/abis/reverseName/interfaces/version), __typename, and
+            // any unknown field have no resolver-contract-level handler here. Delegate
+            // to the shared resolver builder so we emit valid JSON instead of a dangling
+            // comma. resolver(id) has no single node context, so use the zero namehash —
+            // per-node record fields then resolve to empty/null.
+            const single = selections[idx .. idx + 1];
+            const shared = try builders.buildResolverJson(resolver_addr, Hash.zero, .v2, single, .{
+                .database = database,
+                .depth = 1,
+                .allocator = allocator,
+                .loaders = loaders,
+            });
+            defer allocator.free(shared);
+            // shared is "{<field>}" — splice the inner field, dropping the braces.
+            if (shared.len > 2) try json.appendSlice(allocator, shared[1 .. shared.len - 1]);
             first = false;
         }
     }
@@ -1795,4 +1813,47 @@ pub fn resolveMeta(ctx: parser.ExecutionContext, field: *const parser.Field) !pa
     try w.writeAll("}");
 
     return parser.FieldResult{ .json = try allocator.dupe(u8, json.items) };
+}
+
+test "resolver(id) JSON stays well-formed for record + contract + __typename fields" {
+    const testing = std.testing;
+    // testing.allocator (strict): the resolver(id) builder + delegated record
+    // handlers + owned_string field getters must all be leak-free.
+    const allocator = testing.allocator;
+
+    var database = try db.Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const resolver_addr = try Address.fromHex("0x01926faf6a2b6d618b600266209d6e031850e101");
+
+    // Record-level fields (texts/addresses/coinTypes/contentHash/domain) and
+    // __typename previously matched no branch and left dangling/double commas,
+    // producing malformed JSON. Mix them with contract-level fields here.
+    const query =
+        \\query { resolver(id: "0x01926faf6a2b6d618b600266209d6e031850e101") {
+        \\  id address nodeCount nodes { name } texts addresses { coinType address }
+        \\  coinTypes contentHash domain { id } __typename
+        \\} }
+    ;
+    var p = try parser.Parser.init(allocator, query);
+    var document = try p.parseDocument();
+    defer document.deinit(allocator);
+    const resolver_field = document.operations[0].fields[0];
+
+    const json = try buildResolverJson(resolver_addr, resolver_field.selections, &database, allocator, null);
+    defer allocator.free(json);
+
+    // Definitive check: the result must parse as JSON (catches the dangling/
+    // double comma that the old serializer produced).
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    // Record-level fields and __typename must be present, not silently dropped.
+    try testing.expect(std.mem.indexOf(u8, json, "\"texts\":") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"coinTypes\":") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"contentHash\":") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"__typename\":\"Resolver\"") != null);
+    // No malformed comma artifacts.
+    try testing.expect(std.mem.indexOf(u8, json, ",,") == null);
+    try testing.expect(std.mem.indexOf(u8, json, ",}") == null);
 }
