@@ -879,6 +879,50 @@ pub fn getNameByNamehashAndProtocol(db: *Database, namehash: Hash, protocol: mod
     return null;
 }
 
+/// Upper bound on the registry-traversal walk in `findEffectiveResolver`. ENS
+/// names are only a handful of labels deep, so this both caps work and defends
+/// against a malformed parent chain / cycle.
+pub const MAX_RESOLVER_INHERITANCE_DEPTH: u8 = 32;
+
+/// ENSIP-23 `findResolver`-style registry traversal.
+/// https://docs.ens.domains/ensip/23#findresolver
+///
+/// Returns the first non-null resolver address found by walking from the node
+/// at `namehash` up its `parent_namehash` chain. A subname with no resolver of
+/// its own inherits the nearest ancestor's resolver (e.g. `alice.ledgit.eth`
+/// inherits `ledgit.eth`'s resolver). Returns the zero address if neither the
+/// node nor any ancestor has a resolver set.
+///
+/// Per ENSIP-23 the *resolver* comes from the ancestor while the *node* used for
+/// record lookups stays the original subname's namehash — callers pair this
+/// result with the original `namehash`, not the ancestor's.
+///
+/// Scoped to a single protocol: V1 and V2 share the namehash space, so crossing
+/// protocols could return a V1 resolver for a V2 name (or vice versa).
+pub fn findEffectiveResolver(db: *Database, namehash: Hash, protocol: models.Protocol) !Address {
+    const start_opt = try getNameByNamehashAndProtocol(db, namehash, protocol);
+    if (start_opt == null) return Address.zero;
+    var start = start_opt.?;
+    const start_resolver = start.resolver;
+    var current_parent = start.parent_namehash;
+    start.deinit(db.allocator);
+    if (!start_resolver.isZero()) return start_resolver;
+
+    var depth: u8 = 0;
+    while (!current_parent.isZero() and depth < MAX_RESOLVER_INHERITANCE_DEPTH) : (depth += 1) {
+        const ancestor_opt = try getNameByNamehashAndProtocol(db, current_parent, protocol);
+        if (ancestor_opt) |ancestor| {
+            var ancestor_mut = ancestor;
+            defer ancestor_mut.deinit(db.allocator);
+            if (!ancestor_mut.resolver.isZero()) return ancestor_mut.resolver;
+            current_parent = ancestor_mut.parent_namehash;
+        } else {
+            break;
+        }
+    }
+    return Address.zero;
+}
+
 /// Get namehash by resolver address
 pub fn getNamehashByResolver(db: *Database, resolver: Address) !?Hash {
     var q = try Query.initCached(db, "SELECT namehash FROM names WHERE resolver = ? LIMIT 1");

@@ -1255,11 +1255,22 @@ fn domainResolvedAddressHandler(ctx: *anyopaque, field: *const parser.Field, nes
 }
 
 /// Domain nested field handler: resolver
+///
+/// Resolves the *effective* resolver per ENSIP-23 `findResolver`
+/// (https://docs.ens.domains/ensip/23#findresolver): if the domain has no
+/// resolver explicitly set on its own node, it inherits the nearest ancestor's
+/// resolver via registry traversal (see `Database.findEffectiveResolver`). The
+/// returned Resolver object is built with the inherited resolver address but the
+/// *domain's own* namehash, so its node-scoped records (texts/addresses) are
+/// read under the correct node — the same key the inheriting subname's records
+/// were written under on-chain.
 fn domainResolverHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
     const domain: *const models.Name = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
-    if (!domain.resolver.isZero()) {
-        return try buildResolverJson(domain.resolver, domain.namehash, domain.protocol, field.selections, .{
+
+    const effective_resolver = try database.findEffectiveResolver(domain.namehash, domain.protocol);
+    if (!effective_resolver.isZero()) {
+        return try buildResolverJson(effective_resolver, domain.namehash, domain.protocol, field.selections, .{
             .database = database,
             .depth = nested_ctx.depth + 1,
             .allocator = nested_ctx.allocator,

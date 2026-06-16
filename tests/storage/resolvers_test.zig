@@ -1200,3 +1200,84 @@ test "upsertResolverEntity ignores the zero-address and empty inputs" {
 
     try testing.expectEqual(@as(usize, 0), entities.len);
 }
+
+// ============================================================================
+// findEffectiveResolver — ENSIP-23 findResolver registry traversal
+// https://docs.ens.domains/ensip/23#findresolver
+// ============================================================================
+// A subname with no resolver of its own inherits the nearest ancestor's
+// resolver. domain.resolver must reflect this effective resolver (paired with
+// the subname's own namehash for record lookups), otherwise records written
+// under an inheriting node are invisible to consumers querying
+// domains(where:{name}){ resolver { texts addresses } }.
+
+test "findEffectiveResolver returns the node's own resolver when set" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try helpers.createTestName(allocator, database, "ledgit.eth", helpers.TEST_OWNER_1);
+    try database.updateNameResolver(nh, helpers.TEST_RESOLVER);
+
+    const eff = try database.findEffectiveResolver(nh, .v2);
+    try testing.expect(eff.eql(helpers.TEST_RESOLVER));
+}
+
+test "findEffectiveResolver inherits the parent resolver for a subname with none" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // Parent has a resolver; the child inherits it (child resolver stays zero).
+    const parent_nh = try helpers.createTestName(allocator, database, "ledgit.eth", helpers.TEST_OWNER_1);
+    try database.updateNameResolver(parent_nh, helpers.TEST_RESOLVER);
+    const child_nh = try helpers.createTestName(allocator, database, "alice.ledgit.eth", helpers.TEST_OWNER_1);
+
+    const eff = try database.findEffectiveResolver(child_nh, .v2);
+    try testing.expect(eff.eql(helpers.TEST_RESOLVER));
+}
+
+test "findEffectiveResolver walks multiple levels to the nearest ancestor resolver" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // Only the grandparent has a resolver; both intermediate and leaf inherit it.
+    const gp_nh = try helpers.createTestName(allocator, database, "ledgit.eth", helpers.TEST_OWNER_1);
+    try database.updateNameResolver(gp_nh, helpers.TEST_RESOLVER);
+    _ = try helpers.createTestName(allocator, database, "sub.ledgit.eth", helpers.TEST_OWNER_1);
+    const leaf_nh = try helpers.createTestName(allocator, database, "alice.sub.ledgit.eth", helpers.TEST_OWNER_1);
+
+    const eff = try database.findEffectiveResolver(leaf_nh, .v2);
+    try testing.expect(eff.eql(helpers.TEST_RESOLVER));
+}
+
+test "findEffectiveResolver returns zero when no ancestor has a resolver" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    _ = try helpers.createTestName(allocator, database, "ledgit.eth", helpers.TEST_OWNER_1);
+    const child_nh = try helpers.createTestName(allocator, database, "alice.ledgit.eth", helpers.TEST_OWNER_1);
+
+    const eff = try database.findEffectiveResolver(child_nh, .v2);
+    try testing.expect(eff.isZero());
+}
+
+test "findEffectiveResolver is protocol-scoped (V1 resolver does not leak to V2)" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // Parent only exists under V2 with a resolver. A V2 child inherits it, but a
+    // lookup scoped to V1 must not (V1/V2 share the namehash space).
+    const parent_nh = try helpers.createTestName(allocator, database, "ledgit.eth", helpers.TEST_OWNER_1);
+    try database.updateNameResolver(parent_nh, helpers.TEST_RESOLVER);
+    const child_nh = try helpers.createTestName(allocator, database, "alice.ledgit.eth", helpers.TEST_OWNER_1);
+
+    const eff_v2 = try database.findEffectiveResolver(child_nh, .v2);
+    try testing.expect(eff_v2.eql(helpers.TEST_RESOLVER));
+
+    const eff_v1 = try database.findEffectiveResolver(child_nh, .v1);
+    try testing.expect(eff_v1.isZero());
+}

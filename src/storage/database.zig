@@ -591,6 +591,7 @@ pub const Database = struct {
     pub const getNameByNamehash = names.getNameByNamehash;
     pub const getNameStringByNamehash = names.getNameStringByNamehash;
     pub const getNameByNamehashAndProtocol = names.getNameByNamehashAndProtocol;
+    pub const findEffectiveResolver = names.findEffectiveResolver;
     pub const getNamehashByResolver = names.getNamehashByResolver;
     pub const updateNameExpiry = names.updateNameExpiry;
     pub const clearNameExpiry = names.clearNameExpiry;
