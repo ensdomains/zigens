@@ -26,6 +26,54 @@ pub fn recordAccountObservation(self: *Indexer, protocol: models.Protocol, addr:
     ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
 }
 
+/// Ensure a `resolvers` entity row exists for the (resolver, node) binding
+/// observed on a record event (TextChanged / AddressChanged / ContenthashChanged
+/// and their legacy variants).
+///
+/// Background: the `resolvers` entity table is normally only populated when a
+/// resolver is *explicitly* set on a node (ResolverUpdated). A subname that
+/// inherits its parent's resolver never produces such an event, so records
+/// written under the inheriting node's namehash had no resolver entity to
+/// surface them — they were silently invisible to the GraphQL `resolvers`
+/// query (queried by namehash) and to `domain.resolver`.
+///
+/// Calling this from every record handler makes the (resolver, node) binding
+/// queryable regardless of whether a resolver-set event was ever seen for the
+/// node. `upsertResolverEntity` uses INSERT OR IGNORE, so an existing row from
+/// a real ResolverUpdated event is never clobbered (its richer `name`/`set_at`
+/// is preserved).
+pub fn ensureResolverEntityForRecord(
+    self: *Indexer,
+    protocol: models.Protocol,
+    resolver: Address,
+    namehash: Hash,
+    log: rpc.Log,
+) void {
+    if (resolver.isZero() or namehash.isZero()) return;
+
+    var resolver_buf: [42]u8 = undefined;
+    const resolver_hex = resolver.toHexBuf(&resolver_buf);
+    var namehash_buf: [66]u8 = undefined;
+    const namehash_hex = namehash.toHexBuf(&namehash_buf);
+
+    // Best-effort name lookup. For inheriting subnames the name row may not be
+    // indexed yet; an empty name is fine — the binding is keyed by namehash.
+    const name_opt = self.getNameFromNamehash(namehash);
+    defer if (name_opt) |n| self.allocator.free(n);
+    const name = name_opt orelse "";
+
+    self.database.upsertResolverEntity(
+        protocol,
+        resolver_hex,
+        namehash_hex,
+        name,
+        log.block_number,
+        self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+    ) catch |err| {
+        std.log.debug("ensureResolverEntityForRecord upsert failed: {}", .{err});
+    };
+}
+
 /// Construct a models.Event from common log fields and emit it via insertEventAndNotify.
 /// Eliminates 6 identical field assignments repeated across handler files.
 pub fn emitEvent(

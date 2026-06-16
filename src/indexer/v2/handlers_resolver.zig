@@ -32,6 +32,8 @@ pub fn handleLegacyAddrChanged(self: *Indexer, protocol: models.Protocol, resolv
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "AddrChanged")) return;
 
+    utils.ensureResolverEntityForRecord(self, protocol, resolver, namehash, log);
+
     const addr_hex = try addr.toHex(self.allocator);
     defer self.allocator.free(addr_hex);
 
@@ -70,6 +72,8 @@ pub fn handleLegacyContentChanged(self: *Indexer, protocol: models.Protocol, res
     const content_hash = Hash{ .bytes = data_values[0].fixed_bytes.data };
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "ContentChanged")) return;
+
+    utils.ensureResolverEntityForRecord(self, protocol, resolver, namehash, log);
 
     const content_hex = try content_hash.toHex(self.allocator);
     defer self.allocator.free(content_hex);
@@ -137,6 +141,8 @@ pub fn handleAddressChanged(self: *Indexer, protocol: models.Protocol, resolver:
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "AddressChanged")) return;
 
+    utils.ensureResolverEntityForRecord(self, protocol, resolver, namehash, log);
+
     const nh_hex_log = try namehash.toHex(self.allocator);
     defer self.allocator.free(nh_hex_log);
     std.log.debug("AddressChanged: namehash={s} coinType={d} address={s}", .{
@@ -199,6 +205,8 @@ pub fn handleContentHashChanged(self: *Indexer, protocol: models.Protocol, resol
     }
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "ContenthashChanged")) return;
+
+    utils.ensureResolverEntityForRecord(self, protocol, resolver, namehash, log);
 
     const nh_hex_log = try namehash.toHex(self.allocator);
     defer self.allocator.free(nh_hex_log);
@@ -275,6 +283,8 @@ pub fn handleTextChanged(self: *Indexer, protocol: models.Protocol, resolver: Ad
     };
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "TextChanged")) return;
+
+    utils.ensureResolverEntityForRecord(self, protocol, resolver, namehash, log);
 
     // Subgraph parity: strip embedded NULs from key/value (SQLite TEXT + JSON
     // output safety), and treat an empty value as "clear" by deleting the
@@ -363,6 +373,8 @@ pub fn handleLegacyTextChanged(self: *Indexer, protocol: models.Protocol, resolv
     };
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "TextChanged (legacy)")) return;
+
+    utils.ensureResolverEntityForRecord(self, protocol, resolver, namehash, log);
 
     // Use the hashed indexed key as the storage key (prefixed to mark it as
     // hashed-only — we don't have the plaintext from this event variant).
@@ -517,6 +529,8 @@ pub fn handleDnsRecordChanged(self: *Indexer, protocol: models.Protocol, resolve
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "DNSRecordChanged")) return;
 
+    utils.ensureResolverEntityForRecord(self, protocol, resolver, namehash, log);
+
     const dns_name_hex = try bytesToHexAlloc(self.allocator, dns_name_bytes);
     defer self.allocator.free(dns_name_hex);
     const record_hex = try bytesToHexAlloc(self.allocator, record_bytes);
@@ -565,6 +579,8 @@ pub fn handleDnsRecordDeleted(self: *Indexer, protocol: models.Protocol, resolve
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "DNSRecordDeleted")) return;
 
+    utils.ensureResolverEntityForRecord(self, protocol, resolver, namehash, log);
+
     const dns_name_hex = try bytesToHexAlloc(self.allocator, dns_name_bytes);
     defer self.allocator.free(dns_name_hex);
 
@@ -599,6 +615,8 @@ pub fn handleDnsZonehashChanged(self: *Indexer, protocol: models.Protocol, resol
     const zonehash_bytes = data_values[1].bytes;
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "DNSZonehashChanged")) return;
+
+    utils.ensureResolverEntityForRecord(self, protocol, resolver, namehash, log);
 
     const last_hex = try bytesToHexAlloc(self.allocator, last_zonehash_bytes);
     defer self.allocator.free(last_hex);
@@ -646,6 +664,8 @@ pub fn handleABIChanged(self: *Indexer, protocol: models.Protocol, resolver: Add
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "ABIChanged")) return;
 
+    utils.ensureResolverEntityForRecord(self, protocol, resolver, namehash, log);
+
     const nh_hex_log = try namehash.toHex(self.allocator);
     defer self.allocator.free(nh_hex_log);
     std.log.debug("ABIChanged: namehash={s} contentType={d}", .{
@@ -692,6 +712,8 @@ pub fn handlePubkeyChanged(self: *Indexer, protocol: models.Protocol, resolver: 
     var namehash = log.topics[1];
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "PubkeyChanged")) return;
+
+    utils.ensureResolverEntityForRecord(self, protocol, resolver, namehash, log);
 
     // Non-indexed payload: (bytes32 x, bytes32 y)
     const data_values = try abi.decodeValues(log.data, &.{ .bytes32, .bytes32 }, self.allocator);
@@ -757,6 +779,8 @@ pub fn handleNameChanged(self: *Indexer, protocol: models.Protocol, resolver: Ad
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "NameChanged")) return;
 
+    utils.ensureResolverEntityForRecord(self, protocol, resolver, namehash, log);
+
     // Non-indexed payload: (string name)
     const data_values = try abi.decodeValues(log.data, &.{.string}, self.allocator);
     defer abi.freeValues(data_values, self.allocator);
@@ -820,6 +844,8 @@ pub fn handleInterfaceChanged(self: *Indexer, protocol: models.Protocol, resolve
     var namehash = log.topics[1];
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "InterfaceChanged")) return;
+
+    utils.ensureResolverEntityForRecord(self, protocol, resolver, namehash, log);
 
     // Interface ID is a bytes4, left-aligned (right-padded) in the 32-byte topic
     const interface_id_bytes = log.topics[2].bytes[0..4];

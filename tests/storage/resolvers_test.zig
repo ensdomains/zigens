@@ -1063,3 +1063,140 @@ test "getFilteredNameCount with resolver filter" {
 
     try testing.expectEqual(@as(usize, 2), count);
 }
+
+// ============================================================================
+// RESOLVER ENTITY (subgraph parity) — inheriting-subname record indexing
+// ============================================================================
+// Regression coverage for the bug where records written under a subname's node
+// that inherits its parent's resolver were not surfaced. The indexer only ever
+// created a `resolvers` entity on an explicit ResolverUpdated event, so a node
+// that inherited its parent resolver (no resolver-set event) had no entity to
+// attach its records to — making them invisible to `resolvers(where:{namehash})`.
+// The fix upserts the (resolver, node) binding directly from record events, so
+// these tests assert the binding is queryable by namehash on its own.
+
+test "upsertResolverEntity makes an inheriting subname's node queryable by namehash" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // alice.ledgit.eth inherits ledgit.eth's resolver: there is NO names.resolver
+    // binding for the alice node, only a record written under its namehash.
+    const alice_nh = try namehash_fn(allocator, "alice.ledgit.eth");
+    const resolver = helpers.TEST_RESOLVER;
+
+    var alice_nh_buf: [66]u8 = undefined;
+    const alice_nh_hex = alice_nh.toHexBuf(&alice_nh_buf);
+    var resolver_buf: [42]u8 = undefined;
+    const resolver_hex = resolver.toHexBuf(&resolver_buf);
+
+    // Simulate what a record handler (TextChanged etc.) now does on top of the
+    // record write: ensure the resolver entity exists for this node.
+    try database.upsertResolverEntity(.v2, resolver_hex, alice_nh_hex, "alice.ledgit.eth", 1000, 1700000000);
+    try resolvers.storeResolverText(
+        database,
+        alice_nh,
+        resolver,
+        "ledgit.hcs.topic",
+        "0.0.9219676",
+        .v2,
+        1000,
+        helpers.randomHash(),
+        1700000000,
+    );
+
+    // resolvers(where: { namehash: <aliceNode> }) must now return a row.
+    const entities = try database.getFilteredResolverEntities(
+        .{ .namehash = alice_nh_hex },
+        0,
+        100,
+        .asc,
+        .set_block,
+    );
+    defer {
+        for (entities) |*e| {
+            var m = e.*;
+            m.deinit(allocator);
+        }
+        allocator.free(entities);
+    }
+
+    try testing.expectEqual(@as(usize, 1), entities.len);
+    try testing.expectEqualStrings(alice_nh_hex, entities[0].namehash);
+    try testing.expectEqualStrings(resolver_hex, entities[0].address);
+
+    // And its node-scoped text record is retrievable.
+    const value = try resolvers.getTextRecord(database, resolver, alice_nh, "ledgit.hcs.topic");
+    try testing.expect(value != null);
+    defer allocator.free(value.?);
+    try testing.expectEqualStrings("0.0.9219676", value.?);
+}
+
+test "upsertResolverEntity is idempotent and preserves the original binding" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "idem.ledgit.eth");
+    const resolver = helpers.TEST_RESOLVER;
+
+    var nh_buf: [66]u8 = undefined;
+    const nh_hex = nh.toHexBuf(&nh_buf);
+    var resolver_buf: [42]u8 = undefined;
+    const resolver_hex = resolver.toHexBuf(&resolver_buf);
+
+    // First write wins (INSERT OR IGNORE): name "idem.ledgit.eth", block 1000.
+    try database.upsertResolverEntity(.v2, resolver_hex, nh_hex, "idem.ledgit.eth", 1000, 1700000000);
+    // A later record event for the same (resolver, node) must not clobber it,
+    // even if the best-effort name lookup was empty at that point.
+    try database.upsertResolverEntity(.v2, resolver_hex, nh_hex, "", 2000, 1700000999);
+
+    const entities = try database.getFilteredResolverEntities(
+        .{ .namehash = nh_hex },
+        0,
+        100,
+        .asc,
+        .set_block,
+    );
+    defer {
+        for (entities) |*e| {
+            var m = e.*;
+            m.deinit(allocator);
+        }
+        allocator.free(entities);
+    }
+
+    try testing.expectEqual(@as(usize, 1), entities.len);
+    try testing.expectEqualStrings("idem.ledgit.eth", entities[0].name);
+    try testing.expectEqual(@as(u64, 1000), entities[0].set_block);
+}
+
+test "upsertResolverEntity ignores the zero-address and empty inputs" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "zero.ledgit.eth");
+    var nh_buf: [66]u8 = undefined;
+    const nh_hex = nh.toHexBuf(&nh_buf);
+
+    // Empty resolver / empty namehash are no-ops (guarded in storage layer).
+    try database.upsertResolverEntity(.v2, "", nh_hex, "zero.ledgit.eth", 1000, 1700000000);
+
+    const entities = try database.getFilteredResolverEntities(
+        .{ .namehash = nh_hex },
+        0,
+        100,
+        .asc,
+        .set_block,
+    );
+    defer {
+        for (entities) |*e| {
+            var m = e.*;
+            m.deinit(allocator);
+        }
+        allocator.free(entities);
+    }
+
+    try testing.expectEqual(@as(usize, 0), entities.len);
+}

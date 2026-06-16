@@ -36,8 +36,18 @@ pub const Config = struct {
 
         const network = contracts.Network.fromString(env_mod.getEnv(&env_map, "NETWORK", "sepolia")) catch .sepolia;
 
-        const v1_contract_addrs = try contracts.getContractAddresses(network);
-        const v2_contract_addrs = try contracts.getContractAddresses(network);
+        var v1_contract_addrs = try contracts.getContractAddresses(network);
+        var v2_contract_addrs = try contracts.getContractAddresses(network);
+
+        // START_BLOCK, when set, overrides the hardcoded deployment blocks so the
+        // indexer (V1 and V2) begins scanning from the requested block. Without
+        // this, the V2 indexer always falls back to the compiled-in
+        // v2_deployment_block and ignores START_BLOCK on a fresh database.
+        if (env_mod.getEnv(&env_map, "START_BLOCK", "").len > 0) {
+            const start_override = env_mod.getEnvInt(&env_map, u64, "START_BLOCK", v1_contract_addrs.v1_deployment_block);
+            v1_contract_addrs.v1_deployment_block = start_override;
+            v2_contract_addrs.v2_deployment_block = start_override;
+        }
 
         return Config{
             .allocator = allocator,
