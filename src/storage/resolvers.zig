@@ -1440,6 +1440,9 @@ pub fn getResolverRoles(db: *Database, resolver: Address) ![]models.EACRoleAssig
             .log_index = @intCast(q.getInt(7)),
             .timestamp = q.getInt64(8),
             .name = name_val,
+            // This query is scoped to a single resolver contract, so every row
+            // is a resolver-EAC assignment — decode against the resolver table.
+            .contract_kind = .resolver,
         };
         try roles.append(db.allocator, role);
     }

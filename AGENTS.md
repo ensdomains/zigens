@@ -12,6 +12,13 @@ ENSv2 Indexer is a high-performance Ethereum Name Service indexer written in Zig
 
 ## Build Commands
 
+> **Newer host glibc note:** if `zig build` fails to *link* with
+> `fatal linker error: unhandled relocation type R_X86_64_PC64 ... crt1.o:.sframe`,
+> your system glibc/gcc CRT objects are too new for Zig's linker. Pin glibc to
+> the host version and re-point the system lib search path, e.g. for glibc 2.43:
+> `zig build <step> -Dtarget=native-native-gnu.2.43 --search-prefix /usr`
+> (`ldd --version` shows the version; `--search-prefix` lets it still find libsqlite3).
+
 ```bash
 # Build all binaries
 zig build

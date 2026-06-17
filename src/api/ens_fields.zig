@@ -14,6 +14,9 @@ const Hash = @import("../types/hash.zig").Hash;
 const generic_fields = @import("../lib/graphql/fields.zig");
 pub const escapeJsonString = generic_fields.escapeJsonString;
 
+// EAC roleBitmap → named permission decoding
+const eac_roles = @import("eac_roles.zig");
+
 // ============================================================================
 // ENS-SPECIFIC FIELD TYPES (extends generic with Address/Hash)
 // ============================================================================
@@ -437,6 +440,7 @@ pub const EACRoleFields = [_]FieldDef{
     FieldDef.string("resource", getEACRoleResource),
     FieldDef.customScalar("account", writeEACRoleAccount),
     FieldDef.string("roleBitmap", getEACRoleBitmap),
+    FieldDef.custom("permissions", writeEACRolePermissions),
     FieldDef.int("blockNumber", getEACRoleBlockNumber),
     FieldDef.hashField("transactionHash", getEACRoleTransactionHash),
     FieldDef.int("timestamp", getEACRoleTimestamp),
@@ -456,6 +460,25 @@ fn writeEACRoleAccount(ctx: *anyopaque, output_key: []const u8, writer: std.Arra
     const hex = try role.account.toHex(allocator);
     defer allocator.free(hex);
     try writer.print("\"{s}\":\"{s}\"", .{ output_key, hex });
+    return true;
+}
+
+/// Custom writer for the decoded `permissions` list — the human-readable names
+/// of the roles encoded in `roleBitmap`, decoded against the emitting contract's
+/// role table (resolver vs registry). Renders a JSON array of strings.
+pub fn writeEACRolePermissions(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+    const role = getEACRoleCtx(ctx);
+    const perms = try eac_roles.decodeHex(allocator, role.role_bitmap, role.contract_kind);
+    defer eac_roles.freePermissions(allocator, perms);
+
+    try writer.print("\"{s}\":[", .{output_key});
+    for (perms, 0..) |perm, i| {
+        if (i != 0) try writer.writeByte(',');
+        const escaped = try escapeJsonString(allocator, perm);
+        defer allocator.free(escaped);
+        try writer.print("\"{s}\"", .{escaped});
+    }
+    try writer.writeByte(']');
     return true;
 }
 
