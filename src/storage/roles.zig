@@ -40,9 +40,39 @@ pub fn upsertEACRole(db: *Database, protocol: models.Protocol, resource: []const
     try q.exec();
 }
 
-/// Parse EACRoleAssignment from query results
-/// Column order: id(0), protocol(1), resource(2), account(3), role_bitmap(4),
-///               block_number(5), transaction_hash(6), log_index(7), timestamp(8), name(9)
+/// Column list shared by all EAC role SELECTs. Column order is relied upon by
+/// `parseEACRoleRow`:
+///   id(0), protocol(1), resource(2), account(3), role_bitmap(4),
+///   block_number(5), transaction_hash(6), log_index(7), timestamp(8),
+///   name(9), is_resolver(10)
+///
+/// `is_resolver` is derived from whether the emitting `contract_address` is a
+/// `known_resolvers` row — the exact set the indexer routes resolver events from
+/// (see `event_fetchers.zig`: a log is dispatched to the resolver handlers, incl.
+/// `handleResolverEACRolesChanged`, only when its address is a known resolver).
+/// So every resolver-EAC row's contract is in `known_resolvers`, and every other
+/// EAC emitter is a registry. This classification lets the API decode `role_bitmap`
+/// against the correct named-role table. See `models.EACContractKind`.
+///
+/// NOTE: classification must NOT key on the `resolvers` (name-binding) JOIN — those
+/// rows carry `resource = namehash`, but resolver-EAC events store `resource =`
+/// canonical_id (0 for the contract-global admin roles that make up live data), so
+/// that JOIN never matches a real resolver row. The `resolvers`/`resolver_name`
+/// JOINs below remain only for resolver-path name resolution (a no-op on current
+/// data; future-proofing for label-scoped resolver EAC).
+const EAC_SELECT_COLUMNS =
+    \\SELECT r.id, r.protocol, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp,
+    \\       COALESCE(reg_name.name, resolver_name.name) AS name,
+    \\       CASE WHEN kr.address IS NOT NULL THEN 1 ELSE 0 END AS is_resolver
+    \\FROM eac_roles r
+    \\LEFT JOIN names reg_name ON r.resource = reg_name.canonical_id AND r.contract_address = reg_name.registry
+    \\LEFT JOIN resolvers res ON r.contract_address = res.address AND r.resource = res.namehash AND res.protocol = r.protocol
+    \\LEFT JOIN names resolver_name ON res.namehash = resolver_name.namehash AND resolver_name.protocol = r.protocol
+    \\LEFT JOIN known_resolvers kr ON kr.address = r.contract_address AND kr.protocol = r.protocol
+;
+
+/// Parse EACRoleAssignment from query results.
+/// Column order: see `EAC_SELECT_COLUMNS`.
 fn parseEACRoleRow(q: *Query, allocator: std.mem.Allocator) !models.EACRoleAssignment {
     const protocol_col = q.getTextSlice(1) orelse return error.MissingProtocol;
     const resource_col = q.getTextSlice(2) orelse return error.MissingResource;
@@ -57,6 +87,10 @@ fn parseEACRoleRow(q: *Query, allocator: std.mem.Allocator) !models.EACRoleAssig
         null;
     errdefer if (name) |n| allocator.free(n);
 
+    // is_resolver (column 10): a row whose emitting contract is a known resolver
+    // is decoded against the resolver role table; otherwise it's a registry.
+    const contract_kind: models.EACContractKind = if (q.getInt(10) != 0) .resolver else .registry;
+
     return models.EACRoleAssignment{
         .id = @intCast(q.getInt64(0)),
         .protocol = try models.Protocol.fromString(protocol_col),
@@ -68,6 +102,7 @@ fn parseEACRoleRow(q: *Query, allocator: std.mem.Allocator) !models.EACRoleAssig
         .log_index = @intCast(q.getInt(7)),
         .timestamp = q.getInt64(8),
         .name = name,
+        .contract_kind = contract_kind,
     };
 }
 
@@ -79,13 +114,8 @@ fn parseEACRoleRow(q: *Query, allocator: std.mem.Allocator) !models.EACRoleAssig
 ///      where `resource = namehash`, the resolvers JOIN resolves to a name. No handler
 ///      currently stores roles in this shape; the JOIN is a no-op on current data.
 pub fn getRolesByResource(db: *Database, protocol: models.Protocol, resource: []const u8) ![]models.EACRoleAssignment {
-    const sql =
-        \\SELECT r.id, r.protocol, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp,
-        \\       COALESCE(reg_name.name, resolver_name.name) AS name
-        \\FROM eac_roles r
-        \\LEFT JOIN names reg_name ON r.resource = reg_name.canonical_id AND r.contract_address = reg_name.registry
-        \\LEFT JOIN resolvers res ON r.contract_address = res.address AND r.resource = res.namehash AND res.protocol = r.protocol
-        \\LEFT JOIN names resolver_name ON res.namehash = resolver_name.namehash AND resolver_name.protocol = r.protocol
+    const sql = EAC_SELECT_COLUMNS ++
+        \\
         \\WHERE r.protocol = ? AND r.resource = ?
         \\ORDER BY r.timestamp DESC
     ;
@@ -115,13 +145,8 @@ pub fn getRolesByResource(db: *Database, protocol: models.Protocol, resource: []
 /// Get all role assignments for an account.
 /// Resolves name via registry or resolver paths (see getRolesByResource).
 pub fn getRolesByAccount(db: *Database, protocol: models.Protocol, account: Address) ![]models.EACRoleAssignment {
-    const sql =
-        \\SELECT r.id, r.protocol, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp,
-        \\       COALESCE(reg_name.name, resolver_name.name) AS name
-        \\FROM eac_roles r
-        \\LEFT JOIN names reg_name ON r.resource = reg_name.canonical_id AND r.contract_address = reg_name.registry
-        \\LEFT JOIN resolvers res ON r.contract_address = res.address AND r.resource = res.namehash AND res.protocol = r.protocol
-        \\LEFT JOIN names resolver_name ON res.namehash = resolver_name.namehash AND resolver_name.protocol = r.protocol
+    const sql = EAC_SELECT_COLUMNS ++
+        \\
         \\WHERE r.protocol = ? AND r.account = ?
         \\ORDER BY r.timestamp DESC
     ;
@@ -163,16 +188,11 @@ pub const RolePaginationOptions = struct {
 /// Get roles with pagination support
 pub fn getRolesWithPagination(db: *Database, protocol: models.Protocol, options: RolePaginationOptions) ![]models.EACRoleAssignment {
     // Build SQL dynamically based on filters
-    var sql_buf: [1024]u8 = undefined;
+    var sql_buf: [2048]u8 = undefined;
     var sql_len: usize = 0;
 
-    const base =
-        \\SELECT r.id, r.protocol, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp,
-        \\       COALESCE(reg_name.name, resolver_name.name) AS name
-        \\FROM eac_roles r
-        \\LEFT JOIN names reg_name ON r.resource = reg_name.canonical_id AND r.contract_address = reg_name.registry
-        \\LEFT JOIN resolvers res ON r.contract_address = res.address AND r.resource = res.namehash AND res.protocol = r.protocol
-        \\LEFT JOIN names resolver_name ON res.namehash = resolver_name.namehash AND resolver_name.protocol = r.protocol
+    const base = EAC_SELECT_COLUMNS ++
+        \\
         \\WHERE r.protocol = ?
     ;
     @memcpy(sql_buf[sql_len .. sql_len + base.len], base);

@@ -419,6 +419,16 @@ pub const EACRole = enum(u8) {
     }
 };
 
+/// Classifies the contract that emitted an `EACRolesChanged` event. Determines
+/// which named-role table the opaque `role_bitmap` is decoded against, since the
+/// same nybble means different permissions on a registry vs a resolver.
+pub const EACContractKind = enum {
+    registry,
+    resolver,
+    /// Emitting contract could not be classified from indexed data.
+    unknown,
+};
+
 /// EAC role assignment record
 pub const EACRoleAssignment = struct {
     /// Record ID
@@ -441,6 +451,9 @@ pub const EACRoleAssignment = struct {
     timestamp: i64,
     /// Domain name (resolved from resource/canonical_id, null for global roles)
     name: ?[]const u8 = null,
+    /// Kind of contract that emitted the role event. Used to decode `role_bitmap`
+    /// into named permissions. Defaults to `.registry` (the primary EAC path).
+    contract_kind: EACContractKind = .registry,
 
     pub fn deinit(self: *EACRoleAssignment, allocator: std.mem.Allocator) void {
         allocator.free(self.resource);

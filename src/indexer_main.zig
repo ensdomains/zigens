@@ -161,4 +161,7 @@ pub fn main() !void {
 
 test {
     std.testing.refAllDecls(@This());
+    // refAllDecls is shallow — explicitly pull in the EAC roleBitmap decoder's
+    // inline tests so `zig build test` exercises the role-table/decode logic.
+    _ = @import("api/eac_roles.zig");
 }

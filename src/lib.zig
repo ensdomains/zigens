@@ -14,6 +14,10 @@ pub const storage = struct {
     pub const sync = @import("storage/sync.zig");
 };
 
+pub const api = struct {
+    pub const eac_roles = @import("api/eac_roles.zig");
+};
+
 pub const types = struct {
     pub const models = @import("types/models.zig");
     pub const address = @import("types/address.zig");

@@ -16,6 +16,7 @@ const pagination = common.pagination;
 const builders = @import("../builders/builders.zig");
 const json_utils = common.json_utils;
 const domain_resolvers = @import("domain.zig");
+const eac_roles = @import("../eac_roles.zig");
 
 /// Parse protocol argument from field (defaults to v2).
 /// Surfaces invalid protocol values as `error.InvalidProtocol` rather than silently
@@ -798,6 +799,18 @@ fn handleEACRoleField(ctx: *anyopaque, output_key: []const u8, field_name: []con
         const escaped = try json_utils.escapeString(allocator, role.role_bitmap);
         defer allocator.free(escaped);
         try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
+        return true;
+    } else if (std.mem.eql(u8, field_name, "permissions")) {
+        const perms = try eac_roles.decodeHex(allocator, role.role_bitmap, role.contract_kind);
+        defer eac_roles.freePermissions(allocator, perms);
+        try writer.print("\"{s}\":[", .{output_key});
+        for (perms, 0..) |perm, i| {
+            if (i != 0) try writer.writeByte(',');
+            const escaped = try json_utils.escapeString(allocator, perm);
+            defer allocator.free(escaped);
+            try writer.print("\"{s}\"", .{escaped});
+        }
+        try writer.writeByte(']');
         return true;
     } else if (std.mem.eql(u8, field_name, "blockNumber")) {
         try writer.print("\"{s}\":{d}", .{ output_key, role.block_number });
