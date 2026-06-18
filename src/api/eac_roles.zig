@@ -44,6 +44,10 @@ const RoleSlot = struct {
     name: []const u8,
     /// Regular-role nybble index, 0-31.
     nybble: u6,
+    /// Roles the contract defines ONLY in their admin form (no regular role at
+    /// this nybble), e.g. registry `ROLE_CAN_TRANSFER_ADMIN`. The bare name is
+    /// never emitted for these — only `<name>_ADMIN` when the admin nybble is set.
+    admin_only: bool = false,
 };
 
 /// Resolver role slots — from `PermissionedResolverLib.sol`.
@@ -59,14 +63,12 @@ const RESOLVER_ROLES = [_]RoleSlot{
     .{ .name = "SET_ALIAS", .nybble = 7 }, // 1 << 28
     .{ .name = "CLEAR", .nybble = 8 }, // 1 << 32
     .{ .name = "SET_DATA", .nybble = 9 }, // 1 << 36
-    .{ .name = "CAN_NAME", .nybble = 30 }, // 1 << 120
     .{ .name = "UPGRADE", .nybble = 31 }, // 1 << 124
 };
 
 /// Registry role slots — from `RegistryRolesLib.sol`.
-/// Note slot 7 (`CAN_TRANSFER`) and slot 8 (`WAS_RESERVED`) are special in the
-/// contract (admin-only / token-only), but each still occupies its nybble, so
-/// for naming purposes we list them as regular slots.
+/// `CAN_TRANSFER` is defined only as `ROLE_CAN_TRANSFER_ADMIN = (1 << 28) << 128`
+/// (admin nybble 7) — there is no regular nybble-7 role — so it is admin-only.
 const REGISTRY_ROLES = [_]RoleSlot{
     .{ .name = "REGISTRAR", .nybble = 0 }, // 1 << 0
     .{ .name = "REGISTER_RESERVED", .nybble = 1 }, // 1 << 4
@@ -75,10 +77,7 @@ const REGISTRY_ROLES = [_]RoleSlot{
     .{ .name = "RENEW", .nybble = 4 }, // 1 << 16
     .{ .name = "SET_SUBREGISTRY", .nybble = 5 }, // 1 << 20
     .{ .name = "SET_RESOLVER", .nybble = 6 }, // 1 << 24
-    .{ .name = "CAN_TRANSFER", .nybble = 7 }, // 1 << 28 (admin-only in contract)
-    .{ .name = "WAS_RESERVED", .nybble = 8 }, // 1 << 32 (token-only in contract)
-    .{ .name = "SET_URI", .nybble = 9 }, // 1 << 36
-    .{ .name = "CAN_NAME", .nybble = 30 }, // 1 << 120
+    .{ .name = "CAN_TRANSFER", .nybble = 7, .admin_only = true }, // only (1 << 28) << 128
     .{ .name = "UPGRADE", .nybble = 31 }, // 1 << 124
 };
 
@@ -161,7 +160,7 @@ pub fn decode(allocator: std.mem.Allocator, bitmap: u256, kind: ContractKind) ![
     }
 
     for (slotsFor(kind)) |slot| {
-        if (hasRegularNybble(bitmap, slot.nybble)) {
+        if (!slot.admin_only and hasRegularNybble(bitmap, slot.nybble)) {
             const name = try allocator.dupe(u8, slot.name);
             errdefer allocator.free(name);
             try list.append(allocator, name);
@@ -227,16 +226,51 @@ test "decode resolver ALL_ROLES (live Sepolia 0x11..11) yields all resolver perm
     const perms = try decode(allocator, ALL_ROLES, .resolver);
     defer freePermissions(allocator, perms);
 
-    // 12 named resolver slots → 12 regular + 12 admin = 24 names.
-    try testing.expectEqual(@as(usize, 24), perms.len);
+    // 11 named resolver slots → 11 regular + 11 admin = 22 names.
+    try testing.expectEqual(@as(usize, 22), perms.len);
     try expectPerms(&.{
-        "SET_ADDR",       "SET_TEXT",        "SET_CONTENTHASH", "SET_PUBKEY",
-        "SET_ABI",        "SET_INTERFACE",   "SET_NAME",        "SET_ALIAS",
-        "CLEAR",          "SET_DATA",        "CAN_NAME",        "UPGRADE",
-        "SET_ADDR_ADMIN", "SET_NAME_ADMIN",  "UPGRADE_ADMIN",   "SET_DATA_ADMIN",
-        "CLEAR_ADMIN",    "SET_ALIAS_ADMIN", "CAN_NAME_ADMIN",  "SET_ABI_ADMIN",
-        "SET_TEXT_ADMIN", "SET_CONTENTHASH_ADMIN", "SET_PUBKEY_ADMIN", "SET_INTERFACE_ADMIN",
+        "SET_ADDR",         "SET_TEXT",            "SET_CONTENTHASH", "SET_PUBKEY",
+        "SET_ABI",          "SET_INTERFACE",       "SET_NAME",        "SET_ALIAS",
+        "CLEAR",            "SET_DATA",            "UPGRADE",         "SET_ADDR_ADMIN",
+        "SET_NAME_ADMIN",   "UPGRADE_ADMIN",       "SET_DATA_ADMIN",  "CLEAR_ADMIN",
+        "SET_ALIAS_ADMIN",  "SET_ABI_ADMIN",       "SET_TEXT_ADMIN",  "SET_CONTENTHASH_ADMIN",
+        "SET_PUBKEY_ADMIN", "SET_INTERFACE_ADMIN",
     }, perms);
+}
+
+test "decode registry ALL_ROLES (live 0x11..11) — CAN_TRANSFER is admin-only" {
+    const allocator = testing.allocator;
+    const perms = try decode(allocator, ALL_ROLES, .registry);
+    defer freePermissions(allocator, perms);
+
+    // 8 regular-emitting slots (REGISTRAR..SET_RESOLVER, UPGRADE) → 8 regular
+    // names; 9 admin nybbles (those 8 + CAN_TRANSFER) → 9 admin names = 17.
+    try testing.expectEqual(@as(usize, 17), perms.len);
+    // CAN_TRANSFER exists only as an admin role — the bare name must NOT appear.
+    for (perms) |p| try testing.expect(!std.mem.eql(u8, p, "CAN_TRANSFER"));
+    try expectPerms(&.{
+        "REGISTRAR",       "REGISTER_RESERVED",       "SET_PARENT",         "UNREGISTER",
+        "RENEW",           "SET_SUBREGISTRY",         "SET_RESOLVER",       "UPGRADE",
+        "REGISTRAR_ADMIN", "REGISTER_RESERVED_ADMIN", "SET_PARENT_ADMIN",   "UNREGISTER_ADMIN",
+        "RENEW_ADMIN",     "SET_SUBREGISTRY_ADMIN",   "SET_RESOLVER_ADMIN", "CAN_TRANSFER_ADMIN",
+        "UPGRADE_ADMIN",
+    }, perms);
+}
+
+test "decode registry CAN_TRANSFER: regular nybble 7 emits nothing, admin nybble emits _ADMIN only" {
+    const allocator = testing.allocator;
+    // Regular nybble 7 set, admin nybble 7 clear → no CAN_TRANSFER (admin-only).
+    {
+        const perms = try decode(allocator, @as(u256, 1) << (7 * 4), .registry);
+        defer freePermissions(allocator, perms);
+        try testing.expectEqual(@as(usize, 0), perms.len);
+    }
+    // Admin nybble 7 set → CAN_TRANSFER_ADMIN only.
+    {
+        const perms = try decode(allocator, @as(u256, 1) << (7 * 4 + 128), .registry);
+        defer freePermissions(allocator, perms);
+        try expectPerms(&.{"CAN_TRANSFER_ADMIN"}, perms);
+    }
 }
 
 test "decode resolver single regular role SET_ADDR" {
@@ -328,5 +362,5 @@ test "decodeHex round-trips the stored fixed-width ALL_ROLES form" {
     const allocator = testing.allocator;
     const perms = try decodeHex(allocator, "0x1111111111111111111111111111111111111111111111111111111111111111", .resolver);
     defer freePermissions(allocator, perms);
-    try testing.expectEqual(@as(usize, 24), perms.len);
+    try testing.expectEqual(@as(usize, 22), perms.len);
 }

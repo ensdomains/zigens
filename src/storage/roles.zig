@@ -46,17 +46,29 @@ pub fn upsertEACRole(db: *Database, protocol: models.Protocol, resource: []const
 ///   block_number(5), transaction_hash(6), log_index(7), timestamp(8),
 ///   name(9), is_resolver(10)
 ///
-/// `is_resolver` is derived from whether the emitting `contract_address` matches
-/// a row in `resolvers`; it lets the API decode `role_bitmap` against the
-/// correct (resolver vs registry) named-role table. See `models.EACContractKind`.
+/// `is_resolver` is derived from whether the emitting `contract_address` is a
+/// `known_resolvers` row — the exact set the indexer routes resolver events from
+/// (see `event_fetchers.zig`: a log is dispatched to the resolver handlers, incl.
+/// `handleResolverEACRolesChanged`, only when its address is a known resolver).
+/// So every resolver-EAC row's contract is in `known_resolvers`, and every other
+/// EAC emitter is a registry. This classification lets the API decode `role_bitmap`
+/// against the correct named-role table. See `models.EACContractKind`.
+///
+/// NOTE: classification must NOT key on the `resolvers` (name-binding) JOIN — those
+/// rows carry `resource = namehash`, but resolver-EAC events store `resource =`
+/// canonical_id (0 for the contract-global admin roles that make up live data), so
+/// that JOIN never matches a real resolver row. The `resolvers`/`resolver_name`
+/// JOINs below remain only for resolver-path name resolution (a no-op on current
+/// data; future-proofing for label-scoped resolver EAC).
 const EAC_SELECT_COLUMNS =
     \\SELECT r.id, r.protocol, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp,
     \\       COALESCE(reg_name.name, resolver_name.name) AS name,
-    \\       CASE WHEN res.address IS NOT NULL THEN 1 ELSE 0 END AS is_resolver
+    \\       CASE WHEN kr.address IS NOT NULL THEN 1 ELSE 0 END AS is_resolver
     \\FROM eac_roles r
     \\LEFT JOIN names reg_name ON r.resource = reg_name.canonical_id AND r.contract_address = reg_name.registry
     \\LEFT JOIN resolvers res ON r.contract_address = res.address AND r.resource = res.namehash AND res.protocol = r.protocol
     \\LEFT JOIN names resolver_name ON res.namehash = resolver_name.namehash AND resolver_name.protocol = r.protocol
+    \\LEFT JOIN known_resolvers kr ON kr.address = r.contract_address AND kr.protocol = r.protocol
 ;
 
 /// Parse EACRoleAssignment from query results.
