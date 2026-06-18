@@ -577,7 +577,7 @@ fn accountDomainsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx
     }
     try arr.end();
 
-    return try nested_ctx.allocator.dupe(u8, json.items);
+    return try json.toOwnedSlice(nested_ctx.allocator);
 }
 
 /// Account nested field handler: registrations
@@ -610,7 +610,7 @@ fn accountRegistrationsHandler(ctx: *anyopaque, field: *const parser.Field, nest
     }
     try arr.end();
 
-    return try nested_ctx.allocator.dupe(u8, json.items);
+    return try json.toOwnedSlice(nested_ctx.allocator);
 }
 
 /// Account nested field handler: primaryName
@@ -681,7 +681,7 @@ fn accountWrappedDomainsHandler(ctx: *anyopaque, field: *const parser.Field, nes
     }
     try arr.end();
 
-    return try nested_ctx.allocator.dupe(u8, json.items);
+    return try json.toOwnedSlice(nested_ctx.allocator);
 }
 
 /// Account entity configuration
@@ -867,7 +867,7 @@ fn resolverAddressesHandler(ctx: *anyopaque, field: *const parser.Field, nested_
     }
     try arr.end();
 
-    return try nested_ctx.allocator.dupe(u8, json.items);
+    return try json.toOwnedSlice(nested_ctx.allocator);
 }
 
 /// Resolver nested field handler: coinTypes — parallel projection of the
@@ -891,7 +891,7 @@ fn resolverCoinTypesHandler(ctx: *anyopaque, field: *const parser.Field, nested_
         try arr.itemStr(ct_str, nested_ctx.allocator);
     }
     try arr.end();
-    return try nested_ctx.allocator.dupe(u8, json.items);
+    return try json.toOwnedSlice(nested_ctx.allocator);
 }
 
 /// Resolver nested field handler: domain — canonical Domain back-reference.
@@ -957,7 +957,7 @@ fn resolverTextsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx:
     for (text_keys) |key| try arr.itemStr(key, nested_ctx.allocator);
     try arr.end();
 
-    return try nested_ctx.allocator.dupe(u8, json.items);
+    return try json.toOwnedSlice(nested_ctx.allocator);
 }
 
 /// Resolver nested field handler: text
@@ -1231,12 +1231,19 @@ fn domainResolvedAddressHandler(ctx: *anyopaque, field: *const parser.Field, nes
         }
     }
 
-    // If the domain has no resolver set, there can be no resolved address.
-    if (domain.resolver.isZero()) {
+    // If the domain has no resolver of its own, fall back to the nearest
+    // ancestor's resolver (ENSIP-10 inheritance) before giving up. The addr
+    // record is still read under THIS name's own namehash, so an inherited
+    // resolver only surfaces an address actually set for this node.
+    var effective_resolver = domain.resolver;
+    if (effective_resolver.isZero()) {
+        effective_resolver = (try findInheritedResolver(database, nested_ctx.allocator, domain)) orelse domain.resolver;
+    }
+    if (effective_resolver.isZero()) {
         return try nested_ctx.allocator.dupe(u8, "null");
     }
 
-    const resolved_addr_opt = try database.getAddressRecord(domain.resolver, domain.namehash, 60);
+    const resolved_addr_opt = try database.getAddressRecord(effective_resolver, domain.namehash, 60);
     defer if (resolved_addr_opt) |a| nested_ctx.allocator.free(a);
 
     if (resolved_addr_opt) |addr_str| {
@@ -1254,12 +1261,43 @@ fn domainResolvedAddressHandler(ctx: *anyopaque, field: *const parser.Field, nes
     return try nested_ctx.allocator.dupe(u8, "null");
 }
 
+/// Max ancestors to walk when resolving an inherited resolver (ENSIP-10).
+/// Bounds the parent_namehash chain traversal; real ENS names are far shallower.
+const MAX_RESOLVER_WALKUP: u8 = 64;
+
+/// ENSIP-10 resolver inheritance: when a name has no resolver of its own, its
+/// effective resolver is the nearest ancestor that does (UniversalResolver
+/// `findResolver`). Walk the parent_namehash chain within the same protocol and
+/// return the first ancestor's non-zero resolver, or null if none exists.
+/// Records are always read under the ORIGINAL name's namehash, so an inherited
+/// resolver only ever surfaces records actually emitted for that node.
+fn findInheritedResolver(database: *db.Database, allocator: std.mem.Allocator, domain: *const models.Name) anyerror!?Address {
+    var parent = domain.parent_namehash;
+    var hops: u8 = 0;
+    while (!parent.isZero() and hops < MAX_RESOLVER_WALKUP) : (hops += 1) {
+        const anc_opt = try database.getNameByNamehashAndProtocol(parent, domain.protocol);
+        if (anc_opt) |anc| {
+            var anc_mut = anc;
+            defer anc_mut.deinit(allocator);
+            if (!anc_mut.resolver.isZero()) return anc_mut.resolver;
+            parent = anc_mut.parent_namehash;
+        } else return null;
+    }
+    return null;
+}
+
 /// Domain nested field handler: resolver
 fn domainResolverHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
     const domain: *const models.Name = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
-    if (!domain.resolver.isZero()) {
-        return try buildResolverJson(domain.resolver, domain.namehash, domain.protocol, field.selections, .{
+    var effective_resolver = domain.resolver;
+    if (effective_resolver.isZero()) {
+        // ENSIP-10 resolver inheritance: a subname resolved via an inherited
+        // (ancestor) resolver should surface that resolver and its records.
+        effective_resolver = (try findInheritedResolver(database, nested_ctx.allocator, domain)) orelse domain.resolver;
+    }
+    if (!effective_resolver.isZero()) {
+        return try buildResolverJson(effective_resolver, domain.namehash, domain.protocol, field.selections, .{
             .database = database,
             .depth = nested_ctx.depth + 1,
             .allocator = nested_ctx.allocator,
@@ -1344,7 +1382,7 @@ fn domainSubdomainsHandler(ctx: *anyopaque, field: *const parser.Field, nested_c
     }
 
     try arr.end();
-    return try nested_ctx.allocator.dupe(u8, json.items);
+    return try json.toOwnedSlice(nested_ctx.allocator);
 }
 
 /// Domain nested field handler: events
@@ -1414,7 +1452,7 @@ fn domainEventsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: 
     }
     try arr.end();
 
-    return try nested_ctx.allocator.dupe(u8, json.items);
+    return try json.toOwnedSlice(nested_ctx.allocator);
 }
 
 /// Domain nested field handler: domain (recursive)
@@ -1725,7 +1763,7 @@ fn domainSubdomainConnectionHandler(ctx: *anyopaque, field: *const parser.Field,
         try root.end();
     }
 
-    return try allocator.dupe(u8, json.items);
+    return try json.toOwnedSlice(allocator);
 }
 
 /// Domain nested field handler: eventsConnection (Relay-style connection)
@@ -1814,7 +1852,7 @@ fn domainEventsConnectionHandler(ctx: *anyopaque, field: *const parser.Field, ne
     }
     try root.end();
 
-    return try allocator.dupe(u8, json.items);
+    return try json.toOwnedSlice(allocator);
 }
 
 /// Domain entity configuration
@@ -1870,4 +1908,149 @@ pub fn buildDomainJson(
             .loaders = ctx.loaders,
         },
     );
+}
+
+// ============================================================================
+// ENSIP-10 RESOLVER INHERITANCE TESTS
+// ============================================================================
+// Regression for subnames (e.g. alice.ledgit.eth) whose records were set on an
+// inherited (ancestor) resolver: the subname has no resolver of its own, so its
+// effective resolver is the nearest ancestor that does, and records read under
+// the subname's own namehash must surface.
+
+fn testBaseName(nh_eth: Hash, owner: Address) models.Name {
+    return models.Name{
+        .name = null,
+        .namehash = nh_eth,
+        .label = null,
+        .label_hash = nh_eth,
+        .parent_name = null,
+        .parent_namehash = Hash.zero,
+        .protocol = .v2,
+        .registry = Address.zero,
+        .owner = owner,
+        .registrant = owner,
+        .resolver = Address.zero,
+        .token_id = 0,
+        .canonical_id = 0,
+        .token_version = 0,
+        .expiry = 0,
+        .registry_locked = false,
+        .migrated = true,
+        .created_block = 1,
+        .created_at = 0,
+        .registered_at = 0,
+        .updated_block = 1,
+        .updated_at = 0,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    };
+}
+
+test "ENSIP-10 inheritance surfaces records from an ancestor resolver" {
+    const testing = std.testing;
+    // testing.allocator (not an arena): proves the whole render path frees every
+    // allocation — the field getters' owned_string values and the builders'
+    // toOwnedSlice buffers — so it is leak-clean under a strict allocator.
+    const allocator = testing.allocator;
+
+    var database = try db.Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const owner = try Address.fromHex("0xd7e02fb8a60e78071d69ded9eb1b89e372ee2292");
+    const parent_resolver = try Address.fromHex("0x01926faf6a2b6d618b600266209d6e031850e101");
+    const nh_eth = try Hash.fromHex("0x93cdeb708b7545dc668eb9280176169d1c33cfd8ed6f04690a0bcc88a93fc4ae");
+    const nh_parent = try Hash.fromHex("0x579781c7d436dd3d81505ef14f49ca511b7142148095dcbf483ffb3596e2dd6c");
+    const nh_child = try Hash.fromHex("0x43457411479f02943ca736d20bd419169c004f1389681a09754b20470c86eda9");
+
+    var parent = testBaseName(nh_eth, owner);
+    parent.name = "ledgit.eth";
+    parent.namehash = nh_parent;
+    parent.label = "ledgit";
+    parent.parent_name = "eth";
+    parent.parent_namehash = nh_eth;
+    parent.resolver = parent_resolver;
+    try database.insertName(parent);
+
+    var child = testBaseName(nh_eth, owner);
+    child.name = "alice.ledgit.eth";
+    child.namehash = nh_child;
+    child.label = "alice";
+    child.parent_name = "ledgit.eth";
+    child.parent_namehash = nh_parent;
+    child.resolver = Address.zero;
+    try database.insertName(child);
+
+    try database.storeResolverText(nh_child, parent_resolver, "ledgit.hcs.topic", "0.0.9219676", .v2, 2, nh_child, 0);
+
+    // Unit: the walk-up resolves the child's effective resolver to the parent's.
+    const inherited = (try findInheritedResolver(&database, allocator, &child)) orelse return error.NoInheritedResolver;
+    try testing.expect(inherited.eql(parent_resolver));
+
+    // End-to-end: domain.resolver + texts must surface via the inherited resolver.
+    const query =
+        \\query { domain(id: "alice.ledgit.eth") { tokenId canonicalId resolver { id address texts } } }
+    ;
+    var p = try parser.Parser.init(allocator, query);
+    var document = try p.parseDocument();
+    defer document.deinit(allocator);
+    const domain_field = document.operations[0].fields[0];
+
+    const json = try buildDomainJson(&child, domain_field.selections, .{
+        .database = &database,
+        .depth = 0,
+        .allocator = allocator,
+        .loaders = null,
+    });
+    defer allocator.free(json);
+
+    try testing.expect(std.mem.indexOf(u8, json, "ledgit.hcs.topic") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "01926faf6a2b6d618b600266209d6e031850e101") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"resolver\":null") == null);
+}
+
+test "ENSIP-10 inheritance yields null when no ancestor has a resolver" {
+    const testing = std.testing;
+    // testing.allocator (not an arena): proves the whole render path frees every
+    // allocation — the field getters' owned_string values and the builders'
+    // toOwnedSlice buffers — so it is leak-clean under a strict allocator.
+    const allocator = testing.allocator;
+
+    var database = try db.Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const nh_eth = try Hash.fromHex("0x93cdeb708b7545dc668eb9280176169d1c33cfd8ed6f04690a0bcc88a93fc4ae");
+    const nh_orphan = try Hash.fromHex("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+    var orphan = testBaseName(nh_eth, Address.zero);
+    orphan.name = "orphan.eth";
+    orphan.namehash = nh_orphan;
+    orphan.label = "orphan";
+    orphan.parent_name = "eth";
+    orphan.parent_namehash = nh_eth;
+    try database.insertName(orphan);
+
+    // No ancestor row carries a resolver -> walk-up yields null (no false positives).
+    try testing.expect((try findInheritedResolver(&database, allocator, &orphan)) == null);
+
+    const query =
+        \\query { domain(id: "orphan.eth") { resolver { address } } }
+    ;
+    var p = try parser.Parser.init(allocator, query);
+    var document = try p.parseDocument();
+    defer document.deinit(allocator);
+    const domain_field = document.operations[0].fields[0];
+
+    const json = try buildDomainJson(&orphan, domain_field.selections, .{
+        .database = &database,
+        .depth = 0,
+        .allocator = allocator,
+        .loaders = null,
+    });
+    defer allocator.free(json);
+
+    try testing.expect(std.mem.indexOf(u8, json, "\"resolver\":null") != null);
 }
