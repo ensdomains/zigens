@@ -14,7 +14,9 @@ const webhook_manager = @import("../webhooks/manager.zig");
 /// Provides REST endpoints and GraphQL for querying indexed data
 pub const Server = struct {
     allocator: std.mem.Allocator,
-    database: *db.Database,
+    /// Pool of read-only connections. Every request borrows its own connection
+    /// so request threads never share a `sqlite3*` handle (see pool.zig).
+    pool: *db.DatabasePool,
     webhook_database: ?*db.Database, // Optional - only initialized if webhooks enabled
     port: u16,
     server: ?std.net.Server,
@@ -23,7 +25,7 @@ pub const Server = struct {
     webhook_admin_username: ?[]const u8, // Optional - if set with password, requires Basic Auth
     webhook_admin_password: ?[]const u8, // Optional - if set, requires Basic Auth for webhook endpoints
 
-    pub fn init(allocator: std.mem.Allocator, database: *db.Database, webhook_db_path: ?[]const u8, port: u16, complexity_max_depth: u32, complexity_max_cost: u32, metrics_enabled: bool, rate_limit_per_second: u32, webhook_admin_username: ?[]const u8, webhook_admin_password: ?[]const u8) !Server {
+    pub fn init(allocator: std.mem.Allocator, pool: *db.DatabasePool, webhook_db_path: ?[]const u8, port: u16, complexity_max_depth: u32, complexity_max_cost: u32, metrics_enabled: bool, rate_limit_per_second: u32, webhook_admin_username: ?[]const u8, webhook_admin_password: ?[]const u8) !Server {
         // Only open webhook database if path is provided (webhooks enabled)
         var webhook_db: ?*db.Database = null;
         if (webhook_db_path) |path| {
@@ -39,11 +41,11 @@ pub const Server = struct {
 
         return .{
             .allocator = allocator,
-            .database = database,
+            .pool = pool,
             .webhook_database = webhook_db,
             .port = port,
             .server = null,
-            .graphql_handler = try graphql.GraphQLHandler.init(allocator, database, complexity_max_depth, complexity_max_cost, metrics_enabled),
+            .graphql_handler = try graphql.GraphQLHandler.init(allocator, pool, complexity_max_depth, complexity_max_cost, metrics_enabled),
             .rate_limiter = PerIpRateLimiter.init(allocator, rate_limit * 2, rate_limit, 100_000),
             .webhook_admin_username = webhook_admin_username,
             .webhook_admin_password = webhook_admin_password,
@@ -290,8 +292,15 @@ pub const Server = struct {
         // Compute namehash
         const nh = try @import("../types/hash.zig").namehash(self.allocator, name);
 
+        // Borrow a connection for this request (released at end of scope).
+        const lease = self.pool.acquire() catch |err| {
+            if (err == error.PoolExhausted) return try self.sendServiceUnavailable(stream);
+            return err;
+        };
+        defer self.pool.release(lease);
+
         // Query database
-        const name_record = try self.database.getNameByNamehash(nh);
+        const name_record = try lease.database.getNameByNamehash(nh);
 
         if (name_record) |record| {
             var record_copy = record;
@@ -358,8 +367,15 @@ pub const Server = struct {
             return try self.sendBadRequest(stream, "Invalid address format");
         };
 
+        // Borrow a connection for this request (released at end of scope).
+        const lease = self.pool.acquire() catch |err| {
+            if (err == error.PoolExhausted) return try self.sendServiceUnavailable(stream);
+            return err;
+        };
+        defer self.pool.release(lease);
+
         // Query database for all names owned by this address
-        const names = try self.database.getNamesByOwner(owner, 100); // Limit to 100 names
+        const names = try lease.database.getNamesByOwner(owner, 100); // Limit to 100 names
         defer {
             for (names) |*name| {
                 name.deinit(self.allocator);
@@ -389,8 +405,15 @@ pub const Server = struct {
     }
 
     fn handleEventsQuery(self: *Server, stream: std.net.Stream) !void {
+        // Borrow a connection for this request (released at end of scope).
+        const lease = self.pool.acquire() catch |err| {
+            if (err == error.PoolExhausted) return try self.sendServiceUnavailable(stream);
+            return err;
+        };
+        defer self.pool.release(lease);
+
         // Query recent events from database (last 50)
-        const events = try self.database.getRecentEvents(null, null, 50);
+        const events = try lease.database.getRecentEvents(null, null, 50);
         defer {
             for (events) |*event| {
                 event.deinit(self.allocator);
@@ -448,14 +471,25 @@ pub const Server = struct {
         _ = try stream.write(response.items);
     }
 
+    /// Return the request body (everything after the header/body delimiter).
+    /// Handles both `\r\n\r\n` (4 bytes) and bare `\n\n` (2 bytes) delimiters;
+    /// using a fixed `+ 4` offset for the `\n\n` case would slice off the first
+    /// two bytes of the body and corrupt JSON parsing.
+    fn extractBody(request: []const u8) ?[]const u8 {
+        if (std.mem.indexOf(u8, request, "\r\n\r\n")) |pos| {
+            return request[pos + 4 ..];
+        }
+        if (std.mem.indexOf(u8, request, "\n\n")) |pos| {
+            return request[pos + 2 ..];
+        }
+        return null;
+    }
+
     fn handleGraphQLQuery(self: *Server, stream: std.net.Stream, request: []const u8) !void {
         // Extract GraphQL query from POST body
-        // Find the body after double newline
-        const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse std.mem.indexOf(u8, request, "\n\n") orelse {
+        const body = extractBody(request) orelse {
             return try self.sendBadRequest(stream, "Invalid request format");
         };
-
-        const body = request[body_start + 4 ..];
 
         // Parse JSON body to extract query and variables
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {
@@ -501,7 +535,12 @@ pub const Server = struct {
         }
 
         // Handle the query with variables and operation name
-        const result = try self.graphql_handler.handleQuery(query, variables_value, operation_name);
+        const result = self.graphql_handler.handleQuery(query, variables_value, operation_name) catch |err| {
+            if (err == error.PoolExhausted) {
+                return try self.sendServiceUnavailable(stream);
+            }
+            return err;
+        };
         defer self.allocator.free(result);
 
         try self.sendJsonResponse(stream, 200, result);
@@ -570,6 +609,17 @@ pub const Server = struct {
             \\{"error":"Too many requests. Please try again later."}
         ;
         try self.sendJsonResponse(stream, 429, response);
+    }
+
+    /// 503 for when the DB connection pool is exhausted (all connections,
+    /// including overflow up to the hard cap, are checked out). Returning a
+    /// proper HTTP response instead of dropping the TCP connection lets clients
+    /// distinguish overload from a crash and back off / retry.
+    fn sendServiceUnavailable(self: *Server, stream: std.net.Stream) !void {
+        const response =
+            \\{"error":"Server busy: database connection pool exhausted. Please retry shortly."}
+        ;
+        try self.sendJsonResponse(stream, 503, response);
     }
 
     fn sendCorsPreflightResponse(_: *Server, stream: std.net.Stream) !void {
@@ -787,10 +837,9 @@ pub const Server = struct {
         }
 
         // Extract JSON body
-        const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse std.mem.indexOf(u8, request, "\n\n") orelse {
+        const body = extractBody(request) orelse {
             return try self.sendBadRequest(stream, "Invalid request format");
         };
-        const body = request[body_start + 4 ..];
 
         // Parse JSON body
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {
@@ -872,10 +921,9 @@ pub const Server = struct {
         }
 
         // Extract JSON body
-        const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse std.mem.indexOf(u8, request, "\n\n") orelse {
+        const body = extractBody(request) orelse {
             return try self.sendBadRequest(stream, "Invalid request format");
         };
-        const body = request[body_start + 4 ..];
 
         // Parse JSON body
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {
@@ -1839,10 +1887,10 @@ test "Server init" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var database = try db.Database.init(allocator, ":memory:");
-    defer database.deinit();
+    var pool = try db.DatabasePool.init(allocator, ":memory:", 1, 2, 4);
+    defer pool.deinit();
 
-    var server = try Server.init(allocator, &database, null, 8080, 10, 1000, false, 100, null, null);
+    var server = try Server.init(allocator, &pool, null, 8080, 10, 1000, false, 100, null, null);
     defer server.deinit();
 
     try std.testing.expect(server.port == 8080);

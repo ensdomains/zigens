@@ -1,6 +1,7 @@
 const std = @import("std");
 const env_mod = @import("env.zig");
 const contracts = @import("contracts.zig");
+const constants = @import("constants.zig");
 
 pub const Config = struct {
     allocator: std.mem.Allocator,
@@ -25,6 +26,8 @@ pub const Config = struct {
     checkpoint_interval: u64,
     graphql_max_depth: u32,
     graphql_max_cost: u32,
+    /// Number of long-lived read-only SQLite connections the API keeps pooled.
+    db_pool_size: u32,
     metrics_enabled: bool,
     rainbow_path: []const u8,
     v1_contracts: contracts.ContractAddresses,
@@ -92,6 +95,7 @@ pub const Config = struct {
             .checkpoint_interval = env_mod.getEnvInt(&env_map, u64, "CHECKPOINT_INTERVAL", 100),
             .graphql_max_depth = env_mod.getEnvInt(&env_map, u32, "GRAPHQL_MAX_DEPTH", 10),
             .graphql_max_cost = env_mod.getEnvInt(&env_map, u32, "GRAPHQL_MAX_COST", 10000),
+            .db_pool_size = env_mod.getEnvInt(&env_map, u32, "API_DB_POOL_SIZE", constants.SQLite.db_pool_size),
             .metrics_enabled = env_mod.getEnvBool(&env_map, "METRICS_ENABLED", false),
             .rainbow_path = try allocator.dupe(u8, env_mod.getEnv(&env_map, "RAINBOW_PATH", "./data/ens_rainbow.db")),
         };

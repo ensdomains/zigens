@@ -2,6 +2,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const api = @import("api/server.zig");
 const db = @import("storage/database.zig");
+const constants = @import("constants.zig");
 const ens_normalize = @import("ens_normalize");
 
 pub fn main() !void {
@@ -48,19 +49,33 @@ pub fn main() !void {
     std.log.info("GraphQL Max Depth: {d}", .{cfg.graphql_max_depth});
     std.log.info("GraphQL Max Cost: {d}", .{cfg.graphql_max_cost});
 
-    // Initialize database (read-only for API - skip schema loading)
-    var database = try db.Database.initWithoutSchema(allocator, cfg.database_path);
-    defer database.deinit();
-    database.setChainId(cfg.network.chainId());
+    // Bootstrap connection: used only for the startup integrity check. The
+    // request path uses the connection pool below, not this handle.
+    var bootstrap_db = try db.Database.initWithoutSchema(allocator, cfg.database_path);
+    bootstrap_db.setChainId(cfg.network.chainId());
 
     // Check database integrity
-    const integrity_ok = try database.checkIntegrity();
+    const integrity_ok = try bootstrap_db.checkIntegrity();
+    bootstrap_db.deinit();
     if (!integrity_ok) {
         std.log.err("Database integrity check failed!", .{});
         return error.DatabaseCorrupted;
     }
 
-    std.log.info("Database connected", .{});
+    // Connection pool: each request thread borrows its own read-only connection,
+    // so no two threads ever share a sqlite3 handle (which previously caused
+    // transient EXECUTION_ERROR under concurrent load). WAL mode lets these
+    // connections read in parallel.
+    var pool = try db.DatabasePool.init(
+        allocator,
+        cfg.database_path,
+        cfg.network.chainId(),
+        cfg.db_pool_size,
+        constants.SQLite.db_pool_max,
+    );
+    defer pool.deinit();
+
+    std.log.info("Database connected (pool size: {d})", .{cfg.db_pool_size});
 
     // Eagerly initialize ENS normalizer to avoid cold-start latency on first query
     std.log.info("Initializing ENS name normalizer...", .{});
@@ -70,7 +85,7 @@ pub fn main() !void {
     // Start API server with complexity limits and metrics from config
     // Only pass webhook_db_path if webhooks are enabled
     const webhook_path: ?[]const u8 = if (cfg.webhooks_enabled) cfg.webhook_db_path else null;
-    var server = try api.Server.init(allocator, &database, webhook_path, cfg.api_port, cfg.graphql_max_depth, cfg.graphql_max_cost, cfg.metrics_enabled, cfg.rate_limit_per_second, cfg.webhook_admin_username, cfg.webhook_admin_password);
+    var server = try api.Server.init(allocator, &pool, webhook_path, cfg.api_port, cfg.graphql_max_depth, cfg.graphql_max_cost, cfg.metrics_enabled, cfg.rate_limit_per_second, cfg.webhook_admin_username, cfg.webhook_admin_password);
     defer server.deinit();
 
     if (cfg.webhook_admin_username != null and cfg.webhook_admin_password != null) {

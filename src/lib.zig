@@ -5,6 +5,9 @@ pub const storage = struct {
     pub const Database = database.Database;
     pub const Query = database.Query;
 
+    pub const pool = @import("storage/pool.zig");
+    pub const DatabasePool = pool.DatabasePool;
+
     pub const names = @import("storage/names.zig");
     pub const events = @import("storage/events.zig");
     pub const resolvers = @import("storage/resolvers.zig");

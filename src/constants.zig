@@ -69,6 +69,20 @@ pub const SQLite = struct {
 
     /// Journal size limit in bytes (512MB)
     pub const journal_size_limit: i64 = 512 * 1024 * 1024;
+
+    /// Default number of read-only connections in the API's connection pool.
+    /// Each pooled connection is its own `sqlite3*` + prepared-statement cache,
+    /// so a request thread can run queries without sharing a connection with
+    /// any other thread (sharing a single connection across the thread-per-
+    /// connection server is unsafe — `SQLITE_CONFIG_SERIALIZED` only guards
+    /// individual C calls, not a prepare→step→finalize sequence). WAL mode lets
+    /// these connections read concurrently. Overridable via API_DB_POOL_SIZE.
+    pub const db_pool_size: u32 = 16;
+
+    /// Hard cap on the pool size, including overflow connections opened when the
+    /// pool is exhausted. Bounds memory (each connection has its own page cache)
+    /// and file-descriptor usage under load.
+    pub const db_pool_max: u32 = 64;
 };
 
 // ============================================================================

@@ -45,6 +45,10 @@ pub const ResolverEntitySortField = resolvers.ResolverEntitySortField;
 pub const query = @import("query.zig");
 pub const Query = query.Query;
 
+// Read-only connection pool for the API (see pool.zig). Re-exported here so
+// callers can refer to it as `db.DatabasePool` alongside `db.Database`.
+pub const DatabasePool = @import("pool.zig").DatabasePool;
+
 // SQLITE_TRANSIENT - For Zig 0.15.1, we can't use the C constant due to alignment issues
 // Instead, we use null which tells SQLite to make a copy of the string
 // This is functionally equivalent to SQLITE_TRANSIENT for our use case
@@ -289,12 +293,21 @@ pub const Database = struct {
             .db = db,
             .stmt_cache = std.StringHashMap(*c.sqlite3_stmt).init(allocator),
         };
+        // If any PRAGMA below fails, close the sqlite3 handle and free the
+        // stmt_cache — otherwise both leak (sqlite3_open succeeded above, so the
+        // caller's errdefer that only frees the struct is not enough).
+        errdefer database.deinit();
+
+        // Set busy_timeout FIRST: the next PRAGMA (journal_mode=WAL) takes a
+        // brief write lock, and if the indexer is writing concurrently it can
+        // return SQLITE_BUSY. Without busy_timeout set, that fails immediately
+        // instead of retrying for the configured window.
+        try database.exec(std.fmt.comptimePrint("PRAGMA busy_timeout = {d};", .{constants.SQLite.busy_timeout_ms}));
 
         // Enable WAL mode for better concurrency
         try database.exec("PRAGMA journal_mode=WAL;");
 
         // Performance and reliability PRAGMAs (values from constants.zig)
-        try database.exec(std.fmt.comptimePrint("PRAGMA busy_timeout = {d};", .{constants.SQLite.busy_timeout_ms}));
         try database.exec("PRAGMA synchronous = NORMAL;");
         try database.exec(std.fmt.comptimePrint("PRAGMA cache_size = {d};", .{constants.SQLite.cache_size_kb}));
         try database.exec("PRAGMA foreign_keys = ON;");

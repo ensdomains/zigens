@@ -16,18 +16,22 @@ const schema_validator_mod = @import("schema_validator.zig");
 
 pub const GraphQLHandler = struct {
     allocator: std.mem.Allocator,
-    database: *db.Database,
+    /// Connection pool. Each request borrows its own connection so resolver
+    /// threads never share a `sqlite3*` handle (see storage/pool.zig).
+    pool: *db.DatabasePool,
     executor: parser.Executor,
     schema_validator: schema_validator_mod.SchemaValidator,
     complexity_max_depth: u32,
     complexity_max_cost: u32,
     metrics: metrics_mod.Metrics,
 
-    pub fn init(allocator: std.mem.Allocator, database: *db.Database, max_depth: u32, max_cost: u32, metrics_enabled: bool) !GraphQLHandler {
-        // Create execution context (loaders are set per-request, not globally)
+    pub fn init(allocator: std.mem.Allocator, pool: *db.DatabasePool, max_depth: u32, max_cost: u32, metrics_enabled: bool) !GraphQLHandler {
+        // Create execution context. `database` is a placeholder here: the real
+        // per-request connection is injected into a per-request executor copy in
+        // handleQuery (see below). loaders are also set per-request.
         const ctx = parser.ExecutionContext{
             .allocator = allocator,
-            .database = @ptrCast(database),
+            .database = undefined,
             .loaders = null, // Will be set per request for request-scoped caching
         };
 
@@ -80,7 +84,7 @@ pub const GraphQLHandler = struct {
 
         return .{
             .allocator = allocator,
-            .database = database,
+            .pool = pool,
             .executor = executor,
             .schema_validator = schema_validator,
             .complexity_max_depth = max_depth,
@@ -130,18 +134,29 @@ pub const GraphQLHandler = struct {
         defer arena.deinit();
         const request_alloc = arena.allocator();
 
+        // Borrow a dedicated DB connection for this request. Every query the
+        // resolvers run goes through this connection, which is owned by this
+        // thread alone until release — this is what makes concurrent requests
+        // safe (a shared connection would interleave prepare/step calls across
+        // threads and return SQLITE_BUSY/MISUSE). Released when the request ends.
+        const lease = try self.pool.acquire();
+        defer self.pool.release(lease);
+        const database = lease.database;
+
         // Create request-scoped DataLoader context for batching and caching
         const dataloader_mod = @import("loaders.zig");
-        var loader_context = try dataloader_mod.LoaderContext.init(request_alloc, self.database);
+        var loader_context = try dataloader_mod.LoaderContext.init(request_alloc, database);
         defer loader_context.deinit();
 
         // Create a per-request executor copy to avoid race conditions when
         // multiple threads handle requests concurrently. The shared executor's
         // resolvers map is read-only and safe to share; per-request state
-        // (fragments, variables, loaders) lives on this stack copy.
+        // (database connection, fragments, variables, loaders) lives on this
+        // stack copy.
         var request_executor = self.executor;
         request_executor.allocator = request_alloc;
         request_executor.context.allocator = request_alloc;
+        request_executor.context.database = @ptrCast(database);
         request_executor.context.loaders = @ptrCast(loader_context);
 
         // Parse the query using the arena allocator
