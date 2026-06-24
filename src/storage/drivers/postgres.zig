@@ -36,6 +36,40 @@ const OID = struct {
 
 // ── Connection ──────────────────────────────────────────────────────────────
 
+/// How to negotiate TLS with the server, derived from the URL `sslmode` (libpq
+/// names). `.require` encrypts without certificate verification; `.verify_full`
+/// verifies the server cert against the system CA bundle (ca-certificates).
+/// TLS only actually happens when the build links OpenSSL (`zig build -Dpg-tls=true`),
+/// which managed Postgres (e.g. Neon) requires; a plain build leaves it plaintext.
+pub const TlsMode = enum { off, require, verify_full };
+
+/// Map a URL `sslmode` value to a TlsMode. Absent/`disable`/`allow`/`prefer` → off
+/// (suits a local non-TLS Postgres); `require` → encrypt only; `verify-ca`/
+/// `verify-full` → verify against system CAs. An unrecognized-but-present value
+/// fails safe to `.require` (encrypt rather than silently fall back to plaintext).
+pub fn tlsModeFromSslmode(sslmode: ?[]const u8) TlsMode {
+    const m = sslmode orelse return .off;
+    if (std.ascii.eqlIgnoreCase(m, "disable") or std.ascii.eqlIgnoreCase(m, "allow") or std.ascii.eqlIgnoreCase(m, "prefer")) return .off;
+    if (std.ascii.eqlIgnoreCase(m, "require")) return .require;
+    if (std.ascii.eqlIgnoreCase(m, "verify-ca") or std.ascii.eqlIgnoreCase(m, "verify-full")) return .verify_full;
+    return .require;
+}
+
+/// Find a `name=value` parameter in a `&`-separated URL query (value may be empty;
+/// a bare `name` flag returns ""). Returns null if `query` is null or absent.
+fn queryParam(query: ?[]const u8, name: []const u8) ?[]const u8 {
+    const q = query orelse return null;
+    var it = std.mem.splitScalar(u8, q, '&');
+    while (it.next()) |pair| {
+        if (std.mem.indexOfScalar(u8, pair, '=')) |eq| {
+            if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
+        } else if (std.mem.eql(u8, pair, name)) {
+            return "";
+        }
+    }
+    return null;
+}
+
 pub const ConnectOpts = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 5432,
@@ -43,6 +77,8 @@ pub const ConnectOpts = struct {
     password: ?[]const u8 = null,
     database: []const u8,
     pool_size: u16 = 1,
+    /// TLS negotiation mode, parsed from the URL `sslmode` (default off).
+    tls: TlsMode = .off,
 };
 
 const PgConn = struct {
@@ -75,11 +111,16 @@ pub fn parseUrl(url: []const u8) !ConnectOpts {
 
     const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.MissingDatabase;
     const authority = rest[0..slash];
-    var db = rest[slash + 1 ..];
-    if (std.mem.indexOfScalar(u8, db, '?')) |q| db = db[0..q];
+    const path_and_query = rest[slash + 1 ..];
+    var db = path_and_query;
+    var query: ?[]const u8 = null;
+    if (std.mem.indexOfScalar(u8, path_and_query, '?')) |q| {
+        db = path_and_query[0..q];
+        query = path_and_query[q + 1 ..];
+    }
     if (db.len == 0) return error.MissingDatabase;
 
-    var opts = ConnectOpts{ .database = db };
+    var opts = ConnectOpts{ .database = db, .tls = tlsModeFromSslmode(queryParam(query, "sslmode")) };
 
     var hostport = authority;
     if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| {
@@ -109,6 +150,9 @@ inline fn asConn(ctx: *anyopaque) *PgConn {
     return @ptrCast(@alignCast(ctx));
 }
 
+/// Max pool-init attempts before giving up (covers a managed-PG cold start).
+const max_connect_attempts: u32 = 5;
+
 /// Open a PostgreSQL backend: one pinned connection from a size-1 pool. Caller owns
 /// the returned `Backend` and must `close` it via `vtable.close`.
 pub fn open(allocator: std.mem.Allocator, opts: ConnectOpts) !backend.Backend {
@@ -122,11 +166,36 @@ pub fn open(allocator: std.mem.Allocator, opts: ConnectOpts) !backend.Backend {
     const database = try allocator.dupe(u8, opts.database);
     errdefer allocator.free(database);
 
-    const pool = try pg.Pool.init(allocator, .{
-        .size = opts.pool_size,
-        .connect = .{ .host = host, .port = opts.port },
-        .auth = .{ .username = username, .password = password, .database = database },
-    });
+    // Map our backend-neutral TlsMode onto pg.zig's TLS union. `.verify_full = null`
+    // verifies the server cert against the system CA bundle (ca-certificates). TLS
+    // only takes effect when the build links OpenSSL (`-Dpg-tls=true`).
+    const pg_tls: pg.Conn.Opts.TLS = switch (opts.tls) {
+        .off => .off,
+        .require => .require,
+        .verify_full => .{ .verify_full = null },
+    };
+
+    // Managed Postgres (e.g. Neon) suspends idle computes; the first connect after
+    // idle can take a few seconds or transiently fail while the compute wakes. Retry
+    // the pool init with exponential backoff (0.5s,1s,2s,4s → ~7.5s) before failing.
+    var attempt: u32 = 1;
+    const pool = while (true) : (attempt += 1) {
+        const p = pg.Pool.init(allocator, .{
+            .size = opts.pool_size,
+            .connect = .{ .host = host, .port = opts.port, .tls = pg_tls },
+            .auth = .{ .username = username, .password = password, .database = database },
+        }) catch |err| {
+            if (attempt >= max_connect_attempts) {
+                std.log.err("postgres: connect failed after {d} attempts: {}", .{ attempt, err });
+                return err;
+            }
+            const backoff_ms: u64 = @as(u64, 500) * (@as(u64, 1) << @intCast(attempt - 1));
+            std.log.warn("postgres: connect attempt {d}/{d} failed ({}); retrying in {d}ms", .{ attempt, max_connect_attempts, err, backoff_ms });
+            std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
+            continue;
+        };
+        break p;
+    };
     errdefer pool.deinit();
 
     const conn = try pool.acquire();

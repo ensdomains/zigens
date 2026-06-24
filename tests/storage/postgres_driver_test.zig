@@ -626,3 +626,39 @@ fn selectAliceId(db: *lib.Database) !i64 {
     if (!try st.step()) return error.AliceMissing;
     return st.getInt64(0);
 }
+
+// ── URL / TLS parsing (pure — no live connection; Neon TLS support) ───────────
+
+test "postgres driver: tlsModeFromSslmode maps libpq sslmode values" {
+    const TlsMode = pg_driver.TlsMode;
+    try testing.expectEqual(TlsMode.off, pg_driver.tlsModeFromSslmode(null));
+    try testing.expectEqual(TlsMode.off, pg_driver.tlsModeFromSslmode("disable"));
+    try testing.expectEqual(TlsMode.off, pg_driver.tlsModeFromSslmode("prefer"));
+    try testing.expectEqual(TlsMode.require, pg_driver.tlsModeFromSslmode("require"));
+    try testing.expectEqual(TlsMode.require, pg_driver.tlsModeFromSslmode("REQUIRE")); // case-insensitive
+    try testing.expectEqual(TlsMode.verify_full, pg_driver.tlsModeFromSslmode("verify-ca"));
+    try testing.expectEqual(TlsMode.verify_full, pg_driver.tlsModeFromSslmode("verify-full"));
+    try testing.expectEqual(TlsMode.require, pg_driver.tlsModeFromSslmode("bogus")); // unknown → fail-safe encrypt
+}
+
+test "postgres driver: parseUrl extracts sslmode, host, port (Neon-style + local)" {
+    const TlsMode = pg_driver.TlsMode;
+    // Neon-style: TLS required, host carries the cert SNI, extra query params ignored.
+    const neon = try pg_driver.parseUrl("postgresql://u:p@ep-cool-snow-123.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require");
+    try testing.expectEqualStrings("ep-cool-snow-123.us-east-2.aws.neon.tech", neon.host);
+    try testing.expectEqualStrings("neondb", neon.database);
+    try testing.expectEqualStrings("u", neon.username);
+    try testing.expectEqualStrings("p", neon.password.?);
+    try testing.expectEqual(@as(u16, 5432), neon.port);
+    try testing.expectEqual(TlsMode.require, neon.tls);
+
+    // verify-full → verify against system CAs.
+    const vf = try pg_driver.parseUrl("postgres://u:p@host.example/db?sslmode=verify-full");
+    try testing.expectEqual(TlsMode.verify_full, vf.tls);
+
+    // Local non-TLS Postgres: no sslmode → TLS off; explicit port honored.
+    const local = try pg_driver.parseUrl("postgres://postgres:postgres@127.0.0.1:5433/ensv2_test");
+    try testing.expectEqual(TlsMode.off, local.tls);
+    try testing.expectEqual(@as(u16, 5433), local.port);
+    try testing.expectEqualStrings("127.0.0.1", local.host);
+}
