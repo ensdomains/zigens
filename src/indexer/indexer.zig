@@ -1048,6 +1048,7 @@ pub const Indexer = struct {
     pub const handleTransferBatch = handlers_v2_registry.handleTransferBatch;
     pub const handleApproval = handlers_v2_registry.handleApproval;
     pub const handleEACRolesChanged = handlers_v2_registry.handleEACRolesChanged;
+    pub const handleEACRolesChangedImpl = handlers_v2_registry.handleEACRolesChangedImpl;
     pub const handleLabelRegistered = handlers_v2_registry.handleLabelRegistered;
     pub const handleLabelReserved = handlers_v2_registry.handleLabelReserved;
     pub const handleLabelUnregistered = handlers_v2_registry.handleLabelUnregistered;

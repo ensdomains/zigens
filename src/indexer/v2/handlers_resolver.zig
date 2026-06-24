@@ -1053,11 +1053,13 @@ pub fn handleAliasChanged(self: *Indexer, protocol: models.Protocol, resolver: A
     try utils.emitEvent(self, protocol, log, .alias_changed, null, null, event_data);
 }
 
-/// Wrapper for EACRolesChanged from resolver contracts
-/// Adapts ResolverEventConfig signature to call the existing RegistryEventConfig handler
+/// Wrapper for EACRolesChanged from resolver contracts.
+/// Adapts ResolverEventConfig signature to the shared handler, flagging it as a
+/// resolver event so the indexed `resource` (keccak256(node, part), or ROOT 0) is
+/// stored verbatim rather than canonicalized like a registry token id (WEB-511).
 pub fn handleResolverEACRolesChanged(self: *Indexer, protocol: models.Protocol, _resolver: Address, log: rpc.Log) !void {
     _ = _resolver;
-    try Indexer.handleEACRolesChanged(self, protocol, log);
+    try Indexer.handleEACRolesChangedImpl(self, protocol, log, true);
 }
 
 /// Decode DNS wire format to human-readable domain name
