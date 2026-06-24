@@ -19,6 +19,12 @@ services:
       - webhook-data-staging:/app/webhooks
     environment:
       - DATABASE_PATH=/app/data/ens_staging.db
+      # Postgres (e.g. Neon): set DATABASE_URL to a postgres:// string to switch off
+      # SQLite. Backend is inferred from the URL scheme; the image is built with
+      # -Dpg-tls=true so a `?sslmode=require` Neon URL negotiates TLS.
+      - DATABASE_BACKEND=${DATABASE_BACKEND:-}
+      - DATABASE_URL=${DATABASE_URL:-}
+      - DATABASE_POOL_SIZE=${DATABASE_POOL_SIZE:-8}
       - RAINBOW_PATH=/app/data/ens_rainbow.db
       - DOWNLOAD_RAINBOW=true
       - RPC_URL=${RPC_URL}
@@ -63,6 +69,12 @@ services:
       - webhook-data-staging:/app/webhooks
     environment:
       - DATABASE_PATH=/app/data/ens_staging.db
+      # Postgres (e.g. Neon): set DATABASE_URL to a postgres:// string to switch off
+      # SQLite. Backend is inferred from the URL scheme; the image is built with
+      # -Dpg-tls=true so a `?sslmode=require` Neon URL negotiates TLS.
+      - DATABASE_BACKEND=${DATABASE_BACKEND:-}
+      - DATABASE_URL=${DATABASE_URL:-}
+      - DATABASE_POOL_SIZE=${DATABASE_POOL_SIZE:-8}
       - RAINBOW_PATH=/app/data/ens_rainbow.db
       - DOWNLOAD_RAINBOW=false
       - API_PORT=5656
