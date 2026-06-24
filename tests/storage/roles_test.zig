@@ -9,6 +9,7 @@ const roles = lib.storage.roles;
 const models = lib.models;
 const Address = lib.Address;
 const Hash = lib.Hash;
+const eac_roles = lib.api.eac_roles;
 
 // ============================================================================
 // ROLE UPSERT OPERATIONS
@@ -174,4 +175,92 @@ test "deleteEACRole with nonexistent role is no-op" {
 
     // Should not error
     try roles.deleteEACRole(database, .v2, "nonexistent", helpers.TEST_OWNER_1, helpers.TEST_RESOLVER);
+}
+
+// ============================================================================
+// PERMISSION DECODING (WEB-399)
+// ============================================================================
+
+test "stored role defaults to registry contract_kind and decodes registry names" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const resource = "perm_registry";
+    const tx_hash = helpers.randomHash();
+    // ROLE_SET_RESOLVER = 1 << 24 on a registry.
+    const bitmap_hex = "0x0000000000000000000000000000000000000000000000000000000001000000";
+    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_1, bitmap_hex, 1000, tx_hash, 0, helpers.TEST_RESOLVER);
+
+    const role_list = try roles.getRolesByResource(database, .v2, resource);
+    defer {
+        for (role_list) |*r| r.deinit(allocator);
+        allocator.free(role_list);
+    }
+
+    try testing.expectEqual(@as(usize, 1), role_list.len);
+    // Contract not registered as a resolver → classified as registry.
+    try testing.expectEqual(models.EACContractKind.registry, role_list[0].contract_kind);
+
+    const perms = try eac_roles.decodeHex(allocator, role_list[0].role_bitmap, role_list[0].contract_kind);
+    defer eac_roles.freePermissions(allocator, perms);
+    try testing.expectEqual(@as(usize, 1), perms.len);
+    try testing.expectEqualStrings("SET_RESOLVER", perms[0]);
+}
+
+test "live Sepolia ALL_ROLES bitmap decodes to full resolver permission set" {
+    const allocator = testing.allocator;
+    // The 22 live Sepolia resolver-EAC rows all carry roleBitmap = 0x11..11.
+    const all_roles_hex = "0x1111111111111111111111111111111111111111111111111111111111111111";
+    const perms = try eac_roles.decodeHex(allocator, all_roles_hex, .resolver);
+    defer eac_roles.freePermissions(allocator, perms);
+
+    // 11 resolver roles + 11 admin counterparts.
+    try testing.expectEqual(@as(usize, 22), perms.len);
+
+    // Spot-check a couple of resolver-specific names are present.
+    var has_set_addr = false;
+    var has_set_name = false;
+    for (perms) |p| {
+        if (std.mem.eql(u8, p, "SET_ADDR")) has_set_addr = true;
+        if (std.mem.eql(u8, p, "SET_NAME")) has_set_name = true;
+    }
+    try testing.expect(has_set_addr);
+    try testing.expect(has_set_name);
+}
+
+test "EAC row from a known resolver classifies as resolver and decodes resolver names" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // Mark the emitting contract as a known resolver — this is the same set the
+    // indexer routes resolver events from, so it is the classification key.
+    var resolver_buf: [42]u8 = undefined;
+    const resolver_hex = helpers.TEST_RESOLVER.toHexBuf(&resolver_buf);
+    try database.registerResolver(.v2, resolver_hex, 1);
+
+    // Contract-global admin role (resource = 0, EAC ROOT_RESOURCE) — the live
+    // Sepolia shape — which previously failed the resolvers name-binding JOIN.
+    const resource = "0x0000000000000000000000000000000000000000000000000000000000000000";
+    const tx_hash = helpers.randomHash();
+    // 1 << 24 = nybble 6 → SET_NAME on a resolver (SET_RESOLVER on a registry).
+    const bitmap_hex = "0x0000000000000000000000000000000000000000000000000000000001000000";
+    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_1, bitmap_hex, 1000, tx_hash, 0, helpers.TEST_RESOLVER);
+
+    const role_list = try roles.getRolesByResource(database, .v2, resource);
+    defer {
+        for (role_list) |*r| r.deinit(allocator);
+        allocator.free(role_list);
+    }
+
+    try testing.expectEqual(@as(usize, 1), role_list.len);
+    // Emitting contract is a known resolver → classified as resolver, NOT registry.
+    try testing.expectEqual(models.EACContractKind.resolver, role_list[0].contract_kind);
+
+    const perms = try eac_roles.decodeHex(allocator, role_list[0].role_bitmap, role_list[0].contract_kind);
+    defer eac_roles.freePermissions(allocator, perms);
+    try testing.expectEqual(@as(usize, 1), perms.len);
+    // Resolver name for nybble 6 — the bug previously yielded registry's SET_RESOLVER.
+    try testing.expectEqualStrings("SET_NAME", perms[0]);
 }

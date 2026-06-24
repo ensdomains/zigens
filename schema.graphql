@@ -1098,8 +1098,16 @@ type EACRoleAssignment {
   """Account that has the role"""
   account: String!
 
-  """Role bitmap (hex string)"""
+  """Role bitmap (hex string). Preserved verbatim for clients that decode it directly."""
   roleBitmap: String!
+
+  """
+  Human-readable names of the roles encoded in `roleBitmap`, decoded against the
+  emitting contract's role table (resolver vs registry). Admin roles are suffixed
+  with `_ADMIN` (e.g. `["SET_RESOLVER", "SET_RESOLVER_ADMIN"]`). Empty when no
+  roles are set or the bitmap is unrecognized.
+  """
+  permissions: [String!]!
 
   """Block number when assigned"""
   blockNumber: Int!

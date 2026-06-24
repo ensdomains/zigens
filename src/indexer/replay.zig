@@ -103,9 +103,18 @@ pub fn replayEventsToRebuildNames(self: *Indexer) !void {
     // or, for a generated column, leaves queries referencing a column the
     // rebuilt table lacks. Clearing rows keeps the real table — every column,
     // its generated columns, indexes, and UNIQUE(protocol, namehash) (which
-    // insertName's upsert needs) — and the reorg triggers (no cursor is armed
-    // during replay, so the bulk DELETE captures nothing). Bulk-load speed is
-    // preserved by the dropNamesIndexes/createNamesIndexes pair below.
+    // insertName's upsert needs). Bulk-load speed is preserved by the
+    // dropNamesIndexes/createNamesIndexes pair below.
+    //
+    // A full names rebuild also invalidates the reorg undo-log, and the AFTER
+    // UPDATE/DELETE triggers on `names` (a protected table) would otherwise
+    // self-capture the entire rebuild into reorg_undo at the stale live cursor —
+    // DELETE keeps the triggers live (unlike the old DROP). Clear the cursor/active
+    // context + undo log first so the triggers no-op and no stale entries survive.
+    try database.exec("DELETE FROM reorg_cursor");
+    try database.exec("DELETE FROM reorg_active");
+    try database.exec("DELETE FROM reorg_undo");
+
     std.log.info("Clearing names table...", .{});
     try database.exec("DELETE FROM names");
     try database.exec("DELETE FROM backfill_status");
@@ -169,9 +178,10 @@ pub fn replayEventsToRebuildNames(self: *Indexer) !void {
     std.log.info("Recreating names indexes...", .{});
     try createNamesIndexes(database);
 
-    // Reinstall reorg undo-log triggers: DROP TABLE names (step 5) also dropped its
-    // triggers. Idempotent for the other protected tables. Replay itself sets no
-    // cursor, so the bulk rebuild above captured nothing.
+    // Ensure reorg undo-log triggers are installed (idempotent / first-run table
+    // creation). The bulk rebuild above captured nothing because step 5 cleared the
+    // cursor + active context before touching `names` (the triggers stay live now
+    // that we DELETE rather than DROP the table).
     try reorg_undo.installTriggers(database);
 
     // ── Step 8: Post-replay backfill passes ──

@@ -1051,9 +1051,27 @@ pub fn handleApproval(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !
 // Enhanced Access Control (EAC) Event Handler
 // ========================================================================
 
-/// Handle EACRolesChanged event from registry contracts
+/// Handle EACRolesChanged event from registry contracts.
+///
+/// Registry resources are ENS token ids (canonical_id | 32-bit version), so we
+/// strip the version bits to a stable canonical_id. See `handleEACRolesChangedImpl`.
 /// EACRolesChanged(uint256 indexed resource, address indexed account, uint256 oldRoleBitmap, uint256 newRoleBitmap)
 pub fn handleEACRolesChanged(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
+    try handleEACRolesChangedImpl(self, protocol, log, false);
+}
+
+/// Handle EACRolesChanged event, branching on the emitting contract kind.
+///
+/// `is_resolver` controls how the indexed `resource` is interpreted:
+///   - Registry (is_resolver = false): `resource` is a token id of the form
+///     `canonical_id | uint32(version)`. The lower 32 version bits are stripped
+///     to `canonical_id` so the resource stays stable across TokenRegenerated.
+///   - Resolver (is_resolver = true): `resource` is either ROOT_RESOURCE (0) or
+///     `uint256(keccak256(abi.encode(node, part)))` (see PermissionedResolverLib
+///     in contracts-v2). This is a full-entropy hash with NO version bits, so it
+///     must be stored verbatim — stripping the low 32 bits would corrupt it into
+///     a value that exists nowhere on-chain (WEB-511 Bug A).
+pub fn handleEACRolesChangedImpl(self: *Indexer, protocol: models.Protocol, log: rpc.Log, is_resolver: bool) !void {
     // Event: EACRolesChanged(uint256 indexed resource, address indexed account, uint256 oldRoleBitmap, uint256 newRoleBitmap)
     // topics[0] = event signature
     // topics[1] = resource (tokenId/namehash as uint256) - indexed
@@ -1077,14 +1095,14 @@ pub fn handleEACRolesChanged(self: *Indexer, protocol: models.Protocol, log: rpc
     const old_role_bitmap = data_values[0].uint256;
     const new_role_bitmap = data_values[1].uint256;
 
-    // Strip to canonical_id (clear lower 32 version bits) so the resource is stable
-    // across TokenRegenerated events. Works whether the contract emits token_id or canonical_id.
+    // Resolve the stored resource id: resolver = verbatim keccak256(node,part)/ROOT,
+    // registry = version-stripped token id (see token_id.resolveStoredResource).
     const token_id_utils = @import("../../types/token_id.zig");
-    const canonical_id = token_id_utils.getCanonicalId(resource_uint);
+    const stored_resource: u256 = token_id_utils.resolveStoredResource(resource_uint, is_resolver);
 
-    // Convert canonical_id to hex string for storage
+    // Convert resource to hex string for storage
     var resource_bytes: [32]u8 = undefined;
-    std.mem.writeInt(u256, &resource_bytes, canonical_id, .big);
+    std.mem.writeInt(u256, &resource_bytes, stored_resource, .big);
     const resource_hex_chars = std.fmt.bytesToHex(resource_bytes, .lower);
     const resource_hex = try std.fmt.allocPrint(self.allocator, "0x{s}", .{resource_hex_chars});
     defer self.allocator.free(resource_hex);
@@ -1140,16 +1158,21 @@ pub fn handleEACRolesChanged(self: *Indexer, protocol: models.Protocol, log: rpc
         new_bitmap_hex,
     });
 
-    // Look up name by canonical_id AND registry to avoid cross-registry collisions
-    const maybe_name = try self.database.getNameByTokenIdAndRegistry(canonical_id, log.address);
+    // Look up name by canonical_id AND registry to avoid cross-registry collisions.
+    // Only valid for the registry path: registry resources are token ids that map
+    // to a name. Resolver resources are keccak256(node, part) and `log.address` is
+    // the resolver (not a registry), so a token-id lookup can never match — skip it.
     var name_str_opt: ?[]const u8 = null;
     var namehash_opt: ?Hash = null;
 
-    if (maybe_name) |name| {
-        name_str_opt = if (name.name) |n| try self.allocator.dupe(u8, n) else null;
-        namehash_opt = name.namehash;
-        var name_copy = name;
-        name_copy.deinit(self.allocator);
+    if (!is_resolver) {
+        const maybe_name = try self.database.getNameByTokenIdAndRegistry(stored_resource, log.address);
+        if (maybe_name) |name| {
+            name_str_opt = if (name.name) |n| try self.allocator.dupe(u8, n) else null;
+            namehash_opt = name.namehash;
+            var name_copy = name;
+            name_copy.deinit(self.allocator);
+        }
     }
 
     const event_name = if (name_str_opt) |n| try self.allocator.dupe(u8, n) else null;

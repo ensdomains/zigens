@@ -1230,6 +1230,10 @@ test "expiry_date filters tolerate a near-max stored expiry" {
     try testing.expectEqualStrings("poisoned.eth", names[0].name.?);
 }
 
+// ============================================================================
+// ROOT-PARENT / NAME-CONSTRUCTION INVARIANTS (ens_name.zig + storage boundary)
+// ============================================================================
+
 test "insertName coerces null parent_name to empty string (NOT NULL invariant)" {
     const allocator = testing.allocator;
     const database = try helpers.createTestDatabase(allocator);

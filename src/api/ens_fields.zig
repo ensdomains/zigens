@@ -14,6 +14,9 @@ const Hash = @import("../types/hash.zig").Hash;
 const generic_fields = @import("../lib/graphql/fields.zig");
 pub const escapeJsonString = generic_fields.escapeJsonString;
 
+// EAC roleBitmap → named permission decoding
+const eac_roles = @import("eac_roles.zig");
+
 // ============================================================================
 // ENS-SPECIFIC FIELD TYPES (extends generic with Address/Hash)
 // ============================================================================
@@ -51,6 +54,12 @@ pub const FieldType = enum {
 pub const FieldValue = union(enum) {
     string: []const u8,
     optional_string: ?[]const u8,
+    /// Allocator-owned string — `writeFieldValue` frees it after writing.
+    /// Use this (not `.string`) whenever the getter allocates its value, so the
+    /// render path is leak-free under any allocator, not just the request arena.
+    owned_string: []const u8,
+    /// Allocator-owned optional string — freed after writing when present.
+    owned_optional_string: ?[]const u8,
     int: i64,
     optional_int: ?i64,
     bool_val: bool,
@@ -196,6 +205,24 @@ fn writeFieldValue(
             }
             return true;
         },
+        .owned_string => |s| {
+            defer allocator.free(s);
+            const escaped = try escapeJsonString(allocator, s);
+            defer allocator.free(escaped);
+            try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
+            return true;
+        },
+        .owned_optional_string => |maybe_s| {
+            if (maybe_s) |s| {
+                defer allocator.free(s);
+                const escaped = try escapeJsonString(allocator, s);
+                defer allocator.free(escaped);
+                try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
+            } else {
+                try writer.print("\"{s}\":null", .{output_key});
+            }
+            return true;
+        },
         .int => |i| {
             try writer.print("\"{s}\":{d}", .{ output_key, i });
             return true;
@@ -270,6 +297,14 @@ fn getEventCtx(ctx: *anyopaque) *const models.Event {
     return @ptrCast(@alignCast(ctx));
 }
 
+fn getEventId(ctx: *anyopaque, allocator: std.mem.Allocator) !FieldValue {
+    const event = getEventCtx(ctx);
+    const tx_hash = try event.tx_hash.toHex(allocator);
+    defer allocator.free(tx_hash);
+    const id = try std.fmt.allocPrint(allocator, "{s}-{d}", .{ tx_hash, event.log_index });
+    return FieldValue{ .owned_string = id };
+}
+
 fn getEventType(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
     const event = getEventCtx(ctx);
     return FieldValue{ .string = event.event_type.toString() };
@@ -327,7 +362,7 @@ fn extractDataField(data: ?[]const u8, expected_type: []const u8, event_type: []
     const value_start = start + needle_buf.len;
     const value_end_rel = std.mem.indexOfScalar(u8, blob[value_start..], '"') orelse return FieldValue{ .optional_string = null };
     const owned = try allocator.dupe(u8, blob[value_start .. value_start + value_end_rel]);
-    return FieldValue{ .optional_string = owned };
+    return FieldValue{ .owned_optional_string = owned };
 }
 
 fn getEventTextKey(ctx: *anyopaque, allocator: std.mem.Allocator) !FieldValue {
@@ -378,7 +413,97 @@ fn writeEventId(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u
 // EAC ROLE FIELD DEFINITIONS
 // ============================================================================
 
+fn getEACRoleCtx(ctx: *anyopaque) *const models.EACRoleAssignment {
+    return @ptrCast(@alignCast(ctx));
+}
+
+fn getEACRoleId(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
+    const role = getEACRoleCtx(ctx);
+    return FieldValue{ .int = @intCast(role.id) };
+}
+
+fn getEACRoleResource(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
+    const role = getEACRoleCtx(ctx);
+    return FieldValue{ .string = role.resource };
+}
+
+fn getEACRoleAccount(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
+    const role = getEACRoleCtx(ctx);
+    return FieldValue{ .address = role.account };
+}
+
+fn getEACRoleBitmap(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
+    const role = getEACRoleCtx(ctx);
+    return FieldValue{ .string = role.role_bitmap };
+}
+
+fn getEACRoleBlockNumber(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
+    const role = getEACRoleCtx(ctx);
+    return FieldValue{ .int = @intCast(role.block_number) };
+}
+
+fn getEACRoleTransactionHash(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
+    const role = getEACRoleCtx(ctx);
+    return FieldValue{ .hash = role.tx_hash };
+}
+
+fn getEACRoleTimestamp(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
+    const role = getEACRoleCtx(ctx);
+    return FieldValue{ .int = role.timestamp };
+}
+
+fn getEACRoleName(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
+    const role = getEACRoleCtx(ctx);
+    return FieldValue{ .optional_string = role.name };
+}
+
 /// EAC Role field definitions table
+pub const EACRoleFields = [_]FieldDef{
+    FieldDef.customScalar("id", writeEACRoleId),
+    FieldDef.string("resource", getEACRoleResource),
+    FieldDef.customScalar("account", writeEACRoleAccount),
+    FieldDef.string("roleBitmap", getEACRoleBitmap),
+    FieldDef.custom("permissions", writeEACRolePermissions),
+    FieldDef.int("blockNumber", getEACRoleBlockNumber),
+    FieldDef.hashField("transactionHash", getEACRoleTransactionHash),
+    FieldDef.int("timestamp", getEACRoleTimestamp),
+    FieldDef.optionalString("name", getEACRoleName),
+};
+
+/// Custom writer for EAC role ID
+fn writeEACRoleId(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, _: std.mem.Allocator) !bool {
+    const role = getEACRoleCtx(ctx);
+    try writer.print("\"{s}\":\"{d}\"", .{ output_key, role.id });
+    return true;
+}
+
+/// Custom writer for EAC role account (as hex string)
+fn writeEACRoleAccount(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+    const role = getEACRoleCtx(ctx);
+    const hex = try role.account.toHex(allocator);
+    defer allocator.free(hex);
+    try writer.print("\"{s}\":\"{s}\"", .{ output_key, hex });
+    return true;
+}
+
+/// Custom writer for the decoded `permissions` list — the human-readable names
+/// of the roles encoded in `roleBitmap`, decoded against the emitting contract's
+/// role table (resolver vs registry). Renders a JSON array of strings.
+pub fn writeEACRolePermissions(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+    const role = getEACRoleCtx(ctx);
+    const perms = try eac_roles.decodeHex(allocator, role.role_bitmap, role.contract_kind);
+    defer eac_roles.freePermissions(allocator, perms);
+
+    try writer.print("\"{s}\":[", .{output_key});
+    for (perms, 0..) |perm, i| {
+        if (i != 0) try writer.writeByte(',');
+        const escaped = try escapeJsonString(allocator, perm);
+        defer allocator.free(escaped);
+        try writer.print("\"{s}\"", .{escaped});
+    }
+    try writer.writeByte(']');
+    return true;
+}
 
 // ============================================================================
 // RESOLVER FIELD DEFINITIONS
@@ -566,14 +691,14 @@ test "effectiveDomainExpiry: grace only for unwrapped V1 .eth 2LDs" {
 fn getDomainTokenId(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!FieldValue {
     const name = getNameCtx(ctx);
     const hex = try std.fmt.allocPrint(allocator, "0x{x}", .{name.token_id});
-    return FieldValue{ .string = hex };
+    return FieldValue{ .owned_string = hex };
 }
 
 /// Get domain canonical ID (as hex string)
 fn getDomainCanonicalId(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!FieldValue {
     const name = getNameCtx(ctx);
     const hex = try std.fmt.allocPrint(allocator, "0x{x}", .{name.canonical_id});
-    return FieldValue{ .string = hex };
+    return FieldValue{ .owned_string = hex };
 }
 
 /// Get domain token version
@@ -733,7 +858,7 @@ fn getAddressCtx(ctx: *anyopaque) *const Address {
 fn getAccountId(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!FieldValue {
     const addr = getAddressCtx(ctx);
     const hex = try addr.toHex(allocator);
-    return FieldValue{ .string = hex };
+    return FieldValue{ .owned_string = hex };
 }
 
 /// Account field definitions - only scalar field is "id"
@@ -785,14 +910,14 @@ fn getResolverBuildId(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!Fi
         addr_hex,
         namehash_hex,
     });
-    return FieldValue{ .string = id };
+    return FieldValue{ .owned_string = id };
 }
 
 /// Address-only view of the resolver contract.
 fn getResolverBuildAddress(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!FieldValue {
     const rctx = getResolverBuildCtx(ctx);
     const hex = try rctx.resolver.toHex(allocator);
-    return FieldValue{ .string = hex };
+    return FieldValue{ .owned_string = hex };
 }
 
 /// Resolver build field definitions - scalar fields only

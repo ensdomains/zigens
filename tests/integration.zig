@@ -1454,6 +1454,82 @@ test "reorg undo-log: v1_controllers remove-then-readd straddling N restores rem
     std.debug.print("✓ v1_controllers remove-then-readd straddle restores as-of-N removed state\n", .{});
 }
 
+// eac_roles reorg coverage: the table is in PROTECTED_TABLES with a (protocol,
+// resource, account, contract_address) business key in schema_keys, so an
+// overwrite/revoke straddling N must roll back to its as-of-N state. (Previously
+// wired but never behaviorally exercised — both DBs compared empty in reconcile.)
+
+fn eacRoleCount(allocator: std.mem.Allocator, database: *Database, resource: []const u8) !usize {
+    const rs = try database.getRolesByResource(.v2, resource);
+    defer {
+        for (rs) |*r| r.deinit(allocator);
+        allocator.free(rs);
+    }
+    return rs.len;
+}
+
+fn expectSingleRoleBitmap(allocator: std.mem.Allocator, database: *Database, resource: []const u8, expected: []const u8) !void {
+    const rs = try database.getRolesByResource(.v2, resource);
+    defer {
+        for (rs) |*r| r.deinit(allocator);
+        allocator.free(rs);
+    }
+    try testing.expectEqual(@as(usize, 1), rs.len);
+    try testing.expectEqualStrings(expected, rs[0].role_bitmap);
+}
+
+test "reorg undo-log reverses an eac_roles overwrite (v2)" {
+    const allocator = testing.allocator;
+    var database = try testDb(allocator);
+    defer database.deinit();
+
+    const account = try Address.fromHex("0x00000000000000000000000000000000000000aa");
+    const contract = try Address.fromHex("0x00000000000000000000000000000000000000cc");
+    const tx = try Hash.fromHex("0x1111111111111111111111111111111111111111111111111111111111111111");
+    const resource = "0x0000000000000000000000000000000000000000000000000000000000000001";
+    const bitmap_v1 = "0x0000000000000000000000000000000000000000000000000000000001000000";
+    const bitmap_v2 = "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+    // Block 100: grant a role (survives a rollback to 150).
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 100);
+    try database.upsertEACRole(.v2, resource, account, bitmap_v1, 100, tx, 0, contract);
+
+    // Block 200: overwrite the bitmap (ON CONFLICT DO UPDATE — captured, tagged 200).
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
+    try database.upsertEACRole(.v2, resource, account, bitmap_v2, 200, tx, 1, contract);
+    try expectSingleRoleBitmap(allocator, &database, resource, bitmap_v2);
+
+    // Reorg to 150: the block-200 overwrite is reversed; the role (granted 100) is back at v1.
+    try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
+    try expectSingleRoleBitmap(allocator, &database, resource, bitmap_v1);
+}
+
+test "reorg undo-log reverses an eac_roles delete (v2)" {
+    const allocator = testing.allocator;
+    var database = try testDb(allocator);
+    defer database.deinit();
+
+    const account = try Address.fromHex("0x00000000000000000000000000000000000000aa");
+    const contract = try Address.fromHex("0x00000000000000000000000000000000000000cc");
+    const tx = try Hash.fromHex("0x1111111111111111111111111111111111111111111111111111111111111111");
+    const resource = "0x0000000000000000000000000000000000000000000000000000000000000002";
+    const bitmap = "0x0000000000000000000000000000000000000000000000000000000001000000";
+
+    // Block 100: grant a role.
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 100);
+    try database.upsertEACRole(.v2, resource, account, bitmap, 100, tx, 0, contract);
+
+    // Block 200: revoke it (DELETE — captured, tagged 200).
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
+    try database.deleteEACRole(.v2, resource, account, contract);
+    try testing.expectEqual(@as(usize, 0), try eacRoleCount(allocator, &database, resource));
+
+    // Reorg to 150: the delete is reversed (delete+reinsert on the business UNIQUE — the
+    // PG restore path), so the role is restored with its block-100 bitmap.
+    try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
+    try expectSingleRoleBitmap(allocator, &database, resource, bitmap);
+}
+
 // ============================================================================
 // Reorg undo-log: the reconcile invariant (#9, RPC-free)
 //
