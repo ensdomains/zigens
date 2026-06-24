@@ -1094,15 +1094,10 @@ pub fn handleEACRolesChangedImpl(self: *Indexer, protocol: models.Protocol, log:
     const old_role_bitmap = data_values[0].uint256;
     const new_role_bitmap = data_values[1].uint256;
 
-    // Resolve the stored resource id.
-    //   - Resolver EAC resources are keccak256(node, part) (or ROOT 0): store verbatim.
-    //   - Registry EAC resources are token ids: strip the lower 32 version bits to
-    //     canonical_id so the resource is stable across TokenRegenerated events.
+    // Resolve the stored resource id: resolver = verbatim keccak256(node,part)/ROOT,
+    // registry = version-stripped token id (see token_id.resolveStoredResource).
     const token_id_utils = @import("../../types/token_id.zig");
-    const stored_resource: u256 = if (is_resolver)
-        resource_uint
-    else
-        token_id_utils.getCanonicalId(resource_uint);
+    const stored_resource: u256 = token_id_utils.resolveStoredResource(resource_uint, is_resolver);
 
     // Convert resource to hex string for storage
     var resource_bytes: [32]u8 = undefined;
