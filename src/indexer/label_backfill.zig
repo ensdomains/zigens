@@ -1,4 +1,5 @@
 const std = @import("std");
+const ens_name = @import("../utils/ens_name.zig");
 const rpc = @import("../rpc/client.zig");
 const db_module = @import("../storage/database.zig");
 const c = db_module.c;
@@ -345,22 +346,30 @@ pub const LabelBackfill = struct {
             const parent_namehash = try Hash.fromHex(unknown_label.parent_node);
             var parent_name_str: ?[]const u8 = null;
             var parent_record_to_free: ?models.Name = null;
-            if (try names_storage.getNameByNamehash(self.database, parent_namehash)) |parent_record| {
-                parent_record_to_free = parent_record;
-                parent_name_str = parent_record.name;
-            }
             defer if (parent_record_to_free) |*pr| pr.deinit(self.allocator);
 
-            // Construct full name
-            const full_name = if (parent_name_str) |pn|
-                try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_text, pn })
-            else
-                try self.allocator.dupe(u8, label_text);
+            if (parent_namehash.eql(constants.WellKnown.root_namehash)) {
+                // Genuine root child (a TLD): bare label, no suffix.
+                parent_name_str = ens_name.ROOT_PARENT;
+            } else if (try names_storage.getNameByNamehash(self.database, parent_namehash)) |parent_record| {
+                parent_record_to_free = parent_record;
+                parent_name_str = parent_record.name;
+            } else {
+                // Parent absent and not root: joining against an empty parent
+                // would mint a root-level name ('foo') inconsistent with this
+                // row's namehash (= namehash('foo.<parent>')). Leave the
+                // [labelhash] placeholder for a later heal once the parent is
+                // indexed, rather than write a wrong name.
+                std.log.debug("Skipping label heal for '{s}': parent {s} not yet indexed", .{ label_text, unknown_label.parent_node });
+                return;
+            }
+
+            const full_name = try ens_name.join(self.allocator, label_text, parent_name_str);
             defer self.allocator.free(full_name);
 
             // Now that the plaintext name is known, recompute the ENSIP-15 flag.
             const is_norm = ens_normalize.nameIsNormalized(self.allocator, full_name);
-            try names_storage.updateNameLabel(self.database, namehash, label_text, full_name, is_norm);
+            try names_storage.updateNameLabel(self.database, .v1, namehash, label_text, full_name, is_norm);
             std.log.debug("Healed subdomain label: {s}", .{full_name});
         }
         // If name doesn't exist (shouldn't happen with new indexing), skip silently

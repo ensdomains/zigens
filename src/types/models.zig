@@ -398,6 +398,42 @@ pub const Webhook = struct {
     }
 };
 
+/// EAC (Enhanced Access Control) role types
+/// Each role is a nybble (4 bits) in the role bitmap
+pub const EACRole = enum(u8) {
+    // Owner roles (lower 128 bits)
+    registrar = 0, // Can register names
+    renew = 4, // Can renew names
+    set_subregistry = 8, // Can set subregistries
+    set_resolver = 12, // Can set resolvers
+    set_token_observer = 16, // Can set token observers
+    burn = 20, // Can burn tokens
+
+    // Admin roles would be at (role + 128)
+    // We don't need to enumerate all of them here
+
+    pub fn toString(self: EACRole) []const u8 {
+        return switch (self) {
+            .registrar => "REGISTRAR",
+            .renew => "RENEW",
+            .set_subregistry => "SET_SUBREGISTRY",
+            .set_resolver => "SET_RESOLVER",
+            .set_token_observer => "SET_TOKEN_OBSERVER",
+            .burn => "BURN",
+        };
+    }
+};
+
+/// Classifies the contract that emitted an `EACRolesChanged` event. Determines
+/// which named-role table the opaque `role_bitmap` is decoded against, since the
+/// same nybble means different permissions on a registry vs a resolver.
+pub const EACContractKind = enum {
+    registry,
+    resolver,
+    /// Emitting contract could not be classified from indexed data.
+    unknown,
+};
+
 /// EAC role assignment record
 pub const EACRoleAssignment = struct {
     /// Record ID
@@ -420,6 +456,9 @@ pub const EACRoleAssignment = struct {
     timestamp: i64,
     /// Domain name (resolved from resource/canonical_id, null for global roles)
     name: ?[]const u8 = null,
+    /// Kind of contract that emitted the role event. Used to decode `role_bitmap`
+    /// into named permissions. Defaults to `.registry` (the primary EAC path).
+    contract_kind: EACContractKind = .registry,
 
     pub fn deinit(self: *EACRoleAssignment, allocator: std.mem.Allocator) void {
         allocator.free(self.resource);

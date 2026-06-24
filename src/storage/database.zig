@@ -760,6 +760,7 @@ pub const Database = struct {
     pub const getTotalRoleCount = roles.getTotalRoleCount;
     pub const getRoleCountFiltered = roles.getRoleCountFiltered;
     pub const RoleCountFilters = roles.RoleCountFilters;
+    pub const getLabelRoleHolderCount = roles.getLabelRoleHolderCount;
 
     // ENSIP-16 module (7 functions)
     pub const upsertResolverMetadata = ensip16.upsertResolverMetadata;

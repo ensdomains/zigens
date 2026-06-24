@@ -1,4 +1,5 @@
 const std = @import("std");
+const ens_name = @import("../../utils/ens_name.zig");
 const models = @import("../../types/models.zig");
 // ABI decoding migrated from hand-rolled `../abi.zig` to eth.zig-backed
 // `../abi_eth.zig`. The old module is kept for fallback. EventSignatures still
@@ -9,7 +10,6 @@ const db = @import("../../storage/database.zig");
 const Query = db.Query;
 const Hash = @import("../../types/hash.zig").Hash;
 const Address = @import("../../types/address.zig").Address;
-const unicode = @import("../../utils/unicode.zig");
 const Indexer = @import("../indexer.zig").Indexer;
 const utils = @import("../utils.zig");
 const json_utils = @import("../../utils/json.zig");
@@ -30,8 +30,7 @@ pub fn processOrphanedRegistration(
     const hash_mod = @import("../../types/hash.zig");
     const token_id_utils = @import("../../types/token_id.zig");
 
-    // Compute full name: label.parent_name
-    const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ orphan.label, parent_name });
+    const full_name = try ens_name.join(self.allocator, orphan.label, parent_name);
     defer self.allocator.free(full_name);
 
     const namehash = try hash_mod.namehash(self.allocator, full_name);
@@ -241,7 +240,7 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
     const expiration: u256 = data_values[1].uint256;
     const registered_by = Address{ .bytes = data_values[2].address };
 
-    unicode.validateName(label_str) catch |err| {
+    ens_name.validateLabel(label_str) catch |err| {
         std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
         return;
     };
@@ -316,8 +315,7 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
     }
     defer if (parent_name_allocated) self.allocator.free(parent_name);
 
-    // Compute full name: label.parent_name
-    const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
+    const full_name = try ens_name.join(self.allocator, label_str, parent_name);
     defer self.allocator.free(full_name);
     const namehash = try @import("../../types/hash.zig").namehash(self.allocator, full_name);
 
@@ -329,7 +327,7 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
     const canonical_id = token_id_utils.getCanonicalId(token_id);
     const token_version = token_id_utils.getTokenVersion(token_id);
 
-    const name_str_dup = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
+    const name_str_dup = try self.allocator.dupe(u8, full_name);
     defer self.allocator.free(name_str_dup);
 
     const label_dup = try self.allocator.dupe(u8, label_str);
@@ -417,8 +415,11 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
         expiration,
     });
 
-    const event_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
+    const event_name = try ens_name.join(self.allocator, label_str, parent_name);
 
+    // event_data and event_name transfer to emitEvent, which is their sole owner
+    // (insertEventAndNotify frees both on every path) — no errdefer here, matching
+    // every other emit site in this file; an errdefer would double-free on a DB error.
     try utils.emitEvent(self, protocol, log, .name_registered, event_name, namehash, event_data);
 }
 
@@ -573,7 +574,7 @@ pub fn handleETHNameRegistered(self: *Indexer, protocol: models.Protocol, log: r
     const base_price = data_values[7].uint256;
     const premium = data_values[8].uint256;
 
-    unicode.validateName(label_str) catch |err| {
+    ens_name.validateLabel(label_str) catch |err| {
         std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
         return;
     };
@@ -732,7 +733,7 @@ pub fn handleETHNameRenewed(self: *Indexer, protocol: models.Protocol, log: rpc.
     const referrer = Hash{ .bytes = data_values[4].fixed_bytes.data };
     const base_price = data_values[5].uint256;
 
-    unicode.validateName(label_str) catch |err| {
+    ens_name.validateLabel(label_str) catch |err| {
         std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
         return;
     };
@@ -1049,9 +1050,27 @@ pub fn handleApproval(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !
 // Enhanced Access Control (EAC) Event Handler
 // ========================================================================
 
-/// Handle EACRolesChanged event from registry contracts
+/// Handle EACRolesChanged event from registry contracts.
+///
+/// Registry resources are ENS token ids (canonical_id | 32-bit version), so we
+/// strip the version bits to a stable canonical_id. See `handleEACRolesChangedImpl`.
 /// EACRolesChanged(uint256 indexed resource, address indexed account, uint256 oldRoleBitmap, uint256 newRoleBitmap)
 pub fn handleEACRolesChanged(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
+    try handleEACRolesChangedImpl(self, protocol, log, false);
+}
+
+/// Handle EACRolesChanged event, branching on the emitting contract kind.
+///
+/// `is_resolver` controls how the indexed `resource` is interpreted:
+///   - Registry (is_resolver = false): `resource` is a token id of the form
+///     `canonical_id | uint32(version)`. The lower 32 version bits are stripped
+///     to `canonical_id` so the resource stays stable across TokenRegenerated.
+///   - Resolver (is_resolver = true): `resource` is either ROOT_RESOURCE (0) or
+///     `uint256(keccak256(abi.encode(node, part)))` (see PermissionedResolverLib
+///     in contracts-v2). This is a full-entropy hash with NO version bits, so it
+///     must be stored verbatim — stripping the low 32 bits would corrupt it into
+///     a value that exists nowhere on-chain (WEB-511 Bug A).
+pub fn handleEACRolesChangedImpl(self: *Indexer, protocol: models.Protocol, log: rpc.Log, is_resolver: bool) !void {
     // Event: EACRolesChanged(uint256 indexed resource, address indexed account, uint256 oldRoleBitmap, uint256 newRoleBitmap)
     // topics[0] = event signature
     // topics[1] = resource (tokenId/namehash as uint256) - indexed
@@ -1075,14 +1094,14 @@ pub fn handleEACRolesChanged(self: *Indexer, protocol: models.Protocol, log: rpc
     const old_role_bitmap = data_values[0].uint256;
     const new_role_bitmap = data_values[1].uint256;
 
-    // Strip to canonical_id (clear lower 32 version bits) so the resource is stable
-    // across TokenRegenerated events. Works whether the contract emits token_id or canonical_id.
+    // Resolve the stored resource id: resolver = verbatim keccak256(node,part)/ROOT,
+    // registry = version-stripped token id (see token_id.resolveStoredResource).
     const token_id_utils = @import("../../types/token_id.zig");
-    const canonical_id = token_id_utils.getCanonicalId(resource_uint);
+    const stored_resource: u256 = token_id_utils.resolveStoredResource(resource_uint, is_resolver);
 
-    // Convert canonical_id to hex string for storage
+    // Convert resource to hex string for storage
     var resource_bytes: [32]u8 = undefined;
-    std.mem.writeInt(u256, &resource_bytes, canonical_id, .big);
+    std.mem.writeInt(u256, &resource_bytes, stored_resource, .big);
     const resource_hex_chars = std.fmt.bytesToHex(resource_bytes, .lower);
     const resource_hex = try std.fmt.allocPrint(self.allocator, "0x{s}", .{resource_hex_chars});
     defer self.allocator.free(resource_hex);
@@ -1138,16 +1157,21 @@ pub fn handleEACRolesChanged(self: *Indexer, protocol: models.Protocol, log: rpc
         new_bitmap_hex,
     });
 
-    // Look up name by canonical_id AND registry to avoid cross-registry collisions
-    const maybe_name = try self.database.getNameByTokenIdAndRegistry(canonical_id, log.address);
+    // Look up name by canonical_id AND registry to avoid cross-registry collisions.
+    // Only valid for the registry path: registry resources are token ids that map
+    // to a name. Resolver resources are keccak256(node, part) and `log.address` is
+    // the resolver (not a registry), so a token-id lookup can never match — skip it.
     var name_str_opt: ?[]const u8 = null;
     var namehash_opt: ?Hash = null;
 
-    if (maybe_name) |name| {
-        name_str_opt = if (name.name) |n| try self.allocator.dupe(u8, n) else null;
-        namehash_opt = name.namehash;
-        var name_copy = name;
-        name_copy.deinit(self.allocator);
+    if (!is_resolver) {
+        const maybe_name = try self.database.getNameByTokenIdAndRegistry(stored_resource, log.address);
+        if (maybe_name) |name| {
+            name_str_opt = if (name.name) |n| try self.allocator.dupe(u8, n) else null;
+            namehash_opt = name.namehash;
+            var name_copy = name;
+            name_copy.deinit(self.allocator);
+        }
     }
 
     const event_name = if (name_str_opt) |n| try self.allocator.dupe(u8, n) else null;
@@ -1182,7 +1206,7 @@ pub fn handleLabelRegistered(self: *Indexer, protocol: models.Protocol, log: rpc
     const owner = Address{ .bytes = data_values[1].address };
     const expiry: u64 = @truncate(data_values[2].uint256);
 
-    unicode.validateName(label_str) catch |err| {
+    ens_name.validateLabel(label_str) catch |err| {
         std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
         return;
     };
@@ -1252,7 +1276,7 @@ pub fn handleLabelRegistered(self: *Indexer, protocol: models.Protocol, log: rpc
     }
     defer if (parent_name_allocated) self.allocator.free(parent_name);
 
-    const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
+    const full_name = try ens_name.join(self.allocator, label_str, parent_name);
     defer self.allocator.free(full_name);
 
     const namehash_val = try @import("../../types/hash.zig").namehash(self.allocator, full_name);
@@ -1418,7 +1442,7 @@ pub fn handleLabelReserved(self: *Indexer, protocol: models.Protocol, log: rpc.L
     const label_str = data_values[0].string;
     const expiry: u64 = @truncate(data_values[1].uint256);
 
-    unicode.validateName(label_str) catch |err| {
+    ens_name.validateLabel(label_str) catch |err| {
         std.log.warn("Invalid name label '{s}' for tokenId={d}: {any}", .{ label_str, token_id, err });
         return;
     };
@@ -1464,7 +1488,7 @@ pub fn handleLabelReserved(self: *Indexer, protocol: models.Protocol, log: rpc.L
     }
     defer if (parent_name_allocated) self.allocator.free(parent_name);
 
-    const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, parent_name });
+    const full_name = try ens_name.join(self.allocator, label_str, parent_name);
     defer self.allocator.free(full_name);
 
     const namehash_val = try @import("../../types/hash.zig").namehash(self.allocator, full_name);

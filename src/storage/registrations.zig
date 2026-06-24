@@ -1,4 +1,5 @@
 const std = @import("std");
+const ens_name = @import("../utils/ens_name.zig");
 const constants = @import("../constants.zig");
 const db_module = @import("database.zig");
 const Database = db_module.Database;
@@ -349,11 +350,7 @@ fn rowToEvent(allocator: std.mem.Allocator, q: *db_module.Query) !models.Event {
     const namehash = try Hash.fromHex(namehash_str);
     const tx_hash = try Hash.fromHex(tx_hash_str);
 
-    // event.name = "label.parent_name" (or just "label" when parent is empty).
-    const name = if (parent.len == 0)
-        try allocator.dupe(u8, label)
-    else
-        try std.fmt.allocPrint(allocator, "{s}.{s}", .{ label, parent });
+    const name = try ens_name.join(allocator, label, parent);
     errdefer allocator.free(name);
 
     // event.data: builders read `owner` and `expiry`. Keep `name` for any

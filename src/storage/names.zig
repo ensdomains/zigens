@@ -428,7 +428,10 @@ pub fn insertName(db: *Database, name: models.Name) !void {
     try q.bindOptionalText(name.name);
     try q.bindOptionalText(name.label);
     try q.bindHash(name.label_hash);
-    try q.bindOptionalText(name.parent_name);
+    // parent_name is NOT NULL: a root child is the empty string, never SQL NULL.
+    // Coerce here so the schema invariant holds for every caller (a null would
+    // otherwise abort the insert on the NOT NULL constraint). See ens_name.ROOT_PARENT.
+    try q.bindText(name.parent_name orelse "");
     try q.bindHash(name.parent_namehash);
     try q.bindTextStatic(name.protocol.toString());
     try q.bindAddress(name.registry);
@@ -788,11 +791,13 @@ pub fn materializePccDomainExpiry(db: *Database) !u32 {
 
 /// Update label and name fields for a name record (used by label healing).
 /// `is_normalized` is recomputed by the caller (indexer layer, which has the
-/// ENSIP-15 lib) now that the plaintext label/name is known.
-pub fn updateNameLabel(database: *Database, namehash: Hash, label: []const u8, name: []const u8, is_normalized: bool) !void {
+/// ENSIP-15 lib) now that the plaintext label/name is known. Scoped by protocol:
+/// names is UNIQUE(protocol, namehash), so a V1 heal must not overwrite a
+/// same-namehashed V2 row (e.g. a V1->V2 migrated name).
+pub fn updateNameLabel(database: *Database, protocol: models.Protocol, namehash: Hash, label: []const u8, name: []const u8, is_normalized: bool) !void {
     var q = try Query.initCached(database,
         \\UPDATE names SET label = ?, name = ?, is_normalized = ?
-        \\WHERE namehash = ?
+        \\WHERE namehash = ? AND protocol = ?
     );
     defer q.deinit();
 
@@ -800,6 +805,7 @@ pub fn updateNameLabel(database: *Database, namehash: Hash, label: []const u8, n
     try q.bindText(name);
     try q.bindInt(if (is_normalized) 1 else 0);
     try q.bindHash(namehash);
+    try q.bindTextStatic(protocol.toString());
     try q.exec();
 }
 
@@ -1164,6 +1170,9 @@ fn appendNameScalarConditions(
     }
     if (filters.resolver != null) try conditions.append(db.allocator, "resolver = ?");
     if (filters.registry != null) try conditions.append(db.allocator, "registry = ?");
+    if (filters.subregistry_pointer != null) {
+        try conditions.append(db.allocator, "EXISTS (SELECT 1 FROM registry_entries re WHERE re.protocol = names.protocol AND re.parent_registry = names.registry AND re.canonical_id = names.canonical_id AND re.subregistry = ?)");
+    }
     if (filters.migrated) |m| {
         try conditions.append(db.allocator, if (m) "migrated = 1" else "migrated = 0");
     }
@@ -1283,6 +1292,7 @@ fn bindNameScalars(q: *Query, filters: NameFilters) !void {
     if (filters.resolved_address) |addr| try q.bindAddress(addr);
     if (filters.resolver) |addr| try q.bindAddress(addr);
     if (filters.registry) |addr| try q.bindAddress(addr);
+    if (filters.subregistry_pointer) |addr| try q.bindAddress(addr);
     // migrated, has_subdomains contribute no binds (literal SQL)
     if (filters.subdomain_count_gt) |v| try q.bindInt64(v);
     if (filters.subdomain_count_lt) |v| try q.bindInt64(v);
@@ -1458,6 +1468,12 @@ pub const NameFilters = struct {
     resolver: ?Address = null,
     // Registry contract address filter (the contract that owns this name's label)
     registry: ?Address = null,
+    /// Inverse subregistry-pointer filter: match names whose CURRENT subregistry pointer
+    /// (the `registry_entries.subregistry` value for this name) equals this address. Powers
+    /// `RegistryInfo.referencedBy` — the names that use a registry as their subname registry.
+    /// Implemented as a correlated EXISTS join over `registry_entries`; there is no
+    /// subregistry column on `names`.
+    subregistry_pointer: ?Address = null,
     // Migration filter
     migrated: ?bool = null,
     // Subdomain filters (requires subquery)

@@ -3,6 +3,7 @@
 /// Used by `--backfill` CLI mode: clears names, replays all events in order,
 /// and re-derives name records using the same storage functions as live indexing.
 const std = @import("std");
+const ens_name = @import("../utils/ens_name.zig");
 const constants = @import("../constants.zig");
 const db_module = @import("../storage/database.zig");
 const Query = db_module.Query;
@@ -94,44 +95,24 @@ pub fn replayEventsToRebuildNames(self: *Indexer) !void {
     try dropNamesIndexes(database);
 
     // ── Step 5: Clear names + backfill_status ──
-    // DROP + CREATE is orders of magnitude faster than DELETE on millions of rows.
-    std.log.info("Dropping and recreating names table...", .{});
-    try database.exec("DROP TABLE IF EXISTS names");
-    try database.exec(
-        \\CREATE TABLE names (
-        \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
-        \\  protocol TEXT NOT NULL,
-        \\  name TEXT NOT NULL,
-        \\  namehash TEXT NOT NULL,
-        \\  label TEXT NOT NULL,
-        \\  label_hash TEXT NOT NULL,
-        \\  parent_name TEXT NOT NULL,
-        \\  parent_namehash TEXT NOT NULL,
-        \\  registry TEXT NOT NULL,
-        \\  owner TEXT NOT NULL,
-        \\  resolver TEXT,
-        \\  token_id TEXT NOT NULL,
-        \\  canonical_id TEXT NOT NULL,
-        \\  token_version INTEGER NOT NULL,
-        \\  expiry INTEGER,
-        \\  registry_locked INTEGER NOT NULL DEFAULT 0,
-        \\  migrated INTEGER NOT NULL DEFAULT 0,
-        \\  created_block INTEGER NOT NULL,
-        \\  created_at INTEGER NOT NULL,
-        \\  updated_block INTEGER NOT NULL,
-        \\  updated_at INTEGER NOT NULL,
-        \\  is_wrapped INTEGER NOT NULL DEFAULT 0,
-        \\  wrapper_fuses TEXT DEFAULT NULL,
-        \\  wrapper_expiry INTEGER DEFAULT NULL,
-        \\  is_v1_name INTEGER NOT NULL DEFAULT 0,
-        \\  v1_label_hash TEXT DEFAULT NULL,
-        \\  registrant TEXT,
-        \\  registered_at INTEGER,
-        \\  UNIQUE(protocol, namehash)
-        \\)
-    );
-    // Keep the namehash index — it's the primary lookup key used during replay
-    try database.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_names_namehash ON names(namehash)");
+    // DELETE, not DROP+CREATE: the canonical names schema lives only in
+    // schema/schema.sql. A hand-maintained CREATE TABLE copy here drifted out of
+    // sync (missing columns -> every replay insert failed silently) and diverged
+    // on the unique key. Clearing rows keeps the real table, its
+    // UNIQUE(protocol, namehash) constraint (which insertName's upsert depends
+    // on), and every column. Bulk-load speed is preserved by the
+    // dropNamesIndexes/createNamesIndexes pair bracketing the reinsert.
+    // A full names rebuild invalidates the reorg undo-log, and the AFTER UPDATE/DELETE
+    // triggers on `names` (a protected table) would otherwise self-capture the entire
+    // rebuild into reorg_undo at the stale live cursor — this path now DELETEs rather
+    // than DROPs `names`, so the triggers stay live. Clear the cursor/active context +
+    // undo log first so the triggers no-op and no stale entries survive the rebuild.
+    try database.exec("DELETE FROM reorg_cursor");
+    try database.exec("DELETE FROM reorg_active");
+    try database.exec("DELETE FROM reorg_undo");
+
+    std.log.info("Clearing names table...", .{});
+    try database.exec("DELETE FROM names");
     try database.exec("DELETE FROM backfill_status");
 
     // ── Step 5: Bulk-load v1_labels into the in-memory cache ──
@@ -193,9 +174,10 @@ pub fn replayEventsToRebuildNames(self: *Indexer) !void {
     std.log.info("Recreating names indexes...", .{});
     try createNamesIndexes(database);
 
-    // Reinstall reorg undo-log triggers: DROP TABLE names (step 5) also dropped its
-    // triggers. Idempotent for the other protected tables. Replay itself sets no
-    // cursor, so the bulk rebuild above captured nothing.
+    // Ensure reorg undo-log triggers are installed (idempotent / first-run table
+    // creation). The bulk rebuild above captured nothing because step 5 cleared the
+    // cursor + active context before touching `names` (the triggers stay live now
+    // that we DELETE rather than DROP the table).
     try reorg_undo.installTriggers(database);
 
     // ── Step 8: Post-replay backfill passes ──
@@ -398,11 +380,7 @@ fn replayNewOwner(self: *Indexer, q: *Query) !void {
         parent_name_str = parent_record.name;
     }
 
-    // Construct full name
-    const full_name = if (parent_name_str) |pn|
-        try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label_str, pn })
-    else
-        try self.allocator.dupe(u8, label_str);
+    const full_name = try ens_name.join(self.allocator, label_str, parent_name_str);
     defer self.allocator.free(full_name);
 
     // Create or update
@@ -415,7 +393,8 @@ fn replayNewOwner(self: *Indexer, q: *Query) !void {
 
         const name_copy = try self.allocator.dupe(u8, full_name);
         const label_copy = try self.allocator.dupe(u8, label_str);
-        const parent_copy = if (parent_name_str) |pn| try self.allocator.dupe(u8, pn) else null;
+        // Root parent is the empty string, never null. See ens_name.ROOT_PARENT.
+        const parent_copy = try self.allocator.dupe(u8, parent_name_str orelse ens_name.ROOT_PARENT);
 
         var name = models.Name{
             .protocol = .v1,
@@ -430,7 +409,10 @@ fn replayNewOwner(self: *Indexer, q: *Query) !void {
             .registrant = owner,
             .resolver = Address.zero,
             .token_id = 0,
-            .canonical_id = 0,
+            // Parity with the live handler (handleV1NewOwner): V1 rows have no
+            // version bits, so the namehash is the canonical_id — replaying 0
+            // here would make canonical_id lookups ambiguous after a --backfill.
+            .canonical_id = std.mem.readInt(u256, &subdomain_namehash.bytes, .big),
             .token_version = 0,
             .expiry = 0,
             .registry_locked = false,
@@ -728,8 +710,10 @@ fn createNamesIndexes(database: *db_module.Database) !void {
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_is_wrapped ON names(is_wrapped)");
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_is_v1_name ON names(is_v1_name)");
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_wrapper_expiry ON names(wrapper_expiry)");
-    // Keep namehash unique index (primary lookup key, always needed)
-    try database.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_names_namehash ON names(namehash)");
+    // Namehash lookup index — non-unique, matching schema/schema.sql (the
+    // table's UNIQUE(protocol, namehash) is the real key; namehash alone is not
+    // unique across protocols for V1->V2 migrated names).
+    try database.exec("CREATE INDEX IF NOT EXISTS idx_names_namehash ON names(namehash)");
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_token_id ON names(token_id)");
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_canonical_id ON names(canonical_id)");
     const elapsed = std.time.milliTimestamp() - timer;
