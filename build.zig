@@ -20,12 +20,15 @@ pub fn build(b: *std.Build) void {
     });
     const eth_module = eth_dep.module("eth");
 
-    // PostgreSQL driver dependency (Phase 4). TLS is opt-in (off by default → no
-    // openssl/libc linkage), which suits a local/containerized test Postgres.
-    const pg_dep = b.dependency("pg", .{
-        .target = target,
-        .optimize = optimize,
-    });
+    // PostgreSQL driver dependency (Phase 4). TLS is opt-in via -Dpg-tls: when set,
+    // pg.zig links OpenSSL (system libssl/libcrypto) so the driver can negotiate TLS,
+    // which managed Postgres (e.g. Neon) requires. Off by default → no openssl linkage,
+    // suiting a local/containerized non-TLS Postgres and the SQLite-only builds.
+    const pg_tls = b.option(bool, "pg-tls", "Link OpenSSL into the Postgres driver for TLS (required for Neon/managed Postgres)") orelse false;
+    const pg_dep = if (pg_tls)
+        b.dependency("pg", .{ .target = target, .optimize = optimize, .openssl_lib_name = @as([]const u8, "ssl") })
+    else
+        b.dependency("pg", .{ .target = target, .optimize = optimize });
     const pg_module = pg_dep.module("pg");
 
     // Create GraphQL library module for use by test files
