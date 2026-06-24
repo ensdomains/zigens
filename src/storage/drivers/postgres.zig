@@ -155,6 +155,16 @@ const max_connect_attempts: u32 = 5;
 
 /// Open a PostgreSQL backend: one pinned connection from a size-1 pool. Caller owns
 /// the returned `Backend` and must `close` it via `vtable.close`.
+// Operational safeguard knob: bound every statement so a stuck query (lock wait, a
+// dropped managed-PG connection, or a transaction-mode pooler stall) fails loudly
+// instead of hanging forever. Seconds; default 120, 0 disables. Read here (not via
+// Config) to keep it a self-contained driver concern with no config/test churn.
+fn statementTimeoutSecs(allocator: std.mem.Allocator) u32 {
+    const v = std.process.getEnvVarOwned(allocator, "DATABASE_STATEMENT_TIMEOUT") catch return 120;
+    defer allocator.free(v);
+    return std.fmt.parseInt(u32, std.mem.trim(u8, v, " \t\r\n"), 10) catch 120;
+}
+
 pub fn open(allocator: std.mem.Allocator, opts: ConnectOpts) !backend.Backend {
     // Own the connection params (pg.Pool borrows them) — freed in close() after teardown.
     const host = try allocator.dupe(u8, opts.host);
@@ -201,6 +211,18 @@ pub fn open(allocator: std.mem.Allocator, opts: ConnectOpts) !backend.Backend {
     const conn = try pool.acquire();
     errdefer pool.release(conn);
 
+    // Bound statement runtime so a stuck query fails loudly (see statementTimeoutSecs).
+    // Non-fatal: on a transaction-mode pooler a session SET may not persist — the real
+    // fix there is a session/direct endpoint — but a failed SET must not block startup.
+    const stmt_timeout_s = statementTimeoutSecs(allocator);
+    if (stmt_timeout_s > 0) {
+        var tbuf: [64]u8 = undefined;
+        const tsql = std.fmt.bufPrint(&tbuf, "SET statement_timeout = {d}", .{@as(u64, stmt_timeout_s) * 1000}) catch unreachable;
+        _ = conn.exec(tsql, .{}) catch |err| {
+            std.log.warn("postgres: could not set statement_timeout ({d}s): {}", .{ stmt_timeout_s, err });
+        };
+    }
+
     const self = try allocator.create(PgConn);
     self.* = .{
         .allocator = allocator,
@@ -239,6 +261,12 @@ fn execRaw(ctx: *anyopaque, sql: []const u8) anyerror!void {
     // Parameterless DDL/DML; the simple-query protocol handles multi-statement input
     // and drains itself.
     _ = self.conn.exec(sql, .{}) catch |err| {
+        if (err == error.PG) {
+            if (self.conn.err) |e| {
+                std.log.err("postgres execRaw failed [{s} {s}]: {s}\nSQL: {s}", .{ e.severity, e.code, e.message, sql });
+                return error.ExecFailed;
+            }
+        }
         std.log.err("postgres execRaw failed: {}\nSQL: {s}", .{ err, sql });
         return error.ExecFailed;
     };
@@ -408,8 +436,31 @@ inline fn asStmt(ctx: *anyopaque) *PgStmt {
 }
 
 fn recordErr(self: *PgStmt, comptime fmt: []const u8, args: anytype) void {
-    const msg = std.fmt.bufPrint(&self.last_err, fmt, args) catch "postgres error";
+    const cap = self.last_err.len - 1; // reserve a slot for the NUL terminator
+    const msg = std.fmt.bufPrint(self.last_err[0..cap], fmt, args) catch self.last_err[0..cap];
     self.last_err_len = msg.len;
+    self.last_err[self.last_err_len] = 0; // NUL-terminate so lastError() returns a valid [:0]
+}
+
+// Capture the real Postgres error behind `error.PG` — SQLSTATE + message, plus the
+// constraint/detail when present — which pg.zig parses into conn.err, into last_err so
+// the storage layer's "Failed to {execute,step} query: {s}" log (via lastError(), in
+// backend.zig) is diagnosable instead of the opaque "postgres statement error". Records
+// only (no logging) so the raw exec()/step() vtable stays log-silent — the Statement
+// wrappers do the logging. Non-PG errors (bind/protocol/io) fall back to the Zig tag.
+fn recordPgErr(self: *PgStmt, comptime op: []const u8, err: anyerror) void {
+    if (err == error.PG) {
+        if (self.conn.err) |e| {
+            if (e.constraint) |c|
+                recordErr(self, op ++ ": {s} (SQLSTATE {s}, constraint {s})", .{ e.message, e.code, c })
+            else if (e.detail) |d|
+                recordErr(self, op ++ ": {s} (SQLSTATE {s}) — {s}", .{ e.message, e.code, d })
+            else
+                recordErr(self, op ++ ": {s} (SQLSTATE {s})", .{ e.message, e.code });
+            return;
+        }
+    }
+    recordErr(self, op ++ ": {}", .{err});
 }
 
 fn bindText(ctx: *anyopaque, idx: c_int, ptr: [*]const u8, len: usize) bool {
@@ -559,7 +610,7 @@ fn doExec(self: *PgStmt) !void {
 fn exec(ctx: *anyopaque) bool {
     const self = asStmt(ctx);
     doExec(self) catch |err| {
-        recordErr(self, "execute: {}", .{err});
+        recordPgErr(self, "exec", err);
         return false;
     };
     return true; // connection drained back to idle; affected-row count captured
@@ -568,7 +619,7 @@ fn exec(ctx: *anyopaque) bool {
 fn step(ctx: *anyopaque) StepOutcome {
     const self = asStmt(ctx);
     doExecute(self) catch |err| {
-        recordErr(self, "execute: {}", .{err});
+        recordPgErr(self, "step", err);
         return .failed;
     };
     if (self.cursor >= self.rows.len) {
@@ -624,9 +675,9 @@ fn columnInt(ctx: *anyopaque, col: c_int) i32 {
 fn lastError(ctx: *anyopaque) [:0]const u8 {
     const self = asStmt(ctx);
     if (self.last_err_len == 0) return "";
-    // The buffer isn't sentinel-terminated; return a fixed message slice instead of
-    // risking an unterminated [:0] cast. Detailed errors are already logged.
-    return "postgres statement error";
+    // recordErr() NUL-terminates last_err at last_err_len, so this [:0] slice is valid.
+    // Carries the real Postgres error (SQLSTATE + message) for the storage-layer logs.
+    return self.last_err[0..self.last_err_len :0];
 }
 
 fn reset(ctx: *anyopaque) void {

@@ -25,6 +25,9 @@ services:
       - DATABASE_BACKEND=${DATABASE_BACKEND:-}
       - DATABASE_URL=${DATABASE_URL:-}
       - DATABASE_POOL_SIZE=${DATABASE_POOL_SIZE:-8}
+      # Postgres only: bound per-statement runtime (seconds) so a stuck query fails
+      # loudly instead of hanging forever; 0 disables. Raise for heavy bulk reindexes.
+      - DATABASE_STATEMENT_TIMEOUT=${DATABASE_STATEMENT_TIMEOUT:-120}
       - RAINBOW_PATH=/app/data/ens_rainbow.db
       - DOWNLOAD_RAINBOW=true
       - RPC_URL=${RPC_URL}
@@ -75,6 +78,9 @@ services:
       - DATABASE_BACKEND=${DATABASE_BACKEND:-}
       - DATABASE_URL=${DATABASE_URL:-}
       - DATABASE_POOL_SIZE=${DATABASE_POOL_SIZE:-8}
+      # Postgres only: bound per-statement runtime (seconds) so a stuck query fails
+      # loudly instead of hanging forever; 0 disables. Raise for heavy bulk reindexes.
+      - DATABASE_STATEMENT_TIMEOUT=${DATABASE_STATEMENT_TIMEOUT:-120}
       - RAINBOW_PATH=/app/data/ens_rainbow.db
       - DOWNLOAD_RAINBOW=false
       - API_PORT=5656

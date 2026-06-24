@@ -196,6 +196,11 @@ test "postgres driver: failed execute frees the statement and leaves the connect
         // Call the raw vtable exec (returns false, records to a buffer) rather than
         // Statement.exec(), whose std.log.err on failure would trip the test runner.
         try testing.expect(!st.vtable.exec(st.ctx));
+        // lastError() must surface the real Postgres error (SQLSTATE + message), not a
+        // placeholder — this is what the storage-layer logs print in production.
+        const errmsg = st.vtable.lastError(st.ctx);
+        try testing.expect(std.mem.indexOf(u8, errmsg, "23505") != null);
+        try testing.expect(std.mem.indexOf(u8, errmsg, "duplicate key") != null);
     }
 
     // Connection recovered (peekForError consumed ReadyForQuery): a fresh op works.
