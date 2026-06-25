@@ -431,7 +431,7 @@ pub fn handleV1NewResolver(self: *Indexer, protocol: models.Protocol, log: rpc.L
     } else {
         std.log.debug("V1 NewResolver: no Name row for node={s} — skipping resolver update (auto-create disabled, see comment)", .{node_hex});
     }
-    try self.database.registerResolver(protocol, resolver_hex, log.block_number);
+    try self.registerResolverOnce(protocol, resolver_hex, log.block_number);
 
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"node\":\"{s}\",\"resolver\":\"{s}\"}}", .{
         node_hex, resolver_hex,
