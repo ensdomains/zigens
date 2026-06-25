@@ -354,6 +354,20 @@ pub fn registerSubregistry(
     try q.exec();
 }
 
+/// The earliest block at which `address` exists as a registry for `protocol` — i.e. the
+/// lower bound for any event it could have emitted (a contract emits nothing before it is
+/// created). Used to scope subregistry backfill to [created_block, …] instead of the
+/// indexer's start_block, which would scan millions of provably-empty pre-creation blocks.
+/// Returns 0 if the address isn't a known registry (caller falls back to start_block).
+pub fn getSubregistryCreatedBlock(db: *Database, protocol: models.Protocol, address: []const u8) !u64 {
+    var q = try Query.initCached(db, "SELECT COALESCE(MIN(created_block), 0) FROM registries WHERE protocol = ? AND address = ?");
+    defer q.deinit();
+    try q.bindTextStatic(protocol.toString());
+    try q.bindText(address);
+    if (try q.step()) return @intCast(q.getInt64(0));
+    return 0;
+}
+
 /// Register or update a known resolver
 pub fn registerResolver(db: *Database, protocol: models.Protocol, address: []const u8, block_number: u64) !void {
     const sql = try std.fmt.allocPrint(db.allocator,

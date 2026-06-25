@@ -26,16 +26,22 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
     // When a subregistry is first registered via SubregistryUpdate, it may have already emitted events
     // (e.g. NameRegistered, EACRolesGranted during initialization) that we missed. Fetch those now.
     if (discovery.newly_discovered.len > 0 and from_block > 0) {
-        const backfill_from = self.config.start_block;
-        std.log.info("Backfilling {d} newly discovered subregistr{s} from block {d} to {d}", .{
+        const backfill_to = from_block - 1;
+        std.log.info("Backfilling {d} newly discovered subregistr{s} (up to block {d})", .{
             discovery.newly_discovered.len,
             if (discovery.newly_discovered.len == 1) "y" else "ies",
-            backfill_from,
-            from_block - 1,
+            backfill_to,
         });
         for (discovery.newly_discovered) |subreg_str| {
             const addr = Address.fromHex(subreg_str) catch continue;
-            backfillSubregistryEvents(self, protocol, client, addr, backfill_from, from_block - 1) catch |err| {
+            // Scope to the subregistry's own creation block, not the indexer's start_block:
+            // a contract emits no events before it exists, so [start_block, created_block)
+            // is millions of provably-empty blocks of wasted getLogs. Fall back to
+            // start_block if the created_block is unknown (0). backfillSubregistryEvents
+            // short-circuits a from>to range (subregistry created in/after this batch).
+            const created = self.database.getSubregistryCreatedBlock(protocol, subreg_str) catch 0;
+            const backfill_from = @max(self.config.start_block, created);
+            backfillSubregistryEvents(self, protocol, client, addr, backfill_from, backfill_to) catch |err| {
                 std.log.warn("Failed to backfill subregistry {s}: {}", .{ subreg_str, err });
             };
         }

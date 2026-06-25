@@ -459,17 +459,20 @@ pub const Database = struct {
     /// Keeps only indexes required for sync lookup operations:
     /// - UNIQUE constraints (built into table defs, can't be dropped)
     /// - idx_names_namehash, idx_names_token_id, idx_names_canonical_id (handler lookups)
+    /// - idx_events_name (the in-place event name-patch matches events by name)
     /// - idx_v1_labels_*, idx_v1_controllers_active (V1 handler lookups)
     /// - idx_registries_*, idx_known_*_last_indexed, idx_orphaned_* (sync tracking)
     /// - idx_block_hashes_timestamp (block tracking)
     pub fn dropSyncIndexes(self: *Database) !void {
         std.log.info("Dropping non-essential indexes for bulk sync...", .{});
 
-        // Events table: drop all 8 indexes (none needed during sync)
+        // Events table: drop 7 of 8 indexes. KEEP idx_events_name — the per-event
+        // placeholder patch (updatePlaceholderEventsByName: `UPDATE events ... WHERE
+        // name = ?`) runs throughout sync; without this index it degrades to a full
+        // seq scan over the growing events table, i.e. O(n^2) across a bulk sync.
         try self.exec("DROP INDEX IF EXISTS idx_events_protocol");
         try self.exec("DROP INDEX IF EXISTS idx_events_type");
         try self.exec("DROP INDEX IF EXISTS idx_events_block");
-        try self.exec("DROP INDEX IF EXISTS idx_events_name");
         try self.exec("DROP INDEX IF EXISTS idx_events_namehash");
         try self.exec("DROP INDEX IF EXISTS idx_events_contract_address");
         try self.exec("DROP INDEX IF EXISTS idx_events_protocol_type_block");
@@ -778,6 +781,7 @@ pub const Database = struct {
     pub const registerSubregistry = sync.registerSubregistry;
     pub const registerResolver = sync.registerResolver;
     pub const discoverAndGetSubregistries = sync.discoverAndGetSubregistries;
+    pub const getSubregistryCreatedBlock = sync.getSubregistryCreatedBlock;
     pub const deleteDataAfterBlock = sync.deleteDataAfterBlock;
     pub const OrphanedRegistration = sync.OrphanedRegistration;
     pub const insertOrphanedRegistration = sync.insertOrphanedRegistration;
