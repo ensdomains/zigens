@@ -1937,7 +1937,7 @@ pub fn handleResolverUpdated(self: *Indexer, protocol: models.Protocol, log: rpc
     // Register the resolver for record indexing
     var resolver_hex_buf: [42]u8 = undefined;
     const resolver_hex = resolver_addr.toHexBuf(&resolver_hex_buf);
-    try self.database.registerResolver(protocol, resolver_hex, log.block_number);
+    try self.registerResolverOnce(protocol, resolver_hex, log.block_number);
 
     const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
 

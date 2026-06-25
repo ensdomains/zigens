@@ -48,6 +48,18 @@ pub const Indexer = struct {
     v1_active_controllers: ?[]Address = null,
     // Cached V1 token_id → label mappings (populated on miss from DB)
     v1_label_cache: std.StringHashMap([]const u8),
+    // In-memory dedup of registered resolvers (membership-only — known_resolvers'
+    // last_indexed_block is never read), so the same resolver isn't re-upserted on
+    // every ResolverUpdated/NewResolver. See registerResolverOnce.
+    known_resolver_cache: std.StringHashMap(void),
+    // In-memory dedup of account observations per (protocol,address) this run: accounts'
+    // first_seen is a MIN and seen_v1/seen_v2 are MAX, and the indexer processes forward,
+    // so re-upserting an already-seen address is a no-op. Cleared on batch rollback.
+    account_obs_cache: std.StringHashMap(void),
+    // Per-batch namehash→name read cache: resolver events cluster many lookups on the
+    // same few names; dedups getNameFromNamehash within a batch (cleared per batch to
+    // pick up placeholder→real name patches). Values are owned.
+    name_by_namehash_cache: std.AutoHashMap(Hash, []const u8),
     // Track block hash from processed logs to avoid extra getBlockByNumber RPC calls
     last_seen_block_hash: ?Hash = null,
     last_seen_block_number: u64 = 0,
@@ -55,6 +67,11 @@ pub const Indexer = struct {
     // so `markEventBlock` only writes on a change (avoids a per-event upsert). -1 = unset.
     reorg_cursor_block: i64 = -1,
     reorg_cursor_proto: i8 = -1,
+    // Reorg undo capture is armed only near the chain tip (within REORG_ARM_WINDOW of the
+    // head). Bulk-sync blocks are finalized and cannot reorg, so leaving the cursor unarmed
+    // there makes the AFTER UPDATE/DELETE triggers skip capture — eliminating the reorg_undo
+    // writes + trigger work for the millions of old blocks in a backfill.
+    reorg_arm: bool = true,
     // Write buffer for batching DB operations during chunk processing
     write_buffer: WriteBuffer,
     // Rainbow table for resolving labelhashes to labels (optional)
@@ -146,6 +163,9 @@ pub const Indexer = struct {
             .status_server = status_server,
             .block_timestamp_cache = std.AutoHashMap(u64, i64).init(allocator),
             .v1_label_cache = std.StringHashMap([]const u8).init(allocator),
+            .known_resolver_cache = std.StringHashMap(void).init(allocator),
+            .account_obs_cache = std.StringHashMap(void).init(allocator),
+            .name_by_namehash_cache = std.AutoHashMap(Hash, []const u8).init(allocator),
             .write_buffer = WriteBuffer.init(allocator),
             .rainbow = rainbow,
             .eth_namehash = try @import("../types/hash.zig").namehash(allocator, "eth"),
@@ -239,6 +259,9 @@ pub const Indexer = struct {
             .status_server = status_server,
             .block_timestamp_cache = std.AutoHashMap(u64, i64).init(allocator),
             .v1_label_cache = std.StringHashMap([]const u8).init(allocator),
+            .known_resolver_cache = std.StringHashMap(void).init(allocator),
+            .account_obs_cache = std.StringHashMap(void).init(allocator),
+            .name_by_namehash_cache = std.AutoHashMap(Hash, []const u8).init(allocator),
             .write_buffer = WriteBuffer.init(allocator),
             .rainbow = rainbow,
             .eth_namehash = try @import("../types/hash.zig").namehash(allocator, "eth"),
@@ -282,6 +305,53 @@ pub const Indexer = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.v1_label_cache.deinit();
+
+        // Free cached resolver-dedup keys
+        var rk_it = self.known_resolver_cache.keyIterator();
+        while (rk_it.next()) |k| self.allocator.free(k.*);
+        self.known_resolver_cache.deinit();
+
+        // Free cached account-dedup keys
+        var ak_it = self.account_obs_cache.keyIterator();
+        while (ak_it.next()) |k| self.allocator.free(k.*);
+        self.account_obs_cache.deinit();
+
+        // Free cached namehash→name values
+        var nv_it = self.name_by_namehash_cache.valueIterator();
+        while (nv_it.next()) |v| self.allocator.free(v.*);
+        self.name_by_namehash_cache.deinit();
+    }
+
+    /// Register a resolver as known, deduplicated in-memory: the first observation per
+    /// (protocol, address) this run does the DB upsert; later observations are skipped.
+    /// `known_resolvers` is membership-only (its `last_indexed_block` is never read), so
+    /// skipping is safe and removes the bulk of per-event resolver upserts during sync.
+    pub fn registerResolverOnce(self: *Indexer, protocol: models.Protocol, address_hex: []const u8, block_number: u64) !void {
+        var key_buf: [64]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}:{s}", .{ protocol.toString(), address_hex }) catch address_hex;
+        if (self.known_resolver_cache.contains(key)) return;
+        try self.database.registerResolver(protocol, address_hex, block_number);
+        const key_copy = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(key_copy);
+        try self.known_resolver_cache.put(key_copy, {});
+    }
+
+    /// Drop the in-memory resolver dedup cache. MUST be called whenever a batch
+    /// transaction is rolled back: the rollback also reverts any known_resolvers inserts
+    /// the batch made, so a cached-but-reverted resolver would otherwise be skipped
+    /// forever and never re-inserted (membership loss). Cheap to rebuild.
+    pub fn clearKnownResolverCache(self: *Indexer) void {
+        var it = self.known_resolver_cache.keyIterator();
+        while (it.next()) |k| self.allocator.free(k.*);
+        self.known_resolver_cache.clearRetainingCapacity();
+    }
+
+    /// Drop the in-memory account-observation dedup cache. Like clearKnownResolverCache,
+    /// MUST run on batch rollback so reverted account upserts get re-applied next pass.
+    pub fn clearAccountObsCache(self: *Indexer) void {
+        var it = self.account_obs_cache.keyIterator();
+        while (it.next()) |k| self.allocator.free(k.*);
+        self.account_obs_cache.clearRetainingCapacity();
     }
 
     /// Invalidate the cached active controllers list (call after ControllerAdded/Removed)
@@ -403,7 +473,20 @@ pub const Indexer = struct {
     /// column instead of the full 21-column Name row, since the caller only needs
     /// the string. Saves per-event allocation/dupe overhead during reverse resolution.
     pub fn getNameFromNamehash(self: *Indexer, namehash: Hash) ?[]const u8 {
-        return self.database.getNameStringByNamehash(namehash, self.allocator) catch null;
+        // Per-batch read cache: resolver events cluster many lookups on the same name.
+        // Cache HITS only (non-null) and return an owned dupe (caller frees) so the cache
+        // keeps its own copy. The cache is cleared each batch (indexBlockRange) so a
+        // placeholder→real name patch is picked up on the next batch.
+        if (self.name_by_namehash_cache.get(namehash)) |cached| {
+            return self.allocator.dupe(u8, cached) catch null;
+        }
+        const name = (self.database.getNameStringByNamehash(namehash, self.allocator) catch null) orelse return null;
+        const copy = self.allocator.dupe(u8, name) catch return name;
+        self.name_by_namehash_cache.put(namehash, copy) catch {
+            self.allocator.free(copy);
+            return name;
+        };
+        return name;
     }
 
     // Helper methods to eliminate protocol-specific conditionals
@@ -847,6 +930,7 @@ pub const Indexer = struct {
     /// upsert per block, not per event. Capture failure must not abort indexing — a
     /// missed cursor only degrades reorg-rollback precision, so errors are logged.
     pub fn markEventBlock(self: *Indexer, protocol: models.Protocol, block_number: u64) void {
+        if (!self.reorg_arm) return; // bulk sync: finalized blocks can't reorg — skip capture
         const proto_i: i8 = @intCast(@intFromEnum(protocol));
         if (self.reorg_cursor_block == @as(i64, @intCast(block_number)) and self.reorg_cursor_proto == proto_i) return;
         reorg_undo.setCursor(self.database, protocol, block_number) catch |err| {
@@ -985,12 +1069,27 @@ pub const Indexer = struct {
         // Starts at configured size, halves on RPC response size errors, grows back on success
         var current_batch_size = self.config.batch_size;
         const ABSOLUTE_MIN_BATCH: u64 = 100;
+        // Arm reorg undo capture only within this many blocks of the head. Must exceed the
+        // deepest realistic reorg (Ethereum finality is ~64-128 blocks); 1000 is a wide
+        // safety margin while still skipping capture for the millions of bulk-sync blocks.
+        const REORG_ARM_WINDOW: u64 = 1000;
         var from_block = last_synced + 1;
         var blocks_indexed: u64 = 0;
 
         while (from_block <= target_block and !self.should_stop.load(.acquire)) {
             const to_block = @min(from_block + current_batch_size - 1, target_block);
             const batch_blocks = to_block - from_block + 1;
+
+            // Arm reorg capture only near the tip; far-from-head batches are finalized and
+            // can't reorg, so skip capturing their undo (the dominant DB write during bulk
+            // sync). On the bulk-sync side, clear any stale cursor an earlier near-tip run
+            // may have left armed so the triggers don't capture against it.
+            self.reorg_arm = target_block - to_block < REORG_ARM_WINDOW;
+            if (!self.reorg_arm and self.reorg_cursor_block != -1) {
+                reorg_undo.clearCursor(self.database, protocol) catch |err|
+                    std.log.warn("reorg undo-log: failed to clear stale cursor: {}", .{err});
+                self.invalidateReorgCursor();
+            }
 
             // Rate limit RPC calls to avoid hitting provider limits
             self.rate_limiter.acquire();
@@ -1018,6 +1117,10 @@ pub const Indexer = struct {
                 // The reverted transaction included this batch's setCursor writes; drop the
                 // in-memory mirror so the smaller-batch retry re-arms the cursor per block.
                 self.invalidateReorgCursor();
+                // The rolled-back batch reverted its known_resolvers + accounts inserts;
+                // drop those dedup caches so the entries get re-inserted on retry.
+                self.clearKnownResolverCache();
+                self.clearAccountObsCache();
 
                 if ((err == error.RpcError or err == error.StreamTooLong) and current_batch_size > ABSOLUTE_MIN_BATCH) {
                     current_batch_size = @max(ABSOLUTE_MIN_BATCH, current_batch_size / 2);
@@ -1094,6 +1197,13 @@ pub const Indexer = struct {
     }
 
     fn indexBlockRange(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64, to_block: u64) !void {
+        // Per-batch namehash→name read cache: clear each batch to pick up name patches.
+        {
+            var nv_it = self.name_by_namehash_cache.valueIterator();
+            while (nv_it.next()) |v| self.allocator.free(v.*);
+            self.name_by_namehash_cache.clearRetainingCapacity();
+        }
+
         // IMPORTANT: Process events in dependency order:
         // 1. First create names (NameRegistered, NewSubname)
         // 2. Then modify names (SubregistryUpdate, ResolverUpdate, Transfer)

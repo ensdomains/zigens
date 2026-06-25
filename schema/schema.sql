@@ -181,6 +181,11 @@ CREATE INDEX IF NOT EXISTS idx_names_label ON names(label);
 CREATE INDEX IF NOT EXISTS idx_names_owner ON names(owner);
 CREATE INDEX IF NOT EXISTS idx_names_token_id ON names(token_id);
 CREATE INDEX IF NOT EXISTS idx_names_canonical_id ON names(canonical_id);
+-- getNameByTokenIdAndRegistry filters (canonical_id, registry); a popular label's
+-- canonical_id appears in many registries, so the single-column index leaves a per-row
+-- `registry` Filter (EXPLAIN confirmed). This compound index makes registry an Index
+-- Cond. Kept through bulk sync (handler lookup), like idx_names_canonical_id.
+CREATE INDEX IF NOT EXISTS idx_names_canonical_id_registry ON names(canonical_id, registry);
 CREATE INDEX IF NOT EXISTS idx_names_expiry ON names(expiry);
 CREATE INDEX IF NOT EXISTS idx_names_expiry_effective ON names(expiry_effective);
 CREATE INDEX IF NOT EXISTS idx_names_registry ON names(protocol, registry);

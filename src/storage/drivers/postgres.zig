@@ -85,6 +85,7 @@ const PgConn = struct {
     allocator: std.mem.Allocator,
     pool: *pg.Pool,
     conn: *pg.Conn, // single writer connection, pinned for this Backend's lifetime
+    stmt_cache: bool, // reuse server-side prepared statements (DATABASE_STMT_CACHE)
     // Owned copies of the connection params. pg.Pool only copies the opts STRUCT, not the
     // strings (it dupes host only when TLS is on), so it borrows these for its lifetime —
     // we own them here and free them in close() after the pool is torn down. This makes
@@ -165,6 +166,37 @@ fn statementTimeoutSecs(allocator: std.mem.Allocator) u32 {
     return std.fmt.parseInt(u32, std.mem.trim(u8, v, " \t\r\n"), 10) catch 120;
 }
 
+// Server-side prepared-statement reuse (see preparePossiblyCached). On by default; set
+// DATABASE_STMT_CACHE=0/false/off to disable (kill-switch — it reaches into pinned
+// pg.zig internals). Caps the per-connection cache so dynamically-built cached SQL can't
+// grow it unbounded; beyond the cap, statements fall back to one-shot prepares.
+const MAX_CACHED_STMTS: usize = 1024;
+
+fn stmtCacheEnabled(allocator: std.mem.Allocator) bool {
+    const v = std.process.getEnvVarOwned(allocator, "DATABASE_STMT_CACHE") catch return true;
+    defer allocator.free(v);
+    const t = std.mem.trim(u8, v, " \t\r\n");
+    return !(std.ascii.eqlIgnoreCase(t, "0") or std.ascii.eqlIgnoreCase(t, "false") or std.ascii.eqlIgnoreCase(t, "off"));
+}
+
+// synchronous_commit knob: bulk indexing can trade per-commit WAL durability for speed on
+// a remote/managed PG. DATABASE_SYNCHRONOUS_COMMIT = on|off|local|remote_write|remote_apply;
+// unset/blank leaves the server default (on). Safe for an indexer — it re-syncs from the
+// chain on restart, so a lost just-committed batch is simply re-indexed. Returns a static
+// (canonical) slice so it needs no ownership; null = don't touch the setting.
+fn synchronousCommitSetting(allocator: std.mem.Allocator) ?[]const u8 {
+    const v = std.process.getEnvVarOwned(allocator, "DATABASE_SYNCHRONOUS_COMMIT") catch return null;
+    defer allocator.free(v);
+    const t = std.mem.trim(u8, v, " \t\r\n");
+    if (t.len == 0) return null;
+    const allowed = [_][]const u8{ "on", "off", "local", "remote_write", "remote_apply" };
+    for (allowed) |a| {
+        if (std.ascii.eqlIgnoreCase(t, a)) return a;
+    }
+    std.log.warn("postgres: ignoring invalid DATABASE_SYNCHRONOUS_COMMIT='{s}' (use on|off|local|remote_write|remote_apply)", .{t});
+    return null;
+}
+
 pub fn open(allocator: std.mem.Allocator, opts: ConnectOpts) !backend.Backend {
     // Own the connection params (pg.Pool borrows them) — freed in close() after teardown.
     const host = try allocator.dupe(u8, opts.host);
@@ -223,11 +255,21 @@ pub fn open(allocator: std.mem.Allocator, opts: ConnectOpts) !backend.Backend {
         };
     }
 
+    // Optional durability/speed trade-off for bulk sync (see synchronousCommitSetting).
+    if (synchronousCommitSetting(allocator)) |sc| {
+        var scbuf: [64]u8 = undefined;
+        const scsql = std.fmt.bufPrint(&scbuf, "SET synchronous_commit = {s}", .{sc}) catch unreachable;
+        _ = conn.exec(scsql, .{}) catch |err| {
+            std.log.warn("postgres: could not set synchronous_commit={s}: {}", .{ sc, err });
+        };
+    }
+
     const self = try allocator.create(PgConn);
     self.* = .{
         .allocator = allocator,
         .pool = pool,
         .conn = conn,
+        .stmt_cache = stmtCacheEnabled(allocator),
         .host = host,
         .username = username,
         .password = password,
@@ -342,14 +384,57 @@ fn introspectColumns(ctx: *anyopaque, allocator: std.mem.Allocator, table: []con
     return list.toOwnedSlice(allocator);
 }
 
+// Reuse server-side prepared statements for `cached` queries, keyed by a hash of the
+// (already `?`→`$N` renumbered) SQL in pg.zig's per-connection cache. A cache HIT skips
+// the Parse+Describe round-trip and the server re-plan, ~halving round-trips per
+// statement — the dominant cost against a remote DB. pg.zig only wires this caching into
+// its inline-values API (queryOpts); our incremental-bind path replicates that exact flow
+// here. Gated by DATABASE_STMT_CACHE; the cache is bounded by MAX_CACHED_STMTS and freed
+// with the connection (pg.Conn.deinit frees _prepared_statements).
+fn preparePossiblyCached(self: *PgConn, sql: []const u8, cached: bool) !pg.Stmt {
+    const conn = self.conn;
+    if (!cached or !self.stmt_cache) return conn.prepare(sql);
+
+    var name_buf: [18]u8 = undefined; // 'z' + up to 16 hex digits
+    const name = std.fmt.bufPrint(&name_buf, "z{x}", .{std.hash.Wyhash.hash(0, sql)}) catch
+        return conn.prepare(sql);
+
+    if (conn._prepared_statements.getEntry(name)) |entry| {
+        // HIT: re-execute the already-prepared statement (no Parse). `entry.key_ptr` is
+        // the cache-owned name (lives with the entry) so the Stmt's `.name` won't dangle.
+        var stmt = try pg.Stmt.fromDescribe(conn, entry.value_ptr, .{ .cache_name = entry.key_ptr.* });
+        errdefer stmt.deinit();
+        try conn._reader.startFlow(stmt.arena.allocator(), null);
+        try conn.write(&.{ 'S', 0, 0, 0, 4 }); // Sync
+        stmt.buf.reset();
+        try stmt.prepareForBind(@intCast(entry.value_ptr.param_oids.len));
+        return stmt;
+    }
+
+    // MISS: keep the cache bounded; beyond the cap fall back to a one-shot prepare.
+    if (conn._prepared_statements.count() >= MAX_CACHED_STMTS) return conn.prepare(sql);
+    var stmt = try pg.Stmt.init(conn, .{ .cache_name = name });
+    errdefer stmt.deinit();
+    var describe_arena = std.heap.ArenaAllocator.init(conn._allocator);
+    errdefer describe_arena.deinit();
+    try stmt.prepare(sql, describe_arena.allocator());
+    const owned_name = try describe_arena.allocator().dupe(u8, name);
+    try conn._prepared_statements.put(conn._allocator, owned_name, .{
+        .param_oids = stmt.param_oids,
+        .arena = describe_arena,
+        .result_state = stmt.result_state,
+    });
+    stmt.name = owned_name; // re-point off the stack buffer to the cache-owned copy
+    return stmt;
+}
+
 fn prepare(ctx: *anyopaque, sql: []const u8, cached: bool) anyerror!Statement {
-    _ = cached; // PG re-prepares each call (no client-side reuse); server cache is future work.
     const self = asConn(ctx);
 
     const renumbered = try pg_dialect_mod.renumberPlaceholders(self.allocator, sql);
     errdefer self.allocator.free(renumbered);
 
-    var stmt = self.conn.prepare(renumbered) catch |err| {
+    var stmt = preparePossiblyCached(self, renumbered, cached) catch |err| {
         // warn, not err: the caller receives error.PrepareFailed and reports with
         // its own context (and the conformance suite exercises this path — the
         // default test runner fails any test that emits an err-level log).

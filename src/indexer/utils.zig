@@ -18,12 +18,23 @@ pub fn recordAccountObservation(self: *Indexer, protocol: models.Protocol, addr:
     if (addr.isZero()) return;
     var addr_buf: [42]u8 = undefined;
     const addr_hex = addr.toHexBuf(&addr_buf);
+    // Dedup per (protocol, address) this run: after first sight the upsert is a no-op
+    // (first_seen is a MIN, seen_v1/seen_v2 are MAX, and processing is forward). This
+    // also skips the getBlockTimestamp call (which can cost an RPC). See account_obs_cache.
+    var key_buf: [48]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}:{s}", .{ protocol.toString(), addr_hex }) catch addr_hex;
+    if (self.account_obs_cache.contains(key)) return;
     self.database.upsertAccount(
         protocol,
         addr_hex,
         log.block_number,
         self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-    ) catch |err| std.log.debug("upsertAccount failed: {}", .{err});
+    ) catch |err| {
+        std.log.debug("upsertAccount failed: {}", .{err});
+        return; // don't cache on failure — retry on the next observation
+    };
+    const key_copy = self.allocator.dupe(u8, key) catch return;
+    self.account_obs_cache.put(key_copy, {}) catch self.allocator.free(key_copy);
 }
 
 /// Construct a models.Event from common log fields and emit it via insertEventAndNotify.

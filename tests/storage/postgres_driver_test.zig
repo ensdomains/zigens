@@ -667,3 +667,57 @@ test "postgres driver: parseUrl extracts sslmode, host, port (Neon-style + local
     try testing.expectEqual(@as(u16, 5433), local.port);
     try testing.expectEqualStrings("127.0.0.1", local.host);
 }
+
+// ── #3 prepared-statement caching: a `cached` prepare must create ONE reusable
+// server-side prepared statement (visible in pg_prepared_statements) and reuse it on
+// repeat. Assumes the default (DATABASE_STMT_CACHE on). ──
+fn countPreparedStmts(be: lib.storage.backend.Backend) !i64 {
+    var st = try be.vtable.prepare(be.ptr, "SELECT count(*) FROM pg_prepared_statements", false);
+    defer st.deinit();
+    try testing.expect(try st.step());
+    return st.getInt64(0);
+}
+
+test "postgres driver: cached prepares reuse one server-side prepared statement" {
+    var be = openBe() catch return error.SkipZigTest;
+    defer be.vtable.close(be.ptr);
+    try be.vtable.execRaw(be.ptr, "DROP TABLE IF EXISTS cache_probe");
+    try be.vtable.execRaw(be.ptr, "CREATE TABLE cache_probe (id BIGINT, v TEXT)");
+    try be.vtable.execRaw(be.ptr, "INSERT INTO cache_probe (id, v) VALUES (1, 'a')");
+    try be.vtable.execRaw(be.ptr, "INSERT INTO cache_probe (id, v) VALUES (2, 'b')");
+
+    const before = try countPreparedStmts(be);
+    const sel = "SELECT v FROM cache_probe WHERE id = ?";
+
+    // First cached prepare → one named server-side prepared statement is created.
+    {
+        var st = try be.vtable.prepare(be.ptr, sel, true);
+        defer st.deinit();
+        try st.bindInt64(1);
+        try testing.expect(try st.step());
+        try testing.expectEqualStrings("a", st.getTextSlice(0).?);
+    }
+    const after_first = try countPreparedStmts(be);
+    try testing.expectEqual(before + 1, after_first);
+
+    // Second cached prepare of the SAME sql → REUSE (no new prepared statement), result
+    // still correct (proves the cache-hit bind+execute path).
+    {
+        var st = try be.vtable.prepare(be.ptr, sel, true);
+        defer st.deinit();
+        try st.bindInt64(2);
+        try testing.expect(try st.step());
+        try testing.expectEqualStrings("b", st.getTextSlice(0).?);
+    }
+    try testing.expectEqual(after_first, try countPreparedStmts(be));
+
+    // Connection stays healthy for a subsequent uncached statement.
+    {
+        var st = try be.vtable.prepare(be.ptr, "SELECT 1", false);
+        defer st.deinit();
+        try testing.expect(try st.step());
+        try testing.expectEqual(@as(i64, 1), st.getInt64(0));
+    }
+
+    try be.vtable.execRaw(be.ptr, "DROP TABLE cache_probe");
+}
