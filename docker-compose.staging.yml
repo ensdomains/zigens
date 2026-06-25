@@ -28,6 +28,13 @@ services:
       # Postgres only: bound per-statement runtime (seconds) so a stuck query fails
       # loudly instead of hanging forever; 0 disables. Raise for heavy bulk reindexes.
       - DATABASE_STATEMENT_TIMEOUT=${DATABASE_STATEMENT_TIMEOUT:-120}
+      # Postgres only: trade per-commit WAL durability for bulk-sync speed. One of
+      # on|off|local|remote_write|remote_apply; blank = server default (on). Safe for an
+      # indexer — it re-syncs from the chain on restart.
+      - DATABASE_SYNCHRONOUS_COMMIT=${DATABASE_SYNCHRONOUS_COMMIT:-}
+      # Postgres only: reuse server-side prepared statements (big win on remote DBs);
+      # set to 0 to disable if it ever misbehaves.
+      - DATABASE_STMT_CACHE=${DATABASE_STMT_CACHE:-1}
       - RAINBOW_PATH=/app/data/ens_rainbow.db
       - DOWNLOAD_RAINBOW=true
       - RPC_URL=${RPC_URL}
@@ -81,6 +88,13 @@ services:
       # Postgres only: bound per-statement runtime (seconds) so a stuck query fails
       # loudly instead of hanging forever; 0 disables. Raise for heavy bulk reindexes.
       - DATABASE_STATEMENT_TIMEOUT=${DATABASE_STATEMENT_TIMEOUT:-120}
+      # Postgres only: trade per-commit WAL durability for bulk-sync speed. One of
+      # on|off|local|remote_write|remote_apply; blank = server default (on). Safe for an
+      # indexer — it re-syncs from the chain on restart.
+      - DATABASE_SYNCHRONOUS_COMMIT=${DATABASE_SYNCHRONOUS_COMMIT:-}
+      # Postgres only: reuse server-side prepared statements (big win on remote DBs);
+      # set to 0 to disable if it ever misbehaves.
+      - DATABASE_STMT_CACHE=${DATABASE_STMT_CACHE:-1}
       - RAINBOW_PATH=/app/data/ens_rainbow.db
       - DOWNLOAD_RAINBOW=false
       - API_PORT=5656
