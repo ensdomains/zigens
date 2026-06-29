@@ -166,13 +166,7 @@ fn rowJson(allocator: std.mem.Allocator, cols: [][]u8, alias: []const u8) ![]u8 
 /// re-run if a protected table is dropped/recreated (e.g. replay rebuilds `names`).
 pub fn installTriggers(db: *Database) !void {
     if (db.isPostgres()) {
-        // Postgres can't gate triggers on a subquery WHEN, so the cursor/active-context
-        // gate lives in two shared PL/pgSQL functions; the per-table FOR EACH ROW triggers
-        // cover the same {U,D} (protected) / {I,U,D} (active) ops as the SQLite triggers.
-        // Multi-statement DDL execs through the simple-query protocol in one call.
-        const sql = try pgTriggerInstallSql(db.allocator);
-        defer db.allocator.free(sql);
-        try db.exec(sql);
+        try installPgTriggers(db);
         return;
     }
     const allocator = db.allocator;
@@ -333,6 +327,111 @@ pub fn pgTriggerInstallSql(allocator: std.mem.Allocator) ![]u8 {
         try appendPgTrigger(allocator, &buf, table, "d", "DELETE", "reorg_capture_active");
     }
     return buf.toOwnedSlice(allocator);
+}
+
+const PG_INSTALL_ATTEMPTS = 4;
+
+/// Install the Postgres reorg triggers without re-locking tables that already have them.
+/// The original one-shot DROP/CREATE batch took SHARE ROW EXCLUSIVE on every protected
+/// table on every boot and, with no lock_timeout, hung until statement_timeout (57014)
+/// whenever another connection held a write lock. Here the two capture functions (no
+/// table locks) are always refreshed, existing triggers are skipped, and the few that
+/// are actually missing are created under a bounded lock_timeout with a short retry so a
+/// transient lock heals and a persistent one fails fast with an actionable message.
+fn installPgTriggers(db: *Database) !void {
+    const allocator = db.allocator;
+
+    // Bound the lock wait so a contended table fails fast (retryable) instead of blocking
+    // until statement_timeout. Restored to the server default when done.
+    db.exec("SET lock_timeout = '5s'") catch {};
+    defer db.exec("SET lock_timeout = 0") catch {};
+
+    try execPgDdlWithRetry(db, PG_CAPTURE_PROTOCOL_FN, "reorg_capture_protocol()");
+    try execPgDdlWithRetry(db, PG_CAPTURE_ACTIVE_FN, "reorg_capture_active()");
+
+    var existing = try pgExistingTriggers(db, allocator);
+    defer {
+        var it = existing.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        existing.deinit();
+    }
+
+    for (PROTECTED_TABLES) |table| {
+        try ensurePgTrigger(db, &existing, table, "u", "UPDATE", "reorg_capture_protocol");
+        try ensurePgTrigger(db, &existing, table, "d", "DELETE", "reorg_capture_protocol");
+    }
+    for (REORG_ACTIVE_TABLES) |table| {
+        try ensurePgTrigger(db, &existing, table, "i", "INSERT", "reorg_capture_active");
+        try ensurePgTrigger(db, &existing, table, "u", "UPDATE", "reorg_capture_active");
+        try ensurePgTrigger(db, &existing, table, "d", "DELETE", "reorg_capture_active");
+    }
+}
+
+/// Names of already-installed reorg triggers in the active schema. Caller owns the keys.
+fn pgExistingTriggers(db: *Database, allocator: std.mem.Allocator) !std.StringHashMap(void) {
+    var set = std.StringHashMap(void).init(allocator);
+    errdefer {
+        var it = set.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        set.deinit();
+    }
+    var q = try Query.init(db,
+        \\SELECT t.tgname FROM pg_trigger t
+        \\JOIN pg_class c ON t.tgrelid = c.oid
+        \\JOIN pg_namespace n ON c.relnamespace = n.oid
+        \\WHERE n.nspname = current_schema() AND NOT t.tgisinternal AND t.tgname LIKE '%reorg_undo%'
+    );
+    defer q.deinit();
+    while (try q.step()) {
+        const name = q.getTextSlice(0) orelse continue;
+        const owned = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned);
+        try set.put(owned, {});
+    }
+    return set;
+}
+
+fn pgTableExists(db: *Database, table: []const u8) bool {
+    const cols = db.introspectColumns(db.allocator, table) catch return false;
+    defer backend.freeColumnInfo(db.allocator, cols);
+    return cols.len > 0;
+}
+
+/// Create one trigger only if it is missing and its table exists, under the bounded
+/// lock_timeout set by the caller. A no-op once installed — so a normal restart locks
+/// no tables at all.
+fn ensurePgTrigger(db: *Database, existing: *std.StringHashMap(void), table: []const u8, suffix: []const u8, event: []const u8, func: []const u8) !void {
+    const allocator = db.allocator;
+    var name_buf: [192]u8 = undefined;
+    const tgname = try std.fmt.bufPrint(&name_buf, "{s}_reorg_undo_{s}", .{ table, suffix });
+    if (existing.contains(tgname)) return;
+    if (!pgTableExists(db, table)) return;
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "CREATE TRIGGER \"{s}\" AFTER {s} ON \"{s}\" FOR EACH ROW EXECUTE FUNCTION {s}()",
+        .{ tgname, event, table, func },
+    );
+    defer allocator.free(sql);
+    try execPgDdlWithRetry(db, sql, table);
+}
+
+/// Run a DDL statement, retrying a bounded number of times when it fails (a contended
+/// lock trips the bounded lock_timeout). Surfaces an actionable error if it never clears.
+fn execPgDdlWithRetry(db: *Database, sql: []const u8, label: []const u8) !void {
+    var attempt: u32 = 1;
+    while (true) : (attempt += 1) {
+        if (db.exec(sql)) {
+            return;
+        } else |err| {
+            if (attempt >= PG_INSTALL_ATTEMPTS) {
+                std.log.err("reorg: could not install triggers for \"{s}\" after {d} attempts — another connection holds a conflicting lock; stop any other ensv2-indexer/ensv2-api running against this DB", .{ label, attempt });
+                return err;
+            }
+            std.log.warn("reorg: trigger install for \"{s}\" blocked (attempt {d}/{d}); retrying in 2s", .{ label, attempt, PG_INSTALL_ATTEMPTS });
+            std.Thread.sleep(2 * std.time.ns_per_s);
+        }
+    }
 }
 
 /// Set the block currently being processed for `protocol`. Enables undo capture
