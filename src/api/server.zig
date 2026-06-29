@@ -1635,6 +1635,11 @@ pub const Server = struct {
             \\
             \\  <div id="message"></div>
             \\
+            \\  <div id="secretBox" style="display:none; background:#fff8e1; border:1px solid #ffe082; border-radius:8px; padding:16px; margin-bottom:24px;">
+            \\    <strong>Webhook created.</strong> Save this signing secret now — it is NOT retrievable later. Set it as <code>WEBHOOK_SECRET</code> on the receiver to verify deliveries:
+            \\    <pre id="secretValue" style="user-select:all; background:#1a1a1a; color:#fff; padding:12px; border-radius:6px; overflow-x:auto; margin:8px 0 0;"></pre>
+            \\  </div>
+            \\
             \\  <div class="container">
             \\    <h2>Create New Webhook</h2>
             \\    <form id="createForm">
@@ -1643,6 +1648,13 @@ pub const Server = struct {
             \\          <div class="form-group">
             \\            <label>Webhook URL:</label>
             \\            <input type="url" id="url" placeholder="https://your-server.com/webhook" required>
+            \\          </div>
+            \\
+            \\          <div class="form-group">
+            \\            <label class="checkbox-item" style="font-weight:600; cursor:pointer;">
+            \\              <input type="checkbox" id="useCustomSecret"> Provide my own signing secret (otherwise one is generated)
+            \\            </label>
+            \\            <input type="text" id="secret" placeholder="64-char hex secret (e.g. the receiver's WEBHOOK_SECRET)" autocomplete="off" pattern="[0-9a-fA-F]+" style="display:none; margin-top:8px;">
             \\          </div>
             \\
             \\          <div class="form-group">
@@ -1717,8 +1729,6 @@ pub const Server = struct {
             \\                </div>
             \\              </div>
             \\
-            \\              <div class="event-category">
-            \\                <div class="category-title">
             \\              <div class="event-category">
             \\                <div class="category-title">
             \\                  Resolver Records
@@ -1924,7 +1934,19 @@ pub const Server = struct {
             \\      });
             \\      updateSummary(false);
             \\      updateAllCategoryToggles(document);
+            \\      const useCustomSecret = document.getElementById('useCustomSecret');
+            \\      if (useCustomSecret) {
+            \\        useCustomSecret.addEventListener('change', () => {
+            \\          document.getElementById('secret').style.display = useCustomSecret.checked ? 'block' : 'none';
+            \\        });
+            \\      }
             \\    });
+            \\
+            \\    function showSecret(secret) {
+            \\      const box = document.getElementById('secretBox');
+            \\      document.getElementById('secretValue').textContent = secret || '(none returned)';
+            \\      box.style.display = 'block';
+            \\    }
             \\
             \\    async function loadWebhooks() {
             \\      try {
@@ -2033,22 +2055,26 @@ pub const Server = struct {
             \\
             \\      const url = document.getElementById('url').value;
             \\      const eventTypes = Array.from(document.querySelectorAll('.event-checkbox:checked')).map(cb => cb.value);
+            \\      const payload = { url: url, event_types: eventTypes, active: true, max_retries: 3 };
+            \\      const useCustomSecret = document.getElementById('useCustomSecret');
+            \\      if (useCustomSecret && useCustomSecret.checked) {
+            \\        const secretVal = document.getElementById('secret').value.trim();
+            \\        if (!secretVal) { showMessage('Enter a hex secret or uncheck "provide my own secret".', true); return; }
+            \\        payload.secret = secretVal;
+            \\      }
             \\
             \\      try {
             \\        const response = await fetch(API_BASE, {
             \\          method: 'POST',
             \\          headers: { 'Content-Type': 'application/json' },
-            \\          body: JSON.stringify({
-            \\            url: url,
-            \\            event_types: eventTypes,
-            \\            active: true,
-            \\            max_retries: 3
-            \\          })
+            \\          body: JSON.stringify(payload)
             \\        });
             \\
             \\        if (response.ok) {
-            \\          showMessage('Webhook created successfully!');
+            \\          const result = await response.json();
+            \\          showSecret(result.secret);
             \\          document.getElementById('createForm').reset();
+            \\          document.getElementById('secret').style.display = 'none';
             \\          document.querySelectorAll('.event-checkbox').forEach(cb => cb.checked = false);
             \\          updateSummary(false);
             \\          loadWebhooks();
@@ -2154,6 +2180,7 @@ pub const Server = struct {
         try writer.print(
             "HTTP/1.1 200 OK\r\n" ++
                 "Content-Type: text/html; charset=utf-8\r\n" ++
+                "Cache-Control: no-store\r\n" ++
                 "Content-Length: {d}\r\n" ++
                 "\r\n" ++
                 "{s}",
