@@ -1153,9 +1153,24 @@ pub const Server = struct {
         const active = if (obj.get("active")) |a| a.bool else true;
         const max_retries = if (obj.get("max_retries")) |mr| @as(u32, @intCast(mr.integer)) else 3;
 
-        // Generate a fresh HMAC secret for this webhook. This is the ONLY time the
-        // secret is returned to the caller — it's not retrievable later.
-        const secret = try webhook_manager.generateWebhookSecret(self.allocator);
+        // Use a caller-supplied secret when provided so several senders can share a
+        // receiver's single WEBHOOK_SECRET; otherwise mint a fresh one. Either way the
+        // value is hex (computeWebhookSignature hex-decodes it), so a provided secret
+        // must be non-empty even-length hex to match the receiver's hex secret.
+        const secret = if (obj.get("secret")) |s| blk: {
+            const provided = switch (s) {
+                .string => |str| str,
+                else => return try self.sendBadRequest(stream, "secret must be a string"),
+            };
+            if (provided.len == 0 or provided.len > 256 or provided.len % 2 != 0) {
+                return try self.sendBadRequest(stream, "secret must be non-empty even-length hex (max 256 chars)");
+            }
+            for (provided) |c| {
+                const is_hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+                if (!is_hex) return try self.sendBadRequest(stream, "secret must be hex (0-9, a-f)");
+            }
+            break :blk try self.allocator.dupe(u8, provided);
+        } else try webhook_manager.generateWebhookSecret(self.allocator);
         defer self.allocator.free(secret);
 
         // Create webhook
