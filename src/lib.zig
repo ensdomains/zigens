@@ -31,6 +31,10 @@ pub const api = struct {
     pub const eac_roles = @import("api/eac_roles.zig");
 };
 
+pub const indexer = struct {
+    pub const label_backfill = @import("indexer/label_backfill.zig");
+};
+
 pub const types = struct {
     pub const models = @import("types/models.zig");
     pub const address = @import("types/address.zig");

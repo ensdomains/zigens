@@ -126,6 +126,60 @@ pub fn getUnknownLabelsForBackfill(
     return results.toOwnedSlice(allocator);
 }
 
+/// Get every unknown-label row sharing a labelhash (a label can appear under multiple
+/// parents). Used to heal them when the plaintext arrives via an on-chain LabelStore
+/// `Label` event. Returned strings are owned by `allocator`; free with `freeUnknownLabel`.
+pub fn getUnknownLabelsByLabelhash(
+    allocator: std.mem.Allocator,
+    db: *Database,
+    labelhash: Hash,
+) ![]UnknownLabel {
+    var q = try Query.init(db,
+        \\SELECT
+        \\  id, name_id, transaction_hash, labelhash, namehash, parent_node,
+        \\  owner, block_number, created_at, backfill_attempts, last_backfill_attempt
+        \\FROM unknown_labels
+        \\WHERE labelhash = ?
+    );
+    defer q.deinit();
+    try q.bindHash(labelhash);
+
+    var results: std.ArrayList(UnknownLabel) = .{};
+    errdefer {
+        for (results.items) |label| freeUnknownLabel(allocator, label);
+        results.deinit(allocator);
+    }
+
+    while (try q.step()) {
+        const tx_hash = try allocator.dupe(u8, q.getTextSlice(2) orelse "");
+        errdefer allocator.free(tx_hash);
+        const lh = try allocator.dupe(u8, q.getTextSlice(3) orelse "");
+        errdefer allocator.free(lh);
+        const namehash = try allocator.dupe(u8, q.getTextSlice(4) orelse "");
+        errdefer allocator.free(namehash);
+        const parent_node = try allocator.dupe(u8, q.getTextSlice(5) orelse "");
+        errdefer allocator.free(parent_node);
+        const owner = try allocator.dupe(u8, q.getTextSlice(6) orelse "");
+        errdefer allocator.free(owner);
+
+        try results.append(allocator, UnknownLabel{
+            .id = q.getInt64(0),
+            .name_id = q.getOptionalInt64(1),
+            .transaction_hash = tx_hash,
+            .labelhash = lh,
+            .namehash = namehash,
+            .parent_node = parent_node,
+            .owner = owner,
+            .block_number = q.getInt64(7),
+            .created_at = q.getInt64(8),
+            .backfill_attempts = q.getInt64(9),
+            .last_backfill_attempt = q.getOptionalInt64(10),
+        });
+    }
+
+    return results.toOwnedSlice(allocator);
+}
+
 /// Increment backfill attempt counter for an unknown label
 pub fn incrementBackfillAttempt(db: *Database, id: i64) !void {
     // `strftime('%s','now')` is SQLite-only; dialect.nowEpoch is the portable current-epoch

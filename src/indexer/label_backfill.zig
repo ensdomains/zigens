@@ -320,48 +320,7 @@ pub const LabelBackfill = struct {
         label_text: []const u8,
         unknown_label: unknown_labels_storage.UnknownLabel,
     ) !void {
-        const namehash = try Hash.fromHex(unknown_label.namehash);
-
-        // Check if name exists — it should, since handleV1NewOwner now creates records inline
-        if (try names_storage.getNameByNamehash(self.database, namehash)) |existing| {
-            var existing_mut = existing;
-            defer existing_mut.deinit(self.allocator);
-
-            // Only heal if the label is still in [labelhash] notation
-            const needs_heal = existing.label != null and existing.label.?[0] == '[';
-            if (!needs_heal) return; // Already has a real label
-
-            // Look up parent name to reconstruct full name
-            const parent_namehash = try Hash.fromHex(unknown_label.parent_node);
-            var parent_name_str: ?[]const u8 = null;
-            var parent_record_to_free: ?models.Name = null;
-            defer if (parent_record_to_free) |*pr| pr.deinit(self.allocator);
-
-            if (parent_namehash.eql(constants.WellKnown.root_namehash)) {
-                // Genuine root child (a TLD): bare label, no suffix.
-                parent_name_str = ens_name.ROOT_PARENT;
-            } else if (try names_storage.getNameByNamehash(self.database, parent_namehash)) |parent_record| {
-                parent_record_to_free = parent_record;
-                parent_name_str = parent_record.name;
-            } else {
-                // Parent absent and not root: joining against an empty parent
-                // would mint a root-level name ('foo') inconsistent with this
-                // row's namehash (= namehash('foo.<parent>')). Leave the
-                // [labelhash] placeholder for a later heal once the parent is
-                // indexed, rather than write a wrong name.
-                std.log.debug("Skipping label heal for '{s}': parent {s} not yet indexed", .{ label_text, unknown_label.parent_node });
-                return;
-            }
-
-            const full_name = try ens_name.join(self.allocator, label_text, parent_name_str);
-            defer self.allocator.free(full_name);
-
-            // Now that the plaintext name is known, recompute the ENSIP-15 flag.
-            const is_norm = ens_normalize.nameIsNormalized(self.allocator, full_name);
-            try names_storage.updateNameLabel(self.database, .v1, namehash, label_text, full_name, is_norm);
-            std.log.debug("Healed subdomain label: {s}", .{full_name});
-        }
-        // If name doesn't exist (shouldn't happen with new indexing), skip silently
+        return healSubdomainLabel(self.allocator, self.database, label_text, unknown_label);
     }
 
     /// Get statistics about unknown labels
@@ -396,3 +355,47 @@ pub const BackfillStats = struct {
     retrying: u64,
     failed: u64,
 };
+
+/// Materialize a previously-unknown subdomain label onto its name record once the
+/// plaintext label becomes known — from the rainbow table or an on-chain LabelStore
+/// `Label` event. The protocol is taken from the existing name row, so both V1 and V2
+/// names heal. No-op if the name is absent, already has a real label, or its parent
+/// is not indexed yet (leaves the `[labelhash]` placeholder for a later heal).
+pub fn healSubdomainLabel(
+    allocator: std.mem.Allocator,
+    database: *db_module.Database,
+    label_text: []const u8,
+    unknown_label: unknown_labels_storage.UnknownLabel,
+) !void {
+    const namehash = try Hash.fromHex(unknown_label.namehash);
+
+    if (try names_storage.getNameByNamehash(database, namehash)) |existing| {
+        var existing_mut = existing;
+        defer existing_mut.deinit(allocator);
+
+        const needs_heal = existing.label != null and existing.label.?[0] == '[';
+        if (!needs_heal) return;
+
+        const parent_namehash = try Hash.fromHex(unknown_label.parent_node);
+        var parent_name_str: ?[]const u8 = null;
+        var parent_record_to_free: ?models.Name = null;
+        defer if (parent_record_to_free) |*pr| pr.deinit(allocator);
+
+        if (parent_namehash.eql(constants.WellKnown.root_namehash)) {
+            parent_name_str = ens_name.ROOT_PARENT;
+        } else if (try names_storage.getNameByNamehash(database, parent_namehash)) |parent_record| {
+            parent_record_to_free = parent_record;
+            parent_name_str = parent_record.name;
+        } else {
+            std.log.debug("Skipping label heal for '{s}': parent {s} not yet indexed", .{ label_text, unknown_label.parent_node });
+            return;
+        }
+
+        const full_name = try ens_name.join(allocator, label_text, parent_name_str);
+        defer allocator.free(full_name);
+
+        const is_norm = ens_normalize.nameIsNormalized(allocator, full_name);
+        try names_storage.updateNameLabel(database, existing.protocol, namehash, label_text, full_name, is_norm);
+        std.log.debug("Healed subdomain label: {s}", .{full_name});
+    }
+}
