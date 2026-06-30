@@ -119,7 +119,7 @@ fn sepoliaAddresses() ContractAddresses {
         .eth_registrar_v2 = Address.fromHex("0xa4449a0dd2b83007553d9b1d28b583a46a805a30") catch unreachable,
         .eth_renewer_v1 = Address.fromHex("0x1be516ae1b72765ae55bd5e9ca628c9058a1c622") catch unreachable,
         .eth_label_store = Address.fromHex("0xb03524289c16424f71802a1794c29c7bd1b9f577") catch unreachable,
-        .eth_reverse_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable, // no V2 reverse-registrar event source in this deployment; reverse flows via resolver NameChanged
+        .eth_reverse_registrar = Address.zero, // no V2 reverse-registrar event source in this deployment; reverse flows via resolver NameChanged
         .batch_registrar = Address.fromHex("0xfe2aab6df1cbff84534ce65d9e4a755ba02d6795") catch unreachable,
         .premigration_registrar = Address.fromHex("0x08c297214c7ea8de81e2d984d66dcc1684054037") catch unreachable, // DNSV1MirrorRootBatchRegistrar (unused by indexer)
 
@@ -155,19 +155,19 @@ fn mainnetAddresses() ContractAddresses {
         .name_wrapper = Address.fromHex("0xD4416b13d2b3a9aBae7AcD5D6C2BbDBE25686401") catch unreachable,
 
         // V2 Mainnet Contracts (ENSv2 — not yet deployed; zero placeholders)
-        .root_registry = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .eth_registry = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .eth_registrar_v2 = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .eth_renewer_v1 = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .eth_label_store = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .eth_reverse_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .batch_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .premigration_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
+        .root_registry = Address.zero,
+        .eth_registry = Address.zero,
+        .eth_registrar_v2 = Address.zero,
+        .eth_renewer_v1 = Address.zero,
+        .eth_label_store = Address.zero,
+        .eth_reverse_registrar = Address.zero,
+        .batch_registrar = Address.zero,
+        .premigration_registrar = Address.zero,
 
         // Migration Contracts (Not yet deployed on mainnet)
-        .migration_helper = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .locked_migration_controller = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .unlocked_migration_controller = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
+        .migration_helper = Address.zero,
+        .locked_migration_controller = Address.zero,
+        .unlocked_migration_controller = Address.zero,
 
         // Deployment blocks
         // ENS Registry + Temporary Registrar deployed in block 3327417 (May 2017)
