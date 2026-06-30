@@ -31,6 +31,9 @@ pub const Indexer = struct {
     allocator: std.mem.Allocator,
     config: config.Config,
     database: *db.Database,
+    // Whether this process indexes V1. Only V1 produces `unknown_labels` rows, so the
+    // V2 LabelStore heal is a no-op (pure RPC overhead) in the V2-only binary — gate it.
+    indexes_v1: bool,
     v1_client: *rpc.Client,
     shared_http_client: *std.http.Client,
     webhook_manager: ?*webhooks.WebhookManager,
@@ -150,6 +153,7 @@ pub const Indexer = struct {
             .allocator = allocator,
             .config = cfg,
             .database = database,
+            .indexes_v1 = true, // combined indexer indexes both protocols
             .v1_client = v1_client,
             .shared_http_client = http_client,
             .webhook_manager = webhook_manager,
@@ -246,6 +250,7 @@ pub const Indexer = struct {
             .allocator = allocator,
             .config = cfg,
             .database = database,
+            .indexes_v1 = (protocol == .v1),
             .v1_client = client,
             .shared_http_client = http_client,
             .webhook_manager = webhook_manager,
@@ -655,6 +660,16 @@ pub const Indexer = struct {
     // on the reverse registrar rather than going through a separate resolver.
     pub const V2_REVERSE_REGISTRAR_EVENTS = [_]RegistryEventConfig{
         .{ .event_hash = abi.EventSignatures.name_for_addr_changed_hash, .handler = handleV2NameForAddrChanged, .name = "NameForAddrChanged" },
+    };
+
+    // ETHRenewerV1 — standalone renewer emitting the same eth-registrar NameRenewed.
+    pub const V2_ETH_RENEWER_EVENTS = [_]RegistryEventConfig{
+        .{ .event_hash = abi.EventSignatures.eth_name_renewed_hash, .handler = handleETHNameRenewed, .name = "ETH NameRenewed" },
+    };
+
+    // LabelStore — on-chain labelhash->label dictionary; Label events heal unknown labels.
+    pub const V2_LABEL_STORE_EVENTS = [_]RegistryEventConfig{
+        .{ .event_hash = abi.EventSignatures.label_store_label_hash, .handler = handleLabelStoreLabel, .name = "Label" },
     };
 
     // V1 indexing orchestration (extracted to v1_indexing.zig)
@@ -1237,6 +1252,10 @@ pub const Indexer = struct {
             // (1 HTTP request instead of 3, eliminates ~100ms of inter-batch sleeps)
             try self.indexPhase1V2Events(protocol, client, from_block, to_block);
 
+            // Phase 1b: Renewals from the standalone ETHRenewerV1 (same NameRenewed as the
+            // registrar, second source). No-op when the renewer isn't deployed.
+            try self.indexV2RenewerEvents(protocol, client, from_block, to_block);
+
             // Phase 2: Subregistry events (depends on Phase 1 discovering subregistries)
             try self.indexSubregistryEvents(protocol, client, from_block, to_block);
             try self.processRemainingOrphans(protocol);
@@ -1249,6 +1268,11 @@ pub const Indexer = struct {
             // the reverse_records table so primary-name lookups don't have to scan
             // the events feed.
             try self.indexV2ReverseRegistrarEvents(protocol, client, from_block, to_block);
+
+            // Phase 6: LabelStore label-dictionary events. Runs after subregistry events
+            // so any unknown_labels created in this range are present to heal. No-op when
+            // LabelStore isn't deployed.
+            try self.indexLabelStoreEvents(protocol, client, from_block, to_block);
         }
 
         // === RESOLVER RECORD EVENTS (V1 and V2) ===
@@ -1275,6 +1299,8 @@ pub const Indexer = struct {
     pub const indexTransferEvents = event_fetchers.indexTransferEvents;
     pub const indexResolverEvents = event_fetchers.indexResolverEvents;
     pub const indexV2ReverseRegistrarEvents = event_fetchers.indexV2ReverseRegistrarEvents;
+    pub const indexV2RenewerEvents = event_fetchers.indexV2RenewerEvents;
+    pub const indexLabelStoreEvents = event_fetchers.indexLabelStoreEvents;
 
     // V2 registry handlers (extracted to handlers_v2_registry.zig)
     pub const processOrphanedRegistration = handlers_v2_registry.processOrphanedRegistration;
@@ -1292,6 +1318,7 @@ pub const Indexer = struct {
     pub const handleEACRolesChanged = handlers_v2_registry.handleEACRolesChanged;
     pub const handleEACRolesChangedImpl = handlers_v2_registry.handleEACRolesChangedImpl;
     pub const handleLabelRegistered = handlers_v2_registry.handleLabelRegistered;
+    pub const handleLabelStoreLabel = handlers_v2_registry.handleLabelStoreLabel;
     pub const handleLabelReserved = handlers_v2_registry.handleLabelReserved;
     pub const handleLabelUnregistered = handlers_v2_registry.handleLabelUnregistered;
     pub const handleExpiryUpdated = handlers_v2_registry.handleExpiryUpdated;

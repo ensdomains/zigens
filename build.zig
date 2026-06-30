@@ -204,6 +204,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "eth", .module = eth_module },
             .{ .name = "pg", .module = pg_module },
+            .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
         },
     });
 

@@ -423,6 +423,50 @@ pub fn indexV2ReverseRegistrarEvents(self: *Indexer, protocol: models.Protocol, 
     );
 }
 
+/// ETHRenewerV1: a standalone renewer that emits the same eth-registrar
+/// `NameRenewed(...)` as `eth_registrar_v2`. Renewals can originate from either
+/// contract, so this fetch covers the second source. Skipped when not deployed.
+pub fn indexV2RenewerEvents(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64, to_block: u64) !void {
+    if (protocol != .v2) return;
+    const renewer_addr = self.config.v2_contracts.eth_renewer_v1;
+    if (renewer_addr.isZero()) return;
+
+    const v1_indexing = @import("v1/indexing.zig");
+    try v1_indexing.indexV1EventsChunked(
+        self,
+        protocol,
+        client,
+        from_block,
+        to_block,
+        renewer_addr,
+        &Indexer.V2_ETH_RENEWER_EVENTS,
+        "V2 ETH Renewer",
+    );
+}
+
+/// LabelStore: an on-chain labelhash->preimage dictionary. Its `Label` events heal
+/// unknown labels. Skipped when not deployed.
+pub fn indexLabelStoreEvents(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64, to_block: u64) !void {
+    if (protocol != .v2) return;
+    // Only V1 produces unknown_labels, so LabelStore heals nothing in a V2-only process.
+    // Gate it to processes that also index V1 (combined binary) to avoid wasted RPC.
+    if (!self.indexes_v1) return;
+    const label_store_addr = self.config.v2_contracts.eth_label_store;
+    if (label_store_addr.isZero()) return;
+
+    const v1_indexing = @import("v1/indexing.zig");
+    try v1_indexing.indexV1EventsChunked(
+        self,
+        protocol,
+        client,
+        from_block,
+        to_block,
+        label_store_addr,
+        &Indexer.V2_LABEL_STORE_EVENTS,
+        "V2 LabelStore",
+    );
+}
+
 pub fn indexResolverEvents(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64, to_block: u64) !void {
     const resolvers_mod = @import("../storage/resolvers.zig");
 

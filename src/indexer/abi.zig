@@ -86,6 +86,12 @@ pub const EventSignatures = struct {
     pub const parent_updated = "ParentUpdated(address,string,address)";
     pub const parent_updated_hash: Hash = eventHash(parent_updated);
 
+    /// Label(bytes32 indexed labelHash, string label)
+    /// Emitted by the LabelStore contract: an on-chain labelhash->preimage dictionary
+    /// used to heal unknown labels.
+    pub const label_store_label = "Label(bytes32,string)";
+    pub const label_store_label_hash: Hash = eventHash(label_store_label);
+
     // ========================================================================
     // Enhanced Access Control events (from common/access-control/interfaces/IEnhancedAccessControl.sol)
     // ========================================================================

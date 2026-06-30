@@ -1343,3 +1343,103 @@ test "updateNameLabel is protocol-scoped: a v1 heal leaves the same-namehash v2 
     try testing.expectEqualStrings("shared", v2n.label.?);
     try testing.expectEqualStrings("shared.eth", v2n.name.?);
 }
+
+const label_backfill = lib.indexer.label_backfill;
+
+test "getUnknownLabelsByLabelhash returns rows for a labelhash" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const child_nh = try namehash_fn(allocator, "sub.parent.eth");
+    const parent_nh = try namehash_fn(allocator, "parent.eth");
+    const sub_lh = try labelhash_fn(allocator, "sub");
+
+    try unknown_labels.insertUnknownLabel(database, null, Hash.zero, sub_lh, child_nh, parent_nh, helpers.TEST_OWNER_1, 100);
+
+    const rows = try unknown_labels.getUnknownLabelsByLabelhash(allocator, database, sub_lh);
+    defer {
+        for (rows) |r| unknown_labels.freeUnknownLabel(allocator, r);
+        allocator.free(rows);
+    }
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    const child_nh_hex = try child_nh.toHex(allocator);
+    defer allocator.free(child_nh_hex);
+    try testing.expectEqualStrings(child_nh_hex, rows[0].namehash);
+}
+
+test "healSubdomainLabel materializes a placeholder V2 subname" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // Parent must exist so the heal can reconstruct the full name.
+    _ = try helpers.createTestName(allocator, database, "parent.eth", helpers.TEST_OWNER_1);
+
+    const child_nh = try namehash_fn(allocator, "sub.parent.eth");
+    const parent_nh = try namehash_fn(allocator, "parent.eth");
+    const sub_lh = try labelhash_fn(allocator, "sub");
+
+    // Insert the child as a V2 name with a still-unresolved [labelhash] placeholder.
+    try database.insertName(models.Name{
+        .protocol = .v2,
+        .name = "[abc].parent.eth",
+        .namehash = child_nh,
+        .label = "[abc]",
+        .label_hash = sub_lh,
+        .parent_name = "parent.eth",
+        .parent_namehash = parent_nh,
+        .registry = Address.zero,
+        .owner = helpers.TEST_OWNER_1,
+        .registrant = helpers.TEST_OWNER_1,
+        .resolver = Address.zero,
+        .token_id = 0,
+        .canonical_id = 0,
+        .token_version = 1,
+        .expiry = 0,
+        .registry_locked = false,
+        .migrated = false,
+        .created_block = 1000,
+        .created_at = 1700000000,
+        .registered_at = 1700000000,
+        .updated_block = 1000,
+        .updated_at = 1700000000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    });
+
+    const child_nh_hex = try child_nh.toHex(allocator);
+    defer allocator.free(child_nh_hex);
+    const parent_nh_hex = try parent_nh.toHex(allocator);
+    defer allocator.free(parent_nh_hex);
+    const sub_lh_hex = try sub_lh.toHex(allocator);
+    defer allocator.free(sub_lh_hex);
+
+    const ul = unknown_labels.UnknownLabel{
+        .id = 1,
+        .name_id = null,
+        .transaction_hash = "0x",
+        .labelhash = sub_lh_hex,
+        .namehash = child_nh_hex,
+        .parent_node = parent_nh_hex,
+        .owner = "0x",
+        .block_number = 0,
+        .created_at = 0,
+        .backfill_attempts = 0,
+        .last_backfill_attempt = null,
+    };
+
+    try label_backfill.healSubdomainLabel(allocator, database, "sub", ul);
+
+    const got = try names_storage.getNameByNamehash(database, child_nh);
+    try testing.expect(got != null);
+    var healed = got.?;
+    defer healed.deinit(allocator);
+    try testing.expectEqualStrings("sub", healed.label.?);
+    try testing.expectEqualStrings("sub.parent.eth", healed.name.?);
+    // protocol-correct: the V2 row was updated (not a no-op under hardcoded .v1).
+    try testing.expectEqual(models.Protocol.v2, healed.protocol);
+}

@@ -54,6 +54,13 @@ pub const ContractAddresses = struct {
     root_registry: Address,
     eth_registry: Address,
     eth_registrar_v2: Address,
+    // ETHRenewerV1 — standalone renewer that emits the same ETH-registrar
+    // NameRenewed(uint256,string,uint64,uint64,address,bytes32,uint256); renewals can
+    // originate here as well as from eth_registrar_v2. Zero when not deployed.
+    eth_renewer_v1: Address,
+    // LabelStore — on-chain labelhash→label dictionary. Its Label(bytes32,string) events
+    // heal unknown labels (same path as the rainbow table). Zero when not deployed.
+    eth_label_store: Address,
     eth_reverse_registrar: Address,
     // BatchRegistrar — owner-only batch reserve/renew. Used by deployer for the
     // standard production pre-migration flow on mainnet. Same ABI as
@@ -106,22 +113,24 @@ fn sepoliaAddresses() ContractAddresses {
         .reverse_registrar = Address.fromHex("0xA0a1AbcDAe1a2a4A2EF8e9113Ff0e02DD81DC0C6") catch unreachable,
         .name_wrapper = Address.fromHex("0x0635513f179D50A207757E05759CbD106d7dFcE8") catch unreachable,
 
-        // V2 Sepolia Contracts (ENSv2 deployment)
-        .root_registry = Address.fromHex("0xc960f7217d3643b525ef36bec8adf86953cd9ab8") catch unreachable,
-        .eth_registry = Address.fromHex("0xdedb92913a25abe1f7bcdd85d8a344a43b398b67") catch unreachable,
-        .eth_registrar_v2 = Address.fromHex("0x8c2e866b439358c41ae05de9cbe8a00bfefaffca") catch unreachable,
-        .eth_reverse_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable, // TBD
-        .batch_registrar = Address.fromHex("0xb39c2da7143dffa4a097970887fa6f1d17c1d60f") catch unreachable,
-        .premigration_registrar = Address.fromHex("0xdf60c561ca35ad3c89d24bba854654b1c3477078") catch unreachable,
+        // V2 Sepolia Contracts (ENSv2 — June redeployment, contracts-v2 @ 63c8d53)
+        .root_registry = Address.fromHex("0x11b5bfbe9078d826b1edbdd1cfc12f5828d9f50c") catch unreachable,
+        .eth_registry = Address.fromHex("0x67b728a792e789a8978b30cf1b3b641f19354b43") catch unreachable,
+        .eth_registrar_v2 = Address.fromHex("0xa4449a0dd2b83007553d9b1d28b583a46a805a30") catch unreachable,
+        .eth_renewer_v1 = Address.fromHex("0x1be516ae1b72765ae55bd5e9ca628c9058a1c622") catch unreachable,
+        .eth_label_store = Address.fromHex("0xb03524289c16424f71802a1794c29c7bd1b9f577") catch unreachable,
+        .eth_reverse_registrar = Address.zero, // no V2 reverse-registrar event source in this deployment; reverse flows via resolver NameChanged
+        .batch_registrar = Address.fromHex("0xfe2aab6df1cbff84534ce65d9e4a755ba02d6795") catch unreachable,
+        .premigration_registrar = Address.fromHex("0x08c297214c7ea8de81e2d984d66dcc1684054037") catch unreachable, // DNSV1MirrorRootBatchRegistrar (unused by indexer)
 
-        // Migration Contracts (V1→V2, Sepolia deployment)
-        .migration_helper = Address.fromHex("0x11cfa7e034dafb7439cc1cc8b6e547f5c82ad021") catch unreachable,
-        .locked_migration_controller = Address.fromHex("0xf91c34ed840889ed96f806f882fd50506a336edb") catch unreachable,
-        .unlocked_migration_controller = Address.fromHex("0x056138ef5660f7113a3b0adc08ac3683310e7fbc") catch unreachable,
+        // Migration Contracts (V1→V2, Sepolia June deployment)
+        .migration_helper = Address.fromHex("0xd54a53c1567b26f9653c8565dccc39bceb6ab327") catch unreachable,
+        .locked_migration_controller = Address.fromHex("0x681802eff57b83edce99d688c023ab1284495176") catch unreachable,
+        .unlocked_migration_controller = Address.fromHex("0xd021a69db7f9e276a59cbbccf06e7f1e5434215c") catch unreachable,
 
-        // Deployment blocks (verified from on-protocol)
-        .v1_deployment_block = 10893210, // Fresh V1+V2 redeployment on Sepolia
-        .v2_deployment_block = 10893210, // Fresh V1+V2 redeployment on Sepolia
+        // Deployment blocks
+        .v1_deployment_block = 10893210, // V1 (canonical Sepolia ENS) — unchanged
+        .v2_deployment_block = 11163314, // June V2 redeployment (first contract of the batch)
 
         // Historical markers (not applicable for testnets)
         .temp_registrar_start_block = 0,
@@ -146,17 +155,19 @@ fn mainnetAddresses() ContractAddresses {
         .name_wrapper = Address.fromHex("0xD4416b13d2b3a9aBae7AcD5D6C2BbDBE25686401") catch unreachable,
 
         // V2 Mainnet Contracts (ENSv2 — not yet deployed; zero placeholders)
-        .root_registry = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .eth_registry = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .eth_registrar_v2 = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .eth_reverse_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .batch_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .premigration_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
+        .root_registry = Address.zero,
+        .eth_registry = Address.zero,
+        .eth_registrar_v2 = Address.zero,
+        .eth_renewer_v1 = Address.zero,
+        .eth_label_store = Address.zero,
+        .eth_reverse_registrar = Address.zero,
+        .batch_registrar = Address.zero,
+        .premigration_registrar = Address.zero,
 
         // Migration Contracts (Not yet deployed on mainnet)
-        .migration_helper = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .locked_migration_controller = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .unlocked_migration_controller = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
+        .migration_helper = Address.zero,
+        .locked_migration_controller = Address.zero,
+        .unlocked_migration_controller = Address.zero,
 
         // Deployment blocks
         // ENS Registry + Temporary Registrar deployed in block 3327417 (May 2017)

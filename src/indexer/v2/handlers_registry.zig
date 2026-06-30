@@ -14,6 +14,8 @@ const Indexer = @import("../indexer.zig").Indexer;
 const utils = @import("../utils.zig");
 const registry_entries = @import("../../storage/registry_entries.zig");
 const json_utils = @import("../../utils/json.zig");
+const unknown_labels_storage = @import("../../storage/unknown_labels.zig");
+const label_backfill = @import("../label_backfill.zig");
 
 // `handleSubregistryUpdate` (2-arg `SubregistryUpdate(uint256,address)`) was
 // removed in the post-audit cleanup — the fresh-Sepolia contracts only emit
@@ -2010,4 +2012,41 @@ fn warnIfLiveMultiParent(self: *Indexer, protocol: models.Protocol, registry_hex
         parents[1].parent_registry,
         parents[1].canonical_id,
     });
+}
+
+/// Handle LabelStore `Label(bytes32 indexed labelHash, string label)` — the on-chain
+/// labelhash->preimage dictionary. Heals any unknown labels carrying this labelhash by
+/// materializing their name records (reusing the rainbow heal path), then clears them.
+pub fn handleLabelStoreLabel(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
+    _ = protocol;
+    if (log.topics.len < 2) return error.InvalidTopicCount;
+    const labelhash = Hash{ .bytes = log.topics[1].bytes };
+
+    // Non-indexed payload: (string label).
+    const data_values = try abi.decodeValues(log.data, &.{.string}, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const label = data_values[0].string;
+
+    ens_name.validateLabel(label) catch {
+        std.log.warn("LabelStore: ignoring invalid label for labelhash {any}", .{labelhash});
+        return;
+    };
+
+    const rows = try unknown_labels_storage.getUnknownLabelsByLabelhash(self.allocator, self.database, labelhash);
+    defer {
+        for (rows) |r| unknown_labels_storage.freeUnknownLabel(self.allocator, r);
+        self.allocator.free(rows);
+    }
+    if (rows.len == 0) return;
+
+    var healed: usize = 0;
+    for (rows) |row| {
+        label_backfill.healSubdomainLabel(self.allocator, self.database, label, row) catch |err| {
+            std.log.warn("LabelStore heal failed for labelhash={s}: {}", .{ row.labelhash, err });
+            continue;
+        };
+        unknown_labels_storage.deleteUnknownLabel(self.database, row.id) catch {};
+        healed += 1;
+    }
+    if (healed > 0) std.log.debug("LabelStore: healed {d} label(s) as '{s}'", .{ healed, label });
 }
