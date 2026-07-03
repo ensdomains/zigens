@@ -269,6 +269,19 @@ pub fn rollbackToBlock(db: *Database, protocol: models.Protocol, block_number: u
     // above) AND its INSERT (op 'I'), and replayUndo's 'I' handler clears only this
     // protocol's seen flag and drops the row only when neither protocol still claims it.
 
+    // Resolution cache: drop derived answers pinned to a block newer than the
+    // rollback target so the next read re-resolves against the restored chain.
+    // Chain-scoped (one process = one chain), not protocol-scoped — a rollback on
+    // either protocol may purge cache rows attributable to the other, which is
+    // harmless for a disposable overlay (it self-heals on the next lookup).
+    {
+        var cq = try Query.init(db, "DELETE FROM resolution_cache WHERE chain_id = ? AND block_dep_num > ?");
+        defer cq.deinit();
+        try cq.bindInt64(@intCast(db.chain_id));
+        try cq.bindInt64(block_i64);
+        try cq.exec();
+    }
+
     // Update sync state
     try db.setSyncState(protocol, block_number);
 
@@ -571,6 +584,16 @@ pub fn deleteDataAfterBlock(db: *Database, block_number: u64) !void {
 
     // v1_controllers is wound back by the replayUndo calls above (reorg_active undo-log,
     // both protocols) — no explicit column-predicate cleanup needed.
+
+    // Resolution cache: drop derived answers pinned above the target block (chain-
+    // scoped; protocol-agnostic like this whole path). Self-heals on the next read.
+    {
+        var cq = try Query.init(db, "DELETE FROM resolution_cache WHERE chain_id = ? AND block_dep_num > ?");
+        defer cq.deinit();
+        try cq.bindInt64(@intCast(db.chain_id));
+        try cq.bindInt64(@intCast(block_number));
+        try cq.exec();
+    }
 
     // Commit transaction
     try tx.commit();

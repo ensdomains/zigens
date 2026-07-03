@@ -13,6 +13,8 @@ const names = @import("names.zig");
 const resolvers = @import("resolvers.zig");
 const registry_entries = @import("registry_entries.zig");
 const reorg_undo = @import("reorg_undo.zig");
+const resolve_cache = @import("../resolve/cache.zig");
+const finality = @import("finality.zig");
 
 // Re-export types for use by other modules
 pub const OrderDir = names.OrderDir;
@@ -190,6 +192,12 @@ pub const Database = struct {
         // reorg_cursor (no capture unless the indexer sets the current block).
         try reorg_undo.ensureSchema(&database);
         if (be.caps.server_side_undo) try reorg_undo.installTriggers(&database);
+
+        // Resolution cache: idempotent CREATE so already-synced deployments gain the
+        // table without a reindex. Must exist before rollbackToBlock, which purges it.
+        try resolve_cache.ensureSchema(&database);
+        // Finality tiers (Task 09): idempotent CREATE, same rationale.
+        try finality.ensureSchema(&database);
 
         return database;
     }
@@ -775,6 +783,9 @@ pub const Database = struct {
     pub const setSyncState = sync.setSyncState;
     pub const storeBlockHash = sync.storeBlockHash;
     pub const getBlockHash = sync.getBlockHash;
+    pub const setFinality = finality.setFinality;
+    pub const getFinality = finality.getFinality;
+    pub const FinalityTier = finality.Tier;
     pub const rollbackToBlock = sync.rollbackToBlock;
     pub const pruneOldBlockHashes = sync.pruneOldBlockHashes;
     pub const checkIntegrity = sync.checkIntegrity;

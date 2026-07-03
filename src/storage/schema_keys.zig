@@ -55,6 +55,13 @@ const conflict_keys = std.StaticStringMap([]const []const u8).initComptime(.{
     .{ "resolver_named_resources", &[_][]const u8{ "protocol", "resolver", "resource" } },
     .{ "reverse_records", &[_][]const u8{ "protocol", "address" } },
     .{ "unknown_labels", &[_][]const u8{ "labelhash", "parent_node" } },
+    // Resolution cache — created via resolve/cache.zig `ensureSchema` (not the
+    // drop-and-reindex base schema, so it appears here rather than being derived
+    // from schema/schema.sql). Its composite PRIMARY KEY is the ON CONFLICT target.
+    .{ "resolution_cache", &[_][]const u8{ "chain_id", "target", "selector_key", "arg_hash", "block_dep_hash" } },
+    // Finality tiers — created via storage/finality.zig `ensureSchema` (also not in the
+    // base schema); one row per (chain_id, tier) with tier in ('safe','finalized').
+    .{ "finality_state", &[_][]const u8{ "chain_id", "tier" } },
 });
 
 /// The conflict-key columns for `table`, or null if the table is not a known
@@ -99,6 +106,8 @@ test "conflictColsFor matches every schema-derived key" {
         .{ "resolver_named_resources", &[_][]const u8{ "protocol", "resolver", "resource" } },
         .{ "reverse_records", &[_][]const u8{ "protocol", "address" } },
         .{ "unknown_labels", &[_][]const u8{ "labelhash", "parent_node" } },
+        .{ "resolution_cache", &[_][]const u8{ "chain_id", "target", "selector_key", "arg_hash", "block_dep_hash" } },
+        .{ "finality_state", &[_][]const u8{ "chain_id", "tier" } },
     };
     inline for (expected) |e| {
         try std.testing.expectEqualDeep(@as(?[]const []const u8, e[1]), conflictColsFor(e[0]));
