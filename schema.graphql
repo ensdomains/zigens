@@ -109,6 +109,34 @@ type Query {
 
   """Indexer health / sync state (subgraph parity)."""
   _meta: _Meta_!
+
+  """
+  Finality signalling (ensv2 extension, NOT subgraph). Per-chain head / safe /
+  finalized block positions so a consumer can judge how settled an answer is.
+  `safe`/`finalized` are null until FINALITY_ENABLED and the indexer has fetched them.
+  """
+  _finality: Finality!
+}
+
+"""Finality positions + a staleness signal (ensv2 extension)."""
+type Finality {
+  """Indexed head (highest block synced); hash is null across the two protocols."""
+  head: FinalityBlock!
+  """Chain `safe` block position, or null when not fetched."""
+  safe: FinalityBlock
+  """Chain `finalized` block position, or null when not fetched."""
+  finalized: FinalityBlock
+  """True when the indexed head has not reached the chain's safe point (or no safe data)."""
+  isStale: Boolean!
+}
+
+"""A block position within `Finality`."""
+type FinalityBlock {
+  number: Int!
+  """Block hash (hex), or null."""
+  hash: String
+  """When this position was fetched (unix seconds), or null."""
+  updatedAt: Int
 }
 
 """Indexer health / sync state (subgraph parity)."""
@@ -267,7 +295,7 @@ type EACRoleAssignmentConnection {
 
 """An ENS domain name"""
 type Domain {
-  """Domain identifier (name or namehash)"""
+  """Domain namehash (ERC-137 node hash), matching the ENS subgraph. The singular `domain(id:)` lookup still accepts a name or a namehash."""
   id: String!
 
   """Full domain name (e.g., 'vitalik.eth')"""

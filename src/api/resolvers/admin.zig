@@ -49,9 +49,9 @@ pub fn resolveRoles(ctx: parser.ExecutionContext, field: *const parser.Field) !p
 
     defer {
         for (roles) |*role| {
-            role.deinit(allocator);
+            role.deinit(database.allocator);
         }
-        allocator.free(roles);
+        database.allocator.free(roles);
     }
 
     // Build JSON array
@@ -159,9 +159,9 @@ pub fn resolveRolesConnection(ctx: parser.ExecutionContext, field: *const parser
     });
     defer {
         for (roles) |*role| {
-            @constCast(role).deinit(allocator);
+            @constCast(role).deinit(database.allocator);
         }
-        allocator.free(roles);
+        database.allocator.free(roles);
     }
 
     // Determine actual items to return
@@ -300,9 +300,9 @@ pub fn resolveResolverEntities(ctx: parser.ExecutionContext, field: *const parse
     defer {
         for (entities) |*e| {
             var m = e.*;
-            m.deinit(allocator);
+            m.deinit(database.allocator);
         }
-        allocator.free(entities);
+        database.allocator.free(entities);
     }
 
     var json: std.ArrayList(u8) = .{};
@@ -317,12 +317,14 @@ pub fn resolveResolverEntities(ctx: parser.ExecutionContext, field: *const parse
             resolver_addr,
             namehash_val,
             protocol_val,
+            null,
             field.selections,
             .{
                 .database = database,
                 .depth = 0,
                 .allocator = allocator,
                 .loaders = ctx.loaders,
+                .resolve = ctx.resolve,
             },
         );
         defer allocator.free(entity_json);
@@ -351,9 +353,9 @@ pub fn resolveResolvers(ctx: parser.ExecutionContext, field: *const parser.Field
     const resolvers = try database.getResolversByOwner(protocol, account_addr);
     defer {
         for (resolvers) |*resolver| {
-            resolver.deinit(allocator);
+            resolver.deinit(database.allocator);
         }
-        allocator.free(resolvers);
+        database.allocator.free(resolvers);
     }
 
     // Build JSON array
@@ -391,9 +393,9 @@ pub fn resolveRegistries(ctx: parser.ExecutionContext, field: *const parser.Fiel
     const registries = try database.getRegistriesByOwner(protocol, owner_addr);
     defer {
         for (registries) |*registry| {
-            registry.deinit(allocator);
+            registry.deinit(database.allocator);
         }
-        allocator.free(registries);
+        database.allocator.free(registries);
     }
 
     var json: std.ArrayList(u8) = .{};
@@ -429,7 +431,7 @@ pub fn resolveRegistry(ctx: parser.ExecutionContext, field: *const parser.Field)
         return parser.FieldResult{ .json = try allocator.dupe(u8, "null") };
     }
     var registry = registry_opt.?;
-    defer registry.deinit(allocator);
+    defer registry.deinit(database.allocator);
 
     const json = try buildRegistryInfoJson(allocator, database, &registry, field.selections, ctx);
     return parser.FieldResult{ .json = json };
@@ -454,7 +456,7 @@ pub fn resolveMetadata(ctx: parser.ExecutionContext, field: *const parser.Field)
     const metadata_opt = try database.getResolverMetadata(protocol, resolver_addr);
     if (metadata_opt) |metadata| {
         var metadata_mut = metadata;
-        defer metadata_mut.deinit(allocator);
+        defer metadata_mut.deinit(database.allocator);
 
         const handler = FieldHandler{
             .handleFn = handleResolverMetadataField,
@@ -491,9 +493,9 @@ pub fn resolveApprovals(ctx: parser.ExecutionContext, field: *const parser.Field
 
     defer {
         for (approvals) |*approval| {
-            approval.deinit(allocator);
+            approval.deinit(database.allocator);
         }
-        allocator.free(approvals);
+        database.allocator.free(approvals);
     }
 
     // Build JSON array
@@ -587,8 +589,8 @@ fn buildResolverJson(
             const limit: u32 = @intCast(@min(limit_arg, 1000));
             const names = try database.getNamesByResolver(resolver_addr, limit);
             defer {
-                for (names) |*name| @constCast(name).deinit(allocator);
-                allocator.free(names);
+                for (names) |*name| @constCast(name).deinit(database.allocator);
+                database.allocator.free(names);
             }
 
             try json.appendSlice(allocator, "\"");
@@ -611,8 +613,8 @@ fn buildResolverJson(
         } else if (std.mem.eql(u8, sel.name, "aliases")) {
             const alias_records = try database.getResolverAliases(resolver_addr);
             defer {
-                for (alias_records) |*r| @constCast(r).deinit(allocator);
-                allocator.free(alias_records);
+                for (alias_records) |*r| @constCast(r).deinit(database.allocator);
+                database.allocator.free(alias_records);
             }
 
             try json.appendSlice(allocator, "\"");
@@ -657,8 +659,8 @@ fn buildResolverJson(
         } else if (std.mem.eql(u8, sel.name, "roles")) {
             const role_list = try database.getResolverRoles(resolver_addr);
             defer {
-                for (role_list) |*role| @constCast(role).deinit(allocator);
-                allocator.free(role_list);
+                for (role_list) |*role| @constCast(role).deinit(database.allocator);
+                database.allocator.free(role_list);
             }
 
             try json.appendSlice(allocator, "\"");
@@ -714,8 +716,8 @@ fn buildResolverJson(
                 .limit = limit,
             });
             defer {
-                for (events_list) |*evt| @constCast(evt).deinit(allocator);
-                allocator.free(events_list);
+                for (events_list) |*evt| @constCast(evt).deinit(database.allocator);
+                database.allocator.free(events_list);
             }
 
             try json.appendSlice(allocator, "\"");
@@ -742,7 +744,7 @@ fn buildResolverJson(
             // comma. resolver(id) has no single node context, so use the zero namehash —
             // per-node record fields then resolve to empty/null.
             const single = selections[idx .. idx + 1];
-            const shared = try builders.buildResolverJson(resolver_addr, Hash.zero, .v2, single, .{
+            const shared = try builders.buildResolverJson(resolver_addr, Hash.zero, .v2, null, single, .{
                 .database = database,
                 .depth = 1,
                 .allocator = allocator,
@@ -1117,9 +1119,9 @@ fn writeRegistryOwner(
     defer {
         for (role_rows) |*r| {
             var role_mut = r.*;
-            role_mut.deinit(allocator);
+            role_mut.deinit(database.allocator);
         }
-        allocator.free(role_rows);
+        database.allocator.free(role_rows);
     }
 
     var owner_addr: ?Address = null;
@@ -1137,6 +1139,7 @@ fn writeRegistryOwner(
             .depth = 0,
             .allocator = allocator,
             .loaders = ctx.loaders,
+            .resolve = ctx.resolve,
         });
         defer allocator.free(account_json);
         try writer.writeAll(account_json);
@@ -1209,9 +1212,9 @@ fn writeRegistryNameList(
     defer {
         for (names) |*n| {
             var name_mut = n.*;
-            name_mut.deinit(allocator);
+            name_mut.deinit(database.allocator);
         }
-        allocator.free(names);
+        database.allocator.free(names);
     }
 
     try writer.print("\"{s}\":[", .{output_key});
@@ -1222,6 +1225,7 @@ fn writeRegistryNameList(
             .depth = 0,
             .allocator = allocator,
             .loaders = ctx.loaders,
+            .resolve = ctx.resolve,
         });
         defer allocator.free(dom_json);
         try writer.writeAll(dom_json);
@@ -1254,9 +1258,9 @@ fn writeRegistryEvents(
     defer {
         for (events) |*e| {
             var ev_mut = e.*;
-            ev_mut.deinit(allocator);
+            ev_mut.deinit(database.allocator);
         }
-        allocator.free(events);
+        database.allocator.free(events);
     }
 
     try writer.print("\"{s}\":[", .{output_key});
@@ -1267,6 +1271,7 @@ fn writeRegistryEvents(
             .depth = 0,
             .allocator = allocator,
             .loaders = ctx.loaders,
+            .resolve = ctx.resolve,
         });
         defer allocator.free(ev_json);
         try writer.writeAll(ev_json);
@@ -1296,9 +1301,9 @@ fn writeRegistryRoles(
     defer {
         for (roles_list) |*r| {
             var role_mut = r.*;
-            role_mut.deinit(allocator);
+            role_mut.deinit(database.allocator);
         }
-        allocator.free(roles_list);
+        database.allocator.free(roles_list);
     }
 
     try writer.print("\"{s}\":[", .{output_key});
@@ -1435,9 +1440,9 @@ fn writeRegistryNameConnection(
     defer {
         for (names) |*n| {
             var nn = n.*;
-            nn.deinit(allocator);
+            nn.deinit(database.allocator);
         }
-        allocator.free(names);
+        database.allocator.free(names);
     }
 
     const has_more = names.len > params.limit;
@@ -1471,6 +1476,7 @@ fn writeRegistryNameConnection(
             .depth = 0,
             .allocator = allocator,
             .loaders = ctx.loaders,
+            .resolve = ctx.resolve,
         });
         defer allocator.free(dom_json);
         try writer.writeAll(dom_json);
@@ -1547,9 +1553,9 @@ fn writeRegistryEventConnection(
     defer {
         for (events) |*e| {
             var em = e.*;
-            em.deinit(allocator);
+            em.deinit(database.allocator);
         }
-        allocator.free(events);
+        database.allocator.free(events);
     }
 
     const has_more = events.len > params.limit;
@@ -1585,6 +1591,7 @@ fn writeRegistryEventConnection(
             .depth = 0,
             .allocator = allocator,
             .loaders = ctx.loaders,
+            .resolve = ctx.resolve,
         });
         defer allocator.free(ev_json);
         try writer.writeAll(ev_json);
@@ -1645,9 +1652,9 @@ fn writeRegistryRoleConnection(
     defer {
         for (role_rows) |*r| {
             var rm = r.*;
-            rm.deinit(allocator);
+            rm.deinit(database.allocator);
         }
-        allocator.free(role_rows);
+        database.allocator.free(role_rows);
     }
 
     const has_more = role_rows.len > params.limit;
@@ -1812,8 +1819,8 @@ pub fn resolveWrappedDomains(ctx: parser.ExecutionContext, field: *const parser.
 
     const rows = try database.getWrappedDomains(filters, @intCast(page.skip), page.first);
     defer {
-        for (rows) |*r| @constCast(r).deinit(allocator);
-        allocator.free(rows);
+        for (rows) |*r| @constCast(r).deinit(database.allocator);
+        database.allocator.free(rows);
     }
 
     var json: std.ArrayList(u8) = .{};
@@ -1826,6 +1833,7 @@ pub fn resolveWrappedDomains(ctx: parser.ExecutionContext, field: *const parser.
             .depth = 0,
             .allocator = allocator,
             .loaders = ctx.loaders,
+            .resolve = ctx.resolve,
         });
         defer allocator.free(wd_json);
         try json.appendSlice(allocator, wd_json);
@@ -1892,6 +1900,84 @@ pub fn resolveMeta(ctx: parser.ExecutionContext, field: *const parser.Field) !pa
     }
     try w.writeAll("}");
 
+    return parser.FieldResult{ .json = try allocator.dupe(u8, json.items) };
+}
+
+fn writeFinalityBlock(w: anytype, key: []const u8, sels: []const parser.Field, number: u64, hash: ?Hash, updated_at: ?i64) !void {
+    try w.print("\"{s}\":{{", .{key});
+    var first = true;
+    if (sels.len == 0) {
+        try w.print("\"number\":{d}", .{number});
+    } else {
+        for (sels) |*s| {
+            const k = s.alias orelse s.name;
+            if (!first) try w.writeAll(",");
+            if (std.mem.eql(u8, s.name, "number")) {
+                try w.print("\"{s}\":{d}", .{ k, number });
+            } else if (std.mem.eql(u8, s.name, "hash")) {
+                if (hash) |h| {
+                    var buf: [66]u8 = undefined;
+                    try w.print("\"{s}\":\"{s}\"", .{ k, h.toHexBuf(&buf) });
+                } else try w.print("\"{s}\":null", .{k});
+            } else if (std.mem.eql(u8, s.name, "updatedAt")) {
+                if (updated_at) |u| {
+                    try w.print("\"{s}\":{d}", .{ k, u });
+                } else try w.print("\"{s}\":null", .{k});
+            } else {
+                try w.print("\"{s}\":null", .{k});
+            }
+            first = false;
+        }
+    }
+    try w.writeAll("}");
+}
+
+fn writeFinalityTier(w: anytype, key: []const u8, sels: []const parser.Field, pos: anytype) !void {
+    if (pos) |p| {
+        try writeFinalityBlock(w, key, sels, p.number, p.hash, p.updated_at);
+    } else {
+        try w.print("\"{s}\":null", .{key});
+    }
+}
+
+/// `_finality` (Task 09): additive, non-subgraph signal of how settled the data is. The
+/// `head` tier is the indexed head (max sync_state); `safe`/`finalized` are the chain
+/// positions the indexer fetched into finality_state (null until FINALITY_ENABLED + a
+/// fetch). `isStale` is true when the indexed head hasn't reached the chain's safe point
+/// (or no safe data). This does not touch the subgraph `_meta` shape.
+pub fn resolveFinality(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
+    const allocator = ctx.allocator;
+    const database: *db.Database = @ptrCast(@alignCast(ctx.database));
+
+    const v1_block = (try database.getSyncState(.v1)) orelse 0;
+    const v2_block = (try database.getSyncState(.v2)) orelse 0;
+    const head: u64 = if (v1_block > v2_block) v1_block else v2_block;
+    const safe = try database.getFinality(database.chain_id, .safe);
+    const finalized = try database.getFinality(database.chain_id, .finalized);
+    const is_stale = if (safe) |snap| head < snap.number else true;
+
+    var json: std.ArrayList(u8) = .{};
+    defer json.deinit(allocator);
+    const w = json.writer(allocator);
+    try w.writeAll("{");
+    var first = true;
+    for (field.selections) |*sel| {
+        const key = sel.alias orelse sel.name;
+        if (!first) try w.writeAll(",");
+        if (std.mem.eql(u8, sel.name, "head")) {
+            try writeFinalityBlock(w, key, sel.selections, head, null, null);
+        } else if (std.mem.eql(u8, sel.name, "safe")) {
+            try writeFinalityTier(w, key, sel.selections, safe);
+        } else if (std.mem.eql(u8, sel.name, "finalized")) {
+            try writeFinalityTier(w, key, sel.selections, finalized);
+        } else if (std.mem.eql(u8, sel.name, "isStale")) {
+            try w.print("\"{s}\":{}", .{ key, is_stale });
+        } else {
+            try w.print("\"{s}\":null", .{key});
+        }
+        first = false;
+    }
+    try w.writeAll("}");
     return parser.FieldResult{ .json = try allocator.dupe(u8, json.items) };
 }
 
