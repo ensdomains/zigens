@@ -104,6 +104,44 @@ fn writeJsonValue(writer: anytype, value: anytype) !void {
     }
 }
 
+/// Block reference for a read-only call. Prefer `.hash` for reproducible,
+/// reorg-safe reads (the answer is pinned to an exact block); `.number` and
+/// `.latest` are best-effort against a head that may move or be reorged.
+pub const BlockTag = union(enum) {
+    latest,
+    number: u64,
+    hash: Hash,
+};
+
+/// Result of a revert-exposing eth_call (`ethCallAllowRevert`). `.ok` carries the return
+/// bytes; `.reverted` carries the revert DATA (e.g. an EIP-3668 OffchainLookup). Both are
+/// owned by the client allocator.
+pub const CallResult = union(enum) {
+    ok: []u8,
+    reverted: []u8,
+
+    pub fn deinit(self: CallResult, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .ok => |d| allocator.free(d),
+            .reverted => |d| allocator.free(d),
+        }
+    }
+};
+
+const call_hex_alphabet = "0123456789abcdef";
+
+/// Encode raw calldata as a `0x`-prefixed lowercase hex string. Caller owns it.
+fn encodeCallData(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, 2 + bytes.len * 2);
+    out[0] = '0';
+    out[1] = 'x';
+    for (bytes, 0..) |b, i| {
+        out[2 + i * 2] = call_hex_alphabet[b >> 4];
+        out[2 + i * 2 + 1] = call_hex_alphabet[b & 0x0f];
+    }
+    return out;
+}
+
 pub const Block = struct {
     number: u64,
     hash: Hash,
@@ -381,12 +419,21 @@ pub const Client = struct {
         };
         errdefer parsed.deinit();
 
+        // A non-conformant provider can return valid JSON that is not the expected shape;
+        // treat that as a catchable error, never an (uncatchable) panic — some callers run
+        // in the indexer poll loop and rely on `catch` to degrade.
+        if (parsed.value != .object) {
+            std.log.err("RPC response for {s} was not a JSON object", .{method});
+            return error.InvalidRpcResponse;
+        }
         const response = parsed.value.object;
 
         // Check for errors
         if (response.get("error")) |err| {
-            const error_obj = err.object;
-            const error_message = error_obj.get("message").?.string;
+            const error_message = if (err == .object)
+                (if (err.object.get("message")) |m| (if (m == .string) m.string else "(non-string message)") else "(no message)")
+            else
+                "(malformed error)";
             std.log.err("RPC error: {s}", .{error_message});
             return error.RpcError;
         }
@@ -395,7 +442,10 @@ pub const Client = struct {
     }
 
     /// Make a single RPC call with pre-built JSON params
-    fn makeRpcCallWithParams(self: *Client, method: []const u8, params: std.json.Value) !std.json.Parsed(std.json.Value) {
+    /// Execute a JSON-RPC call and return the parsed response WITHOUT collapsing the
+    /// `error` member — callers that need the error object (e.g. eth_call revert data for
+    /// EIP-3668) inspect it themselves. Transport/parse failures still error.
+    fn makeRpcCallRaw(self: *Client, method: []const u8, params: std.json.Value) !std.json.Parsed(std.json.Value) {
         const request_id = self.nextRequestId();
 
         // Use arena allocator for request/response buffers
@@ -417,23 +467,22 @@ pub const Client = struct {
         const response_body = try self.executeHttpRequest(arena_allocator, request_buf.items);
 
         // Parse JSON response with main allocator (result will outlive this function)
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response_body, .{}) catch |err| {
+        return std.json.parseFromSlice(std.json.Value, self.allocator, response_body, .{}) catch |err| {
             const preview_len = @min(response_body.len, 500);
             std.log.err("Failed to parse RPC response as JSON ({s}): {s}", .{ method, response_body[0..preview_len] });
             return err;
         };
+    }
+
+    fn makeRpcCallWithParams(self: *Client, method: []const u8, params: std.json.Value) !std.json.Parsed(std.json.Value) {
+        const parsed = try self.makeRpcCallRaw(method, params);
         errdefer parsed.deinit();
-
-        const response = parsed.value.object;
-
         // Check for errors
-        if (response.get("error")) |err| {
-            const error_obj = err.object;
-            const error_message = error_obj.get("message").?.string;
+        if (parsed.value.object.get("error")) |err| {
+            const error_message = err.object.get("message").?.string;
             std.log.err("RPC error: {s}", .{error_message});
             return error.RpcError;
         }
-
         return parsed;
     }
 
@@ -520,6 +569,87 @@ pub const Client = struct {
         return block_num;
     }
 
+    /// Execute a read-only contract call (`eth_call`) against `to` with `data`,
+    /// evaluated at `block`. Returns the raw ABI return bytes, owned by this
+    /// client's allocator (an empty return is a zero-length slice). An on-chain
+    /// revert or transport failure surfaces as an error — resolution callers are
+    /// expected to catch it and fall back to their indexed answer.
+    pub fn ethCall(self: *Client, to: Address, data: []const u8, block: BlockTag) ![]u8 {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        // params: [ { to, data }, <block reference> ]
+        var call_obj = std.json.ObjectMap.init(a);
+        try call_obj.put("to", .{ .string = try to.toHex(a) });
+        try call_obj.put("data", .{ .string = try encodeCallData(a, data) });
+
+        var params_arr = std.json.Array.init(a);
+        try params_arr.append(.{ .object = call_obj });
+        switch (block) {
+            .latest => try params_arr.append(.{ .string = "latest" }),
+            .number => |n| try params_arr.append(.{ .string = try std.fmt.allocPrint(a, "0x{x}", .{n}) }),
+            .hash => |h| {
+                // EIP-1898 block-hash reference so the read is pinned to an exact block.
+                var blk_obj = std.json.ObjectMap.init(a);
+                try blk_obj.put("blockHash", .{ .string = try h.toHex(a) });
+                try params_arr.append(.{ .object = blk_obj });
+            },
+        }
+
+        const parsed = try self.makeRpcCallWithParams("eth_call", .{ .array = params_arr });
+        defer parsed.deinit();
+
+        const result = parsed.value.object.get("result") orelse return error.RpcNoResult;
+        switch (result) {
+            .string => |s| return try self.hexToBytes(s),
+            else => return error.RpcNoResult,
+        }
+    }
+
+    /// EIP-3668/CCIP: the revert-exposing sibling of `ethCall`. Returns `.ok` with the
+    /// return bytes, or `.reverted` with the revert DATA (needed to decode an
+    /// OffchainLookup). A transport failure, missing result, or a revert WITHOUT data
+    /// surfaces as an error so the caller degrades. Result owned by `self.allocator`.
+    pub fn ethCallAllowRevert(self: *Client, to: Address, data: []const u8, block: BlockTag) !CallResult {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var call_obj = std.json.ObjectMap.init(a);
+        try call_obj.put("to", .{ .string = try to.toHex(a) });
+        try call_obj.put("data", .{ .string = try encodeCallData(a, data) });
+        var params_arr = std.json.Array.init(a);
+        try params_arr.append(.{ .object = call_obj });
+        switch (block) {
+            .latest => try params_arr.append(.{ .string = "latest" }),
+            .number => |n| try params_arr.append(.{ .string = try std.fmt.allocPrint(a, "0x{x}", .{n}) }),
+            .hash => |h| {
+                var blk_obj = std.json.ObjectMap.init(a);
+                try blk_obj.put("blockHash", .{ .string = try h.toHex(a) });
+                try params_arr.append(.{ .object = blk_obj });
+            },
+        }
+
+        const parsed = try self.makeRpcCallRaw("eth_call", .{ .array = params_arr });
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        if (obj.get("error")) |err| {
+            // Revert data lives in error.data as a 0x-hex string on most nodes.
+            if (err.object.get("data")) |d| {
+                if (d == .string and std.mem.startsWith(u8, d.string, "0x")) {
+                    return .{ .reverted = try self.hexToBytes(d.string) };
+                }
+            }
+            return error.RpcError; // revert without data / other RPC error
+        }
+        const result = obj.get("result") orelse return error.RpcNoResult;
+        switch (result) {
+            .string => |s| return .{ .ok = try self.hexToBytes(s) },
+            else => return error.RpcNoResult,
+        }
+    }
+
     pub fn getBlockByNumber(self: *Client, block_number: u64, include_txs: bool) !Block {
         const block_hex = try std.fmt.allocPrint(self.allocator, "0x{x}", .{block_number});
         defer self.allocator.free(block_hex);
@@ -540,6 +670,68 @@ pub const Client = struct {
             .parent_hash = try Hash.fromHex(block_obj.get("parentHash").?.string),
             .timestamp = try std.fmt.parseInt(u64, block_obj.get("timestamp").?.string[2..], 16),
         };
+    }
+
+    /// A block position by tier (number + hash). Used for finality (Task 09).
+    pub const TaggedBlock = struct { number: u64, hash: Hash };
+
+    /// Fetch a block by tag ('safe' / 'finalized' / 'latest'). Returns null when the
+    /// provider doesn't support the tag or returns a null block (pre-Merge nodes, some
+    /// L2s) — the caller degrades. Only number + hash are decoded; never throws for a
+    /// finality fetch, so a bad provider can't break indexing.
+    /// Decode a TaggedBlock from a parsed eth_getBlockByNumber response. Every access is
+    /// checked so a hostile/non-conformant provider response degrades to null and never
+    /// panics — the caller runs this in the indexer poll loop and relies on that.
+    fn parseTaggedBlock(value: std.json.Value) ?TaggedBlock {
+        if (value != .object) return null;
+        const result = value.object.get("result") orelse return null;
+        if (result != .object) return null; // "result": null → tag unsupported
+        const block_obj = result.object;
+        const num_v = block_obj.get("number") orelse return null;
+        const hash_v = block_obj.get("hash") orelse return null;
+        if (num_v != .string or hash_v != .string) return null;
+        const num_s = num_v.string;
+        // Require a 0x-prefixed hex quantity with at least one digit; guards the [2..]
+        // slice (an empty/short string would panic) and rejects a non-hex misparse.
+        if (num_s.len < 3 or !std.mem.startsWith(u8, num_s, "0x")) return null;
+        return TaggedBlock{
+            .number = std.fmt.parseInt(u64, num_s[2..], 16) catch return null,
+            .hash = Hash.fromHex(hash_v.string) catch return null,
+        };
+    }
+
+    pub fn getBlockByTag(self: *Client, tag: []const u8) ?TaggedBlock {
+        const parsed = self.makeRpcCall("eth_getBlockByNumber", .{ tag, false }) catch return null;
+        defer parsed.deinit();
+        return parseTaggedBlock(parsed.value);
+    }
+
+    test "parseTaggedBlock degrades on malformed provider responses, never panics" {
+        const a = std.testing.allocator;
+        const valid_hash = "0x" ++ ("aa" ** 32); // 66-char valid hash
+        const Case = struct { json: []const u8, ok: bool, num: u64 };
+        const cases = [_]Case{
+            .{ .json = "{\"result\":{\"number\":\"0x64\",\"hash\":\"" ++ valid_hash ++ "\"}}", .ok = true, .num = 100 },
+            .{ .json = "{\"result\":null}", .ok = false, .num = 0 }, // tag unsupported
+            // Empty number string — before the length/prefix guard this slice-panicked (the reviewed bug).
+            .{ .json = "{\"result\":{\"number\":\"\",\"hash\":\"" ++ valid_hash ++ "\"}}", .ok = false, .num = 0 },
+            .{ .json = "{\"result\":{\"number\":\"0x\",\"hash\":\"" ++ valid_hash ++ "\"}}", .ok = false, .num = 0 }, // 0x, no digits
+            .{ .json = "{\"result\":{\"number\":\"0x64\"}}", .ok = false, .num = 0 }, // missing hash
+            .{ .json = "{\"result\":{\"number\":100,\"hash\":\"0x00\"}}", .ok = false, .num = 0 }, // non-string number
+            .{ .json = "{\"result\":{\"number\":\"0x64\",\"hash\":\"0xbeef\"}}", .ok = false, .num = 0 }, // bad hash len
+            .{ .json = "[]", .ok = false, .num = 0 }, // non-object top-level
+        };
+        for (cases) |c| {
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, c.json, .{});
+            defer parsed.deinit();
+            const got = parseTaggedBlock(parsed.value);
+            if (c.ok) {
+                try std.testing.expect(got != null);
+                try std.testing.expectEqual(c.num, got.?.number);
+            } else {
+                try std.testing.expect(got == null);
+            }
+        }
     }
 
     /// Descriptor for a single getLogs request in a batch
