@@ -1,0 +1,903 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ENSv2 Webhook Management</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 40px 20px;
+      background: #f8f9fa;
+      min-height: 100vh;
+      color: #1a1a1a;
+    }
+    h1 {
+      color: #1a1a1a;
+      text-align: left;
+      font-size: 1.75rem;
+      font-weight: 600;
+      margin-bottom: 32px;
+      letter-spacing: -0.5px;
+    }
+    h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      color: #1a1a1a;
+      margin-bottom: 20px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .container {
+      background: #fff;
+      padding: 28px;
+      border-radius: 8px;
+      border: 1px solid #e5e5e5;
+      margin-bottom: 24px;
+    }
+    .form-grid {
+      display: grid;
+      grid-template-columns: 1fr 340px;
+      gap: 32px;
+    }
+    @media (max-width: 900px) {
+      .form-grid { grid-template-columns: 1fr; }
+    }
+    .event-categories {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 16px;
+      margin-top: 12px;
+    }
+    .event-category {
+      border: 1px solid #e5e5e5;
+      border-radius: 6px;
+      padding: 16px;
+      background: #fafafa;
+    }
+    .category-title {
+      font-weight: 600;
+      color: #666;
+      margin-bottom: 12px;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .select-all {
+      font-size: 10px;
+      color: #888;
+      cursor: pointer;
+      text-decoration: none;
+      font-weight: 500;
+    }
+    .select-all:hover {
+      color: #1a1a1a;
+    }
+    .checkbox-item {
+      display: flex;
+      align-items: center;
+      margin-bottom: 8px;
+      cursor: pointer;
+    }
+    .checkbox-item input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      margin-right: 10px;
+      cursor: pointer;
+      accent-color: #1a1a1a;
+    }
+    .checkbox-item label {
+      cursor: pointer;
+      font-size: 13px;
+      color: #444;
+      user-select: none;
+    }
+    .summary-panel {
+      position: sticky;
+      top: 20px;
+      border: 1px solid #e5e5e5;
+      border-radius: 6px;
+      padding: 20px;
+      background: #fafafa;
+      max-height: 600px;
+      overflow-y: auto;
+    }
+    .summary-title {
+      font-weight: 600;
+      font-size: 11px;
+      color: #666;
+      margin-bottom: 16px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+    }
+    .summary-count {
+      background: #1a1a1a;
+      color: #fff;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 11px;
+    }
+    .summary-empty {
+      color: #888;
+      font-size: 13px;
+      text-align: center;
+      padding: 20px 0;
+    }
+    .summary-events {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .summary-event-tag {
+      background: #fff;
+      border: 1px solid #ddd;
+      color: #444;
+      padding: 5px 10px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 500;
+    }
+    .summary-event-tag.all {
+      background: #1a1a1a;
+      border-color: #1a1a1a;
+      color: #fff;
+      font-weight: 600;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 16px;
+      font-size: 13px;
+    }
+    th, td {
+      text-align: left;
+      padding: 12px 16px;
+      border-bottom: 1px solid #eee;
+    }
+    th {
+      background: #fafafa;
+      color: #666;
+      font-weight: 600;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      border-bottom: 1px solid #e5e5e5;
+    }
+    tr:hover td {
+      background: #fafafa;
+    }
+    button {
+      padding: 8px 16px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      margin-right: 6px;
+      transition: all 0.15s ease;
+      background: #fff;
+      color: #444;
+    }
+    button:hover {
+      border-color: #999;
+      background: #fafafa;
+    }
+    .btn-primary {
+      background: #1a1a1a;
+      border-color: #1a1a1a;
+      color: #fff;
+    }
+    .btn-primary:hover {
+      background: #333;
+      border-color: #333;
+    }
+    .btn-danger {
+      background: #fff;
+      border-color: #ccc;
+      color: #666;
+    }
+    .btn-danger:hover {
+      background: #f5f5f5;
+      border-color: #999;
+      color: #333;
+    }
+    .btn-success {
+      background: #1a1a1a;
+      border-color: #1a1a1a;
+      color: #fff;
+    }
+    .btn-success:hover {
+      background: #333;
+      border-color: #333;
+    }
+    .btn-warning {
+      background: #fff;
+      border-color: #ccc;
+      color: #666;
+    }
+    .btn-warning:hover {
+      background: #f5f5f5;
+      border-color: #999;
+    }
+    .btn-edit {
+      background: #fff;
+      border-color: #ccc;
+      color: #666;
+    }
+    .btn-edit:hover {
+      background: #f5f5f5;
+      border-color: #999;
+    }
+    input[type="text"], input[type="url"] {
+      padding: 10px 12px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      font-size: 14px;
+      width: 100%;
+      transition: border-color 0.15s ease;
+      background: #fff;
+    }
+    input[type="text"]:focus, input[type="url"]:focus {
+      outline: none;
+      border-color: #999;
+    }
+    .form-group {
+      margin-bottom: 20px;
+    }
+    .form-group label {
+      display: block;
+      margin-bottom: 8px;
+      font-weight: 500;
+      color: #444;
+      font-size: 13px;
+    }
+    .status-active {
+      color: #1a1a1a;
+      font-weight: 600;
+    }
+    .status-active::before {
+      content: "";
+      display: inline-block;
+      width: 6px;
+      height: 6px;
+      background: #1a1a1a;
+      border-radius: 50%;
+      margin-right: 6px;
+    }
+    .status-inactive {
+      color: #888;
+      font-weight: 500;
+    }
+    .status-inactive::before {
+      content: "";
+      display: inline-block;
+      width: 6px;
+      height: 6px;
+      background: #ccc;
+      border-radius: 50%;
+      margin-right: 6px;
+    }
+    .event-tag {
+      display: inline-block;
+      background: #f0f0f0;
+      padding: 3px 8px;
+      border-radius: 3px;
+      margin: 2px;
+      font-size: 11px;
+      color: #555;
+    }
+    #message {
+      padding: 14px 16px;
+      border-radius: 4px;
+      margin-bottom: 20px;
+      display: none;
+      font-weight: 500;
+      font-size: 13px;
+    }
+    #message.success {
+      background: #f8f9fa;
+      color: #1a1a1a;
+      border: 1px solid #ddd;
+      display: block;
+    }
+    #message.error {
+      background: #fafafa;
+      color: #666;
+      border: 1px solid #ddd;
+      display: block;
+    }
+    .modal {
+      display: none;
+      position: fixed;
+      z-index: 1000;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0,0,0,0.4);
+      backdrop-filter: blur(2px);
+    }
+    .modal-content {
+      background: #fff;
+      margin: 60px auto;
+      padding: 28px;
+      border-radius: 8px;
+      max-width: 900px;
+      max-height: 85vh;
+      overflow-y: auto;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.15);
+    }
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 24px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid #e5e5e5;
+    }
+    .modal-header h2 {
+      margin: 0;
+      color: #1a1a1a;
+      font-size: 1.1rem;
+    }
+    .close {
+      font-size: 24px;
+      font-weight: 300;
+      color: #999;
+      cursor: pointer;
+      line-height: 1;
+    }
+    .close:hover {
+      color: #1a1a1a;
+    }
+  </style>
+</head>
+<body>
+  <h1>Webhook Management</h1>
+
+  <div id="message"></div>
+
+  <div id="secretBox" style="display:none; background:#fff8e1; border:1px solid #ffe082; border-radius:8px; padding:16px; margin-bottom:24px;">
+    <strong>Webhook created.</strong> Save this signing secret now — it is NOT retrievable later. Set it as <code>WEBHOOK_SECRET</code> on the receiver to verify deliveries:
+    <pre id="secretValue" style="user-select:all; background:#1a1a1a; color:#fff; padding:12px; border-radius:6px; overflow-x:auto; margin:8px 0 0;"></pre>
+  </div>
+
+  <div class="container">
+    <h2>Create New Webhook</h2>
+    <form id="createForm">
+      <div class="form-grid">
+        <div>
+          <div class="form-group">
+            <label>Webhook URL:</label>
+            <input type="url" id="url" placeholder="https://your-server.com/webhook" required>
+          </div>
+
+          <div class="form-group">
+            <label class="checkbox-item" style="font-weight:600; cursor:pointer;">
+              <input type="checkbox" id="useCustomSecret"> Provide my own signing secret (otherwise one is generated)
+            </label>
+            <input type="text" id="secret" placeholder="64-char hex secret (e.g. the receiver's WEBHOOK_SECRET)" autocomplete="off" pattern="[0-9a-fA-F]+" style="display:none; margin-top:8px;">
+          </div>
+
+          <div class="form-group">
+            <label>Select Event Types (leave unchecked for ALL events):</label>
+            <div class="event-categories">
+              <div class="event-category">
+                <div class="category-title">
+                  Registry
+                  <span class="select-all" data-category="registry" onclick="toggleCategory('registry')">Select All</span>
+                </div>
+                <div class="checkbox-item">
+                  <input type="checkbox" id="new_subname" value="new_subname" class="event-checkbox registry-event">
+                  <label for="new_subname">NewSubname</label>
+                </div>
+                <div class="checkbox-item">
+                  <input type="checkbox" id="subregistry_update" value="subregistry_update" class="event-checkbox registry-event">
+                  <label for="subregistry_update">SubregistryUpdate</label>
+                </div>
+                <div class="checkbox-item">
+                  <input type="checkbox" id="resolver_update" value="resolver_update" class="event-checkbox registry-event">
+                  <label for="resolver_update">ResolverUpdate</label>
+                </div>
+                <div class="checkbox-item">
+                  <input type="checkbox" id="transfer" value="transfer" class="event-checkbox registry-event">
+                  <label for="transfer">Transfer</label>
+                </div>
+              </div>
+
+              <div class="event-category">
+                <div class="category-title">
+                  Registration
+                  <span class="select-all" data-category="registration" onclick="toggleCategory('registration')">Select All</span>
+                </div>
+                <div class="checkbox-item">
+                  <input type="checkbox" id="name_registered" value="name_registered" class="event-checkbox registration-event">
+                  <label for="name_registered">NameRegistered</label>
+                </div>
+                <div class="checkbox-item">
+                  <input type="checkbox" id="name_renewed" value="name_renewed" class="event-checkbox registration-event">
+                  <label for="name_renewed">NameRenewed</label>
+                </div>
+                <div class="checkbox-item">
+                  <input type="checkbox" id="name_burned" value="name_burned" class="event-checkbox registration-event">
+                  <label for="name_burned">NameBurned</label>
+                </div>
+                <div class="checkbox-item">
+                  <input type="checkbox" id="commitment_made" value="commitment_made" class="event-checkbox registration-event">
+                  <label for="commitment_made">CommitmentMade</label>
+                </div>
+              </div>
+
+              <div class="event-category">
+                <div class="category-title">
+                  Token & Other
+                  <span class="select-all" data-category="token" onclick="toggleCategory('token')">Select All</span>
+                </div>
+                <div class="checkbox-item">
+                  <input type="checkbox" id="token_regenerated" value="token_regenerated" class="event-checkbox token-event">
+                  <label for="token_regenerated">TokenRegenerated</label>
+                </div>
+                <div class="checkbox-item">
+                  <input type="checkbox" id="approval" value="approval" class="event-checkbox token-event">
+                  <label for="approval">Approval</label>
+                </div>
+                <div class="checkbox-item">
+                  <input type="checkbox" id="metadata_changed" value="metadata_changed" class="event-checkbox token-event">
+                  <label for="metadata_changed">MetadataChanged</label>
+                </div>
+                <div class="checkbox-item">
+                  <input type="checkbox" id="resolver_approved" value="resolver_approved" class="event-checkbox token-event">
+                  <label for="resolver_approved">ResolverApproved</label>
+                </div>
+              </div>
+
+              <div class="event-category">
+                <div class="category-title">
+                  Resolver Records
+                  <span class="select-all" data-category="resolver" onclick="toggleCategory('resolver')">Select All</span>
+                </div>
+                <div class="checkbox-item">
+                  <input type="checkbox" id="text_changed" value="text_changed" class="event-checkbox resolver-event">
+                  <label for="text_changed">TextChanged</label>
+                </div>
+                <div class="checkbox-item">
+                  <input type="checkbox" id="address_changed" value="address_changed" class="event-checkbox resolver-event">
+                  <label for="address_changed">AddressChanged</label>
+                </div>
+                <div class="checkbox-item">
+                  <input type="checkbox" id="contenthash_changed" value="contenthash_changed" class="event-checkbox resolver-event">
+                  <label for="contenthash_changed">ContenthashChanged</label>
+                </div>
+                <div class="checkbox-item">
+                  <input type="checkbox" id="abi_changed" value="abi_changed" class="event-checkbox resolver-event">
+                  <label for="abi_changed">ABIChanged</label>
+                </div>
+                <div class="checkbox-item">
+                  <input type="checkbox" id="pubkey_changed" value="pubkey_changed" class="event-checkbox resolver-event">
+                  <label for="pubkey_changed">PubkeyChanged</label>
+                </div>
+                <div class="checkbox-item">
+                  <input type="checkbox" id="name_changed" value="name_changed" class="event-checkbox resolver-event">
+                  <label for="name_changed">NameChanged</label>
+                </div>
+                <div class="checkbox-item">
+                  <input type="checkbox" id="interface_changed" value="interface_changed" class="event-checkbox resolver-event">
+                  <label for="interface_changed">InterfaceChanged</label>
+                </div>
+              </div>
+            </div>
+          </div>
+          <button type="submit" class="btn-success">Create Webhook</button>
+        </div>
+
+        <div class="summary-panel">
+          <div class="summary-title">
+            Subscription Summary
+            <span class="summary-count" id="summaryCount">0</span>
+          </div>
+          <div id="summaryContent" class="summary-empty">
+            No events selected. Webhook will receive ALL events.
+          </div>
+        </div>
+      </div>
+    </form>
+  </div>
+
+  <div class="container">
+    <h2>Existing Webhooks</h2>
+    <table id="webhooksTable">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>URL</th>
+          <th>Event Types</th>
+          <th>Status</th>
+          <th>Max Retries</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="webhooksList">
+        <tr><td colspan="6" style="text-align: center;">Loading webhooks...</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div id="editModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>Edit Webhook</h2>
+        <span class="close" onclick="closeEditModal()">&times;</span>
+      </div>
+      <form id="editForm">
+        <input type="hidden" id="editWebhookId">
+        <div class="form-grid">
+          <div>
+            <div class="form-group">
+              <label>Webhook URL:</label>
+              <input type="url" id="editUrl" required>
+            </div>
+            <div class="form-group">
+              <label>Select Event Types:</label>
+              <div class="event-categories" id="editEventCategories"></div>
+            </div>
+            <button type="submit" class="btn-primary">Save Changes</button>
+            <button type="button" class="btn-danger" onclick="closeEditModal()">Cancel</button>
+          </div>
+          <div class="summary-panel">
+            <div class="summary-title">
+              Subscription Summary
+              <span class="summary-count" id="editSummaryCount">0</span>
+            </div>
+            <div id="editSummaryContent" class="summary-empty">
+              No events selected. Webhook will receive ALL events.
+            </div>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    const API_BASE = '/api/webhooks';
+
+    // Event type definitions grouped by category
+    const EVENT_CATEGORIES = {
+      registry: ['new_subname', 'subregistry_update', 'resolver_update', 'transfer'],
+      registration: ['name_registered', 'name_renewed', 'name_burned', 'commitment_made'],
+      token: ['token_regenerated', 'approval', 'metadata_changed', 'resolver_approved'],
+      resolver: ['text_changed', 'address_changed', 'contenthash_changed', 'abi_changed', 'pubkey_changed', 'name_changed', 'interface_changed']
+    };
+
+    const EVENT_DISPLAY_NAMES = {
+      'new_subname': 'NewSubname',
+      'subregistry_update': 'SubregistryUpdate',
+      'resolver_update': 'ResolverUpdate',
+      'transfer': 'Transfer',
+      'name_registered': 'NameRegistered',
+      'name_renewed': 'NameRenewed',
+      'name_burned': 'NameBurned',
+      'commitment_made': 'CommitmentMade',
+      'token_regenerated': 'TokenRegenerated',
+      'approval': 'Approval',
+      'metadata_changed': 'MetadataChanged',
+      'resolver_approved': 'ResolverApproved',
+      'text_changed': 'TextChanged',
+      'address_changed': 'AddressChanged',
+      'contenthash_changed': 'ContenthashChanged',
+      'abi_changed': 'ABIChanged',
+      'pubkey_changed': 'PubkeyChanged',
+      'name_changed': 'NameChanged',
+      'interface_changed': 'InterfaceChanged'
+    };
+
+    function showMessage(text, isError = false) {
+      const msg = document.getElementById('message');
+      msg.textContent = text;
+      msg.className = isError ? 'error' : 'success';
+      setTimeout(() => msg.className = '', 5000);
+    }
+
+    function updateSummary(isEdit = false) {
+      const checkboxes = document.querySelectorAll(isEdit ? '#editEventCategories .event-checkbox' : '.event-checkbox');
+      const selected = Array.from(checkboxes).filter(cb => cb.checked).map(cb => cb.value);
+
+      const count = selected.length;
+      const countEl = document.getElementById(isEdit ? 'editSummaryCount' : 'summaryCount');
+      const contentEl = document.getElementById(isEdit ? 'editSummaryContent' : 'summaryContent');
+
+      countEl.textContent = count;
+
+      if (count === 0) {
+        contentEl.className = 'summary-empty';
+        contentEl.innerHTML = '<div style="margin-bottom: 12px;">No events selected.</div><div>Webhook will receive <span class="summary-event-tag all">ALL EVENTS</span></div>';
+      } else {
+        contentEl.className = 'summary-events';
+        contentEl.innerHTML = selected.map(v =>
+          `<span class="summary-event-tag">${EVENT_DISPLAY_NAMES[v] || v}</span>`
+        ).join('');
+      }
+    }
+
+    function toggleCategory(category, container = document) {
+      const events = EVENT_CATEGORIES[category];
+      const checkboxes = events.map(e => container.querySelector(`#${e}`) || container.querySelector(`[value="${e}"]`)).filter(Boolean);
+      const allChecked = checkboxes.every(cb => cb.checked);
+      checkboxes.forEach(cb => cb.checked = !allChecked);
+      updateCategoryToggleText(category, container);
+      updateSummary(container !== document);
+    }
+
+    function updateCategoryToggleText(category, container = document) {
+      const events = EVENT_CATEGORIES[category];
+      const checkboxes = events.map(e => container.querySelector(`#${e}`) || container.querySelector(`[value="${e}"]`)).filter(Boolean);
+      const allChecked = checkboxes.every(cb => cb.checked);
+      const toggleEl = container.querySelector(`[data-category="${category}"]`);
+      if (toggleEl) {
+        toggleEl.textContent = allChecked ? 'Deselect All' : 'Select All';
+      }
+    }
+
+    function updateAllCategoryToggles(container = document) {
+      Object.keys(EVENT_CATEGORIES).forEach(cat => updateCategoryToggleText(cat, container));
+    }
+
+    // Legacy function name for backwards compatibility
+    function selectCategory(category) {
+      toggleCategory(category, document);
+    }
+
+    // Set up event listeners for create form checkboxes
+    document.addEventListener('DOMContentLoaded', () => {
+      document.querySelectorAll('.event-checkbox').forEach(cb => {
+        cb.addEventListener('change', () => {
+          updateSummary(false);
+          updateAllCategoryToggles(document);
+        });
+      });
+      updateSummary(false);
+      updateAllCategoryToggles(document);
+      const useCustomSecret = document.getElementById('useCustomSecret');
+      if (useCustomSecret) {
+        useCustomSecret.addEventListener('change', () => {
+          document.getElementById('secret').style.display = useCustomSecret.checked ? 'block' : 'none';
+        });
+      }
+    });
+
+    function showSecret(secret) {
+      const box = document.getElementById('secretBox');
+      document.getElementById('secretValue').textContent = secret || '(none returned)';
+      box.style.display = 'block';
+    }
+
+    async function loadWebhooks() {
+      try {
+        const response = await fetch(API_BASE);
+        const webhooks = await response.json();
+
+        const tbody = document.getElementById('webhooksList');
+        if (webhooks.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" style="text-align: center;">No webhooks configured</td></tr>';
+          return;
+        }
+
+        tbody.innerHTML = webhooks.map(wh => `
+          <tr>
+            <td>${wh.id}</td>
+            <td style="word-break: break-all;">${wh.url}</td>
+            <td class="event-types">
+              ${wh.event_types.length === 0
+                ? '<span class="event-tag">ALL EVENTS</span>'
+                : wh.event_types.map(et => `<span class="event-tag">${EVENT_DISPLAY_NAMES[et] || et}</span>`).join('')
+              }
+            </td>
+            <td class="${wh.active ? 'status-active' : 'status-inactive'}">
+              ${wh.active ? '✓ Active' : '✗ Inactive'}
+            </td>
+            <td>${wh.max_retries}</td>
+            <td>
+              <button class="btn-edit" onclick='editWebhook(${JSON.stringify(wh)})'>✏ Edit</button>
+              <button class="btn-warning" onclick="toggleWebhook(${wh.id}, ${!wh.active})">
+                ${wh.active ? 'Disable' : 'Enable'}
+              </button>
+              <button class="btn-danger" onclick="deleteWebhook(${wh.id})">Delete</button>
+            </td>
+          </tr>
+        `).join('');
+      } catch (err) {
+        showMessage('Failed to load webhooks: ' + err.message, true);
+      }
+    }
+
+    function editWebhook(webhook) {
+      document.getElementById('editWebhookId').value = webhook.id;
+      document.getElementById('editUrl').value = webhook.url;
+
+      // Build checkbox categories for edit form
+      const container = document.getElementById('editEventCategories');
+      container.innerHTML = Object.entries(EVENT_CATEGORIES).map(([category, events]) => `
+        <div class="event-category">
+          <div class="category-title">
+            ${category.charAt(0).toUpperCase() + category.slice(1)}
+            <span class="select-all" data-category="${category}" onclick="toggleEditCategory('${category}')">Select All</span>
+          </div>
+          ${events.map(event => `
+            <div class="checkbox-item">
+              <input type="checkbox" id="edit_${event}" value="${event}" class="event-checkbox" ${webhook.event_types.includes(event) ? 'checked' : ''}>
+              <label for="edit_${event}">${EVENT_DISPLAY_NAMES[event]}</label>
+            </div>
+          `).join('')}
+        </div>
+      `).join('');
+
+      // Add event listeners
+      container.querySelectorAll('.event-checkbox').forEach(cb => {
+        cb.addEventListener('change', () => {
+          updateSummary(true);
+          updateAllEditCategoryToggles();
+        });
+      });
+
+      updateSummary(true);
+      updateAllEditCategoryToggles();
+      document.getElementById('editModal').style.display = 'block';
+    }
+
+    function toggleEditCategory(category) {
+      const container = document.getElementById('editEventCategories');
+      const events = EVENT_CATEGORIES[category];
+      const checkboxes = events.map(e => document.getElementById('edit_' + e)).filter(Boolean);
+      const allChecked = checkboxes.every(cb => cb.checked);
+      checkboxes.forEach(cb => cb.checked = !allChecked);
+      updateEditCategoryToggleText(category);
+      updateSummary(true);
+    }
+
+    function updateEditCategoryToggleText(category) {
+      const events = EVENT_CATEGORIES[category];
+      const checkboxes = events.map(e => document.getElementById('edit_' + e)).filter(Boolean);
+      const allChecked = checkboxes.every(cb => cb.checked);
+      const container = document.getElementById('editEventCategories');
+      const toggleEl = container.querySelector(`[data-category="${category}"]`);
+      if (toggleEl) {
+        toggleEl.textContent = allChecked ? 'Deselect All' : 'Select All';
+      }
+    }
+
+    function updateAllEditCategoryToggles() {
+      Object.keys(EVENT_CATEGORIES).forEach(cat => updateEditCategoryToggleText(cat));
+    }
+
+    function closeEditModal() {
+      document.getElementById('editModal').style.display = 'none';
+    }
+
+    document.getElementById('createForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+
+      const url = document.getElementById('url').value;
+      const eventTypes = Array.from(document.querySelectorAll('.event-checkbox:checked')).map(cb => cb.value);
+      const payload = { url: url, event_types: eventTypes, active: true, max_retries: 3 };
+      const useCustomSecret = document.getElementById('useCustomSecret');
+      if (useCustomSecret && useCustomSecret.checked) {
+        const secretVal = document.getElementById('secret').value.trim();
+        if (!secretVal) { showMessage('Enter a hex secret or uncheck "provide my own secret".', true); return; }
+        payload.secret = secretVal;
+      }
+
+      try {
+        const response = await fetch(API_BASE, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        if (response.ok) {
+          const result = await response.json();
+          showSecret(result.secret);
+          document.getElementById('createForm').reset();
+          document.getElementById('secret').style.display = 'none';
+          document.querySelectorAll('.event-checkbox').forEach(cb => cb.checked = false);
+          updateSummary(false);
+          loadWebhooks();
+        } else {
+          const error = await response.json();
+          showMessage('Failed to create webhook: ' + error.error, true);
+        }
+      } catch (err) {
+        showMessage('Failed to create webhook: ' + err.message, true);
+      }
+    });
+
+    document.getElementById('editForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+
+      const id = document.getElementById('editWebhookId').value;
+      const url = document.getElementById('editUrl').value;
+      const eventTypes = Array.from(document.querySelectorAll('#editEventCategories .event-checkbox:checked')).map(cb => cb.value);
+
+      try {
+        const response = await fetch(`${API_BASE}/${id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url: url,
+            event_types: eventTypes
+          })
+        });
+
+        if (response.ok) {
+          showMessage('Webhook updated successfully!');
+          closeEditModal();
+          loadWebhooks();
+        } else {
+          const error = await response.json();
+          showMessage('Failed to update webhook: ' + error.error, true);
+        }
+      } catch (err) {
+        showMessage('Failed to update webhook: ' + err.message, true);
+      }
+    });
+
+    async function toggleWebhook(id, active) {
+      try {
+        const response = await fetch(`${API_BASE}/${id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ active: active })
+        });
+
+        if (response.ok) {
+          showMessage(`Webhook ${active ? 'enabled' : 'disabled'} successfully!`);
+          loadWebhooks();
+        } else {
+          const error = await response.json();
+          showMessage('Failed to update webhook: ' + error.error, true);
+        }
+      } catch (err) {
+        showMessage('Failed to update webhook: ' + err.message, true);
+      }
+    }
+
+    async function deleteWebhook(id) {
+      if (!confirm('Are you sure you want to delete this webhook?')) {
+        return;
+      }
+
+      try {
+        const response = await fetch(`${API_BASE}/${id}`, {
+          method: 'DELETE'
+        });
+
+        if (response.ok) {
+          showMessage('Webhook deleted successfully!');
+          loadWebhooks();
+        } else {
+          const error = await response.json();
+          showMessage('Failed to delete webhook: ' + error.error, true);
+        }
+      } catch (err) {
+        showMessage('Failed to delete webhook: ' + err.message, true);
+      }
+    }
+
+    window.onclick = function(event) {
+      const modal = document.getElementById('editModal');
+      if (event.target === modal) {
+        closeEditModal();
+      }
+    }
+
+    // Load webhooks on page load
+    loadWebhooks();
+  </script>
+</body>
+</html>
