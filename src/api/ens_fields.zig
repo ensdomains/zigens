@@ -9,6 +9,7 @@ const std = @import("std");
 const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
+const keccak256 = @import("../types/hash.zig").keccak256;
 
 // Import generic field utilities
 const generic_fields = @import("../lib/graphql/fields.zig");
@@ -405,6 +406,20 @@ fn writeEventId(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u
 // ============================================================================
 
 /// Registration uses Event as underlying model
+/// Registration.id is the labelhash (keccak256 of the label), matching the ENS
+/// subgraph — NOT the human name. `label_name` carries the label (the storage
+/// SELECT aliases COALESCE(label_name, label), NOT NULL for registration rows);
+/// fall back to the namehash if it is somehow absent. The `name` field still
+/// returns the human name via getRegistrationName.
+fn getRegistrationId(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!FieldValue {
+    const event = getEventCtx(ctx);
+    if (event.label_name) |label| {
+        return FieldValue{ .hash = try keccak256(allocator, label) };
+    }
+    if (event.namehash) |nh| return FieldValue{ .hash = nh };
+    return FieldValue{ .hash = Hash.zero };
+}
+
 fn getRegistrationName(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
     const event = getEventCtx(ctx);
     return FieldValue{ .optional_string = event.name };
@@ -485,7 +500,7 @@ fn writeRegistrationCost(ctx: *anyopaque, output_key: []const u8, writer: std.Ar
 /// Note: expiryDate, registrant, and domain are handled as nested fields
 /// because they require database access and JSON parsing
 pub const RegistrationFields = [_]FieldDef{
-    FieldDef.optionalString("id", getRegistrationName),
+    FieldDef.hashField("id", getRegistrationId),
     FieldDef.optionalString("name", getRegistrationName),
     FieldDef.int("block", getRegistrationBlock),
     FieldDef.int("blockNumber", getRegistrationBlock),
@@ -679,7 +694,9 @@ fn getDomainGracePeriodEnd(ctx: *anyopaque, _: std.mem.Allocator) anyerror!Field
 /// Domain build field definitions - scalar fields only
 /// Nested fields (owner, registrant, resolver, etc.) are handled via NestedFieldDef
 pub const DomainBuildFields = [_]FieldDef{
-    FieldDef.customScalar("id", writeNameId),
+    // Domain.id is the namehash (ERC-137 node), matching the ENS subgraph. The
+    // singular domain(id:) lookup still accepts a name OR a namehash (resolveDomainId).
+    FieldDef.hashField("id", getDomainNamehash),
     FieldDef.customScalar("name", writeNameId),
     FieldDef.hashField("namehash", getDomainNamehash),
     FieldDef.customScalar("labelName", writeNameLabelName),
@@ -758,6 +775,10 @@ pub const ResolverBuildContext = struct {
     namehash: Hash,
     protocol: models.Protocol,
     chain_id: u64,
+    /// The human (ENSIP-15-normalized) name for this node, when known. Needed to
+    /// DNS-encode the Universal Resolver `resolve(bytes name, ...)` call on an indexed
+    /// MISS. Null when the caller couldn't supply it → live fallback is skipped.
+    name: ?[]const u8 = null,
 };
 
 /// Helper to get ResolverBuildContext from opaque pointer

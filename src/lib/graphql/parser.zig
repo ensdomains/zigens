@@ -1074,6 +1074,10 @@ pub const ExecutionContext = struct {
     allocator: std.mem.Allocator,
     database: *anyopaque, // Will be cast to *Database by resolvers
     loaders: ?*anyopaque, // Will be cast to *LoaderContext by resolvers (optional for backward compatibility)
+    /// Optional live-resolution context (cast to resolve.universal.LiveContext by the
+    /// record-read handlers). Null unless RESOLVE_LIVE_ENABLED wired a resolver for this
+    /// request; when null the handlers behave exactly as before (indexed-only).
+    resolve: ?*anyopaque = null,
 };
 
 /// Result of executing a field

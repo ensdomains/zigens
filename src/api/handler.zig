@@ -70,6 +70,7 @@ pub const GraphQLHandler = struct {
         try executor.registerResolver("approvals", resolvers.resolveApprovals);
         try executor.registerResolver("wrappedDomains", resolvers.resolveWrappedDomains);
         try executor.registerResolver("_meta", resolvers.resolveMeta);
+        try executor.registerResolver("_finality", resolvers.resolveFinality);
 
         // Build the schema validator once from the embedded introspection JSON.
         // It indexes the introspection types into hash maps used to reject
@@ -115,6 +116,14 @@ pub const GraphQLHandler = struct {
     /// variable-coercion check below. The error envelope itself is unchanged here; the
     /// server strips the `data` entry for strict 4xx request errors.
     pub fn handleQuery(self: *GraphQLHandler, database: *db.Database, query: []const u8, variables: ?std.json.Value, operation_name: ?[]const u8, strict: bool) ![]u8 {
+        return self.handleQueryWithResolve(database, query, variables, operation_name, strict, null);
+    }
+
+    /// Like `handleQuery`, but with an optional live-resolution context (opaque pointer
+    /// to resolve.universal.LiveContext) threaded into the executor so the record-read
+    /// handlers can fall back to a live UR read on an indexed MISS. Pass null (what
+    /// `handleQuery` does) for indexed-only behavior — the default everywhere.
+    pub fn handleQueryWithResolve(self: *GraphQLHandler, database: *db.Database, query: []const u8, variables: ?std.json.Value, operation_name: ?[]const u8, strict: bool, resolve_ctx: ?*anyopaque) ![]u8 {
         // Start timing for metrics
         var timer = metrics_mod.QueryTimer.start();
 
@@ -145,6 +154,7 @@ pub const GraphQLHandler = struct {
         request_executor.context.allocator = request_alloc;
         request_executor.context.database = @ptrCast(database);
         request_executor.context.loaders = @ptrCast(loader_context);
+        request_executor.context.resolve = resolve_ctx; // null unless live resolution is on
 
         // Parse the query using the arena allocator
         var document = parser.parseQuery(request_alloc, query) catch |err| {

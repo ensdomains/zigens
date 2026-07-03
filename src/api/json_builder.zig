@@ -34,6 +34,11 @@ pub const NestedContext = struct {
     depth: u32,
     allocator: std.mem.Allocator,
     loaders: ?*anyopaque,
+    /// Optional live-resolution context (cast to resolve.universal.LiveContext by the
+    /// record-read handlers). Default null; propagated from the parent context at every
+    /// nested-context construction, so a missed propagation just disables the fallback
+    /// on that branch (fail-safe = pre-existing indexed-only behavior).
+    resolve: ?*anyopaque = null,
 };
 
 /// Nested field handler function type

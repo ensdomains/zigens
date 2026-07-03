@@ -22,16 +22,19 @@ pub const LoaderContext = struct {
     /// same row; in list queries that pull all four, the per-row count drops
     /// from 4 → 1 with this cache. Keyed by 0x-prefixed lowercase address;
     /// the entry value is the loaded row (or null sentinel for "looked up,
-    /// no such account"). All allocations live on the request arena and are
-    /// freed when the request ends.
+    /// no such account"). Cache keys live on `allocator` (the request arena);
+    /// the row values' inner slices are owned by `db_allocator` — db.getAccount
+    /// dupes `.address` on the persistent db allocator, not the arena — so
+    /// deinit must free both explicitly.
     account_cache: std.StringHashMap(?db.Account),
+    db_allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, database: *db.Database) !*LoaderContext {
-        _ = database;
         const ctx = try allocator.create(LoaderContext);
         ctx.* = .{
             .allocator = allocator,
             .account_cache = std.StringHashMap(?db.Account).init(allocator),
+            .db_allocator = database.allocator,
         };
         return ctx;
     }
@@ -55,6 +58,14 @@ pub const LoaderContext = struct {
     }
 
     pub fn deinit(self: *LoaderContext) void {
+        var it = self.account_cache.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.*) |acct| {
+                var row = acct;
+                row.deinit(self.db_allocator); // frees .address (db-allocator-owned)
+            }
+            self.allocator.free(entry.key_ptr.*); // arena key (no-op on arena; correct on GPA)
+        }
         self.account_cache.deinit();
         self.allocator.destroy(self);
     }

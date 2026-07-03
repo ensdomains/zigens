@@ -48,6 +48,11 @@ pub const ContractAddresses = struct {
     reverse_registrar: Address,
     name_wrapper: Address,
 
+    // Query-time ENSIP-10 Universal Resolver (Task 06 live-resolution fallback).
+    // Address.zero = not wired for this network; set RESOLVE_UNIVERSAL_RESOLVER to
+    // supply it at deploy time. TODO(task-08): move this to manifest data.
+    universal_resolver: Address,
+
     // ═══════════════════════════════════════════════════════════════════════
     //  V2 Protocol (ENSv2 — Sepolia only today; mainnet not deployed yet)
     // ═══════════════════════════════════════════════════════════════════════
@@ -136,6 +141,8 @@ fn sepoliaAddresses() ContractAddresses {
         .temp_registrar_start_block = 0,
         .v1_migration_block = 0,
         .name_wrapper_deployment_block = 0,
+
+        .universal_resolver = Address.zero, // set via RESOLVE_UNIVERSAL_RESOLVER; TODO(task-08)
     };
 }
 
@@ -180,5 +187,7 @@ fn mainnetAddresses() ContractAddresses {
         .temp_registrar_start_block = 3327417, // Temporary Registrar deployment (May 2017)
         .v1_migration_block = 9380410, // V1 Permanent Registrar deployment (May 2019)
         .name_wrapper_deployment_block = 15628465, // Name Wrapper deployment (September 2022)
+
+        .universal_resolver = Address.zero, // set via RESOLVE_UNIVERSAL_RESOLVER; TODO(task-08)
     };
 }

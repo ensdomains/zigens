@@ -85,6 +85,14 @@ pub fn main() !void {
     var server = try api.Server.init(allocator, &db_pool, webhook_path, cfg.api_port, cfg.graphql_max_depth, cfg.graphql_max_cost, cfg.metrics_enabled, cfg.rate_limit_per_second, cfg.webhook_admin_username, cfg.webhook_admin_password, cfg.trusted_proxy_hops);
     defer server.deinit();
 
+    // Opt-in on-chain resolution (default off). Covers primary-name verification (05)
+    // and/or live Universal Resolver record fallback (06); either flag creates the shared
+    // RPC client. Leaving both unset creates no RPC client and changes no served value.
+    if (cfg.primary_verify_enabled or cfg.resolve_live_enabled) {
+        try server.enableResolution(cfg.resolve_rpc_url, cfg.resolve_cache_ttl_s, cfg.network.chainId(), cfg.v1_contracts.ens_registry, cfg.resolve_universal_resolver, cfg.resolve_live_enabled, cfg.primary_verify_enabled, cfg.resolve_ccip_enabled, cfg.ccip_max_redirects, cfg.ccip_gateway_timeout_ms);
+        std.log.info("On-chain resolution enabled (primary_verify={}, live={}, rpc={s})", .{ cfg.primary_verify_enabled, cfg.resolve_live_enabled, cfg.resolve_rpc_url });
+    }
+
     if (cfg.webhook_admin_username != null and cfg.webhook_admin_password != null) {
         std.log.info("Webhook auth enabled (username: {s})", .{cfg.webhook_admin_username.?});
     } else {

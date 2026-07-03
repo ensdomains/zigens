@@ -14,6 +14,11 @@ pub const Metrics = struct {
     failed_queries: u64,
     rejected_queries: u64, // Rejected due to complexity
 
+    // Primary-name forward-verification outcomes (see resolve/primary.zig).
+    primary_verified: u64,
+    primary_mismatch: u64,
+    primary_unverified: u64,
+
     // Timing stats (in microseconds)
     total_duration_us: u64,
     min_duration_us: u64,
@@ -37,6 +42,9 @@ pub const Metrics = struct {
             .successful_queries = 0,
             .failed_queries = 0,
             .rejected_queries = 0,
+            .primary_verified = 0,
+            .primary_mismatch = 0,
+            .primary_unverified = 0,
             .total_duration_us = 0,
             .min_duration_us = std.math.maxInt(u64),
             .max_duration_us = 0,
@@ -112,6 +120,24 @@ pub const Metrics = struct {
         }
     }
 
+    /// Outcome of a primary-name forward verification. Mirrors resolve/primary.zig
+    /// `Verdict` without importing it, so the metrics module stays dependency-free.
+    pub const PrimaryOutcome = enum { verified, mismatch, unverified };
+
+    /// Record a primary-name forward-verification outcome.
+    pub fn recordPrimaryVerification(self: *Metrics, outcome: PrimaryOutcome) void {
+        if (!self.enabled) return;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        switch (outcome) {
+            .verified => self.primary_verified += 1,
+            .mismatch => self.primary_mismatch += 1,
+            .unverified => self.primary_unverified += 1,
+        }
+    }
+
     /// Get snapshot of current metrics (thread-safe)
     pub fn getSnapshot(self: *Metrics) MetricsSnapshot {
         if (!self.enabled) {
@@ -121,6 +147,9 @@ pub const Metrics = struct {
                 .successful_queries = 0,
                 .failed_queries = 0,
                 .rejected_queries = 0,
+                .primary_verified = 0,
+                .primary_mismatch = 0,
+                .primary_unverified = 0,
                 .avg_duration_us = 0,
                 .min_duration_us = 0,
                 .max_duration_us = 0,
@@ -159,6 +188,9 @@ pub const Metrics = struct {
             .successful_queries = self.successful_queries,
             .failed_queries = self.failed_queries,
             .rejected_queries = self.rejected_queries,
+            .primary_verified = self.primary_verified,
+            .primary_mismatch = self.primary_mismatch,
+            .primary_unverified = self.primary_unverified,
             .avg_duration_us = avg_duration,
             .min_duration_us = if (self.min_duration_us == std.math.maxInt(u64)) 0 else self.min_duration_us,
             .max_duration_us = self.max_duration_us,
@@ -198,6 +230,18 @@ pub const Metrics = struct {
         try writer.writeAll("# HELP graphql_queries_rejected Number of queries rejected due to complexity\n");
         try writer.writeAll("# TYPE graphql_queries_rejected counter\n");
         try writer.print("graphql_queries_rejected {d}\n", .{snapshot.rejected_queries});
+
+        try writer.writeAll("# HELP primary_verifications_verified Primary-name claims that forward-verified to the same address\n");
+        try writer.writeAll("# TYPE primary_verifications_verified counter\n");
+        try writer.print("primary_verifications_verified {d}\n", .{snapshot.primary_verified});
+
+        try writer.writeAll("# HELP primary_verifications_mismatch Primary-name claims that forward-resolved to a different address\n");
+        try writer.writeAll("# TYPE primary_verifications_mismatch counter\n");
+        try writer.print("primary_verifications_mismatch {d}\n", .{snapshot.primary_mismatch});
+
+        try writer.writeAll("# HELP primary_verifications_unverified Primary-name claims with no usable forward evidence\n");
+        try writer.writeAll("# TYPE primary_verifications_unverified counter\n");
+        try writer.print("primary_verifications_unverified {d}\n", .{snapshot.primary_unverified});
 
         try writer.writeAll("# HELP graphql_query_duration_microseconds_avg Average query duration\n");
         try writer.writeAll("# TYPE graphql_query_duration_microseconds_avg gauge\n");
@@ -239,13 +283,16 @@ pub const Metrics = struct {
         const snapshot = self.getSnapshot();
 
         return std.fmt.allocPrint(allocator,
-            \\{{"enabled":{s},"total_queries":{d},"successful_queries":{d},"failed_queries":{d},"rejected_queries":{d},"avg_duration_us":{d},"min_duration_us":{d},"max_duration_us":{d},"avg_depth":{d},"max_depth":{d},"avg_cost":{d},"max_cost":{d},"uptime_seconds":{d}}}
+            \\{{"enabled":{s},"total_queries":{d},"successful_queries":{d},"failed_queries":{d},"rejected_queries":{d},"primary_verified":{d},"primary_mismatch":{d},"primary_unverified":{d},"avg_duration_us":{d},"min_duration_us":{d},"max_duration_us":{d},"avg_depth":{d},"max_depth":{d},"avg_cost":{d},"max_cost":{d},"uptime_seconds":{d}}}
         , .{
             if (snapshot.enabled) "true" else "false",
             snapshot.total_queries,
             snapshot.successful_queries,
             snapshot.failed_queries,
             snapshot.rejected_queries,
+            snapshot.primary_verified,
+            snapshot.primary_mismatch,
+            snapshot.primary_unverified,
             snapshot.avg_duration_us,
             snapshot.min_duration_us,
             snapshot.max_duration_us,
@@ -265,6 +312,9 @@ pub const MetricsSnapshot = struct {
     successful_queries: u64,
     failed_queries: u64,
     rejected_queries: u64,
+    primary_verified: u64,
+    primary_mismatch: u64,
+    primary_unverified: u64,
     avg_duration_us: u64,
     min_duration_us: u64,
     max_duration_us: u64,
@@ -312,6 +362,37 @@ test "Metrics init and basic recording" {
     metrics.recordRejection(5, 100);
     try std.testing.expect(metrics.total_queries == 3);
     try std.testing.expect(metrics.rejected_queries == 1);
+}
+
+test "Metrics primary verification counters" {
+    const allocator = std.testing.allocator;
+
+    var metrics = Metrics.init(allocator, true);
+    defer metrics.deinit();
+
+    metrics.recordPrimaryVerification(.verified);
+    metrics.recordPrimaryVerification(.verified);
+    metrics.recordPrimaryVerification(.mismatch);
+    metrics.recordPrimaryVerification(.unverified);
+
+    const snapshot = metrics.getSnapshot();
+    try std.testing.expect(snapshot.primary_verified == 2);
+    try std.testing.expect(snapshot.primary_mismatch == 1);
+    try std.testing.expect(snapshot.primary_unverified == 1);
+
+    const output = try metrics.formatPrometheus(allocator);
+    defer allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "primary_verifications_verified 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "primary_verifications_mismatch 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "primary_verifications_unverified 1") != null);
+}
+
+test "Metrics primary verification is disabled-safe" {
+    const allocator = std.testing.allocator;
+    var metrics = Metrics.init(allocator, false);
+    defer metrics.deinit();
+    metrics.recordPrimaryVerification(.verified);
+    try std.testing.expect(metrics.primary_verified == 0);
 }
 
 test "Metrics disabled has zero overhead" {

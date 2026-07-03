@@ -57,3 +57,4 @@ pub const resolveMetadata = admin.resolveMetadata;
 pub const resolveApprovals = admin.resolveApprovals;
 pub const resolveWrappedDomains = admin.resolveWrappedDomains;
 pub const resolveMeta = admin.resolveMeta;
+pub const resolveFinality = admin.resolveFinality;
