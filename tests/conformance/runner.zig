@@ -1,0 +1,364 @@
+//! GraphQL conformance harness.
+//!
+//! Runs a fixed set of subgraph-shaped GraphQL operations against a deterministic
+//! in-memory fixture through the REAL GraphQLHandler, and asserts each JSON
+//! response matches a committed golden in tests/conformance/golden/<op>.json. This
+//! turns "subgraph-compatible" from an ad-hoc claim into a byte-for-byte gate: any
+//! change to a served response shape or value fails this lane with a readable diff.
+//!
+//! Determinism: the fixture seeds fixed timestamps/blocks and pins sync_state, and
+//! the GraphQL read path performs no wall-clock reads — so every response is a pure
+//! function of DB state. `_meta.block.number` = max(sync_state v1,v2); block hash and
+//! timestamp are null by design.
+//!
+//! Modes (env vars):
+//!   CONFORMANCE_UPDATE=1  — (re)write every golden/<op>.json from the actual output.
+//!                           Review the diff, then commit. Use after changing an op or
+//!                           an intentional behavior change.
+//!   CONFORMANCE_PRINT=1   — dump each op's actual JSON to stderr (debugging).
+//!   CONFORMANCE_LEAKCHECK=1 — run on testing.allocator (leak gate) instead of the
+//!                           default arena, turning exercised resolver paths into a
+//!                           leak check too.
+//! id-parameterized ops use GraphQL variables so the query strings stay static.
+
+const std = @import("std");
+const testing = std.testing;
+const helpers = @import("helpers");
+const lib = @import("lib");
+
+const models = lib.models;
+const Address = lib.Address;
+const Hash = lib.Hash;
+const Database = lib.Database;
+const GraphQLHandler = lib.api.handler.GraphQLHandler;
+const resolvers = lib.storage.resolvers;
+
+const FIXED_TS: i64 = 1700000000;
+const FIXED_BLOCK: u64 = 100;
+const GOLDEN_DIR = "tests/conformance/golden";
+
+fn seedName(
+    db: *Database,
+    a: std.mem.Allocator,
+    name: []const u8,
+    label: []const u8,
+    parent: []const u8,
+    owner: Address,
+    resolver: Address,
+    token_id: u256,
+    expiry: u64,
+    is_wrapped: bool,
+    fuses: ?[]const u8,
+) !Hash {
+    const nh = try lib.namehash(a, name);
+    try db.insertName(models.Name{
+        .protocol = .v2,
+        .name = name,
+        .namehash = nh,
+        .label = label,
+        .label_hash = try lib.labelhash(a, label),
+        .parent_name = parent,
+        .parent_namehash = try lib.namehash(a, parent),
+        .registry = Address.zero,
+        .owner = owner,
+        .registrant = owner,
+        .resolver = resolver,
+        .token_id = token_id,
+        .canonical_id = token_id,
+        .token_version = 1,
+        .expiry = expiry,
+        .registry_locked = false,
+        .migrated = false,
+        .created_block = FIXED_BLOCK,
+        .created_at = FIXED_TS,
+        .registered_at = FIXED_TS,
+        .updated_block = FIXED_BLOCK,
+        .updated_at = FIXED_TS,
+        .is_wrapped = is_wrapped,
+        .wrapper_fuses = fuses,
+        .wrapper_expiry = if (is_wrapped) 2000000000 else null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    });
+    return nh;
+}
+
+fn seedFixture(db: *Database, a: std.mem.Allocator) !void {
+    // Pin the indexed head so _meta is deterministic.
+    try db.setSyncState(.v1, 0);
+    try db.setSyncState(.v2, 12345);
+
+    const owner1 = helpers.TEST_OWNER_1;
+    const owner2 = helpers.TEST_OWNER_2;
+    const resolver = helpers.TEST_RESOLVER;
+    const tx = Hash{ .bytes = [_]u8{0xAA} ** 32 };
+
+    // alice.eth — plain 2LD with a resolver + addr + text records.
+    const alice = try seedName(db, a, "alice.eth", "alice", "eth", owner1, resolver, 0xA11CE, 2000000000, false, null);
+    // sub.alice.eth — subname with its own resolver; wrapped, to exercise the
+    // subdomain (SHORT-select) wrapper-field path.
+    _ = try seedName(db, a, "sub.alice.eth", "sub", "alice.eth", owner1, resolver, 0x5, 0, true, "65536");
+    // bob.eth — wrapped name (different owner).
+    const bob = try seedName(db, a, "bob.eth", "bob", "eth", owner2, Address.zero, 0xB0B, 2000000000, true, "65536");
+    // expired.eth — 2LD with a long-past expiry, to exercise expiryDate/gracePeriodEnd.
+    const expired = try seedName(db, a, "expired.eth", "expired", "eth", owner2, resolver, 0xE, 1600000000, false, null);
+
+    // Resolver entity + records for alice.
+    var resolver_hex: [42]u8 = undefined;
+    const resolver_hexs = resolver.toHexBuf(&resolver_hex);
+    var alice_hex: [66]u8 = undefined;
+    const alice_hexs = alice.toHexBuf(&alice_hex);
+    try resolvers.upsertResolverEntity(db, .v2, resolver_hexs, alice_hexs, "alice.eth", FIXED_BLOCK, FIXED_TS);
+    try resolvers.storeResolverAddress(db, alice, resolver, 60, "0x1234567890abcdef1234567890abcdef12345678", .v2, FIXED_BLOCK, tx, FIXED_TS);
+    try resolvers.storeResolverText(db, alice, resolver, "avatar", "https://example.com/a.png", .v2, FIXED_BLOCK, tx, FIXED_TS);
+
+    // V2 account observations for the name owners (mirrors the indexer's
+    // recordAccountObservation; storage insertName alone never touches `accounts`).
+    var o1_buf: [42]u8 = undefined;
+    var o2_buf: [42]u8 = undefined;
+    try db.upsertAccount(.v2, owner1.toHexBuf(&o1_buf), FIXED_BLOCK, FIXED_TS);
+    try db.upsertAccount(.v2, owner2.toHexBuf(&o2_buf), FIXED_BLOCK, FIXED_TS);
+
+    // Primary (reverse) name: owner1 -> alice.eth. primaryName resolves in two hops —
+    // reverse_records[owner1] -> namehash, then resolver_names[namehash] -> the name()
+    // record. We use alice's namehash as the reverse target and store its name() record
+    // so the full path is exercised (getLatestNameByNamehash reads resolver_names).
+    try db.upsertReverseRecord(.v2, owner1, alice, FIXED_BLOCK, tx, 0, FIXED_TS);
+    try resolvers.storeResolverName(db, alice, resolver, "alice.eth", .v2, FIXED_BLOCK, tx, FIXED_TS);
+
+    // EAC role assignment on alice's resolver, so roles(resource:) + permissions
+    // decoding are exercised. resource/bitmap mirror a real emitted pair.
+    try db.upsertEACRole(
+        .v2,
+        "0x0000000000000000000000000000000000000000000000000000000000000001",
+        owner1,
+        "0x0000000000000000000000000000000000000000000000000000000001000000",
+        FIXED_BLOCK,
+        tx,
+        0,
+        resolver,
+    );
+
+    // Registration rows: the `registrations` query reads a dedicated table that
+    // insertName does not touch, so seed the .eth 2LDs (subnames are not registrations).
+    try db.insertRegistration(.v2, alice, "alice", "eth", owner1, FIXED_TS, 2000000000, FIXED_BLOCK, tx, 0, .name_registered);
+    try db.insertRegistration(.v2, bob, "bob", "eth", owner2, FIXED_TS, 2000000000, FIXED_BLOCK, tx, 1, .name_registered);
+    try db.insertRegistration(.v2, expired, "expired", "eth", owner2, FIXED_TS, 1600000000, FIXED_BLOCK, tx, 2, .name_registered);
+
+    // Finality positions (Task 09): seed safe/finalized so the _finality op is deterministic.
+    // safe(12340) is below the indexed head (12345) → isStale=false.
+    const safe_hash = Hash{ .bytes = [_]u8{0xf5} ** 32 };
+    const fin_hash = Hash{ .bytes = [_]u8{0xf9} ** 32 };
+    try db.setFinality(db.chain_id, .safe, 12340, safe_hash, FIXED_TS);
+    try db.setFinality(db.chain_id, .finalized, 12300, fin_hash, FIXED_TS);
+}
+
+const Op = struct {
+    name: []const u8,
+    query: []const u8,
+    vars: ?[]const u8 = null, // JSON object string, or null
+};
+
+const Mode = enum { compare, update, print };
+
+fn checkOp(a: std.mem.Allocator, handler: *GraphQLHandler, db: *Database, op: Op, mode: Mode) !void {
+    var parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed) |p| p.deinit();
+    const vars_value: ?std.json.Value = if (op.vars) |vj| blk: {
+        parsed = try std.json.parseFromSlice(std.json.Value, a, vj, .{});
+        break :blk parsed.?.value;
+    } else null;
+
+    const result = try handler.handleQuery(db, op.query, vars_value, null, false);
+    defer a.free(result);
+
+    if (mode == .print) {
+        std.debug.print("=== {s} ===\n{s}\n", .{ op.name, result });
+        return;
+    }
+
+    const path = try std.fmt.allocPrint(a, GOLDEN_DIR ++ "/{s}.json", .{op.name});
+    defer a.free(path);
+
+    if (mode == .update) {
+        std.fs.cwd().makePath(GOLDEN_DIR) catch {};
+        const f = try std.fs.cwd().createFile(path, .{});
+        defer f.close();
+        try f.writeAll(result);
+        std.debug.print("updated {s}\n", .{path});
+        return;
+    }
+
+    const golden = std.fs.cwd().readFileAlloc(a, path, 1 << 20) catch |e| {
+        std.debug.print("\nMISSING GOLDEN {s} ({}). Run: CONFORMANCE_UPDATE=1 zig build test-conformance\n", .{ path, e });
+        return e;
+    };
+    defer a.free(golden);
+    testing.expectEqualStrings(golden, result) catch |e| {
+        std.debug.print("\nCONFORMANCE MISMATCH [{s}]\n  golden: {s}\n  actual: {s}\n", .{ op.name, golden, result });
+        return e;
+    };
+}
+
+test "conformance goldens" {
+    const leakcheck = std.process.hasEnvVarConstant("CONFORMANCE_LEAKCHECK");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = if (leakcheck) testing.allocator else arena.allocator();
+
+    const db = try helpers.createTestDatabase(a);
+    defer helpers.destroyTestDatabase(a, db);
+    try seedFixture(db, a);
+
+    var handler = try GraphQLHandler.init(a, 30, 100000, false);
+    defer handler.deinit();
+
+    const mode: Mode = if (std.process.hasEnvVarConstant("CONFORMANCE_PRINT"))
+        .print
+    else if (std.process.hasEnvVarConstant("CONFORMANCE_UPDATE"))
+        .update
+    else
+        .compare;
+
+    // Variable payloads (id/address) for parameterized ops.
+    var alice_buf: [66]u8 = undefined;
+    var bob_buf: [66]u8 = undefined;
+    var exp_buf: [66]u8 = undefined;
+    var owner_buf: [42]u8 = undefined;
+    const alice_hex = (try lib.namehash(a, "alice.eth")).toHexBuf(&alice_buf);
+    const bob_hex = (try lib.namehash(a, "bob.eth")).toHexBuf(&bob_buf);
+    const exp_hex = (try lib.namehash(a, "expired.eth")).toHexBuf(&exp_buf);
+    const owner_hex = helpers.TEST_OWNER_1.toHexBuf(&owner_buf);
+
+    const alice_vars = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\"}}", .{alice_hex});
+    defer a.free(alice_vars);
+    const bob_vars = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\"}}", .{bob_hex});
+    defer a.free(bob_vars);
+    const exp_vars = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\"}}", .{exp_hex});
+    defer a.free(exp_vars);
+    const owner_vars = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\"}}", .{owner_hex});
+    defer a.free(owner_vars);
+
+    const ops = [_]Op{
+        .{ .name = "meta", .query = "{ _meta { block { number hash } hasIndexingErrors } }" },
+        .{ .name = "domains_ordered", .query = "{ domains(first: 10, orderBy: createdAt, orderDirection: asc) { id name owner { id } isWrapped protocol } }" },
+        .{ .name = "domain_by_id", .query = "query($id:String!){ domain(id:$id){ id name labelName labelhash owner { id } registrant { id } resolver { id address } isWrapped isReachable protocol subdomainCount expiryDate tokenId } }", .vars = alice_vars },
+        .{ .name = "resolver_records", .query = "query($id:String!){ domain(id:$id){ resolver { id address addr coinTypes texts } } }", .vars = alice_vars },
+        .{ .name = "subdomains", .query = "query($id:String!){ domain(id:$id){ subdomainCount subdomains { id name owner { id } isWrapped fuses } } }", .vars = alice_vars },
+        .{ .name = "wrapped_domain", .query = "query($id:String!){ domain(id:$id){ id isWrapped fuses wrapperExpiry } }", .vars = bob_vars },
+        .{ .name = "account_domains", .query = "query($id:String!){ account(id:$id){ id domains { id name } seenV2 } }", .vars = owner_vars },
+        // --- broadened coverage ---
+        .{ .name = "primary_name", .query = "query($id:String!){ account(id:$id){ id primaryName } }", .vars = owner_vars },
+        .{ .name = "expired_domain", .query = "query($id:String!){ domain(id:$id){ name expiryDate gracePeriodEnd isReachable } }", .vars = exp_vars },
+        .{ .name = "eac_roles", .query = "{ roles(resource: \"0x0000000000000000000000000000000000000000000000000000000000000001\") { id resource account roleBitmap permissions blockNumber } }" },
+        .{ .name = "pagination_skip", .query = "{ domains(first: 2, skip: 1, orderBy: createdAt, orderDirection: asc) { id name } }" },
+        .{ .name = "domain_connection", .query = "{ domainConnection(first: 2, orderBy: createdAt, orderDirection: asc) { edges { cursor node { id name } } pageInfo { hasNextPage hasPreviousPage startCursor endCursor } } }" },
+        // --- where-filter matrix (deterministic order via orderBy createdAt asc, namehash tie-break) ---
+        .{ .name = "filter_owner", .query = "{ domains(where:{owner:\"0x1111111111111111111111111111111111111111\"}, orderBy:createdAt, orderDirection:asc){ id name } }" },
+        .{ .name = "filter_name_exact", .query = "{ domains(where:{name:\"bob.eth\"}){ id name } }" },
+        .{ .name = "filter_name_contains", .query = "{ domains(where:{name_contains:\"alice\"}, orderBy:createdAt, orderDirection:asc){ id name } }" },
+        .{ .name = "filter_name_ends_with", .query = "{ domains(where:{name_ends_with:\"alice.eth\"}, orderBy:createdAt, orderDirection:asc){ id name } }" },
+        .{ .name = "filter_name_in", .query = "{ domains(where:{name_in:[\"alice.eth\",\"bob.eth\"]}, orderBy:createdAt, orderDirection:asc){ id name } }" },
+        .{ .name = "filter_label_name", .query = "{ domains(where:{labelName:\"sub\"}){ id name } }" },
+        .{ .name = "filter_expiry_gt", .query = "{ domains(where:{expiryDate_gt:1900000000}, orderBy:createdAt, orderDirection:asc){ id name expiryDate } }" },
+        .{ .name = "filter_owner_and_ends_with", .query = "{ domains(where:{owner:\"0x2222222222222222222222222222222222222222\", name_ends_with:\".eth\"}, orderBy:createdAt, orderDirection:asc){ id name } }" },
+        .{ .name = "filter_has_subdomains", .query = "{ domains(where:{hasSubdomains:true}){ id name } }" },
+        // --- accounts list filters (AccountFilter: id/id_in/seenV1/seenV2) ---
+        .{ .name = "accounts_seenv2", .query = "{ accounts(where:{seenV2:true}, orderBy:id, orderDirection:asc){ id seenV1 seenV2 } }" },
+        .{ .name = "accounts_by_id", .query = "{ accounts(where:{id:\"0x1111111111111111111111111111111111111111\"}){ id primaryName } }" },
+        .{ .name = "accounts_id_in", .query = "{ accounts(where:{id_in:[\"0x1111111111111111111111111111111111111111\",\"0x2222222222222222222222222222222222222222\"]}, orderBy:id, orderDirection:asc){ id } }" },
+        // --- registrations list filters (RegistrationFilter: registrant/registrant_in/expiryDate_*/protocol) ---
+        .{ .name = "registrations_all", .query = "{ registrations(first:10, orderBy:name, orderDirection:asc){ id name registrant { id } registrationDate expiryDate protocol } }" },
+        .{ .name = "registrations_by_registrant", .query = "{ registrations(where:{registrant:\"0x2222222222222222222222222222222222222222\"}, orderBy:name, orderDirection:asc){ id name } }" },
+        .{ .name = "registrations_expiry_gt", .query = "{ registrations(where:{expiryDate_gt:1900000000}, orderBy:name, orderDirection:asc){ id name expiryDate } }" },
+        // --- finality signalling (Task 09; _finality is additive, subgraph _meta unchanged) ---
+        .{ .name = "finality", .query = "{ _finality { head { number } safe { number hash } finalized { number } isStale } }" },
+        // --- error-shape ops: lock the GraphQL error envelope for cases that DO error ---
+        .{ .name = "err_missing_required_arg", .query = "{ domain { id } }" },
+        .{ .name = "err_unknown_query", .query = "{ notARealQueryField { id } }" },
+        // --- leniency ops: document (and lock) where zigens is LENIENT in non-strict
+        //     mode rather than raising a validation error — an unknown field resolves to
+        //     null, and an invalid orderBy enum is ignored (default order). These are
+        //     intentional divergences from strict GraphQL; the goldens guard against a
+        //     silent change either way.
+        .{ .name = "lenient_unknown_field", .query = "{ domains(first:1){ notARealField } }" },
+        .{ .name = "lenient_invalid_orderby", .query = "{ domains(orderBy: notARealField){ id } }" },
+    };
+
+    for (ops) |op| try checkOp(a, &handler, db, op, mode);
+}
+
+// Task 06 acceptance: with live resolution ON, a record the index does NOT carry (an
+// addr MISS on a name that only has a resolver pointer) resolves via the Universal
+// Resolver fallback; with it OFF the same query returns null. The UR eth_call is served
+// from a PRE-SEEDED resolution_cache row (a deliberately-undefined rpc client would crash
+// if the fallback wrongly hit the network), so this runs fully offline yet exercises the
+// entire wiring: handler -> executor context.resolve -> nested propagation ->
+// resolverAddrHandler -> liveRecordFallback -> universal.resolve -> cache hit -> JSON.
+test "task06: indexed-miss addr resolves via Universal Resolver only when live is ON" {
+    const a = testing.allocator;
+    const cache = lib.resolve.cache;
+    const uni = lib.resolve.universal;
+
+    const db = try helpers.createTestDatabase(a);
+    defer helpers.destroyTestDatabase(a, db);
+
+    // A name with a resolver set but NO indexed addr record — the exact MISS the fallback
+    // is meant to cover (e.g. a wildcard/uncached record).
+    const owner = helpers.TEST_OWNER_1;
+    const resolver = helpers.TEST_RESOLVER;
+    _ = try seedName(db, a, "wildcard.eth", "wildcard", "eth", owner, resolver, 0x1, 2000000000, false, null);
+    const node = try lib.namehash(a, "wildcard.eth");
+
+    const ur_addr = Address{ .bytes = [_]u8{0xee} ** 20 };
+    const block_num: u64 = 500;
+    const block_hash = Hash{ .bytes = [_]u8{0xcd} ** 32 };
+    const now: i64 = 1_700_000_000;
+
+    // Pre-seed the resolution_cache with a canned UR (bytes result, address) answer for
+    // addr(node): result = a 32-byte word holding 0x22*20. Key matches universal.resolve.
+    const rec: uni.Record = .addr;
+    const inner = try uni.encodeInner(a, node, rec);
+    defer a.free(inner);
+    const calldata = try uni.encodeResolveCall(a, "wildcard.eth", inner);
+    defer a.free(calldata);
+    const selkey = try rec.cacheKey(a);
+    defer a.free(selkey);
+    var blob: [128]u8 = [_]u8{0} ** 128;
+    blob[31] = 0x40;
+    @memset(blob[44..64], 0x11);
+    blob[95] = 32;
+    @memset(blob[108..128], 0x22);
+    try cache.put(db, .{
+        .chain_id = 1,
+        .target = ur_addr,
+        .selector_key = selkey,
+        .arg_hash = cache.argHash(calldata),
+        .block_dep_num = block_num,
+        .block_dep_hash = block_hash,
+    }, .success, &blob, .resolved_live, now);
+
+    var resolver_client = lib.resolve.client.Resolver.init(@as(*lib.rpc.client.Client, undefined), db, 1, 300);
+    var live = uni.LiveContext{ .resolver = &resolver_client, .ur_address = ur_addr, .block_num = block_num, .block_hash = block_hash, .now = now };
+
+    var handler = try GraphQLHandler.init(a, 30, 100000, false);
+    defer handler.deinit();
+
+    var nh_buf: [66]u8 = undefined;
+    const nh_hex = node.toHexBuf(&nh_buf);
+    const vars = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\"}}", .{nh_hex});
+    defer a.free(vars);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, vars, .{});
+    defer parsed.deinit();
+    const query = "query($id:String!){ domain(id:$id){ resolver { addr } } }";
+
+    // Flag OFF (null resolve ctx): indexed miss -> addr is null.
+    const off = try handler.handleQuery(db, query, parsed.value, null, false);
+    defer a.free(off);
+    try testing.expect(std.mem.indexOf(u8, off, "\"addr\":null") != null);
+
+    // Flag ON (live ctx): the fallback resolves addr from the pre-seeded UR answer.
+    const on = try handler.handleQueryWithResolve(db, query, parsed.value, null, false, @ptrCast(&live));
+    defer a.free(on);
+    try testing.expect(std.mem.indexOf(u8, on, "0x2222222222222222222222222222222222222222") != null);
+}

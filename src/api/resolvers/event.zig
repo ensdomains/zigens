@@ -174,9 +174,9 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
     const events = try database.getEventsFiltered(fetch_filter);
     defer {
         for (events) |*event| {
-            event.deinit(allocator);
+            event.deinit(database.allocator);
         }
-        allocator.free(events);
+        database.allocator.free(events);
     }
 
     // We fetched `params.limit + 1` to detect a trailing page; if we actually got
@@ -227,6 +227,7 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
                 .depth = 0,
                 .allocator = allocator,
                 .loaders = ctx.loaders,
+                .resolve = ctx.resolve,
             },
             .id = id,
         };
@@ -408,9 +409,9 @@ fn resolveEventsWithForced(ctx: parser.ExecutionContext, field: *const parser.Fi
     const events = try database.getEventsFiltered(filter_opts);
     defer {
         for (events) |*event| {
-            event.deinit(allocator);
+            event.deinit(database.allocator);
         }
-        allocator.free(events);
+        database.allocator.free(events);
     }
 
     // Build JSON array
@@ -427,6 +428,7 @@ fn resolveEventsWithForced(ctx: parser.ExecutionContext, field: *const parser.Fi
             .depth = 0,
             .allocator = allocator,
             .loaders = ctx.loaders,
+            .resolve = ctx.resolve,
         });
         defer allocator.free(event_json);
         try json.appendSlice(allocator, event_json);
