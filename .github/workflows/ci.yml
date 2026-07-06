@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: "0.15.2"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # SQLite lanes + build. Hermetic: no external services.
+  # ---------------------------------------------------------------------------
+  build-and-test-sqlite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libsqlite3-dev
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          sudo mkdir -p /opt/zig
+          sudo tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          echo "/opt/zig" >> "$GITHUB_PATH"
+
+      - name: Zig version
+        run: zig version
+
+      - name: Cache Zig global cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: zig-${{ env.ZIG_VERSION }}-${{ runner.os }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            zig-${{ env.ZIG_VERSION }}-${{ runner.os }}-
+
+      # `zig build` also regenerates src/api/introspection.json and the Postgres
+      # schema. Building here catches compile errors in every binary.
+      - name: Build all binaries
+        run: zig build
+
+      # A schema.sql edit that forgot to regenerate the Postgres twin must fail CI.
+      # (introspection.json is gitignored + regenerated and embedded every build, so
+      # it can never ship stale — there is nothing tracked to diff it against.)
+      - name: Check generated Postgres schema is in sync
+        run: |
+          set -euo pipefail
+          git diff --exit-code -- schema/postgres \
+            || { echo "::error::schema/postgres is stale — run 'zig build' (regenerates it from schema.sql) and commit the result."; exit 1; }
+
+      - name: Format check
+        # Non-blocking for now; flip to a hard failure once the tree is clean.
+        run: zig fmt --check src build.zig || echo "::warning::zig fmt found unformatted files"
+
+      - name: Run all SQLite test lanes
+        run: zig build test-all --summary all
+
+  # ---------------------------------------------------------------------------
+  # Postgres lanes against a service container.
+  # ---------------------------------------------------------------------------
+  build-and-test-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ensv2_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # The PG test lanes open the local `ensv2_test` database (TEST_BACKEND=postgres).
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/ensv2_test
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: ensv2_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libsqlite3-dev
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          sudo mkdir -p /opt/zig
+          sudo tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          echo "/opt/zig" >> "$GITHUB_PATH"
+
+      - name: Cache Zig global cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: zig-${{ env.ZIG_VERSION }}-${{ runner.os }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            zig-${{ env.ZIG_VERSION }}-${{ runner.os }}-
+
+      # Bounded parallelism: the PG-backed lanes share one database and can
+      # exhaust its connection pool under high test concurrency.
+      - name: Run Postgres test lanes
+        env:
+          TEST_BACKEND: postgres
+        run: |
+          set -euo pipefail
+          zig build test-pg --summary all
+          zig build test-storage-pg --summary all
+          zig build test-integration-pg --summary all
