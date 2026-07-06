@@ -113,13 +113,16 @@ jobs:
           restore-keys: |
             zig-${{ env.ZIG_VERSION }}-${{ runner.os }}-
 
-      # Bounded parallelism: the PG-backed lanes share one database and can
-      # exhaust its connection pool under high test concurrency.
+      # These lanes share ONE Postgres database, so their test binaries must run
+      # serially (-j1). In parallel they race on schema bootstrap — concurrent
+      # CREATE TYPE/TABLE (duplicate pg_type), reorg-trigger install lock contention,
+      # and "relation does not exist" while another binary is mid-bootstrap. -j1
+      # matches how these lanes run locally.
       - name: Run Postgres test lanes
         env:
           TEST_BACKEND: postgres
         run: |
           set -euo pipefail
-          zig build test-pg --summary all
-          zig build test-storage-pg --summary all
-          zig build test-integration-pg --summary all
+          zig build test-pg --summary all -j1
+          zig build test-storage-pg --summary all -j1
+          zig build test-integration-pg --summary all -j1
