@@ -107,21 +107,21 @@ fn sepoliaAddresses() ContractAddresses {
         .name_wrapper = Address.fromHex("0x0635513f179D50A207757E05759CbD106d7dFcE8") catch unreachable,
 
         // V2 Sepolia Contracts (ENSv2 deployment)
-        .root_registry = Address.fromHex("0xc960f7217d3643b525ef36bec8adf86953cd9ab8") catch unreachable,
-        .eth_registry = Address.fromHex("0xdedb92913a25abe1f7bcdd85d8a344a43b398b67") catch unreachable,
-        .eth_registrar_v2 = Address.fromHex("0x8c2e866b439358c41ae05de9cbe8a00bfefaffca") catch unreachable,
+        .root_registry = Address.fromHex("0x11b5bfbe9078d826b1edbdd1cfc12f5828d9f50c") catch unreachable,
+        .eth_registry = Address.fromHex("0x67b728a792e789a8978b30cf1b3b641f19354b43") catch unreachable,
+        .eth_registrar_v2 = Address.fromHex("0xa4449a0dd2b83007553d9b1d28b583a46a805a30") catch unreachable,
         .eth_reverse_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable, // TBD
-        .batch_registrar = Address.fromHex("0xb39c2da7143dffa4a097970887fa6f1d17c1d60f") catch unreachable,
-        .premigration_registrar = Address.fromHex("0xdf60c561ca35ad3c89d24bba854654b1c3477078") catch unreachable,
+        .batch_registrar = Address.fromHex("0xfe2aab6df1cbff84534ce65d9e4a755ba02d6795") catch unreachable,
+        .premigration_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
 
         // Migration Contracts (V1→V2, Sepolia deployment)
-        .migration_helper = Address.fromHex("0x11cfa7e034dafb7439cc1cc8b6e547f5c82ad021") catch unreachable,
-        .locked_migration_controller = Address.fromHex("0xf91c34ed840889ed96f806f882fd50506a336edb") catch unreachable,
-        .unlocked_migration_controller = Address.fromHex("0x056138ef5660f7113a3b0adc08ac3683310e7fbc") catch unreachable,
+        .migration_helper = Address.fromHex("0xd54a53c1567b26f9653c8565dccc39bceb6ab327") catch unreachable,
+        .locked_migration_controller = Address.fromHex("0x681802eff57b83edce99d688c023ab1284495176") catch unreachable,
+        .unlocked_migration_controller = Address.fromHex("0xd021a69db7f9e276a59cbbccf06e7f1e5434215c") catch unreachable,
 
         // Deployment blocks (verified from on-protocol)
-        .v1_deployment_block = 10893210, // Fresh V1+V2 redeployment on Sepolia
-        .v2_deployment_block = 10893210, // Fresh V1+V2 redeployment on Sepolia
+        .v1_deployment_block = 11158967, // Post-audit V2 redeployment on Sepolia
+        .v2_deployment_block = 11158967, // Post-audit V2 redeployment on Sepolia
 
         // Historical markers (not applicable for testnets)
         .temp_registrar_start_block = 0,
