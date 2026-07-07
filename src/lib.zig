@@ -29,6 +29,21 @@ pub const contracts = @import("contracts.zig");
 
 pub const api = struct {
     pub const eac_roles = @import("api/eac_roles.zig");
+    // Exposed so the conformance harness reaches GraphQLHandler through the SAME
+    // module graph as `lib.Database` (one Database type across the test).
+    pub const handler = @import("api/handler.zig");
+};
+
+/// Resolution layer (Tasks 04-06). Exposed so tests can build a LiveContext / Resolver
+/// and drive the flag-ON live-resolution path against a pre-seeded cache (no network).
+pub const resolve = struct {
+    pub const client = @import("resolve/client.zig");
+    pub const cache = @import("resolve/cache.zig");
+    pub const universal = @import("resolve/universal.zig");
+    pub const primary = @import("resolve/primary.zig");
+};
+pub const rpc = struct {
+    pub const client = @import("rpc/client.zig");
 };
 
 pub const indexer = struct {

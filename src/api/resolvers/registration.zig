@@ -224,9 +224,9 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
     const events = try database.getRegistrations(fetch_filter);
     defer {
         for (events) |*event| {
-            event.deinit(allocator);
+            event.deinit(database.allocator);
         }
-        allocator.free(events);
+        database.allocator.free(events);
     }
 
     // We fetched `params.limit + 1` to detect a trailing page; if we actually got
@@ -277,6 +277,7 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
                 .depth = 0,
                 .allocator = allocator,
                 .loaders = ctx.loaders,
+                .resolve = ctx.resolve,
             },
             .id = id,
         };
@@ -396,9 +397,9 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
     });
     defer {
         for (events_result) |*event| {
-            event.deinit(allocator);
+            event.deinit(database.allocator);
         }
-        allocator.free(events_result);
+        database.allocator.free(events_result);
     }
 
     // Data is sorted by SQL for all paths now
@@ -417,6 +418,7 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
             .depth = 0,
             .allocator = allocator,
             .loaders = ctx.loaders,
+            .resolve = ctx.resolve,
         });
         defer allocator.free(reg_json);
         try json.appendSlice(allocator, reg_json);

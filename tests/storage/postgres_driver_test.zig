@@ -56,6 +56,15 @@ fn pgTestConfig() !config.Config {
         .rainbow_path = "",
         .v1_contracts = addrs,
         .v2_contracts = addrs,
+        .resolve_rpc_url = "http://localhost:8545",
+        .resolve_cache_ttl_s = 300,
+        .primary_verify_enabled = false,
+        .resolve_live_enabled = false,
+        .resolve_universal_resolver = Address.zero,
+        .resolve_ccip_enabled = false,
+        .ccip_gateway_timeout_ms = 5000,
+        .ccip_max_redirects = 4,
+        .finality_enabled = false,
     };
 }
 

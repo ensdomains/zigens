@@ -395,7 +395,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
             // even on direct namehash lookup. Audit clients pass
             // `includeUnreachable: true` to override.
             if (!include_unreachable and !name.is_reachable) {
-                defer name.deinit(allocator);
+                defer name.deinit(database.allocator);
                 return .{ .json = try allocator.dupe(u8, "[]") };
             }
             // Normalization filter — mirror getFilteredNames so this fast-path matches
@@ -408,16 +408,17 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
             else
                 (include_unnormalized or name.is_normalized);
             if (!norm_ok) {
-                defer name.deinit(allocator);
+                defer name.deinit(database.allocator);
                 return .{ .json = try allocator.dupe(u8, "[]") };
             }
-            defer name.deinit(allocator);
+            defer name.deinit(database.allocator);
 
             const name_json = try builders.buildDomainJson(name, field.selections, .{
                 .database = database,
                 .depth = 0,
                 .allocator = allocator,
                 .loaders = ctx.loaders,
+                .resolve = ctx.resolve,
             });
             defer allocator.free(name_json);
 
@@ -513,9 +514,9 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
         try database.getAllNamesWithOrder(null, @intCast(skip), fetch_limit, order_dir, sort_field);
     defer {
         for (names) |*name| {
-            name.deinit(allocator);
+            name.deinit(database.allocator);
         }
-        allocator.free(names);
+        database.allocator.free(names);
     }
 
     // Build JSON from DB-sorted names
@@ -533,6 +534,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
             .depth = 0,
             .allocator = allocator,
             .loaders = ctx.loaders,
+            .resolve = ctx.resolve,
         });
         defer allocator.free(name_json);
         try json.appendSlice(allocator, name_json);
@@ -751,9 +753,9 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         try database.getAllNamesWithOrder(null, skip, @intCast(fetch_limit), order_dir, sort_field);
     defer {
         for (names) |*name| {
-            name.deinit(allocator);
+            name.deinit(database.allocator);
         }
-        allocator.free(names);
+        database.allocator.free(names);
     }
 
     // We fetched `params.limit + 1` to detect a trailing page; if we actually got
@@ -802,6 +804,7 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
                 .depth = 0,
                 .allocator = allocator,
                 .loaders = ctx.loaders,
+                .resolve = ctx.resolve,
             },
             .hex_id = hex_id,
         };
@@ -903,7 +906,7 @@ pub fn resolveDomain(ctx: parser.ExecutionContext, field: *const parser.Field) !
         return parser.FieldResult{ .json = null_json };
     }
     var name = name_opt.?;
-    defer name.deinit(allocator);
+    defer name.deinit(database.allocator);
 
     // Hide unreachable domains from default lookup. There's currently no
     // `includeUnreachable` arg on the singular `domain(id:)` query; clients
@@ -919,6 +922,7 @@ pub fn resolveDomain(ctx: parser.ExecutionContext, field: *const parser.Field) !
         .depth = 0,
         .allocator = allocator,
         .loaders = ctx.loaders,
+        .resolve = ctx.resolve,
     });
     return parser.FieldResult{ .json = name_json };
 }
