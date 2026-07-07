@@ -714,4 +714,88 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_pool_tests.step);
     test_step.dependOn(&run_normalize_tests.step);
     test_step.dependOn(&run_indexer_tests.step);
+
+    // Resolution layer tests (query-time eth_call + resolution cache). Rooted
+    // inside src/ so it reaches the storage, rpc, and type modules by relative
+    // import; the {ens_normalize, eth, pg} trio matches the other src-rooted lanes.
+    const resolve_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/resolve_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
+                .{ .name = "eth", .module = eth_module },
+                .{ .name = "pg", .module = pg_module },
+            },
+        }),
+    });
+    resolve_tests.linkLibC();
+    resolve_tests.linkSystemLibrary("sqlite3");
+    const run_resolve_tests = b.addRunArtifact(resolve_tests);
+    run_resolve_tests.setCwd(b.path("."));
+    const resolve_test_step = b.step("test-resolve", "Run resolution layer tests");
+    resolve_test_step.dependOn(&run_resolve_tests.step);
+    test_step.dependOn(&run_resolve_tests.step);
+
+    // GraphQL conformance harness: drives the real GraphQLHandler end-to-end against
+    // a seeded in-memory DB (deterministic golden responses). Rooted in tests/ and
+    // reaches the handler + Database via the SAME `lib` module `helpers` uses, so
+    // there is exactly one Database type across the module graph.
+    const conformance_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/conformance/runner.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "helpers", .module = helpers_mod },
+                .{ .name = "lib", .module = lib_mod },
+            },
+        }),
+        .test_runner = .{ .path = b.path("tests/conformance/quiet_runner.zig"), .mode = .simple },
+    });
+    conformance_tests.linkLibC();
+    conformance_tests.linkSystemLibrary("sqlite3");
+    const run_conformance_tests = b.addRunArtifact(conformance_tests);
+    run_conformance_tests.setCwd(b.path("."));
+    const conformance_test_step = b.step("test-conformance", "Run GraphQL conformance golden harness");
+    conformance_test_step.dependOn(&run_conformance_tests.step);
+    // Manifest-driven config (Task 08). Uses the quiet runner because the validation tests
+    // deliberately trigger std.log.err on bad-address/wrong-chain/unknown-contract paths;
+    // setCwd(.) so it reads the committed manifests/ reference files.
+    const manifest_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/manifest_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .test_runner = .{ .path = b.path("tests/conformance/quiet_runner.zig"), .mode = .simple },
+    });
+    const run_manifest_tests = b.addRunArtifact(manifest_tests);
+    run_manifest_tests.setCwd(b.path("."));
+    const manifest_test_step = b.step("test-manifest", "Run contract-manifest loader tests");
+    manifest_test_step.dependOn(&run_manifest_tests.step);
+
+    // Aggregate lane: every SQLite-backed test lane behind one target so CI has a
+    // single entry point and new lanes join here. The Postgres-backed lanes
+    // (test-*-pg) are intentionally excluded — they require a live database.
+    const test_all_step = b.step("test-all", "Run every SQLite-backed test lane");
+    test_all_step.dependOn(test_step);
+    test_all_step.dependOn(integration_test_step);
+    test_all_step.dependOn(integration_fallback_step);
+    test_all_step.dependOn(graphql_test_step);
+    test_all_step.dependOn(graphql_features_test_step);
+    test_all_step.dependOn(filter_test_step);
+    test_all_step.dependOn(normalize_test_step);
+    test_all_step.dependOn(indexer_test_step);
+    test_all_step.dependOn(json_writer_test_step);
+    test_all_step.dependOn(api_test_step);
+    test_all_step.dependOn(events_test_step);
+    test_all_step.dependOn(apollo_test_step);
+    test_all_step.dependOn(variables_test_step);
+    test_all_step.dependOn(address_validation_test_step);
+    test_all_step.dependOn(storage_test_step);
+    test_all_step.dependOn(resolve_test_step);
+    test_all_step.dependOn(conformance_test_step);
+    test_all_step.dependOn(manifest_test_step);
 }

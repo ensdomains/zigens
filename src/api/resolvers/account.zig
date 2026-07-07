@@ -30,6 +30,7 @@ pub fn resolveAccount(ctx: parser.ExecutionContext, field: *const parser.Field) 
         .depth = 1,
         .allocator = allocator,
         .loaders = ctx.loaders,
+        .resolve = ctx.resolve,
     });
     return parser.FieldResult{ .json = account_json };
 }
@@ -86,9 +87,9 @@ pub fn resolveAccounts(ctx: parser.ExecutionContext, field: *const parser.Field)
     defer {
         for (accounts) |*a| {
             var m = a.*;
-            m.deinit(allocator);
+            m.deinit(database.allocator);
         }
-        allocator.free(accounts);
+        database.allocator.free(accounts);
     }
 
     var json: std.ArrayList(u8) = .{};
@@ -102,6 +103,7 @@ pub fn resolveAccounts(ctx: parser.ExecutionContext, field: *const parser.Field)
             .depth = 0,
             .allocator = allocator,
             .loaders = ctx.loaders,
+            .resolve = ctx.resolve,
         });
         defer allocator.free(acct_json);
         try json.appendSlice(allocator, acct_json);
