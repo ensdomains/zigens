@@ -1,5 +1,6 @@
 /// Library root module for test imports
 /// Re-exports all components needed for testing
+pub const zsys = @import("utils/system.zig");
 pub const storage = struct {
     pub const database = @import("storage/database.zig");
     pub const backend = @import("storage/backend.zig");

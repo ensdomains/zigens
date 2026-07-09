@@ -1,4 +1,5 @@
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const Address = @import("address.zig").Address;
 const Hash = @import("hash.zig").Hash;
 
@@ -146,7 +147,7 @@ pub const Name = struct {
 
     pub fn isExpired(self: Name) bool {
         if (self.expiry == 0) return false;
-        const now: u64 = @intCast(std.time.timestamp());
+        const now: u64 = @intCast(zsys.timestamp());
         return now >= self.expiry;
     }
 };

@@ -15,17 +15,21 @@
 //!      StreamTooLong for the halve-on-error loops; eth.zig fetches unbounded.
 //! Also: eth.zig's Log has no `block_timestamp` (the Alchemy extension we use
 //! to avoid block fetches), and any second transport would bypass
-//! `drainIdleHttpConnections` — the Zig 0.15.2 std.http pool-poisoning
-//! workaround — reintroducing that failure through the second pool.
+//! `drainIdleHttpConnections` — the std.http pool-poisoning workaround (still
+//! needed on Zig 0.16, see below) — reintroducing that failure through the
+//! second pool.
 //!
 //! REVISIT when: eth.zig grows batch + filter-arrays + surfaced RPC errors +
-//! a response cap (upstream-able), AND Zig 0.16's std.Io http rewrite lands
-//! (removes the drain workaround). Until then this file is deliberate.
+//! a response cap (upstream-able), AND std.http.Client evicts dead pooled
+//! connections on send-path failure (0.16's std.Io rewrite fixed only the
+//! receive path; see drainIdleHttpConnections). Until then this file is
+//! deliberate.
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
 
-/// Helper to write JSON values for RPC params (Zig 0.15 compatible)
+/// Helper to write JSON values for RPC params
 fn writeJsonValue(writer: anytype, value: anytype) !void {
     const T = @TypeOf(value);
     switch (@typeInfo(T)) {
@@ -142,6 +146,85 @@ fn encodeCallData(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     return out;
 }
 
+/// Free hex->bytes decode (0x-prefix optional). Shared by hexToBytes and parseCallResult.
+fn hexToBytesAlloc(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
+    const hex_data = if (std.mem.startsWith(u8, hex, "0x")) hex[2..] else hex;
+    if (hex_data.len % 2 != 0) return error.InvalidHexLength;
+    const bytes = try allocator.alloc(u8, hex_data.len / 2);
+    _ = try std.fmt.hexToBytes(bytes, hex_data);
+    return bytes;
+}
+
+/// Parse an eth_call JSON-RPC response value into a CallResult. PURE (no I/O) so it is
+/// unit-testable with canned responses (see tests below): `error.data` 0x-hex -> `.reverted`
+/// (the revert DATA, e.g. an EIP-3668 OffchainLookup); a result string -> `.ok` (return
+/// bytes); a revert WITHOUT data, or a missing/non-string result -> an error the caller
+/// degrades on. Bytes owned by `allocator`.
+fn parseCallResult(allocator: std.mem.Allocator, value: std.json.Value) !CallResult {
+    if (value != .object) return error.RpcNoResult;
+    const obj = value.object;
+    if (obj.get("error")) |err| {
+        if (err == .object) {
+            if (err.object.get("data")) |d| {
+                if (d == .string and std.mem.startsWith(u8, d.string, "0x"))
+                    return .{ .reverted = try hexToBytesAlloc(allocator, d.string) };
+            }
+        }
+        return error.RpcError; // revert without data / other RPC error
+    }
+    const result = obj.get("result") orelse return error.RpcNoResult;
+    switch (result) {
+        .string => |str| return .{ .ok = try hexToBytesAlloc(allocator, str) },
+        else => return error.RpcNoResult,
+    }
+}
+
+test "encodeCallData: bytes -> lowercase 0x-hex (eth_call request-encode)" {
+    const a = std.testing.allocator;
+    const out = try encodeCallData(a, &[_]u8{ 0x00, 0x0a, 0xff, 0x10 });
+    defer a.free(out);
+    try std.testing.expectEqualStrings("0x000aff10", out);
+    const empty = try encodeCallData(a, &[_]u8{});
+    defer a.free(empty);
+    try std.testing.expectEqualStrings("0x", empty);
+}
+
+test "parseCallResult: ok / revert-with-data / revert-without-data / no-result (canned responses)" {
+    const a = std.testing.allocator;
+    const Case = struct { json: []const u8 };
+    // .ok — result hex decodes to return bytes.
+    {
+        const p = try std.json.parseFromSlice(std.json.Value, a, "{\"result\":\"0xdeadbeef\"}", .{});
+        defer p.deinit();
+        const r = try parseCallResult(a, p.value);
+        defer r.deinit(a);
+        try std.testing.expect(r == .ok);
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 0xde, 0xad, 0xbe, 0xef }, r.ok);
+    }
+    // .reverted — error.data hex IS the revert DATA (where an OffchainLookup lives).
+    {
+        const p = try std.json.parseFromSlice(std.json.Value, a, "{\"error\":{\"code\":3,\"data\":\"0x1234\"}}", .{});
+        defer p.deinit();
+        const r = try parseCallResult(a, p.value);
+        defer r.deinit(a);
+        try std.testing.expect(r == .reverted);
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 0x12, 0x34 }, r.reverted);
+    }
+    // Revert WITHOUT data -> error (caller degrades to a miss / rpc_error).
+    {
+        const p = try std.json.parseFromSlice(std.json.Value, a, "{\"error\":{\"code\":3,\"message\":\"execution reverted\"}}", .{});
+        defer p.deinit();
+        try std.testing.expectError(error.RpcError, parseCallResult(a, p.value));
+    }
+    // No result key -> error.
+    {
+        const p = try std.json.parseFromSlice(std.json.Value, a, "{\"id\":1}", .{});
+        defer p.deinit();
+        try std.testing.expectError(error.RpcNoResult, parseCallResult(a, p.value));
+    }
+    _ = Case;
+}
+
 pub const Block = struct {
     number: u64,
     hash: Hash,
@@ -186,27 +269,30 @@ pub const Transaction = struct {
 
 /// Walk an http.Client's idle-connection pool and destroy every entry.
 ///
-/// Workaround for Zig 0.15.2: std.http.Client.ConnectionPool.resize is broken
-/// (Client.zig:167 calls `popped.data.close()` but the popped value is a
+/// Workaround carried from Zig 0.15.2 into 0.16:
+/// std.http.Client.ConnectionPool.resize is still broken (Client.zig:175 calls
+/// `popped.data.close(allocator)` but the popped value is a
 /// `*DoublyLinkedList.Node` with no `data` field; the function fails to
 /// compile when invoked). We replicate what resize(0) was meant to do — lock
-/// the pool mutex, pop every node from `free`, recover the parent Connection
-/// via @fieldParentPtr, and call Connection.destroy() (which closes the
-/// socket and frees the per-connection allocation).
+/// the pool mutex (an Io.Mutex in 0.16, so lock/unlock take the client's io
+/// handle), pop every node from `free`, recover the parent Connection via
+/// @fieldParentPtr, and call Connection.destroy(io) (which closes the socket
+/// and frees the per-connection allocation).
 ///
 /// Touches stdlib internals (the ConnectionPool struct fields and
 /// Connection.pool_node are public, but reaching into them is brittle).
 /// Safe-ish: only the indexer thread writes to this pool, and the API
 /// server has its own http.Client.
 fn drainIdleHttpConnections(http_client: *std.http.Client) void {
+    const io = http_client.io;
     const pool = &http_client.connection_pool;
-    pool.mutex.lock();
-    defer pool.mutex.unlock();
+    pool.mutex.lockUncancelable(io);
+    defer pool.mutex.unlock(io);
 
     while (pool.free.popFirst()) |node| {
         pool.free_len -= 1;
         const conn: *std.http.Client.Connection = @alignCast(@fieldParentPtr("pool_node", node));
-        conn.destroy();
+        conn.destroy(io);
     }
 }
 
@@ -237,96 +323,146 @@ pub const Client = struct {
     }
 
     /// Execute a JSON-RPC POST using std.http.Client with retry and exponential backoff.
-    /// Uses the shared http_client (connection pooling + keep-alive) and gzip/deflate decompression.
+    /// Uses the shared http_client (connection pooling + keep-alive). gzip/deflate responses
+    /// are accepted with BOUNDED decompression — see performRequest.
     /// Returns the response body on success, error on failure after all retries exhausted.
     ///
-    /// Timeout NOTE: Zig 0.15's std.http.Client does not expose per-request connect/read
-    /// timeouts. Previously `curl --connect-timeout 30 --max-time 120` protected against
-    /// hung RPC endpoints. Until Zig's http client exposes timeouts (or we wrap fetch in a
-    /// watchdog thread), a single request that hangs can block this indexer thread indefinitely.
+    /// Timeout NOTE: Zig 0.16's std.http.Client still does not expose per-request
+    /// connect/read timeouts. Previously `curl --connect-timeout 30 --max-time 120`
+    /// protected against hung RPC endpoints. Until Zig's http client exposes timeouts (or
+    /// we wrap fetch in a watchdog thread), a single request that hangs can block this
+    /// indexer thread indefinitely.
     /// Mitigation today: most real RPC providers return quickly; TCP keep-alive detects dead
     /// connections within ~2 hours by default.
+    const HttpOutcome = struct {
+        status: u16,
+        body: []u8,
+    };
+
+    /// One request/response cycle. Uses the lower-level request() (not fetch) so the body
+    /// is read through readerDecompressing + allocRemaining(.limited(cap)): gzip/deflate
+    /// are accepted (std's default accept-encoding header advertises them; the default
+    /// accept-array already rejects zstd/compress at receiveHead), but the DECOMPRESSED
+    /// output is capped — a compression bomb from a hostile or compromised endpoint
+    /// surfaces as error.StreamTooLong instead of unbounded allocation. fetch() cannot do
+    /// this: its decompressing stream has no output limit, and a cap enforced via the
+    /// response writer would surface as WriteFailed, which the retry loop must treat as a
+    /// transient connection error. (The 0.15.2 flate panic that briefly forced
+    /// identity-only encoding here is fixed in 0.16 — match writes are limit-guarded.)
+    fn performRequest(self: *Client, arena_allocator: std.mem.Allocator, request_body: []const u8, max_response_bytes: usize) !HttpOutcome {
+        const uri = try std.Uri.parse(self.rpc_url);
+        var req = try self.http_client.request(.POST, uri, .{
+            .redirect_behavior = .unhandled, // same as fetch() for payload requests; 3xx surfaces as a status
+            .keep_alive = true,
+            .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        });
+        defer req.deinit();
+
+        req.transfer_encoding = .{ .content_length = request_body.len };
+        var body_writer = try req.sendBodyUnflushed(&.{});
+        try body_writer.writer.writeAll(request_body);
+        try body_writer.end();
+        try req.connection.?.flush();
+
+        var response = try req.receiveHead(&.{});
+
+        // Reject oversize wire bodies up front; the decompression limit below is what
+        // actually bounds a small-wire/huge-output bomb.
+        if (response.head.content_length) |cl| {
+            if (cl > max_response_bytes) return error.StreamTooLong;
+        }
+
+        var transfer_buffer: [4096]u8 = undefined;
+        var decompress: std.http.Decompress = undefined;
+        var flate_window: [std.compress.flate.max_window_len]u8 = undefined;
+        const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+            .identity => &.{},
+            .gzip, .deflate => &flate_window,
+            // Not advertised and not in the accept-array — receiveHead rejects these
+            // before we get here; kept as a defensive arm.
+            .zstd, .compress => return error.HttpContentEncodingUnsupported,
+        };
+        const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+        const body = try reader.allocRemaining(arena_allocator, .limited(max_response_bytes));
+        return .{ .status = @intFromEnum(response.head.status), .body = body };
+    }
+
     fn executeHttpRequest(self: *Client, arena_allocator: std.mem.Allocator, request_body: []const u8) ![]const u8 {
         const max_retries: u32 = 3;
         const max_response_bytes: usize = 50 * 1024 * 1024;
         var attempt: u32 = 0;
         var last_error: ?anyerror = null;
 
-        const extra_headers = [_]std.http.Header{
-            .{ .name = "Content-Type", .value = "application/json" },
-            .{ .name = "Accept-Encoding", .value = "gzip, deflate" },
-        };
-
         while (attempt < max_retries) : (attempt += 1) {
             if (attempt > 0) {
                 const delay_ms: u64 = @as(u64, 1000) * (@as(u64, 1) << @intCast(attempt - 1));
                 std.log.warn("RPC request failed, retrying in {d}ms (attempt {d}/{d})", .{ delay_ms, attempt + 1, max_retries });
-                std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                zsys.sleep(delay_ms * std.time.ns_per_ms);
             }
 
-            const start_ms = std.time.milliTimestamp();
+            const start_ms = zsys.milliTimestamp();
 
-            var response_buf: std.Io.Writer.Allocating = .init(arena_allocator);
-            defer response_buf.deinit();
-
-            const result = self.http_client.fetch(.{
-                .location = .{ .url = self.rpc_url },
-                .method = .POST,
-                .payload = request_body,
-                .extra_headers = &extra_headers,
-                .response_writer = &response_buf.writer,
-                .keep_alive = true,
-            }) catch |err| {
+            const outcome = self.performRequest(arena_allocator, request_body, max_response_bytes) catch |err| {
                 if (err == error.StreamTooLong) {
-                    // Response exceeds buffer — not a transient failure; the
-                    // caller's adaptive chunking should shrink the request.
+                    // Wire content-length or DECOMPRESSED output exceeded the cap — not a
+                    // transient failure; the caller's adaptive chunking should shrink the
+                    // request.
                     std.log.debug("Response too large: {}", .{err});
                     return err;
                 }
-                // Zig 0.15.2's std.http.Client does NOT evict pooled connections
-                // when fetch fails — Request.deinit() looks at reader.state to
-                // decide closing, and several failure modes leave state in a
-                // shape that makes the dead socket get returned to the free
-                // pool. Next fetch picks the dead socket and fails the same
-                // way. We can't use ConnectionPool.resize either — it's itself
-                // broken in 0.15.2 (Client.zig:167 calls `popped.data.close()`
-                // but DoublyLinkedList.Node has no `data` field; doesn't
-                // compile when invoked).
+                if (err == error.OutOfMemory) return err;
+                // Zig 0.16's std.http.Client evicts a connection whose
+                // receiveHead fails (it sets connection.closing before
+                // returning the error), but a SEND-path failure — WriteFailed
+                // from sendBody*/flush on a stale socket — leaves reader.state
+                // == .ready, so Request.deinit() returns the dead socket to
+                // the free pool. Next fetch picks the dead socket and fails
+                // the same way. We can't use ConnectionPool.resize either —
+                // it's still broken in 0.16 (Client.zig:175 calls
+                // `popped.data.close()` but DoublyLinkedList.Node has no
+                // `data` field; doesn't compile when invoked).
                 //
-                // Workaround: on ANY transient fetch error, walk the free pool
+                // Workaround: on ANY transient request error, walk the free pool
                 // and destroy every idle connection so the next attempt opens
                 // a fresh socket. We've observed `ReadFailed` and `WriteFailed`
                 // both arise from stale pooled connections (different TCP
                 // states at the time of reuse); draining on either keeps the
-                // pool healthy. After heavy initial sync the pool may hold
-                // several stale connections; one drain + one retry typically
-                // restores forward progress.
+                // pool healthy. `HttpConnectionClosing` is the same disease's
+                // clearest symptom — a 0-byte read of the response head, i.e.
+                // the server closed the idle keep-alive socket before we
+                // reused it (observed on the poll pass right after a full
+                // sync, when the whole pool has been sitting idle). 0.16
+                // already destroys THAT one connection, but after heavy
+                // initial sync the pool may hold several stale connections;
+                // one drain + one retry restores forward progress instead of
+                // burning a retry per stale socket.
                 //
-                // Remove this whole block once Zig fixes the pool eviction
-                // or we move to 0.16 (which rewrites http.Client on std.Io).
+                // Remove this whole block once std.http.Client also evicts on
+                // send failure and ConnectionPool.resize compiles.
                 if (err == error.WriteFailed or
                     err == error.ReadFailed or
                     err == error.UnexpectedReadFailure or
                     err == error.EndOfStream or
                     err == error.BrokenPipe or
-                    err == error.ConnectionResetByPeer)
+                    err == error.ConnectionResetByPeer or
+                    err == error.HttpConnectionClosing)
                 {
                     drainIdleHttpConnections(self.http_client);
                     last_error = err;
-                    std.log.warn("http.fetch {} (likely stale pooled connection); evicted free pool, retrying", .{err});
+                    std.log.warn("http request {} (likely stale pooled connection); evicted free pool, retrying", .{err});
                     continue;
                 }
                 last_error = err;
-                std.log.warn("http.fetch error: {}", .{err});
+                std.log.warn("http request error: {}", .{err});
                 continue;
             };
 
-            const status_code = @intFromEnum(result.status);
+            const status_code = outcome.status;
             if (status_code < 200 or status_code >= 300) {
                 // Capture response body for diagnostics (RPC providers typically send a
                 // JSON error describing the issue: "block range too large", "too many logs", etc.).
-                const body_preview_len = @min(response_buf.written().len, 512);
-                const body_preview = response_buf.written()[0..body_preview_len];
+                const body_preview_len = @min(outcome.body.len, 512);
+                const body_preview = outcome.body[0..body_preview_len];
 
                 // 4xx = permanent client error (request too big, malformed, etc.) — caller's
                 // adaptive chunking can halve the range and retry. EXCEPT 408 (Request Timeout)
@@ -346,23 +482,20 @@ pub const Client = struct {
                 continue;
             }
 
-            const body = response_buf.written();
+            const body = outcome.body;
             if (body.len == 0) {
                 last_error = error.HttpError;
-                std.log.warn("http.fetch returned empty response", .{});
+                std.log.warn("http request returned empty response", .{});
                 continue;
             }
-            if (body.len > max_response_bytes) {
-                return error.StreamTooLong;
-            }
 
-            const elapsed = std.time.milliTimestamp() - start_ms;
+            const elapsed = zsys.milliTimestamp() - start_ms;
             if (elapsed > 500) {
                 std.log.debug("RPC http took {d}ms, response {d} bytes", .{ elapsed, body.len });
             }
 
-            // Copy out of the allocating writer's arena-backed buffer
-            return try arena_allocator.dupe(u8, body);
+            // Decompressed into the caller's arena by performRequest; bounded there.
+            return body;
         }
 
         std.log.err("RPC request failed after {d} retries", .{max_retries});
@@ -378,8 +511,8 @@ pub const Client = struct {
         const arena_allocator = arena.allocator();
 
         // Build JSON-RPC request manually for Zig 0.15
-        var request_buf: std.ArrayList(u8) = .{};
-        const writer = request_buf.writer(arena_allocator);
+        var request_buf: std.Io.Writer.Allocating = .init(arena_allocator);
+        const writer = &request_buf.writer;
         try writer.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":", .{ request_id, method });
 
         // Handle params
@@ -408,7 +541,7 @@ pub const Client = struct {
         try writer.writeAll("}");
 
         // Execute HTTP request with retry logic
-        const response_body = try self.executeHttpRequest(arena_allocator, request_buf.items);
+        const response_body = try self.executeHttpRequest(arena_allocator, request_buf.written());
 
         // Parse JSON response with main allocator (result will outlive this function)
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response_body, .{}) catch |err| {
@@ -454,8 +587,8 @@ pub const Client = struct {
         const arena_allocator = arena.allocator();
 
         // Build JSON-RPC request
-        var request_buf: std.ArrayList(u8) = .{};
-        const writer = request_buf.writer(arena_allocator);
+        var request_buf: std.Io.Writer.Allocating = .init(arena_allocator);
+        const writer = &request_buf.writer;
         try writer.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":", .{ request_id, method });
 
         // Write params as JSON
@@ -464,7 +597,7 @@ pub const Client = struct {
         try writer.writeAll("}");
 
         // Execute HTTP request with retry logic
-        const response_body = try self.executeHttpRequest(arena_allocator, request_buf.items);
+        const response_body = try self.executeHttpRequest(arena_allocator, request_buf.written());
 
         // Parse JSON response with main allocator (result will outlive this function)
         return std.json.parseFromSlice(std.json.Value, self.allocator, response_body, .{}) catch |err| {
@@ -501,8 +634,8 @@ pub const Client = struct {
         const arena_allocator = arena.allocator();
 
         // Build JSON-RPC batch request array
-        var request_buf: std.ArrayList(u8) = .{};
-        const writer = request_buf.writer(arena_allocator);
+        var request_buf: std.Io.Writer.Allocating = .init(arena_allocator);
+        const writer = &request_buf.writer;
         try writer.writeAll("[");
 
         for (requests, 0..) |req, i| {
@@ -517,7 +650,7 @@ pub const Client = struct {
         try writer.writeAll("]");
 
         // Execute HTTP request with retry logic
-        const response_body = try self.executeHttpRequest(arena_allocator, request_buf.items);
+        const response_body = try self.executeHttpRequest(arena_allocator, request_buf.written());
 
         // Parse JSON response with main allocator (result will outlive this function)
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response_body, .{}) catch |err| {
@@ -580,9 +713,9 @@ pub const Client = struct {
         const a = arena.allocator();
 
         // params: [ { to, data }, <block reference> ]
-        var call_obj = std.json.ObjectMap.init(a);
-        try call_obj.put("to", .{ .string = try to.toHex(a) });
-        try call_obj.put("data", .{ .string = try encodeCallData(a, data) });
+        var call_obj: std.json.ObjectMap = .empty;
+        try call_obj.put(a, "to", .{ .string = try to.toHex(a) });
+        try call_obj.put(a, "data", .{ .string = try encodeCallData(a, data) });
 
         var params_arr = std.json.Array.init(a);
         try params_arr.append(.{ .object = call_obj });
@@ -591,8 +724,8 @@ pub const Client = struct {
             .number => |n| try params_arr.append(.{ .string = try std.fmt.allocPrint(a, "0x{x}", .{n}) }),
             .hash => |h| {
                 // EIP-1898 block-hash reference so the read is pinned to an exact block.
-                var blk_obj = std.json.ObjectMap.init(a);
-                try blk_obj.put("blockHash", .{ .string = try h.toHex(a) });
+                var blk_obj: std.json.ObjectMap = .empty;
+                try blk_obj.put(a, "blockHash", .{ .string = try h.toHex(a) });
                 try params_arr.append(.{ .object = blk_obj });
             },
         }
@@ -616,38 +749,24 @@ pub const Client = struct {
         defer arena.deinit();
         const a = arena.allocator();
 
-        var call_obj = std.json.ObjectMap.init(a);
-        try call_obj.put("to", .{ .string = try to.toHex(a) });
-        try call_obj.put("data", .{ .string = try encodeCallData(a, data) });
+        var call_obj: std.json.ObjectMap = .empty;
+        try call_obj.put(a, "to", .{ .string = try to.toHex(a) });
+        try call_obj.put(a, "data", .{ .string = try encodeCallData(a, data) });
         var params_arr = std.json.Array.init(a);
         try params_arr.append(.{ .object = call_obj });
         switch (block) {
             .latest => try params_arr.append(.{ .string = "latest" }),
             .number => |n| try params_arr.append(.{ .string = try std.fmt.allocPrint(a, "0x{x}", .{n}) }),
             .hash => |h| {
-                var blk_obj = std.json.ObjectMap.init(a);
-                try blk_obj.put("blockHash", .{ .string = try h.toHex(a) });
+                var blk_obj: std.json.ObjectMap = .empty;
+                try blk_obj.put(a, "blockHash", .{ .string = try h.toHex(a) });
                 try params_arr.append(.{ .object = blk_obj });
             },
         }
 
         const parsed = try self.makeRpcCallRaw("eth_call", .{ .array = params_arr });
         defer parsed.deinit();
-        const obj = parsed.value.object;
-        if (obj.get("error")) |err| {
-            // Revert data lives in error.data as a 0x-hex string on most nodes.
-            if (err.object.get("data")) |d| {
-                if (d == .string and std.mem.startsWith(u8, d.string, "0x")) {
-                    return .{ .reverted = try self.hexToBytes(d.string) };
-                }
-            }
-            return error.RpcError; // revert without data / other RPC error
-        }
-        const result = obj.get("result") orelse return error.RpcNoResult;
-        switch (result) {
-            .string => |s| return .{ .ok = try self.hexToBytes(s) },
-            else => return error.RpcNoResult,
-        }
+        return parseCallResult(self.allocator, parsed.value);
     }
 
     pub fn getBlockByNumber(self: *Client, block_number: u64, include_txs: bool) !Block {
@@ -759,13 +878,13 @@ pub const Client = struct {
             const from_hex = try std.fmt.allocPrint(arena_allocator, "0x{x}", .{req.from_block});
             const to_hex = try std.fmt.allocPrint(arena_allocator, "0x{x}", .{req.to_block});
 
-            var filter = std.json.ObjectMap.init(arena_allocator);
-            try filter.put("fromBlock", .{ .string = from_hex });
-            try filter.put("toBlock", .{ .string = to_hex });
+            var filter: std.json.ObjectMap = .empty;
+            try filter.put(arena_allocator, "fromBlock", .{ .string = from_hex });
+            try filter.put(arena_allocator, "toBlock", .{ .string = to_hex });
 
             if (req.address) |addr| {
                 const addr_hex = try addr.toHex(arena_allocator);
-                try filter.put("address", .{ .string = addr_hex });
+                try filter.put(arena_allocator, "address", .{ .string = addr_hex });
             }
 
             // Convert topics to JSON array
@@ -781,7 +900,7 @@ pub const Client = struct {
                     }
                 }
 
-                try filter.put("topics", .{ .array = topics_array });
+                try filter.put(arena_allocator, "topics", .{ .array = topics_array });
             }
 
             // Create batch request with filter as param array
@@ -887,9 +1006,9 @@ pub const Client = struct {
         const from_hex = try std.fmt.allocPrint(arena_alloc, "0x{x}", .{request.from_block});
         const to_hex = try std.fmt.allocPrint(arena_alloc, "0x{x}", .{request.to_block});
 
-        var filter = std.json.ObjectMap.init(arena_alloc);
-        try filter.put("fromBlock", .{ .string = from_hex });
-        try filter.put("toBlock", .{ .string = to_hex });
+        var filter: std.json.ObjectMap = .empty;
+        try filter.put(arena_alloc, "fromBlock", .{ .string = from_hex });
+        try filter.put(arena_alloc, "toBlock", .{ .string = to_hex });
 
         // Add addresses array
         if (request.addresses.len > 0) {
@@ -898,7 +1017,7 @@ pub const Client = struct {
                 const addr_hex = try addr.toHex(arena_alloc);
                 try addr_array.append(.{ .string = addr_hex });
             }
-            try filter.put("address", .{ .array = addr_array });
+            try filter.put(arena_alloc, "address", .{ .array = addr_array });
         }
 
         // Add topics with OR support for topic[0]
@@ -913,7 +1032,7 @@ pub const Client = struct {
             }
             try topics_array.append(.{ .array = topic0_array });
 
-            try filter.put("topics", .{ .array = topics_array });
+            try filter.put(arena_alloc, "topics", .{ .array = topics_array });
         }
 
         // Build params array
@@ -921,10 +1040,10 @@ pub const Client = struct {
         try params_array.append(.{ .object = filter });
 
         // Make RPC call
-        const rpc_start = std.time.milliTimestamp();
+        const rpc_start = zsys.milliTimestamp();
         const parsed = try self.makeRpcCallWithParams("eth_getLogs", .{ .array = params_array });
         defer parsed.deinit();
-        const rpc_elapsed = std.time.milliTimestamp() - rpc_start;
+        const rpc_elapsed = zsys.milliTimestamp() - rpc_start;
 
         const result = parsed.value.object.get("result").?;
         const logs_array = result.array;
@@ -939,7 +1058,7 @@ pub const Client = struct {
         }
 
         // Parse each log
-        const parse_start = std.time.milliTimestamp();
+        const parse_start = zsys.milliTimestamp();
         for (logs_array.items, 0..) |log_value, i| {
             const log_obj = log_value.object;
 
@@ -967,7 +1086,7 @@ pub const Client = struct {
                 .block_hash = if (log_obj.get("blockHash")) |bh| Hash.fromHex(bh.string) catch null else null,
             };
         }
-        const parse_elapsed = std.time.milliTimestamp() - parse_start;
+        const parse_elapsed = zsys.milliTimestamp() - parse_start;
 
         if (logs.len > 1000) {
             std.log.debug("getLogsMultiAddress: {d} logs, rpc={d}ms, parse={d}ms", .{ logs.len, rpc_elapsed, parse_elapsed });
@@ -997,9 +1116,9 @@ pub const Client = struct {
             const from_hex = try std.fmt.allocPrint(arena_alloc, "0x{x}", .{req.from_block});
             const to_hex = try std.fmt.allocPrint(arena_alloc, "0x{x}", .{req.to_block});
 
-            var filter = std.json.ObjectMap.init(arena_alloc);
-            try filter.put("fromBlock", .{ .string = from_hex });
-            try filter.put("toBlock", .{ .string = to_hex });
+            var filter: std.json.ObjectMap = .empty;
+            try filter.put(arena_alloc, "fromBlock", .{ .string = from_hex });
+            try filter.put(arena_alloc, "toBlock", .{ .string = to_hex });
 
             // Add addresses array
             if (req.addresses.len > 0) {
@@ -1008,7 +1127,7 @@ pub const Client = struct {
                     const addr_hex = try addr.toHex(arena_alloc);
                     try addr_array.append(.{ .string = addr_hex });
                 }
-                try filter.put("address", .{ .array = addr_array });
+                try filter.put(arena_alloc, "address", .{ .array = addr_array });
             }
 
             // Add topics with OR support for topic[0]
@@ -1023,7 +1142,7 @@ pub const Client = struct {
                 }
                 try topics_array.append(.{ .array = topic0_array });
 
-                try filter.put("topics", .{ .array = topics_array });
+                try filter.put(arena_alloc, "topics", .{ .array = topics_array });
             }
 
             // Create batch request with filter as param array
@@ -1037,10 +1156,10 @@ pub const Client = struct {
         }
 
         // Make batch RPC call with timing
-        const rpc_start = std.time.milliTimestamp();
+        const rpc_start = zsys.milliTimestamp();
         const parsed = try self.makeBatchRpcCall(batch_requests);
         defer parsed.deinit();
-        const rpc_elapsed = std.time.milliTimestamp() - rpc_start;
+        const rpc_elapsed = zsys.milliTimestamp() - rpc_start;
 
         const responses = parsed.value.array;
 
@@ -1059,7 +1178,7 @@ pub const Client = struct {
         }
 
         // Parse each response
-        const parse_start = std.time.milliTimestamp();
+        const parse_start = zsys.milliTimestamp();
         var total_logs: usize = 0;
         for (responses.items, 0..) |response_value, i| {
             const response = response_value.object;
@@ -1105,7 +1224,7 @@ pub const Client = struct {
             results[i] = logs;
             total_logs += logs.len;
         }
-        const parse_elapsed = std.time.milliTimestamp() - parse_start;
+        const parse_elapsed = zsys.milliTimestamp() - parse_start;
 
         std.log.debug("getLogsMultiAddressBatch: {d} requests, {d} total logs, rpc={d}ms, parse={d}ms", .{
             requests.len,
@@ -1191,16 +1310,89 @@ pub const Client = struct {
     }
 
     fn hexToBytes(self: *Client, hex: []const u8) ![]u8 {
-        const hex_data = if (std.mem.startsWith(u8, hex, "0x")) hex[2..] else hex;
-
-        if (hex_data.len % 2 != 0) {
-            return error.InvalidHexLength;
-        }
-
-        // SECURITY: Use built-in std.fmt.hexToBytes (industry standard hex decoding)
-        const bytes = try self.allocator.alloc(u8, hex_data.len / 2);
-        _ = try std.fmt.hexToBytes(bytes, hex_data);
-
-        return bytes;
+        return hexToBytesAlloc(self.allocator, hex);
     }
 };
+
+/// Test-only local HTTP peer: accept one connection, discard the request head, respond
+/// with `head` + `body` verbatim, close. Lets the tests below exercise performRequest's
+/// bounded-decompression contract against real wire bytes.
+fn serveOnce(io: std.Io, srv: *std.Io.net.Server, head: []const u8, body: []const u8) void {
+    const conn = srv.accept(io) catch return;
+    defer conn.close(io);
+    var buf: [4096]u8 = undefined;
+    var seen: usize = 0;
+    var head_buf: [8192]u8 = undefined;
+    while (std.mem.indexOf(u8, head_buf[0..seen], "\r\n\r\n") == null) {
+        const n = std.posix.read(conn.socket.handle, &buf) catch return;
+        if (n == 0) break;
+        const take = @min(n, head_buf.len - seen);
+        @memcpy(head_buf[seen..][0..take], buf[0..take]);
+        seen += take;
+    }
+    var write_buf: [512]u8 = undefined;
+    var writer = conn.writer(io, &write_buf);
+    writer.interface.writeAll(head) catch return;
+    writer.interface.writeAll(body) catch return;
+    writer.interface.flush() catch return;
+}
+
+// gzip("{\"result\":\"ok\"}"), level 9, mtime 0 — 35 bytes on the wire.
+const GZ_SMALL = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xab\x56\x2a\x4a\x2d\x2e\xcd\x29\x51\xb2\x52\xca\xcf\x56\xaa\x05\x00\xcc\x7e\xc6\x44\x0f\x00\x00\x00";
+// gzip(8192 zero bytes) — 43 bytes on the wire, 8192 decompressed: a miniature bomb.
+const GZ_BOMB = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xed\xc1\x01\x0d\x00\x00\x00\xc2\xa0\xf7\x4f\x6d\x0e\x37\xa0\x00\x00\x00\x00\x00\x00\x00\x80\x77\x03\x94\x99\xf4\xd8\x00\x20\x00\x00";
+
+test "performRequest decompresses a gzip RPC response (bounded reader, happy path)" {
+    const testing = std.testing;
+    const io = testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+
+    var head_buf: [128]u8 = undefined;
+    const head = try std.fmt.bufPrint(&head_buf, "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: {d}\r\n\r\n", .{GZ_SMALL.len});
+    const thread = try std.Thread.spawn(.{}, serveOnce, .{ io, &server, head, GZ_SMALL });
+
+    var http_client: std.http.Client = .{ .allocator = testing.allocator, .io = io };
+    defer http_client.deinit();
+    var url_buf: [48]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{server.socket.address.getPort()});
+    const client = try Client.initWithSharedHttpClient(testing.allocator, url, &http_client);
+    defer client.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const outcome = try client.performRequest(arena.allocator(), "{}", 50 * 1024 * 1024);
+    thread.join();
+    try testing.expectEqual(@as(u16, 200), outcome.status);
+    try testing.expectEqualStrings("{\"result\":\"ok\"}", outcome.body);
+}
+
+test "performRequest bounds DECOMPRESSED output: small-wire gzip bomb -> StreamTooLong" {
+    const testing = std.testing;
+    const io = testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+
+    // 43 bytes on the wire (passes the content-length pre-check against a 1 KiB cap),
+    // 8 KiB decompressed — only the allocRemaining limit can catch it.
+    var head_buf: [128]u8 = undefined;
+    const head = try std.fmt.bufPrint(&head_buf, "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: {d}\r\n\r\n", .{GZ_BOMB.len});
+    const thread = try std.Thread.spawn(.{}, serveOnce, .{ io, &server, head, GZ_BOMB });
+
+    var http_client: std.http.Client = .{ .allocator = testing.allocator, .io = io };
+    defer http_client.deinit();
+    var url_buf: [48]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{server.socket.address.getPort()});
+    const client = try Client.initWithSharedHttpClient(testing.allocator, url, &http_client);
+    defer client.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const result = client.performRequest(arena.allocator(), "{}", 1024);
+    thread.join();
+    try testing.expectError(error.StreamTooLong, result);
+}
