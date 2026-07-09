@@ -1443,3 +1443,83 @@ test "healSubdomainLabel materializes a placeholder V2 subname" {
     // protocol-correct: the V2 row was updated (not a no-op under hardcoded .v1).
     try testing.expectEqual(models.Protocol.v2, healed.protocol);
 }
+
+fn seedProtocolTwin(database: *Database, protocol: models.Protocol, name: []const u8, label: []const u8, nh: Hash) !void {
+    try database.insertName(models.Name{
+        .protocol = protocol,
+        .name = name,
+        .namehash = nh,
+        .label = label,
+        .label_hash = Hash{ .bytes = [_]u8{0x11} ** 32 },
+        .parent_name = "eth",
+        .parent_namehash = Hash{ .bytes = [_]u8{0x22} ** 32 },
+        .registry = Address.zero,
+        .owner = helpers.TEST_OWNER_1,
+        .registrant = helpers.TEST_OWNER_1,
+        .resolver = Address.zero,
+        .token_id = 0,
+        .canonical_id = 0,
+        .token_version = 1,
+        .expiry = 0,
+        .registry_locked = false,
+        .migrated = false,
+        .created_block = 1000,
+        .created_at = 1700000000,
+        .registered_at = 1700000000,
+        .updated_block = 1000,
+        .updated_at = 1700000000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = protocol == .v1,
+        .v1_label_hash = null,
+    });
+}
+
+test "domains list dedups protocol twins preferring v2; count stays in lockstep" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const twin_nh = Hash{ .bytes = [_]u8{0xA1} ** 32 };
+    const solo_nh = Hash{ .bytes = [_]u8{0xA2} ** 32 };
+    try seedProtocolTwin(database, .v1, "twin.eth", "twin", twin_nh);
+    try seedProtocolTwin(database, .v2, "twin.eth", "twin", twin_nh);
+    try seedProtocolTwin(database, .v1, "solo.eth", "solo", solo_nh);
+
+    const names = try database.getFilteredNames(.{}, 0, 100, .asc, .name);
+    defer {
+        for (names) |*n| n.deinit(allocator);
+        allocator.free(names);
+    }
+    try testing.expectEqual(@as(usize, 2), names.len);
+    for (names) |n| {
+        if (std.mem.eql(u8, n.name.?, "twin.eth")) {
+            try testing.expectEqual(models.Protocol.v2, n.protocol);
+        } else {
+            try testing.expectEqualStrings("solo.eth", n.name.?);
+            try testing.expectEqual(models.Protocol.v1, n.protocol);
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), try database.getFilteredNameCount(.{}));
+}
+
+test "registrations list dedups protocol twins preferring v2" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const twin_nh = Hash{ .bytes = [_]u8{0xB1} ** 32 };
+    const solo_nh = Hash{ .bytes = [_]u8{0xB2} ** 32 };
+    const tx = Hash{ .bytes = [_]u8{0xB3} ** 32 };
+    try database.insertRegistration(.v1, twin_nh, "twin", "eth", helpers.TEST_OWNER_1, 1700000000, null, 1000, tx, 0, .name_registered);
+    try database.insertRegistration(.v2, twin_nh, "twin", "eth", helpers.TEST_OWNER_1, 1700000000, null, 1001, tx, 1, .name_registered);
+    try database.insertRegistration(.v1, solo_nh, "solo", "eth", helpers.TEST_OWNER_1, 1700000000, null, 1002, tx, 2, .name_registered);
+
+    const regs = try database.getRegistrations(.{});
+    defer {
+        for (regs) |*ev| ev.deinit(allocator);
+        allocator.free(regs);
+    }
+    try testing.expectEqual(@as(usize, 2), regs.len);
+}
