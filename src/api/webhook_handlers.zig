@@ -5,56 +5,61 @@
 //! each other through `self` (resolved via the Server aliases).
 
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const models = @import("../types/models.zig");
 const json_utils = @import("../utils/json.zig");
 const url_utils = @import("../utils/url.zig");
 const validation = @import("../utils/validation.zig");
 const webhook_manager = @import("../webhooks/manager.zig");
+const http_util = @import("http_util.zig");
 const Server = @import("server.zig").Server;
 
-/// Check Basic Auth credentials from request headers
-/// Returns true if auth is valid or not required, false if auth failed
-pub fn checkWebhookAuth(self: *Server, request: []const u8) bool {
-    // If no password is set, allow all requests (auth disabled)
-    const required_password = self.webhook_admin_password orelse return true;
-    const required_username = self.webhook_admin_username orelse return true;
-
-    // Find Authorization header
-    var lines = std.mem.splitSequence(u8, request, "\r\n");
-    while (lines.next()) |line| {
-        if (std.ascii.startsWithIgnoreCase(line, "authorization:")) {
-            const header_value = std.mem.trim(u8, line["authorization:".len..], " ");
-
-            // Check for Basic auth
-            if (std.ascii.startsWithIgnoreCase(header_value, "basic ")) {
-                const encoded = std.mem.trim(u8, header_value["basic ".len..], " ");
-
-                // Decode base64
-                const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return false;
-                if (decoded_len > 256) return false;
-
-                var decoded_buf: [256]u8 = undefined;
-                std.base64.standard.Decoder.decode(&decoded_buf, encoded) catch return false;
-                const decoded = decoded_buf[0..decoded_len];
-
-                // Format is "username:password"
-                if (std.mem.indexOf(u8, decoded, ":")) |colon_pos| {
-                    const username = decoded[0..colon_pos];
-                    const password = decoded[colon_pos + 1 ..];
-                    return std.mem.eql(u8, username, required_username) and std.mem.eql(u8, password, required_password);
-                }
-            }
-            return false;
-        }
-    }
-    return false;
+// Typed accessors over an attacker-supplied std.json.Value. Reading a union field
+// directly (e.g. `v.string`, `v.object`) panics — and crashes the process — when
+// the client sends a different JSON type; these return null on mismatch so the
+// handler can answer 400 instead.
+fn jsonObject(v: std.json.Value) ?std.json.ObjectMap {
+    return switch (v) {
+        .object => |o| o,
+        else => null,
+    };
 }
+fn jsonStr(v: std.json.Value) ?[]const u8 {
+    return switch (v) {
+        .string => |str| str,
+        else => null,
+    };
+}
+fn jsonBool(v: std.json.Value) ?bool {
+    return switch (v) {
+        .bool => |b| b,
+        else => null,
+    };
+}
+fn jsonInt(v: std.json.Value) ?i64 {
+    return switch (v) {
+        .integer => |i| i,
+        else => null,
+    };
+}
+fn jsonArray(v: std.json.Value) ?std.json.Array {
+    return switch (v) {
+        .array => |a| a,
+        else => null,
+    };
+}
+
+// Webhook/internal authentication now lives in api/auth.zig (constant-time,
+// fail-closed) and is enforced at the routing seam in server.zig via
+// `Server.webhookAuthOk`. The former `checkWebhookAuth` here compared credentials
+// with short-circuiting std.mem.eql and failed open on missing config; both are
+// fixed by the unified AdminAuth.
 
 // ========================================================================
 // WEBHOOK MANAGEMENT ENDPOINTS
 // ========================================================================
 
-pub fn handleWebhooksAPI(self: *Server, stream: std.net.Stream, method: []const u8, path: []const u8, request: []const u8) !void {
+pub fn handleWebhooksAPI(self: *Server, conn: http_util.Conn, method: []const u8, path: []const u8, request: []const u8) !void {
     // Parse path to determine webhook ID if present
     // /api/webhooks OR /api/webhooks/123
     const base_path = "/api/webhooks";
@@ -69,21 +74,21 @@ pub fn handleWebhooksAPI(self: *Server, stream: std.net.Stream, method: []const 
             }
             const id_str = path[webhook_id_start + 1 .. id_end];
             const webhook_id = std.fmt.parseInt(u64, id_str, 10) catch {
-                return try self.sendBadRequest(stream, "Invalid webhook ID");
+                return try self.sendBadRequest(conn, "Invalid webhook ID");
             };
 
-            try self.handleGetWebhook(stream, webhook_id);
+            try self.handleGetWebhook(conn, webhook_id);
         } else {
             // GET /api/webhooks - List all webhooks
-            try self.handleListWebhooks(stream);
+            try self.handleListWebhooks(conn);
         }
     } else if (std.mem.eql(u8, method, "POST")) {
         // POST /api/webhooks - Create new webhook
-        try self.handleCreateWebhook(stream, request);
+        try self.handleCreateWebhook(conn, request);
     } else if (std.mem.eql(u8, method, "PATCH")) {
         // PATCH /api/webhooks/:id - Update webhook
         if (path.len <= webhook_id_start + 1) {
-            return try self.sendBadRequest(stream, "Webhook ID required");
+            return try self.sendBadRequest(conn, "Webhook ID required");
         }
 
         var id_end = webhook_id_start + 1;
@@ -92,14 +97,14 @@ pub fn handleWebhooksAPI(self: *Server, stream: std.net.Stream, method: []const 
         }
         const id_str = path[webhook_id_start + 1 .. id_end];
         const webhook_id = std.fmt.parseInt(u64, id_str, 10) catch {
-            return try self.sendBadRequest(stream, "Invalid webhook ID");
+            return try self.sendBadRequest(conn, "Invalid webhook ID");
         };
 
-        try self.handleUpdateWebhook(stream, webhook_id, request);
+        try self.handleUpdateWebhook(conn, webhook_id, request);
     } else if (std.mem.eql(u8, method, "DELETE")) {
         // DELETE /api/webhooks/:id - Delete webhook
         if (path.len <= webhook_id_start + 1) {
-            return try self.sendBadRequest(stream, "Webhook ID required");
+            return try self.sendBadRequest(conn, "Webhook ID required");
         }
 
         var id_end = webhook_id_start + 1;
@@ -108,18 +113,18 @@ pub fn handleWebhooksAPI(self: *Server, stream: std.net.Stream, method: []const 
         }
         const id_str = path[webhook_id_start + 1 .. id_end];
         const webhook_id = std.fmt.parseInt(u64, id_str, 10) catch {
-            return try self.sendBadRequest(stream, "Invalid webhook ID");
+            return try self.sendBadRequest(conn, "Invalid webhook ID");
         };
 
-        try self.handleDeleteWebhook(stream, webhook_id);
+        try self.handleDeleteWebhook(conn, webhook_id);
     } else {
-        try self.sendBadRequest(stream, "Method not allowed");
+        try self.sendBadRequest(conn, "Method not allowed");
     }
 }
 
-pub fn handleListWebhooks(self: *Server, stream: std.net.Stream) !void {
+pub fn handleListWebhooks(self: *Server, conn: http_util.Conn) !void {
     const webhook_db = self.webhook_database orelse {
-        return try self.sendJsonResponse(stream, 503, "{\"error\":\"Webhooks not enabled\"}");
+        return try self.sendJsonResponse(conn, 503, "{\"error\":\"Webhooks not enabled\"}");
     };
     const webhooks = try webhook_db.getWebhooks();
     defer {
@@ -129,7 +134,7 @@ pub fn handleListWebhooks(self: *Server, stream: std.net.Stream) !void {
         self.allocator.free(webhooks);
     }
 
-    var response_buf: std.ArrayList(u8) = .{};
+    var response_buf: std.ArrayList(u8) = .empty;
     defer response_buf.deinit(self.allocator);
 
     try response_buf.appendSlice(self.allocator, "[");
@@ -137,7 +142,7 @@ pub fn handleListWebhooks(self: *Server, stream: std.net.Stream) !void {
         if (i > 0) try response_buf.appendSlice(self.allocator, ",");
 
         // Serialize event_types
-        var event_types_json: std.ArrayList(u8) = .{};
+        var event_types_json: std.ArrayList(u8) = .empty;
         defer event_types_json.deinit(self.allocator);
         try event_types_json.appendSlice(self.allocator, "[");
         for (webhook.event_types, 0..) |et, j| {
@@ -158,12 +163,12 @@ pub fn handleListWebhooks(self: *Server, stream: std.net.Stream) !void {
     }
     try response_buf.appendSlice(self.allocator, "]");
 
-    try self.sendJsonResponse(stream, 200, response_buf.items);
+    try self.sendJsonResponse(conn, 200, response_buf.items);
 }
 
-pub fn handleGetWebhook(self: *Server, stream: std.net.Stream, webhook_id: u64) !void {
+pub fn handleGetWebhook(self: *Server, conn: http_util.Conn, webhook_id: u64) !void {
     const webhook_db = self.webhook_database orelse {
-        return try self.sendJsonResponse(stream, 503, "{\"error\":\"Webhooks not enabled\"}");
+        return try self.sendJsonResponse(conn, 503, "{\"error\":\"Webhooks not enabled\"}");
     };
     const webhook_opt = try webhook_db.getWebhook(webhook_id);
 
@@ -172,7 +177,7 @@ pub fn handleGetWebhook(self: *Server, stream: std.net.Stream, webhook_id: u64) 
         defer wh.deinit(self.allocator);
 
         // Serialize event_types
-        var event_types_json: std.ArrayList(u8) = .{};
+        var event_types_json: std.ArrayList(u8) = .empty;
         defer event_types_json.deinit(self.allocator);
         try event_types_json.appendSlice(self.allocator, "[");
         for (wh.event_types, 0..) |et, i| {
@@ -190,38 +195,43 @@ pub fn handleGetWebhook(self: *Server, stream: std.net.Stream, webhook_id: u64) 
         );
         defer self.allocator.free(webhook_json);
 
-        try self.sendJsonResponse(stream, 200, webhook_json);
+        try self.sendJsonResponse(conn, 200, webhook_json);
     } else {
-        try self.sendNotFound(stream);
+        try self.sendNotFound(conn);
     }
 }
 
-pub fn handleCreateWebhook(self: *Server, stream: std.net.Stream, request: []const u8) !void {
+pub fn handleCreateWebhook(self: *Server, conn: http_util.Conn, request: []const u8) !void {
     if (self.webhook_database == null) {
-        return try self.sendJsonResponse(stream, 503, "{\"error\":\"Webhooks not enabled\"}");
+        return try self.sendJsonResponse(conn, 503, "{\"error\":\"Webhooks not enabled\"}");
     }
 
     // Extract JSON body
     const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse std.mem.indexOf(u8, request, "\n\n") orelse {
-        return try self.sendBadRequest(stream, "Invalid request format");
+        return try self.sendBadRequest(conn, "Invalid request format");
     };
     const body = request[body_start + 4 ..];
 
     // Parse JSON body
     const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {
-        return try self.sendBadRequest(stream, "Invalid JSON body");
+        return try self.sendBadRequest(conn, "Invalid JSON body");
     };
     defer parsed.deinit();
 
-    const obj = parsed.value.object;
+    const obj = jsonObject(parsed.value) orelse {
+        return try self.sendBadRequest(conn, "Request body must be a JSON object");
+    };
 
     // Extract fields
-    const url = obj.get("url") orelse {
-        return try self.sendBadRequest(stream, "url field required");
+    const url_value = obj.get("url") orelse {
+        return try self.sendBadRequest(conn, "url field required");
+    };
+    const url_str = jsonStr(url_value) orelse {
+        return try self.sendBadRequest(conn, "url must be a string");
     };
 
     // SECURITY: Validate webhook URL (SSRF protection, protocol validation, etc.)
-    url_utils.validateWebhookUrl(url.string) catch |err| {
+    url_utils.validateWebhookUrl(url_str) catch |err| {
         const err_msg = switch (err) {
             error.UrlEmpty => "URL cannot be empty",
             error.UrlTooLong => "URL exceeds maximum length",
@@ -231,17 +241,19 @@ pub fn handleCreateWebhook(self: *Server, stream: std.net.Stream, request: []con
             error.NullByteInUrl => "URL contains invalid null byte",
             error.ControlCharacterInUrl => "URL contains invalid control characters",
         };
-        return try self.sendBadRequest(stream, err_msg);
+        return try self.sendBadRequest(conn, err_msg);
     };
 
     // Parse event_types array
-    var event_types: std.ArrayList(models.EventType) = .{};
+    var event_types: std.ArrayList(models.EventType) = .empty;
     defer event_types.deinit(self.allocator);
 
     if (obj.get("event_types")) |et_value| {
-        const et_array = et_value.array;
+        const et_array = jsonArray(et_value) orelse {
+            return try self.sendBadRequest(conn, "event_types must be an array");
+        };
         for (et_array.items) |et_item| {
-            const et_str = et_item.string;
+            const et_str = jsonStr(et_item) orelse continue;
             // Accept the spec name ("NameRegistered") from the API surface. stringToEnum
             // would match only the internal variant name ("name_registered") — wrong direction.
             if (models.EventType.fromString(et_str)) |et| {
@@ -250,8 +262,15 @@ pub fn handleCreateWebhook(self: *Server, stream: std.net.Stream, request: []con
         }
     }
 
-    const active = if (obj.get("active")) |a| a.bool else true;
-    const max_retries = if (obj.get("max_retries")) |mr| @as(u32, @intCast(mr.integer)) else 3;
+    const active = if (obj.get("active")) |a|
+        (jsonBool(a) orelse return try self.sendBadRequest(conn, "active must be a boolean"))
+    else
+        true;
+    const max_retries: u32 = if (obj.get("max_retries")) |mr| blk: {
+        const n = jsonInt(mr) orelse return try self.sendBadRequest(conn, "max_retries must be an integer");
+        if (n < 0 or n > 1000) return try self.sendBadRequest(conn, "max_retries must be between 0 and 1000");
+        break :blk @intCast(n);
+    } else 3;
 
     // Use a caller-supplied secret when provided so several senders can share a
     // receiver's single WEBHOOK_SECRET; otherwise mint a fresh one. Either way the
@@ -260,14 +279,14 @@ pub fn handleCreateWebhook(self: *Server, stream: std.net.Stream, request: []con
     const secret = if (obj.get("secret")) |s| blk: {
         const provided = switch (s) {
             .string => |str| str,
-            else => return try self.sendBadRequest(stream, "secret must be a string"),
+            else => return try self.sendBadRequest(conn, "secret must be a string"),
         };
         if (provided.len == 0 or provided.len > 256 or provided.len % 2 != 0) {
-            return try self.sendBadRequest(stream, "secret must be non-empty even-length hex (max 256 chars)");
+            return try self.sendBadRequest(conn, "secret must be non-empty even-length hex (max 256 chars)");
         }
         for (provided) |c| {
             const is_hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
-            if (!is_hex) return try self.sendBadRequest(stream, "secret must be hex (0-9, a-f)");
+            if (!is_hex) return try self.sendBadRequest(conn, "secret must be hex (0-9, a-f)");
         }
         break :blk try self.allocator.dupe(u8, provided);
     } else try webhook_manager.generateWebhookSecret(self.allocator);
@@ -276,12 +295,12 @@ pub fn handleCreateWebhook(self: *Server, stream: std.net.Stream, request: []con
     // Create webhook
     const webhook = models.Webhook{
         .id = 0, // Will be set by database
-        .url = url.string,
+        .url = url_str,
         .secret = secret,
         .event_types = try event_types.toOwnedSlice(self.allocator),
         .active = active,
         .max_retries = max_retries,
-        .created_at = std.time.timestamp(),
+        .created_at = zsys.timestamp(),
     };
 
     const webhook_id = try self.webhook_database.?.insertWebhook(webhook);
@@ -293,34 +312,39 @@ pub fn handleCreateWebhook(self: *Server, stream: std.net.Stream, request: []con
     );
     defer self.allocator.free(response);
 
-    try self.sendJsonResponse(stream, 201, response);
+    try self.sendJsonResponse(conn, 201, response);
 }
 
-pub fn handleUpdateWebhook(self: *Server, stream: std.net.Stream, webhook_id: u64, request: []const u8) !void {
+pub fn handleUpdateWebhook(self: *Server, conn: http_util.Conn, webhook_id: u64, request: []const u8) !void {
     if (self.webhook_database == null) {
-        return try self.sendJsonResponse(stream, 503, "{\"error\":\"Webhooks not enabled\"}");
+        return try self.sendJsonResponse(conn, 503, "{\"error\":\"Webhooks not enabled\"}");
     }
 
     // Extract JSON body
     const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse std.mem.indexOf(u8, request, "\n\n") orelse {
-        return try self.sendBadRequest(stream, "Invalid request format");
+        return try self.sendBadRequest(conn, "Invalid request format");
     };
     const body = request[body_start + 4 ..];
 
     // Parse JSON body
     const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {
-        return try self.sendBadRequest(stream, "Invalid JSON body");
+        return try self.sendBadRequest(conn, "Invalid JSON body");
     };
     defer parsed.deinit();
 
-    const obj = parsed.value.object;
+    const obj = jsonObject(parsed.value) orelse {
+        return try self.sendBadRequest(conn, "Request body must be a JSON object");
+    };
 
     // Extract fields (all optional for PATCH)
-    const url: ?[]const u8 = if (obj.get("url")) |u| u.string else null;
+    const url: ?[]const u8 = if (obj.get("url")) |u|
+        (jsonStr(u) orelse return try self.sendBadRequest(conn, "url must be a string"))
+    else
+        null;
 
     // Parse event_types array if present
     var event_types: ?[]const models.EventType = null;
-    var event_types_list: std.ArrayList(models.EventType) = .{};
+    var event_types_list: std.ArrayList(models.EventType) = .empty;
     defer {
         if (event_types == null) {
             event_types_list.deinit(self.allocator);
@@ -328,9 +352,11 @@ pub fn handleUpdateWebhook(self: *Server, stream: std.net.Stream, webhook_id: u6
     }
 
     if (obj.get("event_types")) |et_value| {
-        const et_array = et_value.array;
+        const et_array = jsonArray(et_value) orelse {
+            return try self.sendBadRequest(conn, "event_types must be an array");
+        };
         for (et_array.items) |et_item| {
-            const et_str = et_item.string;
+            const et_str = jsonStr(et_item) orelse continue;
             if (models.EventType.fromString(et_str)) |et| {
                 try event_types_list.append(self.allocator, et);
             }
@@ -338,7 +364,10 @@ pub fn handleUpdateWebhook(self: *Server, stream: std.net.Stream, webhook_id: u6
         event_types = try event_types_list.toOwnedSlice(self.allocator);
     }
 
-    const active: ?bool = if (obj.get("active")) |a| a.bool else null;
+    const active: ?bool = if (obj.get("active")) |a|
+        (jsonBool(a) orelse return try self.sendBadRequest(conn, "active must be a boolean"))
+    else
+        null;
 
     // Update webhook
     try self.webhook_database.?.updateWebhook(webhook_id, url, event_types, active);
@@ -351,28 +380,28 @@ pub fn handleUpdateWebhook(self: *Server, stream: std.net.Stream, webhook_id: u6
     const response = try std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"message\":\"Webhook updated\"}}", .{webhook_id});
     defer self.allocator.free(response);
 
-    try self.sendJsonResponse(stream, 200, response);
+    try self.sendJsonResponse(conn, 200, response);
 }
 
-pub fn handleDeleteWebhook(self: *Server, stream: std.net.Stream, webhook_id: u64) !void {
+pub fn handleDeleteWebhook(self: *Server, conn: http_util.Conn, webhook_id: u64) !void {
     if (self.webhook_database == null) {
-        return try self.sendJsonResponse(stream, 503, "{\"error\":\"Webhooks not enabled\"}");
+        return try self.sendJsonResponse(conn, 503, "{\"error\":\"Webhooks not enabled\"}");
     }
     try self.webhook_database.?.deleteWebhook(webhook_id);
 
     const response = try std.fmt.allocPrint(self.allocator, "{{\"id\":{d},\"message\":\"Webhook deleted\"}}", .{webhook_id});
     defer self.allocator.free(response);
 
-    try self.sendJsonResponse(stream, 200, response);
+    try self.sendJsonResponse(conn, 200, response);
 }
 
-pub fn handleWebhookUI(self: *Server, stream: std.net.Stream) !void {
+pub fn handleWebhookUI(self: *Server, conn: http_util.Conn) !void {
     const html = @embedFile("webhook_ui.html");
 
-    var response: std.ArrayList(u8) = .{};
-    defer response.deinit(self.allocator);
+    var response: std.Io.Writer.Allocating = .init(self.allocator);
+    defer response.deinit();
 
-    const writer = response.writer(self.allocator);
+    const writer = &response.writer;
     try writer.print(
         "HTTP/1.1 200 OK\r\n" ++
             "Content-Type: text/html; charset=utf-8\r\n" ++
@@ -383,5 +412,5 @@ pub fn handleWebhookUI(self: *Server, stream: std.net.Stream) !void {
         .{ html.len, html },
     );
 
-    _ = try stream.write(response.items);
+    try conn.writeAll(response.written());
 }

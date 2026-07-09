@@ -1,20 +1,20 @@
 const std = @import("std");
+const zsys = @import("utils/system.zig");
 
 /// 16-byte canonical IP key. IPv4 addresses are stored as IPv4-mapped IPv6
 /// (::ffff:<v4>) so a single map type covers both families uniformly.
 pub const IpKey = [16]u8;
 
-pub fn ipKeyFromAddress(addr: std.net.Address) IpKey {
+pub fn ipKeyFromAddress(addr: std.Io.net.IpAddress) IpKey {
     var key: IpKey = std.mem.zeroes(IpKey);
-    const family = addr.any.family;
-    if (family == std.posix.AF.INET) {
-        // IPv4-mapped form: ::ffff:<ipv4>
-        key[10] = 0xff;
-        key[11] = 0xff;
-        const v4_be = addr.in.sa.addr; // network byte order u32
-        @memcpy(key[12..16], std.mem.asBytes(&v4_be));
-    } else if (family == std.posix.AF.INET6) {
-        @memcpy(&key, &addr.in6.sa.addr);
+    switch (addr) {
+        .ip4 => |ip4| {
+            // IPv4-mapped form: ::ffff:<ipv4>
+            key[10] = 0xff;
+            key[11] = 0xff;
+            @memcpy(key[12..16], &ip4.bytes);
+        },
+        .ip6 => |ip6| @memcpy(&key, &ip6.bytes),
     }
     return key;
 }
@@ -27,7 +27,7 @@ pub const PerIpRateLimiter = struct {
     max_tokens: u32,
     refill_rate: u32, // tokens added per second
     max_entries: u32, // hard cap on map size to bound memory
-    mutex: std.Thread.Mutex,
+    mutex: zsys.Mutex,
     last_sweep: i64,
 
     const IpBucket = struct {
@@ -43,7 +43,7 @@ pub const PerIpRateLimiter = struct {
             .refill_rate = refill_rate,
             .max_entries = max_entries,
             .mutex = .{},
-            .last_sweep = std.time.timestamp(),
+            .last_sweep = zsys.timestamp(),
         };
     }
 
@@ -56,9 +56,9 @@ pub const PerIpRateLimiter = struct {
     /// On allocation failure (OOM during HashMap.put) the limiter fails OPEN
     /// (returns true) — denying every request on internal failure would be a
     /// worse outcome than a brief gap in rate limiting.
-    pub fn tryAcquireFor(self: *PerIpRateLimiter, addr: std.net.Address) bool {
+    pub fn tryAcquireFor(self: *PerIpRateLimiter, addr: std.Io.net.IpAddress) bool {
         const key = ipKeyFromAddress(addr);
-        const now = std.time.timestamp();
+        const now = zsys.timestamp();
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -100,7 +100,7 @@ pub const PerIpRateLimiter = struct {
     /// Called from `tryAcquireFor` while holding the mutex; do not call externally.
     fn sweepStaleLocked(self: *PerIpRateLimiter, now: i64) void {
         const stale_threshold_secs: i64 = 600; // 10 minutes idle
-        var to_remove: std.ArrayList(IpKey) = .{};
+        var to_remove: std.ArrayList(IpKey) = .empty;
         defer to_remove.deinit(self.allocator);
 
         var it = self.buckets.iterator();
@@ -118,8 +118,8 @@ test "PerIpRateLimiter rejects after burst, isolates by IP" {
     var lim = PerIpRateLimiter.init(allocator, 3, 1, 1000);
     defer lim.deinit();
 
-    const a4: std.net.Address = .{ .in = std.net.Ip4Address.init(.{ 1, 2, 3, 4 }, 0) };
-    const b4: std.net.Address = .{ .in = std.net.Ip4Address.init(.{ 5, 6, 7, 8 }, 0) };
+    const a4: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 1, 2, 3, 4 }, .port = 0 } };
+    const b4: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 5, 6, 7, 8 }, .port = 0 } };
 
     // Drain A's bucket
     try std.testing.expect(lim.tryAcquireFor(a4));
@@ -136,9 +136,9 @@ test "PerIpRateLimiter caps map at max_entries" {
     var lim = PerIpRateLimiter.init(allocator, 100, 1, 2);
     defer lim.deinit();
 
-    const a: std.net.Address = .{ .in = std.net.Ip4Address.init(.{ 1, 0, 0, 1 }, 0) };
-    const b: std.net.Address = .{ .in = std.net.Ip4Address.init(.{ 1, 0, 0, 2 }, 0) };
-    const c: std.net.Address = .{ .in = std.net.Ip4Address.init(.{ 1, 0, 0, 3 }, 0) };
+    const a: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 1, 0, 0, 1 }, .port = 0 } };
+    const b: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 1, 0, 0, 2 }, .port = 0 } };
+    const c: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 1, 0, 0, 3 }, .port = 0 } };
 
     try std.testing.expect(lim.tryAcquireFor(a));
     try std.testing.expect(lim.tryAcquireFor(b));
@@ -152,15 +152,15 @@ pub const RateLimiter = struct {
     max_tokens: u32,
     refill_rate: u32, // tokens per second
     last_refill: std.atomic.Value(i64),
-    mutex: std.Thread.Mutex,
+    mutex: zsys.Mutex,
 
     pub fn init(max_tokens: u32, refill_rate: u32) RateLimiter {
         return .{
             .tokens = std.atomic.Value(u32).init(max_tokens),
             .max_tokens = max_tokens,
             .refill_rate = refill_rate,
-            .last_refill = std.atomic.Value(i64).init(std.time.timestamp()),
-            .mutex = std.Thread.Mutex{},
+            .last_refill = std.atomic.Value(i64).init(zsys.timestamp()),
+            .mutex = zsys.Mutex{},
         };
     }
 
@@ -189,7 +189,7 @@ pub const RateLimiter = struct {
                 return;
             }
             // Sleep for a small amount if no tokens available
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            zsys.sleep(100 * std.time.ns_per_ms);
         }
     }
 
@@ -198,7 +198,7 @@ pub const RateLimiter = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const now = std.time.timestamp();
+        const now = zsys.timestamp();
         const last = self.last_refill.load(.acquire);
         const elapsed = now - last;
 
