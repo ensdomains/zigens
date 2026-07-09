@@ -33,8 +33,8 @@
     // internet connectivity.
     .dependencies = .{
         .z_ens_normalize = .{
-            .url = "git+https://github.com/mdtanrikulu/z-ens-normalize#59bdaaad5e63ad945a9ac00908aa39f3187c5754",
-            .hash = "z_ens_normalize-0.0.0-Iv6nMOa-AgDfR1ILozGzMNzPcfFzNxWxLTRvoSW75i4_",
+            .url = "git+https://github.com/mdtanrikulu/z-ens-normalize#9301ca770c90d39408075ce3f998ee0e06806228",
+            .hash = "z_ens_normalize-0.0.0-Iv6nMILMAgA6KXZaqqwWfURCNKsJH2UcCMngg-zCI_eD",
         },
         // eth.zig v0.8.0 (minimum Zig 0.16); tarball pin of the v0.8.0 tag commit.
         .eth = .{
