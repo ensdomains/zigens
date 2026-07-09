@@ -1,6 +1,7 @@
 /// Test helpers for ENS Indexer tests
 /// Provides common utilities for creating test databases and fixtures
 const std = @import("std");
+const zsys = @import("lib").zsys;
 const testing = std.testing;
 const lib = @import("lib");
 const Database = lib.Database;
@@ -52,14 +53,14 @@ pub fn createTestDatabase(allocator: std.mem.Allocator) !*Database {
 /// True when the suite must force SQLite onto the write-path undo fallback
 /// (TEST_FORCE_WRITE_PATH_UNDO=1 — the test-integration-fallback lane).
 fn forceWritePathUndo() bool {
-    const v = std.process.getEnvVarOwned(std.heap.page_allocator, "TEST_FORCE_WRITE_PATH_UNDO") catch return false;
+    const v = zsys.getEnvOwned(std.heap.page_allocator, "TEST_FORCE_WRITE_PATH_UNDO") catch return false;
     defer std.heap.page_allocator.free(v);
     return std.mem.eql(u8, v, "1");
 }
 
 /// True when the suite is being run against Postgres (TEST_BACKEND=postgres).
 fn wantPostgresBackend(allocator: std.mem.Allocator) bool {
-    const v = std.process.getEnvVarOwned(allocator, "TEST_BACKEND") catch return false;
+    const v = zsys.getEnvOwned(allocator, "TEST_BACKEND") catch return false;
     defer allocator.free(v);
     return std.ascii.eqlIgnoreCase(v, "postgres");
 }
@@ -69,7 +70,7 @@ fn wantPostgresBackend(allocator: std.mem.Allocator) bool {
 /// that's redundant on a fresh PG DB (001 already has the column) and — unlike SQLite's
 /// exec, which swallows "duplicate column" — errors on Postgres.
 fn createWebhooksSchemaPg(database: *Database) !void {
-    const sql = try std.fs.cwd().readFileAlloc(database.allocator, "schema/postgres/webhooks/001_webhooks.sql", 1 << 20);
+    const sql = try zsys.readFileAlloc(database.allocator, "schema/postgres/webhooks/001_webhooks.sql", 1 << 20);
     defer database.allocator.free(sql);
     try database.exec(sql);
 }
@@ -149,7 +150,7 @@ pub fn createTestName(
     // Parse name parts
     var parts = std.mem.splitScalar(u8, name, '.');
     const label = parts.first();
-    var parent_parts: std.ArrayList(u8) = .{};
+    var parent_parts: std.ArrayList(u8) = .empty;
     defer parent_parts.deinit(allocator);
 
     var first = true;
@@ -204,9 +205,9 @@ pub fn createTestEvent(
     name: ?[]const u8,
     namehash_val: ?Hash,
 ) !void {
-    const timestamp = std.time.timestamp();
+    const timestamp = zsys.timestamp();
     var tx_hash: [32]u8 = undefined;
-    std.crypto.random.bytes(&tx_hash);
+    zsys.randomBytes(&tx_hash);
 
     try database.insertEvent(models.Event{
         .protocol = .v2,
@@ -225,14 +226,14 @@ pub fn createTestEvent(
 /// Generate a random test address
 pub fn randomAddress() Address {
     var bytes: [20]u8 = undefined;
-    std.crypto.random.bytes(&bytes);
+    zsys.randomBytes(&bytes);
     return Address{ .bytes = bytes };
 }
 
 /// Generate a random test hash
 pub fn randomHash() Hash {
     var bytes: [32]u8 = undefined;
-    std.crypto.random.bytes(&bytes);
+    zsys.randomBytes(&bytes);
     return Hash{ .bytes = bytes };
 }
 
