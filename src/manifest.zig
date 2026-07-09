@@ -17,18 +17,21 @@
 //! remove a contract from the indexed set.
 
 const std = @import("std");
+const zsys = @import("utils/system.zig");
 const contracts = @import("contracts.zig");
 const Address = @import("types/address.zig").Address;
 
 const ContractAddresses = contracts.ContractAddresses;
 const Network = contracts.Network;
 
-pub const Status = enum { active, shadow, disabled };
+pub const Status = enum { active, disabled };
 
 pub const Contract = struct {
     name: []const u8,
     address: []const u8,
-    /// active/shadow are indexed; disabled leaves the address zero (indexer skips it).
+    /// active is indexed; disabled leaves the address zero (the indexer's isActiveContract
+    /// guard then skips it). (A 'shadow' status was removed: ENS V2 migration is parent-first —
+    /// MigrationHelper reverts ParentNotMigrated — so shadow/placeholder parents never occur.)
     status: Status = .active,
     /// Per-contract sync start (informational in v1; the indexer uses the block markers).
     start_block: u64 = 0,
@@ -71,14 +74,14 @@ const addr_count = blk: {
 /// `network`. The returned struct is by-value (no allocation to free). Fails fast on any
 /// misconfiguration.
 pub fn loadManifest(allocator: std.mem.Allocator, path: []const u8, network: Network) !ContractAddresses {
-    const raw = try std.fs.cwd().readFileAlloc(allocator, path, 1 << 20);
+    const raw = try zsys.readFileAlloc(allocator, path, 1 << 20);
     defer allocator.free(raw);
     const src = try allocator.dupeZ(u8, raw); // zon parser needs a sentinel-terminated slice
     defer allocator.free(src);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const m = std.zon.parse.fromSlice(Manifest, arena.allocator(), src, null, .{}) catch {
+    const m = std.zon.parse.fromSliceAlloc(Manifest, arena.allocator(), src, null, .{}) catch {
         std.log.err("MANIFEST_PATH '{s}': malformed .zon manifest", .{path});
         return Error.ManifestParseError;
     };
