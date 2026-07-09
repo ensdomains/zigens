@@ -10,6 +10,7 @@
 //! through `self` and resolves via the Indexer struct's alias/pub decls.
 
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const config = @import("../config.zig");
 const constants = @import("../constants.zig");
 const db = @import("../storage/database.zig");
@@ -77,7 +78,7 @@ pub fn start(self: *Indexer) !void {
         fetchFinality(self);
 
         // Sleep for poll interval before next iteration
-        std.Thread.sleep(self.config.poll_interval * std.time.ns_per_s);
+        zsys.sleep(self.config.poll_interval * std.time.ns_per_s);
     }
 
     std.log.info("Indexer stopped.", .{});
@@ -89,7 +90,7 @@ pub fn start(self: *Indexer) !void {
 fn fetchFinality(self: *Indexer) void {
     if (!self.config.finality_enabled) return;
     const chain_id = self.database.chain_id;
-    const now = std.time.timestamp();
+    const now = zsys.timestamp();
     const safe = self.v1_client.getBlockByTag("safe");
     const finalized = self.v1_client.getBlockByTag("finalized");
     if (safe) |s| {
@@ -202,19 +203,24 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
                     // Inner `executeHttpRequest` retries already cover
                     // transient TLS/socket recovery, so anything beyond
                     // 1s is redundant.
-                    std.Thread.sleep(std.time.ns_per_s);
+                    zsys.sleep(std.time.ns_per_s);
                     continue;
                 },
                 else => {
                     // Other errors (database, parsing, etc) - log and wait briefly
                     std.log.err("{s} indexing error: {}", .{ protocol.toString(), err });
-                    std.Thread.sleep(constants.Timing.error_recovery_delay_ms * std.time.ns_per_ms); // Wait 5s for non-network errors
+                    zsys.sleep(constants.Timing.error_recovery_delay_ms * std.time.ns_per_ms); // Wait 5s for non-network errors
                 },
             }
         }
 
+        // Best-effort finality signalling (Task 09); no-op unless FINALITY_ENABLED.
+        // Wired here too so the single-protocol binaries (ensv2-indexer-v1/-v2) persist
+        // finality just like the combined indexer's `start` loop.
+        fetchFinality(self);
+
         // Sleep for poll interval before next iteration
-        std.Thread.sleep(self.config.poll_interval * std.time.ns_per_s);
+        zsys.sleep(self.config.poll_interval * std.time.ns_per_s);
     }
 
     std.log.info("{s} indexer stopped.", .{protocol.toString()});
@@ -416,7 +422,7 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
             self.clearBlockTimestampCache();
 
             // Force a brief pause to allow memory to be reclaimed
-            std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
+            zsys.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
         }
 
         from_block = to_block + 1;
