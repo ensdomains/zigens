@@ -15,4 +15,8 @@ test {
     _ = @import("resolve/universal.zig");
     _ = @import("resolve/ccip.zig");
     _ = @import("resolve/ccip_transport.zig");
+    // rpc/client.zig's inline tests (eth_call encode/decode, parseTaggedBlock) were
+    // previously not pulled into ANY lane — force them into test-resolve so the
+    // resolution transport is CI-covered.
+    _ = @import("rpc/client.zig");
 }

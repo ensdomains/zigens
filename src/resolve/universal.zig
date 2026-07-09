@@ -18,6 +18,7 @@ const cache = @import("cache.zig");
 const Resolver = @import("client.zig").Resolver;
 const isFresh = @import("client.zig").isFresh;
 const ccip_mod = @import("ccip.zig");
+const primary_mod = @import("primary.zig");
 const testing = std.testing;
 
 /// CCIP-Read parameters threaded into live resolution when RESOLVE_CCIP_ENABLED. When
@@ -108,7 +109,7 @@ pub fn encodeInner(allocator: std.mem.Allocator, node: Hash, record: Record) ![]
         .text => |key| {
             // text(bytes32 node, string key): sel ++ node(32) ++ offset(0x40) ++
             // len(key) ++ key padded to a 32-byte multiple.
-            var out: std.ArrayList(u8) = .{};
+            var out: std.ArrayList(u8) = .empty;
             errdefer out.deinit(allocator);
             try out.appendSlice(allocator, &SEL_TEXT);
             try out.appendSlice(allocator, &node.bytes);
@@ -129,7 +130,7 @@ pub fn encodeResolveCall(allocator: std.mem.Allocator, name: []const u8, inner: 
 
     // resolve(bytes name, bytes data): sel ++ head[off_name, off_data] ++
     // name tail[len, padded] ++ data tail[len, padded].
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, &SEL_RESOLVE);
     const off_name: usize = 0x40; // two head words
@@ -287,6 +288,16 @@ pub const LiveContext = struct {
     now: i64,
     /// CCIP-Read params; null unless RESOLVE_CCIP_ENABLED wired an offchain transport.
     ccip: ?CcipParams = null,
+    /// Registry the ENSIP-3 forward check reads (`registry.resolver(node)`); Task 05.
+    registry: Address = Address.zero,
+    /// Whether primary-name verification (Task 05) is enabled (PRIMARY_VERIFY_ENABLED).
+    primary_verify_enabled: bool = false,
+
+    /// ENSIP-3 forward-verify (Task 05) that `claimed_name` resolves to `address`, pinned
+    /// to this context's block. Never throws on a resolution failure (→ `.unverified`).
+    pub fn verifyPrimary(self: *LiveContext, allocator: std.mem.Allocator, address: Address, claimed_name: []const u8) !primary_mod.Verdict {
+        return primary_mod.verify(self.resolver, allocator, self.registry, address, claimed_name, self.block_num, self.block_hash, self.now);
+    }
 
     /// Live-resolve `record` for `name`/`node`, returning the value string (owned by
     /// `allocator`) or null (no record / any failure → caller degrades to the miss).

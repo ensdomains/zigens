@@ -127,7 +127,7 @@ pub fn buildGatewayRequest(allocator: std.mem.Allocator, url_template: []const u
 }
 
 fn substitute(allocator: std.mem.Allocator, template: []const u8, sender_hex: []const u8, data_hex: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var i: usize = 0;
     while (i < template.len) {
@@ -164,7 +164,7 @@ fn appendPadded(list: *std.ArrayList(u8), allocator: std.mem.Allocator, bytes: [
 /// Assemble the CCIP callback calldata: `callback ++ abi.encode(bytes response, bytes
 /// extraData)`. Hand-packed two-dynamic-bytes ABI (offsets 0x40/off_data). Caller owns.
 pub fn encodeCallback(allocator: std.mem.Allocator, callback: [4]u8, response: []const u8, extra_data: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, &callback);
     const paddedLen = struct {
