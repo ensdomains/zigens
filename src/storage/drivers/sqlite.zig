@@ -249,7 +249,7 @@ fn introspectColumns(ctx: *anyopaque, allocator: std.mem.Allocator, table: []con
     var stmt = try prepare(ctx, sql, false);
     defer stmt.deinit();
 
-    var list: std.ArrayList(backend.ColumnInfo) = .{};
+    var list: std.ArrayList(backend.ColumnInfo) = .empty;
     errdefer {
         for (list.items) |col| {
             allocator.free(col.name);
@@ -306,7 +306,7 @@ fn dialectUpsert(allocator: std.mem.Allocator, table: []const u8, cols: []const 
     // SQLite INSERT OR REPLACE/IGNORE does not take a conflict-key list.
     _ = conflict_cols;
     std.debug.assert(value_exprs.len == 0 or value_exprs.len == cols.len);
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     try appendInsertInto(allocator, &buf, table, cols, action);
     try buf.appendSlice(allocator, " VALUES (");
@@ -321,7 +321,7 @@ fn dialectUpsert(allocator: std.mem.Allocator, table: []const u8, cols: []const 
 fn dialectInsertSelect(allocator: std.mem.Allocator, table: []const u8, cols: []const []const u8, select_body: []const u8, conflict_cols: []const []const u8, action: backend.ConflictAction) anyerror![]u8 {
     // SQLite INSERT OR REPLACE/IGNORE does not take a conflict-key list.
     _ = conflict_cols;
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     try appendInsertInto(allocator, &buf, table, cols, action);
     try buf.append(allocator, ' ');
@@ -334,12 +334,12 @@ fn dialectReturning(allocator: std.mem.Allocator, col: []const u8) anyerror![]u8
 }
 
 fn dialectJsonObject(allocator: std.mem.Allocator, cols: []const []const u8, alias: []const u8) anyerror![]u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     try buf.appendSlice(allocator, "json_object(");
     for (cols, 0..) |col, i| {
         if (i > 0) try buf.appendSlice(allocator, ", ");
-        try buf.writer(allocator).print("'{s}', {s}.\"{s}\"", .{ col, alias, col });
+        try buf.print(allocator, "'{s}', {s}.\"{s}\"", .{ col, alias, col });
     }
     try buf.append(allocator, ')');
     return buf.toOwnedSlice(allocator);

@@ -6,6 +6,7 @@
 //! (and the indexer's `names_storage.f` write sites) are unchanged.
 
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const db_module = @import("database.zig");
 const Database = db_module.Database;
 const Query = db_module.Query;
@@ -121,7 +122,7 @@ pub fn updateNameIsLegacy(db: *Database, namehash: Hash, is_legacy: bool) !void 
     var q = try Query.initCached(db, "UPDATE names SET is_legacy = ?, updated_at = ? WHERE namehash = ?");
     defer q.deinit();
     try q.bindInt(if (is_legacy) 1 else 0);
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
 }
@@ -133,7 +134,7 @@ pub fn updateNameExpiry(db: *Database, namehash: Hash, expiry: u64) !void {
     defer q.deinit();
 
     try q.bindInt64(safeU64ToI64(expiry));
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
 }
@@ -157,7 +158,7 @@ pub fn updateV1RenewalExpiry(db: *Database, namehash: Hash, expires: u64) !void 
     try q.bindInt64(base);
     try q.bindInt64(base);
     try q.bindInt64(base);
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
 }
@@ -169,7 +170,7 @@ pub fn updateNameOwner(db: *Database, namehash: Hash, new_owner: Address) !void 
     defer q.deinit();
 
     try q.bindAddressBuf(new_owner);
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
 }
@@ -184,7 +185,7 @@ pub fn markNameMigrated(db: *Database, namehash: Hash, controller: Address) !voi
     defer q.deinit();
 
     try q.bindAddressBuf(controller);
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
 }
@@ -196,7 +197,7 @@ pub fn updateNameResolver(db: *Database, namehash: Hash, resolver: Address) !voi
     defer q.deinit();
 
     try q.bindAddressBuf(resolver);
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
 }
@@ -210,7 +211,7 @@ pub fn updateResolvedAddressToNull(db: *Database, namehash: Hash) !void {
     var q = try Query.initCached(db, "UPDATE names SET resolved_address = NULL, updated_at = ? WHERE namehash = ?");
     defer q.deinit();
 
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
 }
@@ -224,7 +225,7 @@ pub fn updateNameTTL(db: *Database, namehash: Hash, ttl: u64) !void {
     defer q.deinit();
 
     try q.bindInt64(@intCast(ttl));
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
 }
@@ -321,7 +322,7 @@ pub fn updateNameTokenIdByNamehash(db: *Database, namehash: Hash, new_token_id: 
 
     try q.bindText(new_token_id_hex);
     try q.bindInt64(@intCast(token_version));
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
 }
@@ -341,7 +342,7 @@ pub fn updateNameWrapperState(db: *Database, namehash: Hash, fuses: u32, expiry:
 
     try q.bindText(fuses_str);
     try q.bindInt64(safeU64ToI64(expiry));
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.bindHash(namehash);
     try q.exec();
 }
@@ -358,7 +359,7 @@ pub fn clearNameExpiry(db: *Database, namehash: Hash) !void {
     );
     defer q.deinit();
 
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
 }
@@ -381,7 +382,7 @@ pub fn updateNameUnwrapperState(db: *Database, namehash: Hash) !void {
     );
     defer q.deinit();
 
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.bindHash(namehash);
     try q.exec();
 }
@@ -398,7 +399,7 @@ pub fn updateNameWrapperFuses(db: *Database, namehash: Hash, fuses: u32) !void {
     const fuses_str = try std.fmt.bufPrint(&fuses_buf, "{d}", .{fuses});
 
     try q.bindText(fuses_str);
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.bindHash(namehash);
     try q.exec();
 }
@@ -412,7 +413,7 @@ pub fn updateNameWrapperExpiry(db: *Database, namehash: Hash, expiry: u64) !void
     defer q.deinit();
 
     try q.bindInt64(safeU64ToI64(expiry));
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.bindHash(namehash);
     try q.exec();
 }
@@ -439,7 +440,7 @@ pub fn updateDomainExpiryIfGreater(db: *Database, namehash: Hash, new_expiry: i6
     var q = try Query.initCached(db, sql);
     defer q.deinit();
     try q.bindInt64(new_expiry);
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
 }
@@ -478,7 +479,7 @@ pub fn materializePccDomainExpiry(db: *Database) !u32 {
         \\  AND wrapper_expiry > COALESCE(expiry, 0)
     );
     defer q.deinit();
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.bindInt64(PARENT_CANNOT_CONTROL);
     try q.exec();
     return q.changes();

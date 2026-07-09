@@ -1,4 +1,5 @@
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const db_module = @import("database.zig");
 const reorg_undo = @import("reorg_undo.zig");
 const Database = db_module.Database;
@@ -36,7 +37,7 @@ pub fn upsertEACRole(db: *Database, protocol: models.Protocol, resource: []const
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
     try q.bindInt(@intCast(log_index));
-    try q.bindInt64(@intCast(std.time.timestamp()));
+    try q.bindInt64(@intCast(zsys.timestamp()));
     try q.bindAddress(contract_address);
 
     try q.exec();
@@ -131,7 +132,7 @@ pub fn getRolesByResource(db: *Database, protocol: models.Protocol, resource: []
     try q.bindTextStatic(protocol.toString());
     try q.bindText(resource);
 
-    var roles: std.ArrayList(models.EACRoleAssignment) = .{};
+    var roles: std.ArrayList(models.EACRoleAssignment) = .empty;
     errdefer {
         for (roles.items) |*role| {
             role.deinit(db.allocator);
@@ -162,7 +163,7 @@ pub fn getRolesByAccount(db: *Database, protocol: models.Protocol, account: Addr
     try q.bindTextStatic(protocol.toString());
     try q.bindAddress(account);
 
-    var roles: std.ArrayList(models.EACRoleAssignment) = .{};
+    var roles: std.ArrayList(models.EACRoleAssignment) = .empty;
     errdefer {
         for (roles.items) |*role| {
             role.deinit(db.allocator);
@@ -265,7 +266,7 @@ pub fn getRolesWithPagination(db: *Database, protocol: models.Protocol, options:
 
     try q.bindInt(@intCast(options.limit));
 
-    var roles: std.ArrayList(models.EACRoleAssignment) = .{};
+    var roles: std.ArrayList(models.EACRoleAssignment) = .empty;
     errdefer {
         for (roles.items) |*role| {
             role.deinit(db.allocator);
