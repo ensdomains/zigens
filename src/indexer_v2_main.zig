@@ -10,14 +10,15 @@ pub const std_options: std.Options = .{
     .log_level = .info, // Only show info, warn, err (no debug)
 };
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     // Configure SQLite for thread safety BEFORE any other operations
     db.configureSqliteThreadSafety();
 
     // Use thread-safe GPA configuration
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    const io = init.io;
 
     // Load configuration from .env
     var cfg = try config.Config.fromEnv(allocator);
@@ -50,7 +51,7 @@ pub fn main() !void {
     std.log.info("Database integrity check passed", .{});
 
     // Initialize indexer with only V2 client
-    var idx = try indexer.Indexer.initSingleProtocol(allocator, cfg, &database, .v2, null);
+    var idx = try indexer.Indexer.initSingleProtocol(allocator, io, cfg, &database, .v2, null);
     defer idx.deinit();
 
     std.log.info("V2 Indexer started - indexing blocks...", .{});

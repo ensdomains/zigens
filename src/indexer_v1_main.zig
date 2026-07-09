@@ -29,9 +29,8 @@ fn printHelp() void {
     , .{});
 }
 
-fn parseArgs(allocator: std.mem.Allocator, cfg: *config.Config) !CliMode {
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
+fn parseArgs(process_args: std.process.Args, cfg: *config.Config) !CliMode {
+    var args = process_args.iterate();
 
     var mode: CliMode = .index;
 
@@ -66,21 +65,22 @@ fn parseArgs(allocator: std.mem.Allocator, cfg: *config.Config) !CliMode {
     return mode;
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     // Configure SQLite for thread safety BEFORE any other operations
     db.configureSqliteThreadSafety();
 
     // Use thread-safe GPA configuration
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    const io = init.io;
 
     // Load configuration from .env
     var cfg = try config.Config.fromEnv(allocator);
     defer cfg.deinit();
 
     // Parse command-line arguments (override .env values)
-    const mode = try parseArgs(allocator, &cfg);
+    const mode = try parseArgs(init.minimal.args, &cfg);
 
     std.log.info("ENSv2 V1 Indexer starting...", .{});
     std.log.info("Network: {s}", .{cfg.network.toString()});
@@ -103,7 +103,7 @@ pub fn main() !void {
     }
 
     // Initialize indexer with only V1 client
-    var idx = try indexer.Indexer.initSingleProtocol(allocator, cfg, &database, .v1, cfg.end_block);
+    var idx = try indexer.Indexer.initSingleProtocol(allocator, io, cfg, &database, .v1, cfg.end_block);
     defer idx.deinit();
 
     switch (mode) {

@@ -7,6 +7,7 @@
 //! Cursor()` resolves through that alias too).
 
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
 const reorg_undo = @import("../storage/reorg_undo.zig");
@@ -72,7 +73,7 @@ pub fn reconcileReachabilityUncaptured(self: *Indexer) void {
     defer self.invalidateReorgCursor();
     const head = self.database.getSyncState(.v2) catch null orelse 0;
     const roots = [_]Address{ self.config.v2_contracts.eth_registry, self.config.v2_contracts.root_registry };
-    const fixed = self.database.reconcileV2Reachability(self.allocator, &roots, head, std.time.timestamp()) catch |err| {
+    const fixed = self.database.reconcileV2Reachability(self.allocator, &roots, head, zsys.timestamp()) catch |err| {
         std.log.warn("reconcileV2Reachability failed: {}", .{err});
         return;
     };
