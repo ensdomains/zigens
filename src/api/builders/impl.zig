@@ -24,6 +24,7 @@ const jw = @import("../../lib/graphql/json_writer.zig");
 // Import ENS-specific modules
 const fields = @import("../ens_fields.zig");
 const json_builder = @import("../json_builder.zig");
+const universal = @import("../../resolve/universal.zig");
 const loaders = @import("../loaders.zig");
 const resolvers_mod = @import("../../storage/resolvers.zig");
 const registry_entries = @import("../../storage/registry_entries.zig");
@@ -36,6 +37,9 @@ pub const NestedContext = struct {
     depth: u32,
     allocator: std.mem.Allocator,
     loaders: ?*anyopaque,
+    /// Optional live-resolution context (see json_builder.NestedContext / Task 06).
+    /// Default null → propagated from the parent; a missed site fails safe (no fallback).
+    resolve: ?*anyopaque = null,
 };
 
 // ============================================================================
@@ -51,12 +55,13 @@ fn domainNestedHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: 
         const domain_opt = try database.getNameByNamehash(nh);
         if (domain_opt) |domain| {
             var domain_mut = domain;
-            defer domain_mut.deinit(nested_ctx.allocator);
+            defer domain_mut.deinit(database.allocator);
             return try buildDomainJson(&domain_mut, field.selections, .{
                 .database = database,
                 .depth = nested_ctx.depth + 1,
                 .allocator = nested_ctx.allocator,
                 .loaders = nested_ctx.loaders,
+                .resolve = nested_ctx.resolve,
             });
         }
     }
@@ -98,7 +103,7 @@ fn writeOptStringField(
     const escaped = try json_utils.escapeString(allocator, value);
     defer allocator.free(escaped);
     if (!first.*) try out.append(allocator, ',');
-    try out.writer(allocator).print("\"{s}\":\"{s}\"", .{ key, escaped });
+    try out.print(allocator, "\"{s}\":\"{s}\"", .{ key, escaped });
     first.* = false;
 }
 
@@ -112,7 +117,7 @@ fn writeOptIntField(
 ) !void {
     const value = value_opt orelse return;
     if (!first.*) try out.append(allocator, ',');
-    try out.writer(allocator).print("\"{s}\":{d}", .{ key, value });
+    try out.print(allocator, "\"{s}\":{d}", .{ key, value });
     first.* = false;
 }
 
@@ -123,7 +128,7 @@ fn eventAsTransferHandler(ctx: *anyopaque, field: *const parser.Field, nested_ct
     if (!isEventType(event, "Transfer")) return try allocator.dupe(u8, "null");
     const data = event.data;
 
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.append(allocator, '{');
     var first = true;
@@ -163,7 +168,7 @@ fn eventAsNameRegisteredHandler(ctx: *anyopaque, field: *const parser.Field, nes
     if (!isEventType(event, "NameRegistered")) return try allocator.dupe(u8, "null");
     const data = event.data;
 
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.append(allocator, '{');
     var first = true;
@@ -194,7 +199,7 @@ fn eventAsNameRenewedHandler(ctx: *anyopaque, field: *const parser.Field, nested
     if (!isEventType(event, "NameRenewed")) return try allocator.dupe(u8, "null");
     const data = event.data;
 
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.append(allocator, '{');
     var first = true;
@@ -219,7 +224,7 @@ fn eventAsNameWrappedHandler(ctx: *anyopaque, field: *const parser.Field, nested
     if (!isEventType(event, "NameWrapped")) return try allocator.dupe(u8, "null");
     const data = event.data;
 
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.append(allocator, '{');
     var first = true;
@@ -238,7 +243,7 @@ fn eventAsNameUnwrappedHandler(ctx: *anyopaque, field: *const parser.Field, nest
     if (!isEventType(event, "NameUnwrapped")) return try allocator.dupe(u8, "null");
     const data = event.data;
 
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.append(allocator, '{');
     var first = true;
@@ -255,7 +260,7 @@ fn eventAsFusesSetHandler(ctx: *anyopaque, field: *const parser.Field, nested_ct
     if (!isEventType(event, "FusesSet")) return try allocator.dupe(u8, "null");
     const data = event.data;
 
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.append(allocator, '{');
     var first = true;
@@ -272,7 +277,7 @@ fn eventAsReverseClaimedHandler(ctx: *anyopaque, field: *const parser.Field, nes
     if (!isEventType(event, "ReverseClaimed")) return try allocator.dupe(u8, "null");
     const data = event.data;
 
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.append(allocator, '{');
     var first = true;
@@ -289,7 +294,7 @@ fn eventAsRegistryTransferHandler(ctx: *anyopaque, field: *const parser.Field, n
     if (!isEventType(event, "RegistryTransfer")) return try allocator.dupe(u8, "null");
     const data = event.data;
 
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.append(allocator, '{');
     var first = true;
@@ -306,7 +311,7 @@ fn eventAsTextChangedHandler(ctx: *anyopaque, field: *const parser.Field, nested
     if (!isEventType(event, "TextChanged")) return try allocator.dupe(u8, "null");
     const data = event.data;
 
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.append(allocator, '{');
     var first = true;
@@ -325,7 +330,7 @@ fn eventAsAddressChangedHandler(ctx: *anyopaque, field: *const parser.Field, nes
     if (!isEventType(event, "AddressChanged")) return try allocator.dupe(u8, "null");
     const data = event.data;
 
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.append(allocator, '{');
     var first = true;
@@ -344,7 +349,7 @@ fn eventAsExpiryUpdatedHandler(ctx: *anyopaque, field: *const parser.Field, nest
     if (!isEventType(event, "ExpiryUpdated")) return try allocator.dupe(u8, "null");
     const data = event.data;
 
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.append(allocator, '{');
     var first = true;
@@ -370,7 +375,7 @@ fn eventAsResolverUpdatedHandler(ctx: *anyopaque, field: *const parser.Field, ne
     if (!isEventType(event, "ResolverUpdated")) return try allocator.dupe(u8, "null");
     const data = event.data;
 
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.append(allocator, '{');
     var first = true;
@@ -390,7 +395,7 @@ fn eventAsLabelRegisteredHandler(ctx: *anyopaque, field: *const parser.Field, ne
     if (!isEventType(event, "LabelRegistered")) return try allocator.dupe(u8, "null");
     const data = event.data;
 
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.append(allocator, '{');
     var first = true;
@@ -447,6 +452,7 @@ pub fn buildEventJson(
             .depth = ctx.depth,
             .allocator = ctx.allocator,
             .loaders = ctx.loaders,
+            .resolve = ctx.resolve,
         },
     );
 }
@@ -489,7 +495,7 @@ fn getExpiryFromDomain(event: *const models.Event, database: *db.Database, alloc
         const domain_opt = database.getNameByNamehash(nh) catch null;
         if (domain_opt) |domain| {
             var domain_mut = domain;
-            defer domain_mut.deinit(allocator);
+            defer domain_mut.deinit(database.allocator);
             if (fields.hasValidExpiry(domain_mut.expiry)) {
                 return try std.fmt.allocPrint(allocator, "{d}", .{domain_mut.expiry});
             }
@@ -517,6 +523,7 @@ fn registrationRegistrantHandler(ctx: *anyopaque, field: *const parser.Field, ne
         .depth = nested_ctx.depth + 1,
         .allocator = nested_ctx.allocator,
         .loaders = nested_ctx.loaders,
+        .resolve = nested_ctx.resolve,
     });
 }
 
@@ -547,6 +554,7 @@ pub fn buildRegistrationJson(
             .depth = ctx.depth,
             .allocator = ctx.allocator,
             .loaders = ctx.loaders,
+            .resolve = ctx.resolve,
         },
     );
 }
@@ -565,27 +573,28 @@ fn accountDomainsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx
     const domains = try database.getAllNames(addr.*, page.skip, page.first);
     defer {
         for (domains) |*domain| {
-            domain.deinit(nested_ctx.allocator);
+            domain.deinit(database.allocator);
         }
-        nested_ctx.allocator.free(domains);
+        database.allocator.free(domains);
     }
 
-    var json: std.ArrayList(u8) = .{};
-    errdefer json.deinit(nested_ctx.allocator);
-    var arr = try jw.arrayOn(json.writer(nested_ctx.allocator));
+    var json: std.Io.Writer.Allocating = .init(nested_ctx.allocator);
+    errdefer json.deinit();
+    var arr = try jw.arrayOn(&json.writer);
     for (domains) |*domain| {
         const domain_json = try buildDomainJson(domain, field.selections, .{
             .database = database,
             .depth = nested_ctx.depth + 1,
             .allocator = nested_ctx.allocator,
             .loaders = nested_ctx.loaders,
+            .resolve = null, // list rows: indexed-only; live resolution is single-name (never per-row)
         });
         defer nested_ctx.allocator.free(domain_json);
         try arr.itemRaw(domain_json);
     }
     try arr.end();
 
-    return try json.toOwnedSlice(nested_ctx.allocator);
+    return try json.toOwnedSlice();
 }
 
 /// Account nested field handler: registrations
@@ -610,14 +619,14 @@ fn accountRegistrationsHandler(ctx: *anyopaque, field: *const parser.Field, nest
     });
     defer {
         for (registrations) |*reg| {
-            reg.deinit(nested_ctx.allocator);
+            reg.deinit(database.allocator);
         }
-        nested_ctx.allocator.free(registrations);
+        database.allocator.free(registrations);
     }
 
-    var json: std.ArrayList(u8) = .{};
-    errdefer json.deinit(nested_ctx.allocator);
-    var arr = try jw.arrayOn(json.writer(nested_ctx.allocator));
+    var json: std.Io.Writer.Allocating = .init(nested_ctx.allocator);
+    errdefer json.deinit();
+    var arr = try jw.arrayOn(&json.writer);
     const start_idx: usize = @min(@as(usize, @intCast(page.skip)), registrations.len);
     const end_idx: usize = @min(start_idx + @as(usize, @intCast(page.first)), registrations.len);
     for (registrations[start_idx..end_idx]) |*reg| {
@@ -626,13 +635,14 @@ fn accountRegistrationsHandler(ctx: *anyopaque, field: *const parser.Field, nest
             .depth = nested_ctx.depth + 1,
             .allocator = nested_ctx.allocator,
             .loaders = nested_ctx.loaders,
+            .resolve = null, // list rows: indexed-only; live resolution is single-name (never per-row)
         });
         defer nested_ctx.allocator.free(reg_json);
         try arr.itemRaw(reg_json);
     }
     try arr.end();
 
-    return try json.toOwnedSlice(nested_ctx.allocator);
+    return try json.toOwnedSlice();
 }
 
 /// Account nested field handler: primaryName
@@ -665,11 +675,43 @@ fn accountPrimaryNameHandler(ctx: *anyopaque, field: *const parser.Field, nested
 
     const name_opt = try database.getLatestNameByNamehash(namehash);
     const name = name_opt orelse return try nested_ctx.allocator.dupe(u8, "null");
-    defer nested_ctx.allocator.free(name);
+    defer database.allocator.free(name);
 
     const escaped = try json_utils.escapeString(nested_ctx.allocator, name);
     defer nested_ctx.allocator.free(escaped);
     return try std.fmt.allocPrint(nested_ctx.allocator, "\"{s}\"", .{escaped});
+}
+
+/// Account nested field handler: primaryNameVerification (ENSIP-3, Task 05, additive).
+/// Emits the forward-verification verdict for the account's primaryName. On-chain, so it
+/// runs ONLY in single-entity contexts (resolve context present — the list-suppression nulls
+/// it for list rows) and ONLY when PRIMARY_VERIFY_ENABLED; otherwise null. Never alters the
+/// plain `primaryName` field.
+fn accountPrimaryNameVerificationHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    _ = field;
+    const addr: *const Address = @ptrCast(@alignCast(ctx));
+    const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+
+    const rp = nested_ctx.resolve orelse return try nested_ctx.allocator.dupe(u8, "null");
+    const lc: *universal.LiveContext = @ptrCast(@alignCast(rp));
+    if (!lc.primary_verify_enabled) return try nested_ctx.allocator.dupe(u8, "null");
+
+    // The claimed primary name (same reverse path as primaryName); no claim -> null.
+    const namehash = (blk: {
+        if (try database.getReverseRecordNamehash(.v2, addr.*)) |nh| break :blk nh;
+        if (try database.getReverseRecordNamehash(.v1, addr.*)) |nh| break :blk nh;
+        break :blk null;
+    }) orelse return try nested_ctx.allocator.dupe(u8, "null");
+    const name = (try database.getLatestNameByNamehash(namehash)) orelse return try nested_ctx.allocator.dupe(u8, "null");
+    defer database.allocator.free(name);
+
+    const verdict = lc.verifyPrimary(nested_ctx.allocator, addr.*, name) catch
+        return try nested_ctx.allocator.dupe(u8, "null");
+    return try nested_ctx.allocator.dupe(u8, switch (verdict) {
+        .verified => "\"VERIFIED\"",
+        .mismatch => "\"MISMATCH\"",
+        .unverified => "\"UNVERIFIED\"",
+    });
 }
 
 /// Account nested field handler: wrappedDomains (V1 NameWrapper records owned by this address).
@@ -682,13 +724,13 @@ fn accountWrappedDomainsHandler(ctx: *anyopaque, field: *const parser.Field, nes
     // Reuse getAllNames (filters reachable, by owner) then keep only wrapped ones.
     const domains = try database.getAllNames(addr.*, page.skip, page.first);
     defer {
-        for (domains) |*d| d.deinit(nested_ctx.allocator);
-        nested_ctx.allocator.free(domains);
+        for (domains) |*d| d.deinit(database.allocator);
+        database.allocator.free(domains);
     }
 
-    var json: std.ArrayList(u8) = .{};
-    errdefer json.deinit(nested_ctx.allocator);
-    var arr = try jw.arrayOn(json.writer(nested_ctx.allocator));
+    var json: std.Io.Writer.Allocating = .init(nested_ctx.allocator);
+    errdefer json.deinit();
+    var arr = try jw.arrayOn(&json.writer);
     for (domains) |*d| {
         if (!d.is_wrapped) continue;
         const wd_ctx = NestedContext{
@@ -696,6 +738,7 @@ fn accountWrappedDomainsHandler(ctx: *anyopaque, field: *const parser.Field, nes
             .depth = nested_ctx.depth + 1,
             .allocator = nested_ctx.allocator,
             .loaders = nested_ctx.loaders,
+            .resolve = null, // list rows: indexed-only; live resolution is single-name (never per-row)
         };
         const wd_json = try buildWrappedDomainJson(d, field.selections, wd_ctx);
         defer nested_ctx.allocator.free(wd_json);
@@ -703,7 +746,7 @@ fn accountWrappedDomainsHandler(ctx: *anyopaque, field: *const parser.Field, nes
     }
     try arr.end();
 
-    return try json.toOwnedSlice(nested_ctx.allocator);
+    return try json.toOwnedSlice();
 }
 
 /// Account entity configuration
@@ -714,6 +757,7 @@ const AccountEntityConfig = json_builder.EntityConfig{
         .{ .name = "domains", .handler = accountDomainsHandler },
         .{ .name = "registrations", .handler = accountRegistrationsHandler },
         .{ .name = "primaryName", .handler = accountPrimaryNameHandler },
+        .{ .name = "primaryNameVerification", .handler = accountPrimaryNameVerificationHandler },
         .{ .name = "wrappedDomains", .handler = accountWrappedDomainsHandler },
         // Account-row-backed scalars. Each handler issues an indexed point
         // lookup on the `accounts` table; the per-field lookups are cheap
@@ -802,6 +846,7 @@ pub fn buildAccountJson(
             .depth = ctx.depth,
             .allocator = ctx.allocator,
             .loaders = ctx.loaders,
+            .resolve = ctx.resolve,
         },
     );
 }
@@ -811,6 +856,33 @@ pub fn buildAccountJson(
 // ============================================================================
 
 /// Resolver nested field handler: addr
+/// Live ENSIP-10 Universal Resolver fallback for a resolver record read on an indexed
+/// MISS. Returns the value as an escaped JSON string, or null so the caller emits "null".
+/// No-op (null) unless a LiveContext (nested_ctx.resolve) AND the node name (rctx.name)
+/// are present — i.e. unless RESOLVE_LIVE_ENABLED wired resolution for this request. A
+/// resolution failure degrades to null (the indexed miss); it never throws for that.
+fn liveRecordFallback(rctx: *const fields.ResolverBuildContext, nested_ctx: json_builder.NestedContext, record: universal.Record) !?[]u8 {
+    const rp = nested_ctx.resolve orelse return null;
+    const name = rctx.name orelse return null;
+    // AUTHORITATIVE-MISS GATE. When this record's resolver is fully indexed (its record
+    // events are ingested into the resolver_* tables), an indexed miss IS the on-chain
+    // state — a live read can only refetch the same emptiness, and a list query fans
+    // that out into one wasted UR round-trip per record (observed: 97 calls, 93 of them
+    // reverts, for a single domains(first:100){resolver{text(key:)}} page). The live
+    // fallback exists for what the index CANNOT see: resolvers whose events were never
+    // ingested and offchain/CCIP answers. Tradeoff: a known resolver that computes
+    // eventless wildcard answers on-chain is not live-resolved; that class is invisible
+    // to event indexing by nature and deliberately out of scope for the fallback.
+    const gate_db: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+    if (try gate_db.isKnownResolver(rctx.protocol, rctx.resolver)) return null;
+    const lc: *universal.LiveContext = @ptrCast(@alignCast(rp));
+    const value = (lc.resolveRecord(nested_ctx.allocator, name, rctx.namehash, record) catch return null) orelse return null;
+    defer nested_ctx.allocator.free(value);
+    const escaped = try json_utils.escapeString(nested_ctx.allocator, value);
+    defer nested_ctx.allocator.free(escaped);
+    return try std.fmt.allocPrint(nested_ctx.allocator, "\"{s}\"", .{escaped});
+}
+
 fn resolverAddrHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
     const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
@@ -830,16 +902,35 @@ fn resolverAddrHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: 
     // Only return records set by the CURRENTLY AUTHORITATIVE resolver.
     // A migrated V1 name may have legacy addr records from its old V1 resolver in the
     // resolver_addresses table; those must not shadow the (possibly empty) V2 resolver state.
-    addr_opt = try database.getAddressRecord(rctx.resolver, rctx.namehash, coin_type);
-    owns_addr = true;
-    _ = loaders; // DataLoader path disabled for correctness; per-resolver filter precludes namehash-only batching.
-    defer if (owns_addr) if (addr_opt) |a| nested_ctx.allocator.free(a);
+    // Batch fast-path: a list page prefetches coin-60 addr records keyed by the SAME
+    // (resolver, namehash) pair queried here, so read the batched value instead of a
+    // per-row point query. A key miss (an unbatched pair, e.g. a nested domain) or a
+    // non-60 coin type falls through to the point query — correctness never depends
+    // on the batch having run (the composite key makes a stale/mismatched key a miss).
+    var batched_hit = false;
+    if (coin_type == 60) {
+        if (nested_ctx.loaders) |lp| {
+            const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+            if (lc.lookupAddr60(rctx.resolver, rctx.namehash)) |batched| {
+                addr_opt = batched; // loader-owned; not freed here
+                owns_addr = false;
+                batched_hit = true;
+            }
+        }
+    }
+    if (!batched_hit) {
+        addr_opt = try database.getAddressRecord(rctx.resolver, rctx.namehash, coin_type);
+        owns_addr = true;
+    }
+    defer if (owns_addr) if (addr_opt) |a| database.allocator.free(a);
 
     if (addr_opt) |addr| {
         const escaped = try json_utils.escapeString(nested_ctx.allocator, addr);
         defer nested_ctx.allocator.free(escaped);
         return try std.fmt.allocPrint(nested_ctx.allocator, "\"{s}\"", .{escaped});
     }
+    const record: universal.Record = if (coin_type == 60) .addr else .{ .addr_coin = coin_type };
+    if (try liveRecordFallback(rctx, nested_ctx, record)) |live| return live;
     return try nested_ctx.allocator.dupe(u8, "null");
 }
 
@@ -851,9 +942,9 @@ fn resolverAddressesHandler(ctx: *anyopaque, field: *const parser.Field, nested_
     const all_addresses = try database.getAddressRecords(rctx.resolver, rctx.namehash);
     defer {
         for (all_addresses) |*addr| {
-            addr.deinit(nested_ctx.allocator);
+            addr.deinit(database.allocator);
         }
-        nested_ctx.allocator.free(all_addresses);
+        database.allocator.free(all_addresses);
     }
 
     var want_coin_type = false;
@@ -870,9 +961,9 @@ fn resolverAddressesHandler(ctx: *anyopaque, field: *const parser.Field, nested_
         want_address = true;
     }
 
-    var json: std.ArrayList(u8) = .{};
-    errdefer json.deinit(nested_ctx.allocator);
-    var arr = try jw.arrayOn(json.writer(nested_ctx.allocator));
+    var json: std.Io.Writer.Allocating = .init(nested_ctx.allocator);
+    errdefer json.deinit();
+    var arr = try jw.arrayOn(&json.writer);
     for (all_addresses) |coin_addr| {
         var obj = try arr.beginObject();
         // `coinType: Int!` lossy-clamps to i64::max for ENSIP-11 L2 entries beyond i64
@@ -889,7 +980,7 @@ fn resolverAddressesHandler(ctx: *anyopaque, field: *const parser.Field, nested_
     }
     try arr.end();
 
-    return try json.toOwnedSlice(nested_ctx.allocator);
+    return try json.toOwnedSlice();
 }
 
 /// Resolver nested field handler: coinTypes — parallel projection of the
@@ -902,18 +993,18 @@ fn resolverCoinTypesHandler(ctx: *anyopaque, field: *const parser.Field, nested_
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
     const coin_types = try database.getCoinTypes(rctx.resolver, rctx.namehash);
-    defer nested_ctx.allocator.free(coin_types);
+    defer database.allocator.free(coin_types);
 
-    var json: std.ArrayList(u8) = .{};
-    errdefer json.deinit(nested_ctx.allocator);
-    var arr = try jw.arrayOn(json.writer(nested_ctx.allocator));
+    var json: std.Io.Writer.Allocating = .init(nested_ctx.allocator);
+    errdefer json.deinit();
+    var arr = try jw.arrayOn(&json.writer);
     for (coin_types) |ct| {
         const ct_str = try std.fmt.allocPrint(nested_ctx.allocator, "{d}", .{ct});
         defer nested_ctx.allocator.free(ct_str);
         try arr.itemStr(ct_str, nested_ctx.allocator);
     }
     try arr.end();
-    return try json.toOwnedSlice(nested_ctx.allocator);
+    return try json.toOwnedSlice();
 }
 
 /// Resolver nested field handler: domain — canonical Domain back-reference.
@@ -928,12 +1019,13 @@ fn resolverDomainHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx
     const name_opt = try database.getDomainByResolver(rctx.resolver);
     if (name_opt) |name| {
         var name_mut = name;
-        defer name_mut.deinit(nested_ctx.allocator);
+        defer name_mut.deinit(database.allocator);
         return try buildDomainJson(&name_mut, field.selections, .{
             .database = database,
             .depth = nested_ctx.depth + 1,
             .allocator = nested_ctx.allocator,
             .loaders = nested_ctx.loaders,
+            .resolve = nested_ctx.resolve,
         });
     }
     return try nested_ctx.allocator.dupe(u8, "null");
@@ -945,16 +1037,33 @@ fn resolverContentHashHandler(ctx: *anyopaque, field: *const parser.Field, neste
     const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
-    // DataLoader path disabled — it batches by namehash only, which would leak
-    // legacy-resolver records for migrated names. Per-resolver filter precludes namehash-only batching.
-    const hash_opt = try database.getContentHashRecord(rctx.resolver, rctx.namehash);
-    defer if (hash_opt) |h| nested_ctx.allocator.free(h);
+    // Batch fast-path (see resolverAddrHandler): use the page-prefetched contenthash
+    // when present, else point-query. Composite (resolver, namehash) key = the same
+    // one the point query uses, so a miss is a safe fallback and never leaks
+    // legacy-resolver records for migrated names.
+    var hash_batched = false;
+    var owns_hash = false;
+    var hash_opt: ?[]const u8 = null;
+    if (nested_ctx.loaders) |lp| {
+        const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+        if (lc.lookupContentHash(rctx.resolver, rctx.namehash)) |batched| {
+            hash_opt = batched; // loader-owned
+            owns_hash = false;
+            hash_batched = true;
+        }
+    }
+    if (!hash_batched) {
+        hash_opt = try database.getContentHashRecord(rctx.resolver, rctx.namehash);
+        owns_hash = true;
+    }
+    defer if (owns_hash) if (hash_opt) |h| database.allocator.free(h);
 
     if (hash_opt) |hash| {
         const escaped = try json_utils.escapeString(nested_ctx.allocator, hash);
         defer nested_ctx.allocator.free(escaped);
         return try std.fmt.allocPrint(nested_ctx.allocator, "\"{s}\"", .{escaped});
     }
+    if (try liveRecordFallback(rctx, nested_ctx, .contenthash)) |live| return live;
     return try nested_ctx.allocator.dupe(u8, "null");
 }
 
@@ -969,17 +1078,17 @@ fn resolverTextsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx:
     // DataLoader path disabled — namehash-only batching would leak legacy-resolver records for migrated names.
     const text_keys = try database.getTextRecordKeys(rctx.resolver, rctx.namehash);
     defer {
-        for (text_keys) |key| nested_ctx.allocator.free(key);
-        nested_ctx.allocator.free(text_keys);
+        for (text_keys) |key| database.allocator.free(key);
+        database.allocator.free(text_keys);
     }
 
-    var json: std.ArrayList(u8) = .{};
-    errdefer json.deinit(nested_ctx.allocator);
-    var arr = try jw.arrayOn(json.writer(nested_ctx.allocator));
+    var json: std.Io.Writer.Allocating = .init(nested_ctx.allocator);
+    errdefer json.deinit();
+    var arr = try jw.arrayOn(&json.writer);
     for (text_keys) |key| try arr.itemStr(key, nested_ctx.allocator);
     try arr.end();
 
-    return try json.toOwnedSlice(nested_ctx.allocator);
+    return try json.toOwnedSlice();
 }
 
 /// Resolver nested field handler: text
@@ -995,15 +1104,32 @@ fn resolverTextHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: 
     }
 
     if (key_arg) |key| {
-        // DataLoader path disabled — namehash-only batching would leak legacy-resolver records for migrated names.
-        const text_value = try database.getTextRecord(rctx.resolver, rctx.namehash, key);
-        defer if (text_value) |val| nested_ctx.allocator.free(val);
+        // Batch fast-path: a list page prefetches text(key:) records keyed by the
+        // SAME (resolver, namehash, key) triple; use the batched value, else
+        // point-query (a miss — unbatched pair or over-long key — is safe).
+        var text_value: ?[]const u8 = null;
+        var owns_text = false;
+        var text_batched = false;
+        if (nested_ctx.loaders) |lp| {
+            const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+            if (lc.lookupText(rctx.resolver, rctx.namehash, key)) |batched| {
+                text_value = batched; // loader-owned
+                owns_text = false;
+                text_batched = true;
+            }
+        }
+        if (!text_batched) {
+            text_value = try database.getTextRecord(rctx.resolver, rctx.namehash, key);
+            owns_text = true;
+        }
+        defer if (owns_text) if (text_value) |val| database.allocator.free(val);
 
         if (text_value) |val| {
             const escaped = try json_utils.escapeString(nested_ctx.allocator, val);
             defer nested_ctx.allocator.free(escaped);
             return try std.fmt.allocPrint(nested_ctx.allocator, "\"{s}\"", .{escaped});
         }
+        if (try liveRecordFallback(rctx, nested_ctx, .{ .text = key })) |live| return live;
     }
     return try nested_ctx.allocator.dupe(u8, "null");
 }
@@ -1016,7 +1142,7 @@ fn resolverPubkeyHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx
 
     var pubkey_opt = try database.getPubkeyRecord(rctx.resolver, rctx.namehash);
     if (pubkey_opt) |*pubkey| {
-        defer pubkey.deinit(nested_ctx.allocator);
+        defer pubkey.deinit(database.allocator);
         const escaped_x = try json_utils.escapeString(nested_ctx.allocator, pubkey.x);
         defer nested_ctx.allocator.free(escaped_x);
         const escaped_y = try json_utils.escapeString(nested_ctx.allocator, pubkey.y);
@@ -1034,15 +1160,15 @@ fn resolverAbisHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: 
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
     const content_types = try database.getAbiContentTypes(rctx.resolver, rctx.namehash);
-    defer nested_ctx.allocator.free(content_types);
+    defer database.allocator.free(content_types);
 
-    var json_buf: std.ArrayList(u8) = .{};
-    errdefer json_buf.deinit(nested_ctx.allocator);
-    var arr = try jw.arrayOn(json_buf.writer(nested_ctx.allocator));
+    var json_buf: std.Io.Writer.Allocating = .init(nested_ctx.allocator);
+    errdefer json_buf.deinit();
+    var arr = try jw.arrayOn(&json_buf.writer);
     for (content_types) |ct| try arr.itemInt(ct);
     try arr.end();
 
-    return try nested_ctx.allocator.dupe(u8, json_buf.items);
+    return try nested_ctx.allocator.dupe(u8, json_buf.written());
 }
 
 /// Resolver nested field handler: reverseName
@@ -1052,7 +1178,7 @@ fn resolverReverseNameHandler(ctx: *anyopaque, field: *const parser.Field, neste
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
     if (try database.getReverseNameRecord(rctx.resolver, rctx.namehash)) |name_val| {
-        defer nested_ctx.allocator.free(name_val);
+        defer database.allocator.free(name_val);
         const escaped = try json_utils.escapeString(nested_ctx.allocator, name_val);
         defer nested_ctx.allocator.free(escaped);
         return try std.fmt.allocPrint(nested_ctx.allocator, "\"{s}\"", .{escaped});
@@ -1067,8 +1193,8 @@ fn resolverInterfacesHandler(ctx: *anyopaque, field: *const parser.Field, nested
 
     const ifaces = try database.getInterfaceRecords(rctx.resolver, rctx.namehash);
     defer {
-        for (ifaces) |*iface| iface.deinit(nested_ctx.allocator);
-        nested_ctx.allocator.free(ifaces);
+        for (ifaces) |*iface| iface.deinit(database.allocator);
+        database.allocator.free(ifaces);
     }
 
     var want_interface_id = false;
@@ -1082,9 +1208,9 @@ fn resolverInterfacesHandler(ctx: *anyopaque, field: *const parser.Field, nested
         want_implementer = true;
     }
 
-    var json_buf: std.ArrayList(u8) = .{};
-    errdefer json_buf.deinit(nested_ctx.allocator);
-    var arr = try jw.arrayOn(json_buf.writer(nested_ctx.allocator));
+    var json_buf: std.Io.Writer.Allocating = .init(nested_ctx.allocator);
+    errdefer json_buf.deinit();
+    var arr = try jw.arrayOn(&json_buf.writer);
     for (ifaces) |iface| {
         var obj = try arr.beginObject();
         if (want_interface_id) try obj.fieldStr("interfaceId", iface.interface_id, nested_ctx.allocator);
@@ -1093,7 +1219,7 @@ fn resolverInterfacesHandler(ctx: *anyopaque, field: *const parser.Field, nested
     }
     try arr.end();
 
-    return try nested_ctx.allocator.dupe(u8, json_buf.items);
+    return try nested_ctx.allocator.dupe(u8, json_buf.written());
 }
 
 /// Resolver nested field handler: aliases
@@ -1103,8 +1229,8 @@ fn resolverAliasesHandler(ctx: *anyopaque, field: *const parser.Field, nested_ct
 
     const alias_records = try database.getResolverAliases(rctx.resolver);
     defer {
-        for (alias_records) |*r| r.deinit(nested_ctx.allocator);
-        nested_ctx.allocator.free(alias_records);
+        for (alias_records) |*r| r.deinit(database.allocator);
+        database.allocator.free(alias_records);
     }
 
     var want_from = false;
@@ -1118,9 +1244,9 @@ fn resolverAliasesHandler(ctx: *anyopaque, field: *const parser.Field, nested_ct
         want_to = true;
     }
 
-    var json_buf: std.ArrayList(u8) = .{};
-    errdefer json_buf.deinit(nested_ctx.allocator);
-    var arr = try jw.arrayOn(json_buf.writer(nested_ctx.allocator));
+    var json_buf: std.Io.Writer.Allocating = .init(nested_ctx.allocator);
+    errdefer json_buf.deinit();
+    var arr = try jw.arrayOn(&json_buf.writer);
     for (alias_records) |record| {
         var obj = try arr.beginObject();
         if (want_from) try obj.fieldStr("fromName", record.from_name, nested_ctx.allocator);
@@ -1129,7 +1255,7 @@ fn resolverAliasesHandler(ctx: *anyopaque, field: *const parser.Field, nested_ct
     }
     try arr.end();
 
-    return try nested_ctx.allocator.dupe(u8, json_buf.items);
+    return try nested_ctx.allocator.dupe(u8, json_buf.written());
 }
 
 /// Resolver nested field handler: version
@@ -1170,6 +1296,7 @@ pub fn buildResolverJson(
     resolver: Address,
     domain_namehash: Hash,
     protocol: models.Protocol,
+    name: ?[]const u8,
     selections: []const parser.Field,
     ctx: NestedContext,
 ) anyerror![]u8 {
@@ -1185,6 +1312,7 @@ pub fn buildResolverJson(
         .namehash = domain_namehash,
         .protocol = protocol,
         .chain_id = database.chain_id,
+        .name = name,
     };
 
     return json_builder.buildEntityJson(
@@ -1197,6 +1325,7 @@ pub fn buildResolverJson(
             .depth = ctx.depth,
             .allocator = ctx.allocator,
             .loaders = ctx.loaders,
+            .resolve = ctx.resolve,
         },
     );
 }
@@ -1214,6 +1343,7 @@ fn domainOwnerHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: j
         .depth = nested_ctx.depth + 1,
         .allocator = nested_ctx.allocator,
         .loaders = nested_ctx.loaders,
+        .resolve = nested_ctx.resolve,
     });
 }
 
@@ -1226,6 +1356,7 @@ fn domainRegistrantHandler(ctx: *anyopaque, field: *const parser.Field, nested_c
         .depth = nested_ctx.depth + 1,
         .allocator = nested_ctx.allocator,
         .loaders = nested_ctx.loaders,
+        .resolve = nested_ctx.resolve,
     });
 }
 
@@ -1249,6 +1380,7 @@ fn domainResolvedAddressHandler(ctx: *anyopaque, field: *const parser.Field, nes
                 .depth = nested_ctx.depth + 1,
                 .allocator = nested_ctx.allocator,
                 .loaders = nested_ctx.loaders,
+                .resolve = nested_ctx.resolve,
             });
         }
     }
@@ -1259,14 +1391,28 @@ fn domainResolvedAddressHandler(ctx: *anyopaque, field: *const parser.Field, nes
     // resolver only surfaces an address actually set for this node.
     var effective_resolver = domain.resolver;
     if (effective_resolver.isZero()) {
-        effective_resolver = (try findInheritedResolver(database, nested_ctx.allocator, domain)) orelse domain.resolver;
+        effective_resolver = (try findInheritedResolver(database, domain)) orelse domain.resolver;
     }
     if (effective_resolver.isZero()) {
         return try nested_ctx.allocator.dupe(u8, "null");
     }
 
-    const resolved_addr_opt = try database.getAddressRecord(effective_resolver, domain.namehash, 60);
-    defer if (resolved_addr_opt) |a| nested_ctx.allocator.free(a);
+    var resolved_batched = false;
+    var owns_resolved = false;
+    var resolved_addr_opt: ?[]const u8 = null;
+    if (nested_ctx.loaders) |lp| {
+        const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+        if (lc.lookupAddr60(effective_resolver, domain.namehash)) |batched| {
+            resolved_addr_opt = batched; // loader-owned
+            owns_resolved = false;
+            resolved_batched = true;
+        }
+    }
+    if (!resolved_batched) {
+        resolved_addr_opt = try database.getAddressRecord(effective_resolver, domain.namehash, 60);
+        owns_resolved = true;
+    }
+    defer if (owns_resolved) if (resolved_addr_opt) |a| database.allocator.free(a);
 
     if (resolved_addr_opt) |addr_str| {
         if (Address.fromHex(addr_str)) |addr| {
@@ -1275,6 +1421,7 @@ fn domainResolvedAddressHandler(ctx: *anyopaque, field: *const parser.Field, nes
                 .depth = nested_ctx.depth + 1,
                 .allocator = nested_ctx.allocator,
                 .loaders = nested_ctx.loaders,
+                .resolve = nested_ctx.resolve,
             });
         } else |_| {
             return try nested_ctx.allocator.dupe(u8, "null");
@@ -1293,19 +1440,28 @@ const MAX_RESOLVER_WALKUP: u8 = 64;
 /// return the first ancestor's non-zero resolver, or null if none exists.
 /// Records are always read under the ORIGINAL name's namehash, so an inherited
 /// resolver only ever surfaces records actually emitted for that node.
-fn findInheritedResolver(database: *db.Database, allocator: std.mem.Allocator, domain: *const models.Name) anyerror!?Address {
+fn findInheritedResolver(database: *db.Database, domain: *const models.Name) anyerror!?Address {
     var parent = domain.parent_namehash;
     var hops: u8 = 0;
     while (!parent.isZero() and hops < MAX_RESOLVER_WALKUP) : (hops += 1) {
         const anc_opt = try database.getNameByNamehashAndProtocol(parent, domain.protocol);
         if (anc_opt) |anc| {
             var anc_mut = anc;
-            defer anc_mut.deinit(allocator);
+            defer anc_mut.deinit(database.allocator);
             if (!anc_mut.resolver.isZero()) return anc_mut.resolver;
             parent = anc_mut.parent_namehash;
         } else return null;
     }
     return null;
+}
+
+/// The resolver a domain's records are read under: its own resolver, or the
+/// nearest ancestor's (ENSIP-10 inheritance) when it has none. Public so the list
+/// resolvers can compute the batch key that matches domainResolverHandler /
+/// domainResolvedAddressHandler exactly.
+pub fn effectiveResolver(database: *db.Database, domain: *const models.Name) anyerror!Address {
+    if (!domain.resolver.isZero()) return domain.resolver;
+    return (try findInheritedResolver(database, domain)) orelse domain.resolver;
 }
 
 /// Domain nested field handler: resolver
@@ -1316,14 +1472,15 @@ fn domainResolverHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx
     if (effective_resolver.isZero()) {
         // ENSIP-10 resolver inheritance: a subname resolved via an inherited
         // (ancestor) resolver should surface that resolver and its records.
-        effective_resolver = (try findInheritedResolver(database, nested_ctx.allocator, domain)) orelse domain.resolver;
+        effective_resolver = (try findInheritedResolver(database, domain)) orelse domain.resolver;
     }
     if (!effective_resolver.isZero()) {
-        return try buildResolverJson(effective_resolver, domain.namehash, domain.protocol, field.selections, .{
+        return try buildResolverJson(effective_resolver, domain.namehash, domain.protocol, domain.name, field.selections, .{
             .database = database,
             .depth = nested_ctx.depth + 1,
             .allocator = nested_ctx.allocator,
             .loaders = nested_ctx.loaders,
+            .resolve = nested_ctx.resolve,
         });
     }
     return try nested_ctx.allocator.dupe(u8, "null");
@@ -1337,12 +1494,13 @@ fn domainParentHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: 
         const parent_opt = try database.getNameByNamehash(domain.parent_namehash);
         if (parent_opt) |parent| {
             var parent_mut = parent;
-            defer parent_mut.deinit(nested_ctx.allocator);
+            defer parent_mut.deinit(database.allocator);
             return try buildDomainJson(&parent_mut, field.selections, .{
                 .database = database,
                 .depth = nested_ctx.depth + 1,
                 .allocator = nested_ctx.allocator,
                 .loaders = nested_ctx.loaders,
+                .resolve = nested_ctx.resolve,
             });
         }
     }
@@ -1363,11 +1521,12 @@ fn domainSubregistryHandler(ctx: *anyopaque, field: *const parser.Field, nested_
     const reg_opt = try database.getRegistry(domain.protocol, sub);
     if (reg_opt) |reg_val| {
         var reg = reg_val;
-        defer reg.deinit(nested_ctx.allocator);
+        defer reg.deinit(database.allocator);
         return try admin.buildRegistryInfoJson(nested_ctx.allocator, database, &reg, field.selections, .{
             .allocator = nested_ctx.allocator,
             .database = nested_ctx.database,
             .loaders = nested_ctx.loaders,
+            .resolve = nested_ctx.resolve,
         });
     }
     return try nested_ctx.allocator.dupe(u8, "null");
@@ -1380,15 +1539,15 @@ fn domainSubdomainsHandler(ctx: *anyopaque, field: *const parser.Field, nested_c
 
     const page = try api_common.parsePagination(field, 10);
 
-    var json: std.ArrayList(u8) = .{};
-    errdefer json.deinit(nested_ctx.allocator);
-    var arr = try jw.arrayOn(json.writer(nested_ctx.allocator));
+    var json: std.Io.Writer.Allocating = .init(nested_ctx.allocator);
+    errdefer json.deinit();
+    var arr = try jw.arrayOn(&json.writer);
 
     if (domain.name) |parent_name| {
         const subdomains = try database.getSubdomains(parent_name, page.skip, page.first);
         defer {
-            for (subdomains) |*n| n.deinit(nested_ctx.allocator);
-            nested_ctx.allocator.free(subdomains);
+            for (subdomains) |*n| n.deinit(database.allocator);
+            database.allocator.free(subdomains);
         }
 
         for (subdomains) |*subdomain| {
@@ -1397,6 +1556,7 @@ fn domainSubdomainsHandler(ctx: *anyopaque, field: *const parser.Field, nested_c
                 .depth = nested_ctx.depth + 1,
                 .allocator = nested_ctx.allocator,
                 .loaders = nested_ctx.loaders,
+                .resolve = null, // list rows: indexed-only; live resolution is single-name (never per-row)
             });
             defer nested_ctx.allocator.free(subdomain_json);
             try arr.itemRaw(subdomain_json);
@@ -1404,7 +1564,7 @@ fn domainSubdomainsHandler(ctx: *anyopaque, field: *const parser.Field, nested_c
     }
 
     try arr.end();
-    return try json.toOwnedSlice(nested_ctx.allocator);
+    return try json.toOwnedSlice();
 }
 
 /// Domain nested field handler: events
@@ -1422,7 +1582,7 @@ fn domainEventsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: 
         .limit = first_arg,
     };
 
-    var event_types_list: std.ArrayList([]const u8) = .{};
+    var event_types_list: std.ArrayList([]const u8) = .empty;
     defer event_types_list.deinit(nested_ctx.allocator);
 
     var normalized_contract_address: ?[]u8 = null;
@@ -1455,26 +1615,27 @@ fn domainEventsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: 
 
     const domain_events = try database.getEventsFiltered(filter_opts);
     defer {
-        for (domain_events) |*e| e.deinit(nested_ctx.allocator);
-        nested_ctx.allocator.free(domain_events);
+        for (domain_events) |*e| e.deinit(database.allocator);
+        database.allocator.free(domain_events);
     }
 
-    var json: std.ArrayList(u8) = .{};
-    errdefer json.deinit(nested_ctx.allocator);
-    var arr = try jw.arrayOn(json.writer(nested_ctx.allocator));
+    var json: std.Io.Writer.Allocating = .init(nested_ctx.allocator);
+    errdefer json.deinit();
+    var arr = try jw.arrayOn(&json.writer);
     for (domain_events) |*event| {
         const event_json = try buildEventJson(event, field.selections, .{
             .database = database,
             .depth = nested_ctx.depth + 1,
             .allocator = nested_ctx.allocator,
             .loaders = nested_ctx.loaders,
+            .resolve = nested_ctx.resolve,
         });
         defer nested_ctx.allocator.free(event_json);
         try arr.itemRaw(event_json);
     }
     try arr.end();
 
-    return try json.toOwnedSlice(nested_ctx.allocator);
+    return try json.toOwnedSlice();
 }
 
 /// Domain nested field handler: domain (recursive)
@@ -1486,6 +1647,7 @@ fn domainDomainHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: 
         .depth = nested_ctx.depth + 1,
         .allocator = nested_ctx.allocator,
         .loaders = nested_ctx.loaders,
+        .resolve = nested_ctx.resolve,
     });
 }
 
@@ -1506,7 +1668,7 @@ pub fn buildWrappedDomainJson(
     const allocator = nested_ctx.allocator;
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.append(allocator, '{');
     var first = true;
@@ -1515,7 +1677,7 @@ pub fn buildWrappedDomainJson(
     if (selections.len == 0) {
         const nh_hex = try domain.namehash.toHex(allocator);
         defer allocator.free(nh_hex);
-        try out.writer(allocator).print("\"id\":\"{s}\"", .{nh_hex});
+        try out.print(allocator, "\"id\":\"{s}\"", .{nh_hex});
         try out.append(allocator, '}');
         return try out.toOwnedSlice(allocator);
     }
@@ -1527,32 +1689,33 @@ pub fn buildWrappedDomainJson(
         if (std.mem.eql(u8, sel.name, "id")) {
             const nh_hex = try domain.namehash.toHex(allocator);
             defer allocator.free(nh_hex);
-            try out.writer(allocator).print("\"{s}\":\"{s}\"", .{ key, nh_hex });
+            try out.print(allocator, "\"{s}\":\"{s}\"", .{ key, nh_hex });
         } else if (std.mem.eql(u8, sel.name, "domain")) {
             const dj = try buildDomainJson(@constCast(domain), sel.selections, .{
                 .database = database,
                 .depth = nested_ctx.depth + 1,
                 .allocator = allocator,
                 .loaders = nested_ctx.loaders,
+                .resolve = nested_ctx.resolve,
             });
             defer allocator.free(dj);
-            try out.writer(allocator).print("\"{s}\":", .{key});
+            try out.print(allocator, "\"{s}\":", .{key});
             try out.appendSlice(allocator, dj);
         } else if (std.mem.eql(u8, sel.name, "expiryDate")) {
             if (domain.wrapper_expiry) |ts| {
-                try out.writer(allocator).print("\"{s}\":{d}", .{ key, ts });
+                try out.print(allocator, "\"{s}\":{d}", .{ key, ts });
             } else {
-                try out.writer(allocator).print("\"{s}\":null", .{key});
+                try out.print(allocator, "\"{s}\":null", .{key});
             }
         } else if (std.mem.eql(u8, sel.name, "fuses")) {
             if (domain.wrapper_fuses) |fs| {
                 if (std.fmt.parseInt(u64, fs, 10)) |parsed| {
-                    try out.writer(allocator).print("\"{s}\":{d}", .{ key, parsed });
+                    try out.print(allocator, "\"{s}\":{d}", .{ key, parsed });
                 } else |_| {
-                    try out.writer(allocator).print("\"{s}\":null", .{key});
+                    try out.print(allocator, "\"{s}\":null", .{key});
                 }
             } else {
-                try out.writer(allocator).print("\"{s}\":null", .{key});
+                try out.print(allocator, "\"{s}\":null", .{key});
             }
         } else if (std.mem.eql(u8, sel.name, "owner")) {
             const aj = try buildAccountJson(domain.owner, sel.selections, .{
@@ -1560,21 +1723,22 @@ pub fn buildWrappedDomainJson(
                 .depth = nested_ctx.depth + 1,
                 .allocator = allocator,
                 .loaders = nested_ctx.loaders,
+                .resolve = nested_ctx.resolve,
             });
             defer allocator.free(aj);
-            try out.writer(allocator).print("\"{s}\":", .{key});
+            try out.print(allocator, "\"{s}\":", .{key});
             try out.appendSlice(allocator, aj);
         } else if (std.mem.eql(u8, sel.name, "name")) {
             if (domain.name) |n| {
                 const escaped = try json_utils.escapeString(allocator, n);
                 defer allocator.free(escaped);
-                try out.writer(allocator).print("\"{s}\":\"{s}\"", .{ key, escaped });
+                try out.print(allocator, "\"{s}\":\"{s}\"", .{ key, escaped });
             } else {
-                try out.writer(allocator).print("\"{s}\":null", .{key});
+                try out.print(allocator, "\"{s}\":null", .{key});
             }
         } else {
             // Unknown field — emit null for forward-compat.
-            try out.writer(allocator).print("\"{s}\":null", .{key});
+            try out.print(allocator, "\"{s}\":null", .{key});
         }
         first = false;
     }
@@ -1593,6 +1757,7 @@ fn domainWrappedDomainHandler(ctx: *anyopaque, field: *const parser.Field, neste
         .depth = nested_ctx.depth + 1,
         .allocator = nested_ctx.allocator,
         .loaders = nested_ctx.loaders,
+        .resolve = nested_ctx.resolve,
     };
     return try buildWrappedDomainJson(domain, field.selections, inner);
 }
@@ -1611,6 +1776,7 @@ fn domainWrappedOwnerHandler(ctx: *anyopaque, field: *const parser.Field, nested
         .depth = nested_ctx.depth + 1,
         .allocator = nested_ctx.allocator,
         .loaders = nested_ctx.loaders,
+        .resolve = nested_ctx.resolve,
     });
 }
 
@@ -1701,8 +1867,8 @@ fn domainSubdomainConnectionHandler(ctx: *anyopaque, field: *const parser.Field,
 
     const limit: u32 = @min((try api_common.parsePagination(field, 10)).first, 100);
 
-    var json: std.ArrayList(u8) = .{};
-    errdefer json.deinit(allocator);
+    var json: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json.deinit();
 
     if (domain.name) |parent_name| {
         var wants_total_count = false;
@@ -1716,8 +1882,8 @@ fn domainSubdomainConnectionHandler(ctx: *anyopaque, field: *const parser.Field,
         // Fetch one extra to determine hasNextPage
         const subdomains = try database.getSubdomains(parent_name, 0, limit + 1);
         defer {
-            for (subdomains) |*n| n.deinit(allocator);
-            allocator.free(subdomains);
+            for (subdomains) |*n| n.deinit(database.allocator);
+            database.allocator.free(subdomains);
         }
 
         const has_next = subdomains.len > limit;
@@ -1736,7 +1902,7 @@ fn domainSubdomainConnectionHandler(ctx: *anyopaque, field: *const parser.Field,
             }
         }
 
-        var root = try jw.objectOn(json.writer(allocator));
+        var root = try jw.objectOn(&json.writer);
         if (wants_total_count) {
             const total_count = try database.countDirectSubdomains(parent_name);
             try root.fieldInt("totalCount", total_count);
@@ -1759,6 +1925,7 @@ fn domainSubdomainConnectionHandler(ctx: *anyopaque, field: *const parser.Field,
                     .depth = nested_ctx.depth + 1,
                     .allocator = allocator,
                     .loaders = nested_ctx.loaders,
+                    .resolve = null, // list rows: indexed-only; live resolution is single-name (never per-row)
                 });
                 defer allocator.free(subdomain_json);
                 try edge.fieldRaw("node", subdomain_json);
@@ -1768,7 +1935,7 @@ fn domainSubdomainConnectionHandler(ctx: *anyopaque, field: *const parser.Field,
         }
         try root.end();
     } else {
-        var root = try jw.objectOn(json.writer(allocator));
+        var root = try jw.objectOn(&json.writer);
         {
             var pi = try root.beginObject("pageInfo");
             try pi.fieldBool("hasNextPage", false);
@@ -1780,7 +1947,7 @@ fn domainSubdomainConnectionHandler(ctx: *anyopaque, field: *const parser.Field,
         try root.end();
     }
 
-    return try json.toOwnedSlice(allocator);
+    return try json.toOwnedSlice();
 }
 
 /// Domain nested field handler: eventsConnection (Relay-style connection)
@@ -1811,8 +1978,8 @@ fn domainEventsConnectionHandler(ctx: *anyopaque, field: *const parser.Field, ne
 
     const events = try database.getEventsFiltered(filter_opts);
     defer {
-        for (events) |*e| e.deinit(allocator);
-        allocator.free(events);
+        for (events) |*e| e.deinit(database.allocator);
+        database.allocator.free(events);
     }
 
     const has_next = events.len > limit;
@@ -1832,10 +1999,10 @@ fn domainEventsConnectionHandler(ctx: *anyopaque, field: *const parser.Field, ne
         }
     }
 
-    var json: std.ArrayList(u8) = .{};
-    errdefer json.deinit(allocator);
+    var json: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json.deinit();
 
-    var root = try jw.objectOn(json.writer(allocator));
+    var root = try jw.objectOn(&json.writer);
     if (wants_total_count) {
         const total_count = try database.countEventsByNamehash(domain.namehash);
         try root.fieldInt("totalCount", total_count);
@@ -1860,6 +2027,7 @@ fn domainEventsConnectionHandler(ctx: *anyopaque, field: *const parser.Field, ne
                 .depth = nested_ctx.depth + 1,
                 .allocator = allocator,
                 .loaders = nested_ctx.loaders,
+                .resolve = nested_ctx.resolve,
             });
             defer allocator.free(event_json);
             try edge.fieldRaw("node", event_json);
@@ -1869,7 +2037,7 @@ fn domainEventsConnectionHandler(ctx: *anyopaque, field: *const parser.Field, ne
     }
     try root.end();
 
-    return try json.toOwnedSlice(allocator);
+    return try json.toOwnedSlice();
 }
 
 /// Domain entity configuration
@@ -1923,6 +2091,7 @@ pub fn buildDomainJson(
             .depth = ctx.depth,
             .allocator = ctx.allocator,
             .loaders = ctx.loaders,
+            .resolve = ctx.resolve,
         },
     );
 }
@@ -2004,7 +2173,7 @@ test "ENSIP-10 inheritance surfaces records from an ancestor resolver" {
     try database.storeResolverText(nh_child, parent_resolver, "ledgit.hcs.topic", "0.0.9219676", .v2, 2, nh_child, 0);
 
     // Unit: the walk-up resolves the child's effective resolver to the parent's.
-    const inherited = (try findInheritedResolver(&database, allocator, &child)) orelse return error.NoInheritedResolver;
+    const inherited = (try findInheritedResolver(&database, &child)) orelse return error.NoInheritedResolver;
     try testing.expect(inherited.eql(parent_resolver));
 
     // End-to-end: domain.resolver + texts must surface via the inherited resolver.
@@ -2051,7 +2220,7 @@ test "ENSIP-10 inheritance yields null when no ancestor has a resolver" {
     try database.insertName(orphan);
 
     // No ancestor row carries a resolver -> walk-up yields null (no false positives).
-    try testing.expect((try findInheritedResolver(&database, allocator, &orphan)) == null);
+    try testing.expect((try findInheritedResolver(&database, &orphan)) == null);
 
     const query =
         \\query { domain(id: "orphan.eth") { resolver { address } } }

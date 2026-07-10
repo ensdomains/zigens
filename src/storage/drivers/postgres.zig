@@ -5,12 +5,16 @@
 //! coercing getters that dispatch on the column OID so a `getInt64`/`getInt`/`getText`
 //! works regardless of the exact PG width (int2/int4/int8/text).
 //!
-//! Ownership rules (verified against pg.zig, see memory pgzig-api-verified):
+//! Ownership rules (verified against pg.zig master a4e1264):
 //!  - `stmt.execute()` transfers the Stmt's arena to the returned `*Result`; after a
 //!    successful execute we free the Result, never the Stmt.
 //!  - a Result must be drained (rows read to null, or `drain()`) before the connection
 //!    is reused, else the next op fails with UnexpectedDBMessage.
+//!  - `pg.Pool.init(io, ...)` dupes all connection strings into its own arena, and its
+//!    sockets + reconnector run on the passed `Io` — the Backend owns a private
+//!    `std.Io.Threaded` that must outlive `pool.deinit()`.
 const std = @import("std");
+const zsys = @import("../../utils/system.zig");
 const pg = @import("pg");
 const backend = @import("../backend.zig");
 const pg_dialect_mod = @import("postgres_dialect.zig");
@@ -83,23 +87,19 @@ pub const ConnectOpts = struct {
 
 const PgConn = struct {
     allocator: std.mem.Allocator,
+    // The pool's sockets, timeouts and reconnector thread all run on this Io; it must
+    // stay alive until pool.deinit() returns, so close() deinits it AFTER the pool.
+    threaded: *std.Io.Threaded,
     pool: *pg.Pool,
     conn: *pg.Conn, // single writer connection, pinned for this Backend's lifetime
     stmt_cache: bool, // reuse server-side prepared statements (DATABASE_STMT_CACHE)
-    // Owned copies of the connection params. pg.Pool only copies the opts STRUCT, not the
-    // strings (it dupes host only when TLS is on), so it borrows these for its lifetime —
-    // we own them here and free them in close() after the pool is torn down. This makes
-    // the Backend self-contained (independent of the caller's ConnectOpts/URL lifetime).
-    host: []u8,
-    username: []u8,
-    password: ?[]u8,
-    database: []u8,
 };
 
 /// Parse `postgres://[user[:password]@]host[:port]/database[?...]` into ConnectOpts.
-/// The returned string fields BORROW from `url` (open() dupes them into the Backend),
-/// so `url` need only outlive this call, not the Backend. Percent-encoding is not
-/// decoded and IPv6 host literals are unsupported — neither appears in our setups.
+/// The returned string fields BORROW from `url` (pg.Pool.init dupes everything it
+/// keeps into its own arena), so `url` need only outlive the open() call, not the
+/// Backend. Percent-encoding is not decoded and IPv6 host literals are unsupported —
+/// neither appears in our setups.
 pub fn parseUrl(url: []const u8) !ConnectOpts {
     var rest = url;
     if (std.mem.startsWith(u8, rest, "postgresql://")) {
@@ -161,7 +161,7 @@ const max_connect_attempts: u32 = 5;
 // instead of hanging forever. Seconds; default 120, 0 disables. Read here (not via
 // Config) to keep it a self-contained driver concern with no config/test churn.
 fn statementTimeoutSecs(allocator: std.mem.Allocator) u32 {
-    const v = std.process.getEnvVarOwned(allocator, "DATABASE_STATEMENT_TIMEOUT") catch return 120;
+    const v = zsys.getEnvOwned(allocator, "DATABASE_STATEMENT_TIMEOUT") catch return 120;
     defer allocator.free(v);
     return std.fmt.parseInt(u32, std.mem.trim(u8, v, " \t\r\n"), 10) catch 120;
 }
@@ -173,7 +173,7 @@ fn statementTimeoutSecs(allocator: std.mem.Allocator) u32 {
 const MAX_CACHED_STMTS: usize = 1024;
 
 fn stmtCacheEnabled(allocator: std.mem.Allocator) bool {
-    const v = std.process.getEnvVarOwned(allocator, "DATABASE_STMT_CACHE") catch return true;
+    const v = zsys.getEnvOwned(allocator, "DATABASE_STMT_CACHE") catch return true;
     defer allocator.free(v);
     const t = std.mem.trim(u8, v, " \t\r\n");
     return !(std.ascii.eqlIgnoreCase(t, "0") or std.ascii.eqlIgnoreCase(t, "false") or std.ascii.eqlIgnoreCase(t, "off"));
@@ -185,7 +185,7 @@ fn stmtCacheEnabled(allocator: std.mem.Allocator) bool {
 // chain on restart, so a lost just-committed batch is simply re-indexed. Returns a static
 // (canonical) slice so it needs no ownership; null = don't touch the setting.
 fn synchronousCommitSetting(allocator: std.mem.Allocator) ?[]const u8 {
-    const v = std.process.getEnvVarOwned(allocator, "DATABASE_SYNCHRONOUS_COMMIT") catch return null;
+    const v = zsys.getEnvOwned(allocator, "DATABASE_SYNCHRONOUS_COMMIT") catch return null;
     defer allocator.free(v);
     const t = std.mem.trim(u8, v, " \t\r\n");
     if (t.len == 0) return null;
@@ -198,15 +198,11 @@ fn synchronousCommitSetting(allocator: std.mem.Allocator) ?[]const u8 {
 }
 
 pub fn open(allocator: std.mem.Allocator, opts: ConnectOpts) !backend.Backend {
-    // Own the connection params (pg.Pool borrows them) — freed in close() after teardown.
-    const host = try allocator.dupe(u8, opts.host);
-    errdefer allocator.free(host);
-    const username = try allocator.dupe(u8, opts.username);
-    errdefer allocator.free(username);
-    const password: ?[]u8 = if (opts.password) |p| try allocator.dupe(u8, p) else null;
-    errdefer if (password) |p| allocator.free(p);
-    const database = try allocator.dupe(u8, opts.database);
-    errdefer allocator.free(database);
+    const threaded = try allocator.create(std.Io.Threaded);
+    errdefer allocator.destroy(threaded);
+    threaded.* = std.Io.Threaded.init(allocator, .{});
+    errdefer threaded.deinit();
+    const io = threaded.io();
 
     // Map our backend-neutral TlsMode onto pg.zig's TLS union. `.verify_full = null`
     // verifies the server cert against the system CA bundle (ca-certificates). TLS
@@ -222,10 +218,10 @@ pub fn open(allocator: std.mem.Allocator, opts: ConnectOpts) !backend.Backend {
     // the pool init with exponential backoff (0.5s,1s,2s,4s → ~7.5s) before failing.
     var attempt: u32 = 1;
     const pool = while (true) : (attempt += 1) {
-        const p = pg.Pool.init(allocator, .{
+        const p = pg.Pool.init(io, allocator, .{
             .size = opts.pool_size,
-            .connect = .{ .host = host, .port = opts.port, .tls = pg_tls },
-            .auth = .{ .username = username, .password = password, .database = database },
+            .connect = .{ .host = opts.host, .port = opts.port, .tls = pg_tls },
+            .auth = .{ .username = opts.username, .password = opts.password, .database = opts.database },
         }) catch |err| {
             if (attempt >= max_connect_attempts) {
                 std.log.err("postgres: connect failed after {d} attempts: {}", .{ attempt, err });
@@ -233,7 +229,7 @@ pub fn open(allocator: std.mem.Allocator, opts: ConnectOpts) !backend.Backend {
             }
             const backoff_ms: u64 = @as(u64, 500) * (@as(u64, 1) << @intCast(attempt - 1));
             std.log.warn("postgres: connect attempt {d}/{d} failed ({}); retrying in {d}ms", .{ attempt, max_connect_attempts, err, backoff_ms });
-            std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
+            zsys.sleep(backoff_ms * std.time.ns_per_ms);
             continue;
         };
         break p;
@@ -267,13 +263,10 @@ pub fn open(allocator: std.mem.Allocator, opts: ConnectOpts) !backend.Backend {
     const self = try allocator.create(PgConn);
     self.* = .{
         .allocator = allocator,
+        .threaded = threaded,
         .pool = pool,
         .conn = conn,
         .stmt_cache = stmtCacheEnabled(allocator),
-        .host = host,
-        .username = username,
-        .password = password,
-        .database = database,
     };
 
     return backend.Backend{ .ptr = self, .vtable = &vtable, .dialect = &pg_dialect_mod.pg_dialect, .caps = capabilities };
@@ -290,11 +283,9 @@ pub const capabilities = backend.Capabilities{
 fn close(ctx: *anyopaque) void {
     const self = asConn(ctx);
     self.pool.release(self.conn);
-    self.pool.deinit(); // tears down all connections — params no longer referenced after this
-    self.allocator.free(self.host);
-    self.allocator.free(self.username);
-    if (self.password) |p| self.allocator.free(p);
-    self.allocator.free(self.database);
+    self.pool.deinit(); // joins the reconnector + closes sockets — still needs the Io alive
+    self.threaded.deinit();
+    self.allocator.destroy(self.threaded);
     self.allocator.destroy(self);
 }
 
@@ -363,7 +354,7 @@ fn introspectColumns(ctx: *anyopaque, allocator: std.mem.Allocator, table: []con
     var result = try self.conn.query(sql, .{table});
     defer result.deinit();
 
-    var list: std.ArrayList(ColumnInfo) = .{};
+    var list: std.ArrayList(ColumnInfo) = .empty;
     errdefer {
         for (list.items) |col| {
             allocator.free(col.name);
@@ -636,7 +627,7 @@ fn doExecute(self: *PgStmt) !void {
     // "iterate query A while issuing query B per row" pattern (pervasive in the storage
     // layer, e.g. backfillFromExistingData) work on a single-connection PG backend.
     defer result.deinit();
-    var list: std.ArrayList(MatRow) = .{};
+    var list: std.ArrayList(MatRow) = .empty;
     errdefer {
         for (list.items) |row| {
             for (row) |v| switch (v) {

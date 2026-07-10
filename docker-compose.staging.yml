@@ -104,7 +104,7 @@ services:
       - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
       - WEBHOOK_ADMIN_USERNAME=${WEBHOOK_ADMIN_USERNAME:-}
       - WEBHOOK_ADMIN_PASSWORD=${WEBHOOK_ADMIN_PASSWORD:-}
-      - METRICS_ENABLED=false
+      - METRICS_ENABLED=${METRICS_ENABLED:-false}
     depends_on:
       - indexer-v2
     healthcheck:

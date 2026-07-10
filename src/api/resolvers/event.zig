@@ -22,7 +22,7 @@ fn parseEventWhereArgs(where_args: []const parser.Argument, allocator: std.mem.A
     for (where_args) |a| {
         if ((std.mem.eql(u8, a.name, "and") or std.mem.eql(u8, a.name, "or")) and a.value == .list) {
             const is_and = std.mem.eql(u8, a.name, "and");
-            var group: std.ArrayList(db.EventFilterOptions) = .{};
+            var group: std.ArrayList(db.EventFilterOptions) = .empty;
             errdefer group.deinit(allocator);
             for (a.value.list) |item| {
                 if (item == .object) try group.append(allocator, try parseEventWhereArgs(item.object, allocator));
@@ -36,7 +36,7 @@ fn parseEventWhereArgs(where_args: []const parser.Argument, allocator: std.mem.A
             continue;
         }
         if (std.mem.eql(u8, a.name, "type_in") and a.value == .list) {
-            var list: std.ArrayList([]const u8) = .{};
+            var list: std.ArrayList([]const u8) = .empty;
             errdefer list.deinit(allocator);
             for (a.value.list) |item| {
                 if (item == .string) try list.append(allocator, item.string);
@@ -45,7 +45,7 @@ fn parseEventWhereArgs(where_args: []const parser.Argument, allocator: std.mem.A
             continue;
         }
         if (std.mem.eql(u8, a.name, "type_not_in") and a.value == .list) {
-            var list: std.ArrayList([]const u8) = .{};
+            var list: std.ArrayList([]const u8) = .empty;
             errdefer list.deinit(allocator);
             for (a.value.list) |item| {
                 if (item == .string) try list.append(allocator, item.string);
@@ -174,9 +174,9 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
     const events = try database.getEventsFiltered(fetch_filter);
     defer {
         for (events) |*event| {
-            event.deinit(allocator);
+            event.deinit(database.allocator);
         }
-        allocator.free(events);
+        database.allocator.free(events);
     }
 
     // We fetched `params.limit + 1` to detect a trailing page; if we actually got
@@ -227,6 +227,7 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
                 .depth = 0,
                 .allocator = allocator,
                 .loaders = ctx.loaders,
+                .resolve = null, // list context: live resolution is single-name only, never per-row
             },
             .id = id,
         };
@@ -251,7 +252,7 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
     defer connection.deinit(allocator);
 
     // Build JSON from connection
-    var json: std.ArrayList(u8) = .{};
+    var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);
 
     try json.appendSlice(allocator, "{\"pageInfo\":{");
@@ -408,13 +409,13 @@ fn resolveEventsWithForced(ctx: parser.ExecutionContext, field: *const parser.Fi
     const events = try database.getEventsFiltered(filter_opts);
     defer {
         for (events) |*event| {
-            event.deinit(allocator);
+            event.deinit(database.allocator);
         }
-        allocator.free(events);
+        database.allocator.free(events);
     }
 
     // Build JSON array
-    var json: std.ArrayList(u8) = .{};
+    var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);
 
     try json.appendSlice(allocator, "[");
@@ -427,6 +428,7 @@ fn resolveEventsWithForced(ctx: parser.ExecutionContext, field: *const parser.Fi
             .depth = 0,
             .allocator = allocator,
             .loaders = ctx.loaders,
+            .resolve = null, // list context: live resolution is single-name only, never per-row
         });
         defer allocator.free(event_json);
         try json.appendSlice(allocator, event_json);

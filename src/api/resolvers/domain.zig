@@ -140,7 +140,7 @@ fn parseWhereArgs(where_args: []const parser.Argument, allocator: std.mem.Alloca
         // Boolean composition: `and` / `or` are lists of nested DomainFilters (subgraph parity).
         if ((std.mem.eql(u8, a.name, "and") or std.mem.eql(u8, a.name, "or")) and a.value == .list) {
             const is_and = std.mem.eql(u8, a.name, "and");
-            var group: std.ArrayList(ParsedDomainFilter) = .{};
+            var group: std.ArrayList(ParsedDomainFilter) = .empty;
             errdefer {
                 for (group.items) |*c| c.deinit(allocator);
                 group.deinit(allocator);
@@ -298,6 +298,80 @@ fn mapFilterGroup(group: ?[]const ParsedDomainFilter, allocator: std.mem.Allocat
     return arr;
 }
 
+const ResolverRecordWants = struct { addr: bool, contenthash: bool };
+
+/// Which batchable resolver records a `domains` selection reads: `resolvedAddress`
+/// or `resolver{ addr }` -> addr; `resolver{ contentHash }` -> contenthash. Used to
+/// skip the page prefetch entirely when the query doesn't select them.
+fn wantsResolverRecords(selections: []const parser.Field) ResolverRecordWants {
+    var want = ResolverRecordWants{ .addr = false, .contenthash = false };
+    for (selections) |*sel| {
+        if (std.mem.eql(u8, sel.name, "resolvedAddress")) {
+            want.addr = true;
+        } else if (std.mem.eql(u8, sel.name, "resolver")) {
+            for (sel.selections) |*sub| {
+                if (std.mem.eql(u8, sub.name, "addr")) want.addr = true;
+                if (std.mem.eql(u8, sub.name, "contentHash")) want.contenthash = true;
+            }
+        }
+    }
+    return want;
+}
+
+/// Collect the distinct `text(key:"...")` keys selected under `resolver { ... }`,
+/// so they can be batch-prefetched. Deduped (aliases of the same key batch once).
+fn collectTextKeys(selections: []const parser.Field, list: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !void {
+    for (selections) |*sel| {
+        if (!std.mem.eql(u8, sel.name, "resolver")) continue;
+        for (sel.selections) |*sub| {
+            if (!std.mem.eql(u8, sub.name, "text")) continue;
+            for (sub.arguments) |arg| {
+                if (!std.mem.eql(u8, arg.name, "key") or arg.value != .string) continue;
+                const k = arg.value.string;
+                var seen = false;
+                for (list.items) |ex| {
+                    if (std.mem.eql(u8, ex, k)) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) try list.append(allocator, k);
+            }
+        }
+    }
+}
+
+/// Prefetch the page's resolver records into the request loader so the per-row
+/// resolver handlers read them from memory (one batch query per record type / text
+/// key instead of one point query per row). Best-effort: any failure leaves the
+/// handlers to fall back to point queries.
+fn prefetchResolverRecords(database: *db.Database, allocator: std.mem.Allocator, loaders_ptr: ?*anyopaque, page: []models.Name, selections: []const parser.Field) void {
+    const want = wantsResolverRecords(selections);
+    var text_keys: std.ArrayList([]const u8) = .empty;
+    defer text_keys.deinit(allocator);
+    collectTextKeys(selections, &text_keys, allocator) catch {};
+    if (!want.addr and !want.contenthash and text_keys.items.len == 0) return;
+    const lp = loaders_ptr orelse return;
+    const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+
+    const resolvers_buf = allocator.alloc(Address, page.len) catch return;
+    defer allocator.free(resolvers_buf);
+    const namehashes_buf = allocator.alloc(Hash, page.len) catch return;
+    defer allocator.free(namehashes_buf);
+    for (page, 0..) |*n, i| {
+        // Compute the SAME effective resolver the record handlers will query with,
+        // so the batch keys match; the composite key makes any divergence a safe miss.
+        resolvers_buf[i] = builders.effectiveResolver(database, n) catch n.resolver;
+        namehashes_buf[i] = n.namehash;
+    }
+    if (want.addr or want.contenthash) {
+        lc.populateResolverRecords(database, resolvers_buf, namehashes_buf, want.addr, want.contenthash);
+    }
+    if (text_keys.items.len > 0) {
+        lc.populateTextRecords(database, resolvers_buf, namehashes_buf, text_keys.items);
+    }
+}
+
 pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
     const allocator = ctx.allocator;
@@ -395,7 +469,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
             // even on direct namehash lookup. Audit clients pass
             // `includeUnreachable: true` to override.
             if (!include_unreachable and !name.is_reachable) {
-                defer name.deinit(allocator);
+                defer name.deinit(database.allocator);
                 return .{ .json = try allocator.dupe(u8, "[]") };
             }
             // Normalization filter — mirror getFilteredNames so this fast-path matches
@@ -408,16 +482,17 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
             else
                 (include_unnormalized or name.is_normalized);
             if (!norm_ok) {
-                defer name.deinit(allocator);
+                defer name.deinit(database.allocator);
                 return .{ .json = try allocator.dupe(u8, "[]") };
             }
-            defer name.deinit(allocator);
+            defer name.deinit(database.allocator);
 
             const name_json = try builders.buildDomainJson(name, field.selections, .{
                 .database = database,
                 .depth = 0,
                 .allocator = allocator,
                 .loaders = ctx.loaders,
+                .resolve = null, // list context: live resolution is single-name only (resolveDomain), never per-row
             });
             defer allocator.free(name_json);
 
@@ -513,17 +588,20 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
         try database.getAllNamesWithOrder(null, @intCast(skip), fetch_limit, order_dir, sort_field);
     defer {
         for (names) |*name| {
-            name.deinit(allocator);
+            name.deinit(database.allocator);
         }
-        allocator.free(names);
+        database.allocator.free(names);
     }
 
-    // Build JSON from DB-sorted names
-    var json: std.ArrayList(u8) = .{};
-    defer json.deinit(allocator);
+    // Build JSON from DB-sorted names. Pre-size to avoid realloc churn across a
+    // full page (each node is a few hundred bytes).
+    var json: std.ArrayList(u8) = .empty;
+    errdefer json.deinit(allocator);
 
-    try json.appendSlice(allocator, "[");
     const items_to_return = @min(first, names.len);
+    prefetchResolverRecords(database, allocator, ctx.loaders, names[0..@as(usize, @intCast(items_to_return))], field.selections);
+    try json.ensureTotalCapacity(allocator, @as(usize, @intCast(items_to_return)) * 512 + 2);
+    try json.appendSlice(allocator, "[");
 
     for (names[0..@as(usize, @intCast(items_to_return))], 0..) |*name, i| {
         if (i > 0) try json.appendSlice(allocator, ",");
@@ -533,14 +611,27 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
             .depth = 0,
             .allocator = allocator,
             .loaders = ctx.loaders,
+            .resolve = null, // list context: live resolution is single-name only (resolveDomain), never per-row
         });
         defer allocator.free(name_json);
         try json.appendSlice(allocator, name_json);
     }
     try json.appendSlice(allocator, "]");
 
-    const result_json = try allocator.dupe(u8, json.items);
-    return parser.FieldResult{ .json = result_json };
+    return parser.FieldResult{ .json = try json.toOwnedSlice(allocator) };
+}
+
+/// Stable one-char discriminator for the sort field, embedded in keyset cursors so a
+/// cursor minted under one orderBy is rejected (treated as start) if the client changes
+/// orderBy mid-pagination.
+fn sortFieldChar(f: db.NameSortField) u8 {
+    return switch (f) {
+        .created_at => 'c',
+        .name => 'n',
+        .expiry => 'e',
+        .expiry_effective => 'x',
+        .registered_at => 'r',
+    };
 }
 
 /// Resolver for domainConnection query (cursor-based pagination)
@@ -681,6 +772,7 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         filter_migrated != null or include_unreachable or
         include_unnormalized or parsed.is_normalized != null or
         parsed.and_filters != null or parsed.or_filters != null;
+    _ = has_filters; // keyset path always uses getFilteredNamesKeyset (handles empty filters)
 
     // Check which top-level fields are requested
     var wants_edges = false;
@@ -719,170 +811,120 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
     // Default order: desc (newest first) when no orderDirection specified
     const base_dir = common.parseOrderDirection(field, db.OrderDir, .desc);
 
-    // Fetch one extra item to determine hasNextPage/hasPreviousPage
+    // Keyset (seek) pagination: fetch limit+1 to detect a trailing page. Replaces
+    // the former OFFSET + per-page countRowsBeforeNamehash full-table scan with an
+    // index range scan anchored on the last row's (sort_value, namehash).
     const fetch_limit = params.limit + 1;
 
-    // Combine pagination direction with user-requested order
+    // Combine pagination direction with user-requested order (backward inverts).
     const order_dir: db.OrderDir = if (params.direction == .backward)
         (if (base_dir == .desc) .asc else .desc)
     else
         base_dir;
 
-    // Convert the cursor (encoded namehash) into a SKIP offset for the SQL query.
-    // The cursor points to the last item the client already saw; we skip everything up
-    // to and including it. This uses countRowsBeforeNamehash which does a (sort_field, namehash)
-    // stable comparison to get the count of rows that sort BEFORE the cursor row, then +1 to
-    // skip the cursor row itself.
-    //
-    // The same filters must be passed in — otherwise the offset is taken over the unfiltered
-    // superset and pagination skips too many rows (e.g. with isMigrated:true ~343 rows would
-    // be lost across pages because non-migrated rows still counted toward the offset).
-    var skip: u32 = 0;
+    // Decode the cursor into a keyset anchor. A mismatched sort field (client changed
+    // orderBy) or an old non-keyset cursor is treated as "start from the beginning".
+    var anchor: ?db.KeysetAnchor = null;
+    var anchor_decoded: ?pagination.CursorCodec.Keyset = null;
+    defer if (anchor_decoded) |d| d.deinit(allocator);
     if (params.cursor) |c| {
-        const cursor_namehash = try pagination.CursorCodec.decodeString(allocator, c);
-        defer allocator.free(cursor_namehash);
-        const rows_before = database.countRowsBeforeNamehash(cursor_namehash, sort_field, order_dir, name_filters) catch 0;
-        skip = rows_before +| 1; // +1 to skip past the cursor row itself
+        if (pagination.CursorCodec.decodeKeyset(allocator, c)) |ks| {
+            if (ks.field == sortFieldChar(sort_field)) {
+                anchor_decoded = ks;
+                anchor = .{ .sort_value = ks.sort_value, .namehash = ks.namehash };
+            } else {
+                ks.deinit(allocator);
+            }
+        } else |_| {}
     }
 
-    const names = if (has_filters)
-        try database.getFilteredNames(name_filters, skip, @intCast(fetch_limit), order_dir, sort_field)
-    else
-        try database.getAllNamesWithOrder(null, skip, @intCast(fetch_limit), order_dir, sort_field);
-    defer {
-        for (names) |*name| {
-            name.deinit(allocator);
-        }
-        allocator.free(names);
-    }
+    var result = try database.getFilteredNamesKeyset(name_filters, anchor, @intCast(fetch_limit), order_dir, sort_field);
+    defer result.deinit(database.allocator);
+    const names = result.names;
+    const sort_values = result.sort_values;
 
-    // We fetched `params.limit + 1` to detect a trailing page; if we actually got
-    // more than `limit`, there's more data in the pagination direction.
     const has_more = names.len > params.limit;
     const actual_items = @min(names.len, params.limit);
 
-    // For backward pagination, reverse the results to maintain proper edge order
+    // Backward pagination: reverse rows AND their parallel sort values together to
+    // restore the user-facing (base) order.
     if (params.direction == .backward and actual_items > 1) {
         std.mem.reverse(models.Name, names[0..actual_items]);
+        std.mem.reverse([]u8, sort_values[0..actual_items]);
     }
 
-    const items_slice = names[0..actual_items];
+    // Batch-prefetch resolver records for this page (same N+1 fix as resolveDomains).
+    prefetchResolverRecords(database, allocator, ctx.loaders, names[0..actual_items], node_selections);
 
-    // Build connection using pagination module
-    const NameWithSelections = struct {
-        name: *models.Name,
-        selections: []const parser.Field,
-        ctx: NestedContext,
-        hex_id: []const u8,
-    };
-
-    // Helper to get hex ID
-    const getId = struct {
-        fn call(item: NameWithSelections) []const u8 {
-            return item.hex_id;
+    // Per-edge cursors: base64 keyset of (sort_field discriminator, row sort value, namehash).
+    // totalCount is a snapshot taken once (page 1) and carried forward in the cursor,
+    // so deep pagination doesn't re-run a COUNT(*) per page. Reuse the incoming
+    // cursor's snapshot when present; otherwise compute once. Only when selected.
+    const total_count: ?usize = if (wants_total_count) blk: {
+        if (anchor_decoded) |d| {
+            if (d.total_count) |tc| break :blk tc;
         }
-    }.call;
+        break :blk try database.getFilteredNameCount(name_filters);
+    } else null;
 
-    // Create wrapper items with hex IDs
-    var wrapper_items = try allocator.alloc(NameWithSelections, items_slice.len);
+    const edge_cursors = try allocator.alloc([]const u8, actual_items);
     defer {
-        for (wrapper_items) |item| {
-            allocator.free(item.hex_id);
-        }
-        allocator.free(wrapper_items);
+        for (edge_cursors) |ec| allocator.free(ec);
+        allocator.free(edge_cursors);
+    }
+    for (0..actual_items) |i| {
+        const nh_hex = try names[i].namehash.toHex(allocator);
+        defer allocator.free(nh_hex);
+        edge_cursors[i] = try pagination.CursorCodec.encodeKeyset(allocator, sortFieldChar(sort_field), total_count, sort_values[i], nh_hex);
     }
 
-    for (items_slice, 0..) |*name, i| {
-        const hex_id = try name.namehash.toHex(allocator);
-        wrapper_items[i] = NameWithSelections{
-            .name = name,
-            .selections = node_selections,
-            .ctx = .{
-                .database = database,
-                .depth = 0,
-                .allocator = allocator,
-                .loaders = ctx.loaders,
-            },
-            .hex_id = hex_id,
-        };
-    }
+    const has_next = if (params.direction == .forward) has_more else (params.cursor != null);
+    const has_prev = if (params.direction == .backward) has_more else (params.cursor != null);
 
-    // Compute total count if requested (wants_total_count determined above)
-    const total_count: ?usize = if (wants_total_count)
-        try database.getFilteredNameCount(name_filters)
-    else
-        null;
-
-    // Build connection
-    const connection = try pagination.buildConnectionString(
-        NameWithSelections,
-        allocator,
-        wrapper_items,
-        params,
-        has_more,
-        getId,
-        total_count,
-    );
-    defer connection.deinit(allocator);
-
-    // Build JSON from connection
-    var json: std.ArrayList(u8) = .{};
+    var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);
 
-    try json.appendSlice(allocator, "{\"pageInfo\":{");
-    try json.appendSlice(allocator, "\"hasNextPage\":");
-    try json.appendSlice(allocator, if (connection.page_info.has_next_page) "true" else "false");
+    try json.appendSlice(allocator, "{\"pageInfo\":{\"hasNextPage\":");
+    try json.appendSlice(allocator, if (has_next) "true" else "false");
     try json.appendSlice(allocator, ",\"hasPreviousPage\":");
-    try json.appendSlice(allocator, if (connection.page_info.has_previous_page) "true" else "false");
-
-    if (connection.page_info.start_cursor) |cursor| {
+    try json.appendSlice(allocator, if (has_prev) "true" else "false");
+    if (actual_items > 0) {
         try json.appendSlice(allocator, ",\"startCursor\":\"");
-        try json.appendSlice(allocator, cursor);
+        try json.appendSlice(allocator, edge_cursors[0]);
+        try json.appendSlice(allocator, "\",\"endCursor\":\"");
+        try json.appendSlice(allocator, edge_cursors[actual_items - 1]);
         try json.appendSlice(allocator, "\"");
     } else {
-        try json.appendSlice(allocator, ",\"startCursor\":null");
+        try json.appendSlice(allocator, ",\"startCursor\":null,\"endCursor\":null");
     }
-
-    if (connection.page_info.end_cursor) |cursor| {
-        try json.appendSlice(allocator, ",\"endCursor\":\"");
-        try json.appendSlice(allocator, cursor);
-        try json.appendSlice(allocator, "\"");
-    } else {
-        try json.appendSlice(allocator, ",\"endCursor\":null");
-    }
-
     try json.appendSlice(allocator, "},\"edges\":[");
 
-    // Build edges
-    for (connection.edges, 0..) |edge, i| {
+    for (0..actual_items) |i| {
         if (i > 0) try json.appendSlice(allocator, ",");
-
         try json.appendSlice(allocator, "{\"cursor\":\"");
-        try json.appendSlice(allocator, edge.cursor);
+        try json.appendSlice(allocator, edge_cursors[i]);
         try json.appendSlice(allocator, "\",\"node\":");
-
-        // Build domain JSON for the node
-        const domain_json = try builders.buildDomainJson(edge.node.name, edge.node.selections, edge.node.ctx);
+        const domain_json = try builders.buildDomainJson(&names[i], node_selections, .{
+            .database = database,
+            .depth = 0,
+            .allocator = allocator,
+            .loaders = ctx.loaders,
+            .resolve = null, // list context: live resolution is single-name only (resolveDomain), never per-row
+        });
         defer allocator.free(domain_json);
         try json.appendSlice(allocator, domain_json);
-
         try json.appendSlice(allocator, "}");
     }
-
     try json.appendSlice(allocator, "]");
 
-    // Add totalCount if available
-    if (connection.total_count) |count| {
-        try json.appendSlice(allocator, ",\"totalCount\":");
-        const count_str = try std.fmt.allocPrint(allocator, "{d}", .{count});
+    if (total_count) |count| {
+        const count_str = try std.fmt.allocPrint(allocator, ",\"totalCount\":{d}", .{count});
         defer allocator.free(count_str);
         try json.appendSlice(allocator, count_str);
     }
-
     try json.appendSlice(allocator, "}");
 
-    const result_json = try allocator.dupe(u8, json.items);
-    return parser.FieldResult{ .json = result_json };
+    return parser.FieldResult{ .json = try json.toOwnedSlice(allocator) };
 }
 
 pub fn resolveDomain(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
@@ -903,7 +945,7 @@ pub fn resolveDomain(ctx: parser.ExecutionContext, field: *const parser.Field) !
         return parser.FieldResult{ .json = null_json };
     }
     var name = name_opt.?;
-    defer name.deinit(allocator);
+    defer name.deinit(database.allocator);
 
     // Hide unreachable domains from default lookup. There's currently no
     // `includeUnreachable` arg on the singular `domain(id:)` query; clients
@@ -919,6 +961,7 @@ pub fn resolveDomain(ctx: parser.ExecutionContext, field: *const parser.Field) !
         .depth = 0,
         .allocator = allocator,
         .loaders = ctx.loaders,
+        .resolve = ctx.resolve,
     });
     return parser.FieldResult{ .json = name_json };
 }

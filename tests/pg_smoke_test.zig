@@ -1,8 +1,7 @@
-//! Phase 4 dependency-integration gate: the pg.zig PostgreSQL driver (zig-0.15
-//! branch) compiles and its public API is importable under our Zig 0.15.2
-//! toolchain, with TLS off (PlainStream — no openssl/libc). The real backend
-//! driver (src/storage/drivers/postgres.zig) lands next; this only proves the
-//! `pg` dependency resolves, builds, and exposes the surface the driver needs.
+//! Phase 4 dependency-integration gate: the pg.zig PostgreSQL driver (master,
+//! Zig 0.16) compiles and its public API is importable under our toolchain, with
+//! TLS off. This only proves the `pg` dependency resolves, builds, and exposes
+//! the surface the driver (src/storage/drivers/postgres.zig) needs.
 const std = @import("std");
 const pg = @import("pg");
 
@@ -21,7 +20,7 @@ test "pg.zig public API is importable" {
 // if no Postgres is reachable (start: `sudo pg_ctlcluster 17 main start`).
 test "pg.zig connects to the live Postgres and round-trips a typed query" {
     const allocator = std.testing.allocator;
-    var pool = pg.Pool.init(allocator, .{
+    var pool = pg.Pool.init(std.testing.io, allocator, .{
         .size = 1,
         .connect = .{ .host = "127.0.0.1", .port = 5432 },
         .auth = .{ .username = "postgres", .password = "postgres", .database = "ensv2_test" },
@@ -48,7 +47,7 @@ test "pg.zig connects to the live Postgres and round-trips a typed query" {
 // → Row.get) + lifetimes — exactly what drivers/postgres.zig will adapt onto.
 test "pg.zig low-level prepare/bind/execute/iterate round-trip" {
     const allocator = std.testing.allocator;
-    var pool = pg.Pool.init(allocator, .{
+    var pool = pg.Pool.init(std.testing.io, allocator, .{
         .size = 1,
         .connect = .{ .host = "127.0.0.1", .port = 5432 },
         .auth = .{ .username = "postgres", .password = "postgres", .database = "ensv2_test" },

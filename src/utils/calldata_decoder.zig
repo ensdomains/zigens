@@ -204,8 +204,7 @@ test "decode setSubnodeRecord calldata" {
         0,    0,    0,    0,
         0,    0,    0,    0,
         0,    0,    0,    0,
-        0,    0,    0,
-        0,
+        0,    0,    0,    0,
         // label: "test" (0x74657374) padded with zeros
         0x74, 0x65, 0x73, 0x74, // "test"
         0,    0,    0,    0,
@@ -238,8 +237,7 @@ test "decode setSubnodeOwner calldata" {
         0,    0,    0,    0,
         0,    0,    0,    0,
         0,    0,    0,    0,
-        0,    0,    0,
-        0,
+        0,    0,    0,    0,
         // label: "mail" (0x6d61696c) padded
         0x6d, 0x61, 0x69, 0x6c, // "mail"
         0,    0,    0,    0,

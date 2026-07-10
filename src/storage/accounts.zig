@@ -147,16 +147,16 @@ pub fn getFilteredAccounts(
     order_dir: db_module.OrderDir,
     sort_field: AccountSortField,
 ) ![]Account {
-    var conditions: std.ArrayList([]const u8) = .{};
+    var conditions: std.ArrayList([]const u8) = .empty;
     defer conditions.deinit(db.allocator);
-    var allocated: std.ArrayList([]const u8) = .{};
+    var allocated: std.ArrayList([]const u8) = .empty;
     defer {
         for (allocated.items) |s| db.allocator.free(s);
         allocated.deinit(db.allocator);
     }
     try appendAccountConditions(db, filters, &conditions, &allocated);
 
-    var sql_buf: std.ArrayList(u8) = .{};
+    var sql_buf: std.ArrayList(u8) = .empty;
     defer sql_buf.deinit(db.allocator);
     try sql_buf.appendSlice(db.allocator, "SELECT address, seen_v1, seen_v2, first_seen_block, first_seen_timestamp FROM accounts");
     if (conditions.items.len > 0) {
@@ -177,7 +177,7 @@ pub fn getFilteredAccounts(
     try q.bindInt64(@intCast(limit));
     try q.bindInt64(@intCast(skip));
 
-    var results: std.ArrayList(Account) = .{};
+    var results: std.ArrayList(Account) = .empty;
     defer results.deinit(db.allocator);
     while (try q.step()) {
         try results.append(db.allocator, .{

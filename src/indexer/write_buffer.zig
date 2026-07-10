@@ -7,6 +7,7 @@
 /// - Better locality: all writes of the same type execute in a tight loop
 /// - Eliminates per-event DB round-trip overhead
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const models = @import("../types/models.zig");
 const Hash = @import("../types/hash.zig").Hash;
 const Address = @import("../types/address.zig").Address;
@@ -67,7 +68,7 @@ pub const WriteBuffer = struct {
         return .{
             .allocator = allocator,
             .names = std.AutoHashMap([32]u8, BufferedName).init(allocator),
-            .events = .{},
+            .events = .empty,
             .active = false,
         };
     }
@@ -320,7 +321,7 @@ pub const WriteBuffer = struct {
     // ========================================================================
 
     pub fn flush(self: *WriteBuffer, db: *Database) !void {
-        const timer = std.time.milliTimestamp();
+        const timer = zsys.milliTimestamp();
         var names_inserted: usize = 0;
         var names_updated: usize = 0;
 
@@ -375,7 +376,7 @@ pub const WriteBuffer = struct {
             try events_storage.insertEvent(db, event);
         }
 
-        const elapsed = std.time.milliTimestamp() - timer;
+        const elapsed = zsys.milliTimestamp() - timer;
         if (self.events.items.len > 0 or names_inserted > 0 or names_updated > 0) {
             std.log.info("  Buffer flush: {d} events, {d} name inserts, {d} name updates in {d}ms", .{
                 self.events.items.len,

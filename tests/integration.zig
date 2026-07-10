@@ -1,4 +1,5 @@
 const std = @import("std");
+const zsys = @import("lib").zsys;
 const testing = std.testing;
 
 // Import modules via lib
@@ -19,13 +20,13 @@ var pg_schema_seq: usize = 0;
 
 fn testDb(allocator: std.mem.Allocator) !Database {
     const want_pg = blk: {
-        const v = std.process.getEnvVarOwned(allocator, "TEST_BACKEND") catch break :blk false;
+        const v = zsys.getEnvOwned(allocator, "TEST_BACKEND") catch break :blk false;
         defer allocator.free(v);
         break :blk std.ascii.eqlIgnoreCase(v, "postgres");
     };
     if (!want_pg) {
         const force_fallback = blk: {
-            const v = std.process.getEnvVarOwned(allocator, "TEST_FORCE_WRITE_PATH_UNDO") catch break :blk false;
+            const v = zsys.getEnvOwned(allocator, "TEST_FORCE_WRITE_PATH_UNDO") catch break :blk false;
             defer allocator.free(v);
             break :blk std.mem.eql(u8, v, "1");
         };
@@ -57,7 +58,7 @@ fn testDb(allocator: std.mem.Allocator) !Database {
 }
 
 test "Database integration - full workflow" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -73,14 +74,14 @@ test "Database integration - full workflow" {
         .namehash = try namehash(allocator, "eth"),
         .parent_registry = Address.zero,
         .created_block = 100,
-        .created_at = std.time.timestamp(),
+        .created_at = zsys.timestamp(),
     };
 
     try database.insertRegistry(eth_registry);
     std.debug.print("✓ Registry inserted\n", .{});
 
     // Test 2: Insert a name
-    const ts = std.time.timestamp();
+    const ts = zsys.timestamp();
     {
         var alice_eth = models.Name{
             .name = try allocator.dupe(u8, "alice.eth"),
@@ -162,7 +163,7 @@ test "Database integration - full workflow" {
 }
 
 test "Namehash computation" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -192,7 +193,7 @@ test "Namehash computation" {
 }
 
 test "Address formatting" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -253,7 +254,7 @@ test "Chain type conversion" {
 }
 
 test "Multiple name insertions and queries" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -264,7 +265,7 @@ test "Multiple name insertions and queries" {
 
     // Insert multiple names
     for (names, 0..) |name_str, i| {
-        const loop_ts = std.time.timestamp();
+        const loop_ts = zsys.timestamp();
         var name = models.Name{
             .name = try allocator.dupe(u8, name_str),
             .namehash = try namehash(allocator, name_str),
@@ -318,11 +319,11 @@ test "Multiple name insertions and queries" {
 }
 
 test "Name expiry checking" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const ts = std.time.timestamp();
+    const ts = zsys.timestamp();
 
     // Create expired name
     const expired_name = models.Name{
@@ -406,7 +407,7 @@ test "Name expiry checking" {
 // ============================================================================
 
 test "reorg rollback deletes derived state created after the block" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -554,7 +555,7 @@ fn ownerOf(allocator: std.mem.Allocator, database: *Database, nh: Hash) !Address
 }
 
 fn expectInPlaceOwnerReversed(protocol: models.Protocol) !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -616,7 +617,7 @@ fn nameExpiry(database: *Database, allocator: std.mem.Allocator, nh: Hash) !u64 
 // disarm and asserts a later reorg does NOT revert the materialized expiry, while
 // a genuinely-captured mutation in the same window IS reversed.
 test "reorg undo-log: uncaptured PCC materialize survives a later reorg" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -651,7 +652,7 @@ test "reorg undo-log: uncaptured PCC materialize survives a later reorg" {
 // if the materialize runs with the cursor still armed (the pre-fix behaviour), the
 // UPDATE IS captured and a later reorg wrongly reverts expiry to its pre-mirror value.
 test "reorg undo-log: PCC materialize WITH the cursor armed is wrongly reverted (pre-fix control)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -694,7 +695,7 @@ fn firstUnknownLabelBlock(database: *Database) !i64 {
 // delete) and persisted as a stale row. Adding it to REORG_ACTIVE_TABLES captures
 // its inserts (op-'I'), so replayUndo deletes the post-N row by id on rollback.
 test "reorg undo-log: unknown_labels post-N insert removed, pre-N kept (cascade gap)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -742,7 +743,7 @@ fn registrationExpiry(database: *Database) !i64 {
 // guards it at build time). A renewal that lands after the reorg block must not
 // survive a rollback to before it.
 test "reorg undo-log: registrations renew (in-place expiry update) reversed on reorg" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -775,7 +776,7 @@ test "reorg undo-log: registrations renew (in-place expiry update) reversed on r
 // coverage guard forced the fix: orphaned_registrations is now a PROTECTED table, so the
 // post-N delete of the pre-N orphan is captured and reversed.
 test "reorg undo-log: orphaned_registrations pre-N row deleted post-N is restored on rollback" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -849,7 +850,7 @@ test "reorg undo-log: pgTriggerInstallSql generates the settled Postgres trigger
 }
 
 test "reorg undo-log: created-after removed AND updated pre-reorg restored together" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -884,7 +885,7 @@ test "reorg undo-log: created-after removed AND updated pre-reorg restored toget
 }
 
 test "reorg undo-log: rollback is idempotent" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -919,7 +920,7 @@ fn resolverAddrCount(database: *Database, nh: Hash) !i64 {
 }
 
 test "reorg undo-log re-inserts a resolver record cleared after the reorg block" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -947,7 +948,7 @@ test "reorg undo-log re-inserts a resolver record cleared after the reorg block"
 }
 
 test "reorg undo-log restores exact state-as-of-N across multiple updates" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -980,7 +981,7 @@ test "reorg undo-log restores exact state-as-of-N across multiple updates" {
 }
 
 test "reorg undo-log: rolling back one protocol leaves the other untouched" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1021,7 +1022,7 @@ test "reorg undo-log: rolling back one protocol leaves the other untouched" {
 test "where.name filter combined with isMigrated respects both" {
     // This is a unit-level test via getFilteredNames, which is the code path
     // the resolver now routes through when name is combined with other filters.
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1142,7 +1143,7 @@ fn countAll(database: *Database, comptime table: []const u8) !i64 {
 // recursive_triggers=ON the implicit DELETE fires no trigger, so an overwrite of a
 // pre-N record was never captured and rollback would lose the old value entirely.
 test "reorg undo-log reverses a resolver text OVERWRITE (INSERT OR REPLACE)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1176,7 +1177,7 @@ test "reorg undo-log reverses a resolver text OVERWRITE (INSERT OR REPLACE)" {
 }
 
 test "reorg undo-log: reverse_records overwrite reversed + post-N insert removed" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1209,7 +1210,7 @@ test "reorg undo-log: reverse_records overwrite reversed + post-N insert removed
 }
 
 test "reorg undo-log: resolver_authorisations post-N insert removed" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1232,7 +1233,7 @@ test "reorg undo-log: resolver_authorisations post-N insert removed" {
 }
 
 test "reorg undo-log: registrations + registry_entries post-N inserts removed" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1265,7 +1266,7 @@ test "reorg undo-log: registrations + registry_entries post-N inserts removed" {
 }
 
 test "reorg undo-log: accounts first-seen-after-N removed, pre-N kept" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1297,7 +1298,7 @@ test "reorg undo-log: accounts first-seen-after-N removed, pre-N kept" {
 // context. A v2 sighting that flips seen_v2 on an address first seen in v1 must be
 // reverted on a v2 reorg, leaving seen_v1 and first_seen intact.
 test "reorg undo-log: accounts seen-flag flip reversed via reorg_active" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1333,7 +1334,7 @@ test "reorg undo-log: accounts seen-flag flip reversed via reorg_active" {
 // Regression for the audit's data-loss bug: rollback is PER-protocol and independent,
 // so a v1 rollback must NOT delete an account that only v2 ever saw (v2 is still synced).
 test "reorg undo-log: per-protocol rollback preserves the other protocol's accounts" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1359,7 +1360,7 @@ test "reorg undo-log: per-protocol rollback preserves the other protocol's accou
 // Shared address first seen by v2@200 then v1@250; a v2 reorg to 150 must clear ONLY
 // v2's flag and keep the row (v1 never rolled back) — no data loss.
 test "reorg undo-log: shared account — v2 reorg clears only seen_v2, keeps the row" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1386,7 +1387,7 @@ test "reorg undo-log: shared account — v2 reorg clears only seen_v2, keeps the
 // v1_controllers drives which contracts get indexed (getActiveControllers). A reorged-out
 // ControllerAdded/Removed must be wound back: added-after-N dropped, removed-after-N reactivated.
 test "reorg undo-log: v1_controllers wound back on reorg" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1424,7 +1425,7 @@ test "reorg undo-log: v1_controllers wound back on reorg" {
 // re-added straddling N. The undo-log captures each mutation, so rollback restores the
 // exact as-of-N state (removed), not the post-readd state (active).
 test "reorg undo-log: v1_controllers remove-then-readd straddling N restores removed state" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1554,7 +1555,7 @@ const RECONCILE_TABLES = [_][]const u8{
 };
 
 // Volatile columns excluded from the content comparison: the autoincrement id (insertion
-// order differs) and the wall-clock columns set via std.time.timestamp() on write
+// order differs) and the wall-clock columns set via zsys.timestamp() on write
 // (names.updated_at, and the internal timestamps of approvals/eac_roles/resolvers/
 // resolver_metadata). Deterministic block-derived columns (block_number, *_block, expiry,
 // registered_at, first_seen_timestamp, …) ARE compared.
@@ -1568,7 +1569,7 @@ fn reconcileIgnored(col: []const u8) bool {
 /// Canonical dump of a table's content: every non-volatile column, every row, ordered
 /// by full content so two DBs built from the same events produce identical bytes.
 fn dumpTable(allocator: std.mem.Allocator, db: *Database, table: []const u8) ![]u8 {
-    var cols: std.ArrayList([]u8) = .{};
+    var cols: std.ArrayList([]u8) = .empty;
     defer {
         for (cols.items) |c| allocator.free(c);
         cols.deinit(allocator);
@@ -1585,20 +1586,20 @@ fn dumpTable(allocator: std.mem.Allocator, db: *Database, table: []const u8) ![]
         }
     }
 
-    var sql: std.ArrayList(u8) = .{};
+    var sql: std.ArrayList(u8) = .empty;
     defer sql.deinit(allocator);
     try sql.appendSlice(allocator, "SELECT ");
     for (cols.items, 0..) |c, i| {
         if (i > 0) try sql.appendSlice(allocator, ", ");
-        try sql.writer(allocator).print("\"{s}\"", .{c});
+        try sql.print(allocator, "\"{s}\"", .{c});
     }
-    try sql.writer(allocator).print(" FROM \"{s}\" ORDER BY ", .{table});
+    try sql.print(allocator, " FROM \"{s}\" ORDER BY ", .{table});
     for (cols.items, 0..) |c, i| {
         if (i > 0) try sql.appendSlice(allocator, ", ");
-        try sql.writer(allocator).print("\"{s}\"", .{c});
+        try sql.print(allocator, "\"{s}\"", .{c});
     }
 
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var q = try lib.storage.Query.init(db, sql.items);
     defer q.deinit();
@@ -1688,7 +1689,7 @@ fn applyReconcileReorged(allocator: std.mem.Allocator, db: *Database) !void {
 }
 
 test "reorg undo-log: rollback(N) equals a clean build at N across all entity tables" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1711,7 +1712,7 @@ test "reorg undo-log: rollback(N) equals a clean build at N across all entity ta
 // Negative control: prove the comparator actually detects drift (so the invariant
 // test above can't pass vacuously).
 test "reorg undo-log: reconcile comparator detects planted drift" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1748,7 +1749,7 @@ fn filteredNameCount(allocator: std.mem.Allocator, database: *Database, filters:
 }
 
 test "normalization: default-hides non-normalized names; opt-in shows them" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1815,7 +1816,7 @@ test "normalization: default-hides non-normalized names; opt-in shows them" {
 // ============================================================================
 
 test "reorg undo-log: bulk reachability flip is reverted (dynamic IN-list capture)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1845,7 +1846,7 @@ test "reorg undo-log: bulk reachability flip is reverted (dynamic IN-list captur
 }
 
 test "reorg undo-log: names delete restores unknown_labels cascade children" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1882,7 +1883,7 @@ test "reorg undo-log: names delete restores unknown_labels cascade children" {
 }
 
 test "reorg undo-log: key-scoped resolver text delete and created_block lowering revert" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

@@ -22,6 +22,7 @@
 //! read-only; running migrate would take a startup write lock against a live
 //! indexer) — the cross-backend analogue of `openFromConfigReadonly`.
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const config = @import("../config.zig");
 const db_open = @import("db_open.zig");
 const Database = @import("database.zig").Database;
@@ -47,8 +48,8 @@ pub const Pool = struct {
     /// Set by deinit: parked/new acquirers fail with error.PoolClosed instead
     /// of racing the teardown.
     closing: bool = false,
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
+    mutex: zsys.Mutex = .{},
+    cond: zsys.Condition = .{},
 
     pub fn open(allocator: std.mem.Allocator, opts: Options) !Pool {
         // `:memory:` (and SQLite's empty-path private temp DB) is per-connection

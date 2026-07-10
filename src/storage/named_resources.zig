@@ -4,6 +4,7 @@
 /// addr coin type — it guards. `record_key`/`coin_type` use '' / -1 sentinels
 /// (not NULL) so the UNIQUE key stays conflict-updatable.
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const db_module = @import("database.zig");
 const reorg_undo = @import("reorg_undo.zig");
 const Database = db_module.Database;
@@ -43,7 +44,7 @@ pub fn upsertNamedResource(
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
     try q.bindInt(@intCast(log_index));
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.exec();
 }
 
@@ -76,7 +77,7 @@ pub fn getNamedResources(db: *Database, allocator: std.mem.Allocator, protocol: 
     try q.bindTextStatic(protocol.toString());
     try q.bindAddress(resolver);
 
-    var out: std.ArrayList(NamedResource) = .{};
+    var out: std.ArrayList(NamedResource) = .empty;
     errdefer {
         for (out.items) |*r| r.deinit(allocator);
         out.deinit(allocator);

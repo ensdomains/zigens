@@ -157,26 +157,26 @@ pub fn Array(comptime W: type) type {
 const testing = std.testing;
 
 test "Object: empty object" {
-    var buf: std.ArrayList(u8) = .{};
-    defer buf.deinit(testing.allocator);
-    var obj = try objectOn(buf.writer(testing.allocator));
+    var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer buf.deinit();
+    var obj = try objectOn(&buf.writer);
     try obj.end();
-    try testing.expectEqualStrings("{}", buf.items);
+    try testing.expectEqualStrings("{}", buf.written());
 }
 
 test "Object: single string field" {
-    var buf: std.ArrayList(u8) = .{};
-    defer buf.deinit(testing.allocator);
-    var obj = try objectOn(buf.writer(testing.allocator));
+    var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer buf.deinit();
+    var obj = try objectOn(&buf.writer);
     try obj.fieldStr("name", "alice.eth", testing.allocator);
     try obj.end();
-    try testing.expectEqualStrings("{\"name\":\"alice.eth\"}", buf.items);
+    try testing.expectEqualStrings("{\"name\":\"alice.eth\"}", buf.written());
 }
 
 test "Object: multiple fields, comma handling" {
-    var buf: std.ArrayList(u8) = .{};
-    defer buf.deinit(testing.allocator);
-    var obj = try objectOn(buf.writer(testing.allocator));
+    var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer buf.deinit();
+    var obj = try objectOn(&buf.writer);
     try obj.fieldStr("name", "alice.eth", testing.allocator);
     try obj.fieldInt("count", 3);
     try obj.fieldBool("isMigrated", true);
@@ -184,42 +184,42 @@ test "Object: multiple fields, comma handling" {
     try obj.end();
     try testing.expectEqualStrings(
         "{\"name\":\"alice.eth\",\"count\":3,\"isMigrated\":true,\"resolver\":null}",
-        buf.items,
+        buf.written(),
     );
 }
 
 test "Object: string escaping" {
-    var buf: std.ArrayList(u8) = .{};
-    defer buf.deinit(testing.allocator);
-    var obj = try objectOn(buf.writer(testing.allocator));
+    var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer buf.deinit();
+    var obj = try objectOn(&buf.writer);
     try obj.fieldStr("q", "a\"b\\c\nd", testing.allocator);
     try obj.end();
-    try testing.expectEqualStrings("{\"q\":\"a\\\"b\\\\c\\nd\"}", buf.items);
+    try testing.expectEqualStrings("{\"q\":\"a\\\"b\\\\c\\nd\"}", buf.written());
 }
 
 test "Array: empty" {
-    var buf: std.ArrayList(u8) = .{};
-    defer buf.deinit(testing.allocator);
-    var arr = try arrayOn(buf.writer(testing.allocator));
+    var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer buf.deinit();
+    var arr = try arrayOn(&buf.writer);
     try arr.end();
-    try testing.expectEqualStrings("[]", buf.items);
+    try testing.expectEqualStrings("[]", buf.written());
 }
 
 test "Array: mixed items" {
-    var buf: std.ArrayList(u8) = .{};
-    defer buf.deinit(testing.allocator);
-    var arr = try arrayOn(buf.writer(testing.allocator));
+    var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer buf.deinit();
+    var arr = try arrayOn(&buf.writer);
     try arr.itemStr("a", testing.allocator);
     try arr.itemInt(42);
     try arr.itemRaw("null");
     try arr.end();
-    try testing.expectEqualStrings("[\"a\",42,null]", buf.items);
+    try testing.expectEqualStrings("[\"a\",42,null]", buf.written());
 }
 
 test "Array of objects (nested): resolver.addresses shape" {
-    var buf: std.ArrayList(u8) = .{};
-    defer buf.deinit(testing.allocator);
-    var arr = try arrayOn(buf.writer(testing.allocator));
+    var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer buf.deinit();
+    var arr = try arrayOn(&buf.writer);
     {
         var o = try arr.beginObject();
         try o.fieldInt("coinType", 60);
@@ -235,14 +235,14 @@ test "Array of objects (nested): resolver.addresses shape" {
     try arr.end();
     try testing.expectEqualStrings(
         "[{\"coinType\":60,\"address\":\"0xdead\"},{\"coinType\":0,\"address\":\"bc1qbtc\"}]",
-        buf.items,
+        buf.written(),
     );
 }
 
 test "Object with nested object field" {
-    var buf: std.ArrayList(u8) = .{};
-    defer buf.deinit(testing.allocator);
-    var obj = try objectOn(buf.writer(testing.allocator));
+    var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer buf.deinit();
+    var obj = try objectOn(&buf.writer);
     try obj.fieldStr("id", "x", testing.allocator);
     {
         var inner = try obj.beginObject("meta");
@@ -250,5 +250,5 @@ test "Object with nested object field" {
         try inner.end();
     }
     try obj.end();
-    try testing.expectEqualStrings("{\"id\":\"x\",\"meta\":{\"ok\":true}}", buf.items);
+    try testing.expectEqualStrings("{\"id\":\"x\",\"meta\":{\"ok\":true}}", buf.written());
 }

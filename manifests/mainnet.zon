@@ -1,0 +1,36 @@
+// Reference contract manifest — generated from src/contracts.zig defaults.
+// See manifests/README.txt. A test asserts this loads to the code defaults.
+.{
+    .manifest_version = 1,
+    .chain_id = 1,
+    .contracts = .{
+        .{ .name = "temporary_registrar", .address = "0x6090a6e47849629b7245dfa1ca21d94cd15878ef" },
+        .{ .name = "old_ens_registry", .address = "0x314159265dd8dbb310642f98f50c066173c1259b" },
+        .{ .name = "old_public_resolver", .address = "0x112234455c3a32fd11230c42e7bccd4a84e02010" },
+        .{ .name = "ens_registry", .address = "0x00000000000c2e074ec69a0dfb2997ba6c7d2e1e" },
+        .{ .name = "base_registrar", .address = "0x57f1887a8bf19b14fc0df6fd9b2acc9af147ea85" },
+        .{ .name = "eth_registrar_controller", .address = "0x283af0b28c62c092c9727f1ee09c02ca627eb7f5" },
+        .{ .name = "public_resolver", .address = "0xf29100983e058b709f3d539b0c765937b804ac15" },
+        .{ .name = "reverse_registrar", .address = "0xa58e81fe9b61b5c3fe2afd33cf304c454abfc7cb" },
+        .{ .name = "name_wrapper", .address = "0xd4416b13d2b3a9abae7acd5d6c2bbdbe25686401" },
+        .{ .name = "universal_resolver", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "root_registry", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "eth_registry", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "eth_registrar_v2", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "eth_renewer_v1", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "eth_label_store", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "eth_reverse_registrar", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "batch_registrar", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "premigration_registrar", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "migration_helper", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "locked_migration_controller", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "unlocked_migration_controller", .address = "0x0000000000000000000000000000000000000000" },
+    },
+    .blocks = .{
+        .v1_deployment_block = 9380410,
+        .v2_deployment_block = 0,
+        .temp_registrar_start_block = 3327417,
+        .v1_migration_block = 9380410,
+        .name_wrapper_deployment_block = 15628465,
+    },
+}

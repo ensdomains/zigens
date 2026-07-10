@@ -1,4 +1,5 @@
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const ens_name = @import("../utils/ens_name.zig");
 const rpc = @import("../rpc/client.zig");
 const db_module = @import("../storage/database.zig");
@@ -83,7 +84,7 @@ pub const LabelBackfill = struct {
             // Inter-batch sleep to be kind to the RPC provider. Skip on the
             // last iteration (loop is about to exit anyway).
             if (iteration + 1 < MAX_ITERATIONS) {
-                std.Thread.sleep(INTER_BATCH_DELAY_MS * std.time.ns_per_ms);
+                zsys.sleep(INTER_BATCH_DELAY_MS * std.time.ns_per_ms);
             }
         }
 
@@ -182,7 +183,7 @@ pub const LabelBackfill = struct {
 
         // STEP 2: For remaining unknown labels, try calldata decoding
         // Collect labels still needing resolution (skip addr.reverse — already handled)
-        var remaining_labels: std.ArrayList(unknown_labels_storage.UnknownLabel) = .{};
+        var remaining_labels: std.ArrayList(unknown_labels_storage.UnknownLabel) = .empty;
         defer remaining_labels.deinit(self.allocator);
 
         for (unknown_labels) |label| {
