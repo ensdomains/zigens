@@ -1,4 +1,5 @@
 const std = @import("std");
+const zsys = @import("../../utils/system.zig");
 const config = @import("../../config.zig");
 const constants = @import("../../constants.zig");
 const models = @import("../../types/models.zig");
@@ -172,7 +173,7 @@ pub fn indexV1EventsChunked(
             chunk_start = chunk_end + 1;
             // Rate limit: wait between batches to avoid hitting RPC provider limits
             if (chunk_start <= to_block) {
-                std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms); // 50ms delay between batches
+                zsys.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms); // 50ms delay between batches
             }
             break :retry_loop; // Success - move to next chunk
         }
@@ -392,7 +393,7 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
             }
 
             // Process results in required order, dispatching by topic[0]
-            const chunk_timer = std.time.milliTimestamp();
+            const chunk_timer = zsys.milliTimestamp();
 
             // 1. ETH Controller events (MUST be first - provides labels for Base Registrar)
             const eth_logs = batch_results[0];
@@ -407,10 +408,10 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
                     }
                 }
             }
-            const eth_elapsed = std.time.milliTimestamp() - chunk_timer;
+            const eth_elapsed = zsys.milliTimestamp() - chunk_timer;
 
             // 2. Base Registrar events
-            const base_timer = std.time.milliTimestamp();
+            const base_timer = zsys.milliTimestamp();
             const base_logs = batch_results[1];
             total_events += base_logs.len;
             for (base_logs) |log| {
@@ -423,10 +424,10 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
                     }
                 }
             }
-            const base_elapsed = std.time.milliTimestamp() - base_timer;
+            const base_elapsed = zsys.milliTimestamp() - base_timer;
 
             // 3. ENS Registry events
-            const registry_timer = std.time.milliTimestamp();
+            const registry_timer = zsys.milliTimestamp();
             const registry_logs = batch_results[2];
             total_events += registry_logs.len;
             for (registry_logs) |log| {
@@ -439,13 +440,13 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
                     }
                 }
             }
-            const registry_elapsed = std.time.milliTimestamp() - registry_timer;
+            const registry_elapsed = zsys.milliTimestamp() - registry_timer;
 
             // 4. Name Wrapper events (if included)
             var wrapper_count: usize = 0;
             var wrapper_elapsed: i64 = 0;
             if (include_name_wrapper) {
-                const wrapper_timer = std.time.milliTimestamp();
+                const wrapper_timer = zsys.milliTimestamp();
                 const wrapper_logs = batch_results[3];
                 wrapper_count = wrapper_logs.len;
                 total_events += wrapper_logs.len;
@@ -459,7 +460,7 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
                         }
                     }
                 }
-                wrapper_elapsed = std.time.milliTimestamp() - wrapper_timer;
+                wrapper_elapsed = zsys.milliTimestamp() - wrapper_timer;
             }
 
             // 5. Reverse Registrar events
@@ -477,13 +478,13 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
                 }
             }
 
-            const total_process_elapsed = std.time.milliTimestamp() - chunk_timer;
+            const total_process_elapsed = zsys.milliTimestamp() - chunk_timer;
 
             // Flush write buffer to database (batched writes)
             self.write_buffer.active = false;
             try self.write_buffer.flush(self.database);
 
-            const total_with_flush = std.time.milliTimestamp() - chunk_timer;
+            const total_with_flush = zsys.milliTimestamp() - chunk_timer;
             std.log.info("  Processed {d} events in {d}ms, flushed in {d}ms (eth={d}/{d}ms base={d}/{d}ms reg={d}/{d}ms wrap={d}/{d}ms rev={d})", .{
                 total_events,
                 total_process_elapsed,
@@ -547,7 +548,7 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
             if (!needs_controller_reprocess) {
                 chunk_start = chunk_end + 1;
                 if (chunk_start <= to_block) {
-                    std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
+                    zsys.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
                 }
             }
             break :retry_loop;
@@ -714,7 +715,7 @@ pub fn indexPreMigrationRegistryEvents(self: *Indexer, protocol: models.Protocol
 
             chunk_start = chunk_end + 1;
             if (chunk_start <= adjusted_to_block) {
-                std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
+                zsys.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
             }
             break :retry_loop;
         }

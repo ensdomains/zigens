@@ -10,10 +10,18 @@ const json_utils = @import("../utils/json.zig");
 const url_utils = @import("../utils/url.zig");
 const validation = @import("../utils/validation.zig");
 const PerIpRateLimiter = @import("../rate_limiter.zig").PerIpRateLimiter;
+
+/// Deliberately LOOSE per-IP rate limit for the Prometheus GET /metrics scrape endpoint.
+/// It gets its own bucket so scrapes never compete with API traffic; the value is generous
+/// enough that real scraping (well under 1/s) is never limited, while still bounding a
+/// /metrics flood (each hit does a DB pool acquire + finality reads).
+const METRICS_RATE_LIMIT_PER_SECOND: u32 = 60;
 const webhook_manager = @import("../webhooks/manager.zig");
 const rpc = @import("../rpc/client.zig");
 const resolve_client = @import("../resolve/client.zig");
 const resolve_primary = @import("../resolve/primary.zig");
+const zsys = @import("../utils/system.zig");
+const auth = @import("auth.zig");
 
 /// On-chain resolution state, created only when primary-name verification is enabled.
 /// Owns the HTTP client the RPC client borrows; both are freed in `Server.deinit`.
@@ -57,14 +65,21 @@ const queryIsMutation = http_util.queryIsMutation;
 /// Provides REST endpoints and GraphQL for querying indexed data
 pub const Server = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     pool: *pool_mod.Pool,
     webhook_database: ?*db.Database, // Optional - only initialized if webhooks enabled
     port: u16,
-    server: ?std.net.Server,
+    server: ?std.Io.net.Server,
     graphql_handler: graphql.GraphQLHandler,
     rate_limiter: PerIpRateLimiter,
-    webhook_admin_username: ?[]const u8, // Optional - if set with password, requires Basic Auth
-    webhook_admin_password: ?[]const u8, // Optional - if set, requires Basic Auth for webhook endpoints
+    /// Loose dedicated bucket for GET /metrics (see METRICS_RATE_LIMIT_PER_SECOND).
+    metrics_rate_limiter: PerIpRateLimiter,
+    /// Unified admin/internal credential check (constant-time, fail-closed).
+    admin_auth: auth.AdminAuth,
+    /// Dedicated low rate limiter for the RPC-amplifying internal routes.
+    internal_rate_limiter: PerIpRateLimiter,
+    /// Explicit dev opt-in to serve webhook admin routes without auth.
+    allow_unauth_webhooks: bool,
     /// Number of trusted reverse-proxy hops. 0 (default) = rate-limit on the direct TCP
     /// peer. > 0 = trust X-Forwarded-For from this many hops and rate-limit on the real
     /// client IP (see handleConnection / resolveClientAddress).
@@ -72,8 +87,14 @@ pub const Server = struct {
     /// On-chain resolution state; null unless primary-name verification is enabled
     /// via `enableResolution`. When null the server behaves exactly as before.
     resolve: ?ResolveState,
+    /// In-flight connection count, bounded by `max_concurrent_connections` so a
+    /// connection flood cannot spawn an unbounded number of 2MB-stack threads.
+    active_conns: std.atomic.Value(u32),
+    max_concurrent_connections: u32,
+    /// Per-request wall-clock read budget (ms); backstops the per-socket timeout.
+    request_timeout_ms: u32,
 
-    pub fn init(allocator: std.mem.Allocator, pool: *pool_mod.Pool, webhook_db_path: ?[]const u8, port: u16, complexity_max_depth: u32, complexity_max_cost: u32, metrics_enabled: bool, rate_limit_per_second: u32, webhook_admin_username: ?[]const u8, webhook_admin_password: ?[]const u8, trusted_proxy_hops: u32) !Server {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, pool: *pool_mod.Pool, webhook_db_path: ?[]const u8, port: u16, complexity_max_depth: u32, complexity_max_cost: u32, metrics_enabled: bool, rate_limit_per_second: u32, webhook_admin_username: ?[]const u8, webhook_admin_password: ?[]const u8, trusted_proxy_hops: u32, request_timeout_ms: u32, max_concurrent_connections: u32, internal_admin_token: ?[]const u8, internal_rate_limit_per_second: u32, allow_unauth_webhooks: bool) !Server {
         // Only open webhook database if path is provided (webhooks enabled)
         var webhook_db: ?*db.Database = null;
         if (webhook_db_path) |path| {
@@ -89,16 +110,22 @@ pub const Server = struct {
 
         return .{
             .allocator = allocator,
+            .io = io,
             .pool = pool,
             .webhook_database = webhook_db,
             .port = port,
             .server = null,
             .graphql_handler = try graphql.GraphQLHandler.init(allocator, complexity_max_depth, complexity_max_cost, metrics_enabled),
             .rate_limiter = PerIpRateLimiter.init(allocator, rate_limit * 2, rate_limit, 100_000),
-            .webhook_admin_username = webhook_admin_username,
-            .webhook_admin_password = webhook_admin_password,
+            .metrics_rate_limiter = PerIpRateLimiter.init(allocator, METRICS_RATE_LIMIT_PER_SECOND * 2, METRICS_RATE_LIMIT_PER_SECOND, 100_000),
+            .admin_auth = auth.AdminAuth.init(webhook_admin_username, webhook_admin_password, internal_admin_token),
+            .internal_rate_limiter = PerIpRateLimiter.init(allocator, @max(internal_rate_limit_per_second * 2, 1), internal_rate_limit_per_second, 100_000),
+            .allow_unauth_webhooks = allow_unauth_webhooks,
             .trusted_proxy_hops = trusted_proxy_hops,
             .resolve = null,
+            .active_conns = std.atomic.Value(u32).init(0),
+            .max_concurrent_connections = max_concurrent_connections,
+            .request_timeout_ms = request_timeout_ms,
         };
     }
 
@@ -109,7 +136,7 @@ pub const Server = struct {
         std.debug.assert(self.resolve == null); // call-once: a second call would leak the first clients
         const http_client = try self.allocator.create(std.http.Client);
         errdefer self.allocator.destroy(http_client);
-        http_client.* = std.http.Client{ .allocator = self.allocator };
+        http_client.* = std.http.Client{ .allocator = self.allocator, .io = self.io };
         errdefer http_client.deinit();
 
         const rpc_client = try rpc.Client.initWithSharedHttpClient(self.allocator, rpc_url, http_client);
@@ -132,6 +159,8 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         self.graphql_handler.deinit();
         self.rate_limiter.deinit();
+        self.metrics_rate_limiter.deinit();
+        self.internal_rate_limiter.deinit();
         if (self.webhook_database) |webhook_db| {
             webhook_db.deinit();
             self.allocator.destroy(webhook_db);
@@ -142,55 +171,72 @@ pub const Server = struct {
             self.allocator.destroy(rs.http_client);
         }
         if (self.server) |*s| {
-            s.deinit();
+            s.deinit(self.io);
         }
     }
 
     pub fn start(self: *Server) !void {
-        const address = try std.net.Address.parseIp("0.0.0.0", self.port);
-        var server = try address.listen(.{
+        const address = try std.Io.net.IpAddress.parse("0.0.0.0", self.port);
+        self.server = try address.listen(self.io, .{
             .reuse_address = true,
             .kernel_backlog = 128, // Handle burst of connections
         });
-        self.server = server;
+        const listener = &self.server.?;
 
         std.log.info("API server listening on port {d}", .{self.port});
 
         while (true) {
-            const connection = server.accept() catch |err| {
+            const stream = listener.accept(self.io) catch |err| {
                 std.log.warn("Failed to accept connection: {}", .{err});
                 continue;
             };
+            const conn = http_util.Conn{ .io = self.io, .stream = stream };
 
-            // Spawn a thread to handle each connection concurrently
-            const thread = std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, handleConnectionThread, .{ self, connection }) catch |err| {
+            // Bound a stalled/trickling peer: reads past request_timeout_ms error out
+            // (see http_util.setStreamTimeout). The wall-clock deadline in
+            // handleConnection is the backstop for a peer that trickles under it.
+            http_util.setStreamTimeout(conn.stream.socket.handle, self.request_timeout_ms);
+
+            // Per-IP rate limiting moved into handleConnection (after the request line is
+            // read) so GET /metrics can use its own loose bucket — its path is not known
+            // here. The concurrency cap below stays pre-spawn as the flood ceiling.
+
+            // Concurrency cap: refuse with 503 rather than spawn an unbounded number of
+            // handler threads under a connection flood. Reserve the slot before spawn;
+            // the handler thread releases it on exit (and the spawn-error path below).
+            if (self.active_conns.fetchAdd(1, .monotonic) + 1 > self.max_concurrent_connections) {
+                _ = self.active_conns.fetchSub(1, .monotonic);
+                self.sendServiceUnavailable(conn) catch {};
+                conn.close();
+                continue;
+            }
+
+            const thread = std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, handleConnectionThread, .{ self, conn }) catch |err| {
                 std.log.warn("Failed to spawn handler thread: {}", .{err});
-                connection.stream.close();
+                _ = self.active_conns.fetchSub(1, .monotonic);
+                conn.close();
                 continue;
             };
             thread.detach();
         }
     }
 
-    fn handleConnectionThread(self: *Server, connection: std.net.Server.Connection) void {
-        defer connection.stream.close();
-        self.handleConnection(connection) catch |err| {
+    fn handleConnectionThread(self: *Server, conn: http_util.Conn) void {
+        defer _ = self.active_conns.fetchSub(1, .monotonic);
+        defer conn.close();
+        self.handleConnection(conn) catch |err| {
             std.log.warn("Connection handler error: {}", .{err});
         };
     }
 
-    fn handleConnection(self: *Server, connection: std.net.Server.Connection) !void {
-        // Rate limit on the direct TCP peer when NOT behind a proxy (the common case) —
-        // before any header read, so a flooding peer is refused immediately. Behind a
-        // trusted proxy (trusted_proxy_hops > 0) the direct peer is the proxy and is shared
-        // by all clients, so we instead limit on the real client IP from X-Forwarded-For
-        // after reading headers (still bounded — headers are capped at 4KB below).
-        if (self.trusted_proxy_hops == 0) {
-            if (!self.rate_limiter.tryAcquireFor(connection.address)) {
-                try self.sendRateLimited(connection.stream);
-                return;
-            }
-        }
+    fn handleConnection(self: *Server, conn: http_util.Conn) !void {
+        // Per-IP rate limiting runs below, after the bounded header read, so the request
+        // line is available and the Prometheus scrape endpoint can be exempted.
+
+        // Wall-clock request deadline: the per-socket receive timeout bounds each
+        // individual read, but a peer trickling one byte per interval could survive
+        // forever, so cap the whole header+body read here too.
+        const request_start_ms = zsys.milliTimestamp();
 
         // Read headers first (up to 4KB for headers)
         var header_buffer: [4096]u8 = undefined;
@@ -198,7 +244,8 @@ pub const Server = struct {
 
         // Read until we find the end of headers (\r\n\r\n or \n\n)
         while (total_header_bytes < header_buffer.len) {
-            const bytes_read = connection.stream.read(header_buffer[total_header_bytes..]) catch |err| {
+            if (self.request_timeout_ms != 0 and zsys.milliTimestamp() - request_start_ms > self.request_timeout_ms) return;
+            const bytes_read = conn.read(header_buffer[total_header_bytes..]) catch |err| {
                 std.log.warn("Error reading request: {}", .{err});
                 return;
             };
@@ -217,13 +264,26 @@ pub const Server = struct {
 
         const header_data = header_buffer[0..total_header_bytes];
 
-        // Behind a trusted proxy: rate-limit on the real client IP from X-Forwarded-For
-        // (spoof-resistant — see resolveClientAddress). Done after the bounded header read,
-        // still before any request body is processed.
-        if (self.trusted_proxy_hops > 0) {
-            const client_addr = resolveClientAddress(connection.address, header_data, self.trusted_proxy_hops);
-            if (!self.rate_limiter.tryAcquireFor(client_addr)) {
-                try self.sendRateLimited(connection.stream);
+        // Per-IP rate limiting, applied here (after the bounded header read, before any
+        // body processing) so the request line is known. GET /metrics gets its own LOOSE
+        // bucket (metrics_rate_limiter) so a Prometheus scrape is never starved by API
+        // traffic sharing a bucket — notably behind a proxy with trusted_proxy_hops == 0,
+        // where the shared key is the proxy's IP — while a /metrics flood stays bounded.
+        // The direct peer is the key when no proxy hops are trusted; otherwise the real
+        // client IP is recovered from X-Forwarded-For (spoof-resistant — see resolveClientAddress).
+        {
+            const rl_line_end = std.mem.indexOfScalar(u8, header_data, '\n') orelse header_data.len;
+            var rl_parts = std.mem.splitScalar(u8, header_data[0..rl_line_end], ' ');
+            const rl_method = rl_parts.next() orelse "";
+            const rl_path = rl_parts.next() orelse "";
+            const is_metrics_scrape = std.mem.eql(u8, rl_method, "GET") and std.mem.startsWith(u8, rl_path, "/metrics");
+            const client_addr = if (self.trusted_proxy_hops > 0)
+                resolveClientAddress(conn.address(), header_data, self.trusted_proxy_hops)
+            else
+                conn.address();
+            const limiter = if (is_metrics_scrape) &self.metrics_rate_limiter else &self.rate_limiter;
+            if (!limiter.tryAcquireFor(client_addr)) {
+                try self.sendRateLimited(conn);
                 return;
             }
         }
@@ -236,33 +296,19 @@ pub const Server = struct {
         };
         const body_offset: usize = if (header_end_crlf != null) 4 else 2;
 
-        // Parse Content-Length from headers
-        var content_length: usize = 0;
-        var header_lines = std.mem.splitSequence(u8, header_data[0..header_end], "\r\n");
-        while (header_lines.next()) |line| {
-            if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
-                const value = std.mem.trim(u8, line["content-length:".len..], " \t");
-                content_length = std.fmt.parseInt(usize, value, 10) catch 0;
-                break;
-            }
-        }
-        // Also try \n separator
-        if (content_length == 0) {
-            var header_lines_lf = std.mem.splitScalar(u8, header_data[0..header_end], '\n');
-            while (header_lines_lf.next()) |line| {
-                const trimmed = std.mem.trimRight(u8, line, "\r");
-                if (std.ascii.startsWithIgnoreCase(trimmed, "content-length:")) {
-                    const value = std.mem.trim(u8, trimmed["content-length:".len..], " \t");
-                    content_length = std.fmt.parseInt(usize, value, 10) catch 0;
-                    break;
-                }
-            }
-        }
+        // Determine the body length from the parsed headers, rejecting framing we
+        // do not safely support (chunked, Content-Length + Transfer-Encoding,
+        // conflicting/malformed Content-Length) rather than guessing — an ambiguous
+        // body length is a request-smuggling / desync vector.
+        const content_length = http_util.parseBodyFraming(header_data[0..header_end]) catch {
+            try self.sendBadRequest(conn, "Unsupported or ambiguous request framing");
+            return;
+        };
 
         // SECURITY: Limit max body size to 64KB to prevent DoS
         const max_body_size: usize = 65536;
         if (content_length > max_body_size) {
-            try self.sendBadRequest(connection.stream, "Request body too large (max 64KB)");
+            try self.sendBadRequest(conn, "Request body too large (max 64KB)");
             return;
         }
 
@@ -273,29 +319,43 @@ pub const Server = struct {
         else
             0;
 
-        // Allocate full request buffer
+        // Bytes buffered past the declared body are a pipelined/smuggled tail:
+        // reject rather than (a) over-reading `request` in the copy below — the
+        // original @memcpy of total_header_bytes into a content_length-sized buffer
+        // was a heap overflow — or (b) leaving the extra bytes unconsumed.
+        if (body_already_read > content_length) {
+            try self.sendBadRequest(conn, "Unexpected data after request body");
+            return;
+        }
+
+        // Allocate full request buffer. body_already_read <= content_length now
+        // guarantees total_header_bytes <= total_size, so the copy is in-bounds.
         const total_size = header_end + body_offset + content_length;
         const request = self.allocator.alloc(u8, total_size) catch {
-            try self.sendBadRequest(connection.stream, "Out of memory");
+            try self.sendBadRequest(conn, "Out of memory");
             return;
         };
         defer self.allocator.free(request);
 
-        // Copy what we have
+        // Copy what we already have (headers + any body prefix in the buffer).
         @memcpy(request[0..total_header_bytes], header_data[0..total_header_bytes]);
 
-        // Read remaining body if needed
+        // Read the remainder of the DECLARED body exactly. A short read (EOF before
+        // content_length is satisfied) is an incomplete request — reject it instead
+        // of parsing the uninitialized allocation tail as if it were body.
         if (body_already_read < content_length) {
-            var remaining = content_length - body_already_read;
             var offset = total_header_bytes;
-            while (remaining > 0) {
-                const bytes_read = connection.stream.read(request[offset..]) catch |err| {
+            while (offset < total_size) {
+                if (self.request_timeout_ms != 0 and zsys.milliTimestamp() - request_start_ms > self.request_timeout_ms) return;
+                const bytes_read = conn.read(request[offset..]) catch |err| {
                     std.log.warn("Error reading request body: {}", .{err});
                     return;
                 };
-                if (bytes_read == 0) break;
+                if (bytes_read == 0) {
+                    try self.sendBadRequest(conn, "Incomplete request body");
+                    return;
+                }
                 offset += bytes_read;
-                remaining -= @min(remaining, bytes_read);
             }
         }
 
@@ -311,7 +371,7 @@ pub const Server = struct {
 
         // Handle CORS preflight requests for all endpoints
         if (std.mem.eql(u8, method, "OPTIONS")) {
-            try self.sendCorsPreflightResponse(connection.stream);
+            try self.sendCorsPreflightResponse(conn);
             return;
         }
 
@@ -319,52 +379,55 @@ pub const Server = struct {
         if (std.mem.startsWith(u8, path, "/graphql")) {
             // Handle GraphQL queries (both GET and POST)
             if (std.mem.eql(u8, method, "POST")) {
-                try self.handleGraphQLQuery(connection.stream, request);
+                try self.handleGraphQLQuery(conn, request);
             } else if (std.mem.eql(u8, method, "GET")) {
-                try self.handleGraphQLGet(connection.stream, path, request);
+                try self.handleGraphQLGet(conn, path, request);
             } else {
-                try self.sendBadRequest(connection.stream, "Only GET and POST supported for GraphQL");
+                try self.sendBadRequest(conn, "Only GET and POST supported for GraphQL");
             }
         } else if (std.mem.startsWith(u8, path, "/webhooks") and !std.mem.startsWith(u8, path, "/api/webhooks")) {
             // Webhook management UI - only available if webhooks are enabled
             if (self.webhook_database == null) {
-                try self.sendNotFound(connection.stream);
+                try self.sendNotFound(conn);
                 return;
             }
-            // Requires auth if password is set
-            if (!self.checkWebhookAuth(request)) {
-                try self.sendUnauthorized(connection.stream);
-                return;
-            }
-            try self.handleWebhookUI(connection.stream);
+            if (!try self.webhookAuthOk(conn, request)) return;
+            try self.handleWebhookUI(conn);
         } else if (std.mem.startsWith(u8, path, "/api/webhooks")) {
             // Webhook API endpoints - only available if webhooks are enabled
             if (self.webhook_database == null) {
-                try self.sendNotFound(connection.stream);
+                try self.sendNotFound(conn);
                 return;
             }
-            // Requires auth if password is set
-            if (!self.checkWebhookAuth(request)) {
-                try self.sendUnauthorized(connection.stream);
-                return;
-            }
-            try self.handleWebhooksAPI(connection.stream, method, path, request);
+            if (!try self.webhookAuthOk(conn, request)) return;
+            try self.handleWebhooksAPI(conn, method, path, request);
         } else if (std.mem.startsWith(u8, path, "/api/name/")) {
-            try self.handleNameQuery(connection.stream, path);
+            try self.handleNameQuery(conn, path);
         } else if (std.mem.startsWith(u8, path, "/api/owner/")) {
-            try self.handleOwnerQuery(connection.stream, path);
+            try self.handleOwnerQuery(conn, path);
         } else if (std.mem.startsWith(u8, path, "/api/events")) {
-            try self.handleEventsQuery(connection.stream);
+            try self.handleEventsQuery(conn);
         } else if (self.resolve != null and self.resolve.?.primary_verify_enabled and std.mem.startsWith(u8, path, "/internal/verify-primary/")) {
-            // Only routed when primary-name verification is enabled; otherwise this
-            // path falls through to 404, keeping flag-off behavior identical to before.
-            try self.handleVerifyPrimary(connection.stream, path);
+            // Internal ops endpoint: ALWAYS requires a configured admin credential
+            // (fail-closed — no unauth opt-in), because it triggers an on-chain RPC
+            // read per request (amplification vector).
+            if (!self.admin_auth.configured() or !self.admin_auth.checkRequest(request)) {
+                try self.sendUnauthorized(conn);
+                return;
+            }
+            // Dedicated low rate limit on the real client IP, before any DB/RPC work.
+            const internal_client = resolveClientAddress(conn.address(), request, self.trusted_proxy_hops);
+            if (!self.internal_rate_limiter.tryAcquireFor(internal_client)) {
+                try self.sendRateLimited(conn);
+                return;
+            }
+            try self.handleVerifyPrimary(conn, path);
         } else if (std.mem.startsWith(u8, path, "/api/health")) {
-            try self.handleHealthCheck(connection.stream);
+            try self.handleHealthCheck(conn);
         } else if (std.mem.startsWith(u8, path, "/metrics")) {
-            try self.handleMetrics(connection.stream);
+            try self.handleMetrics(conn);
         } else {
-            try self.sendNotFound(connection.stream);
+            try self.sendNotFound(conn);
         }
     }
 
@@ -384,17 +447,30 @@ pub const Server = struct {
     pub const handleGraphQLPlayground = api_endpoints.handleGraphQLPlayground;
 
     // Response writers — implementations in api_responses.zig.
+    /// Gate a webhook admin route. Returns true to proceed; on failure it has
+    /// already sent 401 and the caller must return. Fail-closed: with no credential
+    /// configured the route rejects UNLESS the explicit dev opt-in is set.
+    fn webhookAuthOk(self: *Server, conn: http_util.Conn, request: []const u8) !bool {
+        if (self.admin_auth.configured()) {
+            if (self.admin_auth.checkRequest(request)) return true;
+        } else if (self.allow_unauth_webhooks) {
+            return true;
+        }
+        try self.sendUnauthorized(conn);
+        return false;
+    }
+
     pub const sendJsonResponse = api_responses.sendJsonResponse;
     pub const sendNotFound = api_responses.sendNotFound;
     pub const sendBadRequest = api_responses.sendBadRequest;
     pub const sendGraphQLResponse = api_responses.sendGraphQLResponse;
     pub const sendRequestError = api_responses.sendRequestError;
     pub const sendRateLimited = api_responses.sendRateLimited;
+    pub const sendServiceUnavailable = api_responses.sendServiceUnavailable;
     pub const sendCorsPreflightResponse = api_responses.sendCorsPreflightResponse;
     pub const sendUnauthorized = api_responses.sendUnauthorized;
 
     // Webhook management handlers — implementations in webhook_handlers.zig.
-    pub const checkWebhookAuth = webhook_handlers.checkWebhookAuth;
     pub const handleWebhooksAPI = webhook_handlers.handleWebhooksAPI;
     pub const handleListWebhooks = webhook_handlers.handleListWebhooks;
     pub const handleGetWebhook = webhook_handlers.handleGetWebhook;
@@ -405,15 +481,19 @@ pub const Server = struct {
 };
 
 test "Server init" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
 
     var pool = try pool_mod.Pool.open(allocator, .{ .kind = .sqlite, .sqlite_path = ":memory:" });
     defer pool.deinit();
 
-    var server = try Server.init(allocator, &pool, null, 8080, 10, 1000, false, 100, null, null, 0);
+    var server = try Server.init(allocator, threaded.io(), &pool, null, 8080, 10, 1000, false, 100, null, null, 0, 10000, 512, null, 2, true);
     defer server.deinit();
 
     try std.testing.expect(server.port == 8080);
+    try std.testing.expectEqual(@as(u32, 0), server.active_conns.load(.monotonic));
 }

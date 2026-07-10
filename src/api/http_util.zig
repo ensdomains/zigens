@@ -3,23 +3,133 @@
 //! Pure free functions over strings/allocators — no `Server` state — split out of
 //! server.zig so the request-handling core stays focused. server.zig keeps
 //! file-scope aliases (`const resolveClientAddress = http_util.resolveClientAddress;`
-//! …) so its existing unqualified call sites are unchanged.
+//! …) so its existing unqualified call sites are unchanged. Also home of `Conn`,
+//! the blocking socket wrapper the handler clusters take instead of a raw stream.
 
 const std = @import("std");
 const parser = @import("../lib/graphql/parser.zig");
+
+/// Blocking connection wrapper over a 0.16 `std.Io.net.Stream`. Reads and writes go
+/// straight to the socket fd via libc: the 0.16 Stream Reader/Writer interfaces are
+/// buffered and io-threaded, while the handlers were written against 0.15's plain
+/// blocking read/write semantics — the fd-level calls preserve those exactly.
+pub const Conn = struct {
+    io: std.Io,
+    stream: std.Io.net.Stream,
+
+    pub const ReadError = error{ReadFailed};
+    pub const WriteError = error{WriteFailed};
+
+    fn lastErrno() std.c.E {
+        return @enumFromInt(std.c._errno().*);
+    }
+
+    pub fn address(self: Conn) std.Io.net.IpAddress {
+        return self.stream.socket.address;
+    }
+
+    /// Returns 0 at end of stream, like the old std.net.Stream.read.
+    pub fn read(self: Conn, buffer: []u8) ReadError!usize {
+        while (true) {
+            const rc = std.c.read(self.stream.socket.handle, buffer.ptr, buffer.len);
+            if (rc >= 0) return @intCast(rc);
+            if (lastErrno() != .INTR) return error.ReadFailed;
+        }
+    }
+
+    pub fn write(self: Conn, bytes: []const u8) WriteError!usize {
+        while (true) {
+            const rc = std.c.write(self.stream.socket.handle, bytes.ptr, bytes.len);
+            if (rc >= 0) return @intCast(rc);
+            if (lastErrno() != .INTR) return error.WriteFailed;
+        }
+    }
+
+    pub fn writeAll(self: Conn, bytes: []const u8) WriteError!void {
+        var index: usize = 0;
+        while (index < bytes.len) {
+            index += try self.write(bytes[index..]);
+        }
+    }
+
+    pub fn close(self: Conn) void {
+        self.stream.close(self.io);
+    }
+};
 
 /// Find a header value (case-insensitive name) in a raw HTTP header block. Returns the
 /// trimmed value or null. Handles CRLF and LF line endings.
 fn findHeaderValue(header_data: []const u8, name_lower: []const u8) ?[]const u8 {
     var lines = std.mem.splitScalar(u8, header_data, '\n');
     while (lines.next()) |line0| {
-        const line = std.mem.trimRight(u8, line0, "\r");
+        const line = std.mem.trimEnd(u8, line0, "\r");
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
         if (std.ascii.eqlIgnoreCase(line[0..colon], name_lower)) {
             return std.mem.trim(u8, line[colon + 1 ..], " \t");
         }
     }
     return null;
+}
+
+/// Set a receive + send timeout on an accepted socket so a stalled or trickling peer
+/// cannot pin a handler thread forever (slow-loris). Best-effort: a setsockopt failure
+/// is ignored, so the caller's wall-clock request deadline remains the real backstop.
+pub fn setStreamTimeout(handle: std.posix.socket_t, timeout_ms: u32) void {
+    if (timeout_ms == 0) return;
+    const tv = std.posix.timeval{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @intCast((timeout_ms % 1000) * 1000),
+    };
+    const bytes = std.mem.asBytes(&tv);
+    std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, bytes) catch {};
+    std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, bytes) catch {};
+}
+
+pub const FramingError = error{
+    ChunkedUnsupported,
+    ContentLengthAndTransferEncoding,
+    ConflictingContentLength,
+    MalformedContentLength,
+};
+
+/// Determine the request body length from the header block (the bytes BEFORE the
+/// blank-line terminator). Rejects framing this server does not safely support
+/// rather than guessing a length, because an ambiguous body length is a
+/// request-smuggling / desync vector:
+///   - Transfer-Encoding present alongside Content-Length  -> CL.TE desync.
+///   - Transfer-Encoding present alone (e.g. chunked)       -> not decoded here.
+///   - Two Content-Length values that disagree             -> ambiguous framing.
+///   - A non-numeric Content-Length                        -> malformed.
+/// A request carrying neither header has a zero-length body.
+pub fn parseBodyFraming(header_block: []const u8) FramingError!usize {
+    var content_length: ?usize = null;
+    var has_transfer_encoding = false;
+
+    var lines = std.mem.splitScalar(u8, header_block, '\n');
+    _ = lines.next(); // skip the request line (has no header colon semantics)
+    while (lines.next()) |line0| {
+        const line = std.mem.trimEnd(u8, line0, "\r");
+        if (line.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const key = line[0..colon];
+        const val = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(key, "content-length")) {
+            const n = std.fmt.parseInt(usize, val, 10) catch return error.MalformedContentLength;
+            if (content_length) |prev| {
+                if (prev != n) return error.ConflictingContentLength;
+            } else {
+                content_length = n;
+            }
+        } else if (std.ascii.eqlIgnoreCase(key, "transfer-encoding")) {
+            has_transfer_encoding = true;
+        }
+    }
+
+    if (has_transfer_encoding) {
+        if (content_length != null) return error.ContentLengthAndTransferEncoding;
+        return error.ChunkedUnsupported;
+    }
+    return content_length orelse 0;
 }
 
 /// Resolve the client IP to rate-limit on, given the direct TCP peer and request headers,
@@ -30,7 +140,7 @@ fn findHeaderValue(header_data: []const u8, name_lower: []const u8) ?[]const u8 
 /// counting from the right skips exactly the trusted hops. The direct peer is the hop-th
 /// proxy (not in XFF), so we skip `hops - 1` XFF entries. Falls back to the direct peer if
 /// XFF is absent, too short, or unparseable.
-pub fn resolveClientAddress(direct_peer: std.net.Address, header_data: []const u8, hops: u32) std.net.Address {
+pub fn resolveClientAddress(direct_peer: std.Io.net.IpAddress, header_data: []const u8, hops: u32) std.Io.net.IpAddress {
     const xff = findHeaderValue(header_data, "x-forwarded-for") orelse return direct_peer;
     var skip: u32 = if (hops > 0) hops - 1 else 0;
     var it = std.mem.splitBackwardsScalar(u8, xff, ',');
@@ -41,7 +151,7 @@ pub fn resolveClientAddress(direct_peer: std.net.Address, header_data: []const u
             skip -= 1;
             continue;
         }
-        return std.net.Address.parseIp(ip_str, 0) catch direct_peer;
+        return std.Io.net.IpAddress.parse(ip_str, 0) catch direct_peer;
     }
     return direct_peer;
 }
@@ -108,7 +218,7 @@ pub fn getQueryParam(qs: []const u8, key: []const u8) ?[]const u8 {
 /// Decode an application/x-www-form-urlencoded component (`%XX` escapes, `+` for space).
 /// Malformed escapes are passed through verbatim.
 pub fn urlDecode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var i: usize = 0;
     while (i < input.len) : (i += 1) {
@@ -146,11 +256,11 @@ pub fn queryIsMutation(allocator: std.mem.Allocator, query: []const u8) bool {
 }
 
 test "resolveClientAddress: X-Forwarded-For trusted-proxy resolution (spoof-resistant)" {
-    const peer = try std.net.Address.parseIp("10.0.0.1", 0); // the proxy = direct peer
+    const peer = try std.Io.net.IpAddress.parse("10.0.0.1", 0); // the proxy = direct peer
     const eq = struct {
-        fn f(a: std.net.Address, ip: []const u8) bool {
-            const b = std.net.Address.parseIp(ip, 0) catch return false;
-            return a.eql(b);
+        fn f(a: std.Io.net.IpAddress, ip: []const u8) bool {
+            const b = std.Io.net.IpAddress.parse(ip, 0) catch return false;
+            return a.eql(&b);
         }
     }.f;
     // Single trusted proxy: client is the rightmost XFF entry.
@@ -191,4 +301,22 @@ test "strictStatus: 400 for request/parse/validation codes, 200 otherwise" {
     try std.testing.expectEqual(@as(u16, 400), strictStatus("{\"errors\":[{\"extensions\":{\"code\":\"INVALID_ARGUMENT\"}}],\"data\":null}"));
     // A field/execution error (no request-level code) stays 200 under the spec.
     try std.testing.expectEqual(@as(u16, 200), strictStatus("{\"errors\":[{\"extensions\":{\"code\":\"INTERNAL_ERROR\"}}],\"data\":null}"));
+}
+
+test "parseBodyFraming: content-length parsed; absent = 0" {
+    try std.testing.expectEqual(@as(usize, 5), try parseBodyFraming("POST / HTTP/1.1\r\nContent-Length: 5\r\nHost: x"));
+    try std.testing.expectEqual(@as(usize, 0), try parseBodyFraming("GET / HTTP/1.1\r\nHost: x"));
+    // bare-LF line endings
+    try std.testing.expectEqual(@as(usize, 7), try parseBodyFraming("POST / HTTP/1.1\nContent-Length: 7"));
+}
+
+test "parseBodyFraming: rejects chunked and CL+TE (smuggling vectors)" {
+    try std.testing.expectError(error.ChunkedUnsupported, parseBodyFraming("POST / HTTP/1.1\r\nTransfer-Encoding: chunked"));
+    try std.testing.expectError(error.ContentLengthAndTransferEncoding, parseBodyFraming("POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked"));
+}
+
+test "parseBodyFraming: rejects conflicting/malformed content-length; identical dup ok" {
+    try std.testing.expectError(error.ConflictingContentLength, parseBodyFraming("POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6"));
+    try std.testing.expectError(error.MalformedContentLength, parseBodyFraming("POST / HTTP/1.1\r\nContent-Length: abc"));
+    try std.testing.expectEqual(@as(usize, 5), try parseBodyFraming("POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5"));
 }

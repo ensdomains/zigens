@@ -5,36 +5,30 @@ const Hash = @import("types/hash.zig").Hash;
 const v1_names = @import("utils/v1_names.zig");
 const unknown_labels_storage = @import("storage/unknown_labels.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+pub fn main(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     std.log.info("=== Rainbow Table Backfill Tool ===", .{});
-
-    // Parse args
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
 
     var db_path: []const u8 = "./data/ens.db";
     var rainbow_path: []const u8 = "./data/ens_rainbow.db";
     var batch_size: u32 = 100;
     var dry_run = false;
 
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--db")) {
-            i += 1;
-            if (i < args.len) db_path = args[i];
-        } else if (std.mem.eql(u8, args[i], "--rainbow")) {
-            i += 1;
-            if (i < args.len) rainbow_path = args[i];
-        } else if (std.mem.eql(u8, args[i], "--batch-size")) {
-            i += 1;
-            if (i < args.len) batch_size = std.fmt.parseInt(u32, args[i], 10) catch 100;
-        } else if (std.mem.eql(u8, args[i], "--dry-run")) {
+    var args = init.minimal.args.iterate();
+    _ = args.skip();
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--db")) {
+            if (args.next()) |value| db_path = value;
+        } else if (std.mem.eql(u8, arg, "--rainbow")) {
+            if (args.next()) |value| rainbow_path = value;
+        } else if (std.mem.eql(u8, arg, "--batch-size")) {
+            if (args.next()) |value| batch_size = std.fmt.parseInt(u32, value, 10) catch 100;
+        } else if (std.mem.eql(u8, arg, "--dry-run")) {
             dry_run = true;
-        } else if (std.mem.eql(u8, args[i], "--help")) {
+        } else if (std.mem.eql(u8, arg, "--help")) {
             printUsage();
             return;
         }

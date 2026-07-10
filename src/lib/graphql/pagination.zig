@@ -174,6 +174,63 @@ pub const CursorCodec = struct {
         allocator.free(decoded);
         return result;
     }
+
+    /// Decoded keyset cursor: the sort-field discriminator, an optional cached
+    /// totalCount snapshot, and the last row's (sort_value, namehash). Slices borrow
+    /// the decode buffer; see decodeKeyset.
+    pub const Keyset = struct {
+        field: u8,
+        total_count: ?usize,
+        sort_value: []const u8,
+        namehash: []const u8,
+        buf: []const u8, // backing allocation; free via deinit
+        pub fn deinit(self: Keyset, allocator: std.mem.Allocator) void {
+            allocator.free(self.buf);
+        }
+    };
+
+    /// Encode a keyset cursor: base64 of "ks\n<field>\n<count>\n<namehash>\n<sort_value>".
+    /// `count` is the totalCount snapshot (empty when unknown); `namehash` is 0x-hex
+    /// (no '\n'); `sort_value` is placed last so it may contain any bytes. `field` is
+    /// an opaque sort-field discriminator the caller assigns.
+    pub fn encodeKeyset(allocator: std.mem.Allocator, field: u8, total_count: ?usize, sort_value: []const u8, namehash: []const u8) !Cursor {
+        const plain = if (total_count) |tc|
+            try std.fmt.allocPrint(allocator, "ks\n{c}\n{d}\n{s}\n{s}", .{ field, tc, namehash, sort_value })
+        else
+            try std.fmt.allocPrint(allocator, "ks\n{c}\n\n{s}\n{s}", .{ field, namehash, sort_value });
+        defer allocator.free(plain);
+        const encoder = base64.standard.Encoder;
+        const encoded = try allocator.alloc(u8, encoder.calcSize(plain.len));
+        errdefer allocator.free(encoded);
+        return encoder.encode(encoded, plain);
+    }
+
+    /// Decode a keyset cursor produced by encodeKeyset. Returns error.InvalidCursor
+    /// for any non-keyset or malformed cursor (e.g. an old bare-namehash cursor).
+    pub fn decodeKeyset(allocator: std.mem.Allocator, cursor: Cursor) !Keyset {
+        const decoder = base64.standard.Decoder;
+        const decoded_len = decoder.calcSizeForSlice(cursor) catch return error.InvalidCursor;
+        const buf = try allocator.alloc(u8, decoded_len);
+        errdefer allocator.free(buf);
+        decoder.decode(buf, cursor) catch return error.InvalidCursor;
+
+        if (!std.mem.startsWith(u8, buf, "ks\n") or buf.len < 6) return error.InvalidCursor;
+        const field = buf[3];
+        if (buf[4] != '\n') return error.InvalidCursor;
+        // rest = "<count>\n<namehash>\n<sort_value>"
+        const rest = buf[5..];
+        const nl1 = std.mem.indexOfScalar(u8, rest, '\n') orelse return error.InvalidCursor;
+        const count_str = rest[0..nl1];
+        const rest2 = rest[nl1 + 1 ..];
+        const nl2 = std.mem.indexOfScalar(u8, rest2, '\n') orelse return error.InvalidCursor;
+        return .{
+            .field = field,
+            .total_count = if (count_str.len > 0) (std.fmt.parseInt(usize, count_str, 10) catch null) else null,
+            .namehash = rest2[0..nl2],
+            .sort_value = rest2[nl2 + 1 ..],
+            .buf = buf,
+        };
+    }
 };
 
 /// Build a connection from a slice of items with integer IDs.

@@ -18,9 +18,8 @@ const CliArgs = struct {
     help: bool = false,
 };
 
-fn parseArgs(allocator: std.mem.Allocator) !CliArgs {
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
+fn parseArgs(process_args: std.process.Args) !CliArgs {
+    var args = process_args.iterate();
 
     // Skip program name
     _ = args.skip();
@@ -82,17 +81,18 @@ fn printHelp() void {
     , .{});
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     // Configure SQLite for thread safety BEFORE any other operations
     db.configureSqliteThreadSafety();
 
     // Use thread-safe GPA configuration
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    const io = init.io;
 
     // Parse command line arguments
-    const args = try parseArgs(allocator);
+    const args = try parseArgs(init.minimal.args);
 
     if (args.help) {
         printHelp();
@@ -149,7 +149,7 @@ pub fn main() !void {
     }
 
     // Initialize and start indexer
-    var idx = try indexer.Indexer.init(allocator, cfg, &database, args.to_block);
+    var idx = try indexer.Indexer.init(allocator, io, cfg, &database, args.to_block);
     defer idx.deinit();
 
     std.log.info("Indexer started - indexing blocks...", .{});

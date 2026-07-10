@@ -17,6 +17,13 @@ pub const MAX_FIRST: i64 = 1000;
 /// Default skip (offset) when pagination args are omitted.
 pub const DEFAULT_SKIP: i64 = 0;
 
+/// Maximum offset for flat `skip`-paginated queries. Bounds the value so the
+/// `@intCast` to the u32 `Pagination.skip` cannot panic on a hostile
+/// `skip: 9999999999` (which would otherwise crash the process), and keeps
+/// deep-offset scans from becoming an amplification vector. Clients needing to
+/// page deeper than this should use cursor (connection) pagination.
+pub const MAX_SKIP: i64 = 1_000_000;
+
 // ============================================================================
 // PAGINATION
 // ============================================================================
@@ -30,7 +37,9 @@ pub const Pagination = struct {
 /// - `first`: explicitly-passed values exceeding MAX_FIRST return `error.LimitExceeded`
 ///   so callers don't get deceptively-truncated pages. The default (when omitted)
 ///   never errors. Negative values return `error.NegativeLimit`.
-/// - `skip`: clamped to `[0, ∞)` (negative values silently snap to 0).
+/// - `skip`: negative values return `error.NegativeLimit`; values exceeding
+///   `MAX_SKIP` return `error.LimitExceeded` (an unbounded `skip` would overflow
+///   the u32 cast and crash the process).
 ///
 /// For Relay-style connection queries, use `lib/graphql/pagination.PaginationParams.parse`
 /// instead — this helper is for flat list queries that take `first`/`skip` directly.
@@ -40,15 +49,15 @@ pub fn parsePagination(field: *const parser.Field, default_first: i64) !Paginati
     const first_explicit = parser.getIntArg(field, "first", null);
     const first_raw = first_explicit orelse default_first;
     const skip_raw = parser.getIntArg(field, "skip", DEFAULT_SKIP) orelse DEFAULT_SKIP;
-    if (first_raw < 0) return error.NegativeLimit;
+    if (first_raw < 0 or skip_raw < 0) return error.NegativeLimit;
     if (first_explicit) |e| {
         if (e > MAX_FIRST) return error.LimitExceeded;
     }
+    if (skip_raw > MAX_SKIP) return error.LimitExceeded;
     const first_clamped = @min(first_raw, MAX_FIRST);
-    const skip_clamped = @max(skip_raw, 0);
     return .{
         .first = @intCast(first_clamped),
-        .skip = @intCast(skip_clamped),
+        .skip = @intCast(skip_raw),
     };
 }
 
@@ -138,7 +147,7 @@ pub fn parseStringListArg(arg: parser.Argument, allocator: std.mem.Allocator) !?
     const constants_mod = @import("../constants.zig");
     if (arg.value != .list) return null;
     if (arg.value.list.len > constants_mod.Pagination.max_limit) return error.TooManyNames;
-    var list: std.ArrayList([]const u8) = .{};
+    var list: std.ArrayList([]const u8) = .empty;
     defer list.deinit(allocator);
     for (arg.value.list) |item| {
         if (item == .string) try list.append(allocator, item.string);
@@ -152,7 +161,7 @@ pub fn parseStringListArg(arg: parser.Argument, allocator: std.mem.Allocator) !?
 /// fails hex parsing (matches `matchAddressArg`'s fail-loud semantics).
 pub fn parseAddressListArg(arg: parser.Argument, allocator: std.mem.Allocator) !?[]Address {
     if (arg.value != .list) return null;
-    var list: std.ArrayList(Address) = .{};
+    var list: std.ArrayList(Address) = .empty;
     defer list.deinit(allocator);
     for (arg.value.list) |item| {
         if (item == .string) {

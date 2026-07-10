@@ -29,7 +29,7 @@ fn isConflictCol(conflict_cols: []const []const u8, col: []const u8) bool {
 /// `DO NOTHING` if every column is part of the conflict key).
 fn dialectUpsert(allocator: std.mem.Allocator, table: []const u8, cols: []const []const u8, value_exprs: []const []const u8, conflict_cols: []const []const u8, action: backend.ConflictAction) anyerror![]u8 {
     std.debug.assert(value_exprs.len == 0 or value_exprs.len == cols.len);
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     try buf.appendSlice(allocator, "INSERT INTO ");
     try appendQuotedIdent(allocator, &buf, table);
@@ -50,7 +50,7 @@ fn dialectUpsert(allocator: std.mem.Allocator, table: []const u8, cols: []const 
 
 /// `INSERT INTO "t" (cols) <select_body> ON CONFLICT … DO NOTHING/UPDATE`.
 fn dialectInsertSelect(allocator: std.mem.Allocator, table: []const u8, cols: []const []const u8, select_body: []const u8, conflict_cols: []const []const u8, action: backend.ConflictAction) anyerror![]u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     try buf.appendSlice(allocator, "INSERT INTO ");
     try appendQuotedIdent(allocator, &buf, table);
@@ -99,12 +99,12 @@ fn dialectReturning(allocator: std.mem.Allocator, col: []const u8) anyerror![]u8
 /// `jsonb_build_object('c', alias."c", …)` — the Postgres counterpart of SQLite's
 /// per-column `json_object`.
 fn dialectJsonObject(allocator: std.mem.Allocator, cols: []const []const u8, alias: []const u8) anyerror![]u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     try buf.appendSlice(allocator, "jsonb_build_object(");
     for (cols, 0..) |col, i| {
         if (i > 0) try buf.appendSlice(allocator, ", ");
-        try buf.writer(allocator).print("'{s}', {s}.\"{s}\"", .{ col, alias, col });
+        try buf.print(allocator, "'{s}', {s}.\"{s}\"", .{ col, alias, col });
     }
     try buf.append(allocator, ')');
     return buf.toOwnedSlice(allocator);
@@ -145,7 +145,7 @@ pub const pg_dialect = backend.Dialect{
 /// renumbered; add comment/dollar-quote skipping here if that ever changes.
 /// Caller owns the returned slice.
 pub fn renumberPlaceholders(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     var auto: usize = 0;
     var i: usize = 0;
@@ -201,7 +201,7 @@ pub fn renumberPlaceholders(allocator: std.mem.Allocator, sql: []const u8) ![]u8
                 } else {
                     // bare ? → next positional $N
                     auto += 1;
-                    try buf.writer(allocator).print("${d}", .{auto});
+                    try buf.print(allocator, "${d}", .{auto});
                 }
             },
             else => {

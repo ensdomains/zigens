@@ -61,7 +61,7 @@ fn parseRegWhereArgs(where_args: []const parser.Argument, allocator: std.mem.All
     for (where_args) |a| {
         if ((std.mem.eql(u8, a.name, "and") or std.mem.eql(u8, a.name, "or")) and a.value == .list) {
             const is_and = std.mem.eql(u8, a.name, "and");
-            var group: std.ArrayList(ParsedRegistrationFilter) = .{};
+            var group: std.ArrayList(ParsedRegistrationFilter) = .empty;
             errdefer {
                 for (group.items) |*c| c.deinit(allocator);
                 group.deinit(allocator);
@@ -224,9 +224,9 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
     const events = try database.getRegistrations(fetch_filter);
     defer {
         for (events) |*event| {
-            event.deinit(allocator);
+            event.deinit(database.allocator);
         }
-        allocator.free(events);
+        database.allocator.free(events);
     }
 
     // We fetched `params.limit + 1` to detect a trailing page; if we actually got
@@ -277,6 +277,7 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
                 .depth = 0,
                 .allocator = allocator,
                 .loaders = ctx.loaders,
+                .resolve = null, // list context: live resolution is single-name only, never per-row
             },
             .id = id,
         };
@@ -301,7 +302,7 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
     defer connection.deinit(allocator);
 
     // Build JSON from connection
-    var json: std.ArrayList(u8) = .{};
+    var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);
 
     try json.appendSlice(allocator, "{\"pageInfo\":{");
@@ -396,14 +397,14 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
     });
     defer {
         for (events_result) |*event| {
-            event.deinit(allocator);
+            event.deinit(database.allocator);
         }
-        allocator.free(events_result);
+        database.allocator.free(events_result);
     }
 
     // Data is sorted by SQL for all paths now
     // Build JSON, applying skip
-    var json: std.ArrayList(u8) = .{};
+    var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);
 
     try json.appendSlice(allocator, "[");
@@ -417,6 +418,7 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
             .depth = 0,
             .allocator = allocator,
             .loaders = ctx.loaders,
+            .resolve = null, // list context: live resolution is single-name only, never per-row
         });
         defer allocator.free(reg_json);
         try json.appendSlice(allocator, reg_json);

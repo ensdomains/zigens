@@ -16,7 +16,7 @@ const std = @import("std");
 /// 1..=255 bytes; an empty interior label (e.g. "a..b") or an over-long label is
 /// rejected. Caller owns the returned slice.
 pub fn encodeDNSName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
     if (name.len != 0) {
@@ -35,7 +35,7 @@ pub fn encodeDNSName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
 /// Returns a slice of labels (e.g., ["vitalik", "eth"]).
 /// Caller owns the returned slice and each label string (all allocated from `allocator`).
 pub fn decodeDNSName(allocator: std.mem.Allocator, data: []const u8) ![][]const u8 {
-    var labels: std.ArrayList([]const u8) = .{};
+    var labels: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (labels.items) |l| allocator.free(l);
         labels.deinit(allocator);

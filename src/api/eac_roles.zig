@@ -134,7 +134,7 @@ pub fn parseBitmap(hex: []const u8) !u256 {
 /// Caller owns the returned slice and each contained string; free with
 /// `freePermissions`.
 pub fn decode(allocator: std.mem.Allocator, bitmap: u256, kind: ContractKind) ![]const []const u8 {
-    var list: std.ArrayList([]const u8) = .{};
+    var list: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (list.items) |item| allocator.free(item);
         list.deinit(allocator);

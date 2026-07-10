@@ -43,9 +43,9 @@ fn mockDomainResolver(ctx: parser.ExecutionContext, field: *const parser.Field) 
     const allocator = ctx.allocator;
 
     // Build JSON based on requested selections
-    var json: std.ArrayList(u8) = .{};
-    defer json.deinit(allocator);
-    const writer = json.writer(allocator);
+    var json: std.Io.Writer.Allocating = .init(allocator);
+    defer json.deinit();
+    const writer = &json.writer;
 
     try writer.writeAll("{");
     var first = true;
@@ -92,7 +92,7 @@ fn mockDomainResolver(ctx: parser.ExecutionContext, field: *const parser.Field) 
     try writer.writeAll("}");
 
     return parser.FieldResult{
-        .json = try allocator.dupe(u8, json.items),
+        .json = try allocator.dupe(u8, json.written()),
     };
 }
 
@@ -109,9 +109,9 @@ fn mockDomainsResolver(ctx: parser.ExecutionContext, field: *const parser.Field)
         }
     }
 
-    var json: std.ArrayList(u8) = .{};
-    defer json.deinit(allocator);
-    const writer = json.writer(allocator);
+    var json: std.Io.Writer.Allocating = .init(allocator);
+    defer json.deinit();
+    const writer = &json.writer;
 
     try writer.writeAll("[");
 
@@ -165,16 +165,16 @@ fn mockDomainsResolver(ctx: parser.ExecutionContext, field: *const parser.Field)
     try writer.writeAll("]");
 
     return parser.FieldResult{
-        .json = try allocator.dupe(u8, json.items),
+        .json = try allocator.dupe(u8, json.written()),
     };
 }
 
 fn mockEventsResolver(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
     const allocator = ctx.allocator;
 
-    var json: std.ArrayList(u8) = .{};
-    defer json.deinit(allocator);
-    const writer = json.writer(allocator);
+    var json: std.Io.Writer.Allocating = .init(allocator);
+    defer json.deinit();
+    const writer = &json.writer;
 
     try writer.writeAll("[{");
     var first = true;
@@ -199,16 +199,16 @@ fn mockEventsResolver(ctx: parser.ExecutionContext, field: *const parser.Field) 
     try writer.writeAll("}]");
 
     return parser.FieldResult{
-        .json = try allocator.dupe(u8, json.items),
+        .json = try allocator.dupe(u8, json.written()),
     };
 }
 
 fn mockRegistrationsResolver(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
     const allocator = ctx.allocator;
 
-    var json: std.ArrayList(u8) = .{};
-    defer json.deinit(allocator);
-    const writer = json.writer(allocator);
+    var json: std.Io.Writer.Allocating = .init(allocator);
+    defer json.deinit();
+    const writer = &json.writer;
 
     try writer.writeAll("[{");
     var first = true;
@@ -230,7 +230,7 @@ fn mockRegistrationsResolver(ctx: parser.ExecutionContext, field: *const parser.
     try writer.writeAll("}]");
 
     return parser.FieldResult{
-        .json = try allocator.dupe(u8, json.items),
+        .json = try allocator.dupe(u8, json.written()),
     };
 }
 

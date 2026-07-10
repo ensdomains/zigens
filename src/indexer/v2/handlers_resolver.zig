@@ -1,4 +1,5 @@
 const std = @import("std");
+const zsys = @import("../../utils/system.zig");
 const models = @import("../../types/models.zig");
 // ABI decoding migrated to eth.zig-backed shim. Old `../abi.zig` kept for
 // fallback. This file uses no EventSignatures, so the swap is wholesale.
@@ -52,7 +53,7 @@ pub fn handleLegacyAddrChanged(self: *Indexer, protocol: models.Protocol, resolv
         protocol,
         log.block_number,
         log.transaction_hash,
-        std.time.timestamp(),
+        zsys.timestamp(),
     );
 }
 
@@ -94,7 +95,7 @@ pub fn handleLegacyContentChanged(self: *Indexer, protocol: models.Protocol, res
         protocol,
         log.block_number,
         log.transaction_hash,
-        std.time.timestamp(),
+        zsys.timestamp(),
     );
 
     // Store event
@@ -155,7 +156,7 @@ pub fn handleAddressChanged(self: *Indexer, protocol: models.Protocol, resolver:
         protocol,
         log.block_number,
         log.transaction_hash,
-        std.time.timestamp(),
+        zsys.timestamp(),
     );
 
     // Store event and trigger webhooks
@@ -216,7 +217,7 @@ pub fn handleContentHashChanged(self: *Indexer, protocol: models.Protocol, resol
         protocol,
         log.block_number,
         log.transaction_hash,
-        std.time.timestamp(),
+        zsys.timestamp(),
     );
 
     // Store event and trigger webhooks
@@ -241,7 +242,7 @@ pub fn handleContentHashChanged(self: *Indexer, protocol: models.Protocol, resol
 /// Subgraph parity: SQLite TEXT and JSON output don't tolerate NUL bytes well.
 /// Caller owns the returned slice.
 fn stripNulls(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.ensureTotalCapacity(allocator, input.len);
     for (input) |b| {
@@ -308,7 +309,7 @@ pub fn handleTextChanged(self: *Indexer, protocol: models.Protocol, resolver: Ad
             protocol,
             log.block_number,
             log.transaction_hash,
-            std.time.timestamp(),
+            zsys.timestamp(),
         );
     }
 
@@ -394,7 +395,7 @@ pub fn handleLegacyTextChanged(self: *Indexer, protocol: models.Protocol, resolv
             protocol,
             log.block_number,
             log.transaction_hash,
-            std.time.timestamp(),
+            zsys.timestamp(),
         );
     }
 

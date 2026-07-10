@@ -1,4 +1,5 @@
 const std = @import("std");
+const zsys = @import("../../utils/system.zig");
 const ens_name = @import("../../utils/ens_name.zig");
 const constants = @import("../../constants.zig");
 const models = @import("../../types/models.zig");
@@ -99,7 +100,7 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
         try q.bindInt64(@intCast(log.block_number));
         try q.bindTextStatic(tx_hash_hex);
         try q.bindInt64(@intCast(log.log_index));
-        try q.bindInt64(std.time.timestamp());
+        try q.bindInt64(zsys.timestamp());
         try q.exec();
 
         // Sibling parity: Transfer/NewResolver/NewTTL emit events rows in this
@@ -184,7 +185,7 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
 
     // Create or update the name record
     const registry = try Address.fromHex("00000000000C2E074eC69A0dFb2997BA6C7d2e1e");
-    const now = std.time.timestamp();
+    const now = zsys.timestamp();
 
     if (try names_storage.getNameByNamehash(self.database, subdomain_namehash)) |existing| {
         // Name already exists — update owner
@@ -901,7 +902,7 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, protocol: models.Prot
             .created_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
             .registered_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
             .updated_block = log.block_number,
-            .updated_at = std.time.timestamp(),
+            .updated_at = zsys.timestamp(),
             .is_wrapped = false, // Not wrapped initially
             .wrapper_fuses = null,
             .wrapper_expiry = null,
@@ -1017,7 +1018,7 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, protocol: models.Prot
             .created_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
             .registered_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
             .updated_block = log.block_number,
-            .updated_at = std.time.timestamp(),
+            .updated_at = zsys.timestamp(),
             .is_wrapped = false,
             .wrapper_fuses = null,
             .wrapper_expiry = null,
@@ -1698,7 +1699,7 @@ fn healLabelsFromDNSName(self: *Indexer, name_bytes: []const u8, wrapped_node: H
         Keccak256.hash(&input, &current_namehash, .{});
 
         // Build the name string for this level
-        var name_parts: std.ArrayList([]const u8) = .{};
+        var name_parts: std.ArrayList([]const u8) = .empty;
         defer name_parts.deinit(self.allocator);
         var j: usize = i;
         while (j < labels.len) : (j += 1) {
