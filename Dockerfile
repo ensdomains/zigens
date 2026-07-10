@@ -3,7 +3,7 @@
 # Rainbow table is downloaded automatically on first startup
 
 # Stage 1: Build Zig applications
-FROM alpine:3.19 AS builder
+FROM alpine:3.22 AS builder
 
 # Install build dependencies
 RUN apk add --no-cache \
@@ -43,7 +43,7 @@ COPY . .
 RUN zig build -Doptimize=ReleaseSafe -Dpg-tls=true
 
 # Stage 2: Runtime
-FROM alpine:3.19
+FROM alpine:3.22
 
 # Install runtime dependencies (including tools for rainbow download)
 RUN apk add --no-cache \
