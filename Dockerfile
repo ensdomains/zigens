@@ -16,12 +16,10 @@ RUN apk add --no-cache \
     g++ \
     python3
 
-# Install Zig 0.15.x (latest stable)
+# Install Zig (must match build.zig.zon's minimum_zig_version — the pinned deps
+# target this std API and fail to compile under older toolchains)
 # Note: Zig 0.15+ uses new naming convention: zig-{arch}-linux instead of zig-linux-{arch}
-# 0.15.2 is a stdlib patch release with std.http.Client + std.crypto.tls fixes;
-# 0.15.1 produced 90s+ TLS/HTTP hangs in deployment that manifested as 408s from
-# the RPC provider, while 0.15.2 (matching local dev) works fine.
-ARG ZIG_VERSION=0.15.2
+ARG ZIG_VERSION=0.16.0
 ARG TARGETARCH
 RUN ARCH=$(case ${TARGETARCH:-$(uname -m)} in \
         amd64|x86_64) echo "x86_64" ;; \
