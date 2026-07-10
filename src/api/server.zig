@@ -10,6 +10,12 @@ const json_utils = @import("../utils/json.zig");
 const url_utils = @import("../utils/url.zig");
 const validation = @import("../utils/validation.zig");
 const PerIpRateLimiter = @import("../rate_limiter.zig").PerIpRateLimiter;
+
+/// Deliberately LOOSE per-IP rate limit for the Prometheus GET /metrics scrape endpoint.
+/// It gets its own bucket so scrapes never compete with API traffic; the value is generous
+/// enough that real scraping (well under 1/s) is never limited, while still bounding a
+/// /metrics flood (each hit does a DB pool acquire + finality reads).
+const METRICS_RATE_LIMIT_PER_SECOND: u32 = 60;
 const webhook_manager = @import("../webhooks/manager.zig");
 const rpc = @import("../rpc/client.zig");
 const resolve_client = @import("../resolve/client.zig");
@@ -66,6 +72,8 @@ pub const Server = struct {
     server: ?std.Io.net.Server,
     graphql_handler: graphql.GraphQLHandler,
     rate_limiter: PerIpRateLimiter,
+    /// Loose dedicated bucket for GET /metrics (see METRICS_RATE_LIMIT_PER_SECOND).
+    metrics_rate_limiter: PerIpRateLimiter,
     /// Unified admin/internal credential check (constant-time, fail-closed).
     admin_auth: auth.AdminAuth,
     /// Dedicated low rate limiter for the RPC-amplifying internal routes.
@@ -109,6 +117,7 @@ pub const Server = struct {
             .server = null,
             .graphql_handler = try graphql.GraphQLHandler.init(allocator, complexity_max_depth, complexity_max_cost, metrics_enabled),
             .rate_limiter = PerIpRateLimiter.init(allocator, rate_limit * 2, rate_limit, 100_000),
+            .metrics_rate_limiter = PerIpRateLimiter.init(allocator, METRICS_RATE_LIMIT_PER_SECOND * 2, METRICS_RATE_LIMIT_PER_SECOND, 100_000),
             .admin_auth = auth.AdminAuth.init(webhook_admin_username, webhook_admin_password, internal_admin_token),
             .internal_rate_limiter = PerIpRateLimiter.init(allocator, @max(internal_rate_limit_per_second * 2, 1), internal_rate_limit_per_second, 100_000),
             .allow_unauth_webhooks = allow_unauth_webhooks,
@@ -150,6 +159,7 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         self.graphql_handler.deinit();
         self.rate_limiter.deinit();
+        self.metrics_rate_limiter.deinit();
         self.internal_rate_limiter.deinit();
         if (self.webhook_database) |webhook_db| {
             webhook_db.deinit();
@@ -187,15 +197,9 @@ pub const Server = struct {
             // handleConnection is the backstop for a peer that trickles under it.
             http_util.setStreamTimeout(conn.stream.socket.handle, self.request_timeout_ms);
 
-            // Rate-limit the direct peer BEFORE spawning a thread, so a flooder is
-            // refused without ever allocating a 2MB handler stack. Behind a trusted
-            // proxy the direct peer is the proxy (shared), so that case is limited on
-            // the real client IP inside handleConnection instead.
-            if (self.trusted_proxy_hops == 0 and !self.rate_limiter.tryAcquireFor(conn.address())) {
-                self.sendRateLimited(conn) catch {};
-                conn.close();
-                continue;
-            }
+            // Per-IP rate limiting moved into handleConnection (after the request line is
+            // read) so GET /metrics can use its own loose bucket — its path is not known
+            // here. The concurrency cap below stays pre-spawn as the flood ceiling.
 
             // Concurrency cap: refuse with 503 rather than spawn an unbounded number of
             // handler threads under a connection flood. Reserve the slot before spawn;
@@ -226,9 +230,8 @@ pub const Server = struct {
     }
 
     fn handleConnection(self: *Server, conn: http_util.Conn) !void {
-        // The direct-peer rate limit (trusted_proxy_hops == 0) now runs in the accept
-        // loop, before this thread is spawned; behind a trusted proxy we still limit on
-        // the real client IP from X-Forwarded-For after the bounded header read below.
+        // Per-IP rate limiting runs below, after the bounded header read, so the request
+        // line is available and the Prometheus scrape endpoint can be exempted.
 
         // Wall-clock request deadline: the per-socket receive timeout bounds each
         // individual read, but a peer trickling one byte per interval could survive
@@ -261,12 +264,25 @@ pub const Server = struct {
 
         const header_data = header_buffer[0..total_header_bytes];
 
-        // Behind a trusted proxy: rate-limit on the real client IP from X-Forwarded-For
-        // (spoof-resistant — see resolveClientAddress). Done after the bounded header read,
-        // still before any request body is processed.
-        if (self.trusted_proxy_hops > 0) {
-            const client_addr = resolveClientAddress(conn.address(), header_data, self.trusted_proxy_hops);
-            if (!self.rate_limiter.tryAcquireFor(client_addr)) {
+        // Per-IP rate limiting, applied here (after the bounded header read, before any
+        // body processing) so the request line is known. GET /metrics gets its own LOOSE
+        // bucket (metrics_rate_limiter) so a Prometheus scrape is never starved by API
+        // traffic sharing a bucket — notably behind a proxy with trusted_proxy_hops == 0,
+        // where the shared key is the proxy's IP — while a /metrics flood stays bounded.
+        // The direct peer is the key when no proxy hops are trusted; otherwise the real
+        // client IP is recovered from X-Forwarded-For (spoof-resistant — see resolveClientAddress).
+        {
+            const rl_line_end = std.mem.indexOfScalar(u8, header_data, '\n') orelse header_data.len;
+            var rl_parts = std.mem.splitScalar(u8, header_data[0..rl_line_end], ' ');
+            const rl_method = rl_parts.next() orelse "";
+            const rl_path = rl_parts.next() orelse "";
+            const is_metrics_scrape = std.mem.eql(u8, rl_method, "GET") and std.mem.startsWith(u8, rl_path, "/metrics");
+            const client_addr = if (self.trusted_proxy_hops > 0)
+                resolveClientAddress(conn.address(), header_data, self.trusted_proxy_hops)
+            else
+                conn.address();
+            const limiter = if (is_metrics_scrape) &self.metrics_rate_limiter else &self.rate_limiter;
+            if (!limiter.tryAcquireFor(client_addr)) {
                 try self.sendRateLimited(conn);
                 return;
             }
