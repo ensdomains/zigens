@@ -1,4 +1,5 @@
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const db_module = @import("database.zig");
 const reorg_undo = @import("reorg_undo.zig");
 const Database = db_module.Database;
@@ -40,7 +41,7 @@ pub fn upsertResolverMetadata(db: *Database, protocol: models.Protocol, resolver
     try q.bindText(graphql_url);
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.exec();
 }
 
@@ -85,7 +86,7 @@ pub fn getAllResolverMetadata(db: *Database, protocol: models.Protocol) ![]model
 
     try q.bindTextStatic(protocol.toString());
 
-    var result: std.ArrayList(models.ResolverMetadata) = .{};
+    var result: std.ArrayList(models.ResolverMetadata) = .empty;
     errdefer {
         for (result.items) |*metadata| metadata.deinit(db.allocator);
         result.deinit(db.allocator);
@@ -137,7 +138,7 @@ pub fn upsertResolverApproval(db: *Database, protocol: models.Protocol, resolver
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
     try q.bindInt(@intCast(log_index));
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.exec();
 }
 
@@ -204,7 +205,7 @@ pub fn getApprovalsForDelegate(db: *Database, protocol: models.Protocol, delegat
 /// Read every remaining row of an approvals query into an owned slice (shared by
 /// getApprovalsForName/getApprovalsForDelegate — identical 11-column projection).
 fn collectApprovals(db: *Database, q: *Query) ![]models.ResolverApproval {
-    var result: std.ArrayList(models.ResolverApproval) = .{};
+    var result: std.ArrayList(models.ResolverApproval) = .empty;
     errdefer {
         for (result.items) |*approval| approval.deinit(db.allocator);
         result.deinit(db.allocator);

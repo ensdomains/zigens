@@ -6,11 +6,36 @@
 /// Used by NameWrapper's NameWrapped event which emits the full name in this format.
 const std = @import("std");
 
+/// Encode a dot-separated name into DNS wire format: [len][label]...[0x00].
+/// Example: "vitalik.eth" → \x07vitalik\x03eth\x00. The empty name encodes to the
+/// single root terminator "\x00" (ENSIP-10 name for the root). This is the `name`
+/// argument for the Universal Resolver's `resolve(bytes name, bytes data)`.
+///
+/// The caller is responsible for passing an ALREADY-normalized name (ENSIP-15) —
+/// this is a pure byte-layout encoder, not a normalizer. Each label must be
+/// 1..=255 bytes; an empty interior label (e.g. "a..b") or an over-long label is
+/// rejected. Caller owns the returned slice.
+pub fn encodeDNSName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    if (name.len != 0) {
+        var it = std.mem.splitScalar(u8, name, '.');
+        while (it.next()) |label| {
+            if (label.len == 0 or label.len > 255) return error.InvalidLabel;
+            try out.append(allocator, @intCast(label.len));
+            try out.appendSlice(allocator, label);
+        }
+    }
+    try out.append(allocator, 0); // root terminator
+    return out.toOwnedSlice(allocator);
+}
+
 /// Decode a DNS wire-format encoded name into its component labels.
 /// Returns a slice of labels (e.g., ["vitalik", "eth"]).
 /// Caller owns the returned slice and each label string (all allocated from `allocator`).
 pub fn decodeDNSName(allocator: std.mem.Allocator, data: []const u8) ![][]const u8 {
-    var labels: std.ArrayList([]const u8) = .{};
+    var labels: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (labels.items) |l| allocator.free(l);
         labels.deinit(allocator);

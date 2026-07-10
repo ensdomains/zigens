@@ -12,7 +12,38 @@ pub const ComplexityLimits = struct {
     /// must assume the worst case rather than 1, otherwise an attacker can
     /// bypass cost analysis by parameterizing every page size.
     max_pagination_assumption: u32 = 1000,
+    /// Cost charged to a LIST-returning field selected WITHOUT an explicit
+    /// `first`/`limit`. Resolvers apply a default page (100) when the client omits
+    /// it, so charging 1 would let `a1:domains{...} a2:domains{...} …` alias-fanout
+    /// hundreds of full pages under the cost limit. Matches the resolvers' default
+    /// page size; single-object fields (owner, resolver, block) are unaffected —
+    /// only names in the list-field set below are charged this.
+    default_page_size: u32 = 100,
+    /// Hard cap on the number of selected fields in a whole operation. Independent
+    /// of cost/depth: bounds raw selection/alias fanout (a query that spams
+    /// thousands of aliased fields) even if each field is individually cheap.
+    max_operation_fields: u32 = 1000,
 };
+
+/// Selectable list-returning output fields (from schema.graphql). A field named
+/// here, selected without an explicit `first`/`limit`, is cost-charged the default
+/// page size rather than 1. Kept in sync with the schema's `[Type]`-returning
+/// output fields; filter-input list fields (and/or/_in) are deliberately excluded.
+const LIST_FIELDS = std.StaticStringMap(void).initComptime(.{
+    .{"domains"},           .{"accounts"},         .{"registrations"},    .{"events"},
+    .{"transfers"},         .{"nameRegistereds"},  .{"nameReneweds"},     .{"textChangeds"},
+    .{"addressChangeds"},   .{"nameWrappeds"},     .{"nameUnwrappeds"},   .{"fusesSets"},
+    .{"expiryUpdateds"},    .{"resolverUpdateds"}, .{"labelRegistereds"}, .{"reverseClaimeds"},
+    .{"registryTransfers"}, .{"roles"},            .{"resolversByOwner"}, .{"registries"},
+    .{"resolvers"},         .{"wrappedDomains"},   .{"approvals"},        .{"nodes"},
+    .{"aliases"},           .{"namedResources"},   .{"subdomains"},       .{"labels"},
+    .{"referencedBy"},      .{"addresses"},        .{"coinTypes"},        .{"texts"},
+    .{"abis"},              .{"interfaces"},       .{"permissions"},      .{"edges"},
+});
+
+fn isListField(name: []const u8) bool {
+    return LIST_FIELDS.has(name);
+}
 
 /// Complexity analysis result
 pub const ComplexityAnalysis = struct {
@@ -20,14 +51,19 @@ pub const ComplexityAnalysis = struct {
     cost: u32,
     exceeded_depth: bool,
     exceeded_cost: bool,
+    field_count: u32 = 0,
+    exceeded_fields: bool = false,
 
     pub fn isValid(self: ComplexityAnalysis) bool {
-        return !self.exceeded_depth and !self.exceeded_cost;
+        return !self.exceeded_depth and !self.exceeded_cost and !self.exceeded_fields;
     }
 
     pub fn errorMessage(self: ComplexityAnalysis, allocator: std.mem.Allocator) ![]const u8 {
         if (self.exceeded_depth) {
             return try std.fmt.allocPrint(allocator, "Query depth ({d}) exceeds maximum allowed depth", .{self.depth});
+        }
+        if (self.exceeded_fields) {
+            return try std.fmt.allocPrint(allocator, "Query selects too many fields ({d})", .{self.field_count});
         }
         if (self.exceeded_cost) {
             return try std.fmt.allocPrint(allocator, "Query complexity ({d}) exceeds maximum allowed cost", .{self.cost});
@@ -59,6 +95,9 @@ pub const ComplexityAnalyzer = struct {
     /// the GraphQL POST). When present, used to refine the multiplier for
     /// `first: $var` instead of falling back to worst-case.
     runtime_variables: ?std.json.Value = null,
+    /// Running count of analyzed fields for the whole document; checked against
+    /// limits.max_operation_fields to bound raw selection/alias fanout.
+    field_count: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, limits: ComplexityLimits) ComplexityAnalyzer {
         return .{ .allocator = allocator, .limits = limits };
@@ -70,6 +109,7 @@ pub const ComplexityAnalyzer = struct {
     pub fn analyzeDocument(self: *ComplexityAnalyzer, document: *const parser.Document, runtime_variables: ?std.json.Value) !ComplexityAnalysis {
         self.runtime_variables = runtime_variables;
         defer self.runtime_variables = null;
+        self.field_count = 0;
         var max_depth: u32 = 0;
         var total_cost: u32 = 0;
 
@@ -89,6 +129,8 @@ pub const ComplexityAnalyzer = struct {
             .cost = total_cost,
             .exceeded_depth = max_depth > self.limits.max_depth,
             .exceeded_cost = total_cost > self.limits.max_cost,
+            .field_count = self.field_count,
+            .exceeded_fields = self.field_count > self.limits.max_operation_fields,
         };
     }
 
@@ -120,6 +162,7 @@ pub const ComplexityAnalyzer = struct {
     /// nested selections inside fragments contribute to depth & cost just like
     /// inline selections.
     fn analyzeField(self: *ComplexityAnalyzer, field: *const parser.Field, current_depth: u32) error{OutOfMemory}!ComplexityAnalysis {
+        self.field_count +|= 1;
         // Fragment spread: charge the spread location as 0 cost (it's a syntactic
         // marker, not a real field) and recurse into the fragment's selections at
         // the SAME depth. Without this, `query { ...Frag }` reports depth 1 + cost 0.
@@ -153,7 +196,7 @@ pub const ComplexityAnalyzer = struct {
         var field_cost: u32 = self.limits.default_field_cost;
         var max_depth: u32 = current_depth;
 
-        const multiplier = self.getFieldMultiplier(field);
+        const multiplier = self.getFieldMultiplier(field, current_depth);
         field_cost *|= multiplier;
 
         if (field.selections.len > 0) {
@@ -189,7 +232,7 @@ pub const ComplexityAnalyzer = struct {
     /// With (1), each request is analyzed against its own values: small `first`
     /// pays small cost, large `first` pays large cost. The worst case still
     /// applies when no runtime value is supplied.
-    fn getFieldMultiplier(self: *ComplexityAnalyzer, field: *const parser.Field) u32 {
+    fn getFieldMultiplier(self: *ComplexityAnalyzer, field: *const parser.Field, current_depth: u32) u32 {
         for (field.arguments) |arg| {
             if (!std.mem.eql(u8, arg.name, "first") and !std.mem.eql(u8, arg.name, "limit")) continue;
 
@@ -216,7 +259,13 @@ pub const ComplexityAnalyzer = struct {
                 else => {},
             }
         }
-        return 1;
+        // No explicit first/limit: a TOP-LEVEL list-returning field still fetches a
+        // full default page, so charge default_page_size — this closes the
+        // alias-fanout amplification (`a1:domains a2:domains …`). Nested list fields
+        // keep multiplier 1: their cost is already multiplied by the parent's page
+        // multiplier, so charging them again double-counts and would reject a
+        // legitimate `domains{ subdomains{ … } }`. Single-object fields always cost 1.
+        return if (current_depth == 1 and isListField(field.name)) self.limits.default_page_size else 1;
     }
 
     fn clampMultiplier(self: *const ComplexityAnalyzer, raw: i64) u32 {
@@ -456,4 +505,44 @@ test "first: $var resolves to runtime value when provided" {
         const analysis = try analyzer.analyzeDocument(&document, parsed.value);
         try testing.expect(analysis.exceeded_cost);
     }
+}
+
+test "top-level list without first is charged a page; nested list-in-list is not double-counted" {
+    const allocator = testing.allocator;
+
+    // Regression for the schema-aware cost model: a legit nested list-in-list query
+    // (`domains{ subdomains{ } }`) must NOT be rejected — nested lists keep multiplier
+    // 1 (bounded by the parent), while a top-level list without `first` is charged the
+    // default page size to close alias-fanout amplification.
+    const nested =
+        \\query { domains(first: 10) { name subdomains { name } } }
+    ;
+    var p1 = try parser.Parser.init(allocator, nested);
+    var doc1 = try p1.parseDocument();
+    defer doc1.deinit(allocator);
+    var an1 = ComplexityAnalyzer.init(allocator, ComplexityLimits{});
+    const a1 = try an1.analyzeDocument(&doc1, null);
+    try testing.expect(a1.isValid()); // was wrongly rejected when nested lists were charged 100
+
+    // Top-level alias fanout of unparameterized list fields must exceed cost.
+    const fanout =
+        \\query { a:domains{name} b:domains{name} c:domains{name} d:domains{name} e:domains{name}
+        \\        f:domains{name} g:domains{name} h:domains{name} i:domains{name} j:domains{name}
+        \\        k:domains{name} l:domains{name} m:domains{name} n:domains{name} o:domains{name}
+        \\        p:domains{name} q:domains{name} r:domains{name} s:domains{name} t:domains{name}
+        \\        u:domains{name} v:domains{name} w:domains{name} x:domains{name} y:domains{name}
+        \\        z:domains{name} a1:domains{name} b1:domains{name} c1:domains{name} d1:domains{name}
+        \\        e1:domains{name} f1:domains{name} g1:domains{name} h1:domains{name} i1:domains{name}
+        \\        j1:domains{name} k1:domains{name} l1:domains{name} m1:domains{name} n1:domains{name}
+        \\        o1:domains{name} p1:domains{name} q1:domains{name} r1:domains{name} s1:domains{name}
+        \\        t1:domains{name} u1:domains{name} v1:domains{name} w1:domains{name} x1:domains{name} }
+    ;
+    var p2 = try parser.Parser.init(allocator, fanout);
+    var doc2 = try p2.parseDocument();
+    defer doc2.deinit(allocator);
+    var an2 = ComplexityAnalyzer.init(allocator, ComplexityLimits{});
+    const a2 = try an2.analyzeDocument(&doc2, null);
+    // Each unparameterized top-level `domains{name}` is charged ~200 (page 100),
+    // so a fanout reaches the cost ceiling — vs ~2 each (≈100 total) without the fix.
+    try testing.expect(a2.cost >= 10000);
 }

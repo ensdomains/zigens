@@ -1,4 +1,5 @@
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const constants = @import("../constants.zig");
 const db_module = @import("database.zig");
 const reorg_undo = @import("reorg_undo.zig");
@@ -198,7 +199,7 @@ pub fn getRecentEventsWithOrder(db: *Database, protocol: ?models.Protocol, event
         try q.bindTextStatic(et.toString());
     }
 
-    var events: std.ArrayList(models.Event) = .{};
+    var events: std.ArrayList(models.Event) = .empty;
     errdefer {
         for (events.items) |*event| {
             event.deinit(db.allocator);
@@ -276,7 +277,7 @@ fn appendEventScalarConditions(
     if (filter.event_type != null) try conditions.append(db.allocator, "event_type = ?");
     if (filter.event_type_not != null) try conditions.append(db.allocator, "event_type != ?");
     if (filter.event_types != null and filter.event_types.?.len > 0) {
-        var in_parts: std.ArrayList(u8) = .{};
+        var in_parts: std.ArrayList(u8) = .empty;
         defer in_parts.deinit(db.allocator);
         try in_parts.appendSlice(db.allocator, "event_type IN (");
         for (filter.event_types.?, 0..) |_, i| {
@@ -289,7 +290,7 @@ fn appendEventScalarConditions(
         try conditions.append(db.allocator, clause);
     }
     if (filter.event_types_not != null and filter.event_types_not.?.len > 0) {
-        var in_parts: std.ArrayList(u8) = .{};
+        var in_parts: std.ArrayList(u8) = .empty;
         defer in_parts.deinit(db.allocator);
         try in_parts.appendSlice(db.allocator, "event_type NOT IN (");
         for (filter.event_types_not.?, 0..) |_, i| {
@@ -304,7 +305,7 @@ fn appendEventScalarConditions(
     if (filter.domain != null) try conditions.append(db.allocator, "name = ?");
     if (filter.contract_address != null) try conditions.append(db.allocator, "contract_address = ?");
     if (filter.contract_addresses != null and filter.contract_addresses.?.len > 0) {
-        var in_parts: std.ArrayList(u8) = .{};
+        var in_parts: std.ArrayList(u8) = .empty;
         defer in_parts.deinit(db.allocator);
         try in_parts.appendSlice(db.allocator, "contract_address IN (");
         for (filter.contract_addresses.?, 0..) |_, i| {
@@ -335,9 +336,9 @@ fn appendEventScalarConditions(
     if (filter.data_json_owners != null and filter.data_json_owners.?.len > 0) {
         const owner_lower = try jsonDataLower(db, "owner");
         defer db.allocator.free(owner_lower);
-        var in_parts: std.ArrayList(u8) = .{};
+        var in_parts: std.ArrayList(u8) = .empty;
         defer in_parts.deinit(db.allocator);
-        try in_parts.writer(db.allocator).print("{s} IN (", .{owner_lower});
+        try in_parts.print(db.allocator, "{s} IN (", .{owner_lower});
         for (filter.data_json_owners.?, 0..) |_, i| {
             if (i > 0) try in_parts.append(db.allocator, ',');
             try in_parts.appendSlice(db.allocator, "LOWER(?)");
@@ -376,7 +377,7 @@ fn buildEventNodeExpr(
     filter: EventFilterOptions,
     allocated_clauses: *std.ArrayList([]const u8),
 ) anyerror!?[]const u8 {
-    var parts: std.ArrayList([]const u8) = .{};
+    var parts: std.ArrayList([]const u8) = .empty;
     defer parts.deinit(db.allocator);
     try appendEventScalarConditions(db, filter, &parts, allocated_clauses);
     if (filter.and_group) |children| {
@@ -385,7 +386,7 @@ fn buildEventNodeExpr(
         }
     }
     if (filter.or_group) |children| {
-        var or_parts: std.ArrayList([]const u8) = .{};
+        var or_parts: std.ArrayList([]const u8) = .empty;
         defer or_parts.deinit(db.allocator);
         for (children) |child| {
             if (try buildEventNodeExpr(db, child, allocated_clauses)) |sub| try or_parts.append(db.allocator, sub);
@@ -477,7 +478,7 @@ pub fn countEventsBeforeCursor(
     // skips too many rows (e.g. with blockNumber_gte/lte bounds, ~60% of edges were missing
     // before this fix). DESC (newest first): "before" = higher (block_number, log_index);
     // ASC: "before" = lower.
-    var sql_buf: std.ArrayList(u8) = .{};
+    var sql_buf: std.ArrayList(u8) = .empty;
     defer sql_buf.deinit(db.allocator);
 
     const base = if (order_dir == .desc)
@@ -486,9 +487,9 @@ pub fn countEventsBeforeCursor(
         "SELECT COUNT(*) FROM events WHERE (block_number < ? OR (block_number = ? AND log_index < ?))";
     try sql_buf.appendSlice(db.allocator, base);
 
-    var conditions: std.ArrayList([]const u8) = .{};
+    var conditions: std.ArrayList([]const u8) = .empty;
     defer conditions.deinit(db.allocator);
-    var allocated_clauses: std.ArrayList([]const u8) = .{};
+    var allocated_clauses: std.ArrayList([]const u8) = .empty;
     defer {
         for (allocated_clauses.items) |s| db.allocator.free(s);
         allocated_clauses.deinit(db.allocator);
@@ -518,11 +519,11 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     @memcpy(sql_buf[sql_len..][0..base_sql.len], base_sql);
     sql_len += base_sql.len;
 
-    var conditions: std.ArrayList([]const u8) = .{};
+    var conditions: std.ArrayList([]const u8) = .empty;
     defer conditions.deinit(db.allocator);
 
     // Track allocated IN clause strings for cleanup
-    var allocated_clauses: std.ArrayList([]const u8) = .{};
+    var allocated_clauses: std.ArrayList([]const u8) = .empty;
     defer {
         for (allocated_clauses.items) |clause| {
             db.allocator.free(clause);
@@ -593,7 +594,7 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
 
     try bindEventFilters(&q, filter);
 
-    var events: std.ArrayList(models.Event) = .{};
+    var events: std.ArrayList(models.Event) = .empty;
     errdefer {
         for (events.items) |*event| {
             event.deinit(db.allocator);
@@ -659,7 +660,7 @@ pub fn insertApproval(db: *Database, protocol: models.Protocol, token_id: u256, 
     try q.bindAddress(approved);
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.bindAddress(registry);
 
     try q.exec();
@@ -679,10 +680,10 @@ pub fn getEventCount(db: *Database, filter: EventFilterOptions) !usize {
     @memcpy(sql_buf[sql_len..][0..base_sql.len], base_sql);
     sql_len += base_sql.len;
 
-    var conditions: std.ArrayList([]const u8) = .{};
+    var conditions: std.ArrayList([]const u8) = .empty;
     defer conditions.deinit(db.allocator);
 
-    var allocated_clauses: std.ArrayList([]const u8) = .{};
+    var allocated_clauses: std.ArrayList([]const u8) = .empty;
     defer {
         for (allocated_clauses.items) |clause| {
             db.allocator.free(clause);

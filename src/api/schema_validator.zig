@@ -19,7 +19,6 @@
 /// `"DomainFilter.name_in"` keep ownership simple — one HashMap per kind,
 /// freed wholesale in `deinit`. An earlier nested-HashMap version leaked
 /// buckets on test teardown, so we keep it flat for clarity.
-
 const std = @import("std");
 const parser = @import("../lib/graphql/parser.zig");
 
@@ -72,7 +71,7 @@ pub const SchemaValidator = struct {
             .root_fields_present = std.StringHashMap(void).init(allocator),
             .input_object_fields = std.StringHashMap(ArgSpec).init(allocator),
             .input_object_types_present = std.StringHashMap(void).init(allocator),
-            .owned_keys = .{},
+            .owned_keys = .empty,
         };
         errdefer validator.deinit();
 

@@ -1,6 +1,8 @@
 const std = @import("std");
 const env_mod = @import("env.zig");
 const contracts = @import("contracts.zig");
+const manifest = @import("manifest.zig");
+const Address = @import("types/address.zig").Address;
 
 /// Which storage backend to open. Defaults to SQLite so existing deployments are
 /// unaffected; selected via DATABASE_BACKEND or inferred from a postgres:// DATABASE_URL.
@@ -28,6 +30,13 @@ pub const Config = struct {
     /// peer. > 0 = trust X-Forwarded-For from this many hops (e.g. 1 for a single LB) and
     /// key on the real client IP. Only enable behind a proxy you control that sets XFF.
     trusted_proxy_hops: u32,
+    /// Wall-clock budget (ms) for reading a full request (headers + body). A peer that
+    /// trickles bytes slower than this is dropped, backstopping the per-socket receive
+    /// timeout against a slow-loris. 0 disables the deadline.
+    request_timeout_ms: u32,
+    /// Hard cap on concurrent API connections; accepts past it get 503. Bounds worst-case
+    /// handler-thread memory (each live connection is one 2MB-stack thread).
+    max_concurrent_connections: u32,
     api_port: u16,
     api_enabled: bool,
     status_port: ?u16,
@@ -36,6 +45,14 @@ pub const Config = struct {
     webhook_db_path: []const u8,
     webhook_admin_username: ?[]const u8,
     webhook_admin_password: ?[]const u8,
+    /// Bearer token for internal/ops endpoints (e.g. /internal/verify-primary).
+    /// Null = those routes are only reachable with the webhook Basic credential.
+    internal_admin_token: ?[]const u8,
+    /// Dedicated (low) per-IP rate limit for the RPC-amplifying internal routes.
+    internal_rate_limit_per_second: u32,
+    /// Explicit dev opt-in to serve webhook admin routes WITHOUT authentication.
+    /// Default false = fail-closed (unconfigured credentials -> routes reject).
+    webhooks_allow_unauthenticated: bool,
     max_memory_mb: u64,
     checkpoint_interval: u64,
     graphql_max_depth: u32,
@@ -44,15 +61,52 @@ pub const Config = struct {
     rainbow_path: []const u8,
     v1_contracts: contracts.ContractAddresses,
     v2_contracts: contracts.ContractAddresses,
+    /// Query-time resolution RPC endpoint. Defaults to `rpc_url` when unset, so
+    /// the resolution layer works with no extra config; point it at a dedicated
+    /// endpoint to isolate read traffic from indexing traffic.
+    resolve_rpc_url: []const u8,
+    /// Soft freshness window (seconds) for cached resolution answers.
+    resolve_cache_ttl_s: u32,
+    /// Gate for forward-verifying reverse/primary-name claims with an on-chain
+    /// read. Off by default; served values are unchanged until enabled.
+    primary_verify_enabled: bool,
+    /// Gate for issuing live ENSIP-10 Universal Resolver reads on an indexed MISS
+    /// (Task 06). Off by default; served values are unchanged until enabled AND a
+    /// non-zero `resolve_universal_resolver` is configured.
+    resolve_live_enabled: bool,
+    /// Universal Resolver address used for live resolution. Defaults to the
+    /// network's contract entry (Address.zero until wired per network);
+    /// RESOLVE_UNIVERSAL_RESOLVER overrides it at deploy time.
+    resolve_universal_resolver: Address,
+    /// Gate for completing EIP-3668 CCIP-Read offchain lookups during live resolution
+    /// (Task 07). Requires resolve_live_enabled; off by default. Enabling it means the
+    /// API makes outbound HTTP to name-controlled gateway URLs (SSRF surface).
+    resolve_ccip_enabled: bool,
+    /// Per-gateway HTTP timeout (ms) for a CCIP-Read fetch.
+    ccip_gateway_timeout_ms: u32,
+    /// Max EIP-3668 OffchainLookup redirect hops before giving up (unresolved).
+    ccip_max_redirects: u32,
+    /// Gate for fetching + persisting per-chain safe/finalized block positions in the
+    /// indexer poll loop (Task 09). Off by default. The additive `_finality` API field is
+    /// always present but returns nulls until this is on and positions are fetched.
+    finality_enabled: bool,
 
     pub fn fromEnv(allocator: std.mem.Allocator) !Config {
         var env_map = try env_mod.loadEnv(allocator, ".env");
         defer env_mod.deinitEnv(&env_map);
 
         const network = contracts.Network.fromString(env_mod.getEnv(&env_map, "NETWORK", "sepolia")) catch .sepolia;
+        // Contract wiring source: a MANIFEST_PATH .zon manifest wins (config-as-data,
+        // Task 08); otherwise the hardcoded code switch (unchanged, the default).
+        const manifest_path = env_mod.getEnv(&env_map, "MANIFEST_PATH", "");
 
-        const v1_contract_addrs = try contracts.getContractAddresses(network);
-        const v2_contract_addrs = try contracts.getContractAddresses(network);
+        const v1_contract_addrs = if (manifest_path.len > 0)
+            try manifest.loadManifest(allocator, manifest_path, network)
+        else
+            try contracts.getContractAddresses(network);
+        // Same network → the V1 and V2 sets are the same struct (the code path also
+        // returned identical copies); ContractAddresses is a by-value copy.
+        const v2_contract_addrs = v1_contract_addrs;
 
         // DATABASE_URL (Postgres) is owned; backend_kind is the explicit DATABASE_BACKEND
         // if set, else inferred from a postgres:// URL scheme, else SQLite.
@@ -98,6 +152,8 @@ pub const Config = struct {
             .max_blocks_per_request = env_mod.getEnvInt(&env_map, u64, "MAX_BLOCKS_PER_REQUEST", 2000),
             .rate_limit_per_second = env_mod.getEnvInt(&env_map, u32, "RATE_LIMIT_PER_SECOND", 15),
             .trusted_proxy_hops = env_mod.getEnvInt(&env_map, u32, "TRUSTED_PROXY_HOPS", 0),
+            .request_timeout_ms = env_mod.getEnvInt(&env_map, u32, "REQUEST_TIMEOUT_MS", 10000),
+            .max_concurrent_connections = env_mod.getEnvInt(&env_map, u32, "MAX_CONCURRENT_CONNECTIONS", 512),
             .api_port = env_mod.getEnvInt(&env_map, u16, "API_PORT", 8080),
             .api_enabled = env_mod.getEnvBool(&env_map, "API_ENABLED", true),
             .status_port = blk: {
@@ -128,12 +184,37 @@ pub const Config = struct {
                     break :blk try allocator.dupe(u8, pwd);
                 }
             },
+            .internal_admin_token = blk: {
+                const tok = env_mod.getEnv(&env_map, "INTERNAL_ADMIN_TOKEN", "");
+                if (tok.len == 0) break :blk null else break :blk try allocator.dupe(u8, tok);
+            },
+            .internal_rate_limit_per_second = env_mod.getEnvInt(&env_map, u32, "INTERNAL_RATE_LIMIT_PER_SECOND", 2),
+            .webhooks_allow_unauthenticated = env_mod.getEnvBool(&env_map, "WEBHOOKS_ALLOW_UNAUTHENTICATED", false),
             .max_memory_mb = env_mod.getEnvInt(&env_map, u64, "MAX_MEMORY_MB", 512),
             .checkpoint_interval = env_mod.getEnvInt(&env_map, u64, "CHECKPOINT_INTERVAL", 100),
             .graphql_max_depth = env_mod.getEnvInt(&env_map, u32, "GRAPHQL_MAX_DEPTH", 10),
             .graphql_max_cost = env_mod.getEnvInt(&env_map, u32, "GRAPHQL_MAX_COST", 10000),
             .metrics_enabled = env_mod.getEnvBool(&env_map, "METRICS_ENABLED", false),
             .rainbow_path = try allocator.dupe(u8, env_mod.getEnv(&env_map, "RAINBOW_PATH", "./data/ens_rainbow.db")),
+            // Falls back to RPC_URL (dupe'd independently so `deinit` can free it
+            // unconditionally without aliasing `rpc_url`).
+            .resolve_rpc_url = try allocator.dupe(u8, env_mod.getEnv(&env_map, "RESOLVE_RPC_URL", env_mod.getEnv(&env_map, "RPC_URL", "http://localhost:8545"))),
+            .resolve_cache_ttl_s = env_mod.getEnvInt(&env_map, u32, "RESOLVE_CACHE_TTL_S", 300),
+            .primary_verify_enabled = env_mod.getEnvBool(&env_map, "PRIMARY_VERIFY_ENABLED", false),
+            .resolve_live_enabled = env_mod.getEnvBool(&env_map, "RESOLVE_LIVE_ENABLED", false),
+            .resolve_universal_resolver = blk: {
+                const s = env_mod.getEnv(&env_map, "RESOLVE_UNIVERSAL_RESOLVER", "");
+                break :blk if (s.len > 0)
+                    (Address.fromHex(s) catch v1_contract_addrs.universal_resolver)
+                else
+                    v1_contract_addrs.universal_resolver;
+            },
+            // CCIP-Read requires live resolution; asking for CCIP without live is a hard
+            // startup error (see validateResolution), not a silently-inert flag.
+            .resolve_ccip_enabled = env_mod.getEnvBool(&env_map, "RESOLVE_CCIP_ENABLED", false),
+            .ccip_gateway_timeout_ms = env_mod.getEnvInt(&env_map, u32, "CCIP_GATEWAY_TIMEOUT_MS", 5000),
+            .ccip_max_redirects = env_mod.getEnvInt(&env_map, u32, "CCIP_MAX_REDIRECTS", 4),
+            .finality_enabled = env_mod.getEnvBool(&env_map, "FINALITY_ENABLED", false),
         };
     }
 
@@ -143,11 +224,44 @@ pub const Config = struct {
         if (self.database_url) |url| self.allocator.free(url);
         self.allocator.free(self.webhook_db_path);
         self.allocator.free(self.rainbow_path);
+        self.allocator.free(self.resolve_rpc_url);
         if (self.webhook_admin_username) |user| {
             self.allocator.free(user);
         }
         if (self.webhook_admin_password) |pwd| {
             self.allocator.free(pwd);
         }
+        if (self.internal_admin_token) |tok| {
+            self.allocator.free(tok);
+        }
+    }
+
+    /// Reject an ambiguous partial webhook-admin credential (exactly one of
+    /// username/password set). Fail-closed: refuse to boot in a state where auth
+    /// was intended but silently half-disabled.
+    pub fn validateAuth(self: *const Config) !void {
+        const has_user = self.webhook_admin_username != null;
+        const has_pass = self.webhook_admin_password != null;
+        if (has_user != has_pass) return error.PartialWebhookAdminConfig;
+    }
+
+    /// CCIP-Read (Task 07) is only ever reached via the live-resolution revert path, so
+    /// RESOLVE_CCIP_ENABLED without RESOLVE_LIVE_ENABLED is a misconfiguration. Fail fast at
+    /// startup rather than run with a silently-inert flag the operator believes is active.
+    pub fn validateResolution(self: *const Config) !void {
+        if (self.resolve_ccip_enabled and !self.resolve_live_enabled) return error.CcipRequiresLive;
     }
 };
+
+test "validateResolution: CCIP without live is a hard error; both-off / both-on / live-only are OK" {
+    var c: Config = undefined;
+    c.resolve_ccip_enabled = true;
+    c.resolve_live_enabled = false;
+    try std.testing.expectError(error.CcipRequiresLive, c.validateResolution());
+    c.resolve_live_enabled = true; // CCIP + live
+    try c.validateResolution();
+    c.resolve_ccip_enabled = false; // live only
+    try c.validateResolution();
+    c.resolve_live_enabled = false; // both off (default)
+    try c.validateResolution();
+}

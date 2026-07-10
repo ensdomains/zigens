@@ -1,4 +1,5 @@
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const config = @import("../config.zig");
 const constants = @import("../constants.zig");
 const models = @import("../types/models.zig");
@@ -112,7 +113,7 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
                 const new_size = retry_chunk_size / 2;
                 std.log.info("    ENS chunk {d}-{d} too large ({any}), reducing to {d} blocks", .{ ens_chunk_from, chunk_to, err, new_size });
                 retry_chunk_size = new_size;
-                std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
+                zsys.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
                 continue;
             };
 
@@ -181,7 +182,7 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
 
         // Rate limit between chunks
         if (ens_chunk_from <= to_block) {
-            std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
+            zsys.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
         }
     }
 
@@ -285,7 +286,7 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
         defer utils.deinitBatchResults(self.allocator, batch_results);
 
         // Process results from batch
-        const filter_start = std.time.milliTimestamp();
+        const filter_start = zsys.milliTimestamp();
         var batch_filtered_small: usize = 0;
         var batch_filtered_unknown: usize = 0;
         var batch_processed: usize = 0;
@@ -323,7 +324,7 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
                 batch_processed += 1;
             }
         }
-        const filter_elapsed = std.time.milliTimestamp() - filter_start;
+        const filter_elapsed = zsys.milliTimestamp() - filter_start;
 
         transfer_total_fetched += batch_fetched;
         chunks_processed += batch_count;
@@ -343,7 +344,7 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
 
         // Rate limit between batches
         if (batch_start_chunk < total_chunks) {
-            std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
+            zsys.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
         }
     }
 
@@ -389,7 +390,7 @@ pub fn indexTransferEvents(self: *Indexer, protocol: models.Protocol, client: *r
     // tokenId in the same block must apply in emission order to produce correct ownership.
     const total_count = batch_results[0].len + batch_results[1].len + batch_results[2].len;
 
-    var entries: std.ArrayList(utils.DispatchEntry) = .{};
+    var entries: std.ArrayList(utils.DispatchEntry) = .empty;
     defer entries.deinit(self.allocator);
     try entries.ensureTotalCapacity(self.allocator, total_count);
 
@@ -666,7 +667,7 @@ fn backfillSubregistryEvents(self: *Indexer, protocol: models.Protocol, client: 
                 const new_size = retry_chunk_size / 2;
                 std.log.info("    Backfill chunk {d}-{d} too large ({any}), reducing to {d} blocks", .{ chunk_from, chunk_to, err, new_size });
                 retry_chunk_size = new_size;
-                std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
+                zsys.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
                 continue;
             };
 
@@ -727,7 +728,7 @@ fn backfillSubregistryEvents(self: *Indexer, protocol: models.Protocol, client: 
 
         // Rate limit between chunks
         if (chunk_from <= to_block) {
-            std.Thread.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
+            zsys.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
         }
     }
 
@@ -830,7 +831,7 @@ pub fn indexPhase1V2Events(self: *Indexer, protocol: models.Protocol, client: *r
         var total_count: usize = total_registry + total_registrar;
         for (results[N_REG + N_REGISTRAR ..]) |logs| total_count += logs.len;
 
-        var entries: std.ArrayList(utils.DispatchEntry) = .{};
+        var entries: std.ArrayList(utils.DispatchEntry) = .empty;
         defer entries.deinit(self.allocator);
         try entries.ensureTotalCapacity(self.allocator, total_count);
 
@@ -879,7 +880,7 @@ pub fn indexPhase1V2Events(self: *Indexer, protocol: models.Protocol, client: *r
         var total_count: usize = total_registry;
         for (results[N_REG..]) |logs| total_count += logs.len;
 
-        var entries: std.ArrayList(utils.DispatchEntry) = .{};
+        var entries: std.ArrayList(utils.DispatchEntry) = .empty;
         defer entries.deinit(self.allocator);
         try entries.ensureTotalCapacity(self.allocator, total_count);
 

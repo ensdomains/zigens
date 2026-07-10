@@ -63,7 +63,7 @@ pub fn getLiveParents(
     try q.bindTextStatic(protocol.toString());
     try q.bindText(subregistry_hex);
 
-    var parents: std.ArrayList(LiveParent) = .{};
+    var parents: std.ArrayList(LiveParent) = .empty;
     errdefer {
         for (parents.items) |p| {
             allocator.free(p.parent_registry);
@@ -104,7 +104,7 @@ pub fn isRegistryReachable(
 
     var seen: std.AutoHashMap(Address, void) = .init(allocator);
     defer seen.deinit();
-    var frontier: std.ArrayList(Address) = .{};
+    var frontier: std.ArrayList(Address) = .empty;
     defer frontier.deinit(allocator);
     try seen.put(registry, {});
     try frontier.append(allocator, registry);
@@ -226,9 +226,9 @@ pub fn collectSubtreeRooted(
 ) ![]Address {
     var seen: std.AutoHashMap(Address, void) = .init(allocator);
     defer seen.deinit();
-    var result: std.ArrayList(Address) = .{};
+    var result: std.ArrayList(Address) = .empty;
     errdefer result.deinit(allocator);
-    var frontier: std.ArrayList(Address) = .{};
+    var frontier: std.ArrayList(Address) = .empty;
     defer frontier.deinit(allocator);
 
     if (root.isZero()) return try result.toOwnedSlice(allocator);
@@ -286,7 +286,7 @@ pub fn setRegistriesReachability(
     while (off < registries.len) : (off += CHUNK) {
         const chunk = registries[off..@min(off + CHUNK, registries.len)];
 
-        var where_buf: std.ArrayList(u8) = .{};
+        var where_buf: std.ArrayList(u8) = .empty;
         defer where_buf.deinit(db.allocator);
         try where_buf.appendSlice(db.allocator, if (reachable)
             "protocol = ? AND is_reachable = 0 AND registry IN ("
@@ -308,7 +308,7 @@ pub fn setRegistriesReachability(
         };
         try reorg_undo.captureWhereBinder(db, "names", "U", where_buf.items, Binder{ .protocol = protocol, .registries = chunk });
 
-        var sql_buf: std.ArrayList(u8) = .{};
+        var sql_buf: std.ArrayList(u8) = .empty;
         defer sql_buf.deinit(db.allocator);
         try sql_buf.appendSlice(db.allocator, if (reachable)
             "UPDATE names SET is_reachable = 1, unreachable_since = NULL, updated_block = ?, updated_at = ? WHERE "
@@ -351,7 +351,7 @@ pub fn reconcileV2Reachability(
     block_number: u64,
     block_timestamp: i64,
 ) !u64 {
-    var regs: std.ArrayList(Address) = .{};
+    var regs: std.ArrayList(Address) = .empty;
     defer regs.deinit(allocator);
     {
         var q = try Query.initCached(db, "SELECT DISTINCT registry FROM names WHERE protocol = 'v2'");
@@ -363,7 +363,7 @@ pub fn reconcileV2Reachability(
         }
     }
 
-    var orphaned: std.ArrayList(Address) = .{};
+    var orphaned: std.ArrayList(Address) = .empty;
     defer orphaned.deinit(allocator);
     for (regs.items) |r| {
         const reachable = isRegistryReachable(db, allocator, .v2, r, roots) catch true;

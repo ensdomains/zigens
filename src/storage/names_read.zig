@@ -278,7 +278,7 @@ pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Nam
 
     try q.bindAddress(owner);
 
-    var names: std.ArrayList(models.Name) = .{};
+    var names: std.ArrayList(models.Name) = .empty;
     errdefer {
         for (names.items) |*name| {
             name.deinit(db.allocator);
@@ -301,7 +301,7 @@ pub fn getNamesByResolver(db: *Database, resolver: Address, limit: u32) ![]model
     try q.bindAddress(resolver);
     try q.bindInt(@intCast(limit));
 
-    var names: std.ArrayList(models.Name) = .{};
+    var names: std.ArrayList(models.Name) = .empty;
     errdefer {
         for (names.items) |*name| {
             name.deinit(db.allocator);
@@ -332,7 +332,7 @@ pub fn getWrappedDomains(
     skip: u32,
     limit: u32,
 ) ![]models.Name {
-    var sql_buf: std.ArrayList(u8) = .{};
+    var sql_buf: std.ArrayList(u8) = .empty;
     defer sql_buf.deinit(db.allocator);
     try sql_buf.appendSlice(db.allocator, SQL_SELECT_NAMES);
     try sql_buf.appendSlice(db.allocator, " WHERE is_reachable = 1 AND is_normalized = 1 AND is_wrapped = 1");
@@ -352,7 +352,7 @@ pub fn getWrappedDomains(
     try q.bindInt(@intCast(limit));
     try q.bindInt(@intCast(skip));
 
-    var names: std.ArrayList(models.Name) = .{};
+    var names: std.ArrayList(models.Name) = .empty;
     errdefer {
         for (names.items) |*n| n.deinit(db.allocator);
         names.deinit(db.allocator);
@@ -400,7 +400,7 @@ const ZERO_ADDR_HEX: []const u8 = "0x0000000000000000000000000000000000000000";
 const SUBDOMAIN_GC_FILTER: []const u8 = " AND NOT (owner = '" ++ ZERO_ADDR_HEX ++ "' AND resolver = '" ++ ZERO_ADDR_HEX ++ "')";
 
 pub fn countDirectSubdomains(db: *Database, parent_name: []const u8) !u32 {
-    var q = try Query.init(db, "SELECT COUNT(*) FROM names WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER);
+    var q = try Query.initCached(db, "SELECT COUNT(*) FROM names WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER);
     defer q.deinit();
 
     try q.bindText(parent_name);
@@ -413,7 +413,7 @@ pub fn countDirectSubdomains(db: *Database, parent_name: []const u8) !u32 {
 
 /// Check if a name has any direct subdomains (reachable + non-burned).
 pub fn hasDirectSubdomains(db: *Database, parent_name: []const u8) !bool {
-    var q = try Query.init(db, "SELECT 1 FROM names WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER ++ " LIMIT 1");
+    var q = try Query.initCached(db, "SELECT 1 FROM names WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER ++ " LIMIT 1");
     defer q.deinit();
 
     try q.bindText(parent_name);
@@ -427,14 +427,14 @@ pub fn hasDirectSubdomains(db: *Database, parent_name: []const u8) !bool {
 /// `include_unreachable` (which still applies the GC filter; resurrection
 /// requires direct namehash lookup).
 pub fn getSubdomains(db: *Database, parent_name_arg: []const u8, skip: u32, limit: u32) ![]models.Name {
-    var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER ++ " ORDER BY name LIMIT ? OFFSET ?");
+    var q = try Query.initCached(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER ++ " ORDER BY name LIMIT ? OFFSET ?");
     defer q.deinit();
 
     try q.bindText(parent_name_arg);
     try q.bindInt(@intCast(limit));
     try q.bindInt(@intCast(skip));
 
-    var names: std.ArrayList(models.Name) = .{};
+    var names: std.ArrayList(models.Name) = .empty;
     errdefer {
         for (names.items) |*name| {
             name.deinit(db.allocator);

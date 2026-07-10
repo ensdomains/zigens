@@ -1,4 +1,5 @@
 const std = @import("std");
+const zsys = @import("../../utils/system.zig");
 const models = @import("../../types/models.zig");
 const db = @import("../../storage/database.zig");
 const Query = db.Query;
@@ -211,7 +212,7 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
         defer self.database.allocator.free(msql);
         var mq = Query.init(self.database, msql) catch break :mark;
         defer mq.deinit();
-        mq.bindInt64(std.time.timestamp()) catch break :mark;
+        mq.bindInt64(zsys.timestamp()) catch break :mark;
         mq.bindInt64(@intCast(count)) catch break :mark;
         mq.exec() catch {};
     }
@@ -264,7 +265,7 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
         // This is an .eth 2LD - try to find owner and expiry from events table
         var owner = Address.zero;
         var expiry: u64 = 0;
-        var reg_timestamp: i64 = std.time.timestamp();
+        var reg_timestamp: i64 = zsys.timestamp();
         var reg_block: i64 = first_seen_block;
 
         // Look up registration event for this name (ETH Controller events have namehash set)
@@ -336,7 +337,7 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
             .created_at = reg_timestamp,
             .registered_at = reg_timestamp,
             .updated_block = @intCast(reg_block),
-            .updated_at = std.time.timestamp(),
+            .updated_at = zsys.timestamp(),
             .is_wrapped = false,
             .wrapper_fuses = null,
             .wrapper_expiry = null,

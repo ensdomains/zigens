@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19,8 +19,8 @@ pub fn main() !void {
 
     std.log.info("HTTP client created, making request...", .{});
 
-    var response_buf: std.ArrayList(u8) = .{};
-    var response_writer = response_buf.writer(allocator);
+    var response_buf: std.Io.Writer.Allocating = .init(allocator);
+    var response_writer = &response_buf.writer;
 
     const result = http_client.fetch(.{
         .location = .{ .uri = uri },
@@ -36,6 +36,6 @@ pub fn main() !void {
     };
 
     std.log.info("Response status: {}", .{result.status});
-    std.log.info("Response body: {s}", .{response_buf.items});
-    allocator.free(response_buf.items);
+    std.log.info("Response body: {s}", .{response_buf.written()});
+    allocator.free(response_buf.written());
 }

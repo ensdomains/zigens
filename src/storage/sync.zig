@@ -1,4 +1,5 @@
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const db_module = @import("database.zig");
 const Database = db_module.Database;
 const Query = db_module.Query;
@@ -139,7 +140,7 @@ pub fn setSyncState(db: *Database, protocol: models.Protocol, block: u64) !void 
 
     try q.bindTextStatic(protocol.toString());
     try q.bindInt64(@intCast(block));
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
 
     try q.exec();
 }
@@ -155,7 +156,7 @@ pub fn storeBlockHash(db: *Database, protocol: models.Protocol, block_number: u6
     try q.bindInt64(@intCast(block_number));
     try q.bindHashBuf(block_hash);
     try q.bindHashBuf(parent_hash);
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
 
     try q.exec();
 }
@@ -268,6 +269,19 @@ pub fn rollbackToBlock(db: *Database, protocol: models.Protocol, block_number: u
     // reorg_active triggers capture each protocol's UPDATE/DELETE (reversed by replayUndo
     // above) AND its INSERT (op 'I'), and replayUndo's 'I' handler clears only this
     // protocol's seen flag and drops the row only when neither protocol still claims it.
+
+    // Resolution cache: drop derived answers pinned to a block newer than the
+    // rollback target so the next read re-resolves against the restored chain.
+    // Chain-scoped (one process = one chain), not protocol-scoped — a rollback on
+    // either protocol may purge cache rows attributable to the other, which is
+    // harmless for a disposable overlay (it self-heals on the next lookup).
+    {
+        var cq = try Query.init(db, "DELETE FROM resolution_cache WHERE chain_id = ? AND block_dep_num > ?");
+        defer cq.deinit();
+        try cq.bindInt64(@intCast(db.chain_id));
+        try cq.bindInt64(block_i64);
+        try cq.exec();
+    }
 
     // Update sync state
     try db.setSyncState(protocol, block_number);
@@ -389,6 +403,21 @@ pub fn registerResolver(db: *Database, protocol: models.Protocol, address: []con
     try q.exec();
 }
 
+/// Whether `address` is a fully-indexed resolver for `protocol` — one whose record
+/// events this indexer ingests (registered on first sight via registerResolver). For
+/// such a resolver an indexed record MISS is authoritative: the record does not exist
+/// in event-visible storage on-chain, so a live re-read can only refetch the same
+/// emptiness.
+pub fn isKnownResolver(db: *Database, protocol: models.Protocol, address: Address) !bool {
+    var q = try Query.initCached(db,
+        \\SELECT 1 FROM known_resolvers WHERE protocol = ? AND address = ? LIMIT 1
+    );
+    defer q.deinit();
+    try q.bindTextStatic(protocol.toString());
+    try q.bindAddress(address);
+    return try q.step();
+}
+
 /// Get subregistries to index for a block range
 /// Uses cache table for O(1) lookup, falls back to full scan on first run
 /// Result of subregistry discovery, including which ones are newly discovered and need backfill.
@@ -434,7 +463,7 @@ pub fn discoverAndGetSubregistries(db: *Database, protocol: models.Protocol, mai
         \\GROUP BY r.address
     ;
 
-    var new_subregistries: std.ArrayList([]u8) = .{};
+    var new_subregistries: std.ArrayList([]u8) = .empty;
     errdefer {
         for (new_subregistries.items) |s| db.allocator.free(s);
         new_subregistries.deinit(db.allocator);
@@ -479,7 +508,7 @@ pub fn discoverAndGetSubregistries(db: *Database, protocol: models.Protocol, mai
 
     try q2.bindTextStatic(protocol_str);
 
-    var subregistries: std.ArrayList([]u8) = .{};
+    var subregistries: std.ArrayList([]u8) = .empty;
     errdefer {
         for (subregistries.items) |subreg| {
             db.allocator.free(subreg);
@@ -572,6 +601,16 @@ pub fn deleteDataAfterBlock(db: *Database, block_number: u64) !void {
     // v1_controllers is wound back by the replayUndo calls above (reorg_active undo-log,
     // both protocols) — no explicit column-predicate cleanup needed.
 
+    // Resolution cache: drop derived answers pinned above the target block (chain-
+    // scoped; protocol-agnostic like this whole path). Self-heals on the next read.
+    {
+        var cq = try Query.init(db, "DELETE FROM resolution_cache WHERE chain_id = ? AND block_dep_num > ?");
+        defer cq.deinit();
+        try cq.bindInt64(@intCast(db.chain_id));
+        try cq.bindInt64(@intCast(block_number));
+        try cq.exec();
+    }
+
     // Commit transaction
     try tx.commit();
     std.log.info("Data cleanup complete", .{});
@@ -630,7 +669,7 @@ pub fn insertOrphanedRegistration(
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
     try q.bindInt(@intCast(log_index));
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
 
     try q.exec();
 }
@@ -650,7 +689,7 @@ pub fn getOrphanedRegistrations(db: *Database, protocol: models.Protocol, subreg
     try q.bindTextStatic(protocol.toString());
     try q.bindText(subregistry_address);
 
-    var results: std.ArrayList(OrphanedRegistration) = .{};
+    var results: std.ArrayList(OrphanedRegistration) = .empty;
     errdefer {
         for (results.items) |*item| {
             item.deinit(db.allocator);
@@ -698,4 +737,20 @@ pub fn deleteOrphanedRegistrations(db: *Database, protocol: models.Protocol, sub
     try q.bindText(subregistry_address);
 
     try q.exec();
+}
+
+test "isKnownResolver is protocol-scoped and requires registration" {
+    const testing = std.testing;
+    var db = try Database.init(testing.allocator, ":memory:");
+    defer db.deinit();
+
+    const r = Address{ .bytes = [_]u8{0x77} ** 20 };
+    try testing.expect(!(try isKnownResolver(&db, .v2, r)));
+
+    const hex = try r.toHex(testing.allocator);
+    defer testing.allocator.free(hex);
+    try registerResolver(&db, .v2, hex, 100);
+
+    try testing.expect(try isKnownResolver(&db, .v2, r));
+    try testing.expect(!(try isKnownResolver(&db, .v1, r)));
 }

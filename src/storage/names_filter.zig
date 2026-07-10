@@ -66,6 +66,12 @@ fn appendNameFilterConditions(
         // Audit/debug callers that pass `includeUnreachable: true` also opt
         // back into seeing it.
         try conditions.append(db.allocator, "namehash != '0x0000000000000000000000000000000000000000000000000000000000000000'");
+        // PROTOCOL DEDUP: a node indexed under BOTH protocols (e.g. a migrated name) is
+        // ONE domain to clients — serve the v2 row and suppress its v1 twin (v2 wins,
+        // the same preference Account.primaryName applies). v1-only names are
+        // unaffected. Scoped to this !include_unreachable block so audit callers that
+        // opt into the raw view (includeUnreachable: true) still see both rows.
+        try conditions.append(db.allocator, "NOT (names.protocol = 'v1' AND EXISTS (SELECT 1 FROM names v2twin WHERE v2twin.namehash = names.namehash AND v2twin.protocol = 'v2'))");
     }
     // ENSIP-15 enforcement (mirrors is_reachable): an explicit `isNormalized` filter
     // wins; otherwise non-normalized names are hidden unless `includeUnnormalized` is set.
@@ -205,7 +211,7 @@ fn buildNameNodeExpr(
     filters: NameFilters,
     allocated_strings: *std.ArrayList([]const u8),
 ) anyerror!?[]const u8 {
-    var parts: std.ArrayList([]const u8) = .{};
+    var parts: std.ArrayList([]const u8) = .empty;
     defer parts.deinit(db.allocator);
 
     try appendNameScalarConditions(db, filters, &parts, allocated_strings);
@@ -218,7 +224,7 @@ fn buildNameNodeExpr(
         }
     }
     if (filters.or_group) |children| {
-        var or_parts: std.ArrayList([]const u8) = .{};
+        var or_parts: std.ArrayList([]const u8) = .empty;
         defer or_parts.deinit(db.allocator);
         for (children) |child| {
             if (try buildNameNodeExpr(db, child, allocated_strings)) |sub| {
@@ -330,16 +336,16 @@ pub fn countRowsBeforeNamehash(
     // many rows, producing partial results (e.g. isMigrated:true with ~9 pages would lose ~343
     // rows because non-migrated rows count toward the offset).
 
-    var conditions: std.ArrayList([]const u8) = .{};
+    var conditions: std.ArrayList([]const u8) = .empty;
     defer conditions.deinit(db.allocator);
-    var allocated_strings: std.ArrayList([]const u8) = .{};
+    var allocated_strings: std.ArrayList([]const u8) = .empty;
     defer {
         for (allocated_strings.items) |s| db.allocator.free(s);
         allocated_strings.deinit(db.allocator);
     }
     try appendNameFilterConditions(db, filters, &conditions, &allocated_strings);
 
-    var filter_clause: std.ArrayList(u8) = .{};
+    var filter_clause: std.ArrayList(u8) = .empty;
     defer filter_clause.deinit(db.allocator);
     if (conditions.items.len > 0) {
         for (conditions.items) |cond| {
@@ -366,15 +372,23 @@ pub fn countRowsBeforeNamehash(
 
 /// Parse name rows from a query result
 fn parseNameRows(q: *Query, allocator: std.mem.Allocator) ![]models.Name {
-    var names: std.ArrayList(models.Name) = .{};
+    var names: std.ArrayList(models.Name) = .empty;
     errdefer {
         for (names.items) |*name| {
             name.deinit(allocator);
         }
         names.deinit(allocator);
     }
-
     while (try q.step()) {
+        try names.append(allocator, try parseOneNameRow(q, allocator));
+    }
+    return names.toOwnedSlice(allocator);
+}
+
+/// Build one models.Name from the CURRENT row of `q` (columns 0..30 of the standard
+/// SELECT list). Does not call step(); the caller controls row iteration.
+fn parseOneNameRow(q: *Query, allocator: std.mem.Allocator) !models.Name {
+    {
         // Column order: name(0), namehash(1), label(2), label_hash(3), parent_name(4), parent_namehash(5),
         //               owner(6), resolver(7), registry(8), protocol(9), token_id(10),
         //               canonical_id(11), token_version(12), expiry(13), registry_locked(14),
@@ -396,7 +410,7 @@ fn parseNameRows(q: *Query, allocator: std.mem.Allocator) ![]models.Name {
         const wrapper_fuses = if (q.getTextSlice(27)) |fuses| try allocator.dupe(u8, fuses) else null;
         const v1_label_hash = if (q.getTextSlice(30)) |hash| try allocator.dupe(u8, hash) else null;
 
-        try names.append(allocator, .{
+        return .{
             .name = try allocator.dupe(u8, name_str),
             .namehash = try Hash.fromHex(namehash_str),
             .label = try allocator.dupe(u8, label_str),
@@ -429,10 +443,8 @@ fn parseNameRows(q: *Query, allocator: std.mem.Allocator) ![]models.Name {
             .ttl = if (q.getOptionalInt64(23)) |t| @intCast(t) else null,
             .is_legacy = q.getBool(24),
             .is_normalized = q.getBool(25),
-        });
+        };
     }
-
-    return names.toOwnedSlice(allocator);
 }
 
 pub fn getAllNames(db: *Database, owner: ?Address, skip: u32, limit: u32) ![]models.Name {
@@ -523,9 +535,9 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
 
     // Build WHERE conditions via the shared helper so all callers (getFilteredNames,
     // getFilteredNameCount, countRowsBeforeNamehash) stay in lockstep.
-    var conditions: std.ArrayList([]const u8) = .{};
+    var conditions: std.ArrayList([]const u8) = .empty;
     defer conditions.deinit(db.allocator);
-    var allocated_strings: std.ArrayList([]const u8) = .{};
+    var allocated_strings: std.ArrayList([]const u8) = .empty;
     defer {
         for (allocated_strings.items) |s| db.allocator.free(s);
         allocated_strings.deinit(db.allocator);
@@ -533,7 +545,7 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
     try appendNameFilterConditions(db, filters, &conditions, &allocated_strings);
 
     // Build WHERE clause
-    var where_clause: std.ArrayList(u8) = .{};
+    var where_clause: std.ArrayList(u8) = .empty;
     defer where_clause.deinit(db.allocator);
 
     if (conditions.items.len > 0) {
@@ -569,6 +581,127 @@ pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u
     return parseNameRows(&q, db.allocator);
 }
 
+/// A keyset (seek) pagination anchor: the sort-field value + namehash of the last
+/// row the client saw, both as text (the namehash is 0x-hex, the value is the
+/// column's text form). Compared against the row's (sort_field, namehash) tuple.
+pub const KeysetAnchor = struct {
+    sort_value: []const u8,
+    namehash: []const u8,
+};
+
+/// Result of a keyset fetch: the page rows plus each row's sort-field value (text),
+/// parallel to `names`, so the caller can build the next cursor. Caller owns both.
+pub const KeysetResult = struct {
+    names: []models.Name,
+    sort_values: [][]u8,
+
+    pub fn deinit(self: *KeysetResult, allocator: std.mem.Allocator) void {
+        for (self.names) |*n| n.deinit(allocator);
+        allocator.free(self.names);
+        for (self.sort_values) |v| allocator.free(v);
+        allocator.free(self.sort_values);
+    }
+};
+
+fn bindKeysetValue(q: *Query, sort_field: NameSortField, value: []const u8) !void {
+    switch (sort_field) {
+        .name => try q.bindText(value),
+        // created_at / expiry / expiry_effective / registered_at are integer columns;
+        // bind as int so the comparison is numeric (and valid on Postgres, which won't
+        // coerce a text bind against an integer column).
+        else => try q.bindInt64(std.fmt.parseInt(i64, value, 10) catch 0),
+    }
+}
+
+/// Keyset (seek) equivalent of `getFilteredNames`: instead of OFFSET, it takes the
+/// last row's `(sort_value, namehash)` anchor and emits rows strictly after it in the
+/// stable `ORDER BY {sort_field} {dir}, namehash {dir}` order. This is an index range
+/// scan (O(limit)) per page vs OFFSET's O(n + skip), and drops the per-page
+/// full-table `countRowsBeforeNamehash` scan entirely.
+///
+/// The keyset predicate is the standard tuple comparison
+///   ({field} {op} ?sv) OR ({field} = ?sv AND namehash {op} ?nh)
+/// with `op` matching the effective order direction. The `{field} = ?sv AND namehash
+/// {op} ?nh` term is what makes TIED sort values (e.g. many rows sharing a
+/// `created_at`) page correctly instead of dropping/duplicating at the boundary.
+///
+/// `anchor == null` returns the first page. Each row's sort value is returned in
+/// parallel (read from an extra `{field} AS _sortval` column) so the caller can build
+/// per-edge cursors without materializing the sort field on models.Name.
+pub fn getFilteredNamesKeyset(db: *Database, filters: NameFilters, anchor: ?KeysetAnchor, limit: u32, order_dir: OrderDir, sort_field: NameSortField) !KeysetResult {
+    const order_str = if (order_dir == .desc) "DESC" else "ASC";
+    const op = if (order_dir == .desc) "<" else ">";
+
+    var conditions: std.ArrayList([]const u8) = .empty;
+    defer conditions.deinit(db.allocator);
+    var allocated_strings: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (allocated_strings.items) |str| db.allocator.free(str);
+        allocated_strings.deinit(db.allocator);
+    }
+    try appendNameFilterConditions(db, filters, &conditions, &allocated_strings);
+
+    if (anchor != null) {
+        const pred = try std.fmt.allocPrint(db.allocator, "({s} {s} ? OR ({s} = ? AND namehash {s} ?))", .{ sort_field.toSql(), op, sort_field.toSql(), op });
+        try allocated_strings.append(db.allocator, pred);
+        try conditions.append(db.allocator, pred);
+    }
+
+    var where_clause: std.ArrayList(u8) = .empty;
+    defer where_clause.deinit(db.allocator);
+    if (conditions.items.len > 0) {
+        try where_clause.appendSlice(db.allocator, "WHERE ");
+        for (conditions.items, 0..) |cond, i| {
+            if (i > 0) try where_clause.appendSlice(db.allocator, " AND ");
+            try where_clause.appendSlice(db.allocator, cond);
+        }
+        try where_clause.appendSlice(db.allocator, " ");
+    }
+
+    // Extra trailing column `{s} AS _sortval` (index 31) so we can read each row's
+    // sort value without adding it to models.Name.
+    const sql = try std.fmt.allocPrint(db.allocator, "SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, protocol, token_id, canonical_id, token_version, expiry, registry_locked, migrated, created_at, registered_at, created_block, updated_at, updated_block, is_reachable, unreachable_since, ttl, is_legacy, is_normalized, is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash, CAST({s} AS TEXT) AS _sortval FROM names {s}ORDER BY {s} {s}, namehash {s} LIMIT ?", .{ sort_field.toSql(), where_clause.items, sort_field.toSql(), order_str, order_str });
+    defer db.allocator.free(sql);
+
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+
+    try bindNameFilters(&q, filters);
+    if (anchor) |a| {
+        try bindKeysetValue(&q, sort_field, a.sort_value);
+        try bindKeysetValue(&q, sort_field, a.sort_value);
+        try q.bindText(a.namehash);
+    }
+    try q.bindInt(@intCast(limit));
+
+    var names: std.ArrayList(models.Name) = .empty;
+    errdefer {
+        for (names.items) |*n| n.deinit(db.allocator);
+        names.deinit(db.allocator);
+    }
+    var sort_values: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (sort_values.items) |v| db.allocator.free(v);
+        sort_values.deinit(db.allocator);
+    }
+    while (try q.step()) {
+        const row = try parseOneNameRow(&q, db.allocator);
+        errdefer {
+            var m = row;
+            m.deinit(db.allocator);
+        }
+        const sv = try db.allocator.dupe(u8, q.getTextSlice(31) orelse "");
+        errdefer db.allocator.free(sv);
+        try names.append(db.allocator, row);
+        try sort_values.append(db.allocator, sv);
+    }
+
+    return .{
+        .names = try names.toOwnedSlice(db.allocator),
+        .sort_values = try sort_values.toOwnedSlice(db.allocator),
+    };
+}
+
 /// Get all names with configurable order direction
 pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u32, order_dir: OrderDir, sort_field: NameSortField) ![]models.Name {
     const order_str = if (order_dir == .desc) "DESC" else "ASC";
@@ -583,7 +716,7 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated,
             \\       created_at, registered_at, created_block, updated_at, updated_block,
             \\       is_reachable, unreachable_since, ttl, is_legacy, is_normalized, is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash
-            \\FROM names WHERE is_reachable = 1 AND is_normalized = 1 AND owner = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
+            \\FROM names WHERE is_reachable = 1 AND is_normalized = 1 AND owner = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' AND NOT (names.protocol = 'v1' AND EXISTS (SELECT 1 FROM names v2twin WHERE v2twin.namehash = names.namehash AND v2twin.protocol = 'v2')) ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
         , .{ sort_field.toSql(), order_str, order_str })
     else
         try std.fmt.allocPrint(db.allocator,
@@ -591,7 +724,7 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated,
             \\       created_at, registered_at, created_block, updated_at, updated_block,
             \\       is_reachable, unreachable_since, ttl, is_legacy, is_normalized, is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash
-            \\FROM names WHERE is_reachable = 1 AND is_normalized = 1 AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
+            \\FROM names WHERE is_reachable = 1 AND is_normalized = 1 AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' AND NOT (names.protocol = 'v1' AND EXISTS (SELECT 1 FROM names v2twin WHERE v2twin.namehash = names.namehash AND v2twin.protocol = 'v2')) ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
         , .{ sort_field.toSql(), order_str, order_str });
     defer db.allocator.free(sql);
 
@@ -614,10 +747,10 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
 /// Get count of names with optional filters.
 /// Builds the same WHERE clause as getFilteredNames but uses SELECT COUNT(*).
 pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
-    var conditions: std.ArrayList([]const u8) = .{};
+    var conditions: std.ArrayList([]const u8) = .empty;
     defer conditions.deinit(db.allocator);
 
-    var allocated_strings: std.ArrayList([]const u8) = .{};
+    var allocated_strings: std.ArrayList([]const u8) = .empty;
     defer {
         for (allocated_strings.items) |s| db.allocator.free(s);
         allocated_strings.deinit(db.allocator);
@@ -625,7 +758,7 @@ pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
     try appendNameFilterConditions(db, filters, &conditions, &allocated_strings);
 
     // Build SQL
-    var where_clause: std.ArrayList(u8) = .{};
+    var where_clause: std.ArrayList(u8) = .empty;
     defer where_clause.deinit(db.allocator);
 
     if (conditions.items.len > 0) {

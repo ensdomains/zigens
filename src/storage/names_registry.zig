@@ -112,7 +112,7 @@ pub fn getRegistriesByOwner(db: *Database, protocol: models.Protocol, owner: Add
     try q.bindTextStatic(protocol.toString());
     try q.bindAddress(owner);
 
-    var registries: std.ArrayList(models.Registry) = .{};
+    var registries: std.ArrayList(models.Registry) = .empty;
     errdefer {
         for (registries.items) |*reg| {
             db.allocator.free(reg.name);
