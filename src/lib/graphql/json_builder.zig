@@ -67,9 +67,9 @@ pub fn buildEntityJson(
         return error.MaxDepthExceeded;
     }
 
-    var json: std.ArrayList(u8) = .{};
-    errdefer json.deinit(allocator);
-    const writer = json.writer(allocator);
+    var json: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json.deinit();
+    const writer = &json.writer;
 
     try writer.writeAll("{");
     var first = true;
@@ -104,21 +104,21 @@ pub fn buildEntityJson(
         if (handled_nested) continue;
 
         // Try scalar field from field definitions
-        var field_buffer: std.ArrayList(u8) = .{};
-        defer field_buffer.deinit(allocator);
+        var field_buffer: std.Io.Writer.Allocating = .init(allocator);
+        defer field_buffer.deinit();
 
         const handled = try fields.handleFieldFromTable(
             ctx,
             output_key,
             field.name,
-            field_buffer.writer(allocator),
+            &field_buffer.writer,
             allocator,
             config.field_defs,
         );
 
         if (handled) {
             if (!first) try writer.writeAll(",");
-            try writer.writeAll(field_buffer.items);
+            try writer.writeAll(field_buffer.written());
             first = false;
         } else {
             // Unknown field - return null per GraphQL spec
@@ -129,7 +129,7 @@ pub fn buildEntityJson(
     }
 
     try writer.writeAll("}");
-    return try allocator.dupe(u8, json.items);
+    return try json.toOwnedSlice();
 }
 
 /// Build JSON array for a list of entities
@@ -141,9 +141,9 @@ pub fn buildEntityArrayJson(
     config: *const EntityConfig,
     nested_ctx: NestedContext,
 ) anyerror![]u8 {
-    var json: std.ArrayList(u8) = .{};
-    errdefer json.deinit(allocator);
-    const writer = json.writer(allocator);
+    var json: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json.deinit();
+    const writer = &json.writer;
 
     try writer.writeAll("[");
 
@@ -161,5 +161,5 @@ pub fn buildEntityArrayJson(
     }
 
     try writer.writeAll("]");
-    return try allocator.dupe(u8, json.items);
+    return try json.toOwnedSlice();
 }

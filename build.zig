@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
 
     // Create GraphQL library module for use by test files
     const graphql_lib_mod = b.createModule(.{
-        .root_source_file = b.path("src/lib/graphql/graphql.zig"),
+        .root_source_file = b.path("src/graphql_lib.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -52,8 +52,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    indexer_exe.linkLibC();
-    indexer_exe.linkSystemLibrary("sqlite3");
+    indexer_exe.root_module.link_libc = true;
+    indexer_exe.root_module.linkSystemLibrary("sqlite3", .{});
     b.installArtifact(indexer_exe);
 
     // V1-only indexer executable (separate process)
@@ -70,8 +70,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    indexer_v1_exe.linkLibC();
-    indexer_v1_exe.linkSystemLibrary("sqlite3");
+    indexer_v1_exe.root_module.link_libc = true;
+    indexer_v1_exe.root_module.linkSystemLibrary("sqlite3", .{});
     b.installArtifact(indexer_v1_exe);
 
     // V2-only indexer executable (separate process)
@@ -88,8 +88,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    indexer_v2_exe.linkLibC();
-    indexer_v2_exe.linkSystemLibrary("sqlite3");
+    indexer_v2_exe.root_module.link_libc = true;
+    indexer_v2_exe.root_module.linkSystemLibrary("sqlite3", .{});
     b.installArtifact(indexer_v2_exe);
 
     // Generate GraphQL introspection from schema.graphql
@@ -123,8 +123,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    api_exe.linkLibC();
-    api_exe.linkSystemLibrary("sqlite3");
+    api_exe.root_module.link_libc = true;
+    api_exe.root_module.linkSystemLibrary("sqlite3", .{});
     api_exe.step.dependOn(&generate_schema.step); // Generate schema before compiling
     b.installArtifact(api_exe);
 
@@ -137,8 +137,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    test_db_reader_exe.linkLibC();
-    test_db_reader_exe.linkSystemLibrary("sqlite3");
+    test_db_reader_exe.root_module.link_libc = true;
+    test_db_reader_exe.root_module.linkSystemLibrary("sqlite3", .{});
     b.installArtifact(test_db_reader_exe);
 
     // Rainbow backfill tool (standalone)
@@ -150,8 +150,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    rainbow_backfill_exe.linkLibC();
-    rainbow_backfill_exe.linkSystemLibrary("sqlite3");
+    rainbow_backfill_exe.root_module.link_libc = true;
+    rainbow_backfill_exe.root_module.linkSystemLibrary("sqlite3", .{});
     b.installArtifact(rainbow_backfill_exe);
 
     // Run commands
@@ -188,8 +188,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    unit_tests.linkLibC();
-    unit_tests.linkSystemLibrary("sqlite3");
+    unit_tests.root_module.link_libc = true;
+    unit_tests.root_module.linkSystemLibrary("sqlite3", .{});
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     run_unit_tests.setCwd(b.path("."));
@@ -219,8 +219,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    integration_tests.linkLibC();
-    integration_tests.linkSystemLibrary("sqlite3");
+    integration_tests.root_module.link_libc = true;
+    integration_tests.root_module.linkSystemLibrary("sqlite3", .{});
 
     const run_integration_tests = b.addRunArtifact(integration_tests);
     run_integration_tests.setCwd(b.path("."));
@@ -255,8 +255,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    graphql_tests.linkLibC();
-    graphql_tests.linkSystemLibrary("sqlite3");
+    graphql_tests.root_module.link_libc = true;
+    graphql_tests.root_module.linkSystemLibrary("sqlite3", .{});
 
     const run_graphql_tests = b.addRunArtifact(graphql_tests);
     const graphql_test_step = b.step("test-graphql", "Run GraphQL parser tests");
@@ -273,8 +273,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    graphql_features_tests.linkLibC();
-    graphql_features_tests.linkSystemLibrary("sqlite3");
+    graphql_features_tests.root_module.link_libc = true;
+    graphql_features_tests.root_module.linkSystemLibrary("sqlite3", .{});
 
     const run_graphql_features_tests = b.addRunArtifact(graphql_features_tests);
     const graphql_features_test_step = b.step("test-graphql-features", "Run all GraphQL feature tests");
@@ -307,6 +307,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    normalize_tests.root_module.link_libc = true;
     const run_normalize_tests = b.addRunArtifact(normalize_tests);
     const normalize_test_step = b.step("test-normalize", "Run ENSIP-15 normalization tests");
     normalize_test_step.dependOn(&run_normalize_tests.step);
@@ -325,8 +326,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    indexer_tests.linkLibC();
-    indexer_tests.linkSystemLibrary("sqlite3");
+    indexer_tests.root_module.link_libc = true;
+    indexer_tests.root_module.linkSystemLibrary("sqlite3", .{});
 
     const run_indexer_tests = b.addRunArtifact(indexer_tests);
     run_indexer_tests.setCwd(b.path("."));
@@ -359,8 +360,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    api_tests.linkLibC();
-    api_tests.linkSystemLibrary("sqlite3");
+    api_tests.root_module.link_libc = true;
+    api_tests.root_module.linkSystemLibrary("sqlite3", .{});
     const run_api_tests = b.addRunArtifact(api_tests);
     run_api_tests.setCwd(b.path("."));
     const api_test_step = b.step("test-api", "Run api-module inline tests");
@@ -374,8 +375,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    events_tests.linkLibC();
-    events_tests.linkSystemLibrary("sqlite3");
+    events_tests.root_module.link_libc = true;
+    events_tests.root_module.linkSystemLibrary("sqlite3", .{});
 
     const run_events_tests = b.addRunArtifact(events_tests);
     run_events_tests.setCwd(b.path("."));
@@ -464,8 +465,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    storage_names_tests.linkLibC();
-    storage_names_tests.linkSystemLibrary("sqlite3");
+    storage_names_tests.root_module.link_libc = true;
+    storage_names_tests.root_module.linkSystemLibrary("sqlite3", .{});
 
     const run_storage_names_tests = b.addRunArtifact(storage_names_tests);
     run_storage_names_tests.setCwd(b.path("."));
@@ -482,8 +483,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    storage_resolvers_tests.linkLibC();
-    storage_resolvers_tests.linkSystemLibrary("sqlite3");
+    storage_resolvers_tests.root_module.link_libc = true;
+    storage_resolvers_tests.root_module.linkSystemLibrary("sqlite3", .{});
 
     const run_storage_resolvers_tests = b.addRunArtifact(storage_resolvers_tests);
     run_storage_resolvers_tests.setCwd(b.path("."));
@@ -500,8 +501,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    storage_roles_tests.linkLibC();
-    storage_roles_tests.linkSystemLibrary("sqlite3");
+    storage_roles_tests.root_module.link_libc = true;
+    storage_roles_tests.root_module.linkSystemLibrary("sqlite3", .{});
 
     const run_storage_roles_tests = b.addRunArtifact(storage_roles_tests);
     run_storage_roles_tests.setCwd(b.path("."));
@@ -518,8 +519,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    storage_webhooks_tests.linkLibC();
-    storage_webhooks_tests.linkSystemLibrary("sqlite3");
+    storage_webhooks_tests.root_module.link_libc = true;
+    storage_webhooks_tests.root_module.linkSystemLibrary("sqlite3", .{});
 
     const run_storage_webhooks_tests = b.addRunArtifact(storage_webhooks_tests);
     run_storage_webhooks_tests.setCwd(b.path("."));
@@ -536,8 +537,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    storage_registry_entries_tests.linkLibC();
-    storage_registry_entries_tests.linkSystemLibrary("sqlite3");
+    storage_registry_entries_tests.root_module.link_libc = true;
+    storage_registry_entries_tests.root_module.linkSystemLibrary("sqlite3", .{});
 
     const run_storage_registry_entries_tests = b.addRunArtifact(storage_registry_entries_tests);
     run_storage_registry_entries_tests.setCwd(b.path("."));
@@ -554,8 +555,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    storage_query_tests.linkLibC();
-    storage_query_tests.linkSystemLibrary("sqlite3");
+    storage_query_tests.root_module.link_libc = true;
+    storage_query_tests.root_module.linkSystemLibrary("sqlite3", .{});
 
     const run_storage_query_tests = b.addRunArtifact(storage_query_tests);
     run_storage_query_tests.setCwd(b.path("."));
@@ -572,8 +573,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    storage_pg_dialect_tests.linkLibC();
-    storage_pg_dialect_tests.linkSystemLibrary("sqlite3");
+    storage_pg_dialect_tests.root_module.link_libc = true;
+    storage_pg_dialect_tests.root_module.linkSystemLibrary("sqlite3", .{});
     const run_storage_pg_dialect_tests = b.addRunArtifact(storage_pg_dialect_tests);
     run_storage_pg_dialect_tests.setCwd(b.path("."));
 
@@ -604,8 +605,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    pg_driver_tests.linkLibC();
-    pg_driver_tests.linkSystemLibrary("sqlite3");
+    pg_driver_tests.root_module.link_libc = true;
+    pg_driver_tests.root_module.linkSystemLibrary("sqlite3", .{});
     const run_pg_driver_tests = b.addRunArtifact(pg_driver_tests);
     run_pg_driver_tests.setCwd(b.path("."));
 
@@ -640,8 +641,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    backend_conformance_tests.linkLibC();
-    backend_conformance_tests.linkSystemLibrary("sqlite3");
+    backend_conformance_tests.root_module.link_libc = true;
+    backend_conformance_tests.root_module.linkSystemLibrary("sqlite3", .{});
     const run_backend_conformance_tests = b.addRunArtifact(backend_conformance_tests);
     run_backend_conformance_tests.setCwd(b.path("."));
 
@@ -658,8 +659,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    pool_tests.linkLibC();
-    pool_tests.linkSystemLibrary("sqlite3");
+    pool_tests.root_module.link_libc = true;
+    pool_tests.root_module.linkSystemLibrary("sqlite3", .{});
     const run_pool_tests = b.addRunArtifact(pool_tests);
     run_pool_tests.setCwd(b.path("."));
 
@@ -730,8 +731,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    resolve_tests.linkLibC();
-    resolve_tests.linkSystemLibrary("sqlite3");
+    resolve_tests.root_module.link_libc = true;
+    resolve_tests.root_module.linkSystemLibrary("sqlite3", .{});
     const run_resolve_tests = b.addRunArtifact(resolve_tests);
     run_resolve_tests.setCwd(b.path("."));
     const resolve_test_step = b.step("test-resolve", "Run resolution layer tests");
@@ -754,8 +755,8 @@ pub fn build(b: *std.Build) void {
         }),
         .test_runner = .{ .path = b.path("tests/conformance/quiet_runner.zig"), .mode = .simple },
     });
-    conformance_tests.linkLibC();
-    conformance_tests.linkSystemLibrary("sqlite3");
+    conformance_tests.root_module.link_libc = true;
+    conformance_tests.root_module.linkSystemLibrary("sqlite3", .{});
     const run_conformance_tests = b.addRunArtifact(conformance_tests);
     run_conformance_tests.setCwd(b.path("."));
     const conformance_test_step = b.step("test-conformance", "Run GraphQL conformance golden harness");
@@ -771,6 +772,7 @@ pub fn build(b: *std.Build) void {
         }),
         .test_runner = .{ .path = b.path("tests/conformance/quiet_runner.zig"), .mode = .simple },
     });
+    manifest_tests.root_module.link_libc = true;
     const run_manifest_tests = b.addRunArtifact(manifest_tests);
     run_manifest_tests.setCwd(b.path("."));
     const manifest_test_step = b.step("test-manifest", "Run contract-manifest loader tests");

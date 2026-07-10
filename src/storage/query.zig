@@ -35,7 +35,7 @@ pub const Query = backend.Statement;
 /// callers should special-case `count == 0` themselves (this helper returns
 /// a syntactically valid but always-empty clause when count is 0).
 pub fn buildInClause(allocator: std.mem.Allocator, column: []const u8, op: []const u8, count: usize) ![]u8 {
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, column);
     try out.append(allocator, ' ');
@@ -53,7 +53,7 @@ pub fn buildInClause(allocator: std.mem.Allocator, column: []const u8, op: []con
 /// "(a<sep>b<sep>c)" — wrap a joined list of SQL fragments in parentheses. Used by the
 /// recursive `and`/`or` boolean-filter builders (names/events/registrations).
 pub fn joinWrapped(allocator: std.mem.Allocator, items: []const []const u8, sep: []const u8) ![]const u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     try buf.append(allocator, '(');
     for (items, 0..) |it, i| {

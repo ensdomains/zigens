@@ -8,6 +8,7 @@
 //! are not private across files).
 
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const models = @import("../types/models.zig");
 const Hash = @import("../types/hash.zig").Hash;
 const Address = @import("../types/address.zig").Address;
@@ -138,7 +139,7 @@ pub fn getBlockTimestamp(self: *Indexer, protocol: models.Protocol, block_number
     const client = self.getClient(protocol);
     const block = client.getBlockByNumber(block_number, false) catch |err| {
         std.log.warn("Failed to fetch block {d} timestamp: {}, using current time", .{ block_number, err });
-        return std.time.timestamp();
+        return zsys.timestamp();
     };
 
     const timestamp: i64 = @intCast(block.timestamp);

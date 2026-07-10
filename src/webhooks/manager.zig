@@ -1,4 +1,5 @@
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const models = @import("../types/models.zig");
 const db = @import("../storage/database.zig");
 const json_utils = @import("../utils/json.zig");
@@ -7,7 +8,7 @@ const json_utils = @import("../utils/json.zig");
 /// Caller owns the returned slice. Use `std.crypto.random` for cryptographically secure bytes.
 pub fn generateWebhookSecret(allocator: std.mem.Allocator) ![]u8 {
     var raw: [32]u8 = undefined;
-    std.crypto.random.bytes(&raw);
+    zsys.randomBytes(&raw);
     const hex = std.fmt.bytesToHex(raw, .lower);
     return try allocator.dupe(u8, &hex);
 }
@@ -30,7 +31,7 @@ pub fn computeWebhookSignature(allocator: std.mem.Allocator, secret_hex: []const
     const ts_str = try std.fmt.bufPrint(&ts_buf, "{d}", .{timestamp_secs});
 
     // signed_string = "{ts}.{payload}"
-    var signed: std.ArrayList(u8) = .{};
+    var signed: std.ArrayList(u8) = .empty;
     defer signed.deinit(allocator);
     try signed.appendSlice(allocator, ts_str);
     try signed.append(allocator, '.');
@@ -93,16 +94,17 @@ test "sanitizeUrlForLog strips userinfo" {
 
 pub const WebhookManager = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     database: *db.Database, // Separate webhook database connection
     http_client: std.http.Client,
     max_retries: u32,
     worker_threads: std.ArrayList(std.Thread),
     should_stop: std.atomic.Value(bool),
     rate_limit_ms: u64, // Milliseconds between requests to same endpoint
-    db_mutex: std.Thread.Mutex, // Protects database access from worker threads
+    db_mutex: zsys.Mutex, // Protects database access from worker threads
     last_cleanup_at: std.atomic.Value(i64), // Timestamp of last queue cleanup
 
-    pub fn init(allocator: std.mem.Allocator, webhook_db_path: []const u8, max_retries: u32, rate_limit_ms: u64) !*WebhookManager {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, webhook_db_path: []const u8, max_retries: u32, rate_limit_ms: u64) !*WebhookManager {
         const manager = try allocator.create(WebhookManager);
         errdefer allocator.destroy(manager);
 
@@ -119,13 +121,14 @@ pub const WebhookManager = struct {
 
         manager.* = .{
             .allocator = allocator,
+            .io = io,
             .database = webhook_db,
-            .http_client = std.http.Client{ .allocator = allocator },
+            .http_client = std.http.Client{ .allocator = allocator, .io = io },
             .max_retries = max_retries,
-            .worker_threads = .{},
+            .worker_threads = .empty,
             .should_stop = std.atomic.Value(bool).init(false),
             .rate_limit_ms = rate_limit_ms,
-            .db_mutex = std.Thread.Mutex{},
+            .db_mutex = zsys.Mutex{},
             .last_cleanup_at = std.atomic.Value(i64).init(0), // Will run cleanup on first check
         };
         return manager;
@@ -146,26 +149,18 @@ pub const WebhookManager = struct {
         std.log.info("Loading webhook schema...", .{});
 
         const schema_dir = "schema/webhooks";
-        var dir = std.fs.cwd().openDir(schema_dir, .{ .iterate = true }) catch |err| {
+        const dir_names = zsys.listFiles(database.allocator, schema_dir) catch |err| {
             std.log.err("Failed to open webhook schema directory '{s}': {}", .{ schema_dir, err });
             return err;
         };
-        defer dir.close();
+        defer zsys.freeFileList(database.allocator, dir_names);
 
-        var iterator = dir.iterate();
-        var schema_files: std.ArrayList([]const u8) = .{};
-        defer {
-            for (schema_files.items) |file| {
-                database.allocator.free(file);
-            }
-            schema_files.deinit(database.allocator);
-        }
+        var schema_files: std.ArrayList([]const u8) = .empty;
+        defer schema_files.deinit(database.allocator);
 
-        while (try iterator.next()) |entry| {
-            if (entry.kind != .file) continue;
-            if (!std.mem.endsWith(u8, entry.name, ".sql")) continue;
-            const file_name = try database.allocator.dupe(u8, entry.name);
-            try schema_files.append(database.allocator, file_name);
+        for (dir_names) |entry_name| {
+            if (!std.mem.endsWith(u8, entry_name, ".sql")) continue;
+            try schema_files.append(database.allocator, entry_name);
         }
 
         // Sort schema files by name (001_, 002_, etc.)
@@ -181,7 +176,7 @@ pub const WebhookManager = struct {
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
             const full_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ schema_dir, file_name });
 
-            const sql = try std.fs.cwd().readFileAlloc(database.allocator, full_path, 1024 * 1024);
+            const sql = try zsys.readFileAlloc(database.allocator, full_path, 1024 * 1024);
             defer database.allocator.free(sql);
 
             database.exec(sql) catch |err| {
@@ -214,7 +209,7 @@ pub const WebhookManager = struct {
         std.log.debug("Webhook worker started", .{});
 
         // Wait a bit for initialization to complete
-        std.Thread.sleep(1000 * std.time.ns_per_ms);
+        zsys.sleep(1000 * std.time.ns_per_ms);
 
         // Reclaim any rows stuck in 'processing' from a previous crashed/restarted worker.
         // Done once at startup; subsequent stale-claim recovery happens periodically
@@ -233,7 +228,7 @@ pub const WebhookManager = struct {
             self.runDailyCleanupIfNeeded();
 
             // Sleep briefly to avoid busy-waiting
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            zsys.sleep(100 * std.time.ns_per_ms);
         }
 
         std.log.debug("Webhook worker stopped", .{});
@@ -244,7 +239,7 @@ pub const WebhookManager = struct {
     /// well beyond a normal HTTP timeout). Reclaimed rows go back to 'pending'.
     fn reclaimStuckClaims(self: *WebhookManager) !void {
         const stuck_threshold_secs: i64 = 300; // 5 minutes
-        const now = std.time.timestamp();
+        const now = zsys.timestamp();
         const cutoff = now - stuck_threshold_secs;
 
         self.db_mutex.lock();
@@ -265,7 +260,7 @@ pub const WebhookManager = struct {
 
     /// Run queue cleanup once per day (24 hours)
     fn runDailyCleanupIfNeeded(self: *WebhookManager) void {
-        const now = std.time.timestamp();
+        const now = zsys.timestamp();
         const last_cleanup = self.last_cleanup_at.load(.acquire);
         const one_day_seconds: i64 = 86400;
 
@@ -341,8 +336,8 @@ pub const WebhookManager = struct {
 
     /// Build JSON payload for event
     fn buildPayload(self: *WebhookManager, event: models.Event) ![]u8 {
-        var payload: std.ArrayList(u8) = .{};
-        errdefer payload.deinit(self.allocator);
+        var payload: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer payload.deinit();
 
         const tx_hex = try event.tx_hash.toHex(self.allocator);
         defer self.allocator.free(tx_hex);
@@ -353,7 +348,7 @@ pub const WebhookManager = struct {
         const data_escaped = try json_utils.escapeString(self.allocator, event.data);
         defer self.allocator.free(data_escaped);
 
-        const writer = payload.writer(self.allocator);
+        const writer = &payload.writer;
 
         // Build base payload with required fields
         try writer.print("{{\"event_type\":\"{s}\",\"protocol\":\"{s}\",\"block_number\":{d},\"tx_hash\":\"{s}\",\"log_index\":{d},\"contract_address\":\"{s}\"", .{
@@ -386,7 +381,7 @@ pub const WebhookManager = struct {
         // Add data and timestamp
         try writer.print(",\"data\":\"{s}\",\"timestamp\":{d}}}", .{ data_escaped, event.timestamp });
 
-        return payload.toOwnedSlice(self.allocator);
+        return payload.toOwnedSlice();
     }
 
     /// Enqueue webhook delivery to persistent database queue.
@@ -415,7 +410,7 @@ pub const WebhookManager = struct {
         try q.bindAddress(event.contract_address);
         try q.bindText(payload);
         try q.bindInt64(event.timestamp);
-        try q.bindInt64(std.time.timestamp()); // Can send immediately
+        try q.bindInt64(zsys.timestamp()); // Can send immediately
         try q.exec();
 
         std.log.debug("Enqueued webhook for {s}: {s}", .{ sanitizeUrlForLog(webhook_url), event.event_type.toString() });
@@ -438,10 +433,10 @@ pub const WebhookManager = struct {
 
     /// Process a batch of pending webhooks from the queue
     fn processQueueBatch(self: *WebhookManager) !void {
-        const now = std.time.timestamp();
+        const now = zsys.timestamp();
 
         // Fetch and copy webhook jobs from database (with mutex protection)
-        var jobs: std.ArrayList(WebhookJob) = .{};
+        var jobs: std.ArrayList(WebhookJob) = .empty;
         defer {
             for (jobs.items) |*job| {
                 job.deinit(self.allocator);
@@ -505,7 +500,7 @@ pub const WebhookManager = struct {
         // any rate_limit_ms < 1000 to 0, disabling the limit entirely.
         var endpoint_last_sent_ms = std.StringHashMap(i64).init(self.allocator);
         defer endpoint_last_sent_ms.deinit();
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = zsys.milliTimestamp();
 
         for (jobs.items) |job| {
             // Check rate limit for this endpoint (millisecond precision)
@@ -551,7 +546,7 @@ pub const WebhookManager = struct {
 
         var q = try db.Query.init(self.database, "UPDATE webhook_queue SET status = 'delivered', updated_at = ? WHERE id = ?");
         defer q.deinit();
-        try q.bindInt64(std.time.timestamp());
+        try q.bindInt64(zsys.timestamp());
         try q.bindInt64(@intCast(queue_id));
         try q.exec();
 
@@ -567,7 +562,7 @@ pub const WebhookManager = struct {
 
         // Calculate next retry time with exponential backoff
         const backoff_secs = @min(@as(i64, 60) * (@as(i64, 1) << @intCast(@min(retry_count, 10))), 3600); // Max 1 hour
-        const next_retry_at = std.time.timestamp() + backoff_secs;
+        const next_retry_at = zsys.timestamp() + backoff_secs;
 
         // Determine if we should give up
         const status = if (new_retry_count >= self.max_retries) "failed" else "pending";
@@ -582,8 +577,8 @@ pub const WebhookManager = struct {
         try q.bindTextStatic(status);
         try q.bindInt(@intCast(new_retry_count));
         try q.bindInt64(next_retry_at);
-        try q.bindInt64(std.time.timestamp());
-        try q.bindInt64(std.time.timestamp());
+        try q.bindInt64(zsys.timestamp());
+        try q.bindInt64(zsys.timestamp());
         try q.bindInt64(@intCast(queue_id));
         try q.exec();
 
@@ -637,7 +632,7 @@ pub const WebhookManager = struct {
         defer args.release();
 
         // Compute HMAC-SHA256 over "{timestamp}.{payload}" for the X-Webhook-Signature header.
-        const timestamp = std.time.timestamp();
+        const timestamp = zsys.timestamp();
         const signature = computeWebhookSignature(args.allocator, args.secret, timestamp, args.payload) catch |err| {
             std.log.err("Webhook signature compute failed for {s}: {}", .{ sanitizeUrlForLog(args.url), err });
             args.done.store(3, .release);
@@ -651,7 +646,7 @@ pub const WebhookManager = struct {
             return;
         };
 
-        var sig_header: std.ArrayList(u8) = .{};
+        var sig_header: std.ArrayList(u8) = .empty;
         defer sig_header.deinit(args.allocator);
         sig_header.appendSlice(args.allocator, "sha256=") catch {
             args.done.store(3, .release);
@@ -676,15 +671,15 @@ pub const WebhookManager = struct {
             .{ .name = "X-Webhook-Id", .value = id_str },
         };
 
-        var response_buf: std.Io.Writer.Allocating = .init(args.allocator);
-        defer response_buf.deinit();
-
+        // No response_writer: only the status matters, and without one fetch discards the
+        // body through the RAW reader — so the endpoint (an untrusted, user-supplied URL)
+        // can never route us into Zig 0.15.2's panic-prone flate decompressor, whatever
+        // Content-Encoding it sends (see rpc/client.zig executeHttpRequest).
         const result = args.client.fetch(.{
             .location = .{ .url = args.url },
             .method = .POST,
             .payload = args.payload,
             .extra_headers = &extra_headers,
-            .response_writer = &response_buf.writer,
             .keep_alive = true,
         }) catch |err| {
             std.log.err("Webhook http.fetch error for {s}: {}", .{ sanitizeUrlForLog(args.url), err });
@@ -728,7 +723,7 @@ pub const WebhookManager = struct {
         thread.detach();
 
         // Poll done flag with a deadline. Sleep granularity 50ms — fine for 10s deadline.
-        const start_ms = std.time.milliTimestamp();
+        const start_ms = zsys.milliTimestamp();
         while (true) {
             const status = args.done.load(.acquire);
             if (status != 0) {
@@ -738,14 +733,14 @@ pub const WebhookManager = struct {
                     else => error.HttpError,
                 };
             }
-            if (std.time.milliTimestamp() - start_ms >= HTTP_DELIVERY_DEADLINE_MS) {
+            if (zsys.milliTimestamp() - start_ms >= HTTP_DELIVERY_DEADLINE_MS) {
                 std.log.warn("Webhook delivery timed out for {s} after {d}ms; abandoning thread", .{
                     sanitizeUrlForLog(url),
                     HTTP_DELIVERY_DEADLINE_MS,
                 });
                 return error.HttpTimeout;
             }
-            std.Thread.sleep(50 * std.time.ns_per_ms);
+            zsys.sleep(50 * std.time.ns_per_ms);
         }
     }
 
@@ -765,7 +760,7 @@ pub const WebhookManager = struct {
             .event_types = event_types,
             .active = true,
             .max_retries = self.max_retries,
-            .created_at = std.time.timestamp(),
+            .created_at = zsys.timestamp(),
         };
 
         const webhook_id = try self.database.insertWebhook(webhook);
@@ -818,7 +813,7 @@ pub const WebhookManager = struct {
         defer self.db_mutex.unlock();
 
         var stats = CleanupStats{ .delivered_removed = 0, .failed_removed = 0 };
-        const now = std.time.timestamp();
+        const now = zsys.timestamp();
 
         // Clean up delivered webhooks
         {
@@ -859,22 +854,22 @@ pub const WebhookManager = struct {
 };
 
 test "WebhookManager init" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const manager = try WebhookManager.init(allocator, ":memory:", 3, 1000);
+    const manager = try WebhookManager.init(allocator, std.testing.io, ":memory:", 3, 1000);
     defer manager.deinit();
 
     try std.testing.expect(manager.max_retries == 3);
 }
 
 test "WebhookManager register webhook" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const manager = try WebhookManager.init(allocator, ":memory:", 3, 1000);
+    const manager = try WebhookManager.init(allocator, std.testing.io, ":memory:", 3, 1000);
     defer manager.deinit();
 
     const event_types = [_]models.EventType{.name_registered};
@@ -886,11 +881,11 @@ test "WebhookManager register webhook" {
 }
 
 test "WebhookManager unregister webhook" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const manager = try WebhookManager.init(allocator, ":memory:", 3, 1000);
+    const manager = try WebhookManager.init(allocator, std.testing.io, ":memory:", 3, 1000);
     defer manager.deinit();
 
     const event_types = [_]models.EventType{.name_registered};
@@ -902,11 +897,11 @@ test "WebhookManager unregister webhook" {
 }
 
 test "WebhookManager list webhooks" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const manager = try WebhookManager.init(allocator, ":memory:", 3, 1000);
+    const manager = try WebhookManager.init(allocator, std.testing.io, ":memory:", 3, 1000);
     defer manager.deinit();
 
     const event_types = [_]models.EventType{.name_registered};

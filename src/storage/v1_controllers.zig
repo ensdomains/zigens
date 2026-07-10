@@ -74,7 +74,7 @@ pub fn getActiveControllers(
     var q = try Query.initCached(database, sql);
     defer q.deinit();
 
-    var controllers: std.ArrayList(Address) = .{};
+    var controllers: std.ArrayList(Address) = .empty;
     errdefer controllers.deinit(allocator);
 
     while (try q.step()) {

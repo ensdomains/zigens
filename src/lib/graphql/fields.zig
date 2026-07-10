@@ -55,7 +55,7 @@ pub const FieldValue = union(enum) {
 pub const FieldGetter = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!FieldValue;
 
 /// Custom writer function type - writes directly to JSON output
-pub const CustomWriter = *const fn (ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) anyerror!bool;
+pub const CustomWriter = *const fn (ctx: *anyopaque, output_key: []const u8, writer: *std.Io.Writer, allocator: std.mem.Allocator) anyerror!bool;
 
 /// Field definition
 pub const FieldDef = struct {
@@ -114,7 +114,7 @@ pub const FieldDef = struct {
 /// Escape a string for JSON output (RFC 8259 compliant)
 /// Properly escapes ALL control characters (0x00-0x1F, 0x7F), quotes, backslashes
 pub fn escapeJsonString(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var result: std.ArrayList(u8) = .{};
+    var result: std.ArrayList(u8) = .empty;
     errdefer result.deinit(allocator);
 
     for (input) |char| {
@@ -128,7 +128,7 @@ pub fn escapeJsonString(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
             '\x0C' => try result.appendSlice(allocator, "\\f"), // form feed
             // All other control characters (0x00-0x1F except the ones above, plus 0x7F) must be escaped as \uXXXX
             0x00...0x07, 0x0B, 0x0E...0x1F, 0x7F => {
-                try result.writer(allocator).print("\\u{x:0>4}", .{char});
+                try result.print(allocator, "\\u{x:0>4}", .{char});
             },
             else => try result.append(allocator, char),
         }
@@ -143,7 +143,7 @@ pub fn handleFieldFromTable(
     ctx: *anyopaque,
     output_key: []const u8,
     field_name: []const u8,
-    writer: std.ArrayList(u8).Writer,
+    writer: *std.Io.Writer,
     allocator: std.mem.Allocator,
     field_defs: []const FieldDef,
 ) !bool {
@@ -160,7 +160,7 @@ pub fn handleFieldFromTable(
 fn writeFieldValue(
     ctx: *anyopaque,
     output_key: []const u8,
-    writer: std.ArrayList(u8).Writer,
+    writer: *std.Io.Writer,
     allocator: std.mem.Allocator,
     def: FieldDef,
 ) !bool {

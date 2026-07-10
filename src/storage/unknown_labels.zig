@@ -87,7 +87,7 @@ pub fn getUnknownLabelsForBackfill(
 
     try q.bindInt64(@intCast(limit));
 
-    var results: std.ArrayList(UnknownLabel) = .{};
+    var results: std.ArrayList(UnknownLabel) = .empty;
     errdefer {
         for (results.items) |label| freeUnknownLabel(allocator, label);
         results.deinit(allocator);
@@ -144,7 +144,7 @@ pub fn getUnknownLabelsByLabelhash(
     defer q.deinit();
     try q.bindHash(labelhash);
 
-    var results: std.ArrayList(UnknownLabel) = .{};
+    var results: std.ArrayList(UnknownLabel) = .empty;
     errdefer {
         for (results.items) |label| freeUnknownLabel(allocator, label);
         results.deinit(allocator);

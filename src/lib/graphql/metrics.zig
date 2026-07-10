@@ -1,4 +1,5 @@
 const std = @import("std");
+const zsys = @import("../../utils/system.zig");
 
 /// GraphQL Metrics Tracker
 /// Thread-safe metrics collection for GraphQL queries
@@ -6,7 +7,7 @@ const std = @import("std");
 pub const Metrics = struct {
     allocator: std.mem.Allocator,
     enabled: bool,
-    mutex: std.Thread.Mutex,
+    mutex: zsys.Mutex,
 
     // Query counters
     total_queries: u64,
@@ -52,7 +53,7 @@ pub const Metrics = struct {
             .max_depth = 0,
             .total_cost = 0,
             .max_cost = 0,
-            .start_time = std.time.timestamp(),
+            .start_time = zsys.timestamp(),
         };
     }
 
@@ -179,7 +180,7 @@ pub const Metrics = struct {
         else
             0;
 
-        const now = std.time.timestamp();
+        const now = zsys.timestamp();
         const uptime = @as(u64, @intCast(now - self.start_time));
 
         return MetricsSnapshot{
@@ -210,10 +211,10 @@ pub const Metrics = struct {
             return try allocator.dupe(u8, "# Metrics disabled\n");
         }
 
-        var buffer: std.ArrayList(u8) = .{};
-        errdefer buffer.deinit(allocator);
+        var buffer: std.Io.Writer.Allocating = .init(allocator);
+        errdefer buffer.deinit();
 
-        const writer = buffer.writer(allocator);
+        const writer = &buffer.writer;
 
         try writer.writeAll("# HELP graphql_queries_total Total number of GraphQL queries\n");
         try writer.writeAll("# TYPE graphql_queries_total counter\n");
@@ -275,7 +276,7 @@ pub const Metrics = struct {
         try writer.writeAll("# TYPE api_uptime_seconds counter\n");
         try writer.print("api_uptime_seconds {d}\n", .{snapshot.uptime_seconds});
 
-        return buffer.toOwnedSlice(allocator);
+        return buffer.toOwnedSlice();
     }
 
     /// Format metrics as JSON
@@ -331,12 +332,12 @@ pub const QueryTimer = struct {
 
     pub fn start() QueryTimer {
         return .{
-            .start_time = std.time.nanoTimestamp(),
+            .start_time = zsys.nanoTimestamp(),
         };
     }
 
     pub fn elapsedMicroseconds(self: *const QueryTimer) u64 {
-        const now = std.time.nanoTimestamp();
+        const now = zsys.nanoTimestamp();
         const elapsed_ns = now - self.start_time;
         return @intCast(@divTrunc(elapsed_ns, 1000));
     }
@@ -436,7 +437,7 @@ test "Metrics snapshot" {
 
 test "QueryTimer" {
     var timer = QueryTimer.start();
-    std.Thread.sleep(1 * std.time.ns_per_ms); // Sleep 1ms
+    zsys.sleep(1 * std.time.ns_per_ms); // Sleep 1ms
     const elapsed = timer.elapsedMicroseconds();
 
     // Should be at least 1000 microseconds (1ms), allow some tolerance
@@ -586,7 +587,7 @@ test "Metrics uptime tracking" {
     var metrics = Metrics.init(allocator, true);
     defer metrics.deinit();
 
-    std.Thread.sleep(2 * std.time.ns_per_s); // Sleep 2 seconds
+    zsys.sleep(2 * std.time.ns_per_s); // Sleep 2 seconds
 
     const snapshot = metrics.getSnapshot();
     // Should be at least 2 seconds, but allow for some variance

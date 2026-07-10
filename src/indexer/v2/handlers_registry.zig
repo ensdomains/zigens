@@ -1,4 +1,5 @@
 const std = @import("std");
+const zsys = @import("../../utils/system.zig");
 const ens_name = @import("../../utils/ens_name.zig");
 const models = @import("../../types/models.zig");
 // ABI decoding migrated from hand-rolled `../abi.zig` to eth.zig-backed
@@ -364,7 +365,7 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
         .created_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
         .registered_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
         .updated_block = log.block_number,
-        .updated_at = std.time.timestamp(),
+        .updated_at = zsys.timestamp(),
         .is_wrapped = false,
         .wrapper_fuses = null,
         .wrapper_expiry = null,
@@ -632,7 +633,7 @@ pub fn handleETHNameRegistered(self: *Indexer, protocol: models.Protocol, log: r
         .created_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
         .registered_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
         .updated_block = log.block_number,
-        .updated_at = std.time.timestamp(),
+        .updated_at = zsys.timestamp(),
         .is_wrapped = false,
         .wrapper_fuses = null,
         .wrapper_expiry = null,

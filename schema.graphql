@@ -431,6 +431,9 @@ type Account {
   """Reverse-resolved primary name for this address (V1 ReverseRegistrar + NameChanged path). Null if not claimed."""
   primaryName: String
 
+  """ENSIP-3 forward verification of `primaryName` (Task 05). Additive — does NOT alter `primaryName`. VERIFIED = the name's resolver.addr(node) forward-resolves back to this address; MISMATCH = it resolves to a different address; UNVERIFIED = no forward record / the on-chain read reverted / not checked. Null unless PRIMARY_VERIFY_ENABLED, and computed only for single-entity lookups (never per-row in a list)."""
+  primaryNameVerification: PrimaryNameVerification
+
   """V1 NameWrapper wrapped-domain records owned by this account."""
   wrappedDomains(first: Int = 100, skip: Int = 0): [WrappedDomain!]!
 
@@ -1330,6 +1333,16 @@ type ResolverApproval {
 enum OrderDirection {
   asc
   desc
+}
+
+"""ENSIP-3 forward-verification verdict for an account's `primaryName` (Task 05)."""
+enum PrimaryNameVerification {
+  """The name's resolver.addr(node) resolves back to this address."""
+  VERIFIED
+  """The name resolves forward to a DIFFERENT address."""
+  MISMATCH
+  """No usable forward evidence (no resolver/record, revert, RPC error, or not checked)."""
+  UNVERIFIED
 }
 
 """Fields to order Domain results by"""

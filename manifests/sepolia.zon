@@ -13,7 +13,7 @@
         .{ .name = "public_resolver", .address = "0xe99638b40e4fff0129d56f03b55b6bbc4bbe49b5" },
         .{ .name = "reverse_registrar", .address = "0xa0a1abcdae1a2a4a2ef8e9113ff0e02dd81dc0c6" },
         .{ .name = "name_wrapper", .address = "0x0635513f179d50a207757e05759cbd106d7dfce8" },
-        .{ .name = "universal_resolver", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "universal_resolver", .address = "0x85edf8b6b7d4211e2b07aa687506b746357b92cf" },
         .{ .name = "root_registry", .address = "0x11b5bfbe9078d826b1edbdd1cfc12f5828d9f50c" },
         .{ .name = "eth_registry", .address = "0x67b728a792e789a8978b30cf1b3b641f19354b43" },
         .{ .name = "eth_registrar_v2", .address = "0xa4449a0dd2b83007553d9b1d28b583a46a805a30" },

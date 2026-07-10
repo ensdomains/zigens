@@ -1,4 +1,5 @@
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const db_module = @import("database.zig");
 const Database = db_module.Database;
 const Query = db_module.Query;
@@ -139,7 +140,7 @@ pub fn setSyncState(db: *Database, protocol: models.Protocol, block: u64) !void 
 
     try q.bindTextStatic(protocol.toString());
     try q.bindInt64(@intCast(block));
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
 
     try q.exec();
 }
@@ -155,7 +156,7 @@ pub fn storeBlockHash(db: *Database, protocol: models.Protocol, block_number: u6
     try q.bindInt64(@intCast(block_number));
     try q.bindHashBuf(block_hash);
     try q.bindHashBuf(parent_hash);
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
 
     try q.exec();
 }
@@ -402,6 +403,21 @@ pub fn registerResolver(db: *Database, protocol: models.Protocol, address: []con
     try q.exec();
 }
 
+/// Whether `address` is a fully-indexed resolver for `protocol` — one whose record
+/// events this indexer ingests (registered on first sight via registerResolver). For
+/// such a resolver an indexed record MISS is authoritative: the record does not exist
+/// in event-visible storage on-chain, so a live re-read can only refetch the same
+/// emptiness.
+pub fn isKnownResolver(db: *Database, protocol: models.Protocol, address: Address) !bool {
+    var q = try Query.initCached(db,
+        \\SELECT 1 FROM known_resolvers WHERE protocol = ? AND address = ? LIMIT 1
+    );
+    defer q.deinit();
+    try q.bindTextStatic(protocol.toString());
+    try q.bindAddress(address);
+    return try q.step();
+}
+
 /// Get subregistries to index for a block range
 /// Uses cache table for O(1) lookup, falls back to full scan on first run
 /// Result of subregistry discovery, including which ones are newly discovered and need backfill.
@@ -447,7 +463,7 @@ pub fn discoverAndGetSubregistries(db: *Database, protocol: models.Protocol, mai
         \\GROUP BY r.address
     ;
 
-    var new_subregistries: std.ArrayList([]u8) = .{};
+    var new_subregistries: std.ArrayList([]u8) = .empty;
     errdefer {
         for (new_subregistries.items) |s| db.allocator.free(s);
         new_subregistries.deinit(db.allocator);
@@ -492,7 +508,7 @@ pub fn discoverAndGetSubregistries(db: *Database, protocol: models.Protocol, mai
 
     try q2.bindTextStatic(protocol_str);
 
-    var subregistries: std.ArrayList([]u8) = .{};
+    var subregistries: std.ArrayList([]u8) = .empty;
     errdefer {
         for (subregistries.items) |subreg| {
             db.allocator.free(subreg);
@@ -653,7 +669,7 @@ pub fn insertOrphanedRegistration(
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
     try q.bindInt(@intCast(log_index));
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
 
     try q.exec();
 }
@@ -673,7 +689,7 @@ pub fn getOrphanedRegistrations(db: *Database, protocol: models.Protocol, subreg
     try q.bindTextStatic(protocol.toString());
     try q.bindText(subregistry_address);
 
-    var results: std.ArrayList(OrphanedRegistration) = .{};
+    var results: std.ArrayList(OrphanedRegistration) = .empty;
     errdefer {
         for (results.items) |*item| {
             item.deinit(db.allocator);
@@ -721,4 +737,20 @@ pub fn deleteOrphanedRegistrations(db: *Database, protocol: models.Protocol, sub
     try q.bindText(subregistry_address);
 
     try q.exec();
+}
+
+test "isKnownResolver is protocol-scoped and requires registration" {
+    const testing = std.testing;
+    var db = try Database.init(testing.allocator, ":memory:");
+    defer db.deinit();
+
+    const r = Address{ .bytes = [_]u8{0x77} ** 20 };
+    try testing.expect(!(try isKnownResolver(&db, .v2, r)));
+
+    const hex = try r.toHex(testing.allocator);
+    defer testing.allocator.free(hex);
+    try registerResolver(&db, .v2, hex, 100);
+
+    try testing.expect(try isKnownResolver(&db, .v2, r));
+    try testing.expect(!(try isKnownResolver(&db, .v1, r)));
 }

@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  ZIG_VERSION: "0.15.2"
+  ZIG_VERSION: "0.16.0"
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -58,8 +58,9 @@ jobs:
             || { echo "::error::schema/postgres is stale — run 'zig build' (regenerates it from schema.sql) and commit the result."; exit 1; }
 
       - name: Format check
-        # Non-blocking for now; flip to a hard failure once the tree is clean.
-        run: zig fmt --check src build.zig || echo "::warning::zig fmt found unformatted files"
+        # Blocking: the tree is fmt-clean; unformatted code fails CI.
+        run: zig fmt --check src build.zig
+          || { echo "::error::unformatted files — run 'zig fmt src build.zig' and commit."; exit 1; }
 
       - name: Run all SQLite test lanes
         run: zig build test-all --summary all

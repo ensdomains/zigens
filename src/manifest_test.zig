@@ -10,6 +10,7 @@
 //! exact defaults.
 
 const std = @import("std");
+const zsys = @import("utils/system.zig");
 const testing = std.testing;
 const manifest = @import("manifest.zig");
 const contracts = @import("contracts.zig");
@@ -24,7 +25,7 @@ fn expectEqualContracts(code: ContractAddresses, loaded: ContractAddresses) !voi
 
 test "reference manifests load to the code defaults (and regen with MANIFEST_GEN=1)" {
     const a = testing.allocator;
-    const gen = std.process.hasEnvVarConstant("MANIFEST_GEN");
+    const gen = zsys.hasEnv("MANIFEST_GEN");
     const nets = [_]struct { net: Network, path: []const u8 }{
         .{ .net = .sepolia, .path = "manifests/sepolia.zon" },
         .{ .net = .mainnet, .path = "manifests/mainnet.zon" },
@@ -32,13 +33,11 @@ test "reference manifests load to the code defaults (and regen with MANIFEST_GEN
     for (nets) |n| {
         const code = try contracts.getContractAddresses(n.net);
         if (gen) {
-            std.fs.cwd().makePath("manifests") catch {};
-            var buf: std.ArrayList(u8) = .{};
-            defer buf.deinit(a);
-            try manifest.serialize(buf.writer(a), code, n.net);
-            const f = try std.fs.cwd().createFile(n.path, .{});
-            defer f.close();
-            try f.writeAll(buf.items);
+            zsys.makePath("manifests") catch {};
+            var buf: std.Io.Writer.Allocating = .init(a);
+            defer buf.deinit();
+            try manifest.serialize(&buf.writer, code, n.net);
+            try zsys.writeFile(n.path, buf.written());
             std.debug.print("generated {s}\n", .{n.path});
             continue;
         }
@@ -99,4 +98,25 @@ test "manifest validation fails fast on bad/wrong/unknown/missing/duplicate cont
     }
     const ca = try manifest.toContractAddresses(withContracts(&dis), .sepolia);
     try testing.expect(ca.ens_registry.isZero());
+}
+
+test "isActiveContract: a disabled (zero-address) contract is never indexed (Task 08 criterion 5)" {
+    const real = try Address.fromHex(A_REAL);
+    const other = try Address.fromHex("0x000000000000000000000000000000000000beef");
+    // An ACTIVE contract matches its own address and nothing else.
+    try testing.expect(contracts.isActiveContract(real, real));
+    try testing.expect(!contracts.isActiveContract(other, real));
+    // A DISABLED contract is the zero address (manifest status=.disabled leaves it zero):
+    // it must never match — not even a zero event address — so getMigrationKind and every
+    // other "is this event from contract X?" check exclude it. This is the indexer-side
+    // half of criterion 5 (the manifest-side disabled->zero is asserted above).
+    try testing.expect(!contracts.isActiveContract(Address.zero, Address.zero));
+    try testing.expect(!contracts.isActiveContract(real, Address.zero));
+}
+
+test {
+    // Pull config.zig's inline tests (validateResolution / validateAuth) into a CI lane.
+    // They were previously rooted nowhere (Zig does not auto-run transitively-imported
+    // files' tests), so they never executed — this lane is the config-as-data home.
+    _ = @import("config.zig");
 }

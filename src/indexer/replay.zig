@@ -3,6 +3,7 @@
 /// Used by `--backfill` CLI mode: clears names, replays all events in order,
 /// and re-derives name records using the same storage functions as live indexing.
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const ens_name = @import("../utils/ens_name.zig");
 const constants = @import("../constants.zig");
 const db_module = @import("../storage/database.zig");
@@ -145,7 +146,7 @@ pub fn replayEventsToRebuildNames(self: *Indexer) !void {
 
     var processed: u64 = 0;
     var errors: u64 = 0;
-    const start_time = std.time.milliTimestamp();
+    const start_time = zsys.milliTimestamp();
 
     while (try q.step()) {
         replayOneEvent(self, &q) catch |err| {
@@ -159,7 +160,7 @@ pub fn replayEventsToRebuildNames(self: *Indexer) !void {
 
         processed += 1;
         if (processed % COMMIT_INTERVAL == 0) {
-            const elapsed_s = @divFloor(std.time.milliTimestamp() - start_time, 1000);
+            const elapsed_s = @divFloor(zsys.milliTimestamp() - start_time, 1000);
             const rate = if (elapsed_s > 0) @divFloor(processed, @as(u64, @intCast(elapsed_s))) else processed;
             const pct = if (total_events > 0) @divFloor(processed * 100, total_events) else 100;
             std.log.info("Replay progress: {d}/{d} ({d}%) — {d} events/s — {d} errors", .{
@@ -169,7 +170,7 @@ pub fn replayEventsToRebuildNames(self: *Indexer) !void {
     }
 
     try database.exec("COMMIT");
-    const elapsed_s = @divFloor(std.time.milliTimestamp() - start_time, 1000);
+    const elapsed_s = @divFloor(zsys.milliTimestamp() - start_time, 1000);
     std.log.info("Replay complete: {d} events processed, {d} errors, {d}s elapsed", .{
         processed, errors, elapsed_s,
     });
@@ -706,7 +707,7 @@ fn dropNamesIndexes(database: *db_module.Database) !void {
 
 /// Recreate only names-related indexes after bulk replay.
 fn createNamesIndexes(database: *db_module.Database) !void {
-    const timer = std.time.milliTimestamp();
+    const timer = zsys.milliTimestamp();
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_protocol ON names(protocol)");
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_name ON names(name)");
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_label ON names(label)");
@@ -727,6 +728,6 @@ fn createNamesIndexes(database: *db_module.Database) !void {
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_namehash ON names(namehash)");
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_token_id ON names(token_id)");
     try database.exec("CREATE INDEX IF NOT EXISTS idx_names_canonical_id ON names(canonical_id)");
-    const elapsed = std.time.milliTimestamp() - timer;
+    const elapsed = zsys.milliTimestamp() - timer;
     std.log.info("Names indexes created in {d}ms", .{elapsed});
 }

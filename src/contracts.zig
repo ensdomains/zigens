@@ -49,8 +49,9 @@ pub const ContractAddresses = struct {
     name_wrapper: Address,
 
     // Query-time ENSIP-10 Universal Resolver (Task 06 live-resolution fallback).
-    // Address.zero = not wired for this network; set RESOLVE_UNIVERSAL_RESOLVER to
-    // supply it at deploy time. TODO(task-08): move this to manifest data.
+    // Manifest data (Task 08): declared per-network in the code default AND the
+    // reference manifests; RESOLVE_UNIVERSAL_RESOLVER overrides it at deploy time
+    // (config.zig). Address.zero = not wired for this network.
     universal_resolver: Address,
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -95,6 +96,16 @@ pub const ContractAddresses = struct {
     v1_migration_block: u64, // V1 Permanent Registrar deployment (May 2019)
     name_wrapper_deployment_block: u64, // Name Wrapper deployment (September 2022)
 };
+
+/// True iff `candidate` is an ACTIVE contract that `addr` matches. A DISABLED contract
+/// is represented by the zero address (manifest.zig `status = .disabled` leaves it zero),
+/// so a zero `candidate` never matches — that is precisely how a disabled contract is
+/// excluded from indexing (Task 08 acceptance criterion 5). Every "is this event from
+/// contract X?" check routes through this guard so the zero==disabled invariant holds
+/// uniformly.
+pub fn isActiveContract(addr: Address, candidate: Address) bool {
+    return !candidate.isZero() and addr.eql(candidate);
+}
 
 pub fn getContractAddresses(network: Network) !ContractAddresses {
     return switch (network) {
@@ -142,7 +153,7 @@ fn sepoliaAddresses() ContractAddresses {
         .v1_migration_block = 0,
         .name_wrapper_deployment_block = 0,
 
-        .universal_resolver = Address.zero, // set via RESOLVE_UNIVERSAL_RESOLVER; TODO(task-08)
+        .universal_resolver = Address.fromHex("0x85edf8b6b7d4211e2b07aa687506b746357b92cf") catch unreachable, // Sepolia URv2 (manifest data; RESOLVE_UNIVERSAL_RESOLVER overrides at deploy time)
     };
 }
 
@@ -188,6 +199,6 @@ fn mainnetAddresses() ContractAddresses {
         .v1_migration_block = 9380410, // V1 Permanent Registrar deployment (May 2019)
         .name_wrapper_deployment_block = 15628465, // Name Wrapper deployment (September 2022)
 
-        .universal_resolver = Address.zero, // set via RESOLVE_UNIVERSAL_RESOLVER; TODO(task-08)
+        .universal_resolver = Address.zero, // no canonical mainnet UR wired as a default yet; supply via manifest or RESOLVE_UNIVERSAL_RESOLVER
     };
 }

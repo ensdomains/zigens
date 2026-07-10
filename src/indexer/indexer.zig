@@ -1,4 +1,5 @@
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const config = @import("../config.zig");
 const constants = @import("../constants.zig");
 const db = @import("../storage/database.zig");
@@ -9,6 +10,7 @@ const models = @import("../types/models.zig");
 const abi = @import("abi_eth.zig");
 const Hash = @import("../types/hash.zig").Hash;
 const Address = @import("../types/address.zig").Address;
+const contract_defs = @import("../contracts.zig");
 const webhooks = @import("../webhooks/manager.zig");
 const RateLimiter = @import("../rate_limiter.zig").RateLimiter;
 const NetworkHealth = @import("../utils/network_health.zig").NetworkHealth;
@@ -34,6 +36,7 @@ const sync_driver = @import("sync_driver.zig");
 
 pub const Indexer = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     config: config.Config,
     database: *db.Database,
     // Whether this process indexes V1. Only V1 produces `unknown_labels` rows, so the
@@ -88,10 +91,10 @@ pub const Indexer = struct {
     // NameRegistered/LabelReserved handler. Two keccak rounds saved per event.
     eth_namehash: Hash,
 
-    pub fn init(allocator: std.mem.Allocator, cfg: config.Config, database: *db.Database, end_block: ?u64) !Indexer {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, database: *db.Database, end_block: ?u64) !Indexer {
         // Create ONE shared HTTP client
         const http_client = try allocator.create(std.http.Client);
-        http_client.* = std.http.Client{ .allocator = allocator };
+        http_client.* = std.http.Client{ .allocator = allocator, .io = io };
         errdefer {
             http_client.deinit();
             allocator.destroy(http_client);
@@ -102,7 +105,7 @@ pub const Indexer = struct {
 
         var webhook_manager: ?*webhooks.WebhookManager = null;
         if (cfg.webhooks_enabled) {
-            webhook_manager = try webhooks.WebhookManager.init(allocator, cfg.webhook_db_path, cfg.webhook_max_retries, 100); // 100ms rate limit per endpoint (10 req/sec)
+            webhook_manager = try webhooks.WebhookManager.init(allocator, io, cfg.webhook_db_path, cfg.webhook_max_retries, 100); // 100ms rate limit per endpoint (10 req/sec)
             // Workers disabled during indexing to avoid SQLite contention
             // Webhooks are queued and can be processed separately
             // try webhook_manager.?.startWorkers(8);
@@ -132,7 +135,7 @@ pub const Indexer = struct {
                 .current_block = current_block,
                 .target_block = target_block,
                 .start_block = cfg.start_block,
-                .start_time = std.time.timestamp(),
+                .start_time = zsys.timestamp(),
                 .graphql_enabled = cfg.api_enabled,
                 .api_enabled = cfg.api_enabled,
                 .webhooks_enabled = cfg.webhooks_enabled,
@@ -156,6 +159,7 @@ pub const Indexer = struct {
 
         return Indexer{
             .allocator = allocator,
+            .io = io,
             .config = cfg,
             .database = database,
             .indexes_v1 = true, // combined indexer indexes both protocols
@@ -182,9 +186,9 @@ pub const Indexer = struct {
     }
 
     /// Initialize indexer for a single protocol (V1 or V2 only)
-    pub fn initSingleProtocol(allocator: std.mem.Allocator, cfg: config.Config, database: *db.Database, protocol: models.Protocol, end_block: ?u64) !Indexer {
+    pub fn initSingleProtocol(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, database: *db.Database, protocol: models.Protocol, end_block: ?u64) !Indexer {
         const http_client = try allocator.create(std.http.Client);
-        http_client.* = std.http.Client{ .allocator = allocator };
+        http_client.* = std.http.Client{ .allocator = allocator, .io = io };
         errdefer {
             http_client.deinit();
             allocator.destroy(http_client);
@@ -195,7 +199,7 @@ pub const Indexer = struct {
 
         var webhook_manager: ?*webhooks.WebhookManager = null;
         if (cfg.webhooks_enabled) {
-            webhook_manager = try webhooks.WebhookManager.init(allocator, cfg.webhook_db_path, cfg.webhook_max_retries, 100); // 100ms rate limit per endpoint (10 req/sec)
+            webhook_manager = try webhooks.WebhookManager.init(allocator, io, cfg.webhook_db_path, cfg.webhook_max_retries, 100); // 100ms rate limit per endpoint (10 req/sec)
             // Workers disabled during indexing to avoid SQLite contention
             // Webhooks are queued and can be processed separately
             // try webhook_manager.?.startWorkers(8);
@@ -229,7 +233,7 @@ pub const Indexer = struct {
                 .current_block = current_block,
                 .target_block = target_block,
                 .start_block = deployment_block,
-                .start_time = std.time.timestamp(),
+                .start_time = zsys.timestamp(),
                 .graphql_enabled = cfg.api_enabled,
                 .api_enabled = cfg.api_enabled,
                 .webhooks_enabled = cfg.webhooks_enabled,
@@ -253,6 +257,7 @@ pub const Indexer = struct {
 
         return Indexer{
             .allocator = allocator,
+            .io = io,
             .config = cfg,
             .database = database,
             .indexes_v1 = (protocol == .v1),
@@ -364,9 +369,11 @@ pub const Indexer = struct {
     pub const MigrationKind = enum { none, locked, unlocked };
 
     pub inline fn getMigrationKind(self: *Indexer, addr: Address) MigrationKind {
-        const contracts = self.config.v1_contracts; // same struct backs v1 and v2 config
-        if (!contracts.locked_migration_controller.isZero() and addr.eql(contracts.locked_migration_controller)) return .locked;
-        if (!contracts.unlocked_migration_controller.isZero() and addr.eql(contracts.unlocked_migration_controller)) return .unlocked;
+        const c = self.config.v1_contracts; // same struct backs v1 and v2 config
+        // isActiveContract skips a DISABLED (zero-address) contract — the manifest
+        // `status = .disabled` path (Task 08 criterion 5). Kept as the shared guard.
+        if (contract_defs.isActiveContract(addr, c.locked_migration_controller)) return .locked;
+        if (contract_defs.isActiveContract(addr, c.unlocked_migration_controller)) return .unlocked;
         return .none;
     }
 

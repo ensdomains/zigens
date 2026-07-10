@@ -1,6 +1,7 @@
 # Zig
 .zig-cache/
 zig-out/
+zig-pkg/
 
 # Generated from schema.graphql by tools/generate_introspection.py on every
 # `zig build` (see build.zig — api_exe.step.dependOn(&generate_schema.step)).

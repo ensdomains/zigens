@@ -119,3 +119,69 @@ test "addressFromReturn rejects zero and short returns" {
     try testing.expect(addressFromReturn(&([_]u8{0xff} ** 20)) == null); // too short
     try testing.expect(addressFromReturn(&[_]u8{}) == null); // empty
 }
+
+test "verify: verified / mismatch / unverified from seeded cache (canned eth_call, no RPC)" {
+    const a = testing.allocator;
+    const db_mod = @import("../storage/database.zig");
+    var db = try db_mod.Database.init(a, ":memory:");
+    defer db.deinit();
+
+    const chain_id: u64 = 1;
+    const now: i64 = 1000;
+    const block_num: u64 = 100;
+    const block_hash = try Hash.fromHex("0x" ++ ("11" ** 32));
+    const registry = try Address.fromHex("0x00000000000000000000000000000000000000ce");
+    const claimant = try Address.fromHex("0x1111111111111111111111111111111111111111");
+    const resolver_addr = try Address.fromHex("0x2222222222222222222222222222222222222222");
+
+    // 32-byte ABI return word with `addr` right-aligned in the low 20 bytes.
+    const addrReturn = struct {
+        fn make(addr: Address) [32]u8 {
+            var w = [_]u8{0} ** 32;
+            @memcpy(w[12..32], &addr.bytes);
+            return w;
+        }
+    }.make;
+
+    // rpc_client UNDEFINED: every step below is a FRESH cache hit, so the eth_call path is
+    // never reached — this both cans the responses and proves verify() reads them from cache.
+    var resolver = Resolver{ .rpc_client = undefined, .db = &db, .chain_id = chain_id, .ttl_s = 3600 };
+
+    // Helper: seed registry.resolver(node)=resolver_addr and resolver.addr(node)=forward.
+    const seed = struct {
+        fn go(dbp: *db_mod.Database, cid: u64, reg: Address, radr: Address, name: []const u8, forward: ?Address, bnum: u64, bhash: Hash, t: i64) !void {
+            const node = try hash_mod.namehash(std.testing.allocator, name);
+            const rcall = buildNodeCall(sel_resolver, node);
+            const rret = addrReturnStatic(radr);
+            try cache.put(dbp, .{ .chain_id = cid, .target = reg, .selector_key = "resolver", .arg_hash = cache.argHash(&rcall), .block_dep_num = bnum, .block_dep_hash = bhash }, .success, &rret, .resolved_live, t);
+            if (forward) |f| {
+                const acall = buildNodeCall(sel_addr, node);
+                const aret = addrReturnStatic(f);
+                try cache.put(dbp, .{ .chain_id = cid, .target = radr, .selector_key = "addr:60", .arg_hash = cache.argHash(&acall), .block_dep_num = bnum, .block_dep_hash = bhash }, .success, &aret, .resolved_live, t);
+            }
+        }
+        fn addrReturnStatic(addr: Address) [32]u8 {
+            var w = [_]u8{0} ** 32;
+            @memcpy(w[12..32], &addr.bytes);
+            return w;
+        }
+    }.go;
+    _ = addrReturn;
+
+    // VERIFIED — the resolver reports the claiming address.
+    try seed(&db, chain_id, registry, resolver_addr, "alice.eth", claimant, block_num, block_hash, now);
+    try testing.expectEqual(Verdict.verified, try verify(&resolver, a, registry, claimant, "alice.eth", block_num, block_hash, now));
+
+    // MISMATCH — the resolver reports a DIFFERENT address.
+    const other = try Address.fromHex("0x3333333333333333333333333333333333333333");
+    try seed(&db, chain_id, registry, resolver_addr, "carol.eth", other, block_num, block_hash, now);
+    try testing.expectEqual(Verdict.mismatch, try verify(&resolver, a, registry, claimant, "carol.eth", block_num, block_hash, now));
+
+    // UNVERIFIED — registry.resolver(node) reverted (no resolver on-chain); fail-closed.
+    {
+        const node = try hash_mod.namehash(a, "bob.eth");
+        const rcall = buildNodeCall(sel_resolver, node);
+        try cache.put(&db, .{ .chain_id = chain_id, .target = registry, .selector_key = "resolver", .arg_hash = cache.argHash(&rcall), .block_dep_num = block_num, .block_dep_hash = block_hash }, .reverted, null, .resolved_live, now);
+        try testing.expectEqual(Verdict.unverified, try verify(&resolver, a, registry, claimant, "bob.eth", block_num, block_hash, now));
+    }
+}

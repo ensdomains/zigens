@@ -6,7 +6,7 @@ This file provides guidelines for agentic coding agents working on this codebase
 
 ENSv2 Indexer is a high-performance Ethereum Name Service indexer written in Zig. It indexes both ENS V1 (legacy) and ENS V2 (new) contract events on Ethereum, provides a GraphQL API, and supports webhooks.
 
-- **Language**: Zig 0.15.1+
+- **Language**: Zig 0.16.0+
 - **Database**: SQLite
 - **Build System**: Zig build
 

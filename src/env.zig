@@ -1,4 +1,5 @@
 const std = @import("std");
+const zsys = @import("utils/system.zig");
 
 /// Simple .env file parser
 pub fn loadEnv(allocator: std.mem.Allocator, path: []const u8) !std.StringHashMap([]const u8) {
@@ -12,16 +13,13 @@ pub fn loadEnv(allocator: std.mem.Allocator, path: []const u8) !std.StringHashMa
         env_map.deinit();
     }
 
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+    const content = zsys.readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
         if (err == error.FileNotFound) {
             std.log.warn("No .env file found at {s}, using defaults", .{path});
             return env_map;
         }
         return err;
     };
-    defer file.close();
-
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024); // 1MB max
     defer allocator.free(content);
 
     var lines = std.mem.splitScalar(u8, content, '\n');
@@ -55,7 +53,7 @@ pub fn loadEnv(allocator: std.mem.Allocator, path: []const u8) !std.StringHashMa
 /// Get environment variable with fallback to .env map
 pub fn getEnv(env_map: *const std.StringHashMap([]const u8), key: []const u8, default: []const u8) []const u8 {
     // First check actual environment
-    if (std.process.getEnvVarOwned(env_map.allocator, key)) |value| {
+    if (zsys.getEnvOwned(env_map.allocator, key)) |value| {
         return value;
     } else |_| {
         // Fall back to .env file

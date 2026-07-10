@@ -5,6 +5,7 @@
 //! handling, and begin/commit/rollback. Skips if no Postgres is reachable (test-pg
 //! lane; start: `sudo pg_ctlcluster 17 main start`).
 const std = @import("std");
+const zsys = @import("lib").zsys;
 const testing = std.testing;
 const lib = @import("lib");
 
@@ -40,6 +41,8 @@ fn pgTestConfig() !config.Config {
         .max_blocks_per_request = 2000,
         .rate_limit_per_second = 15,
         .trusted_proxy_hops = 0,
+        .request_timeout_ms = 10000,
+        .max_concurrent_connections = 512,
         .api_port = 8080,
         .api_enabled = false,
         .status_port = null,
@@ -48,6 +51,9 @@ fn pgTestConfig() !config.Config {
         .webhook_db_path = ":memory:",
         .webhook_admin_username = null,
         .webhook_admin_password = null,
+        .webhooks_allow_unauthenticated = false,
+        .internal_admin_token = null,
+        .internal_rate_limit_per_second = 2,
         .max_memory_mb = 512,
         .checkpoint_interval = 100,
         .graphql_max_depth = 10,
@@ -75,7 +81,7 @@ fn openBe() !lib.storage.backend.Backend {
 // Load the transpiled Postgres schema into a freshly-cleaned `public` schema.
 fn loadPgSchema(be: lib.storage.backend.Backend, a: std.mem.Allocator) !void {
     try be.vtable.execRaw(be.ptr, "DROP SCHEMA public CASCADE; CREATE SCHEMA public");
-    const schema_sql = try std.fs.cwd().readFileAlloc(a, "schema/postgres/schema.sql", 1 << 20);
+    const schema_sql = try zsys.readFileAlloc(a, "schema/postgres/schema.sql", 1 << 20);
     defer a.free(schema_sql);
     try be.vtable.execRaw(be.ptr, schema_sql);
 }
@@ -311,7 +317,7 @@ test "postgres: transpiled schema loads + PG-dialect upsert round-trips on sync_
     // Clean slate so every CREATE in the schema is actually validated this run.
     try be.vtable.execRaw(be.ptr, "DROP SCHEMA public CASCADE; CREATE SCHEMA public");
 
-    const schema_sql = try std.fs.cwd().readFileAlloc(a, "schema/postgres/schema.sql", 1 << 20);
+    const schema_sql = try zsys.readFileAlloc(a, "schema/postgres/schema.sql", 1 << 20);
     defer a.free(schema_sql);
     try be.vtable.execRaw(be.ptr, schema_sql);
 

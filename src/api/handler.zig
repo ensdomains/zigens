@@ -13,11 +13,15 @@ const resolvers = @import("resolvers/resolvers.zig");
 /// GraphQL query handler for ENSv2 Indexer
 /// Provides subgraph-compatible GraphQL API
 const schema_validator_mod = @import("schema_validator.zig");
+const query_validator = @import("query_validator.zig");
 
 pub const GraphQLHandler = struct {
     allocator: std.mem.Allocator,
     executor: parser.Executor,
     schema_validator: schema_validator_mod.SchemaValidator,
+    /// introspection.json parsed ONCE at init and reused by __type introspection,
+    /// instead of re-parsing the whole document per request.
+    introspection_parsed: std.json.Parsed(std.json.Value),
     complexity_max_depth: u32,
     complexity_max_cost: u32,
     metrics: metrics_mod.Metrics,
@@ -80,10 +84,14 @@ pub const GraphQLHandler = struct {
         var schema_validator = try schema_validator_mod.SchemaValidator.init(allocator, introspection_json);
         errdefer schema_validator.deinit();
 
+        const introspection_parsed = try std.json.parseFromSlice(std.json.Value, allocator, introspection_json, .{});
+        errdefer introspection_parsed.deinit();
+
         return .{
             .allocator = allocator,
             .executor = executor,
             .schema_validator = schema_validator,
+            .introspection_parsed = introspection_parsed,
             .complexity_max_depth = max_depth,
             .complexity_max_cost = max_cost,
             .metrics = metrics_mod.Metrics.init(allocator, metrics_enabled),
@@ -94,6 +102,7 @@ pub const GraphQLHandler = struct {
         self.metrics.deinit();
         self.executor.deinit();
         self.schema_validator.deinit();
+        self.introspection_parsed.deinit();
     }
 
     /// Walk the parsed operations and validate each root field against the
@@ -163,6 +172,22 @@ pub const GraphQLHandler = struct {
             return try self.buildErrorResponseWithCode("Invalid GraphQL syntax", ErrorCode.SYNTAX_ERROR);
         };
         defer document.deinit(request_alloc);
+
+        // Structural validation on the freshly-parsed document, BEFORE any pass
+        // that traverses fragments (introspection routing, complexity analysis,
+        // execution). Rejects cyclic and dangling fragment spreads — a cyclic
+        // fragment would otherwise recurse until the native stack overflows and
+        // crashes the process (both the analyzer and the executor expand spreads
+        // with no visited-set).
+        query_validator.validateDocument(request_alloc, &document) catch |err| {
+            self.metrics.recordError();
+            const msg = switch (err) {
+                error.CyclicFragment => "Fragment spreads form a cycle",
+                error.UnknownFragment => "Query references an undefined fragment",
+                else => "Query validation failed",
+            };
+            return try self.buildErrorResponseWithCode(msg, ErrorCode.VALIDATION_ERROR);
+        };
 
         // Introspection routing: detect __schema / __type from the PARSED root
         // fields, not a raw-text substring match. The executor has no __schema/
@@ -342,12 +367,8 @@ pub const GraphQLHandler = struct {
             return try self.buildErrorResponseWithCode("Invalid __type query: missing name argument", ErrorCode.VALIDATION_ERROR);
         };
 
-        // Load and parse introspection data
-        const introspection_json = @embedFile("introspection.json");
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, introspection_json, .{}) catch {
-            return try self.buildErrorResponseWithCode("Failed to parse introspection data", ErrorCode.INTERNAL_ERROR);
-        };
-        defer parsed.deinit();
+        // Reuse the introspection parsed once at handler init (no per-request re-parse).
+        const parsed = self.introspection_parsed;
 
         // Find the requested type
         const types = parsed.value.object.get("data").?.object.get("__schema").?.object.get("types").?.array;
@@ -417,13 +438,13 @@ pub const GraphQLHandler = struct {
         path: ?[]const []const u8,
         extensions: ?[]const u8,
     ) ![]u8 {
-        var response: std.ArrayList(u8) = .{};
-        errdefer response.deinit(self.allocator);
+        var response: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer response.deinit();
 
         const message_escaped = try json_utils.escapeString(self.allocator, message);
         defer self.allocator.free(message_escaped);
 
-        const writer = response.writer(self.allocator);
+        const writer = &response.writer;
 
         // Start errors array
         try writer.writeAll("{\"errors\":[{\"message\":\"");
@@ -461,7 +482,7 @@ pub const GraphQLHandler = struct {
         // Close error object and array, add null data
         try writer.writeAll("}],\"data\":null}");
 
-        return response.toOwnedSlice(self.allocator);
+        return response.toOwnedSlice();
     }
 };
 

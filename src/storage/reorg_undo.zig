@@ -20,6 +20,7 @@
 ///     with block > N (newest-first via id DESC) using a generic INSERT OR REPLACE
 ///     reconstructed from `PRAGMA table_info`, then prunes those undo rows.
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const db_module = @import("database.zig");
 const backend = @import("backend.zig");
 const Database = db_module.Database;
@@ -125,7 +126,7 @@ fn getColumns(db: *Database, allocator: std.mem.Allocator, table: []const u8) ![
     const info = try db.introspectColumns(allocator, table);
     defer backend.freeColumnInfo(allocator, info);
 
-    var cols: std.ArrayList([]u8) = .{};
+    var cols: std.ArrayList([]u8) = .empty;
     errdefer {
         for (cols.items) |c| allocator.free(c);
         cols.deinit(allocator);
@@ -149,12 +150,12 @@ fn freeColumns(allocator: std.mem.Allocator, cols: [][]u8) void {
 /// Build `json_object('c1', <alias>."c1", ...)` over every column. `alias` is OLD
 /// (UPDATE/DELETE) or NEW (INSERT). Caller owns the returned slice.
 fn rowJson(allocator: std.mem.Allocator, cols: [][]u8, alias: []const u8) ![]u8 {
-    var jobj: std.ArrayList(u8) = .{};
+    var jobj: std.ArrayList(u8) = .empty;
     errdefer jobj.deinit(allocator);
     try jobj.appendSlice(allocator, "json_object(");
     for (cols, 0..) |c, i| {
         if (i > 0) try jobj.appendSlice(allocator, ", ");
-        try jobj.writer(allocator).print("'{s}', {s}.\"{s}\"", .{ c, alias, c });
+        try jobj.print(allocator, "'{s}', {s}.\"{s}\"", .{ c, alias, c });
     }
     try jobj.appendSlice(allocator, ")");
     return jobj.toOwnedSlice(allocator);
@@ -300,7 +301,7 @@ const PG_CAPTURE_ACTIVE_FN =
 ;
 
 fn appendPgTrigger(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), table: []const u8, suffix: []const u8, event: []const u8, func: []const u8) !void {
-    try buf.writer(allocator).print(
+    try buf.print(allocator,
         \\DROP TRIGGER IF EXISTS "{s}_reorg_undo_{s}" ON "{s}";
         \\CREATE TRIGGER "{s}_reorg_undo_{s}" AFTER {s} ON "{s}" FOR EACH ROW EXECUTE FUNCTION {s}();
         \\
@@ -313,7 +314,7 @@ fn appendPgTrigger(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), table:
 /// time in Phase 4. Idempotent (CREATE OR REPLACE FUNCTION + DROP/CREATE TRIGGER). Caller
 /// owns the returned SQL.
 pub fn pgTriggerInstallSql(allocator: std.mem.Allocator) ![]u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     try buf.appendSlice(allocator, PG_CAPTURE_PROTOCOL_FN);
     try buf.appendSlice(allocator, PG_CAPTURE_ACTIVE_FN);
@@ -429,7 +430,7 @@ fn execPgDdlWithRetry(db: *Database, sql: []const u8, label: []const u8) !void {
                 return err;
             }
             std.log.warn("reorg: trigger install for \"{s}\" blocked (attempt {d}/{d}); retrying in 2s", .{ label, attempt, PG_INSTALL_ATTEMPTS });
-            std.Thread.sleep(2 * std.time.ns_per_s);
+            zsys.sleep(2 * std.time.ns_per_s);
         }
     }
 }
@@ -489,7 +490,7 @@ pub fn replayUndo(db: *Database, protocol: models.Protocol, block_number: u64) !
     }
 
     const Entry = struct { table: []u8, op: []u8, old_row: []u8 };
-    var entries: std.ArrayList(Entry) = .{};
+    var entries: std.ArrayList(Entry) = .empty;
     defer {
         for (entries.items) |e| {
             allocator.free(e.table);
@@ -621,7 +622,7 @@ fn getRestoreSql(db: *Database, allocator: std.mem.Allocator, cache: *std.String
         for (value_exprs[0..built]) |e| allocator.free(e);
         allocator.free(value_exprs);
     }
-    var pk_cols: std.ArrayList([]const u8) = .{};
+    var pk_cols: std.ArrayList([]const u8) = .empty;
     defer pk_cols.deinit(allocator);
 
     const dialect = db.dialect();

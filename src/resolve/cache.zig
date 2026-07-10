@@ -220,13 +220,21 @@ pub fn put(
     try prune.exec();
 }
 
-/// Look up a cached answer by key. Returns null on a miss. On a hit the caller
-/// owns `entry.value` (free via `Entry.deinit`).
+/// Look up a cached answer by QUERY IDENTITY (chain, target, selector, args) — NOT by
+/// the pinned block. Matching on the caller's current head would invalidate every entry
+/// each time the indexer advances, re-issuing the whole fan-out per query (observed as
+/// one live call per record per head-move). The pinned block still matters: the reorg
+/// rollback DELETEs rows with block_dep_num above the fork (sync.zig), so an
+/// orphaned-chain answer can never be served; freshness is bounded by the caller's TTL.
+/// Returns null on a miss. On a hit the caller owns `entry.value` (free via
+/// `Entry.deinit`).
 pub fn get(allocator: std.mem.Allocator, db: *Database, key: Key) !?Entry {
     var q = try Query.init(db,
         \\SELECT status, value, source, fetched_at
         \\FROM resolution_cache
-        \\WHERE chain_id = ? AND target = ? AND selector_key = ? AND arg_hash = ? AND block_dep_hash = ?
+        \\WHERE chain_id = ? AND target = ? AND selector_key = ? AND arg_hash = ?
+        \\ORDER BY block_dep_num DESC, fetched_at DESC
+        \\LIMIT 1
     );
     defer q.deinit();
 
@@ -234,7 +242,6 @@ pub fn get(allocator: std.mem.Allocator, db: *Database, key: Key) !?Entry {
     try q.bindAddress(key.target);
     try q.bindText(key.selector_key);
     try q.bindHash(key.arg_hash);
-    try q.bindHash(key.block_dep_hash);
 
     if (!try q.step()) return null;
 
@@ -303,9 +310,17 @@ test "cache put/get round-trip and miss" {
     try testing.expectEqual(@as(i64, 1700000000), got.fetched_at);
     try testing.expectEqualSlices(u8, &payload, got.value.?);
 
-    // A different pinned block hash is a distinct key → miss.
-    const other = testKey(db.chain_id, "addr:60", 100, Hash{ .bytes = [_]u8{0x22} ** 32 });
+    // A different query (selector) is a distinct identity → miss.
+    const other = testKey(db.chain_id, "text:url", 100, h);
     try testing.expect((try get(a, &db, other)) == null);
+
+    // Same query pinned at a LATER head is still a hit: lookup is by query identity,
+    // so an advancing indexer head does not invalidate fresh answers (freshness is the
+    // caller's TTL; reorged rows are removed by the rollback DELETE, tested below).
+    const advanced = testKey(db.chain_id, "addr:60", 107, Hash{ .bytes = [_]u8{0x22} ** 32 });
+    const still = (try get(a, &db, advanced)) orelse return error.ExpectedHitAcrossHeads;
+    defer still.deinit(a);
+    try testing.expectEqualSlices(u8, &payload, still.value.?);
 }
 
 test "reorg rollback drops cache rows pinned above the fork" {
@@ -342,7 +357,12 @@ test "put prunes superseded rows for the same query at older heads" {
     try put(&db, new_head, .success, &[_]u8{0x02}, .resolved_live, 1700000001);
 
     // The superseded older-head row is pruned; only the current-head row survives.
-    try testing.expect((try get(a, &db, old_head)) == null);
+    // Lookup is by query identity, so BOTH key variants hit the same surviving row —
+    // proven by the value: the old head's payload (0x01) is gone, replaced by 0x02.
+    const via_old = (try get(a, &db, old_head)) orelse return error.ExpectedCurrentRow;
+    defer via_old.deinit(a);
+    try testing.expectEqualSlices(u8, &[_]u8{0x02}, via_old.value.?);
     const cur = (try get(a, &db, new_head)) orelse return error.ExpectedCurrentRow;
-    cur.deinit(a);
+    defer cur.deinit(a);
+    try testing.expectEqualSlices(u8, &[_]u8{0x02}, cur.value.?);
 }

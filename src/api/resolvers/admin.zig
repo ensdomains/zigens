@@ -55,7 +55,7 @@ pub fn resolveRoles(ctx: parser.ExecutionContext, field: *const parser.Field) !p
     }
 
     // Build JSON array
-    var json: std.ArrayList(u8) = .{};
+    var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);
     try json.appendSlice(allocator, "[");
 
@@ -182,7 +182,7 @@ pub fn resolveRolesConnection(ctx: parser.ExecutionContext, field: *const parser
         null;
 
     // Build JSON
-    var json: std.ArrayList(u8) = .{};
+    var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);
 
     try json.appendSlice(allocator, "{\"pageInfo\":{");
@@ -305,7 +305,7 @@ pub fn resolveResolverEntities(ctx: parser.ExecutionContext, field: *const parse
         database.allocator.free(entities);
     }
 
-    var json: std.ArrayList(u8) = .{};
+    var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);
     try json.appendSlice(allocator, "[");
     for (entities, 0..) |row, i| {
@@ -324,7 +324,7 @@ pub fn resolveResolverEntities(ctx: parser.ExecutionContext, field: *const parse
                 .depth = 0,
                 .allocator = allocator,
                 .loaders = ctx.loaders,
-                .resolve = ctx.resolve,
+                .resolve = null, // list context: live resolution is single-name only, never per-row
             },
         );
         defer allocator.free(entity_json);
@@ -359,7 +359,7 @@ pub fn resolveResolvers(ctx: parser.ExecutionContext, field: *const parser.Field
     }
 
     // Build JSON array
-    var json: std.ArrayList(u8) = .{};
+    var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);
     try json.appendSlice(allocator, "[");
 
@@ -398,7 +398,7 @@ pub fn resolveRegistries(ctx: parser.ExecutionContext, field: *const parser.Fiel
         database.allocator.free(registries);
     }
 
-    var json: std.ArrayList(u8) = .{};
+    var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);
     try json.appendSlice(allocator, "[");
 
@@ -499,7 +499,7 @@ pub fn resolveApprovals(ctx: parser.ExecutionContext, field: *const parser.Field
     }
 
     // Build JSON array
-    var json: std.ArrayList(u8) = .{};
+    var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);
     try json.appendSlice(allocator, "[");
 
@@ -547,7 +547,7 @@ fn buildResolverJson(
     allocator: std.mem.Allocator,
     loaders: ?*anyopaque,
 ) ![]u8 {
-    var json: std.ArrayList(u8) = .{};
+    var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);
     try json.appendSlice(allocator, "{");
 
@@ -767,7 +767,7 @@ const FieldHandler = struct {
     /// Returns true if field was handled, false if field is unknown
     /// output_key: the alias if provided, otherwise field_name (use this for JSON keys)
     /// field_name: the actual field name (use this for field matching logic)
-    handleFn: *const fn (ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) anyerror!bool,
+    handleFn: *const fn (ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: *std.Io.Writer, allocator: std.mem.Allocator) anyerror!bool,
     context: *anyopaque,
 };
 
@@ -777,7 +777,7 @@ fn buildJsonWithFields(
     selections: []const parser.Field,
     handler: FieldHandler,
 ) ![]u8 {
-    var json: std.ArrayList(u8) = .{};
+    var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);
 
     try json.appendSlice(allocator, "{");
@@ -788,16 +788,16 @@ fn buildJsonWithFields(
         const output_key = field.alias orelse field.name;
 
         // Create a temporary buffer for this field
-        var field_json: std.ArrayList(u8) = .{};
-        defer field_json.deinit(allocator);
+        var field_json: std.Io.Writer.Allocating = .init(allocator);
+        defer field_json.deinit();
 
         // Try to handle the field in the temporary buffer
-        const handled = try handler.handleFn(handler.context, output_key, field.name, field_json.writer(allocator), allocator);
+        const handled = try handler.handleFn(handler.context, output_key, field.name, &field_json.writer, allocator);
         if (handled) {
             if (!first) {
                 try json.appendSlice(allocator, ",");
             }
-            try json.appendSlice(allocator, field_json.items);
+            try json.appendSlice(allocator, field_json.written());
             first = false;
         }
     }
@@ -812,7 +812,7 @@ const NamedResourceFieldCtx = struct {
 };
 
 /// NamedResourceEntry field handler
-fn handleNamedResourceField(ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn handleNamedResourceField(ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: *std.Io.Writer, allocator: std.mem.Allocator) !bool {
     const c: *const NamedResourceFieldCtx = @ptrCast(@alignCast(ctx));
     if (std.mem.eql(u8, field_name, "protocol")) {
         try writer.print("\"{s}\":\"{s}\"", .{ output_key, c.protocol });
@@ -848,7 +848,7 @@ fn handleNamedResourceField(ctx: *anyopaque, output_key: []const u8, field_name:
 }
 
 /// EACRole field handler
-fn handleEACRoleField(ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn handleEACRoleField(ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: *std.Io.Writer, allocator: std.mem.Allocator) !bool {
     const role: *const models.EACRoleAssignment = @ptrCast(@alignCast(ctx));
 
     if (std.mem.eql(u8, field_name, "id")) {
@@ -906,7 +906,7 @@ fn handleEACRoleField(ctx: *anyopaque, output_key: []const u8, field_name: []con
 }
 
 /// Registry field handler
-fn handleRegistryField(ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn handleRegistryField(ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: *std.Io.Writer, allocator: std.mem.Allocator) !bool {
     const registry: *const models.Registry = @ptrCast(@alignCast(ctx));
 
     if (std.mem.eql(u8, field_name, "address")) {
@@ -981,7 +981,7 @@ pub fn buildRegistryInfoJson(
     selections: []const parser.Field,
     ctx: parser.ExecutionContext,
 ) anyerror![]u8 {
-    var json: std.ArrayList(u8) = .{};
+    var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);
     try json.appendSlice(allocator, "{");
 
@@ -989,14 +989,14 @@ pub fn buildRegistryInfoJson(
     for (selections) |*sel| {
         const output_key = sel.alias orelse sel.name;
 
-        var field_buf: std.ArrayList(u8) = .{};
-        defer field_buf.deinit(allocator);
+        var field_buf: std.Io.Writer.Allocating = .init(allocator);
+        defer field_buf.deinit();
 
-        const handled = try writeRegistryField(allocator, database, registry, sel, output_key, field_buf.writer(allocator), ctx);
+        const handled = try writeRegistryField(allocator, database, registry, sel, output_key, &field_buf.writer, ctx);
         if (!handled) continue;
 
         if (!first) try json.appendSlice(allocator, ",");
-        try json.appendSlice(allocator, field_buf.items);
+        try json.appendSlice(allocator, field_buf.written());
         first = false;
     }
 
@@ -1012,7 +1012,7 @@ fn writeRegistryField(
     registry: *const models.Registry,
     sel: *const parser.Field,
     output_key: []const u8,
-    writer: std.ArrayList(u8).Writer,
+    writer: *std.Io.Writer,
     ctx: parser.ExecutionContext,
 ) anyerror!bool {
     // Scalar fields: delegate to the existing handler.
@@ -1102,7 +1102,7 @@ fn writeRegistryOwner(
     registry: *const models.Registry,
     sel: *const parser.Field,
     output_key: []const u8,
-    writer: std.ArrayList(u8).Writer,
+    writer: *std.Io.Writer,
     ctx: parser.ExecutionContext,
 ) !void {
     // Query all root-resource roles on this contract, then pick the most
@@ -1196,7 +1196,7 @@ fn writeRegistryNameList(
     database: *db.Database,
     sel: *const parser.Field,
     output_key: []const u8,
-    writer: std.ArrayList(u8).Writer,
+    writer: *std.Io.Writer,
     ctx: parser.ExecutionContext,
     base_filters: db.NameFilters,
 ) !void {
@@ -1225,7 +1225,7 @@ fn writeRegistryNameList(
             .depth = 0,
             .allocator = allocator,
             .loaders = ctx.loaders,
-            .resolve = ctx.resolve,
+            .resolve = null, // list context: live resolution is single-name only, never per-row
         });
         defer allocator.free(dom_json);
         try writer.writeAll(dom_json);
@@ -1240,7 +1240,7 @@ fn writeRegistryEvents(
     registry: *const models.Registry,
     sel: *const parser.Field,
     output_key: []const u8,
-    writer: std.ArrayList(u8).Writer,
+    writer: *std.Io.Writer,
     ctx: parser.ExecutionContext,
 ) !void {
     const addr_hex = try registry.address.toHex(allocator);
@@ -1271,7 +1271,7 @@ fn writeRegistryEvents(
             .depth = 0,
             .allocator = allocator,
             .loaders = ctx.loaders,
-            .resolve = ctx.resolve,
+            .resolve = null, // list context: live resolution is single-name only, never per-row
         });
         defer allocator.free(ev_json);
         try writer.writeAll(ev_json);
@@ -1287,7 +1287,7 @@ fn writeRegistryRoles(
     registry: *const models.Registry,
     sel: *const parser.Field,
     output_key: []const u8,
-    writer: std.ArrayList(u8).Writer,
+    writer: *std.Io.Writer,
 ) !void {
     var opts = db.RolePaginationOptions{
         .contract_address = registry.address,
@@ -1373,7 +1373,7 @@ fn findNodeSelections(sel: *const parser.Field) []const parser.Field {
 /// Write the `pageInfo` block of a connection. Cursors are passed pre-encoded
 /// so this helper is agnostic to int vs. string cursor flavors.
 fn writeConnectionPageInfo(
-    writer: std.ArrayList(u8).Writer,
+    writer: *std.Io.Writer,
     params: pagination.PaginationParams,
     has_more: bool,
     start_cursor: ?[]const u8,
@@ -1402,7 +1402,7 @@ fn writeRegistryNameConnection(
     database: *db.Database,
     sel: *const parser.Field,
     output_key: []const u8,
-    writer: std.ArrayList(u8).Writer,
+    writer: *std.Io.Writer,
     ctx: parser.ExecutionContext,
     base_filters: db.NameFilters,
 ) !void {
@@ -1476,7 +1476,7 @@ fn writeRegistryNameConnection(
             .depth = 0,
             .allocator = allocator,
             .loaders = ctx.loaders,
-            .resolve = ctx.resolve,
+            .resolve = null, // list context: live resolution is single-name only, never per-row
         });
         defer allocator.free(dom_json);
         try writer.writeAll(dom_json);
@@ -1497,7 +1497,7 @@ fn writeRegistryEventConnection(
     registry: *const models.Registry,
     sel: *const parser.Field,
     output_key: []const u8,
-    writer: std.ArrayList(u8).Writer,
+    writer: *std.Io.Writer,
     ctx: parser.ExecutionContext,
 ) !void {
     const params = try parseConnectionParams(sel);
@@ -1591,7 +1591,7 @@ fn writeRegistryEventConnection(
             .depth = 0,
             .allocator = allocator,
             .loaders = ctx.loaders,
-            .resolve = ctx.resolve,
+            .resolve = null, // list context: live resolution is single-name only, never per-row
         });
         defer allocator.free(ev_json);
         try writer.writeAll(ev_json);
@@ -1612,7 +1612,7 @@ fn writeRegistryRoleConnection(
     registry: *const models.Registry,
     sel: *const parser.Field,
     output_key: []const u8,
-    writer: std.ArrayList(u8).Writer,
+    writer: *std.Io.Writer,
 ) !void {
     const params = try parseConnectionParams(sel);
     const wants = detectConnectionWants(sel);
@@ -1700,7 +1700,7 @@ fn writeRegistryRoleConnection(
 }
 
 /// Resolver Metadata field handler
-fn handleResolverMetadataField(ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn handleResolverMetadataField(ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: *std.Io.Writer, allocator: std.mem.Allocator) !bool {
     const metadata: *const models.ResolverMetadata = @ptrCast(@alignCast(ctx));
 
     if (std.mem.eql(u8, field_name, "id")) {
@@ -1732,7 +1732,7 @@ fn handleResolverMetadataField(ctx: *anyopaque, output_key: []const u8, field_na
 }
 
 /// Resolver Approval field handler
-fn handleResolverApprovalField(ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn handleResolverApprovalField(ctx: *anyopaque, output_key: []const u8, field_name: []const u8, writer: *std.Io.Writer, allocator: std.mem.Allocator) !bool {
     const approval: *const models.ResolverApproval = @ptrCast(@alignCast(ctx));
 
     if (std.mem.eql(u8, field_name, "id")) {
@@ -1823,7 +1823,7 @@ pub fn resolveWrappedDomains(ctx: parser.ExecutionContext, field: *const parser.
         database.allocator.free(rows);
     }
 
-    var json: std.ArrayList(u8) = .{};
+    var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);
     try json.appendSlice(allocator, "[");
     for (rows, 0..) |*r, i| {
@@ -1833,7 +1833,7 @@ pub fn resolveWrappedDomains(ctx: parser.ExecutionContext, field: *const parser.
             .depth = 0,
             .allocator = allocator,
             .loaders = ctx.loaders,
-            .resolve = ctx.resolve,
+            .resolve = null, // list context: live resolution is single-name only, never per-row
         });
         defer allocator.free(wd_json);
         try json.appendSlice(allocator, wd_json);
@@ -1854,9 +1854,9 @@ pub fn resolveMeta(ctx: parser.ExecutionContext, field: *const parser.Field) !pa
     const v2_block = (try database.getSyncState(.v2)) orelse 0;
     const head: u64 = if (v1_block > v2_block) v1_block else v2_block;
 
-    var json: std.ArrayList(u8) = .{};
-    defer json.deinit(allocator);
-    const w = json.writer(allocator);
+    var json: std.Io.Writer.Allocating = .init(allocator);
+    defer json.deinit();
+    const w = &json.writer;
 
     try w.writeAll("{");
     var first_meta = true;
@@ -1900,7 +1900,7 @@ pub fn resolveMeta(ctx: parser.ExecutionContext, field: *const parser.Field) !pa
     }
     try w.writeAll("}");
 
-    return parser.FieldResult{ .json = try allocator.dupe(u8, json.items) };
+    return parser.FieldResult{ .json = try allocator.dupe(u8, json.written()) };
 }
 
 fn writeFinalityBlock(w: anytype, key: []const u8, sels: []const parser.Field, number: u64, hash: ?Hash, updated_at: ?i64) !void {
@@ -1956,9 +1956,9 @@ pub fn resolveFinality(ctx: parser.ExecutionContext, field: *const parser.Field)
     const finalized = try database.getFinality(database.chain_id, .finalized);
     const is_stale = if (safe) |snap| head < snap.number else true;
 
-    var json: std.ArrayList(u8) = .{};
-    defer json.deinit(allocator);
-    const w = json.writer(allocator);
+    var json: std.Io.Writer.Allocating = .init(allocator);
+    defer json.deinit();
+    const w = &json.writer;
     try w.writeAll("{");
     var first = true;
     for (field.selections) |*sel| {
@@ -1978,7 +1978,7 @@ pub fn resolveFinality(ctx: parser.ExecutionContext, field: *const parser.Field)
         first = false;
     }
     try w.writeAll("}");
-    return parser.FieldResult{ .json = try allocator.dupe(u8, json.items) };
+    return parser.FieldResult{ .json = try allocator.dupe(u8, json.written()) };
 }
 
 test "resolver(id) JSON stays well-formed for record + contract + __typename fields" {

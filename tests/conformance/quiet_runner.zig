@@ -14,13 +14,21 @@ const builtin = @import("builtin");
 const testing = std.testing;
 
 pub const std_options: std.Options = .{ .logFn = quietLog };
-fn quietLog(comptime _: std.log.Level, comptime _: @Type(.enum_literal), comptime _: []const u8, _: anytype) void {}
+fn quietLog(comptime _: std.log.Level, comptime _: @EnumLiteral(), comptime _: []const u8, _: anytype) void {}
 
-pub fn main() void {
+pub fn main(init: std.process.Init.Minimal) void {
     var failed: usize = 0;
     for (builtin.test_functions) |t| {
+        // Same per-test wiring as lib/compiler/test_runner.zig: tests reach the io
+        // handle via std.testing.io, which reads testing.io_instance.
+        testing.environ = init.environ;
         testing.allocator_instance = .{};
+        testing.io_instance = .init(testing.allocator, .{
+            .argv0 = .init(init.args),
+            .environ = init.environ,
+        });
         const result = t.func();
+        testing.io_instance.deinit();
         const leaked = testing.allocator_instance.deinit() == .leak;
         if (result) |_| {
             if (leaked) {

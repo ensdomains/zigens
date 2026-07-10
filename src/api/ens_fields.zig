@@ -78,7 +78,7 @@ pub const FieldValue = union(enum) {
 pub const FieldGetter = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!FieldValue;
 
 /// Custom writer function type - writes directly to JSON output
-pub const CustomWriter = *const fn (ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) anyerror!bool;
+pub const CustomWriter = *const fn (ctx: *anyopaque, output_key: []const u8, writer: *std.Io.Writer, allocator: std.mem.Allocator) anyerror!bool;
 
 /// Field definition (ENS-extended)
 pub const FieldDef = struct {
@@ -155,7 +155,7 @@ pub fn handleFieldFromTable(
     ctx: *anyopaque,
     output_key: []const u8,
     field_name: []const u8,
-    writer: std.ArrayList(u8).Writer,
+    writer: *std.Io.Writer,
     allocator: std.mem.Allocator,
     field_defs: []const FieldDef,
 ) !bool {
@@ -172,7 +172,7 @@ pub fn handleFieldFromTable(
 fn writeFieldValue(
     ctx: *anyopaque,
     output_key: []const u8,
-    writer: std.ArrayList(u8).Writer,
+    writer: *std.Io.Writer,
     allocator: std.mem.Allocator,
     def: FieldDef,
 ) !bool {
@@ -393,7 +393,7 @@ pub const EventFields = [_]FieldDef{
 };
 
 /// Custom writer for event ID (composite field)
-fn writeEventId(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn writeEventId(ctx: *anyopaque, output_key: []const u8, writer: *std.Io.Writer, allocator: std.mem.Allocator) !bool {
     const event = getEventCtx(ctx);
     const tx_hash = try event.tx_hash.toHex(allocator);
     defer allocator.free(tx_hash);
@@ -470,7 +470,7 @@ fn getRegistrationReferrer(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
 /// clean lifetime (returning an allocated string via FieldValue.optional_string
 /// would leak — the dispatcher in lib/graphql/fields.zig doesn't free getter
 /// return values, and we can't safely escape/free in-line).
-fn writeRegistrationCost(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn writeRegistrationCost(ctx: *anyopaque, output_key: []const u8, writer: *std.Io.Writer, allocator: std.mem.Allocator) !bool {
     const event = getEventCtx(ctx);
     const base = event.base_cost orelse {
         try writer.print("\"{s}\":null", .{output_key});
@@ -523,7 +523,7 @@ fn getNameCtx(ctx: *anyopaque) *const models.Name {
 }
 
 /// Custom writer for name ID/name field
-fn writeNameId(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn writeNameId(ctx: *anyopaque, output_key: []const u8, writer: *std.Io.Writer, allocator: std.mem.Allocator) !bool {
     const name = getNameCtx(ctx);
     const escaped = try escapeJsonString(allocator, name.name orelse "[unknown]");
     defer allocator.free(escaped);
@@ -719,7 +719,7 @@ pub const DomainBuildFields = [_]FieldDef{
 };
 
 /// Custom writer for labelName
-fn writeNameLabelName(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn writeNameLabelName(ctx: *anyopaque, output_key: []const u8, writer: *std.Io.Writer, allocator: std.mem.Allocator) !bool {
     const name = getNameCtx(ctx);
     const escaped = try escapeJsonString(allocator, name.label orelse "[unknown]");
     defer allocator.free(escaped);
@@ -728,7 +728,7 @@ fn writeNameLabelName(ctx: *anyopaque, output_key: []const u8, writer: std.Array
 }
 
 /// Custom writer for labelhash
-fn writeNameLabelhash(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn writeNameLabelhash(ctx: *anyopaque, output_key: []const u8, writer: *std.Io.Writer, allocator: std.mem.Allocator) !bool {
     const name = getNameCtx(ctx);
     const hash_hex = try name.label_hash.toHex(allocator);
     defer allocator.free(hash_hex);

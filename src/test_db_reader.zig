@@ -1,8 +1,8 @@
 const std = @import("std");
 const db = @import("storage/database.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+pub fn main(_: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

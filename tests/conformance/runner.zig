@@ -22,6 +22,7 @@
 //! id-parameterized ops use GraphQL variables so the query strings stay static.
 
 const std = @import("std");
+const zsys = @import("lib").zsys;
 const testing = std.testing;
 const helpers = @import("helpers");
 const lib = @import("lib");
@@ -181,27 +182,47 @@ fn checkOp(a: std.mem.Allocator, handler: *GraphQLHandler, db: *Database, op: Op
     defer a.free(path);
 
     if (mode == .update) {
-        std.fs.cwd().makePath(GOLDEN_DIR) catch {};
-        const f = try std.fs.cwd().createFile(path, .{});
-        defer f.close();
-        try f.writeAll(result);
+        zsys.makePath(GOLDEN_DIR) catch {};
+        try zsys.writeFile(path, result);
         std.debug.print("updated {s}\n", .{path});
         return;
     }
 
-    const golden = std.fs.cwd().readFileAlloc(a, path, 1 << 20) catch |e| {
+    const golden = zsys.readFileAlloc(a, path, 1 << 20) catch |e| {
         std.debug.print("\nMISSING GOLDEN {s} ({}). Run: CONFORMANCE_UPDATE=1 zig build test-conformance\n", .{ path, e });
         return e;
     };
     defer a.free(golden);
+    try compareGolden(op.name, golden, result);
+}
+
+/// The conformance comparator: a STRICT byte-for-byte compare with a readable diff on
+/// mismatch. Extracted + named so the self-test below locks that a mutated response is
+/// actually rejected — guarding against the comparison ever being weakened to a lenient
+/// (substring / whitespace-normalized) match that would silently pass real divergences.
+fn compareGolden(op_name: []const u8, golden: []const u8, result: []const u8) !void {
     testing.expectEqualStrings(golden, result) catch |e| {
-        std.debug.print("\nCONFORMANCE MISMATCH [{s}]\n  golden: {s}\n  actual: {s}\n", .{ op.name, golden, result });
+        std.debug.print("\nCONFORMANCE MISMATCH [{s}]\n  golden: {s}\n  actual: {s}\n", .{ op_name, golden, result });
         return e;
     };
 }
 
+test "conformance comparator is strict: identical passes, a one-byte mutation fails" {
+    const a = testing.allocator;
+    const golden = "{\"data\":{\"domain\":{\"name\":\"alice.eth\"}}}";
+    // Known-good: identical bytes pass.
+    try compareGolden("selftest", golden, golden);
+    // Mutated response: flip one byte — the SAME comparator checkOp uses must reject it,
+    // so a golden/response divergence can never slip through as a silent pass.
+    const mutated = try a.dupe(u8, golden);
+    defer a.free(mutated);
+    mutated[mutated.len - 3] +%= 1;
+    try testing.expect(!std.mem.eql(u8, golden, mutated));
+    try testing.expectError(error.TestExpectedEqual, compareGolden("selftest", golden, mutated));
+}
+
 test "conformance goldens" {
-    const leakcheck = std.process.hasEnvVarConstant("CONFORMANCE_LEAKCHECK");
+    const leakcheck = zsys.hasEnv("CONFORMANCE_LEAKCHECK");
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = if (leakcheck) testing.allocator else arena.allocator();
@@ -213,9 +234,9 @@ test "conformance goldens" {
     var handler = try GraphQLHandler.init(a, 30, 100000, false);
     defer handler.deinit();
 
-    const mode: Mode = if (std.process.hasEnvVarConstant("CONFORMANCE_PRINT"))
+    const mode: Mode = if (zsys.hasEnv("CONFORMANCE_PRINT"))
         .print
-    else if (std.process.hasEnvVarConstant("CONFORMANCE_UPDATE"))
+    else if (zsys.hasEnv("CONFORMANCE_UPDATE"))
         .update
     else
         .compare;
@@ -361,4 +382,44 @@ test "task06: indexed-miss addr resolves via Universal Resolver only when live i
     const on = try handler.handleQueryWithResolve(db, query, parsed.value, null, false, @ptrCast(&live));
     defer a.free(on);
     try testing.expect(std.mem.indexOf(u8, on, "0x2222222222222222222222222222222222222222") != null);
+
+    // GATE: a domain whose resolver IS fully indexed (known_resolvers) must NOT fall
+    // back — its indexed miss is authoritative. A UR answer (0x33…) is pre-seeded for
+    // this node too, so addr staying null with the flag ON proves the gate
+    // short-circuits before the cache/UR; a gate regression would surface 0x3333….
+    const known_res = Address{ .bytes = [_]u8{0x77} ** 20 };
+    _ = try seedName(db, a, "gated.eth", "gated", "eth", owner, known_res, 0x2, 2000000000, false, null);
+    const gated_node = try lib.namehash(a, "gated.eth");
+    const known_hex = try known_res.toHex(a);
+    defer a.free(known_hex);
+    try db.registerResolver(.v2, known_hex, 100);
+
+    const g_inner = try uni.encodeInner(a, gated_node, rec);
+    defer a.free(g_inner);
+    const g_calldata = try uni.encodeResolveCall(a, "gated.eth", g_inner);
+    defer a.free(g_calldata);
+    var g_blob: [128]u8 = [_]u8{0} ** 128;
+    g_blob[31] = 0x40;
+    @memset(g_blob[44..64], 0x11);
+    g_blob[95] = 32;
+    @memset(g_blob[108..128], 0x33);
+    try cache.put(db, .{
+        .chain_id = 1,
+        .target = ur_addr,
+        .selector_key = selkey,
+        .arg_hash = cache.argHash(g_calldata),
+        .block_dep_num = block_num,
+        .block_dep_hash = block_hash,
+    }, .success, &g_blob, .resolved_live, now);
+
+    var gnh_buf: [66]u8 = undefined;
+    const gnh_hex = gated_node.toHexBuf(&gnh_buf);
+    const gvars = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\"}}", .{gnh_hex});
+    defer a.free(gvars);
+    const gparsed = try std.json.parseFromSlice(std.json.Value, a, gvars, .{});
+    defer gparsed.deinit();
+    const gated_on = try handler.handleQueryWithResolve(db, query, gparsed.value, null, false, @ptrCast(&live));
+    defer a.free(gated_on);
+    try testing.expect(std.mem.indexOf(u8, gated_on, "\"addr\":null") != null);
+    try testing.expect(std.mem.indexOf(u8, gated_on, "0x3333333333333333333333333333333333333333") == null);
 }

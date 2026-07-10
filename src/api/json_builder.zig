@@ -78,9 +78,9 @@ pub fn buildEntityJson(
         return error.MaxDepthExceeded;
     }
 
-    var json: std.ArrayList(u8) = .{};
-    errdefer json.deinit(allocator);
-    const writer = json.writer(allocator);
+    var json: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json.deinit();
+    const writer = &json.writer;
 
     try writer.writeAll("{");
     var first = true;
@@ -155,21 +155,21 @@ pub fn buildEntityJson(
         }
 
         // Try scalar field from field definitions
-        var field_buffer: std.ArrayList(u8) = .{};
-        defer field_buffer.deinit(allocator);
+        var field_buffer: std.Io.Writer.Allocating = .init(allocator);
+        defer field_buffer.deinit();
 
         const handled = try fields.handleFieldFromTable(
             ctx,
             output_key,
             field.name,
-            field_buffer.writer(allocator),
+            &field_buffer.writer,
             allocator,
             config.field_defs,
         );
 
         if (handled) {
             if (!first) try writer.writeAll(",");
-            try writer.writeAll(field_buffer.items);
+            try writer.writeAll(field_buffer.written());
             first = false;
         } else {
             // Unknown field - return null per GraphQL spec
@@ -181,6 +181,6 @@ pub fn buildEntityJson(
 
     try writer.writeAll("}");
     // toOwnedSlice transfers the backing buffer directly to the caller — saves the
-    // dupe-then-free round trip vs `allocator.dupe(u8, json.items)`.
-    return try json.toOwnedSlice(allocator);
+    // dupe-then-free round trip vs `allocator.dupe(u8, json.written())`.
+    return try json.toOwnedSlice();
 }

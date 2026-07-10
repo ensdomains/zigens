@@ -10,7 +10,7 @@ const models = @import("../types/models.zig");
 
 /// Serialize event types as a JSON array string. Caller owns the result.
 fn serializeEventTypes(allocator: std.mem.Allocator, event_types: []const models.EventType) ![]u8 {
-    var json: std.ArrayList(u8) = .{};
+    var json: std.ArrayList(u8) = .empty;
     errdefer json.deinit(allocator);
     try json.append(allocator, '[');
     for (event_types, 0..) |et, i| {
@@ -25,7 +25,7 @@ fn serializeEventTypes(allocator: std.mem.Allocator, event_types: []const models
 
 /// Parse a JSON array of event-type strings (simple quoted-string scan). Caller owns the result.
 fn parseEventTypes(allocator: std.mem.Allocator, json: []const u8) ![]models.EventType {
-    var event_types: std.ArrayList(models.EventType) = .{};
+    var event_types: std.ArrayList(models.EventType) = .empty;
     errdefer event_types.deinit(allocator);
     var i: usize = 0;
     while (i < json.len) : (i += 1) {
@@ -110,7 +110,7 @@ pub fn getWebhooks(db: *Database) ![]models.Webhook {
     var q = try Query.init(db, "SELECT id, url, secret, event_types, active, max_retries, created_at FROM webhooks");
     defer q.deinit();
 
-    var webhooks: std.ArrayList(models.Webhook) = .{};
+    var webhooks: std.ArrayList(models.Webhook) = .empty;
     errdefer {
         for (webhooks.items) |*wh| wh.deinit(db.allocator);
         webhooks.deinit(db.allocator);
@@ -152,7 +152,7 @@ pub fn updateWebhook(db: *Database, webhook_id: u64, url: ?[]const u8, event_typ
     defer if (old_url) |ou| db.allocator.free(ou);
 
     // Build dynamic SQL based on what fields are provided.
-    var sql_parts: std.ArrayList(u8) = .{};
+    var sql_parts: std.ArrayList(u8) = .empty;
     defer sql_parts.deinit(db.allocator);
     try sql_parts.appendSlice(db.allocator, "UPDATE webhooks SET ");
 

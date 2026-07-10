@@ -6,6 +6,7 @@
 //! runs the same contracts against real PG sessions.
 
 const std = @import("std");
+const zsys = @import("lib").zsys;
 const testing = std.testing;
 const lib = @import("lib");
 const pool_mod = lib.storage.pool;
@@ -14,7 +15,7 @@ const Pool = pool_mod.Pool;
 const PG_URL = "postgresql://postgres:postgres@127.0.0.1:5432/ensv2_test";
 
 fn wantPostgres() bool {
-    const v = std.process.getEnvVarOwned(testing.allocator, "TEST_BACKEND") catch return false;
+    const v = zsys.getEnvOwned(testing.allocator, "TEST_BACKEND") catch return false;
     defer testing.allocator.free(v);
     return std.ascii.eqlIgnoreCase(v, "postgres");
 }
@@ -30,7 +31,7 @@ fn fileOptions(size: u32, sqlite_file: []const u8) pool_mod.Options {
 }
 
 fn cleanupSqliteFile(path: []const u8) void {
-    if (!wantPostgres()) std.fs.cwd().deleteFile(path) catch {};
+    if (!wantPostgres()) zsys.deleteFile(path) catch {};
 }
 
 test "sqlite :memory: pool is pinned to a single session with checkout accounting" {
@@ -74,7 +75,7 @@ test "acquire blocks at exhaustion until a session is released" {
 
     const Releaser = struct {
         fn run(p: *Pool, session: *lib.Database) void {
-            std.Thread.sleep(30 * std.time.ns_per_ms);
+            zsys.sleep(30 * std.time.ns_per_ms);
             p.release(session);
         }
     };
@@ -90,7 +91,7 @@ test "concurrent sessions execute queries without corruption" {
     const file = "/tmp/zigens_pool_concurrent.db";
     defer cleanupSqliteFile(file);
 
-    var tsa: std.heap.ThreadSafeAllocator = .{ .child_allocator = testing.allocator };
+    var tsa: ThreadSafeAllocator = .{ .child_allocator = testing.allocator };
     const allocator = tsa.allocator();
 
     var pool = try Pool.open(allocator, fileOptions(3, file));
@@ -140,7 +141,7 @@ test "deinit waits for checked-out sessions to come home" {
     const held = try pool.acquire();
     const Returner = struct {
         fn run(p: *Pool, session: *lib.Database) void {
-            std.Thread.sleep(30 * std.time.ns_per_ms);
+            zsys.sleep(30 * std.time.ns_per_ms);
             p.release(session);
         }
     };
@@ -171,14 +172,14 @@ test "shutdown: parked acquirer fails with PoolClosed while deinit drains" {
     };
     const Returner = struct {
         fn run(p: *Pool, session: *lib.Database) void {
-            std.Thread.sleep(60 * std.time.ns_per_ms);
+            zsys.sleep(60 * std.time.ns_per_ms);
             p.release(session);
         }
     };
 
     var saw_closed = std.atomic.Value(bool).init(false);
     const parked = try std.Thread.spawn(.{}, Parked.run, .{ &pool, &saw_closed });
-    std.Thread.sleep(20 * std.time.ns_per_ms); // let the acquirer park
+    zsys.sleep(20 * std.time.ns_per_ms); // let the acquirer park
     const returner = try std.Thread.spawn(.{}, Returner.run, .{ &pool, held });
 
     pool.deinit(); // closes the pool, drains the parked acquirer, waits for held
@@ -187,3 +188,38 @@ test "shutdown: parked acquirer fails with PoolClosed while deinit drains" {
     returner.join();
     try testing.expect(saw_closed.load(.acquire));
 }
+
+/// 0.16 removed std.heap.ThreadSafeAllocator; this is its shape over the zsys
+/// pthread mutex, just enough for the concurrency test above.
+const ThreadSafeAllocator = struct {
+    child_allocator: std.mem.Allocator,
+    mutex: zsys.Mutex = .{},
+
+    fn allocator(self: *ThreadSafeAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *ThreadSafeAllocator = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.child_allocator.rawAlloc(n, alignment, ra);
+    }
+    fn resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *ThreadSafeAllocator = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.child_allocator.rawResize(buf, alignment, new_len, ra);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *ThreadSafeAllocator = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.child_allocator.rawRemap(memory, alignment, new_len, ra);
+    }
+    fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *ThreadSafeAllocator = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.child_allocator.rawFree(buf, alignment, ra);
+    }
+};
