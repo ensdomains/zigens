@@ -25,6 +25,11 @@ pub fn build(b: *std.Build) void {
     // which managed Postgres (e.g. Neon) requires. Off by default → no openssl linkage,
     // suiting a local/containerized non-TLS Postgres and the SQLite-only builds.
     const pg_tls = b.option(bool, "pg-tls", "Link OpenSSL into the Postgres driver for TLS (required for Neon/managed Postgres)") orelse false;
+
+    // Auxiliary tool binaries (test-db-reader, rainbow-backfill) are not shipped in
+    // the Docker image; -Dtools=false drops them from the default install to cut the
+    // deployment build by two ReleaseSafe compilations.
+    const tools = b.option(bool, "tools", "Install auxiliary tool binaries (test-db-reader, rainbow-backfill)") orelse true;
     const pg_dep = if (pg_tls)
         b.dependency("pg", .{ .target = target, .optimize = optimize, .openssl_lib_name = @as([]const u8, "ssl") })
     else
@@ -139,7 +144,7 @@ pub fn build(b: *std.Build) void {
     });
     test_db_reader_exe.root_module.link_libc = true;
     test_db_reader_exe.root_module.linkSystemLibrary("sqlite3", .{});
-    b.installArtifact(test_db_reader_exe);
+    if (tools) b.installArtifact(test_db_reader_exe);
 
     // Rainbow backfill tool (standalone)
     const rainbow_backfill_exe = b.addExecutable(.{
@@ -152,7 +157,7 @@ pub fn build(b: *std.Build) void {
     });
     rainbow_backfill_exe.root_module.link_libc = true;
     rainbow_backfill_exe.root_module.linkSystemLibrary("sqlite3", .{});
-    b.installArtifact(rainbow_backfill_exe);
+    if (tools) b.installArtifact(rainbow_backfill_exe);
 
     // Run commands
     const run_indexer = b.addRunArtifact(indexer_exe);

@@ -34,13 +34,31 @@ RUN ARCH=$(case ${TARGETARCH:-$(uname -m)} in \
 # Set working directory
 WORKDIR /app
 
+# Fetch the dependency tree straight from the manifest (single source of truth,
+# nothing duplicated here) before sources are copied, so the layer stays cached
+# until build.zig/build.zig.zon change. Retried in the shell because zig's
+# fetcher has none (ziglang/zig#25120) and reports any transient non-200 from a
+# git host as a hard ProtocolError — which broke deploys fetching translate-c
+# (transitive via pg.zig) from codeberg.org.
+COPY build.zig build.zig.zon ./
+RUN ok=0; \
+    for i in 1 2 3 4 5; do \
+      zig build --fetch && ok=1 && break; \
+      echo "dependency fetch attempt $i failed; retrying in 5s"; sleep 5; \
+    done; \
+    [ "$ok" = 1 ]
+
 # Copy source code
 COPY . .
 
 # Build all applications (generates introspection.json, builds indexer + API).
 # ReleaseSafe keeps bounds/overflow/optional-unwrap checks active in production —
 # the indexer parses untrusted RPC/ABI bytes, so safety checks are worth the cost.
-RUN zig build -Doptimize=ReleaseSafe -Dpg-tls=true
+# -Dtools=false skips test-db-reader and rainbow-backfill, which the image never ships.
+# -j2 bounds concurrent compiles: peak build memory stays ~3.3GB (the api compile
+# alone needs ~2GB+ on Zig 0.16) so the build can't starve the host it shares
+# with the deployment platform.
+RUN zig build -Doptimize=ReleaseSafe -Dpg-tls=true -Dtools=false -j2
 
 # Stage 2: Runtime
 FROM alpine:3.22
