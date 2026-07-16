@@ -15,6 +15,7 @@ const CliArgs = struct {
     from_block: ?u64 = null,
     to_block: ?u64 = null,
     clean: bool = false,
+    backfill: bool = false,
     help: bool = false,
 };
 
@@ -45,6 +46,8 @@ fn parseArgs(process_args: std.process.Args) !CliArgs {
             }
         } else if (std.mem.eql(u8, arg, "--clean")) {
             result.clean = true;
+        } else if (std.mem.eql(u8, arg, "--backfill")) {
+            result.backfill = true;
         } else {
             std.log.warn("Unknown argument: {s}", .{arg});
         }
@@ -64,6 +67,7 @@ fn printHelp() void {
         \\  --from-block <N>    Re-index from block N (resets sync state)
         \\  --to-block <N>      Stop indexing at block N (default: current block)
         \\  --clean             Delete all data after --from-block before re-indexing
+        \\  --backfill          Rebuild the names table from stored events (V1 then V2), no RPC, then exit
         \\  --help, -h          Show this help message
         \\
         \\Examples:
@@ -129,28 +133,52 @@ pub fn main(init: std.process.Init) !void {
     }
     std.log.info("Database integrity check passed", .{});
 
-    // Handle re-indexing if --from-block is specified
-    if (args.from_block) |from_block| {
-        std.log.info("Re-indexing requested from block {d}", .{from_block});
+    // --backfill: offline rebuild of the names projection from stored events. Disable the status
+    // server and webhooks (no RPC, no lock contention); live-index setup below is skipped.
+    if (args.backfill) {
+        cfg.status_port = null;
+        cfg.webhooks_enabled = false;
+    }
 
-        if (args.clean) {
-            std.log.warn("--clean mode: Deleting all data after block {d}...", .{from_block});
-            try database.deleteDataAfterBlock(from_block);
-            std.log.info("Data cleanup complete", .{});
-        } else {
-            std.log.info("Idempotent re-index: Keeping existing data, will skip duplicates", .{});
+    // Handle re-indexing if --from-block is specified (not applicable in --backfill mode)
+    if (!args.backfill) {
+        if (args.from_block) |from_block| {
+            std.log.info("Re-indexing requested from block {d}", .{from_block});
+
+            if (args.clean) {
+                std.log.warn("--clean mode: Deleting all data after block {d}...", .{from_block});
+                try database.deleteDataAfterBlock(from_block);
+                std.log.info("Data cleanup complete", .{});
+            } else {
+                std.log.info("Idempotent re-index: Keeping existing data, will skip duplicates", .{});
+            }
+
+            // Reset sync state for both chains
+            std.log.info("Resetting sync state to block {d}...", .{from_block});
+            try database.setSyncState(.v1, from_block);
+            try database.setSyncState(.v2, from_block);
+            std.log.info("Sync state reset complete. Indexer will resume from block {d}", .{from_block});
         }
-
-        // Reset sync state for both chains
-        std.log.info("Resetting sync state to block {d}...", .{from_block});
-        try database.setSyncState(.v1, from_block);
-        try database.setSyncState(.v2, from_block);
-        std.log.info("Sync state reset complete. Indexer will resume from block {d}", .{from_block});
     }
 
     // Initialize and start indexer
     var idx = try indexer.Indexer.init(allocator, io, cfg, &database, args.to_block);
     defer idx.deinit();
+
+    // --backfill: rebuild names from stored events (V1 first so V1→V2 migration lookups find
+    // their source rows, then V2), then exit without entering the live index loop.
+    if (args.backfill) {
+        std.log.info("Running in --backfill mode: rebuilding names + records + roles + registrations from stored events (V1 then V2)", .{});
+        try idx.replayEventsToRebuildNames();
+        try idx.replayV2NamesCore();
+        try idx.replayV2RecordsCore();
+        try idx.replayV2EacRolesCore();
+        try idx.replayV2RegistrationsCore();
+        try idx.replayV2RegistriesCore(); // after names (pointer cascade fixes subregistry reachability)
+        try idx.replayAccountsCore(); // after names + registrations (backfill seed reads them)
+        std.log.info("Backfill complete. Exiting.", .{});
+        return;
+    }
 
     std.log.info("Indexer started - indexing blocks...", .{});
 

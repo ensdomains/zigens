@@ -10,6 +10,7 @@
 const std = @import("std");
 const constants = @import("../../constants.zig");
 const backend = @import("../backend.zig");
+const zsys = @import("../../utils/system.zig");
 const Statement = backend.Statement;
 
 const c = @cImport({
@@ -193,7 +194,9 @@ fn execRaw(ctx: *anyopaque, sql: []const u8) anyerror!void {
 fn begin(ctx: *anyopaque, mode: backend.TxMode) anyerror!void {
     const conn = asConn(ctx);
     const sql = switch (mode) {
-        .deferred => "BEGIN TRANSACTION",
+        // A plain BEGIN read transaction takes its snapshot on the first read and holds it
+        // until commit (WAL), so read_snapshot needs no distinct SQLite syntax.
+        .deferred, .read_snapshot => "BEGIN TRANSACTION",
         .immediate => "BEGIN IMMEDIATE TRANSACTION",
     };
     if (c.sqlite3_exec(conn.db, sql, null, null, null) != c.SQLITE_OK) {
@@ -365,11 +368,28 @@ pub const sqlite_dialect = backend.Dialect{
 
 // ── Open / global config ────────────────────────────────────────────────────
 
+/// Resolve the connection journal mode from SQLITE_JOURNAL_MODE (default WAL). Validated against
+/// SQLite's journal modes; an unset/unknown value returns WAL so production defaults hold.
+fn journalModeFromEnv() []const u8 {
+    const v = zsys.getenv("SQLITE_JOURNAL_MODE") orelse return "WAL";
+    const modes = [_][]const u8{ "WAL", "DELETE", "TRUNCATE", "PERSIST", "MEMORY", "OFF" };
+    for (modes) |m| {
+        if (std.ascii.eqlIgnoreCase(v, m)) return m;
+    }
+    return "WAL";
+}
+
 /// Apply the standard connection PRAGMAs (WAL, busy_timeout, synchronous,
 /// cache_size, foreign_keys, temp_store, recursive_triggers). `recursive_triggers`
 /// is load-bearing for the reorg undo-log (see reorg_undo.zig).
 fn applyPragmas(conn: *SqliteConn) !void {
-    try execOnConn(conn, "PRAGMA journal_mode=WAL;");
+    // journal_mode defaults to WAL (best reader/writer concurrency). It is configurable because
+    // WAL's mmap'd `-shm` index file faults on filesystems without proper shared-memory mmap
+    // (FUSE/virtiofs, some network mounts) — set SQLITE_JOURNAL_MODE=DELETE there. An unknown
+    // value falls back to WAL, so production defaults are unchanged.
+    var jm_buf: [48]u8 = undefined;
+    const jm_pragma = std.fmt.bufPrint(&jm_buf, "PRAGMA journal_mode={s};", .{journalModeFromEnv()}) catch "PRAGMA journal_mode=WAL;";
+    try execOnConn(conn, jm_pragma);
     try execOnConn(conn, std.fmt.comptimePrint("PRAGMA busy_timeout = {d};", .{constants.SQLite.busy_timeout_ms}));
     try execOnConn(conn, "PRAGMA synchronous = NORMAL;");
     try execOnConn(conn, std.fmt.comptimePrint("PRAGMA cache_size = {d};", .{constants.SQLite.cache_size_kb}));

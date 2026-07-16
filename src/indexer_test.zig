@@ -12,6 +12,7 @@ comptime {
     _ = @import("utils/calldata_decoder.zig");
     _ = @import("utils/v1_names.zig");
     _ = @import("types/token_id.zig");
+    _ = @import("indexer/replay.zig");
 }
 
 const dns = @import("utils/dns.zig");

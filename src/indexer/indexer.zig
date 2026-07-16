@@ -348,6 +348,19 @@ pub const Indexer = struct {
     pub const resolveLabel = caches.resolveLabel;
     /// Replay all stored events to rebuild the names table (--backfill mode).
     pub const replayEventsToRebuildNames = replay_mod.replayEventsToRebuildNames;
+    /// Rebuild the V2 names projection from stored V2 events. In a combined --backfill this
+    /// MUST run AFTER replayEventsToRebuildNames so V1→V2 migration lookups find their V1 rows.
+    pub const replayV2NamesCore = replay_mod.replayV2NamesCore;
+    /// Rebuild the V2 resolver-record projections (addresses/texts/contenthashes) from events.
+    pub const replayV2RecordsCore = replay_mod.replayV2RecordsCore;
+    /// Rebuild the V2 eac_roles projection from stored EACRolesChanged events.
+    pub const replayV2EacRolesCore = replay_mod.replayV2EacRolesCore;
+    /// Rebuild the V2 registrations projection from stored LabelRegistered/NameRegistered events.
+    pub const replayV2RegistrationsCore = replay_mod.replayV2RegistrationsCore;
+    /// Rebuild the accounts projection (V1+V2 observations + backfill seed) from events.
+    pub const replayAccountsCore = replay_mod.replayAccountsCore;
+    /// Rebuild the V2 registries + registry_entries projections (bootstrap + pointer changes).
+    pub const replayV2RegistriesCore = replay_mod.replayV2RegistriesCore;
     pub const trackBlockHash = caches.trackBlockHash;
     pub const resetBlockHashTracking = caches.resetBlockHashTracking;
     pub const getBlockTimestamp = caches.getBlockTimestamp;
