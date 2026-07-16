@@ -710,6 +710,8 @@ fn accountPrimaryNameVerificationHandler(ctx: *anyopaque, field: *const parser.F
     return try nested_ctx.allocator.dupe(u8, switch (verdict) {
         .verified => "\"VERIFIED\"",
         .mismatch => "\"MISMATCH\"",
+        .invalid_name => "\"INVALID_NAME\"",
+        .not_found => "\"NOT_FOUND\"",
         .unverified => "\"UNVERIFIED\"",
     });
 }
@@ -1817,6 +1819,37 @@ fn domainIsNormalizedHandler(ctx: *anyopaque, field: *const parser.Field, nested
     return try nested_ctx.allocator.dupe(u8, if (domain.is_normalized) "true" else "false");
 }
 
+/// Classify a domain's current state by how settled it is against chain finality:
+/// FINALIZED (last change at/below the finalized head — will not reorg), SAFE (at/below
+/// the safe head), or HEAD (in the unsafe zone). Pure so the boundary logic is testable.
+fn finalityTier(updated_block: u64, safe: u64, finalized: u64) []const u8 {
+    if (updated_block <= finalized) return "\"FINALIZED\"";
+    if (updated_block <= safe) return "\"SAFE\"";
+    return "\"HEAD\"";
+}
+
+/// Domain nested field handler: finality (finality-tiered reads). Reports the finality
+/// tier of the domain's CURRENT state from its last-modified block vs the stored safe/
+/// finalized positions. Null when finality is not tracked (FINALITY_ENABLED off), so a
+/// client can distinguish "unknown" from "unsafe".
+fn domainFinalityHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    _ = field;
+    const domain: *const models.Name = @ptrCast(@alignCast(ctx));
+    const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+    const safe = (try database.getFinality(database.chain_id, .safe)) orelse return try nested_ctx.allocator.dupe(u8, "null");
+    const finalized = (try database.getFinality(database.chain_id, .finalized)) orelse return try nested_ctx.allocator.dupe(u8, "null");
+    return try nested_ctx.allocator.dupe(u8, finalityTier(domain.updated_block, safe.number, finalized.number));
+}
+
+test "finalityTier classifies by updated_block vs safe/finalized" {
+    const t = std.testing;
+    try t.expectEqualStrings("\"FINALIZED\"", finalityTier(90, 100, 95));
+    try t.expectEqualStrings("\"FINALIZED\"", finalityTier(95, 100, 95)); // == finalized boundary
+    try t.expectEqualStrings("\"SAFE\"", finalityTier(96, 100, 95));
+    try t.expectEqualStrings("\"SAFE\"", finalityTier(100, 100, 95)); // == safe boundary
+    try t.expectEqualStrings("\"HEAD\"", finalityTier(101, 100, 95));
+}
+
 /// Domain nested field handler: subdomainsCount (aggregation)
 fn domainSubdomainsCountHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
     _ = field;
@@ -2064,6 +2097,7 @@ const DomainBuildEntityConfig = json_builder.EntityConfig{
         .{ .name = "expiryDate", .handler = domainExpiryDateHandler },
         .{ .name = "normalizedName", .handler = domainNormalizedNameHandler },
         .{ .name = "isNormalized", .handler = domainIsNormalizedHandler },
+        .{ .name = "finality", .handler = domainFinalityHandler },
         .{ .name = "wrappedDomain", .handler = domainWrappedDomainHandler },
         .{ .name = "wrappedOwner", .handler = domainWrappedOwnerHandler },
     },

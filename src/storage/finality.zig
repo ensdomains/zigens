@@ -7,8 +7,9 @@
 //! is not part of the drop-and-reindex base schema and does not affect PG-schema drift.
 //!
 //! Signalling only: this never blocks indexing (best-effort; a fetch failure leaves the
-//! prior/absent position), and monotonicity (finalized <= safe <= head) is enforced by
-//! the writer, not here.
+//! prior/absent position). Per-tier monotonicity (a tier only ever advances) is enforced
+//! in `setFinality`; the cross-tier `finalized <= safe` invariant is checked by the writer
+//! before it calls in.
 
 const std = @import("std");
 const db_module = @import("database.zig");
@@ -44,7 +45,14 @@ pub fn ensureSchema(db: *Database) !void {
 }
 
 /// Upsert the `tier` position for `chain_id`. `now` is the fetch time (unix seconds).
+/// Monotonic: a tier only advances. A provider that momentarily reports a lower (or a
+/// transiently wrong) safe/finalized head must not move the persisted position backward;
+/// a genuine downward correction reconverges once a higher head is reported again.
 pub fn setFinality(db: *Database, chain_id: u64, tier: Tier, number: u64, hash: Hash, now: i64) !void {
+    if (try getFinality(db, chain_id, tier)) |current| {
+        if (number < current.number) return;
+    }
+
     const sql = try db.upsertSql(db.allocator, "finality_state", &.{ "chain_id", "tier", "number", "hash", "updated_at" }, .replace);
     defer db.allocator.free(sql);
 
@@ -99,4 +107,24 @@ test "finality_state round-trips per (chain, tier) and is null when unset" {
     try std.testing.expectEqual(@as(u64, 110), (try getFinality(&database, 1, .safe)).?.number);
     // A different chain is independent.
     try std.testing.expect((try getFinality(&database, 2, .safe)) == null);
+}
+
+test "setFinality is monotonic: a lower head does not move a tier backward" {
+    const a = std.testing.allocator;
+    var database = try Database.init(a, ":memory:");
+    defer database.deinit();
+
+    const h1 = Hash{ .bytes = [_]u8{0x11} ** 32 };
+    const h2 = Hash{ .bytes = [_]u8{0x22} ** 32 };
+    try setFinality(&database, 1, .safe, 200, h1, 1700000000);
+    // A backward move (e.g. a provider blip) is ignored, hash included.
+    try setFinality(&database, 1, .safe, 150, h2, 1700000100);
+    const after_backward = (try getFinality(&database, 1, .safe)).?;
+    try std.testing.expectEqual(@as(u64, 200), after_backward.number);
+    try std.testing.expectEqual(h1.bytes, after_backward.hash.bytes);
+    // Forward still advances, including an equal-height re-report (hash refresh).
+    try setFinality(&database, 1, .safe, 200, h2, 1700000200);
+    try std.testing.expectEqual(h2.bytes, (try getFinality(&database, 1, .safe)).?.hash.bytes);
+    try setFinality(&database, 1, .safe, 250, h1, 1700000300);
+    try std.testing.expectEqual(@as(u64, 250), (try getFinality(&database, 1, .safe)).?.number);
 }
