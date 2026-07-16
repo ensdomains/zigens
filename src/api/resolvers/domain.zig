@@ -822,14 +822,19 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
     else
         base_dir;
 
-    // Decode the cursor into a keyset anchor. A mismatched sort field (client changed
-    // orderBy) or an old non-keyset cursor is treated as "start from the beginning".
+    // Fingerprint the active filters + order direction; a cursor is a valid anchor only
+    // for a request that reproduces it (same sort field AND same filters).
+    const filter_hash = hashFilters(name_filters, base_dir);
+
+    // Decode the cursor into a keyset anchor. A changed sort field, a changed `where`
+    // filter set, or an old non-keyset cursor is treated as "start from the beginning" —
+    // which also drops the stale totalCount snapshot (its reuse is gated on the anchor).
     var anchor: ?db.KeysetAnchor = null;
     var anchor_decoded: ?pagination.CursorCodec.Keyset = null;
     defer if (anchor_decoded) |d| d.deinit(allocator);
     if (params.cursor) |c| {
         if (pagination.CursorCodec.decodeKeyset(allocator, c)) |ks| {
-            if (ks.field == sortFieldChar(sort_field)) {
+            if (ks.field == sortFieldChar(sort_field) and ks.filter_hash == filter_hash) {
                 anchor_decoded = ks;
                 anchor = .{ .sort_value = ks.sort_value, .namehash = ks.namehash };
             } else {
@@ -838,7 +843,24 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         } else |_| {}
     }
 
+    // Read the page rows and (for page 1) the fresh totalCount in ONE read-only snapshot,
+    // so totalCount can't disagree with the rows because a write landed between the two
+    // reads. Deeper pages reuse the cursor's totalCount snapshot and skip the count.
+    const need_fresh_count = wants_total_count and (anchor_decoded == null or anchor_decoded.?.total_count == null);
+    var snapshot_count: ?usize = null;
+    var snap_tx = try db.Tx.begin(database, .read_snapshot);
+    errdefer snap_tx.deinit();
     var result = try database.getFilteredNamesKeyset(name_filters, anchor, @intCast(fetch_limit), order_dir, sort_field);
+    if (need_fresh_count) {
+        snapshot_count = database.getFilteredNameCount(name_filters) catch |e| {
+            result.deinit(database.allocator);
+            return e;
+        };
+    }
+    snap_tx.commit() catch |e| {
+        result.deinit(database.allocator);
+        return e;
+    };
     defer result.deinit(database.allocator);
     const names = result.names;
     const sort_values = result.sort_values;
@@ -864,7 +886,7 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         if (anchor_decoded) |d| {
             if (d.total_count) |tc| break :blk tc;
         }
-        break :blk try database.getFilteredNameCount(name_filters);
+        break :blk snapshot_count orelse try database.getFilteredNameCount(name_filters);
     } else null;
 
     const edge_cursors = try allocator.alloc([]const u8, actual_items);
@@ -875,7 +897,7 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
     for (0..actual_items) |i| {
         const nh_hex = try names[i].namehash.toHex(allocator);
         defer allocator.free(nh_hex);
-        edge_cursors[i] = try pagination.CursorCodec.encodeKeyset(allocator, sortFieldChar(sort_field), total_count, sort_values[i], nh_hex);
+        edge_cursors[i] = try pagination.CursorCodec.encodeKeyset(allocator, sortFieldChar(sort_field), filter_hash, total_count, sort_values[i], nh_hex);
     }
 
     const has_next = if (params.direction == .forward) has_more else (params.cursor != null);
@@ -964,4 +986,30 @@ pub fn resolveDomain(ctx: parser.ExecutionContext, field: *const parser.Field) !
         .resolve = ctx.resolve,
     });
     return parser.FieldResult{ .json = name_json };
+}
+
+
+/// Fingerprint the active filter set + order direction for the keyset cursor. A cursor is
+/// only a valid anchor for a request that reproduces this fingerprint; reusing one against
+/// a changed `where`/orderDirection falls through to a fresh page (correct seek + a fresh
+/// totalCount). Hashed generically so every NameFilters field, present and future, is
+/// covered — a new filter can never silently escape the fingerprint.
+fn hashFilters(name_filters: db.NameFilters, base_dir: db.OrderDir) u64 {
+    var h = std.hash.Wyhash.init(0);
+    std.hash.autoHashStrat(&h, name_filters, .DeepRecursive);
+    std.hash.autoHash(&h, base_dir);
+    return h.final();
+}
+
+test "hashFilters distinguishes filter sets and order direction" {
+    const empty = db.NameFilters{};
+    const by_owner = db.NameFilters{ .owner = @import("../../types/address.zig").Address.zero };
+    const by_name = db.NameFilters{ .name = "alice.eth" };
+    // Identical inputs hash identically; different filters/direction differ.
+    try std.testing.expectEqual(hashFilters(empty, .desc), hashFilters(db.NameFilters{}, .desc));
+    try std.testing.expect(hashFilters(empty, .desc) != hashFilters(by_owner, .desc));
+    try std.testing.expect(hashFilters(empty, .desc) != hashFilters(by_name, .desc));
+    try std.testing.expect(hashFilters(by_owner, .desc) != hashFilters(by_name, .desc));
+    try std.testing.expect(hashFilters(empty, .desc) != hashFilters(empty, .asc));
+    try std.testing.expect(hashFilters(db.NameFilters{ .name = "a.eth" }, .desc) != hashFilters(db.NameFilters{ .name = "b.eth" }, .desc));
 }

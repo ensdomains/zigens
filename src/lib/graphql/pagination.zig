@@ -180,6 +180,10 @@ pub const CursorCodec = struct {
     /// the decode buffer; see decodeKeyset.
     pub const Keyset = struct {
         field: u8,
+        /// Fingerprint of the active filter set + order direction. A cursor is only a
+        /// valid anchor for a request whose filters produce the same fingerprint;
+        /// reusing it against a changed `where` must fall through to a fresh page.
+        filter_hash: u64,
         total_count: ?usize,
         sort_value: []const u8,
         namehash: []const u8,
@@ -189,15 +193,18 @@ pub const CursorCodec = struct {
         }
     };
 
-    /// Encode a keyset cursor: base64 of "ks\n<field>\n<count>\n<namehash>\n<sort_value>".
-    /// `count` is the totalCount snapshot (empty when unknown); `namehash` is 0x-hex
-    /// (no '\n'); `sort_value` is placed last so it may contain any bytes. `field` is
-    /// an opaque sort-field discriminator the caller assigns.
-    pub fn encodeKeyset(allocator: std.mem.Allocator, field: u8, total_count: ?usize, sort_value: []const u8, namehash: []const u8) !Cursor {
+    /// Encode a keyset cursor: base64 of
+    /// "kf\n<field>\n<filter_hash>\n<count>\n<namehash>\n<sort_value>". `filter_hash` is a
+    /// hex fingerprint of the active filter set + order direction (reject on mismatch);
+    /// `count` is the totalCount snapshot (empty when unknown); `namehash` is 0x-hex (no
+    /// '\n'); `sort_value` is placed last so it may contain any bytes. `field` is an opaque
+    /// sort-field discriminator the caller assigns. The "kf" magic distinguishes this from
+    /// the older filterless "ks" format, which now decodes as InvalidCursor (→ fresh page).
+    pub fn encodeKeyset(allocator: std.mem.Allocator, field: u8, filter_hash: u64, total_count: ?usize, sort_value: []const u8, namehash: []const u8) !Cursor {
         const plain = if (total_count) |tc|
-            try std.fmt.allocPrint(allocator, "ks\n{c}\n{d}\n{s}\n{s}", .{ field, tc, namehash, sort_value })
+            try std.fmt.allocPrint(allocator, "kf\n{c}\n{x}\n{d}\n{s}\n{s}", .{ field, filter_hash, tc, namehash, sort_value })
         else
-            try std.fmt.allocPrint(allocator, "ks\n{c}\n\n{s}\n{s}", .{ field, namehash, sort_value });
+            try std.fmt.allocPrint(allocator, "kf\n{c}\n{x}\n\n{s}\n{s}", .{ field, filter_hash, namehash, sort_value });
         defer allocator.free(plain);
         const encoder = base64.standard.Encoder;
         const encoded = try allocator.alloc(u8, encoder.calcSize(plain.len));
@@ -214,17 +221,21 @@ pub const CursorCodec = struct {
         errdefer allocator.free(buf);
         decoder.decode(buf, cursor) catch return error.InvalidCursor;
 
-        if (!std.mem.startsWith(u8, buf, "ks\n") or buf.len < 6) return error.InvalidCursor;
+        if (!std.mem.startsWith(u8, buf, "kf\n") or buf.len < 6) return error.InvalidCursor;
         const field = buf[3];
         if (buf[4] != '\n') return error.InvalidCursor;
-        // rest = "<count>\n<namehash>\n<sort_value>"
+        // rest = "<filter_hash>\n<count>\n<namehash>\n<sort_value>"
         const rest = buf[5..];
-        const nl1 = std.mem.indexOfScalar(u8, rest, '\n') orelse return error.InvalidCursor;
-        const count_str = rest[0..nl1];
-        const rest2 = rest[nl1 + 1 ..];
+        const nlf = std.mem.indexOfScalar(u8, rest, '\n') orelse return error.InvalidCursor;
+        const filter_hash = std.fmt.parseInt(u64, rest[0..nlf], 16) catch return error.InvalidCursor;
+        const rest_c = rest[nlf + 1 ..];
+        const nl1 = std.mem.indexOfScalar(u8, rest_c, '\n') orelse return error.InvalidCursor;
+        const count_str = rest_c[0..nl1];
+        const rest2 = rest_c[nl1 + 1 ..];
         const nl2 = std.mem.indexOfScalar(u8, rest2, '\n') orelse return error.InvalidCursor;
         return .{
             .field = field,
+            .filter_hash = filter_hash,
             .total_count = if (count_str.len > 0) (std.fmt.parseInt(usize, count_str, 10) catch null) else null,
             .namehash = rest2[0..nl2],
             .sort_value = rest2[nl2 + 1 ..],
@@ -361,6 +372,38 @@ pub fn buildConnectionString(
 // ============================================================================
 // TESTS
 // ============================================================================
+
+test "CursorCodec keyset round-trips field/filter_hash/count/namehash/sort_value" {
+    const a = std.testing.allocator;
+    const cur = try CursorCodec.encodeKeyset(a, 'n', 0xDEADBEEFCAFE, 42, "value\nwith\nnewlines", "0xabcd");
+    defer a.free(cur);
+    const ks = try CursorCodec.decodeKeyset(a, cur);
+    defer ks.deinit(a);
+    try std.testing.expectEqual(@as(u8, 'n'), ks.field);
+    try std.testing.expectEqual(@as(u64, 0xDEADBEEFCAFE), ks.filter_hash);
+    try std.testing.expectEqual(@as(?usize, 42), ks.total_count);
+    try std.testing.expectEqualStrings("0xabcd", ks.namehash);
+    try std.testing.expectEqualStrings("value\nwith\nnewlines", ks.sort_value); // sort_value may hold '\n'
+
+    // A null totalCount round-trips as null.
+    const cur2 = try CursorCodec.encodeKeyset(a, 'e', 7, null, "sv", "0x00");
+    defer a.free(cur2);
+    const ks2 = try CursorCodec.decodeKeyset(a, cur2);
+    defer ks2.deinit(a);
+    try std.testing.expectEqual(@as(?usize, null), ks2.total_count);
+    try std.testing.expectEqual(@as(u64, 7), ks2.filter_hash);
+
+    // The legacy filterless "ks\n" format is rejected (→ caller starts fresh).
+    const legacy = try Cursor_fromPlain(a, "ks\nn\n\n0xabcd\nsv");
+    defer a.free(legacy);
+    try std.testing.expectError(error.InvalidCursor, CursorCodec.decodeKeyset(a, legacy));
+}
+
+fn Cursor_fromPlain(allocator: std.mem.Allocator, plain: []const u8) !Cursor {
+    const encoder = base64.standard.Encoder;
+    const out = try allocator.alloc(u8, encoder.calcSize(plain.len));
+    return encoder.encode(out, plain);
+}
 
 test "CursorCodec.encodeInt and decodeInt" {
     const testing = std.testing;

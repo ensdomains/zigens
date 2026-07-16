@@ -59,10 +59,13 @@ pub const Capabilities = struct {
 /// Connection access mode for the Phase-4 `Pool`; defined here as part of the SPI.
 pub const AccessMode = enum { writer, reader };
 
-/// Transaction mode. `immediate` takes a write lock up front (SQLite
-/// `BEGIN IMMEDIATE`); `deferred` is a plain `BEGIN`. On Postgres both map to a
-/// plain `BEGIN` (it locks lazily and isolation handles serialization).
-pub const TxMode = enum { deferred, immediate };
+/// Transaction mode. `immediate` takes a write lock up front (SQLite `BEGIN IMMEDIATE`);
+/// `deferred` is a plain `BEGIN`. `read_snapshot` is a read-only transaction giving a
+/// STABLE snapshot across statements — SQLite plain `BEGIN` (WAL snapshots on first read),
+/// Postgres `REPEATABLE READ, READ ONLY` — so several reads in one request observe one
+/// consistent state. On Postgres `deferred`/`immediate` both map to a plain `BEGIN` (it
+/// locks lazily and isolation handles serialization).
+pub const TxMode = enum { deferred, immediate, read_snapshot };
 
 /// Upsert conflict behaviour: `.replace` overwrites the conflicting row,
 /// `.ignore` keeps it. (SQLite `INSERT OR REPLACE`/`OR IGNORE`; Postgres

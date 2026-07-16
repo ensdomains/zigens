@@ -306,8 +306,14 @@ fn execRaw(ctx: *anyopaque, sql: []const u8) anyerror!void {
 }
 
 fn begin(ctx: *anyopaque, mode: backend.TxMode) anyerror!void {
-    _ = mode; // PG locks lazily; isolation handles serialization (no BEGIN IMMEDIATE)
-    try asConn(ctx).conn.begin();
+    const conn = asConn(ctx).conn;
+    try conn.begin(); // plain BEGIN; PG locks lazily (no BEGIN IMMEDIATE)
+    if (mode == .read_snapshot) {
+        // First statement in the tx: upgrade to a stable read-only snapshot. Best-effort —
+        // if a pooler rejects it the read simply runs at the default isolation, never worse.
+        _ = conn.exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY", .{}) catch |err|
+            std.log.warn("postgres: could not set read-snapshot isolation: {}", .{err});
+    }
 }
 
 fn commit(ctx: *anyopaque) anyerror!void {

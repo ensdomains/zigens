@@ -227,6 +227,18 @@ fn sortColumn(sort_field: events.EventSortField) []const u8 {
     };
 }
 
+/// Sort-column expression shared by getRegistrations and countRegistrationsBeforeCursor so
+/// the fetch order and the cursor-position count agree exactly. Nullable columns are
+/// COALESCE'd so NULLs order deterministically and the count comparison stays NULL-free.
+fn sortColExprReg(sort_field: events.EventSortField) []const u8 {
+    return switch (sort_field) {
+        .block_number => "block_number",
+        .timestamp => "COALESCE(registered_at, 0)",
+        .name => "COALESCE(label, '')",
+        .expiry => "COALESCE(expiry, 0)",
+    };
+}
+
 /// Append WHERE conditions for a registrations-table query. `allocated_clauses`
 /// owns dynamically-built IN clauses so the caller can free them.
 fn appendFilterConditions(
@@ -436,8 +448,9 @@ pub fn getRegistrations(database: *Database, filter: RegistrationFilterOptions) 
         }
     }
 
+    // Total order: sort expression then the unique `id`, shared with the cursor count.
     try sql_buf.appendSlice(database.allocator, " ORDER BY ");
-    try sql_buf.appendSlice(database.allocator, sortColumn(filter.sort_field));
+    try sql_buf.appendSlice(database.allocator, sortColExprReg(filter.sort_field));
     try sql_buf.appendSlice(database.allocator, if (filter.order_dir == .desc) " DESC" else " ASC");
     try sql_buf.appendSlice(database.allocator, ", id ");
     try sql_buf.appendSlice(database.allocator, if (filter.order_dir == .desc) "DESC" else "ASC");
@@ -505,25 +518,31 @@ pub fn countRegistrationsBeforeCursor(
     order_dir: events.OrderDir,
     filter: RegistrationFilterOptions,
 ) !u32 {
-    // Resolve the cursor row's block_number first.
-    var lookup = try db_module.Query.init(
-        database,
-        "SELECT block_number FROM registrations WHERE transaction_hash = ? AND log_index = ? LIMIT 1",
-    );
+    // Count in the SAME total order the fetch uses: (sort_expr, id). A cursor identifies a
+    // unique row; count rows strictly before it so OFFSET = count + 1 lands on the next page
+    // with no dropped/duplicated rows.
+    const sort_expr = sortColExprReg(filter.sort_field);
+    const is_text_sort = filter.sort_field == .name;
+
+    // Resolve the cursor row's (sort_value, id).
+    const lookup_sql = try std.fmt.allocPrint(database.allocator, "SELECT {s}, id FROM registrations WHERE transaction_hash = ? AND log_index = ? LIMIT 1", .{sort_expr});
+    defer database.allocator.free(lookup_sql);
+    var lookup = try db_module.Query.init(database, lookup_sql);
     defer lookup.deinit();
     try lookup.bindText(tx_hash_hex);
     try lookup.bindInt(@intCast(log_index));
     if (!try lookup.step()) return 0;
-    const cursor_block = lookup.getInt64(0);
+    const cursor_sort_int: i64 = if (is_text_sort) 0 else lookup.getInt64(0);
+    const cursor_sort_text: []const u8 = try database.allocator.dupe(u8, if (is_text_sort) (lookup.getTextSlice(0) orelse "") else "");
+    defer database.allocator.free(cursor_sort_text);
+    const cursor_id = lookup.getInt64(1);
 
+    const op: []const u8 = if (order_dir == .desc) ">" else "<";
     var sql_buf: std.ArrayList(u8) = .empty;
     defer sql_buf.deinit(database.allocator);
-
-    const base = if (order_dir == .desc)
-        "SELECT COUNT(*) FROM registrations WHERE (block_number > ? OR (block_number = ? AND log_index > ?))"
-    else
-        "SELECT COUNT(*) FROM registrations WHERE (block_number < ? OR (block_number = ? AND log_index < ?))";
-    try sql_buf.appendSlice(database.allocator, base);
+    const pred = try std.fmt.allocPrint(database.allocator, "SELECT COUNT(*) FROM registrations WHERE ({s} {s} ? OR ({s} = ? AND id {s} ?))", .{ sort_expr, op, sort_expr, op });
+    defer database.allocator.free(pred);
+    try sql_buf.appendSlice(database.allocator, pred);
 
     var conditions: std.ArrayList([]const u8) = .empty;
     defer conditions.deinit(database.allocator);
@@ -540,9 +559,14 @@ pub fn countRegistrationsBeforeCursor(
 
     var q = try db_module.Query.initCached(database, sql_buf.items);
     defer q.deinit();
-    try q.bindInt64(cursor_block);
-    try q.bindInt64(cursor_block);
-    try q.bindInt(@intCast(log_index));
+    if (is_text_sort) {
+        try q.bindText(cursor_sort_text);
+        try q.bindText(cursor_sort_text);
+    } else {
+        try q.bindInt64(cursor_sort_int);
+        try q.bindInt64(cursor_sort_int);
+    }
+    try q.bindInt64(cursor_id);
     try bindFilters(&q, filter);
     if (!try q.step()) return 0;
     return @intCast(q.getInt64(0));
@@ -555,4 +579,63 @@ pub fn countRegistrationsBeforeCursor(
 test "getRegistrations reads from registrations table" {
     // Smoke: module compiles. Real coverage lives in tests/storage tests with
     // a populated DB fixture (out of scope here).
+}
+
+test "registration connection pagination reproduces the full ordered result (all sort fields)" {
+    const allocator = std.testing.allocator;
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const Row = struct { blk: u64, log: u32, ts: i64, label: []const u8 };
+    const rows = [_]Row{
+        .{ .blk = 100, .log = 0, .ts = 1000, .label = "bbb" },
+        .{ .blk = 100, .log = 1, .ts = 1000, .label = "aaa" },
+        .{ .blk = 101, .log = 0, .ts = 1000, .label = "aaa" },
+        .{ .blk = 101, .log = 1, .ts = 1001, .label = "ccc" },
+        .{ .blk = 102, .log = 0, .ts = 1001, .label = "bbb" },
+        .{ .blk = 102, .log = 1, .ts = 1002, .label = "aaa" },
+        .{ .blk = 103, .log = 0, .ts = 1002, .label = "ddd" },
+    };
+    for (rows, 0..) |r, i| {
+        var tx = [_]u8{0} ** 32;
+        std.mem.writeInt(u32, tx[0..4], @intCast(i + 1), .big);
+        try insertRegistration(&database, .v2, Hash.zero, r.label, "eth", Address.zero, r.ts, null, r.blk, Hash{ .bytes = tx }, r.log, .name_registered);
+    }
+
+    const sorts = [_]events.EventSortField{ .block_number, .timestamp, .name };
+    const dirs = [_]events.OrderDir{ .desc, .asc };
+    for (sorts) |sf| {
+        for (dirs) |dir| {
+            const full = try getRegistrations(&database, .{ .sort_field = sf, .order_dir = dir, .limit = 1000 });
+            defer {
+                for (full) |*e| e.deinit(database.allocator);
+                database.allocator.free(full);
+            }
+
+            var collected: std.ArrayList(struct { blk: u64, log: u32 }) = .empty;
+            defer collected.deinit(allocator);
+            var skip: u32 = 0;
+            while (true) {
+                const page = try getRegistrations(&database, .{ .sort_field = sf, .order_dir = dir, .limit = 3, .skip = skip });
+                defer {
+                    for (page) |*e| e.deinit(database.allocator);
+                    database.allocator.free(page);
+                }
+                if (page.len == 0) break;
+                for (page) |e| try collected.append(allocator, .{ .blk = e.block_number, .log = e.log_index });
+                const last = page[page.len - 1];
+                const tx_hex = try last.tx_hash.toHex(allocator);
+                defer allocator.free(tx_hex);
+                const before = try countRegistrationsBeforeCursor(&database, tx_hex, last.log_index, dir, .{ .sort_field = sf, .order_dir = dir });
+                skip = before + 1;
+                if (page.len < 3) break;
+            }
+
+            try std.testing.expectEqual(full.len, collected.items.len);
+            for (full, collected.items) |f, c| {
+                try std.testing.expectEqual(f.block_number, c.blk);
+                try std.testing.expectEqual(f.log_index, c.log);
+            }
+        }
+    }
 }
