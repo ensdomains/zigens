@@ -724,8 +724,12 @@ pub const Client = struct {
             .number => |n| try params_arr.append(.{ .string = try std.fmt.allocPrint(a, "0x{x}", .{n}) }),
             .hash => |h| {
                 // EIP-1898 block-hash reference so the read is pinned to an exact block.
+                // requireCanonical rejects a read against a block that has been reorged
+                // out, so a result cached during the reorg window can't be a wrong-branch
+                // answer; a provider that errors on the field degrades to the indexed value.
                 var blk_obj: std.json.ObjectMap = .empty;
                 try blk_obj.put(a, "blockHash", .{ .string = try h.toHex(a) });
+                try blk_obj.put(a, "requireCanonical", .{ .bool = true });
                 try params_arr.append(.{ .object = blk_obj });
             },
         }
@@ -758,8 +762,11 @@ pub const Client = struct {
             .latest => try params_arr.append(.{ .string = "latest" }),
             .number => |n| try params_arr.append(.{ .string = try std.fmt.allocPrint(a, "0x{x}", .{n}) }),
             .hash => |h| {
+                // EIP-1898 pinned read; requireCanonical rejects a reorged-out block so a
+                // revert/answer can't be decoded from a wrong-branch state.
                 var blk_obj: std.json.ObjectMap = .empty;
                 try blk_obj.put(a, "blockHash", .{ .string = try h.toHex(a) });
+                try blk_obj.put(a, "requireCanonical", .{ .bool = true });
                 try params_arr.append(.{ .object = blk_obj });
             },
         }

@@ -11,7 +11,8 @@
 //! Scope: FALLBACK only. Indexed answers always win; this fires on an indexed MISS.
 
 const std = @import("std");
-const Hash = @import("../types/hash.zig").Hash;
+const hash_mod = @import("../types/hash.zig");
+const Hash = hash_mod.Hash;
 const Address = @import("../types/address.zig").Address;
 const dns = @import("../utils/dns.zig");
 const cache = @import("cache.zig");
@@ -295,8 +296,26 @@ pub const LiveContext = struct {
 
     /// ENSIP-3 forward-verify (Task 05) that `claimed_name` resolves to `address`, pinned
     /// to this context's block. Never throws on a resolution failure (→ `.unverified`).
+    ///
+    /// When a Universal Resolver is configured, the forward `addr(node)` read is routed
+    /// through it so inherited, wildcard (ENSIP-10) and offchain (CCIP) resolvers verify
+    /// correctly; without one, it falls back to the direct registry+resolver check. Both
+    /// paths reject a non-normalized claimed name as `.invalid_name`.
     pub fn verifyPrimary(self: *LiveContext, allocator: std.mem.Allocator, address: Address, claimed_name: []const u8) !primary_mod.Verdict {
-        return primary_mod.verify(self.resolver, allocator, self.registry, address, claimed_name, self.block_num, self.block_hash, self.now);
+        if (self.ur_address.isZero()) {
+            return primary_mod.verify(self.resolver, allocator, self.registry, address, claimed_name, self.block_num, self.block_hash, self.now);
+        }
+
+        const norm = (try primary_mod.normalizedClaimOwned(allocator, claimed_name)) orelse return .invalid_name;
+        defer allocator.free(norm);
+        const node = try hash_mod.namehash(allocator, norm);
+
+        // resolve() returns the forward address as a hex string, or null for no record /
+        // any failure — both of which are "no usable evidence" here.
+        const forward_hex = (resolve(self.resolver, allocator, self.ur_address, norm, node, .addr, self.block_num, self.block_hash, self.now, self.ccip) catch null) orelse return .unverified;
+        defer allocator.free(forward_hex);
+        const forward = Address.fromHex(forward_hex) catch return .unverified;
+        return if (forward.eql(address)) .verified else .mismatch;
     }
 
     /// Live-resolve `record` for `name`/`node`, returning the value string (owned by
