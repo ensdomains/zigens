@@ -30,6 +30,14 @@ const WriteBuffer = @import("write_buffer.zig").WriteBuffer;
 const Rainbow = @import("../rainbow/rainbow.zig").Rainbow;
 const Indexer = @import("indexer.zig").Indexer;
 
+/// Near the tip, block lineage is stored per-block (not just at batch boundaries) so a
+/// reorg's fork point is located exactly. A batch larger than this is stored at the
+/// boundary only, bounding per-batch header RPC during catch-up (those far-from-tip
+/// blocks finalize long before the tip reaches them).
+const PER_BLOCK_LINEAGE_MAX: u64 = 128;
+
+const BlockLineage = struct { number: u64, hash: Hash, parent_hash: Hash };
+
 pub fn start(self: *Indexer) !void {
     std.log.info("Indexer starting...", .{});
 
@@ -239,16 +247,39 @@ pub fn verifyStoredBlockHash(self: *Indexer, protocol: models.Protocol, client: 
     return std.mem.eql(u8, &stored.bytes, &actual.hash.bytes);
 }
 
-/// Walk back from `from_block` until a block whose stored hash matches the protocol is found,
-/// then roll the database back to that block. Returns the block number rolled back to.
+/// Walk back from `from_block` to the most recent stored checkpoint whose hash still
+/// matches the canonical chain, then roll the database back to it. Returns the block
+/// number rolled back to, or `error.ReorgTooDeep` when no matching checkpoint exists
+/// within the retained window.
+///
+/// Two properties keep this fail-closed: (1) a height with no stored hash is skipped
+/// rather than treated as a safe stopping point (hashes are dense near the tip, sparse
+/// during catch-up), so stopping early would leave orphaned-branch state below it; (2) an RPC
+/// error while confirming a checkpoint is propagated, so the round aborts and retries
+/// rather than committing a rollback to an unverified height.
 pub fn rollbackToLastValidBlock(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64) !u64 {
+    // Bound the walk to the hash-retention window; beyond it there are no stored hashes to
+    // validate against, so a deeper rollback would be a blind guess (rollbackToBlock guards
+    // the same depth). Matches cleanupOldBlockHashes / REORG_ARM_WINDOW.
+    const RETENTION_BLOCKS: u64 = 1000;
+    const floor = @max(self.config.start_block, from_block -| RETENTION_BLOCKS);
+
     var rollback_to = from_block;
-    while (rollback_to > self.config.start_block) : (rollback_to -= 1) {
+    var matched = false;
+    while (rollback_to > floor) : (rollback_to -= 1) {
         const stored = try self.database.getBlockHash(protocol, rollback_to);
-        if (stored == null) break; // past stored history — treat as safe
-        const actual = client.getBlockByNumber(rollback_to, false) catch break;
-        if (std.mem.eql(u8, &stored.?.bytes, &actual.hash.bytes)) break;
+        if (stored == null) continue; // not a stored checkpoint — keep descending
+        const actual = try client.getBlockByNumber(rollback_to, false); // propagate RPC errors
+        if (std.mem.eql(u8, &stored.?.bytes, &actual.hash.bytes)) {
+            matched = true;
+            break;
+        }
     }
+    if (!matched) {
+        std.log.err("Reorg on {s} from block {d} has no matching checkpoint within {d}-block retention; refusing blind rollback", .{ protocol.toString(), from_block, RETENTION_BLOCKS });
+        return error.ReorgTooDeep;
+    }
+
     std.log.warn("Rolling back {s} to block {d}", .{ protocol.toString(), rollback_to });
     try self.database.rollbackToBlock(protocol, rollback_to);
     // rollbackToBlock cleared the reorg_cursor row; drop the in-memory mirror so the
@@ -379,13 +410,40 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
         const progress = (@as(f64, @floatFromInt(blocks_indexed)) / @as(f64, @floatFromInt(total_blocks))) * 100.0;
         std.log.info("Progress: {d:.1}% ({d}/{d} blocks) - Batch {d}-{d} indexed", .{ progress, blocks_indexed, total_blocks, from_block, to_block });
 
-        // Store block hashes for reorg detection and update sync state ATOMICALLY
+        // --- Block-hash lineage (reorg detection) ---
+        // Near the tip, store per-block (hash, parent_hash) so a reorg's fork point is
+        // located exactly and the parent chain is reliable; far from the tip a single
+        // boundary hash suffices. Bounded: only a small armed batch is stored per-block.
+        const store_per_block = self.reorg_arm and (to_block - from_block + 1) <= PER_BLOCK_LINEAGE_MAX;
+
+        // Gather headers OUTSIDE the write transaction so RPC never holds the DB lock.
+        var lineage: std.ArrayList(BlockLineage) = .empty;
+        defer lineage.deinit(self.allocator);
+        if (store_per_block) {
+            var b = from_block;
+            while (b <= to_block) : (b += 1) {
+                // For to_block, prefer the hash observed while indexing its logs: it is
+                // consistent with the committed events, so a reorg landing after indexing
+                // can't mask itself from the next poll's reorg check (which examines exactly
+                // this height). Intermediate blocks are re-fetched for their real header.
+                if (b == to_block and self.last_seen_block_hash != null and self.last_seen_block_number == to_block) {
+                    try lineage.append(self.allocator, .{ .number = b, .hash = self.last_seen_block_hash.?, .parent_hash = Hash.zero });
+                } else {
+                    self.rate_limiter.acquire();
+                    const info = try client.getBlockByNumber(b, false);
+                    try lineage.append(self.allocator, .{ .number = b, .hash = info.hash, .parent_hash = info.parent_hash });
+                }
+            }
+        }
+
+        // Store block hashes for reorg detection and update sync state ATOMICALLY.
         try self.database.beginTransaction();
         errdefer self.database.rollbackTransaction();
 
-        // Use block hash from processed logs if available (avoids extra RPC call)
-        // Fall back to getBlockByNumber only when no logs were processed in this range
-        if (self.last_seen_block_hash != null and self.last_seen_block_number == to_block) {
+        if (store_per_block) {
+            for (lineage.items) |bl| try self.database.storeBlockHash(protocol, bl.number, bl.hash, bl.parent_hash);
+        } else if (self.last_seen_block_hash != null and self.last_seen_block_number == to_block) {
+            // Bulk sync: reuse the log hash to avoid an extra RPC (parent_hash unused off-tip).
             try self.database.storeBlockHash(protocol, to_block, self.last_seen_block_hash.?, Hash.zero);
         } else {
             const block_info = try client.getBlockByNumber(to_block, false);
