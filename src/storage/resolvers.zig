@@ -41,13 +41,7 @@ pub fn storeResolverAddress(
     timestamp: i64,
 ) !void {
     try reorg_undo.captureUpsert(db, "resolver_addresses", .{ protocol, resolver, namehash, coin_type });
-    const sql = try db.upsertExprSql(
-        db.allocator,
-        "resolver_addresses",
-        &.{ "namehash", "resolver", "coin_type", "address", "protocol", "block_number", "transaction_hash", "timestamp", "context" },
-        &.{ "?", "?", "?", "?", "?", "?", "?", "?", "NULL" },
-        .replace,
-    );
+    const sql = try db.upsertSql(db.allocator, "resolver_addresses", &.{ "namehash", "resolver", "coin_type", "address", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
     defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);

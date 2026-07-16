@@ -279,7 +279,6 @@ CREATE TABLE IF NOT EXISTS resolver_addresses (
   resolver TEXT NOT NULL,
   coin_type BIGINT NOT NULL,
   address TEXT NOT NULL,
-  context TEXT,
   protocol TEXT NOT NULL,
   block_number BIGINT NOT NULL,
   transaction_hash TEXT NOT NULL,
@@ -289,14 +288,12 @@ CREATE TABLE IF NOT EXISTS resolver_addresses (
 
 CREATE INDEX IF NOT EXISTS idx_resolver_addresses_namehash ON resolver_addresses(namehash);
 CREATE INDEX IF NOT EXISTS idx_resolver_addresses_resolver ON resolver_addresses(resolver);
-CREATE INDEX IF NOT EXISTS idx_resolver_addresses_context ON resolver_addresses(protocol, namehash, context);
 
 CREATE TABLE IF NOT EXISTS resolver_contenthashes (
   id BIGSERIAL PRIMARY KEY,
   namehash TEXT NOT NULL,
   resolver TEXT NOT NULL,
   contenthash TEXT NOT NULL,
-  context TEXT,
   protocol TEXT NOT NULL,
   block_number BIGINT NOT NULL,
   transaction_hash TEXT NOT NULL,
@@ -306,7 +303,6 @@ CREATE TABLE IF NOT EXISTS resolver_contenthashes (
 
 CREATE INDEX IF NOT EXISTS idx_resolver_contenthashes_namehash ON resolver_contenthashes(namehash);
 CREATE INDEX IF NOT EXISTS idx_resolver_contenthashes_resolver ON resolver_contenthashes(resolver);
-CREATE INDEX IF NOT EXISTS idx_resolver_contenthashes_context ON resolver_contenthashes(protocol, namehash, context);
 
 CREATE TABLE IF NOT EXISTS resolver_texts (
   id BIGSERIAL PRIMARY KEY,
@@ -314,7 +310,6 @@ CREATE TABLE IF NOT EXISTS resolver_texts (
   resolver TEXT NOT NULL,
   key TEXT NOT NULL,
   value TEXT NOT NULL,
-  context TEXT,
   protocol TEXT NOT NULL,
   block_number BIGINT NOT NULL,
   transaction_hash TEXT NOT NULL,
@@ -325,7 +320,6 @@ CREATE TABLE IF NOT EXISTS resolver_texts (
 CREATE INDEX IF NOT EXISTS idx_resolver_texts_namehash ON resolver_texts(namehash);
 CREATE INDEX IF NOT EXISTS idx_resolver_texts_resolver ON resolver_texts(resolver);
 CREATE INDEX IF NOT EXISTS idx_resolver_texts_key ON resolver_texts(key);
-CREATE INDEX IF NOT EXISTS idx_resolver_texts_context ON resolver_texts(protocol, namehash, context);
 
 
 -- ============================================================================
