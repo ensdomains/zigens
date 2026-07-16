@@ -390,6 +390,9 @@ type Domain {
   """Whether the name passes ENSIP-15 normalization (computed at query time)"""
   isNormalized: Boolean!
 
+  """Finality tier of this domain's CURRENT state — how settled it is against chain finality. FINALIZED = the last change is at/below the finalized head (will not reorg); SAFE = at/below the safe head; HEAD = in the unsafe zone (may still reorg). Null when finality tracking is disabled (FINALITY_ENABLED off), so a client can distinguish 'unknown' from 'unsafe'."""
+  finality: DomainFinality
+
   """Events associated with this domain"""
   events(first: Int = 100, where: EventFilter): [Event!]!
 
@@ -431,7 +434,7 @@ type Account {
   """Reverse-resolved primary name for this address (V1 ReverseRegistrar + NameChanged path). Null if not claimed."""
   primaryName: String
 
-  """ENSIP-3 forward verification of `primaryName` (Task 05). Additive — does NOT alter `primaryName`. VERIFIED = the name's resolver.addr(node) forward-resolves back to this address; MISMATCH = it resolves to a different address; UNVERIFIED = no forward record / the on-chain read reverted / not checked. Null unless PRIMARY_VERIFY_ENABLED, and computed only for single-entity lookups (never per-row in a list)."""
+  """ENSIP-3 forward verification of `primaryName` (Task 05). Additive — does NOT alter `primaryName`. VERIFIED = the name's forward resolution (via the Universal Resolver when configured) points back to this address; MISMATCH = it resolves to a different address; INVALID_NAME = the claimed name is not ENSIP-15 normalized; NOT_FOUND = no resolver/record; UNVERIFIED = the on-chain read reverted / errored / not checked. Null unless PRIMARY_VERIFY_ENABLED, and computed only for single-entity lookups (never per-row in a list)."""
   primaryNameVerification: PrimaryNameVerification
 
   """V1 NameWrapper wrapped-domain records owned by this account."""
@@ -1336,12 +1339,26 @@ enum OrderDirection {
 }
 
 """ENSIP-3 forward-verification verdict for an account's `primaryName` (Task 05)."""
+"""How settled a domain's current state is against chain finality (finality-tiered reads)."""
+enum DomainFinality {
+  """The last change is at/below the finalized head; it will not reorg."""
+  FINALIZED
+  """The last change is at/below the safe head but above finalized."""
+  SAFE
+  """The last change is in the unsafe zone above the safe head; it may still reorg."""
+  HEAD
+}
+
 enum PrimaryNameVerification {
   """The name's resolver.addr(node) resolves back to this address."""
   VERIFIED
   """The name resolves forward to a DIFFERENT address."""
   MISMATCH
-  """No usable forward evidence (no resolver/record, revert, RPC error, or not checked)."""
+  """The claimed name is not ENSIP-15 normalized (e.g. confusable/spoofed); never verified."""
+  INVALID_NAME
+  """No forward evidence exists: no resolver, or an empty/zero address record."""
+  NOT_FOUND
+  """The on-chain read could not be completed (revert or RPC error)."""
   UNVERIFIED
 }
 
