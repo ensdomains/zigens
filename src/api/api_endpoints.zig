@@ -18,7 +18,6 @@ const json_utils = @import("../utils/json.zig");
 const url_utils = @import("../utils/url.zig");
 const validation = @import("../utils/validation.zig");
 const resolve_client = @import("../resolve/client.zig");
-const resolve_primary = @import("../resolve/primary.zig");
 const universal = @import("../resolve/universal.zig");
 const ccip_transport = @import("../resolve/ccip_transport.zig");
 const http_util = @import("http_util.zig");
@@ -74,12 +73,25 @@ pub fn handleVerifyPrimary(self: *Server, conn: http_util.Conn, path: []const u8
         return try self.sendJsonResponse(conn, 200, "{\"status\":\"unverified\",\"reason\":\"no_head_hash\"}");
 
     var resolver = resolve_client.Resolver.init(rs.rpc_client, database, rs.chain_id, rs.ttl_s);
-    const verdict = try resolve_primary.verify(&resolver, self.allocator, rs.registry, addr, name, head, head_hash, zsys.timestamp());
+    // Route through the Universal Resolver (like the GraphQL path) so inherited/wildcard
+    // primary names verify; falls back to the direct check when no UR is configured.
+    var lc = universal.LiveContext{
+        .resolver = &resolver,
+        .ur_address = rs.universal_resolver,
+        .block_num = head,
+        .block_hash = head_hash,
+        .now = zsys.timestamp(),
+        .registry = rs.registry,
+        .primary_verify_enabled = rs.primary_verify_enabled,
+    };
+    const verdict = try lc.verifyPrimary(self.allocator, addr, name);
 
     const outcome: @TypeOf(self.graphql_handler.metrics).PrimaryOutcome = switch (verdict) {
         .verified => .verified,
         .mismatch => .mismatch,
-        .unverified => .unverified,
+        // invalid_name / not_found roll into the "unverified" counter bucket; the finer
+        // verdict is surfaced verbatim in the response body below.
+        .invalid_name, .not_found, .unverified => .unverified,
     };
     self.graphql_handler.metrics.recordPrimaryVerification(outcome);
 
@@ -250,11 +262,39 @@ pub fn handleEventsQuery(self: *Server, conn: http_util.Conn) !void {
     try self.sendJsonResponse(conn, 200, response_buf.items);
 }
 
+/// Liveness: the process is up and the HTTP server accepts requests. Deliberately does
+/// NOT touch the DB — a transient DB blip must not fail liveness and trigger a restart.
+/// Use /ready for a DB-backed readiness signal.
 pub fn handleHealthCheck(self: *Server, conn: http_util.Conn) !void {
     const response =
         \\{"status":"ok","service":"ensv2-indexer"}
     ;
     try self.sendJsonResponse(conn, 200, response);
+}
+
+/// Readiness: can this node actually serve queries? Acquires a pool session and does a
+/// trivial read; returns 503 when the DB is unreachable so a load balancer routes traffic
+/// away. Staleness (indexed head behind the safe head) is surfaced as a `stale` flag, not
+/// a 503, so a node that is merely a little behind keeps serving instead of flapping out
+/// of rotation.
+pub fn handleReadiness(self: *Server, conn: http_util.Conn) !void {
+    const database = self.pool.acquire() catch
+        return self.sendJsonResponse(conn, 503, "{\"status\":\"not_ready\",\"reason\":\"db_unavailable\"}");
+    defer self.pool.release(database);
+
+    const v1 = (database.getSyncState(.v1) catch
+        return self.sendJsonResponse(conn, 503, "{\"status\":\"not_ready\",\"reason\":\"db_unreachable\"}")) orelse 0;
+    const v2 = (database.getSyncState(.v2) catch
+        return self.sendJsonResponse(conn, 503, "{\"status\":\"not_ready\",\"reason\":\"db_unreachable\"}")) orelse 0;
+    const head: u64 = if (v1 > v2) v1 else v2;
+
+    const safe = database.getFinality(database.chain_id, .safe) catch null;
+    const safe_num: u64 = if (safe) |sp| sp.number else 0;
+    const stale = safe != null and head < safe_num;
+
+    const body = try std.fmt.allocPrint(self.allocator, "{{\"status\":\"ready\",\"indexed_head\":{d},\"safe\":{d},\"stale\":{s}}}", .{ head, safe_num, if (stale) "true" else "false" });
+    defer self.allocator.free(body);
+    try self.sendJsonResponse(conn, 200, body);
 }
 
 pub fn handleMetrics(self: *Server, conn: http_util.Conn) !void {
