@@ -1120,6 +1120,14 @@ input EventFilter {
   """Filter by contract address"""
   contractAddress: String
 
+  """
+  Address involvement (ensv2 extension): matches events where the address is the
+  owner, sender (`from`), or recipient (`to`). Per-address history is
+  `events(where:{involved:"0x…"}, orderBy: blockNumber, orderDirection: asc)`;
+  per-name history is `events(where:{namehash:"0x…"})`.
+  """
+  involved: String
+
   """Filter by namehash"""
   namehash: String
 

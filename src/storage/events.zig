@@ -249,6 +249,8 @@ pub const EventFilterOptions = struct {
     timestamp_lte: ?i64 = null,
     data_json_owner: ?[]const u8 = null,
     data_json_owners: ?[]const []const u8 = null,
+    /// Address involvement (owner OR from OR to in event data) — per-address history.
+    involved: ?[]const u8 = null,
     // Expiry filters - uses json_extract(data, '$.expiration')
     expiry_gt: ?i64 = null,
     expiry_gte: ?i64 = null,
@@ -361,6 +363,19 @@ fn appendEventScalarConditions(
         try allocated_clauses.append(db.allocator, clause);
         try conditions.append(db.allocator, clause);
     }
+    if (filter.involved != null) {
+        // Address involvement across the three actor roles; each disjunct hits its own
+        // expression index (idx_events_{owner,to,from}_extracted).
+        const owner_lower = try jsonDataLower(db, "owner");
+        defer db.allocator.free(owner_lower);
+        const to_lower = try jsonDataLower(db, "to");
+        defer db.allocator.free(to_lower);
+        const from_lower = try jsonDataLower(db, "from");
+        defer db.allocator.free(from_lower);
+        const clause = try std.fmt.allocPrint(db.allocator, "({s} = LOWER(?) OR {s} = LOWER(?) OR {s} = LOWER(?))", .{ owner_lower, to_lower, from_lower });
+        try allocated_clauses.append(db.allocator, clause);
+        try conditions.append(db.allocator, clause);
+    }
     // Registration-style expiry filter (V2: data.$.expiry; V1: timestamp + data.$.duration).
     if (filter.expiry_gt != null or filter.expiry_gte != null or filter.expiry_lt != null or filter.expiry_lte != null) {
         const expiry_expr = try expirySortExpr(db, false); // filter omits the $.expiration fallback
@@ -456,6 +471,12 @@ fn bindEventScalars(q: *Query, filter: EventFilterOptions) !void {
     if (filter.data_json_owner) |o| try q.bindText(o);
     if (filter.data_json_owners) |owners| {
         for (owners) |o| try q.bindText(o);
+    }
+    if (filter.involved) |v| {
+        // Three binds — one per OR disjunct in the involvement clause.
+        try q.bindText(v);
+        try q.bindText(v);
+        try q.bindText(v);
     }
     if (filter.expiry_gt) |v| try q.bindInt64(v);
     if (filter.expiry_gte) |v| try q.bindInt64(v);

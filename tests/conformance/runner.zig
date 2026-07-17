@@ -341,6 +341,9 @@ test "conformance goldens" {
         .{ .name = "atblock_late", .query = "query($id:String!){ domain(id:$id, atBlock: 235){ id owner { id } resolver { addr text(key:\"avatar\") } } }", .vars = alice_vars },
         .{ .name = "atblock_prereg", .query = "query($id:String!){ domain(id:$id, atBlock: 150){ id name } }", .vars = alice_vars },
         .{ .name = "atblock_future", .query = "query($id:String!){ domain(id:$id, atBlock: 999999999){ id name } }", .vars = alice_vars },
+        // --- history surfaces over the events log ---
+        .{ .name = "history_name", .query = "query($id:String!){ events(where:{namehash:$id}, orderBy: blockNumber, orderDirection: asc){ type blockNumber } }", .vars = alice_vars },
+        .{ .name = "history_address", .query = "{ events(where:{involved:\"0x2222222222222222222222222222222222222222\"}, orderBy: blockNumber, orderDirection: asc){ type blockNumber } }" },
         // Two aliases of the same list re-run the batch record prefetch over the same
         // (resolver, namehash) pairs; locks output and, under CONFORMANCE_LEAKCHECK,
         // the repeat-populate value replacement in loaders.zig. name_in (not name:)

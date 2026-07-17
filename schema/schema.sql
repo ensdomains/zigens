@@ -554,6 +554,8 @@ CREATE INDEX IF NOT EXISTS idx_events_contract_address ON events(contract_addres
 CREATE INDEX IF NOT EXISTS idx_events_protocol_type_block ON events(protocol, event_type, block_number);
 CREATE INDEX IF NOT EXISTS idx_events_block_log ON events(block_number, log_index);
 CREATE INDEX IF NOT EXISTS idx_events_owner_extracted ON events (LOWER(json_extract(data, '$.owner')));
+CREATE INDEX IF NOT EXISTS idx_events_to_extracted ON events (LOWER(json_extract(data, '$.to')));
+CREATE INDEX IF NOT EXISTS idx_events_from_extracted ON events (LOWER(json_extract(data, '$.from')));
 
 
 -- ============================================================================
