@@ -1,0 +1,96 @@
+# Run the published image — no local toolchain or source build required.
+#   ZIGENS_IMAGE=ghcr.io/mdtanrikulu/zigens:0.1.0 docker compose -f docker-compose.server.yml up -d
+# Pin a version tag in production; :latest is the default for convenience only.
+# The build-from-source deployments stay on docker-compose.yml / docker-compose.staging.yml.
+
+services:
+  indexer-v2:
+    image: ${ZIGENS_IMAGE:-ghcr.io/mdtanrikulu/zigens:latest}
+    container_name: ensv2-indexer-v2
+    restart: unless-stopped
+    command: ["/app/ensv2-indexer-v2"]
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - ens-data:/app/data
+      - webhook-data:/app/webhooks
+    environment:
+      - DATABASE_PATH=/app/data/ens.db
+      - RAINBOW_PATH=/app/data/ens_rainbow.db
+      - DOWNLOAD_RAINBOW=true
+      - RPC_URL=${RPC_URL}
+      - NETWORK=${NETWORK:-sepolia}
+      - BATCH_SIZE=10000
+      - POLL_INTERVAL=12
+      - RATE_LIMIT_PER_SECOND=25
+      - STATUS_PORT=3001
+      - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
+      - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
+      - WEBHOOK_MAX_RETRIES=${WEBHOOK_MAX_RETRIES:-3}
+    healthcheck:
+      test: ["CMD", "/app/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - ens-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  api:
+    image: ${ZIGENS_IMAGE:-ghcr.io/mdtanrikulu/zigens:latest}
+    container_name: ensv2-api
+    restart: unless-stopped
+    command: ["/app/api-entrypoint.sh"]
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "5655:5655"
+    volumes:
+      - ens-data:/app/data:ro
+      - webhook-data:/app/webhooks
+    environment:
+      - DATABASE_PATH=/app/data/ens.db
+      - RAINBOW_PATH=/app/data/ens_rainbow.db
+      - DOWNLOAD_RAINBOW=false
+      - API_PORT=5655
+      - GRAPHQL_MAX_DEPTH=10
+      - GRAPHQL_MAX_COST=${GRAPHQL_MAX_COST:-10000}
+      - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
+      - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
+      - WEBHOOK_ADMIN_USERNAME=${WEBHOOK_ADMIN_USERNAME:-}
+      - WEBHOOK_ADMIN_PASSWORD=${WEBHOOK_ADMIN_PASSWORD:-}
+      - METRICS_ENABLED=false
+    depends_on:
+      - indexer-v2
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:5655/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - ens-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  ens-network:
+    driver: bridge
+
+volumes:
+  ens-data:
+    driver: local
+  webhook-data:
+    driver: local
