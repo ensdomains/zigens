@@ -46,6 +46,21 @@ test "reference manifests load to the code defaults (and regen with MANIFEST_GEN
     }
 }
 
+test "base is manifest-only: no code defaults, and base.zon loads all-disabled" {
+    // Silent all-zero defaults would mis-index; getContractAddresses must refuse.
+    try testing.expectError(error.ManifestRequired, contracts.getContractAddresses(.base));
+    try testing.expectEqual(@as(u64, 8453), Network.base.chainId());
+
+    // The committed substrate manifest loads under NETWORK=base with every
+    // contract explicitly disabled (zero address).
+    const loaded = try manifest.loadManifest(testing.allocator, "manifests/base.zon", .base);
+    inline for (@typeInfo(ContractAddresses).@"struct".fields) |f| {
+        if (f.type == Address) {
+            try testing.expect(@field(loaded, f.name).isZero());
+        }
+    }
+}
+
 const Address = @import("types/address.zig").Address;
 const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
 const A_REAL = "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e";

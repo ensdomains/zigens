@@ -103,7 +103,12 @@ pub const Config = struct {
         const v1_contract_addrs = if (manifest_path.len > 0)
             try manifest.loadManifest(allocator, manifest_path, network)
         else
-            try contracts.getContractAddresses(network);
+            contracts.getContractAddresses(network) catch |err| {
+                if (err == error.ManifestRequired) {
+                    std.log.err("NETWORK={s} has no built-in contract defaults — set MANIFEST_PATH (see manifests/README.txt)", .{network.toString()});
+                }
+                return err;
+            };
         // Same network → the V1 and V2 sets are the same struct (the code path also
         // returned identical copies); ContractAddresses is a by-value copy.
         const v2_contract_addrs = v1_contract_addrs;

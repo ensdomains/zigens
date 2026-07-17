@@ -4,17 +4,24 @@ const Address = @import("types/address.zig").Address;
 pub const Network = enum {
     sepolia,
     mainnet,
+    /// Base mainnet (chain id 8453). Manifest-only: there are no built-in
+    /// contract defaults — a deployment MUST set MANIFEST_PATH (the committed
+    /// manifests/base.zon is the all-disabled substrate until a Basenames
+    /// adapter wires real contracts).
+    base,
 
     pub fn toString(self: Network) []const u8 {
         return switch (self) {
             .sepolia => "sepolia",
             .mainnet => "mainnet",
+            .base => "base",
         };
     }
 
     pub fn fromString(s: []const u8) !Network {
         if (std.ascii.eqlIgnoreCase(s, "sepolia")) return .sepolia;
         if (std.ascii.eqlIgnoreCase(s, "mainnet")) return .mainnet;
+        if (std.ascii.eqlIgnoreCase(s, "base")) return .base;
         return error.UnknownNetwork;
     }
 
@@ -27,6 +34,7 @@ pub const Network = enum {
         return switch (self) {
             .sepolia => 11155111,
             .mainnet => 1,
+            .base => 8453,
         };
     }
 };
@@ -111,6 +119,9 @@ pub fn getContractAddresses(network: Network) !ContractAddresses {
     return switch (network) {
         .sepolia => sepoliaAddresses(),
         .mainnet => mainnetAddresses(),
+        // Manifest-only network: silent all-zero defaults would violate the
+        // "required present or explicitly disabled; never silent mis-index" rule.
+        .base => error.ManifestRequired,
     };
 }
 

@@ -1,0 +1,38 @@
+// Base mainnet (chain id 8453) substrate manifest — ALL contracts explicitly
+// disabled. Base is a manifest-only network (no code defaults); a NETWORK=base
+// deployment boots against this file and indexes nothing until a Basenames
+// adapter replaces the zero addresses with real contracts. See manifests/README.txt.
+.{
+    .manifest_version = 1,
+    .chain_id = 8453,
+    .contracts = .{
+        .{ .name = "temporary_registrar", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "old_ens_registry", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "old_public_resolver", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "ens_registry", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "base_registrar", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "eth_registrar_controller", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "public_resolver", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "reverse_registrar", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "name_wrapper", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "universal_resolver", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "root_registry", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "eth_registry", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "eth_registrar_v2", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "eth_renewer_v1", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "eth_label_store", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "eth_reverse_registrar", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "batch_registrar", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "premigration_registrar", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "migration_helper", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "locked_migration_controller", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "unlocked_migration_controller", .address = "0x0000000000000000000000000000000000000000" },
+    },
+    .blocks = .{
+        .v1_deployment_block = 0,
+        .v2_deployment_block = 0,
+        .temp_registrar_start_block = 0,
+        .v1_migration_block = 0,
+        .name_wrapper_deployment_block = 0,
+    },
+}
