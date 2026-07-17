@@ -1728,7 +1728,6 @@ test "replayV2RecordsCore rebuilds resolver records (address/text/contenthash) w
     try std.testing.expectEqualStrings("0xe30101701220ab", ch.?);
 }
 
-
 test "replayV2EacRolesCore + replayV2RegistrationsCore rebuild roles and registrations from events" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1809,7 +1808,6 @@ test "replayV2EacRolesCore + replayV2RegistrationsCore rebuild roles and registr
     try std.testing.expectEqualStrings("1", n.?);
 }
 
-
 test "replayAccountsCore rebuilds accounts (V2 observations MIN-merged + backfill seed)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1860,13 +1858,33 @@ test "replayAccountsCore rebuilds accounts (V2 observations MIN-merged + backfil
     const nh = try hash_mod2.namehash(allocator, "acct.eth");
     const lh = try hash_mod2.keccak256(allocator, "acct");
     try idx.insertName(.{
-        .name = "acct.eth", .label = "acct", .label_hash = lh, .parent_name = "eth",
-        .parent_namehash = idx.eth_namehash, .protocol = .v2, .registry = idx.getEthRegistry(.v2),
-        .owner = try Address.fromHex(DD), .registrant = try Address.fromHex(DD), .resolver = Address.zero,
-        .token_id = 9, .canonical_id = 9, .token_version = 0, .namehash = nh, .expiry = 0,
-        .registry_locked = false, .migrated = false, .created_block = 77, .created_at = 4242,
-        .registered_at = 4242, .updated_block = 77, .updated_at = 4242, .is_wrapped = false,
-        .wrapper_fuses = null, .wrapper_expiry = null, .is_v1_name = false, .v1_label_hash = null,
+        .name = "acct.eth",
+        .label = "acct",
+        .label_hash = lh,
+        .parent_name = "eth",
+        .parent_namehash = idx.eth_namehash,
+        .protocol = .v2,
+        .registry = idx.getEthRegistry(.v2),
+        .owner = try Address.fromHex(DD),
+        .registrant = try Address.fromHex(DD),
+        .resolver = Address.zero,
+        .token_id = 9,
+        .canonical_id = 9,
+        .token_version = 0,
+        .namehash = nh,
+        .expiry = 0,
+        .registry_locked = false,
+        .migrated = false,
+        .created_block = 77,
+        .created_at = 4242,
+        .registered_at = 4242,
+        .updated_block = 77,
+        .updated_at = 4242,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
     });
     try database.exec("INSERT INTO sync_state (protocol, last_synced_block, last_synced_at) VALUES ('v2', 200, 0)");
 
@@ -1922,19 +1940,47 @@ test "replayV2RegistriesCore rebuilds registries + registry_entries (bootstrap +
     const nh = try hash_mod2.namehash(allocator, "par.eth");
     const lh = try hash_mod2.keccak256(allocator, "par");
     try idx.insertName(.{
-        .name = "par.eth", .label = "par", .label_hash = lh, .parent_name = "eth",
-        .parent_namehash = idx.eth_namehash, .protocol = .v2, .registry = parent_reg,
-        .owner = try Address.fromHex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), .registrant = try Address.fromHex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), .resolver = Address.zero,
-        .token_id = canonical, .canonical_id = canonical, .token_version = 0, .namehash = nh, .expiry = 0,
-        .registry_locked = false, .migrated = false, .created_block = 100, .created_at = 1000,
-        .registered_at = 1000, .updated_block = 100, .updated_at = 1000, .is_wrapped = false,
-        .wrapper_fuses = null, .wrapper_expiry = null, .is_v1_name = false, .v1_label_hash = null,
+        .name = "par.eth",
+        .label = "par",
+        .label_hash = lh,
+        .parent_name = "eth",
+        .parent_namehash = idx.eth_namehash,
+        .protocol = .v2,
+        .registry = parent_reg,
+        .owner = try Address.fromHex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        .registrant = try Address.fromHex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        .resolver = Address.zero,
+        .token_id = canonical,
+        .canonical_id = canonical,
+        .token_version = 0,
+        .namehash = nh,
+        .expiry = 0,
+        .registry_locked = false,
+        .migrated = false,
+        .created_block = 100,
+        .created_at = 1000,
+        .registered_at = 1000,
+        .updated_block = 100,
+        .updated_at = 1000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
     });
 
     const data = try std.fmt.allocPrint(allocator, "{{\"name\":\"par.eth\",\"canonicalId\":{d},\"subregistry\":\"0x9999999999999999999999999999999999999999\",\"registry\":\"{s}\"}}", .{ canonical, parent_hex });
     try @import("../storage/events.zig").insertEvent(database, .{
-        .event_type = .subregistry_updated, .protocol = .v2, .block_number = 101, .tx_hash = Hash.zero,
-        .log_index = 0, .contract_address = parent_reg, .name = "par.eth", .namehash = nh, .data = data, .timestamp = 2000,
+        .event_type = .subregistry_updated,
+        .protocol = .v2,
+        .block_number = 101,
+        .tx_hash = Hash.zero,
+        .log_index = 0,
+        .contract_address = parent_reg,
+        .name = "par.eth",
+        .namehash = nh,
+        .data = data,
+        .timestamp = 2000,
     });
 
     try replayV2RegistriesCore(&idx);
@@ -1959,4 +2005,130 @@ test "replayV2RegistriesCore rebuilds registries + registry_entries (bootstrap +
 
 fn idxEthRegistryIsZero(cfg: @import("../config.zig").Config) bool {
     return cfg.v2_contracts.eth_registry.isZero();
+}
+
+const at_block = @import("../storage/at_block.zig");
+
+test "reconstructV2AtBlock matches truncated live replay at every lifecycle checkpoint" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cfg = @import("../config.zig").Config.fromEnv(allocator) catch return;
+    cfg.status_port = null;
+    cfg.webhooks_enabled = false;
+    defer cfg.deinit();
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const nh = try hash_mod2.namehash(allocator, "tt.eth");
+    const reg = try Address.fromHex("0x3333333333333333333333333333333333333333");
+    const wrong_reg = try Address.fromHex("0x5555555555555555555555555555555555555555");
+    const rsv = try Address.fromHex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+    // Full lifecycle. Every event gets a distinct log_index — the events UNIQUE is
+    // (protocol, tx_hash, log_index) and duplicates are silently dropped.
+    const Ev = struct { et: models.EventType, blk: u64, li: u32, contract: Address, data: []const u8 };
+    const events = [_]Ev{
+        .{ .et = .label_registered, .blk = 100, .li = 0, .contract = reg, .data = "{\"name\":\"tt.eth\",\"tokenId\":500,\"owner\":\"0x1111111111111111111111111111111111111111\",\"expiry\":1000000,\"registry\":\"0x3333333333333333333333333333333333333333\"}" },
+        // Foreign-registry ResolverUpdated: same tokenId, different emitting registry -> must be a no-op.
+        .{ .et = .resolver_updated, .blk = 102, .li = 1, .contract = wrong_reg, .data = "{\"tokenId\":500,\"resolver\":\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}" },
+        .{ .et = .resolver_updated, .blk = 104, .li = 2, .contract = reg, .data = "{\"tokenId\":500,\"resolver\":\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}" },
+        .{ .et = .address_changed, .blk = 106, .li = 3, .contract = rsv, .data = "{\"resolver\":\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"coinType\":60,\"address\":\"0x9999999999999999999999999999999999999999\"}" },
+        .{ .et = .text_changed, .blk = 108, .li = 4, .contract = rsv, .data = "{\"resolver\":\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"key\":\"url\",\"value\":\"https://a\"}" },
+        .{ .et = .text_changed, .blk = 110, .li = 5, .contract = rsv, .data = "{\"resolver\":\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"key\":\"url\",\"value\":\"\"}" },
+        .{ .et = .transfer, .blk = 112, .li = 6, .contract = reg, .data = "{\"to\":\"0x2222222222222222222222222222222222222222\"}" },
+        .{ .et = .name_renewed, .blk = 114, .li = 7, .contract = reg, .data = "{\"newExpiry\":2000000}" },
+        .{ .et = .token_regenerated, .blk = 116, .li = 8, .contract = reg, .data = "{\"oldTokenId\":500,\"newTokenId\":501}" },
+        .{ .et = .name_burned, .blk = 120, .li = 9, .contract = reg, .data = "{\"tokenId\":501}" },
+        .{ .et = .label_registered, .blk = 124, .li = 10, .contract = reg, .data = "{\"name\":\"tt.eth\",\"tokenId\":600,\"owner\":\"0x2222222222222222222222222222222222222222\",\"expiry\":3000000,\"registry\":\"0x3333333333333333333333333333333333333333\"}" },
+    };
+
+    const seed = struct {
+        fn go(db: *db_module.Database, evs: []const Ev, up_to: u64, name_nh: Hash) !void {
+            for (evs) |e| {
+                if (e.blk > up_to) continue;
+                try @import("../storage/events.zig").insertEvent(db, .{
+                    .event_type = e.et,
+                    .protocol = .v2,
+                    .block_number = e.blk,
+                    .tx_hash = Hash.zero,
+                    .log_index = e.li,
+                    .contract_address = e.contract,
+                    .name = "tt.eth",
+                    .namehash = name_nh,
+                    .data = e.data,
+                    .timestamp = 1000,
+                });
+            }
+        }
+    }.go;
+
+    // Full DB: all events + a live-replayed names table (the provenance-overlay source).
+    var full_db = try db_module.Database.init(allocator, ":memory:");
+    defer full_db.deinit();
+    {
+        var idx = try Indexer.init(allocator, io, cfg, &full_db, null);
+        defer idx.deinit();
+        try seed(&full_db, &events, 10_000, nh);
+        try idx.replayV2NamesCore();
+        try idx.replayV2RecordsCore();
+    }
+
+    // At each checkpoint: ground truth = fresh DB with events <= N replayed live.
+    const checkpoints = [_]u64{ 100, 103, 105, 109, 111, 118, 121, 125 };
+    for (checkpoints) |n| {
+        var tdb = try db_module.Database.init(allocator, ":memory:");
+        defer tdb.deinit();
+        {
+            var idx = try Indexer.init(allocator, io, cfg, &tdb, null);
+            defer idx.deinit();
+            try seed(&tdb, &events, n, nh);
+            try idx.replayV2NamesCore();
+            try idx.replayV2RecordsCore();
+        }
+
+        var st = try at_block.reconstructV2AtBlock(&full_db, allocator, nh, n);
+        defer st.deinit();
+
+        const expected = tdb.getNameByNamehashAndProtocol(nh, .v2) catch null;
+        if (expected) |exp_row| {
+            var exp = exp_row;
+            defer exp.deinit(tdb.allocator);
+            const got = st.name orelse return error.AtBlockMissingName;
+            try std.testing.expectEqualStrings(exp.name.?, got.name.?);
+            try std.testing.expectEqualStrings(exp.label.?, got.label.?);
+            try std.testing.expectEqualStrings(exp.parent_name.?, got.parent_name.?);
+            try std.testing.expect(exp.owner.eql(got.owner));
+            try std.testing.expect(exp.registrant.eql(got.registrant));
+            try std.testing.expect(exp.resolver.eql(got.resolver));
+            try std.testing.expect(exp.registry.eql(got.registry));
+            try std.testing.expectEqual(exp.token_id, got.token_id);
+            try std.testing.expectEqual(exp.token_version, got.token_version);
+            try std.testing.expectEqual(exp.expiry, got.expiry);
+            try std.testing.expectEqual(exp.created_block, got.created_block);
+            try std.testing.expectEqual(exp.migrated, got.migrated);
+            try std.testing.expectEqual(exp.is_wrapped, got.is_wrapped);
+
+            // Records: at-block lookups must agree with the truncated DB's tables.
+            const exp_addr = tdb.getAddressRecord(rsv, nh, 60) catch null;
+            const got_addr = st.lookupAddr(rsv, 60);
+            if (exp_addr) |ea| {
+                defer tdb.allocator.free(ea);
+                try std.testing.expectEqualStrings(ea, got_addr orelse return error.AtBlockMissingAddr);
+            } else {
+                try std.testing.expect(got_addr == null);
+            }
+            const exp_text = tdb.getTextRecord(rsv, nh, "url") catch null;
+            const got_text = st.lookupText(rsv, "url");
+            if (exp_text) |et_| {
+                defer tdb.allocator.free(et_);
+                try std.testing.expectEqualStrings(et_, got_text orelse return error.AtBlockMissingText);
+            } else {
+                try std.testing.expect(got_text == null);
+            }
+        } else {
+            try std.testing.expect(st.name == null); // burned / not yet registered
+        }
+    }
 }
