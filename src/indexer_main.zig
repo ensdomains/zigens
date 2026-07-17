@@ -4,6 +4,7 @@ const indexer = @import("indexer/indexer.zig");
 const db = @import("storage/database.zig");
 const db_open = @import("storage/db_open.zig");
 const models = @import("types/models.zig");
+const shutdown = @import("utils/shutdown.zig");
 
 // Configure logging: filter debug logs, use file redirection in production
 // Run with: ./ensv2-indexer > logs/indexer.log 2>&1 &
@@ -182,8 +183,12 @@ pub fn main(init: std.process.Init) !void {
 
     std.log.info("Indexer started - indexing blocks...", .{});
 
-    // Run indexer in main thread (no spawning needed)
+    // Run indexer in main thread (no spawning needed). SIGTERM/SIGINT flips the
+    // shutdown flag; the sync loops exit at the next batch boundary and the
+    // deferred idx.deinit/database.deinit chain runs in order.
+    shutdown.install();
     try idx.start();
+    std.log.info("Shutdown complete.", .{});
 }
 
 test {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const zsys = @import("../utils/system.zig");
+const shutdown = @import("shutdown.zig");
 
 /// Network health checker - waits for network connectivity before continuing
 pub const NetworkHealth = struct {
@@ -17,13 +18,14 @@ pub const NetworkHealth = struct {
         };
     }
 
-    /// Wait until network is healthy, logging status periodically
-    /// This never returns an error - it waits indefinitely until connection is restored
+    /// Wait until network is healthy, logging status periodically.
+    /// Waits indefinitely for connectivity, but returns early on graceful
+    /// shutdown — callers re-check their stop condition immediately after.
     pub fn waitForHealthy(self: *NetworkHealth) void {
         var consecutive_failures: u32 = 0;
         var logged_waiting = false;
 
-        while (true) {
+        while (!shutdown.isRequested()) {
             if (self.checkConnection()) {
                 if (logged_waiting) {
                     std.log.info("✓ Network connection restored, resuming operations", .{});
@@ -44,7 +46,7 @@ pub const NetworkHealth = struct {
                 // Wait before next check (exponential backoff up to 10 seconds)
                 const wait_ms = @min(self.check_interval_ms * @as(u64, @intCast(@min(consecutive_failures, 10))), 10000);
                 const wait_ns = wait_ms * @as(u64, std.time.ns_per_ms);
-                zsys.sleep(wait_ns);
+                if (shutdown.sleepInterruptible(wait_ns)) return;
             }
         }
     }

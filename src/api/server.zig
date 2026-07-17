@@ -21,6 +21,7 @@ const rpc = @import("../rpc/client.zig");
 const resolve_client = @import("../resolve/client.zig");
 const resolve_primary = @import("../resolve/primary.zig");
 const zsys = @import("../utils/system.zig");
+const shutdown = @import("../utils/shutdown.zig");
 const auth = @import("auth.zig");
 
 /// On-chain resolution state, created only when primary-name verification is enabled.
@@ -183,10 +184,17 @@ pub const Server = struct {
         });
         const listener = &self.server.?;
 
+        // Publish the listener so the signal handler can unblock accept: 0.16's
+        // accept retries EINTR, so only shutdown(2) on this fd wakes the loop
+        // (it then fails with error.SocketNotListening).
+        shutdown.setWakeFd(listener.socket.handle);
+        defer shutdown.clearWakeFd();
+
         std.log.info("API server listening on port {d}", .{self.port});
 
-        while (true) {
+        while (!shutdown.isRequested()) {
             const stream = listener.accept(self.io) catch |err| {
+                if (shutdown.isRequested() or err == error.SocketNotListening) break;
                 std.log.warn("Failed to accept connection: {}", .{err});
                 continue;
             };
@@ -219,6 +227,27 @@ pub const Server = struct {
             };
             thread.detach();
         }
+
+        self.drainConnections();
+    }
+
+    /// Bounded wait for detached handler threads after the accept loop exits.
+    /// Handlers can't outlive the per-socket timeout by much, so the deadline is
+    /// generous; if stragglers remain anyway, exit without running destructors —
+    /// a detached thread touching freed Server state would be a UAF.
+    fn drainConnections(self: *Server) void {
+        const active = self.active_conns.load(.monotonic);
+        if (active > 0) std.log.info("Draining {d} in-flight connection(s)...", .{active});
+        const deadline_ms = zsys.milliTimestamp() + @as(i64, @max(self.request_timeout_ms, 15_000));
+        while (self.active_conns.load(.monotonic) > 0 and zsys.milliTimestamp() < deadline_ms) {
+            zsys.sleep(50 * std.time.ns_per_ms);
+        }
+        const stragglers = self.active_conns.load(.monotonic);
+        if (stragglers > 0) {
+            std.log.warn("Drain timed out with {d} connection(s) active; exiting without teardown", .{stragglers});
+            std.process.exit(0);
+        }
+        std.log.info("API server stopped.", .{});
     }
 
     fn handleConnectionThread(self: *Server, conn: http_util.Conn) void {

@@ -3,6 +3,7 @@ const config = @import("config.zig");
 const api = @import("api/server.zig");
 const db = @import("storage/database.zig");
 const pool_mod = @import("storage/pool.zig");
+const shutdown = @import("utils/shutdown.zig");
 const ens_normalize = @import("ens_normalize");
 
 pub fn main(init: std.process.Init) !void {
@@ -114,7 +115,9 @@ pub fn main(init: std.process.Init) !void {
 
     std.log.info("Ready to serve requests", .{});
 
+    shutdown.install();
     try server.start();
+    std.log.info("Shutdown complete.", .{});
 }
 
 test {

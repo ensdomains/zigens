@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const zsys = @import("../utils/system.zig");
+const shutdown = @import("../utils/shutdown.zig");
 const config = @import("../config.zig");
 const constants = @import("../constants.zig");
 const db = @import("../storage/database.zig");
@@ -52,7 +53,7 @@ pub fn start(self: *Indexer) !void {
         };
     }
 
-    while (!self.should_stop.load(.acquire)) {
+    while (!self.should_stop.load(.acquire) and !shutdown.isRequested()) {
         // Index V1 first (SQLite doesn't support concurrent writes from different threads)
         try self.indexProtocol(.v1, self.v1_client);
 
@@ -85,8 +86,8 @@ pub fn start(self: *Indexer) !void {
         // Best-effort finality signalling (Task 09); no-op unless FINALITY_ENABLED.
         fetchFinality(self);
 
-        // Sleep for poll interval before next iteration
-        zsys.sleep(self.config.poll_interval * std.time.ns_per_s);
+        // Sleep for poll interval before next iteration; wakes early on SIGTERM.
+        _ = shutdown.sleepInterruptible(self.config.poll_interval * std.time.ns_per_s);
     }
 
     std.log.info("Indexer stopped.", .{});
@@ -140,7 +141,7 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
         };
     }
 
-    while (!self.should_stop.load(.acquire)) {
+    while (!self.should_stop.load(.acquire) and !shutdown.isRequested()) {
         if (self.indexProtocol(protocol, client)) |_| {
             // Success - after first successful sync, recreate indexes and start webhook workers
             if (!self.initial_sync_complete.load(.acquire)) {
@@ -211,13 +212,13 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
                     // Inner `executeHttpRequest` retries already cover
                     // transient TLS/socket recovery, so anything beyond
                     // 1s is redundant.
-                    zsys.sleep(std.time.ns_per_s);
+                    _ = shutdown.sleepInterruptible(std.time.ns_per_s);
                     continue;
                 },
                 else => {
                     // Other errors (database, parsing, etc) - log and wait briefly
                     std.log.err("{s} indexing error: {}", .{ protocol.toString(), err });
-                    zsys.sleep(constants.Timing.error_recovery_delay_ms * std.time.ns_per_ms); // Wait 5s for non-network errors
+                    _ = shutdown.sleepInterruptible(constants.Timing.error_recovery_delay_ms * std.time.ns_per_ms); // Wait 5s for non-network errors
                 },
             }
         }
@@ -227,8 +228,8 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
         // finality just like the combined indexer's `start` loop.
         fetchFinality(self);
 
-        // Sleep for poll interval before next iteration
-        zsys.sleep(self.config.poll_interval * std.time.ns_per_s);
+        // Sleep for poll interval before next iteration; wakes early on SIGTERM.
+        _ = shutdown.sleepInterruptible(self.config.poll_interval * std.time.ns_per_s);
     }
 
     std.log.info("{s} indexer stopped.", .{protocol.toString()});
@@ -342,7 +343,7 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
     var from_block = last_synced + 1;
     var blocks_indexed: u64 = 0;
 
-    while (from_block <= target_block and !self.should_stop.load(.acquire)) {
+    while (from_block <= target_block and !self.should_stop.load(.acquire) and !shutdown.isRequested()) {
         const to_block = @min(from_block + current_batch_size - 1, target_block);
         const batch_blocks = to_block - from_block + 1;
 
