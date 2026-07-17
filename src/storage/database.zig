@@ -409,6 +409,8 @@ pub const Database = struct {
 
     // Sync module (14 functions)
     pub const getSyncState = sync.getSyncState;
+    pub const getSyncStateFull = sync.getSyncStateFull;
+    pub const ProtocolSync = sync.ProtocolSync;
     pub const setSyncState = sync.setSyncState;
     pub const storeBlockHash = sync.storeBlockHash;
     pub const getBlockHash = sync.getBlockHash;

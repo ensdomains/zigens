@@ -131,6 +131,24 @@ pub fn getSyncState(db: *Database, protocol: models.Protocol) !?u64 {
     return null;
 }
 
+pub const ProtocolSync = struct { block: u64, at: i64 };
+
+/// Like getSyncState but also returns when the head was last advanced —
+/// the freshness signal for the coverage surface.
+pub fn getSyncStateFull(db: *Database, protocol: models.Protocol) !?ProtocolSync {
+    const sql = "SELECT last_synced_block, last_synced_at FROM sync_state WHERE protocol = ?";
+
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+
+    try q.bindTextStatic(protocol.toString());
+
+    if (try q.step()) {
+        return .{ .block = @intCast(q.getInt64(0)), .at = q.getInt64(1) };
+    }
+    return null;
+}
+
 pub fn setSyncState(db: *Database, protocol: models.Protocol, block: u64) !void {
     const sql = try db.upsertSql(db.allocator, "sync_state", &.{ "protocol", "last_synced_block", "last_synced_at" }, .replace);
     defer db.allocator.free(sql);

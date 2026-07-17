@@ -75,6 +75,7 @@ pub const GraphQLHandler = struct {
         try executor.registerResolver("wrappedDomains", resolvers.resolveWrappedDomains);
         try executor.registerResolver("_meta", resolvers.resolveMeta);
         try executor.registerResolver("_finality", resolvers.resolveFinality);
+        try executor.registerResolver("_coverage", resolvers.resolveCoverage);
 
         // Build the schema validator once from the embedded introspection JSON.
         // It indexes the introspection types into hash maps used to reject

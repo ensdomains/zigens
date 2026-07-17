@@ -1952,8 +1952,11 @@ pub fn resolveFinality(ctx: parser.ExecutionContext, field: *const parser.Field)
     const v1_block = (try database.getSyncState(.v1)) orelse 0;
     const v2_block = (try database.getSyncState(.v2)) orelse 0;
     const head: u64 = if (v1_block > v2_block) v1_block else v2_block;
-    const safe = try database.getFinality(database.chain_id, .safe);
-    const finalized = try database.getFinality(database.chain_id, .finalized);
+    // Degrade to null on a DB without the finality_state table (created by the
+    // indexer's ensureSchema; the API's read-only pool never creates it) — a
+    // best-effort signal must not fail the whole query.
+    const safe = database.getFinality(database.chain_id, .safe) catch null;
+    const finalized = database.getFinality(database.chain_id, .finalized) catch null;
     const is_stale = if (safe) |snap| head < snap.number else true;
 
     var json: std.Io.Writer.Allocating = .init(allocator);
@@ -1979,6 +1982,79 @@ pub fn resolveFinality(ctx: parser.ExecutionContext, field: *const parser.Field)
     }
     try w.writeAll("}");
     return parser.FieldResult{ .json = try allocator.dupe(u8, json.written()) };
+}
+
+/// `_coverage`: what this deployment indexes — chain id, per-protocol indexed head +
+/// freshness, and a staleness flag. Additive; does not touch the subgraph `_meta` shape.
+/// `stale` deliberately uses /ready's convention (false when finality data is absent)
+/// rather than `_finality.isStale`'s conservative true — a default deployment without
+/// FINALITY_ENABLED must not permanently declare itself stale on a coverage surface.
+pub fn resolveCoverage(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
+    const allocator = ctx.allocator;
+    const database: *db.Database = @ptrCast(@alignCast(ctx.database));
+
+    const v1 = try database.getSyncStateFull(.v1);
+    const v2 = try database.getSyncStateFull(.v2);
+    const v1_block: u64 = if (v1) |s| s.block else 0;
+    const v2_block: u64 = if (v2) |s| s.block else 0;
+    const head: u64 = if (v1_block > v2_block) v1_block else v2_block;
+    // Same degrade-to-null as resolveFinality: absent finality_state = no signal.
+    const safe = database.getFinality(database.chain_id, .safe) catch null;
+    const is_stale = if (safe) |snap| head < snap.number else false;
+
+    var json: std.Io.Writer.Allocating = .init(allocator);
+    defer json.deinit();
+    const w = &json.writer;
+    try w.writeAll("{");
+    var first = true;
+    for (field.selections) |*sel| {
+        const key = sel.alias orelse sel.name;
+        if (!first) try w.writeAll(",");
+        if (std.mem.eql(u8, sel.name, "chainId")) {
+            try w.print("\"{s}\":{d}", .{ key, database.chain_id });
+        } else if (std.mem.eql(u8, sel.name, "stale")) {
+            try w.print("\"{s}\":{}", .{ key, is_stale });
+        } else if (std.mem.eql(u8, sel.name, "protocols")) {
+            try w.print("\"{s}\":[", .{key});
+            try writeProtocolCoverage(w, sel.selections, "v1", v1);
+            try w.writeAll(",");
+            try writeProtocolCoverage(w, sel.selections, "v2", v2);
+            try w.writeAll("]");
+        } else if (std.mem.eql(u8, sel.name, "__typename")) {
+            try w.print("\"{s}\":\"Coverage\"", .{key});
+        } else {
+            try w.print("\"{s}\":null", .{key});
+        }
+        first = false;
+    }
+    try w.writeAll("}");
+    return parser.FieldResult{ .json = try allocator.dupe(u8, json.written()) };
+}
+
+fn writeProtocolCoverage(w: *std.Io.Writer, selections: []const parser.Field, name: []const u8, s: ?db.Database.ProtocolSync) !void {
+    try w.writeAll("{");
+    var first = true;
+    for (selections) |*sel| {
+        const key = sel.alias orelse sel.name;
+        if (!first) try w.writeAll(",");
+        if (std.mem.eql(u8, sel.name, "protocol")) {
+            try w.print("\"{s}\":\"{s}\"", .{ key, name });
+        } else if (std.mem.eql(u8, sel.name, "indexedHead")) {
+            try w.print("\"{s}\":{d}", .{ key, if (s) |v| v.block else 0 });
+        } else if (std.mem.eql(u8, sel.name, "lastSyncedAt")) {
+            if (s) |v| {
+                try w.print("\"{s}\":{d}", .{ key, v.at });
+            } else {
+                try w.print("\"{s}\":null", .{key});
+            }
+        } else if (std.mem.eql(u8, sel.name, "__typename")) {
+            try w.print("\"{s}\":\"ProtocolCoverage\"", .{key});
+        } else {
+            try w.print("\"{s}\":null", .{key});
+        }
+        first = false;
+    }
+    try w.writeAll("}");
 }
 
 test "resolver(id) JSON stays well-formed for record + contract + __typename fields" {

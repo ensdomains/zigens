@@ -116,6 +116,33 @@ type Query {
   `safe`/`finalized` are null until FINALITY_ENABLED and the indexer has fetched them.
   """
   _finality: Finality!
+
+  """
+  What this deployment indexes (ensv2 extension): chain id, per-protocol indexed
+  head + last-sync time, and a staleness flag. `stale` is false when finality data
+  is absent (default deployments); `_finality.isStale` is the conservative variant.
+  """
+  _coverage: Coverage!
+}
+
+"""Deployment coverage declaration (ensv2 extension)."""
+type Coverage {
+  """EVM chain id this deployment indexes."""
+  chainId: Int!
+  """True only when finality data shows the indexed head behind the chain's safe point."""
+  stale: Boolean!
+  """Per-protocol indexed positions."""
+  protocols: [ProtocolCoverage!]!
+}
+
+"""One protocol's indexed position within `Coverage`."""
+type ProtocolCoverage {
+  """Protocol name: "v1" or "v2"."""
+  protocol: String!
+  """Highest block synced for this protocol (0 = never synced)."""
+  indexedHead: Int!
+  """When the head last advanced (unix seconds), or null when never synced."""
+  lastSyncedAt: Int
 }
 
 """Finality positions + a staleness signal (ensv2 extension)."""

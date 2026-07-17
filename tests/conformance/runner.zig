@@ -294,6 +294,8 @@ test "conformance goldens" {
         .{ .name = "registrations_expiry_gt", .query = "{ registrations(where:{expiryDate_gt:1900000000}, orderBy:name, orderDirection:asc){ id name expiryDate } }" },
         // --- finality signalling (Task 09; _finality is additive, subgraph _meta unchanged) ---
         .{ .name = "finality", .query = "{ _finality { head { number } safe { number hash } finalized { number } isStale } }" },
+        // --- coverage declaration (additive; lastSyncedAt is wall-clock so not selected) ---
+        .{ .name = "coverage", .query = "{ _coverage { chainId stale protocols { protocol indexedHead } } }" },
         // --- error-shape ops: lock the GraphQL error envelope for cases that DO error ---
         .{ .name = "err_missing_required_arg", .query = "{ domain { id } }" },
         .{ .name = "err_unknown_query", .query = "{ notARealQueryField { id } }" },

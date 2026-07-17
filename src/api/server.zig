@@ -453,6 +453,8 @@ pub const Server = struct {
             try self.handleVerifyPrimary(conn, path);
         } else if (std.mem.startsWith(u8, path, "/api/ready") or std.mem.startsWith(u8, path, "/ready")) {
             try self.handleReadiness(conn);
+        } else if (std.mem.startsWith(u8, path, "/api/coverage") or std.mem.startsWith(u8, path, "/coverage")) {
+            try self.handleCoverage(conn);
         } else if (std.mem.startsWith(u8, path, "/api/health") or std.mem.startsWith(u8, path, "/health")) {
             try self.handleHealthCheck(conn);
         } else if (std.mem.startsWith(u8, path, "/metrics")) {
@@ -473,6 +475,7 @@ pub const Server = struct {
     pub const handleEventsQuery = api_endpoints.handleEventsQuery;
     pub const handleHealthCheck = api_endpoints.handleHealthCheck;
     pub const handleReadiness = api_endpoints.handleReadiness;
+    pub const handleCoverage = api_endpoints.handleCoverage;
     pub const handleMetrics = api_endpoints.handleMetrics;
     pub const handleGraphQLQuery = api_endpoints.handleGraphQLQuery;
     pub const handleGraphQLGet = api_endpoints.handleGraphQLGet;

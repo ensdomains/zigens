@@ -297,6 +297,31 @@ pub fn handleReadiness(self: *Server, conn: http_util.Conn) !void {
     try self.sendJsonResponse(conn, 200, body);
 }
 
+/// Coverage declaration: chain id, per-protocol indexed head + last-sync time, and a
+/// staleness flag (same semantics as /ready's `stale`: false when no finality data).
+/// The GraphQL `_coverage` field serves the same data with field selection.
+pub fn handleCoverage(self: *Server, conn: http_util.Conn) !void {
+    const database = self.pool.acquire() catch
+        return self.sendJsonResponse(conn, 503, "{\"status\":\"unavailable\",\"reason\":\"db_unavailable\"}");
+    defer self.pool.release(database);
+
+    const v1 = database.getSyncStateFull(.v1) catch null;
+    const v2 = database.getSyncStateFull(.v2) catch null;
+    const v1_block: u64 = if (v1) |s| s.block else 0;
+    const v2_block: u64 = if (v2) |s| s.block else 0;
+    const head: u64 = if (v1_block > v2_block) v1_block else v2_block;
+    const safe = database.getFinality(database.chain_id, .safe) catch null;
+    const stale = if (safe) |sp| head < sp.number else false;
+
+    const body = try std.fmt.allocPrint(
+        self.allocator,
+        "{{\"chainId\":{d},\"stale\":{s},\"protocols\":[{{\"protocol\":\"v1\",\"indexedHead\":{d},\"lastSyncedAt\":{?d}}},{{\"protocol\":\"v2\",\"indexedHead\":{d},\"lastSyncedAt\":{?d}}}]}}",
+        .{ database.chain_id, if (stale) "true" else "false", v1_block, if (v1) |s| s.at else null, v2_block, if (v2) |s| s.at else null },
+    );
+    defer self.allocator.free(body);
+    try self.sendJsonResponse(conn, 200, body);
+}
+
 pub fn handleMetrics(self: *Server, conn: http_util.Conn) !void {
     // Get metrics from GraphQL handler and format as Prometheus
     const metrics_text = try self.graphql_handler.metrics.formatPrometheus(self.allocator);
