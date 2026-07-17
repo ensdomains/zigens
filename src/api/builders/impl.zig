@@ -30,6 +30,7 @@ const resolvers_mod = @import("../../storage/resolvers.zig");
 const registry_entries = @import("../../storage/registry_entries.zig");
 const admin = @import("../resolvers/admin.zig");
 const api_common = @import("../common.zig");
+const at_block_mod = @import("../../storage/at_block.zig");
 
 /// Context for nested field resolution
 pub const NestedContext = struct {
@@ -40,6 +41,9 @@ pub const NestedContext = struct {
     /// Optional live-resolution context (see json_builder.NestedContext / Task 06).
     /// Default null → propagated from the parent; a missed site fails safe (no fallback).
     resolve: ?*anyopaque = null,
+    /// Optional at-block state (see json_builder.NestedContext): set only on the
+    /// at-block entity's own serve path, never into nested domain entities.
+    at_block: ?*const anyopaque = null,
 };
 
 // ============================================================================
@@ -901,6 +905,18 @@ fn resolverAddrHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: 
         }
     }
 
+    // At-block: serve from the reconstructed state ONLY — a miss means "no record at
+    // that block", never a fall-through to current tables or live resolution.
+    if (nested_ctx.at_block) |ab| {
+        const st: *const at_block_mod.AtBlockState = @ptrCast(@alignCast(ab));
+        if (st.lookupAddr(rctx.resolver, coin_type)) |v| {
+            const escaped = try json_utils.escapeString(nested_ctx.allocator, v);
+            defer nested_ctx.allocator.free(escaped);
+            return try std.fmt.allocPrint(nested_ctx.allocator, "\"{s}\"", .{escaped});
+        }
+        return try nested_ctx.allocator.dupe(u8, "null");
+    }
+
     // Only return records set by the CURRENTLY AUTHORITATIVE resolver.
     // A migrated V1 name may have legacy addr records from its old V1 resolver in the
     // resolver_addresses table; those must not shadow the (possibly empty) V2 resolver state.
@@ -938,6 +954,9 @@ fn resolverAddrHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: 
 
 /// Resolver nested field handler: addresses
 fn resolverAddressesHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    // At-block: list enumeration from the reconstructed state is a follow-up; an
+    // empty list never lies, current-state enumeration would.
+    if (nested_ctx.at_block != null) return try nested_ctx.allocator.dupe(u8, "[]");
     const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
@@ -991,6 +1010,8 @@ fn resolverAddressesHandler(ctx: *anyopaque, field: *const parser.Field, nested_
 fn resolverCoinTypesHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
     // Schema declares `coinTypes: [String!]` — scalar list, no sub-selection.
     if (field.selections.len > 0) return error.SubSelectionOnScalar;
+    // At-block: see resolverAddressesHandler — empty list, never current-state.
+    if (nested_ctx.at_block != null) return try nested_ctx.allocator.dupe(u8, "[]");
     const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
@@ -1039,6 +1060,17 @@ fn resolverContentHashHandler(ctx: *anyopaque, field: *const parser.Field, neste
     const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
+    // At-block: state-only, no fall-through (see resolverAddrHandler).
+    if (nested_ctx.at_block) |ab| {
+        const st: *const at_block_mod.AtBlockState = @ptrCast(@alignCast(ab));
+        if (st.lookupContenthash(rctx.resolver)) |v| {
+            const escaped = try json_utils.escapeString(nested_ctx.allocator, v);
+            defer nested_ctx.allocator.free(escaped);
+            return try std.fmt.allocPrint(nested_ctx.allocator, "\"{s}\"", .{escaped});
+        }
+        return try nested_ctx.allocator.dupe(u8, "null");
+    }
+
     // Batch fast-path (see resolverAddrHandler): use the page-prefetched contenthash
     // when present, else point-query. Composite (resolver, namehash) key = the same
     // one the point query uses, so a miss is a safe fallback and never leaks
@@ -1074,6 +1106,8 @@ fn resolverTextsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx:
     // Schema declares `texts: [String!]` — list of scalar keys. Sub-selections are not valid;
     // surface the error rather than silently dropping them (clients sometimes try `texts { key value }`).
     if (field.selections.len > 0) return error.SubSelectionOnScalar;
+    // At-block: see resolverAddressesHandler — empty list, never current-state.
+    if (nested_ctx.at_block != null) return try nested_ctx.allocator.dupe(u8, "[]");
     const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
@@ -1106,6 +1140,17 @@ fn resolverTextHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: 
     }
 
     if (key_arg) |key| {
+        // At-block: state-only, no fall-through (see resolverAddrHandler).
+        if (nested_ctx.at_block) |ab| {
+            const st: *const at_block_mod.AtBlockState = @ptrCast(@alignCast(ab));
+            if (st.lookupText(rctx.resolver, key)) |v| {
+                const escaped = try json_utils.escapeString(nested_ctx.allocator, v);
+                defer nested_ctx.allocator.free(escaped);
+                return try std.fmt.allocPrint(nested_ctx.allocator, "\"{s}\"", .{escaped});
+            }
+            return try nested_ctx.allocator.dupe(u8, "null");
+        }
+
         // Batch fast-path: a list page prefetches text(key:) records keyed by the
         // SAME (resolver, namehash, key) triple; use the batched value, else
         // point-query (a miss — unbatched pair or over-long key — is safe).
@@ -1328,6 +1373,7 @@ pub fn buildResolverJson(
             .allocator = ctx.allocator,
             .loaders = ctx.loaders,
             .resolve = ctx.resolve,
+            .at_block = ctx.at_block,
         },
     );
 }
@@ -1391,8 +1437,9 @@ fn domainResolvedAddressHandler(ctx: *anyopaque, field: *const parser.Field, nes
     // ancestor's resolver (ENSIP-10 inheritance) before giving up. The addr
     // record is still read under THIS name's own namehash, so an inherited
     // resolver only surfaces an address actually set for this node.
+    // At-block: inheritance skipped (would consult ancestors' CURRENT resolvers).
     var effective_resolver = domain.resolver;
-    if (effective_resolver.isZero()) {
+    if (effective_resolver.isZero() and nested_ctx.at_block == null) {
         effective_resolver = (try findInheritedResolver(database, domain)) orelse domain.resolver;
     }
     if (effective_resolver.isZero()) {
@@ -1402,12 +1449,20 @@ fn domainResolvedAddressHandler(ctx: *anyopaque, field: *const parser.Field, nes
     var resolved_batched = false;
     var owns_resolved = false;
     var resolved_addr_opt: ?[]const u8 = null;
-    if (nested_ctx.loaders) |lp| {
-        const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
-        if (lc.lookupAddr60(effective_resolver, domain.namehash)) |batched| {
-            resolved_addr_opt = batched; // loader-owned
-            owns_resolved = false;
-            resolved_batched = true;
+    // At-block: state-only, no fall-through to batch/point/live reads.
+    if (nested_ctx.at_block) |ab| {
+        const st: *const at_block_mod.AtBlockState = @ptrCast(@alignCast(ab));
+        resolved_addr_opt = st.lookupAddr(effective_resolver, 60); // state-owned
+        resolved_batched = true;
+    }
+    if (!resolved_batched) {
+        if (nested_ctx.loaders) |lp| {
+            const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+            if (lc.lookupAddr60(effective_resolver, domain.namehash)) |batched| {
+                resolved_addr_opt = batched; // loader-owned
+                owns_resolved = false;
+                resolved_batched = true;
+            }
         }
     }
     if (!resolved_batched) {
@@ -1471,9 +1526,11 @@ fn domainResolverHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx
     const domain: *const models.Name = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
     var effective_resolver = domain.resolver;
-    if (effective_resolver.isZero()) {
+    if (effective_resolver.isZero() and nested_ctx.at_block == null) {
         // ENSIP-10 resolver inheritance: a subname resolved via an inherited
         // (ancestor) resolver should surface that resolver and its records.
+        // At-block: skipped — the walk-up would consult ancestors' CURRENT
+        // resolvers, mixing history with the present.
         effective_resolver = (try findInheritedResolver(database, domain)) orelse domain.resolver;
     }
     if (!effective_resolver.isZero()) {
@@ -1483,6 +1540,7 @@ fn domainResolverHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx
             .allocator = nested_ctx.allocator,
             .loaders = nested_ctx.loaders,
             .resolve = nested_ctx.resolve,
+            .at_block = nested_ctx.at_block,
         });
     }
     return try nested_ctx.allocator.dupe(u8, "null");
@@ -2126,6 +2184,7 @@ pub fn buildDomainJson(
             .allocator = ctx.allocator,
             .loaders = ctx.loaders,
             .resolve = ctx.resolve,
+            .at_block = ctx.at_block,
         },
     );
 }

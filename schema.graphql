@@ -2,8 +2,17 @@
 # This schema defines the GraphQL API for querying ENS V2 data
 
 type Query {
-  """Get a single domain by name or namehash. Exact get: returns the row even if non-normalized (unlike domains/where.name, which default-hide non-normalized names); unreachable rows are still hidden (returns null)."""
-  domain(id: String!): Domain
+  """
+  Get a single domain by name or namehash. Exact get: returns the row even if
+  non-normalized (unlike domains/where.name, which default-hide non-normalized
+  names); unreachable rows are still hidden (returns null). `atBlock` (ensv2
+  extension) reconstructs the domain's state as of that block from the event
+  log — V2 names only; scalar fields, `resolver { addr text(key:) contentHash }`
+  and `resolvedAddress` are historical; list record fields return empty at-block;
+  nested domain entities (parent/subdomains) reflect current state; an
+  out-of-range block or a name without V2 event history resolves to null.
+  """
+  domain(id: String!, atBlock: Int): Domain
 
   """Get multiple domains with pagination and filtering (legacy offset-based)"""
   domains(first: Int = 100, skip: Int = 0, where: DomainFilter, orderBy: Domain_orderBy, orderDirection: OrderDirection): [Domain!]!

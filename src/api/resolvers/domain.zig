@@ -10,6 +10,7 @@ const Address = common.Address;
 const parser = common.parser;
 const pagination = common.pagination;
 const builders = @import("../builders/builders.zig");
+const at_block_mod = @import("../../storage/at_block.zig");
 const loaders = common.loaders;
 const namehash = common.namehash_fn;
 const Hash = common.Hash;
@@ -961,6 +962,30 @@ pub fn resolveDomain(ctx: parser.ExecutionContext, field: *const parser.Field) !
 
     // Get name from database — id may be either a name or a namehash hex string
     const nh = try resolveDomainId(allocator, id);
+
+    // atBlock: single-entity time travel from the event log (V2 only). Lenient like the
+    // rest of the query surface: an out-of-range block or a name with no V2 event history
+    // (incl. V1 names) resolves to null rather than erroring.
+    if (parser.getIntArg(field, "atBlock", null)) |ab_raw| {
+        if (ab_raw <= 0) return parser.FieldResult{ .json = try allocator.dupe(u8, "null") };
+        const ab_block: u64 = @intCast(ab_raw);
+        const v2_head = (database.getSyncState(.v2) catch null) orelse 0;
+        if (ab_block > v2_head) return parser.FieldResult{ .json = try allocator.dupe(u8, "null") };
+
+        var st = try at_block_mod.reconstructV2AtBlock(database, allocator, nh, ab_block);
+        defer st.deinit();
+        const hist = if (st.name) |*n| n else return parser.FieldResult{ .json = try allocator.dupe(u8, "null") };
+
+        const name_json = try builders.buildDomainJson(hist, field.selections, .{
+            .database = database,
+            .depth = 0,
+            .allocator = allocator,
+            .loaders = null, // batch caches hold CURRENT records — never mix with history
+            .resolve = null, // live resolution answers "now", not "at block N"
+            .at_block = @ptrCast(&st),
+        });
+        return parser.FieldResult{ .json = name_json };
+    }
     const name_opt = try database.getNameByNamehash(nh);
     if (name_opt == null) {
         const null_json = try allocator.dupe(u8, "null");
@@ -987,7 +1012,6 @@ pub fn resolveDomain(ctx: parser.ExecutionContext, field: *const parser.Field) !
     });
     return parser.FieldResult{ .json = name_json };
 }
-
 
 /// Fingerprint the active filter set + order direction for the keyset cursor. A cursor is
 /// only a valid anchor for a request that reproduces this fingerprint; reusing one against
