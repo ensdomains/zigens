@@ -2110,9 +2110,9 @@ pub fn buildDomainJson(
     ctx: NestedContext,
 ) anyerror![]u8 {
     if (selections.len == 0) {
-        const escaped = try json_utils.escapeString(ctx.allocator, domain.name orelse "[unknown]");
-        defer ctx.allocator.free(escaped);
-        return try std.fmt.allocPrint(ctx.allocator, "{{\"id\":\"{s}\"}}", .{escaped});
+        const nh_hex = try domain.namehash.toHex(ctx.allocator);
+        defer ctx.allocator.free(nh_hex);
+        return try std.fmt.allocPrint(ctx.allocator, "{{\"id\":\"{s}\"}}", .{nh_hex});
     }
 
     return json_builder.buildEntityJson(

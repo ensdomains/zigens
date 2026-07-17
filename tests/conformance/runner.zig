@@ -304,6 +304,14 @@ test "conformance goldens" {
         //     silent change either way.
         .{ .name = "lenient_unknown_field", .query = "{ domains(first:1){ notARealField } }" },
         .{ .name = "lenient_invalid_orderby", .query = "{ domains(orderBy: notARealField){ id } }" },
+        // An empty selection set is spec-invalid but accepted; the fast path must
+        // emit the namehash id like every other Domain serialization.
+        .{ .name = "lenient_empty_selection", .query = "query($id:String!){ domain(id:$id) }", .vars = alice_vars },
+        // Two aliases of the same list re-run the batch record prefetch over the same
+        // (resolver, namehash) pairs; locks output and, under CONFORMANCE_LEAKCHECK,
+        // the repeat-populate value replacement in loaders.zig. name_in (not name:)
+        // so the general list path runs — the name-exact fast path skips the prefetch.
+        .{ .name = "aliased_batch_records", .query = "{ a: domains(where:{name_in:[\"alice.eth\"]}){ resolver { addr text(key:\"avatar\") } } b: domains(where:{name_in:[\"alice.eth\"]}){ resolver { addr text(key:\"avatar\") } } }" },
     };
 
     for (ops) |op| try checkOp(a, &handler, db, op, mode);
