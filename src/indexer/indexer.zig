@@ -91,6 +91,12 @@ pub const Indexer = struct {
     // NameRegistered/LabelReserved handler. Two keccak rounds saved per event.
     eth_namehash: Hash,
 
+    // Registrar root for the V1-shaped path: "eth" on ENS networks, "base.eth"
+    // on Base (Basenames). 2LDs from the base-registrar/controller surface are
+    // `<label>.<root_name>` with parent node `root_node`.
+    root_name: []const u8,
+    root_node: Hash,
+
     pub fn init(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, database: *db.Database, end_block: ?u64) !Indexer {
         // Create ONE shared HTTP client
         const http_client = try allocator.create(std.http.Client);
@@ -182,6 +188,8 @@ pub const Indexer = struct {
             .write_buffer = WriteBuffer.init(allocator),
             .rainbow = rainbow,
             .eth_namehash = try @import("../types/hash.zig").namehash(allocator, "eth"),
+            .root_name = cfg.network.rootName(),
+            .root_node = try @import("../types/hash.zig").namehash(allocator, cfg.network.rootName()),
         };
     }
 
@@ -280,6 +288,8 @@ pub const Indexer = struct {
             .write_buffer = WriteBuffer.init(allocator),
             .rainbow = rainbow,
             .eth_namehash = try @import("../types/hash.zig").namehash(allocator, "eth"),
+            .root_name = cfg.network.rootName(),
+            .root_node = try @import("../types/hash.zig").namehash(allocator, cfg.network.rootName()),
         };
     }
 
@@ -522,6 +532,9 @@ pub const Indexer = struct {
     pub const handleV1ETHControllerNameRegistered7Arg = handlers_v1.handleV1ETHControllerNameRegistered7Arg;
     pub const handleV1ETHControllerNameRenewed = handlers_v1.handleV1ETHControllerNameRenewed;
     pub const handleV1ETHControllerNameRenewedWithReferrer = handlers_v1.handleV1ETHControllerNameRenewedWithReferrer;
+    pub const handleBasenamesControllerNameRegistered = handlers_v1.handleBasenamesControllerNameRegistered;
+    pub const handleBasenamesControllerNameRenewed = handlers_v1.handleBasenamesControllerNameRenewed;
+    pub const handleBasenamesRegistrarNameRegisteredWithRecord = handlers_v1.handleBasenamesRegistrarNameRegisteredWithRecord;
     pub const handleV1ReverseClaimed = handlers_v1.handleV1ReverseClaimed;
     pub const handleV2NameForAddrChanged = handlers_v1.handleV2NameForAddrChanged;
 

@@ -122,6 +122,10 @@ pub const V1_BASE_REGISTRAR_EVENTS = [_]RegistryEventConfig{
     .{ .event_hash = abi.EventSignatures.base_registrar_name_renewed_hash, .handler = Indexer.handleV1BaseRegistrarNameRenewed, .name = "NameRenewed" },
     .{ .event_hash = abi.EventSignatures.controller_added_hash, .handler = Indexer.handleV1ControllerAdded, .name = "ControllerAdded" },
     .{ .event_hash = abi.EventSignatures.controller_removed_hash, .handler = Indexer.handleV1ControllerRemoved, .name = "ControllerRemoved" },
+    // Basenames (Base mainnet): registerWithRecord is the canonical registration
+    // flow and emits ONLY this event (plain NameRegistered never fires there).
+    // Signature-disjoint from every ENS registrar topic — inert off Base.
+    .{ .event_hash = abi.EventSignatures.basenames_registrar_name_registered_with_record_hash, .handler = Indexer.handleBasenamesRegistrarNameRegisteredWithRecord, .name = "NameRegisteredWithRecord (basenames)" },
 };
 
 // ETH Registrar Controller events
@@ -134,6 +138,12 @@ pub const V1_ETH_CONTROLLER_EVENTS = [_]RegistryEventConfig{
     .{ .event_hash = abi.EventSignatures.unwrapped_controller_name_registered_hash, .handler = Indexer.handleV1ETHControllerNameRegistered7Arg, .name = "NameRegistered (7-arg)" },
     .{ .event_hash = abi.EventSignatures.controller_name_renewed_hash, .handler = Indexer.handleV1ETHControllerNameRenewed, .name = "NameRenewed" },
     .{ .event_hash = abi.EventSignatures.unwrapped_controller_name_renewed_hash, .handler = Indexer.handleV1ETHControllerNameRenewedWithReferrer, .name = "NameRenewed (with referrer)" },
+    // Basenames (Base mainnet) controller variants — signature-disjoint from every
+    // ENS controller topic above, so they can never fire on ENS networks. Both
+    // Basenames controllers (legacy + upgradeable proxy) are reached the same way
+    // the ENS ones are: registrar ControllerAdded discovery + the config fallback.
+    .{ .event_hash = abi.EventSignatures.basenames_controller_name_registered_hash, .handler = Indexer.handleBasenamesControllerNameRegistered, .name = "NameRegistered (basenames)" },
+    .{ .event_hash = abi.EventSignatures.basenames_controller_name_renewed_hash, .handler = Indexer.handleBasenamesControllerNameRenewed, .name = "NameRenewed (basenames)" },
 };
 
 // Reverse Registrar events (0xa58E81fe9b61B5c3fE2AFD33CF304c454AbFc7Cb)

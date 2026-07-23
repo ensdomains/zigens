@@ -399,6 +399,24 @@ pub const EventSignatures = struct {
     pub const unwrapped_controller_name_renewed = "NameRenewed(string,bytes32,uint256,uint256,bytes32)";
     pub const unwrapped_controller_name_renewed_hash: Hash = eventHash(unwrapped_controller_name_renewed);
 
+    /// NameRegistered(string name, bytes32 indexed label, address indexed owner, uint256 expires)
+    /// 4-arg Basenames RegistrarController (Base mainnet, legacy + upgradeable
+    /// proxy): no cost fields — a subset of the 5-arg legacy ENS controller shape.
+    pub const basenames_controller_name_registered = "NameRegistered(string,bytes32,address,uint256)";
+    pub const basenames_controller_name_registered_hash: Hash = eventHash(basenames_controller_name_registered);
+
+    /// NameRenewed(string name, bytes32 indexed label, uint256 expires)
+    /// 3-arg Basenames RegistrarController: no cost field.
+    pub const basenames_controller_name_renewed = "NameRenewed(string,bytes32,uint256)";
+    pub const basenames_controller_name_renewed_hash: Hash = eventHash(basenames_controller_name_renewed);
+
+    /// NameRegisteredWithRecord(uint256 indexed id, address indexed owner, uint256 expires, address resolver, uint64 ttl)
+    /// Basenames BaseRegistrar: the CANONICAL registration event on Base — both
+    /// Basenames controllers register via registerWithRecord, which emits ONLY
+    /// this (the plain NameRegistered fires only for direct register/registerOnly).
+    pub const basenames_registrar_name_registered_with_record = "NameRegisteredWithRecord(uint256,address,uint256,address,uint64)";
+    pub const basenames_registrar_name_registered_with_record_hash: Hash = eventHash(basenames_registrar_name_registered_with_record);
+
     // ========================================================================
     // ENS V1 Reverse Registrar events (ReverseRegistrar.sol)
     // Address: 0xa58E81fe9b61B5c3fE2AFD33CF304c454AbFc7Cb

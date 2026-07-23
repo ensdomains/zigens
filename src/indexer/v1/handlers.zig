@@ -115,7 +115,7 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
     }
 
     // .eth 2LDs are handled by BaseRegistrar NameRegistered — skip
-    if (parent_node.eql(constants.WellKnown.eth_namehash)) {
+    if (parent_node.eql(self.root_node)) {
         std.log.debug("V1 NewOwner for .eth 2LD (skipping - handled by BaseRegistrar): labelhash={s}", .{labelhash_hex});
         return;
     }
@@ -184,7 +184,7 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
     std.log.debug("V1 NewOwner subdomain: {s} (namehash={s})", .{ full_name, subdomain_hex });
 
     // Create or update the name record
-    const registry = try Address.fromHex("00000000000C2E074eC69A0dFb2997BA6C7d2e1e");
+    const registry = self.config.v1_contracts.ens_registry;
     const now = zsys.timestamp();
 
     if (try names_storage.getNameByNamehash(self.database, subdomain_namehash)) |existing| {
@@ -757,7 +757,7 @@ pub fn handleV1ERC721Transfer(self: *Indexer, protocol: models.Protocol, log: rp
     // Look up the label from cache (falls back to DB on miss)
     if (try self.getCachedV1Label(token_id_hex)) |label| {
         // Compute the namehash for this name
-        const namehash = v1_names.computeEthNamehash(label);
+        const namehash = v1_names.computeChildNamehash(self.root_node, label);
 
         if (migration_kind != .none) {
             // V1→V2 migration: mark the V1 row as migrated and update owner to the
@@ -768,7 +768,7 @@ pub fn handleV1ERC721Transfer(self: *Indexer, protocol: models.Protocol, log: rp
                 try names_storage.markNameMigrated(self.database, namehash, to);
             }
             // Debug-level: a Sepolia sync produces thousands of these.
-            std.log.debug("V1 → V2 migration detected: {s}.eth → {s} controller (to={s})", .{
+            std.log.debug("V1 → V2 migration detected: {s} → {s} controller (to={s})", .{
                 label,
                 if (migration_kind == .locked) "LOCKED" else "UNLOCKED",
                 to_hex,
@@ -789,7 +789,7 @@ pub fn handleV1ERC721Transfer(self: *Indexer, protocol: models.Protocol, log: rp
                 std.log.debug("updateRegistrationRegistrant failed: {}", .{err});
             };
 
-            std.log.debug("Updated V1 name ownership: {s}.eth -> {s}", .{ label, to_hex });
+            std.log.debug("Updated V1 name ownership: {s} -> {s}", .{ label, to_hex });
         }
     } else {
         // This is expected - not all transfers correspond to known names
@@ -839,6 +839,14 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, protocol: models.Prot
     defer abi.freeValues(data_values, self.allocator);
     const expires = data_values[0].uint256;
 
+    try writeBaseRegistrarRegistration(self, protocol, log, token_id, owner, expires);
+}
+
+/// Shared registrar-registration body: label-known fast path or bracket
+/// placeholder, names + registrations rows, root-aware. Used by the ENS
+/// BaseRegistrar NameRegistered handler and the Basenames
+/// NameRegisteredWithRecord handler.
+fn writeBaseRegistrarRegistration(self: *Indexer, protocol: models.Protocol, log: rpc.Log, token_id: u256, owner: Address, expires: u256) !void {
     var owner_buf: [42]u8 = undefined;
     const owner_hex = owner.toHexBuf(&owner_buf);
 
@@ -855,10 +863,10 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, protocol: models.Prot
         // label is owned by the cache, do not free
 
         // We have the label! Create a complete name record
-        const full_name = try std.fmt.allocPrint(self.allocator, "{s}.eth", .{label});
+        const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label, self.root_name });
         // Note: full_name is freed by insertEventAndNotify, not here
 
-        const namehash = v1_names.computeEthNamehash(label);
+        const namehash = v1_names.computeChildNamehash(self.root_node, label);
         const label_hash = blk: { // tokenID IS the label hash in V1
             var bytes: [32]u8 = undefined;
             std.mem.writeInt(u256, &bytes, token_id, .big);
@@ -866,7 +874,7 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, protocol: models.Prot
         };
 
         // Compute parent namehash ("eth")
-        const eth_node = v1_names.computeEthNamehash("");
+        const eth_node = self.root_node;
 
         std.log.debug("V1 BaseRegistrar NameRegistered: {s} (id={s}) owner={s} expires={d}", .{
             full_name,
@@ -885,7 +893,7 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, protocol: models.Prot
             .namehash = namehash,
             .label = label,
             .label_hash = label_hash,
-            .parent_name = "eth",
+            .parent_name = self.root_name,
             .parent_namehash = eth_node,
             .protocol = protocol,
             .registry = self.config.v1_contracts.ens_registry, // ENS Registry, not Base Registrar!
@@ -929,7 +937,7 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, protocol: models.Prot
             protocol,
             namehash,
             label,
-            "eth",
+            self.root_name,
             owner,
             self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
             if (expiry_u64 == 0) null else expiry_u64,
@@ -968,7 +976,7 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, protocol: models.Prot
         };
 
         // Compute namehash from labelhash: keccak256(eth_node || labelhash)
-        const eth_node = constants.WellKnown.eth_namehash;
+        const eth_node = self.root_node;
         var namehash_input: [64]u8 = undefined;
         @memcpy(namehash_input[0..32], &eth_node.bytes);
         @memcpy(namehash_input[32..64], &label_hash.bytes);
@@ -987,7 +995,7 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, protocol: models.Prot
         const placeholder_label = label_buf[0..66];
 
         // full_name ownership transfers to emitEvent.
-        const full_name = try std.fmt.allocPrint(self.allocator, "{s}.eth", .{placeholder_label});
+        const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ placeholder_label, self.root_name });
 
         // Stack-buf v1_label_hash hex (matches label-known path convention).
         var v1_label_hash_buf: [66]u8 = undefined;
@@ -1001,7 +1009,7 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, protocol: models.Prot
             .namehash = namehash,
             .label = placeholder_label,
             .label_hash = label_hash,
-            .parent_name = "eth",
+            .parent_name = self.root_name,
             .parent_namehash = eth_node,
             .protocol = protocol,
             .registry = self.config.v1_contracts.ens_registry,
@@ -1041,7 +1049,7 @@ pub fn handleV1BaseRegistrarNameRegistered(self: *Indexer, protocol: models.Prot
             protocol,
             namehash,
             placeholder_label,
-            "eth",
+            self.root_name,
             owner,
             self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
             if (expiry_u64 == 0) null else expiry_u64,
@@ -1093,7 +1101,7 @@ pub fn handleV1BaseRegistrarNameRenewed(self: *Indexer, protocol: models.Protoco
         // label is owned by the cache, do not free
 
         // Compute the namehash for this name
-        const namehash = v1_names.computeEthNamehash(label);
+        const namehash = v1_names.computeChildNamehash(self.root_node, label);
 
         // Update the name's expiry. Renewal-specific: wrapped rows keep their
         // grace-inclusive stored expiry (direct registrar renews emit no
@@ -1112,7 +1120,7 @@ pub fn handleV1BaseRegistrarNameRenewed(self: *Indexer, protocol: models.Protoco
             std.log.debug("updateRegistrationExpiry failed: {}", .{err});
         };
 
-        const full_name = try std.fmt.allocPrint(self.allocator, "{s}.eth", .{label});
+        const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label, self.root_name });
         defer self.allocator.free(full_name);
 
         std.log.debug("Updated V1 name expiry: {s} -> {d}", .{ full_name, expires });
@@ -1221,7 +1229,7 @@ fn writeControllerRegistration(
     });
 
     // Store the tokenID->label mapping in the v1_labels table
-    const namehash = v1_names.computeEthNamehash(name);
+    const namehash = v1_names.computeChildNamehash(self.root_node, name);
     var tx_buf: [66]u8 = undefined;
     const tx_hash_hex = log.transaction_hash.toHexBuf(&tx_buf);
 
@@ -1249,7 +1257,7 @@ fn writeControllerRegistration(
     // `name` here is the bare label (e.g. "vitalik"); the full name is
     // "vitalik.eth".
     {
-        const full_name = std.fmt.allocPrint(self.allocator, "{s}.eth", .{name}) catch null;
+        const full_name = std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ name, self.root_name }) catch null;
         if (full_name) |fn_str| {
             defer self.allocator.free(fn_str);
             names_storage.updateNameLabel(self.database, protocol, namehash, name, fn_str, ens_normalize.nameIsNormalized(self.allocator, fn_str)) catch |err| {
@@ -1425,7 +1433,7 @@ pub fn handleV1ETHControllerNameRenewed(self: *Indexer, protocol: models.Protoco
     });
 
     // Store/update the tokenID->label mapping
-    const namehash = v1_names.computeEthNamehash(name);
+    const namehash = v1_names.computeChildNamehash(self.root_node, name);
     var tx_buf: [66]u8 = undefined;
     const tx_hash_hex = log.transaction_hash.toHexBuf(&tx_buf);
 
@@ -1499,7 +1507,7 @@ pub fn handleV1ETHControllerNameRenewedWithReferrer(self: *Indexer, protocol: mo
     });
 
     // Store/update the tokenID->label mapping (load-bearing for label resolution).
-    const namehash = v1_names.computeEthNamehash(name);
+    const namehash = v1_names.computeChildNamehash(self.root_node, name);
     var tx_buf: [66]u8 = undefined;
     const tx_hash_hex = log.transaction_hash.toHexBuf(&tx_buf);
 
@@ -1521,6 +1529,149 @@ pub fn handleV1ETHControllerNameRenewedWithReferrer(self: *Indexer, protocol: mo
     // above for the full rationale.
     _ = protocol;
     self.allocator.free(name);
+}
+
+/// Handle Basenames RegistrarController NameRegistered (4-arg, Base mainnet)
+/// NameRegistered(string name, bytes32 indexed label, address indexed owner, uint256 expires)
+/// Same indexed-topic layout as the ENS controllers, no cost fields — the shared
+/// registration writer applies with zero economics. The topic is signature-disjoint
+/// from every ENS controller variant, so this entry is inert off Base.
+pub fn handleBasenamesControllerNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
+    if (log.topics.len < 3) {
+        std.log.warn("Basenames Controller NameRegistered event has unexpected topic count: {d}, skipping", .{log.topics.len});
+        return;
+    }
+
+    const label_hash = log.topics[1];
+    const owner = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
+
+    // Non-indexed payload: (string name, uint256 expires).
+    const data_values = try abi.decodeValues(
+        log.data,
+        &.{ .string, .uint256 },
+        self.allocator,
+    );
+    defer abi.freeValues(data_values, self.allocator);
+    const name_borrow = data_values[0].string;
+    const expires = data_values[1].uint256;
+    const name = try self.allocator.dupe(u8, name_borrow);
+    errdefer self.allocator.free(name);
+
+    try writeControllerRegistration(self, protocol, log, name, label_hash, owner, 0, 0, expires, null);
+}
+
+/// Handle Basenames RegistrarController NameRenewed (3-arg, Base mainnet)
+/// NameRenewed(string name, bytes32 indexed label, uint256 expires)
+/// Mirrors the ENS controller renewal handlers: cache the label preimage and
+/// backfill v1_labels, but ABSTAIN from emitting — the base registrar's own
+/// NameRenewed remains the canonical renewal source.
+pub fn handleBasenamesControllerNameRenewed(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
+    if (log.topics.len < 2) {
+        std.log.warn("Basenames Controller NameRenewed event has unexpected topic count: {d}, skipping", .{log.topics.len});
+        return;
+    }
+
+    const label_hash = log.topics[1];
+
+    // Non-indexed payload: (string name, uint256 expires).
+    const data_values = try abi.decodeValues(
+        log.data,
+        &.{ .string, .uint256 },
+        self.allocator,
+    );
+    defer abi.freeValues(data_values, self.allocator);
+    const name_borrow = data_values[0].string;
+    const expires = data_values[1].uint256;
+    const name = try self.allocator.dupe(u8, name_borrow);
+    errdefer self.allocator.free(name);
+
+    var label_hash_buf: [66]u8 = undefined;
+    const label_hash_hex = label_hash.toHexBuf(&label_hash_buf);
+
+    std.log.debug("Basenames Controller NameRenewed: name={s} label_hash={s} expires={d}", .{ name, label_hash_hex, expires });
+
+    const namehash = v1_names.computeChildNamehash(self.root_node, name);
+    var tx_buf: [66]u8 = undefined;
+    const tx_hash_hex = log.transaction_hash.toHexBuf(&tx_buf);
+
+    try v1_names.storeTokenIdLabel(
+        self.allocator,
+        self.database,
+        label_hash_hex,
+        name,
+        namehash,
+        log.block_number,
+        tx_hash_hex,
+        models.EventType.name_renewed.toString(),
+    );
+    try self.putCachedV1Label(label_hash_hex, name);
+
+    // Suppress the event emit (base registrar is canonical). See the ENS
+    // controller renewal handlers above for the full rationale.
+    _ = protocol;
+    self.allocator.free(name);
+}
+
+/// Handle Basenames BaseRegistrar NameRegisteredWithRecord (Base mainnet)
+/// NameRegisteredWithRecord(uint256 indexed id, address indexed owner, uint256 expires, address resolver, uint64 ttl)
+/// The canonical Basenames registration event: both controllers register via
+/// registerWithRecord, so the plain NameRegistered never fires on that flow.
+/// Delegates to the shared registrar body, then applies the atomically-set
+/// resolver (mirroring the NewResolver essentials; resolved-address
+/// materialization is deliberately skipped — readers use the query-time path).
+pub fn handleBasenamesRegistrarNameRegisteredWithRecord(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
+    if (log.topics.len < 3) {
+        std.log.warn("Basenames NameRegisteredWithRecord event has unexpected topic count: {d}, skipping", .{log.topics.len});
+        return;
+    }
+
+    const token_id = try abi.ABI.decodeUint256(&log.topics[1].bytes, 0);
+    const owner = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
+
+    // Non-indexed payload: (uint256 expires, address resolver, uint64 ttl).
+    const data_values = try abi.decodeValues(log.data, &.{ .uint256, .address, .uint64 }, self.allocator);
+    defer abi.freeValues(data_values, self.allocator);
+    const expires = data_values[0].uint256;
+    const resolver = Address{ .bytes = data_values[1].address };
+
+    try writeBaseRegistrarRegistration(self, protocol, log, token_id, owner, expires);
+
+    if (resolver.isZero()) return;
+
+    // tokenId IS the labelhash; node = keccak256(root_node || labelhash).
+    var label_hash_bytes: [32]u8 = undefined;
+    std.mem.writeInt(u256, &label_hash_bytes, token_id, .big);
+    var node_input: [64]u8 = undefined;
+    @memcpy(node_input[0..32], &self.root_node.bytes);
+    @memcpy(node_input[32..64], &label_hash_bytes);
+    var node_bytes: [32]u8 = undefined;
+    std.crypto.hash.sha3.Keccak256.hash(&node_input, &node_bytes, .{});
+    const node = Hash{ .bytes = node_bytes };
+
+    var resolver_buf: [42]u8 = undefined;
+    const resolver_hex = resolver.toHexBuf(&resolver_buf);
+    var node_hex_buf: [66]u8 = undefined;
+    const node_hex = node.toHexBuf(&node_hex_buf);
+
+    if (names_storage.getNameByNamehash(self.database, node) catch null) |row| {
+        var row_mut = row;
+        self.database.upsertResolverEntity(
+            protocol,
+            resolver_hex,
+            node_hex,
+            row_mut.name orelse "[unknown]",
+            log.block_number,
+            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        ) catch |err| {
+            std.log.debug("upsertResolverEntity failed: {}", .{err});
+        };
+        row_mut.deinit(self.allocator);
+    }
+    if (self.write_buffer.active) {
+        try self.write_buffer.updateNameResolver(node, resolver);
+    } else {
+        try names_storage.updateNameResolver(self.database, node, resolver);
+    }
 }
 
 /// Handle V1 Reverse Registrar ReverseClaimed event

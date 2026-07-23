@@ -254,7 +254,7 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
         total_found += 1;
 
         // Verify this is an .eth 2LD by checking the namehash matches computeEthNamehash(label)
-        const computed_namehash = v1_names.computeEthNamehash(label);
+        const computed_namehash = v1_names.computeChildNamehash(self.root_node, label);
         const stored_namehash = Hash.fromHex(namehash_hex) catch continue;
 
         if (!std.mem.eql(u8, &computed_namehash.bytes, &stored_namehash.bytes)) {
@@ -302,13 +302,13 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
 
         // Compute derived values
         const label_hash = v1_names.computeLabelHash(label);
-        const parent_namehash = Hash.fromHex("93cdeb708b7545dc668eb9280176169d1c33cfd8ed6f04690a0bcc88a93fc4ae") catch continue;
-        const registry = Address.fromHex("00000000000C2E074eC69A0dFb2997BA6C7d2e1e") catch continue;
+        const parent_namehash = self.root_node;
+        const registry = self.config.v1_contracts.ens_registry;
 
         // Allocate owned strings for the Name struct
-        const full_name = try std.fmt.allocPrint(self.allocator, "{s}.eth", .{label});
+        const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label, self.root_name });
         const label_copy = try self.allocator.dupe(u8, label);
-        const parent_name_copy = try self.allocator.dupe(u8, "eth");
+        const parent_name_copy = try self.allocator.dupe(u8, self.root_name);
         const v1_label_hash = try self.allocator.dupe(u8, token_id_str);
 
         var name = models.Name{
@@ -325,11 +325,11 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
             .resolver = Address.zero,
             .token_id = token_id,
             .canonical_id = token_id, // V1 doesn't use versioning
-            // V1 BaseRegistrar tokens are version 1 (matches the pre-migration
-            // backfill above and the live NameRegistered path). Version 0 is
-            // reserved for non-tokenized V1 names (e.g. .eth itself). These
-            // backfilled rows are .eth 2LDs registered through the controller.
-            .token_version = 1,
+            // Match the LIVE registrar path and the replay arm, which both write
+            // token_version = 0 for registrar 2LDs — a heal-created row must be
+            // byte-identical to the row live indexing would have produced. (The
+            // pre-migration backfill above keeps 1 for its temp-registrar rows.)
+            .token_version = 0,
             .expiry = expiry,
             .registry_locked = false,
             .migrated = false,

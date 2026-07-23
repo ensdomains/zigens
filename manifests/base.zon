@@ -1,7 +1,9 @@
-// Base mainnet (chain id 8453) substrate manifest — ALL contracts explicitly
-// disabled. Base is a manifest-only network (no code defaults); a NETWORK=base
-// deployment boots against this file and indexes nothing until a Basenames
-// adapter replaces the zero addresses with real contracts. See manifests/README.txt.
+// Base mainnet (chain id 8453) — Basenames. Base is a manifest-only network
+// (no code defaults). The Basenames contracts map onto the V1-shaped fields:
+// registry/base_registrar/controller/resolver/reverse; the second (upgradeable)
+// controller 0xa7d2607c6bd39ae9521e514026cbb078405ab322 is discovered at index
+// time via the registrar's ControllerAdded events. V2 fields stay disabled —
+// ENS V2 is not deployed on Base. Deploy blocks from on-chain first-event data.
 .{
     .manifest_version = 1,
     .chain_id = 8453,
@@ -9,10 +11,10 @@
         .{ .name = "temporary_registrar", .address = "0x0000000000000000000000000000000000000000" },
         .{ .name = "old_ens_registry", .address = "0x0000000000000000000000000000000000000000" },
         .{ .name = "old_public_resolver", .address = "0x0000000000000000000000000000000000000000" },
-        .{ .name = "ens_registry", .address = "0x0000000000000000000000000000000000000000" },
-        .{ .name = "base_registrar", .address = "0x0000000000000000000000000000000000000000" },
-        .{ .name = "eth_registrar_controller", .address = "0x0000000000000000000000000000000000000000" },
-        .{ .name = "public_resolver", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "ens_registry", .address = "0xb94704422c2a1e396835a571837aa5ae53285a95" },
+        .{ .name = "base_registrar", .address = "0x03c4738ee98ae44591e1a4a4f3cab6641d95dd9a" },
+        .{ .name = "eth_registrar_controller", .address = "0x4ccb0bb02fcaba27e82a56646e81d8c5bc4119a5" },
+        .{ .name = "public_resolver", .address = "0xc6d566a56a1aff6508b41f6c90ff131615583bcd" },
         .{ .name = "reverse_registrar", .address = "0x0000000000000000000000000000000000000000" },
         .{ .name = "name_wrapper", .address = "0x0000000000000000000000000000000000000000" },
         .{ .name = "universal_resolver", .address = "0x0000000000000000000000000000000000000000" },
@@ -21,7 +23,7 @@
         .{ .name = "eth_registrar_v2", .address = "0x0000000000000000000000000000000000000000" },
         .{ .name = "eth_renewer_v1", .address = "0x0000000000000000000000000000000000000000" },
         .{ .name = "eth_label_store", .address = "0x0000000000000000000000000000000000000000" },
-        .{ .name = "eth_reverse_registrar", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "eth_reverse_registrar", .address = "0x0000000000d8e504002cc26e3ec46d81971c1664" },
         .{ .name = "batch_registrar", .address = "0x0000000000000000000000000000000000000000" },
         .{ .name = "premigration_registrar", .address = "0x0000000000000000000000000000000000000000" },
         .{ .name = "migration_helper", .address = "0x0000000000000000000000000000000000000000" },
@@ -29,7 +31,7 @@
         .{ .name = "unlocked_migration_controller", .address = "0x0000000000000000000000000000000000000000" },
     },
     .blocks = .{
-        .v1_deployment_block = 0,
+        .v1_deployment_block = 17571485,
         .v2_deployment_block = 0,
         .temp_registrar_start_block = 0,
         .v1_migration_block = 0,

@@ -46,19 +46,28 @@ test "reference manifests load to the code defaults (and regen with MANIFEST_GEN
     }
 }
 
-test "base is manifest-only: no code defaults, and base.zon loads all-disabled" {
+test "base is manifest-only: no code defaults, and base.zon wires the Basenames surface" {
     // Silent all-zero defaults would mis-index; getContractAddresses must refuse.
     try testing.expectError(error.ManifestRequired, contracts.getContractAddresses(.base));
     try testing.expectEqual(@as(u64, 8453), Network.base.chainId());
+    try testing.expectEqualStrings("base.eth", Network.base.rootName());
 
-    // The committed substrate manifest loads under NETWORK=base with every
-    // contract explicitly disabled (zero address).
     const loaded = try manifest.loadManifest(testing.allocator, "manifests/base.zon", .base);
-    inline for (@typeInfo(ContractAddresses).@"struct".fields) |f| {
-        if (f.type == Address) {
-            try testing.expect(@field(loaded, f.name).isZero());
-        }
-    }
+    // Basenames indexing surface wired (registry / registrar / legacy controller /
+    // L2 resolver / L2 reverse registrar; the upgradeable controller is discovered
+    // at index time via ControllerAdded)...
+    try testing.expect(!loaded.ens_registry.isZero());
+    try testing.expect(!loaded.base_registrar.isZero());
+    try testing.expect(!loaded.eth_registrar_controller.isZero());
+    try testing.expect(!loaded.public_resolver.isZero());
+    try testing.expect(!loaded.eth_reverse_registrar.isZero());
+    // ...while ENS V2 and the mainnet-V1-only surfaces stay disabled on Base.
+    try testing.expect(loaded.root_registry.isZero());
+    try testing.expect(loaded.eth_registry.isZero());
+    try testing.expect(loaded.name_wrapper.isZero());
+    try testing.expect(loaded.temporary_registrar.isZero());
+    try testing.expect(loaded.locked_migration_controller.isZero());
+    try testing.expectEqual(@as(u64, 17571485), loaded.v1_deployment_block);
 }
 
 const Address = @import("types/address.zig").Address;

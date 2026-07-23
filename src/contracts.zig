@@ -37,6 +37,15 @@ pub const Network = enum {
             .base => 8453,
         };
     }
+
+    /// The registrar root: 2LDs registered through the base-registrar/controller
+    /// surface become `<label>.<rootName()>`. Basenames registers under base.eth.
+    pub fn rootName(self: Network) []const u8 {
+        return switch (self) {
+            .sepolia, .mainnet => "eth",
+            .base => "base.eth",
+        };
+    }
 };
 
 pub const ContractAddresses = struct {

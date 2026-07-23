@@ -318,7 +318,7 @@ fn replayNewOwner(self: *Indexer, q: *Query) !void {
     if (v1_migration_block > 0 and block_number < v1_migration_block) return;
 
     // .eth 2LDs are handled by BaseRegistrar NameRegistered — skip
-    if (parent_node.eql(constants.WellKnown.eth_namehash)) return;
+    if (parent_node.eql(self.root_node)) return;
 
     // Resolve label: addr.reverse → rainbow → [labelhash]
     var resolved_label: ?[]const u8 = null;
@@ -471,7 +471,7 @@ fn replayERC721Transfer(self: *Indexer, q: *Query) !void {
 
     // Look up label from cache
     if (try self.getCachedV1Label(token_id_hex)) |label| {
-        const namehash = v1_names.computeEthNamehash(label);
+        const namehash = v1_names.computeChildNamehash(self.root_node, label);
         names_storage.updateNameOwner(self.database, namehash, to) catch {};
     }
     // If label not found, skip (same as live indexing)
@@ -497,10 +497,10 @@ fn replayBaseRegistrarNameReg(self: *Indexer, q: *Query) !void {
     const maybe_label = try self.getCachedV1Label(token_id_hex);
 
     if (maybe_label) |label| {
-        const full_name = try std.fmt.allocPrint(self.allocator, "{s}.eth", .{label});
-        const namehash = v1_names.computeEthNamehash(label);
+        const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label, self.root_name });
+        const namehash = v1_names.computeChildNamehash(self.root_node, label);
         const label_hash = v1_names.computeLabelHash(label);
-        const eth_node = try Hash.fromHex("93cdeb708b7545dc668eb9280176169d1c33cfd8ed6f04690a0bcc88a93fc4ae");
+        const eth_node = self.root_node;
 
         var label_hash_buf: [66]u8 = undefined;
         const v1_label_hash_hex = label_hash.toHexBuf(&label_hash_buf);
@@ -512,7 +512,7 @@ fn replayBaseRegistrarNameReg(self: *Indexer, q: *Query) !void {
             .namehash = namehash,
             .label = label,
             .label_hash = label_hash,
-            .parent_name = "eth",
+            .parent_name = self.root_name,
             .parent_namehash = eth_node,
             .protocol = .v1,
             .registry = self.config.v1_contracts.ens_registry,
@@ -555,7 +555,7 @@ fn replayBaseRegistrarRenewal(self: *Indexer, q: *Query) !void {
     defer self.allocator.free(token_id_hex);
 
     if (try self.getCachedV1Label(token_id_hex)) |label| {
-        const namehash = v1_names.computeEthNamehash(label);
+        const namehash = v1_names.computeChildNamehash(self.root_node, label);
         names_storage.updateV1RenewalExpiry(self.database, namehash, expires) catch {};
     }
 }
@@ -623,7 +623,7 @@ fn replayETHControllerNameReg(self: *Indexer, q: *Query) !void {
     var label_hash_buf: [66]u8 = undefined;
     const label_hash_hex = label_hash.toHexBuf(&label_hash_buf);
 
-    const namehash = v1_names.computeEthNamehash(name_str);
+    const namehash = v1_names.computeChildNamehash(self.root_node, name_str);
     const block_number: u64 = @intCast(q.getInt64(COL_BLOCK_NUMBER));
     const tx_hash_hex = q.getTextSlice(COL_TX_HASH) orelse return;
 
