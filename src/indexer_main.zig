@@ -17,6 +17,7 @@ const CliArgs = struct {
     to_block: ?u64 = null,
     clean: bool = false,
     backfill: bool = false,
+    cdp_backfill: bool = false,
     help: bool = false,
 };
 
@@ -49,6 +50,8 @@ fn parseArgs(process_args: std.process.Args) !CliArgs {
             result.clean = true;
         } else if (std.mem.eql(u8, arg, "--backfill")) {
             result.backfill = true;
+        } else if (std.mem.eql(u8, arg, "--cdp-backfill")) {
+            result.cdp_backfill = true;
         } else {
             std.log.warn("Unknown argument: {s}", .{arg});
         }
@@ -69,6 +72,7 @@ fn printHelp() void {
         \\  --to-block <N>      Stop indexing at block N (default: current block)
         \\  --clean             Delete all data after --from-block before re-indexing
         \\  --backfill          Rebuild the names table from stored events (V1 then V2), no RPC, then exit
+        \\  --cdp-backfill      Bulk-ingest Base history from the CDP SQL API (BASE_CDP_CLIENT_KEY/BASE_CDP_SECRET_KEY), then exit
         \\  --help, -h          Show this help message
         \\
         \\Examples:
@@ -178,6 +182,13 @@ pub fn main(init: std.process.Init) !void {
         try idx.replayV2RegistriesCore(); // after names (pointer cascade fixes subregistry reachability)
         try idx.replayAccountsCore(); // after names + registrations (backfill seed reads them)
         std.log.info("Backfill complete. Exiting.", .{});
+        return;
+    }
+
+    if (args.cdp_backfill) {
+        std.log.info("Running in --cdp-backfill mode: ingesting history from the CDP SQL API", .{});
+        try @import("indexer/cdp_intake.zig").runCdpBackfill(&idx, args.from_block, args.to_block);
+        std.log.info("CDP backfill complete. Exiting.", .{});
         return;
     }
 
