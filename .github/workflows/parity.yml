@@ -1,0 +1,29 @@
+name: Subgraph Parity
+
+# Nightly proof that "subgraph-compatible" holds against the LIVE reference
+# subgraph: sample real names from the deployed zigens endpoint, query both
+# sides identically, and fail on any divergence outside the documented
+# allowlist (tools/parity_check.py). Runs only when the repo variables
+# PARITY_ZIGENS_URL and PARITY_SUBGRAPH_URL are configured — unset variables
+# skip cleanly so forks and pre-deployment branches stay green.
+on:
+  schedule:
+    - cron: "45 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install keccak dependency (fixed-name hashing)
+        run: pip install pycryptodome --quiet
+
+      - name: Run parity check
+        env:
+          PARITY_ZIGENS_URL: ${{ vars.PARITY_ZIGENS_URL }}
+          PARITY_SUBGRAPH_URL: ${{ vars.PARITY_SUBGRAPH_URL }}
+          PARITY_FIXED_NAMES: ${{ vars.PARITY_FIXED_NAMES }}
+          PARITY_SAMPLE: ${{ vars.PARITY_SAMPLE }}
+        run: python3 tools/parity_check.py

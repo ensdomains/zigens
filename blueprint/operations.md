@@ -68,6 +68,15 @@ Schema migrations are applied by the indexer at startup; the API only reads.
 Forward-only: no downgrade path is maintained — take a DB snapshot before major
 upgrades if you need one.
 
+## Continuous parity proof
+
+A nightly workflow (`.github/workflows/parity.yml`) samples real names from the
+deployed endpoint and diffs zigens' answers field-by-field against the live
+reference ENS subgraph. Divergences outside a small documented allowlist fail
+the run — "subgraph-compatible" is continuously proven, not just claimed.
+Configure via repo variables `PARITY_ZIGENS_URL` and `PARITY_SUBGRAPH_URL`
+(unset = the workflow skips cleanly).
+
 ## Webhook operations
 
 Workers start after the initial sync completes. Deliveries retry with backoff
