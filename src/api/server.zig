@@ -432,6 +432,8 @@ pub const Server = struct {
             try self.handleWebhooksAPI(conn, method, path, request);
         } else if (std.mem.startsWith(u8, path, "/api/name/")) {
             try self.handleNameQuery(conn, path);
+        } else if (std.mem.startsWith(u8, path, "/api/profiles/") or std.mem.startsWith(u8, path, "/profiles/")) {
+            try self.handleProfileQuery(conn, path);
         } else if (std.mem.startsWith(u8, path, "/api/owner/")) {
             try self.handleOwnerQuery(conn, path);
         } else if (std.mem.startsWith(u8, path, "/api/events")) {
@@ -451,6 +453,20 @@ pub const Server = struct {
                 return;
             }
             try self.handleVerifyPrimary(conn, path);
+        } else if (self.resolve != null and self.resolve.?.live_enabled and std.mem.startsWith(u8, path, "/internal/explain/")) {
+            // Same internal-ops posture as verify-primary: admin credential required
+            // (fail-closed) + the dedicated low rate limit — a cold explain is an
+            // on-chain read per request.
+            if (!self.admin_auth.configured() or !self.admin_auth.checkRequest(request)) {
+                try self.sendUnauthorized(conn);
+                return;
+            }
+            const internal_client = resolveClientAddress(conn.address(), request, self.trusted_proxy_hops);
+            if (!self.internal_rate_limiter.tryAcquireFor(internal_client)) {
+                try self.sendRateLimited(conn);
+                return;
+            }
+            try self.handleExplain(conn, path);
         } else if (std.mem.startsWith(u8, path, "/api/ready") or std.mem.startsWith(u8, path, "/ready")) {
             try self.handleReadiness(conn);
         } else if (std.mem.startsWith(u8, path, "/api/coverage") or std.mem.startsWith(u8, path, "/coverage")) {
@@ -476,6 +492,8 @@ pub const Server = struct {
     pub const handleHealthCheck = api_endpoints.handleHealthCheck;
     pub const handleReadiness = api_endpoints.handleReadiness;
     pub const handleCoverage = api_endpoints.handleCoverage;
+    pub const handleProfileQuery = api_endpoints.handleProfileQuery;
+    pub const handleExplain = api_endpoints.handleExplain;
     pub const handleMetrics = api_endpoints.handleMetrics;
     pub const handleGraphQLQuery = api_endpoints.handleGraphQLQuery;
     pub const handleGraphQLGet = api_endpoints.handleGraphQLGet;

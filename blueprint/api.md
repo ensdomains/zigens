@@ -69,9 +69,11 @@ connection — never a hang.
 | `GET /coverage` | What this deployment indexes (chain, heads, freshness) | — |
 | `GET /metrics` | Prometheus metrics | — |
 | `GET /api/name/{name}` | Single-name lookup | — |
+| `GET /profiles/{name}` | Aggregated profile: core fields + resolver records + owner's primary name | — |
 | `GET /api/owner/{address}` | Names owned by an address | — |
 | `GET /api/events` | Recent indexed events | — |
 | `GET /internal/verify-primary/{address}` | On-chain primary-name verification (needs `PRIMARY_VERIFY_ENABLED`) | admin |
+| `GET /internal/explain/{name}` | Step-by-step trace of a live resolution (needs `RESOLVE_LIVE_ENABLED`) | admin |
 | `GET /webhooks` | Webhook admin UI | admin |
 | `/api/webhooks` | Webhook CRUD API | admin |
 

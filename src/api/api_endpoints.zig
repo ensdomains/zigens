@@ -19,6 +19,7 @@ const url_utils = @import("../utils/url.zig");
 const validation = @import("../utils/validation.zig");
 const resolve_client = @import("../resolve/client.zig");
 const universal = @import("../resolve/universal.zig");
+const resolve_primary = @import("../resolve/primary.zig");
 const ccip_transport = @import("../resolve/ccip_transport.zig");
 const http_util = @import("http_util.zig");
 const acceptsResponseJson = http_util.acceptsResponseJson;
@@ -102,6 +103,79 @@ pub fn handleVerifyPrimary(self: *Server, conn: http_util.Conn, path: []const u8
     try self.sendJsonResponse(conn, 200, body);
 }
 
+/// Explain a live resolution: run the exact resolve path for addr(60) with a
+/// step-trace attached and return the ordered steps. Auth-gated like
+/// verify-primary (each hit is an on-chain read when the cache is cold).
+pub fn handleExplain(self: *Server, conn: http_util.Conn, path: []const u8) !void {
+    const rs = self.resolve orelse {
+        return try self.sendJsonResponse(conn, 200, "{\"status\":\"disabled\"}");
+    };
+
+    const prefix = "/internal/explain/";
+    if (path.len <= prefix.len) {
+        return try self.sendBadRequest(conn, "Name required");
+    }
+    var end = prefix.len;
+    while (end < path.len and path[end] != ' ' and path[end] != '?' and path[end] != '\r') {
+        end += 1;
+    }
+    const raw_name = path[prefix.len..end];
+    const name = (try resolve_primary.normalizedClaimOwned(self.allocator, raw_name)) orelse {
+        return try self.sendBadRequest(conn, "Name does not normalize (ENSIP-15)");
+    };
+    defer self.allocator.free(name);
+    const node = try @import("../types/hash.zig").namehash(self.allocator, name);
+
+    const database = try self.pool.acquire();
+    defer self.pool.release(database);
+    const v1_head = (try database.getSyncState(.v1)) orelse 0;
+    const v2_head = (try database.getSyncState(.v2)) orelse 0;
+    const use_v1 = v1_head >= v2_head;
+    const head = if (use_v1) v1_head else v2_head;
+    const head_hash = (if (use_v1) try database.getBlockHash(.v1, head) else try database.getBlockHash(.v2, head)) orelse
+        return try self.sendJsonResponse(conn, 200, "{\"status\":\"unavailable\",\"reason\":\"no_head_hash\"}");
+
+    var resolver = resolve_client.Resolver.init(rs.rpc_client, database, rs.chain_id, rs.ttl_s);
+    var trace = universal.Trace{ .allocator = self.allocator };
+    defer trace.deinit();
+    var lc = universal.LiveContext{
+        .resolver = &resolver,
+        .ur_address = rs.universal_resolver,
+        .block_num = head,
+        .block_hash = head_hash,
+        .now = zsys.timestamp(),
+        .registry = rs.registry,
+        .primary_verify_enabled = rs.primary_verify_enabled,
+        .trace = &trace,
+    };
+    const result = lc.resolveRecord(self.allocator, name, node, .addr) catch null;
+    defer if (result) |r| self.allocator.free(r);
+
+    var out: std.Io.Writer.Allocating = .init(self.allocator);
+    defer out.deinit();
+    const w = &out.writer;
+    const name_escaped = try json_utils.escapeString(self.allocator, name);
+    defer self.allocator.free(name_escaped);
+    var node_buf: [66]u8 = undefined;
+    try w.print("{{\"name\":\"{s}\",\"node\":\"{s}\",\"record\":\"addr\",\"block\":{d},", .{ name_escaped, node.toHexBuf(&node_buf), head });
+    if (result) |r| {
+        const esc = try json_utils.escapeString(self.allocator, r);
+        defer self.allocator.free(esc);
+        try w.print("\"result\":\"{s}\",", .{esc});
+    } else {
+        try w.writeAll("\"result\":null,");
+    }
+    try w.writeAll("\"steps\":[");
+    for (trace.steps.items, 0..) |st, i| {
+        if (i > 0) try w.writeAll(",");
+        const de = try json_utils.escapeString(self.allocator, st.detail);
+        defer self.allocator.free(de);
+        try w.print("{{\"step\":\"{s}\",\"detail\":\"{s}\"}}", .{ st.name, de });
+    }
+    try w.writeAll("]}");
+    try self.sendJsonResponse(conn, 200, out.written());
+}
+
 pub fn handleNameQuery(self: *Server, conn: http_util.Conn, path: []const u8) !void {
     // Extract name from path: /api/name/{name}
     const name_start = "/api/name/".len;
@@ -173,6 +247,125 @@ pub fn handleNameQuery(self: *Server, conn: http_util.Conn, path: []const u8) !v
     } else {
         try self.sendNotFound(conn);
     }
+}
+
+/// Aggregated profile: one GET returns the domain's core fields, its effective
+/// resolver's records (addr/contenthash/all texts), and the owner's primary
+/// name. Indexed data only — on-chain verification stays on the auth-gated
+/// /internal/verify-primary endpoint (a live RPC per public hit would be a DoS
+/// vector).
+pub fn handleProfileQuery(self: *Server, conn: http_util.Conn, path: []const u8) !void {
+    const prefix_len: usize = if (std.mem.startsWith(u8, path, "/api/profiles/")) "/api/profiles/".len else "/profiles/".len;
+    if (path.len <= prefix_len) {
+        return try self.sendBadRequest(conn, "Name parameter required");
+    }
+    var name_end = prefix_len;
+    while (name_end < path.len and path[name_end] != ' ' and path[name_end] != '?' and path[name_end] != '\r') {
+        name_end += 1;
+    }
+    const name = path[prefix_len..name_end];
+    validation.validateEnsName(name) catch {
+        return try self.sendBadRequest(conn, "Invalid name: length must be between 1 and 255 characters");
+    };
+
+    const nh = try @import("../types/hash.zig").namehash(self.allocator, name);
+    const database = try self.pool.acquire();
+    defer self.pool.release(database);
+
+    const row_opt = try database.getNameByNamehash(nh);
+    if (row_opt == null) {
+        return try self.sendJsonResponse(conn, 404, "{\"error\":\"name not found\"}");
+    }
+    var row = row_opt.?;
+    defer row.deinit(database.allocator);
+
+    // Same effective-resolver semantics as GraphQL: ENSIP-10 ancestor walk-up
+    // when the name has no resolver of its own.
+    const impl = @import("builders/impl.zig");
+    const resolver = impl.effectiveResolver(database, &row) catch row.resolver;
+
+    var out: std.Io.Writer.Allocating = .init(self.allocator);
+    defer out.deinit();
+    const w = &out.writer;
+
+    const name_escaped = try json_utils.escapeString(self.allocator, row.name orelse name);
+    defer self.allocator.free(name_escaped);
+    var nh_buf: [66]u8 = undefined;
+    var owner_buf: [42]u8 = undefined;
+    try w.print("{{\"name\":\"{s}\",\"namehash\":\"{s}\",\"owner\":\"{s}\",\"protocol\":\"{s}\",\"expiry\":{d}", .{
+        name_escaped,
+        row.namehash.toHexBuf(&nh_buf),
+        row.owner.toHexBuf(&owner_buf),
+        row.protocol.toString(),
+        row.expiry,
+    });
+
+    if (resolver.isZero()) {
+        try w.writeAll(",\"resolver\":null,\"address\":null,\"contenthash\":null,\"texts\":{}");
+    } else {
+        var resolver_buf: [42]u8 = undefined;
+        try w.print(",\"resolver\":\"{s}\"", .{resolver.toHexBuf(&resolver_buf)});
+
+        if (database.getAddressRecord(resolver, nh, 60) catch null) |a| {
+            defer database.allocator.free(a);
+            const esc = try json_utils.escapeString(self.allocator, a);
+            defer self.allocator.free(esc);
+            try w.print(",\"address\":\"{s}\"", .{esc});
+        } else {
+            try w.writeAll(",\"address\":null");
+        }
+
+        if (database.getContentHashRecord(resolver, nh) catch null) |ch| {
+            defer database.allocator.free(ch);
+            const esc = try json_utils.escapeString(self.allocator, ch);
+            defer self.allocator.free(esc);
+            try w.print(",\"contenthash\":\"{s}\"", .{esc});
+        } else {
+            try w.writeAll(",\"contenthash\":null");
+        }
+
+        try w.writeAll(",\"texts\":{");
+        const keys = database.getTextRecordKeys(resolver, nh) catch &[_][]const u8{};
+        defer {
+            for (keys) |k| database.allocator.free(k);
+            if (keys.len > 0) database.allocator.free(keys);
+        }
+        var first = true;
+        for (keys) |k| {
+            const v = (database.getTextRecord(resolver, nh, k) catch null) orelse continue;
+            defer database.allocator.free(v);
+            const ek = try json_utils.escapeString(self.allocator, k);
+            defer self.allocator.free(ek);
+            const ev = try json_utils.escapeString(self.allocator, v);
+            defer self.allocator.free(ev);
+            if (!first) try w.writeAll(",");
+            try w.print("\"{s}\":\"{s}\"", .{ ek, ev });
+            first = false;
+        }
+        try w.writeAll("}");
+    }
+
+    // The OWNER's primary (reverse) name, preferring V2 claims like GraphQL.
+    const primary_nh = blk: {
+        if (database.getReverseRecordNamehash(.v2, row.owner) catch null) |p| break :blk p;
+        if (database.getReverseRecordNamehash(.v1, row.owner) catch null) |p| break :blk p;
+        break :blk null;
+    };
+    if (primary_nh) |pnh| {
+        if (database.getLatestNameByNamehash(pnh) catch null) |pname| {
+            defer database.allocator.free(pname);
+            const esc = try json_utils.escapeString(self.allocator, pname);
+            defer self.allocator.free(esc);
+            try w.print(",\"ownerPrimaryName\":\"{s}\"", .{esc});
+        } else {
+            try w.writeAll(",\"ownerPrimaryName\":null");
+        }
+    } else {
+        try w.writeAll(",\"ownerPrimaryName\":null");
+    }
+
+    try w.writeAll("}");
+    try self.sendJsonResponse(conn, 200, out.written());
 }
 
 pub fn handleOwnerQuery(self: *Server, conn: http_util.Conn, path: []const u8) !void {
