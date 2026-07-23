@@ -744,6 +744,27 @@ pub fn build(b: *std.Build) void {
     resolve_test_step.dependOn(&run_resolve_tests.step);
     test_step.dependOn(&run_resolve_tests.step);
 
+    // Fuzz lane: hostile-input decoders/parsers (smoke-run in test-all; real
+    // exploration via `zig build test-fuzz --fuzz`). Same src-rooted module trio.
+    const fuzz_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ens_normalize", .module = ens_normalize.module("z_ens_normalize") },
+                .{ .name = "eth", .module = eth_module },
+                .{ .name = "pg", .module = pg_module },
+            },
+        }),
+    });
+    fuzz_tests.root_module.link_libc = true;
+    fuzz_tests.root_module.linkSystemLibrary("sqlite3", .{});
+    const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
+    run_fuzz_tests.setCwd(b.path("."));
+    const fuzz_test_step = b.step("test-fuzz", "Run fuzz targets (smoke; add --fuzz to explore)");
+    fuzz_test_step.dependOn(&run_fuzz_tests.step);
+
     // GraphQL conformance harness: drives the real GraphQLHandler end-to-end against
     // a seeded in-memory DB (deterministic golden responses). Rooted in tests/ and
     // reaches the handler + Database via the SAME `lib` module `helpers` uses, so
@@ -805,4 +826,5 @@ pub fn build(b: *std.Build) void {
     test_all_step.dependOn(resolve_test_step);
     test_all_step.dependOn(conformance_test_step);
     test_all_step.dependOn(manifest_test_step);
+    test_all_step.dependOn(fuzz_test_step);
 }
