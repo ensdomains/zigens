@@ -39,6 +39,30 @@ const PER_BLOCK_LINEAGE_MAX: u64 = 128;
 
 const BlockLineage = struct { number: u64, hash: Hash, parent_hash: Hash };
 
+/// Classify and absorb a sync-iteration error so the run loop never dies on a
+/// transient failure: network errors wait for connectivity to return (the RPC
+/// being down for hours must stall indexing, not kill it); anything else gets a
+/// bounded pause. The cursor is unchanged, so the next iteration resumes where
+/// this one failed.
+fn handleSyncError(self: *Indexer, protocol: models.Protocol, err: anyerror) void {
+    switch (err) {
+        error.HttpError, error.NetworkUnreachable, error.ConnectionRefused, error.ConnectionTimedOut, error.ConnectionResetByPeer, error.WriteFailed, error.BrokenPipe, error.EndOfStream, error.UnexpectedReadFailure => {
+            std.log.warn("{s} network error detected: {}, waiting for connection...", .{ protocol.toString(), err });
+            self.v1_network_health.waitForHealthy();
+            std.log.info("{s} network restored, continuing...", .{protocol.toString()});
+            // 1s breather before retry. Bounds log volume during a sustained
+            // outage and prevents the tight spin we'd otherwise hit when
+            // `waitForHealthy` (which uses a fresh http.Client) reports healthy
+            // while the indexer's pooled client is still failing.
+            _ = shutdown.sleepInterruptible(std.time.ns_per_s);
+        },
+        else => {
+            std.log.err("{s} indexing error: {}", .{ protocol.toString(), err });
+            _ = shutdown.sleepInterruptible(constants.Timing.error_recovery_delay_ms * std.time.ns_per_ms);
+        },
+    }
+}
+
 pub fn start(self: *Indexer) !void {
     std.log.info("Indexer starting...", .{});
 
@@ -55,10 +79,16 @@ pub fn start(self: *Indexer) !void {
 
     while (!self.should_stop.load(.acquire) and !shutdown.isRequested()) {
         // Index V1 first (SQLite doesn't support concurrent writes from different threads)
-        try self.indexProtocol(.v1, self.v1_client);
+        self.indexProtocol(.v1, self.v1_client) catch |err| {
+            handleSyncError(self, .v1, err);
+            continue;
+        };
 
         // Then index V2
-        try self.indexProtocol(.v2, self.v1_client);
+        self.indexProtocol(.v2, self.v1_client) catch |err| {
+            handleSyncError(self, .v2, err);
+            continue;
+        };
 
         // After first successful sync of both chains, recreate indexes and start webhook workers
         if (!self.initial_sync_complete.load(.acquire)) {
@@ -97,7 +127,7 @@ pub fn start(self: *Indexer) !void {
 
             if (self.webhook_manager) |wm| {
                 std.log.info("Initial sync complete - starting 8 webhook workers", .{});
-                try wm.startWorkers(8);
+                wm.startWorkers(8) catch |err| std.log.err("webhook workers failed to start: {}", .{err});
             }
         }
 
@@ -164,7 +194,6 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
     }
 
     const client = self.getClient(protocol);
-    var network_health = &self.v1_network_health;
 
     // Drop non-essential indexes for faster bulk inserts during initial sync
     if (!self.initial_sync_complete.load(.acquire)) {
@@ -199,7 +228,7 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
 
                 if (self.webhook_manager) |wm| {
                     std.log.info("Initial sync complete - starting webhook workers", .{});
-                    try wm.startWorkers(1);
+                    wm.startWorkers(1) catch |err| std.log.err("webhook workers failed to start: {}", .{err});
                 }
 
                 // Backfill pre-migration names after initial sync completes.
@@ -229,30 +258,8 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
                 }
             }
         } else |err| {
-            // Handle errors gracefully based on type
-            switch (err) {
-                error.HttpError, error.NetworkUnreachable, error.ConnectionRefused, error.ConnectionTimedOut, error.ConnectionResetByPeer, error.WriteFailed, error.BrokenPipe, error.EndOfStream, error.UnexpectedReadFailure => {
-                    // Network error - wait for connection to be restored.
-                    std.log.warn("{s} network error detected: {}, waiting for connection...", .{ protocol.toString(), err });
-                    network_health.waitForHealthy();
-                    std.log.info("{s} network restored, continuing...", .{protocol.toString()});
-                    // 1s breather before retry. Bounds log volume during a
-                    // sustained outage and prevents the tight spin we'd
-                    // otherwise hit when `network_health.waitForHealthy()`
-                    // (which uses a fresh http.Client) reports healthy
-                    // while the indexer's pooled client is still failing.
-                    // Inner `executeHttpRequest` retries already cover
-                    // transient TLS/socket recovery, so anything beyond
-                    // 1s is redundant.
-                    _ = shutdown.sleepInterruptible(std.time.ns_per_s);
-                    continue;
-                },
-                else => {
-                    // Other errors (database, parsing, etc) - log and wait briefly
-                    std.log.err("{s} indexing error: {}", .{ protocol.toString(), err });
-                    _ = shutdown.sleepInterruptible(constants.Timing.error_recovery_delay_ms * std.time.ns_per_ms); // Wait 5s for non-network errors
-                },
-            }
+            handleSyncError(self, protocol, err);
+            continue;
         }
 
         // Best-effort finality signalling (Task 09); no-op unless FINALITY_ENABLED.
