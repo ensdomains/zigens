@@ -203,11 +203,10 @@ test "complexity limits can be customized" {
     try testing.expect(lenient_analysis.isValid());
 }
 
-test "variables do not affect complexity calculation" {
+test "first: $var resolves from runtime variables, worst-case without them" {
     const allocator = testing.allocator;
 
-    // Query with variables
-    const query =
+    const var_query =
         \\query($limit: Int!) {
         \\  domains(first: $limit) {
         \\    name
@@ -215,18 +214,38 @@ test "variables do not affect complexity calculation" {
         \\  }
         \\}
     ;
+    const inline_query =
+        \\query {
+        \\  domains(first: 2) {
+        \\    name
+        \\    owner { id }
+        \\  }
+        \\}
+    ;
 
-    var document = try parser.parseQuery(allocator, query);
-    defer document.deinit(allocator);
+    var var_doc = try parser.parseQuery(allocator, var_query);
+    defer var_doc.deinit(allocator);
+    var inline_doc = try parser.parseQuery(allocator, inline_query);
+    defer inline_doc.deinit(allocator);
 
     const limits = complexity.ComplexityLimits{};
-    var analyzer = complexity.ComplexityAnalyzer.init(allocator, limits);
-    const analysis = try analyzer.analyzeDocument(&document, null);
 
-    // Variables are not resolved during complexity analysis
-    // So the multiplier will be 1 (default)
-    try testing.expect(analysis.isValid());
-    try testing.expect(analysis.cost < 10);
+    // With the runtime value bound, the parameterized query costs exactly what
+    // the inline literal costs — benign clients with small pages pay small cost.
+    var parsed_vars = try std.json.parseFromSlice(std.json.Value, allocator, "{\"limit\":2}", .{});
+    defer parsed_vars.deinit();
+    var var_analyzer = complexity.ComplexityAnalyzer.init(allocator, limits);
+    const var_analysis = try var_analyzer.analyzeDocument(&var_doc, parsed_vars.value);
+    var inline_analyzer = complexity.ComplexityAnalyzer.init(allocator, limits);
+    const inline_analysis = try inline_analyzer.analyzeDocument(&inline_doc, null);
+    try testing.expectEqual(inline_analysis.cost, var_analysis.cost);
+
+    // Without a value the analyzer must assume the worst case, not multiplier 1 —
+    // otherwise parameterizing every page size bypasses cost analysis entirely.
+    var blind_analyzer = complexity.ComplexityAnalyzer.init(allocator, limits);
+    const blind_analysis = try blind_analyzer.analyzeDocument(&var_doc, null);
+    try testing.expect(blind_analysis.cost >= limits.max_pagination_assumption);
+    try testing.expect(blind_analysis.cost > var_analysis.cost);
 }
 
 test "complexity error message format" {
@@ -280,26 +299,52 @@ test "complexity error message format" {
     }
 }
 
-test "pagination argument caps at 100" {
+test "pagination multiplier is uncapped: oversized first pays proportionally" {
     const allocator = testing.allocator;
 
-    // Query with excessive pagination
-    const query =
+    const big_query =
         \\query {
         \\  domains(first: 10000) {
         \\    name
         \\  }
         \\}
     ;
+    const page_query =
+        \\query {
+        \\  domains(first: 100) {
+        \\    name
+        \\  }
+        \\}
+    ;
 
-    var document = try parser.parseQuery(allocator, query);
-    defer document.deinit(allocator);
+    var big_doc = try parser.parseQuery(allocator, big_query);
+    defer big_doc.deinit(allocator);
+    var page_doc = try parser.parseQuery(allocator, page_query);
+    defer page_doc.deinit(allocator);
+
+    const ceiling_query =
+        \\query {
+        \\  domains(first: 1000) {
+        \\    name
+        \\  }
+        \\}
+    ;
+    var ceiling_doc = try parser.parseQuery(allocator, ceiling_query);
+    defer ceiling_doc.deinit(allocator);
 
     const limits = complexity.ComplexityLimits{};
-    var analyzer = complexity.ComplexityAnalyzer.init(allocator, limits);
-    const analysis = try analyzer.analyzeDocument(&document, null);
+    var big_analyzer = complexity.ComplexityAnalyzer.init(allocator, limits);
+    const big_analysis = try big_analyzer.analyzeDocument(&big_doc, null);
+    var page_analyzer = complexity.ComplexityAnalyzer.init(allocator, limits);
+    const page_analysis = try page_analyzer.analyzeDocument(&page_doc, null);
+    var ceiling_analyzer = complexity.ComplexityAnalyzer.init(allocator, limits);
+    const ceiling_analysis = try ceiling_analyzer.analyzeDocument(&ceiling_doc, null);
 
-    // Multiplier should be capped at 100, not 10000
-    // So cost should be reasonable (100 × 2 fields = 200)
-    try testing.expect(analysis.cost < 300);
+    // Page size prices proportionally up to max_pagination_assumption (1000),
+    // then clamps: `first: 10000` costs exactly what `first: 1000` costs, and
+    // both dwarf a default-page query. A default-page query stays valid.
+    try testing.expectEqual(ceiling_analysis.cost, big_analysis.cost);
+    try testing.expect(big_analysis.cost >= limits.max_pagination_assumption);
+    try testing.expect(big_analysis.cost > page_analysis.cost);
+    try testing.expect(page_analysis.isValid());
 }

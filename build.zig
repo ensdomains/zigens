@@ -288,6 +288,21 @@ pub fn build(b: *std.Build) void {
     // Also add to the main graphql test step
     graphql_test_step.dependOn(&run_graphql_features_tests.step);
 
+    // Cost-model integration tests: real queries through the parser + analyzer,
+    // proving the DoS governor's verdicts end-to-end (not just unit-level).
+    const complexity_integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/graphql/complexity_integration_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "graphql", .module = graphql_lib_mod },
+            },
+        }),
+    });
+    const run_complexity_integration_tests = b.addRunArtifact(complexity_integration_tests);
+    graphql_test_step.dependOn(&run_complexity_integration_tests.step);
+
     // Filter logic tests
     const filter_tests = b.addTest(.{
         .root_module = b.createModule(.{
