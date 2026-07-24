@@ -53,7 +53,7 @@ pub fn handleLegacyAddrChanged(self: *Indexer, protocol: models.Protocol, resolv
         protocol,
         log.block_number,
         log.transaction_hash,
-        zsys.timestamp(),
+        try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     );
 }
 
@@ -95,7 +95,7 @@ pub fn handleLegacyContentChanged(self: *Indexer, protocol: models.Protocol, res
         protocol,
         log.block_number,
         log.transaction_hash,
-        zsys.timestamp(),
+        try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     );
 
     // Store event
@@ -156,7 +156,7 @@ pub fn handleAddressChanged(self: *Indexer, protocol: models.Protocol, resolver:
         protocol,
         log.block_number,
         log.transaction_hash,
-        zsys.timestamp(),
+        try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     );
 
     // Store event and trigger webhooks
@@ -217,7 +217,7 @@ pub fn handleContentHashChanged(self: *Indexer, protocol: models.Protocol, resol
         protocol,
         log.block_number,
         log.transaction_hash,
-        zsys.timestamp(),
+        try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     );
 
     // Store event and trigger webhooks
@@ -309,7 +309,7 @@ pub fn handleTextChanged(self: *Indexer, protocol: models.Protocol, resolver: Ad
             protocol,
             log.block_number,
             log.transaction_hash,
-            zsys.timestamp(),
+            try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
         );
     }
 
@@ -395,7 +395,7 @@ pub fn handleLegacyTextChanged(self: *Indexer, protocol: models.Protocol, resolv
             protocol,
             log.block_number,
             log.transaction_hash,
-            zsys.timestamp(),
+            try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
         );
     }
 
@@ -463,7 +463,7 @@ pub fn handleAuthorisationChanged(self: *Indexer, protocol: models.Protocol, res
         log.block_number,
         log.transaction_hash,
         log.log_index,
-        self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     ) catch |err| {
         std.log.warn("Failed to store resolver authorisation: {}", .{err});
     };
@@ -670,7 +670,7 @@ pub fn handleDnsRecordChanged(self: *Indexer, protocol: models.Protocol, resolve
         log.block_number,
         log.transaction_hash,
         log.log_index,
-        self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     ) catch |err| {
         std.log.warn("Failed to store resolver DNS record: {}", .{err});
     };
@@ -752,7 +752,7 @@ pub fn handleDnsZonehashChanged(self: *Indexer, protocol: models.Protocol, resol
         log.block_number,
         log.transaction_hash,
         log.log_index,
-        self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     ) catch |err| {
         std.log.warn("Failed to store resolver DNS zonehash: {}", .{err});
     };
@@ -805,7 +805,7 @@ pub fn handleABIChanged(self: *Indexer, protocol: models.Protocol, resolver: Add
         protocol,
         log.block_number,
         log.transaction_hash,
-        self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     ) catch |err| {
         std.log.warn("Failed to store resolver ABI: {}", .{err});
     };
@@ -868,7 +868,7 @@ pub fn handlePubkeyChanged(self: *Indexer, protocol: models.Protocol, resolver: 
         protocol,
         log.block_number,
         log.transaction_hash,
-        self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     ) catch |err| {
         std.log.warn("Failed to store resolver pubkey: {}", .{err});
     };
@@ -931,7 +931,7 @@ pub fn handleNameChanged(self: *Indexer, protocol: models.Protocol, resolver: Ad
         protocol,
         log.block_number,
         log.transaction_hash,
-        self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     ) catch |err| {
         std.log.warn("Failed to store resolver name: {}", .{err});
     };
@@ -1001,7 +1001,7 @@ pub fn handleInterfaceChanged(self: *Indexer, protocol: models.Protocol, resolve
         protocol,
         log.block_number,
         log.transaction_hash,
-        self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     ) catch |err| {
         std.log.warn("Failed to store resolver interface: {}", .{err});
     };
@@ -1081,7 +1081,7 @@ pub fn handleVersionChanged(self: *Indexer, protocol: models.Protocol, resolver:
         protocol,
         log.block_number,
         log.transaction_hash,
-        self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     ) catch |err| {
         std.log.warn("Failed to store resolver version: {}", .{err});
     };
@@ -1161,7 +1161,7 @@ pub fn handleAliasChanged(self: *Indexer, protocol: models.Protocol, resolver: A
             protocol,
             log.block_number,
             log.transaction_hash,
-            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+            try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
         ) catch |err| {
             std.log.warn("Failed to store resolver alias: {}", .{err});
         };

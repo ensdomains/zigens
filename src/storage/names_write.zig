@@ -218,13 +218,15 @@ pub fn updateResolvedAddressToNull(db: *Database, namehash: Hash) !void {
 
 /// Update TTL for a name (V1 ENS Registry NewTTL event).
 /// No-op if no row exists with this namehash — consistent with NewResolver:
-/// V1 NewTTL on a non-existent name has nothing to attach to.
+/// V1 NewTTL on a non-existent name has nothing to attach to. TTL is an
+/// arbitrary caller-set u64 on-chain; values beyond i64 collapse to the 0
+/// sentinel like expiry does.
 pub fn updateNameTTL(db: *Database, namehash: Hash, ttl: u64) !void {
     try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     var q = try Query.initCached(db, "UPDATE names SET ttl = ?, updated_at = ? WHERE namehash = ?");
     defer q.deinit();
 
-    try q.bindInt64(@intCast(ttl));
+    try q.bindInt64(safeU64ToI64(ttl));
     try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();

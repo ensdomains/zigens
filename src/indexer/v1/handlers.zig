@@ -100,7 +100,7 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
         try q.bindInt64(@intCast(log.block_number));
         try q.bindTextStatic(tx_hash_hex);
         try q.bindInt64(@intCast(log.log_index));
-        try q.bindInt64(zsys.timestamp());
+        try q.bindInt64(try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp));
         try q.exec();
 
         // Sibling parity: Transfer/NewResolver/NewTTL emit events rows in this
@@ -186,6 +186,7 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
     // Create or update the name record
     const registry = self.config.v1_contracts.ens_registry;
     const now = zsys.timestamp();
+    const blk_ts = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
 
     if (try names_storage.getNameByNamehash(self.database, subdomain_namehash)) |existing| {
         // Name already exists — update owner
@@ -239,8 +240,8 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
             .registry_locked = false,
             .migrated = false,
             .created_block = log.block_number,
-            .created_at = now,
-            .registered_at = now,
+            .created_at = blk_ts,
+            .registered_at = blk_ts,
             .updated_block = log.block_number,
             .updated_at = now,
             .is_wrapped = false,
@@ -383,7 +384,7 @@ pub fn handleV1NewResolver(self: *Indexer, protocol: models.Protocol, log: rpc.L
                 node_hex,
                 row_mut.name orelse "[unknown]",
                 log.block_number,
-                self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+                try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
             ) catch |err| {
                 std.log.debug("upsertResolverEntity failed: {}", .{err});
             };
@@ -907,8 +908,8 @@ fn writeBaseRegistrarRegistration(self: *Indexer, protocol: models.Protocol, log
             .registry_locked = false, // V1 names don't have registry locking
             .migrated = false, // This is a native V1 name
             .created_block = log.block_number,
-            .created_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-            .registered_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+            .created_at = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+            .registered_at = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
             .updated_block = log.block_number,
             .updated_at = zsys.timestamp(),
             .is_wrapped = false, // Not wrapped initially
@@ -939,7 +940,7 @@ fn writeBaseRegistrarRegistration(self: *Indexer, protocol: models.Protocol, log
             label,
             self.root_name,
             owner,
-            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+            try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
             if (expiry_u64 == 0) null else expiry_u64,
             log.block_number,
             log.transaction_hash,
@@ -1023,8 +1024,8 @@ fn writeBaseRegistrarRegistration(self: *Indexer, protocol: models.Protocol, log
             .registry_locked = false,
             .migrated = false,
             .created_block = log.block_number,
-            .created_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-            .registered_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+            .created_at = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+            .registered_at = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
             .updated_block = log.block_number,
             .updated_at = zsys.timestamp(),
             .is_wrapped = false,
@@ -1051,7 +1052,7 @@ fn writeBaseRegistrarRegistration(self: *Indexer, protocol: models.Protocol, log
             placeholder_label,
             self.root_name,
             owner,
-            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+            try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
             if (expiry_u64 == 0) null else expiry_u64,
             log.block_number,
             log.transaction_hash,
@@ -1661,7 +1662,7 @@ pub fn handleBasenamesRegistrarNameRegisteredWithRecord(self: *Indexer, protocol
             node_hex,
             row_mut.name orelse "[unknown]",
             log.block_number,
-            self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+            try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
         ) catch |err| {
             std.log.debug("upsertResolverEntity failed: {}", .{err});
         };
@@ -1698,7 +1699,7 @@ pub fn handleV1ReverseClaimed(self: *Indexer, protocol: models.Protocol, log: rp
     // answered by a point query rather than scanning the events feed. Note: this
     // does NOT prove forward resolution; consumers must round-trip via the
     // resolver's addr() to verify primary-name claims (per ENSIP-3).
-    const block_timestamp = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
+    const block_timestamp = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
     self.database.upsertReverseRecord(
         protocol,
         addr,
@@ -1753,7 +1754,7 @@ pub fn handleV2NameForAddrChanged(self: *Indexer, protocol: models.Protocol, log
     else
         Hash.zero;
 
-    const block_timestamp = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
+    const block_timestamp = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
     self.database.upsertReverseRecord(
         protocol,
         addr,

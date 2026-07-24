@@ -119,12 +119,13 @@ pub fn resetBlockHashTracking(self: *Indexer) void {
     self.last_seen_block_number = 0;
 }
 
-/// Get block timestamp, using log's timestamp if available, then cache, then RPC fallback
-/// If known_timestamp is provided (from RPC provider's blockTimestamp field), use it directly
-pub fn getBlockTimestamp(self: *Indexer, protocol: models.Protocol, block_number: u64, known_timestamp: ?u64) i64 {
+/// Get block timestamp: log-provided value if available, then cache, then RPC.
+/// Errors instead of fabricating a time — a wall-clock substitute would poison
+/// historical rows permanently; failing lets the batch retry.
+pub fn getBlockTimestamp(self: *Indexer, protocol: models.Protocol, block_number: u64, known_timestamp: ?u64) !i64 {
     // If provider included timestamp in log response, use it directly (fastest path)
     if (known_timestamp) |ts| {
-        const timestamp: i64 = @intCast(ts);
+        const timestamp = std.math.cast(i64, ts) orelse return error.InvalidBlockTimestamp;
         // Also cache it for other events in the same block
         self.block_timestamp_cache.put(block_number, timestamp) catch {};
         return timestamp;
@@ -138,11 +139,11 @@ pub fn getBlockTimestamp(self: *Indexer, protocol: models.Protocol, block_number
     // Fetch from RPC (slowest path)
     const client = self.getClient(protocol);
     const block = client.getBlockByNumber(block_number, false) catch |err| {
-        std.log.warn("Failed to fetch block {d} timestamp: {}, using current time", .{ block_number, err });
-        return zsys.timestamp();
+        std.log.warn("Failed to fetch block {d} timestamp: {}", .{ block_number, err });
+        return err;
     };
 
-    const timestamp: i64 = @intCast(block.timestamp);
+    const timestamp = std.math.cast(i64, block.timestamp) orelse return error.InvalidBlockTimestamp;
 
     // Cache the result
     self.block_timestamp_cache.put(block_number, timestamp) catch {

@@ -24,12 +24,11 @@ pub fn recordAccountObservation(self: *Indexer, protocol: models.Protocol, addr:
     var key_buf: [48]u8 = undefined;
     const key = std.fmt.bufPrint(&key_buf, "{s}:{s}", .{ protocol.toString(), addr_hex }) catch addr_hex;
     if (self.account_obs_cache.contains(key)) return;
-    self.database.upsertAccount(
-        protocol,
-        addr_hex,
-        log.block_number,
-        self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-    ) catch |err| {
+    const ts = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp) catch |err| {
+        std.log.debug("observeAccount timestamp fetch failed: {}", .{err});
+        return; // best-effort — retried on the next observation of this address
+    };
+    self.database.upsertAccount(protocol, addr_hex, log.block_number, ts) catch |err| {
         std.log.debug("upsertAccount failed: {}", .{err});
         return; // don't cache on failure — retry on the next observation
     };
@@ -61,7 +60,7 @@ pub fn emitEvent(
         .name = name,
         .namehash = namehash,
         .data = data,
-        .timestamp = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        .timestamp = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     };
     try Indexer.insertEventAndNotify(self, event);
 }
