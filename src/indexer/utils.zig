@@ -110,6 +110,23 @@ fn dispatchEntryLessThan(_: void, a: DispatchEntry, b: DispatchEntry) bool {
     return a.log.log_index < b.log.log_index;
 }
 
+/// Malformed-payload errors from decoding a hostile or legacy event shape (old
+/// contract variants share topic names with different ABIs). One undecodable
+/// event must be skipped with its coordinates logged, never allowed to abort
+/// the batch — a deterministic poison log would pin the sync cursor forever.
+/// Database and I/O errors still propagate: skipping those would drop valid data.
+pub fn isMalformedEventError(err: anyerror) bool {
+    return switch (err) {
+        error.DataTooShort, error.ArrayDataTooShort => true,
+        else => false,
+    };
+}
+
+pub fn skipMalformedEvent(log: rpc.Log, err: anyerror) void {
+    var tx_buf: [66]u8 = undefined;
+    std.log.warn("skipping undecodable event at block {d} tx {s} log_index {d}: {}", .{ log.block_number, log.transaction_hash.toHexBuf(&tx_buf), log.log_index, err });
+}
+
 /// Sort entries by (block_number, log_index) and dispatch each to its handler.
 /// Preserves on-protocol event order across different event types within a batch.
 pub fn dispatchOrdered(
@@ -120,6 +137,9 @@ pub fn dispatchOrdered(
     std.mem.sort(DispatchEntry, entries, {}, dispatchEntryLessThan);
     for (entries) |entry| {
         self.markEventBlock(protocol, entry.log.block_number);
-        try entry.handler(self, protocol, entry.log);
+        entry.handler(self, protocol, entry.log) catch |err| {
+            if (!isMalformedEventError(err)) return err;
+            skipMalformedEvent(entry.log, err);
+        };
     }
 }

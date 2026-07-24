@@ -552,7 +552,10 @@ pub fn indexResolverEvents(self: *Indexer, protocol: models.Protocol, client: *r
         self.markEventBlock(protocol, log.block_number);
         inline for (Indexer.RESOLVER_EVENTS) |event_cfg| {
             if (event_sig.eql(event_cfg.event_hash)) {
-                try event_cfg.handler(self, protocol, resolver, log);
+                event_cfg.handler(self, protocol, resolver, log) catch |err| {
+                    if (!utils.isMalformedEventError(err)) return err;
+                    utils.skipMalformedEvent(log, err);
+                };
                 processed_count += 1;
                 break;
             }
