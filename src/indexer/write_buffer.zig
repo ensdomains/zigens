@@ -302,21 +302,6 @@ pub const WriteBuffer = struct {
     }
 
     // ========================================================================
-    // READ OPERATIONS (check buffer, return null if not found)
-    // ========================================================================
-
-    /// Look up a buffered name by namehash. Returns the record if it was INSERT'd
-    /// in this chunk. For update-only entries, returns null (caller should query DB).
-    pub fn getNameByNamehash(self: *WriteBuffer, namehash: Hash) ?*models.Name {
-        if (self.names.getPtr(namehash.bytes)) |bn| {
-            if (bn.is_new) {
-                return &bn.record.?;
-            }
-        }
-        return null;
-    }
-
-    // ========================================================================
     // FLUSH — Write all buffered data to database
     // ========================================================================
 

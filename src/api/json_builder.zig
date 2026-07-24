@@ -152,9 +152,9 @@ pub fn buildEntityJson(
         // or `name { foo }` on a String field).
         if (field.selections.len > 0) {
             for (config.field_defs) |def| {
-                if (std.mem.eql(u8, def.name, field.name) and def.field_type != .custom) {
-                    // FieldDef.custom = object/list writer (sub-selections honored by writer).
-                    // All other types (including custom_scalar) are scalars and must reject sub-selections.
+                if (std.mem.eql(u8, def.name, field.name)) {
+                    // All FieldDef types (including custom_scalar) are scalars and must
+                    // reject sub-selections; object/list fields go through NestedFieldDef.
                     return error.SubSelectionOnScalar;
                 }
             }

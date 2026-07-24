@@ -47,7 +47,6 @@ pub const getAllNames = names_filter.getAllNames;
 pub const getFilteredNames = names_filter.getFilteredNames;
 pub const getFilteredNamesKeyset = names_filter.getFilteredNamesKeyset;
 pub const KeysetAnchor = names_filter.KeysetAnchor;
-pub const KeysetResult = names_filter.KeysetResult;
 pub const getAllNamesWithOrder = names_filter.getAllNamesWithOrder;
 pub const getFilteredNameCount = names_filter.getFilteredNameCount;
 

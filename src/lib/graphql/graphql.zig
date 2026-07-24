@@ -5,8 +5,7 @@
 //! - Query executor with resolver pattern
 //! - Relay-spec cursor pagination
 //! - Query complexity analysis for DoS protection
-//! - Table-driven field definitions
-//! - JSON response building
+//! - JSON string escaping for response writers
 //!
 //! Usage:
 //! ```zig
@@ -35,7 +34,6 @@ pub const pagination = @import("pagination.zig");
 pub const complexity = @import("complexity.zig");
 pub const metrics = @import("metrics.zig");
 pub const fields = @import("fields.zig");
-pub const json_builder = @import("json_builder.zig");
 
 // ============================================================================
 // Parser Types
@@ -95,60 +93,11 @@ pub const ComplexityAnalysis = complexity.ComplexityAnalysis;
 pub const ComplexityAnalyzer = complexity.ComplexityAnalyzer;
 
 // ============================================================================
-// DataLoader Types
+// JSON Escaping
 // ============================================================================
-
-/// Cache statistics
-
-// ============================================================================
-// Field Definition Types
-// ============================================================================
-
-/// Field value types
-pub const FieldType = fields.FieldType;
-
-/// Field value union
-pub const FieldValue = fields.FieldValue;
-
-/// Field definition for table-driven field handling
-pub const FieldDef = fields.FieldDef;
-
-/// Field getter function type
-pub const FieldGetter = fields.FieldGetter;
-
-/// Custom writer function type
-pub const CustomWriter = fields.CustomWriter;
 
 /// JSON string escape utility
 pub const escapeJsonString = fields.escapeJsonString;
-
-/// Handle a field from a field definition table
-pub const handleFieldFromTable = fields.handleFieldFromTable;
-
-// ============================================================================
-// JSON Builder Types
-// ============================================================================
-
-/// Maximum query depth constant
-pub const MAX_QUERY_DEPTH = json_builder.MAX_QUERY_DEPTH;
-
-/// Context for nested field resolution
-pub const NestedContext = json_builder.NestedContext;
-
-/// Nested field handler function type
-pub const NestedHandler = json_builder.NestedHandler;
-
-/// Nested field definition
-pub const NestedFieldDef = json_builder.NestedFieldDef;
-
-/// Entity configuration for JSON building
-pub const EntityConfig = json_builder.EntityConfig;
-
-/// Build JSON for an entity
-pub const buildEntityJson = json_builder.buildEntityJson;
-
-/// Build JSON array for a list of entities
-pub const buildEntityArrayJson = json_builder.buildEntityArrayJson;
 
 // ============================================================================
 // Tests

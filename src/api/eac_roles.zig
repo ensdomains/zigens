@@ -29,10 +29,6 @@ pub const ContractKind = models.EACContractKind;
 /// which is exactly this value.
 pub const ALL_ROLES: u256 = 0x1111111111111111111111111111111111111111111111111111111111111111;
 
-/// `ADMIN_ROLES` mask from `EACBaseRolesLib` — only the upper 128 bits (the 32
-/// admin nybbles) set.
-pub const ADMIN_ROLES: u256 = 0x1111111111111111111111111111111100000000000000000000000000000000;
-
 /// Number of admin role nybbles / the bit shift separating a regular role from
 /// its admin counterpart.
 const ADMIN_SHIFT: u9 = 128;

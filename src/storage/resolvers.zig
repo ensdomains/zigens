@@ -15,7 +15,6 @@ const Hash = @import("../types/hash.zig").Hash;
 const entity = @import("resolver_entity.zig");
 pub const upsertResolverEntity = entity.upsertResolverEntity;
 pub const getResolverEntityCount = entity.getResolverEntityCount;
-pub const ResolverEntity = entity.ResolverEntity;
 pub const ResolverEntityFilters = entity.ResolverEntityFilters;
 pub const ResolverEntitySortField = entity.ResolverEntitySortField;
 pub const getFilteredResolverEntities = entity.getFilteredResolverEntities;

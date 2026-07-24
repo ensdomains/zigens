@@ -244,73 +244,13 @@ pub const CursorCodec = struct {
     }
 };
 
-/// Build a connection from a slice of items with integer IDs.
+/// Build a connection from a slice of items with string IDs.
 ///
 /// `has_more` must be computed by the caller from the pre-trim fetch result
 /// (typically: fetch limit+1 items, `has_more = fetched.len > limit`, then
 /// pass the trimmed limit-sized slice here). Inferring has_more from `items.len ==
 /// params.limit` after trimming is ambiguous — it can't distinguish "end of data"
 /// from "more available" when the dataset size is an exact multiple of limit.
-pub fn buildConnectionInt(
-    comptime T: type,
-    allocator: std.mem.Allocator,
-    items: []const T,
-    params: PaginationParams,
-    has_more: bool,
-    /// Extract ID from item (for cursor generation)
-    getId: fn (T) i64,
-    /// Optional total count
-    total_count: ?usize,
-) !Connection(T) {
-    if (items.len == 0) {
-        // No edges, but `has_more` and the cursor still inform whether there's data
-        // beyond what was returned. With `first: 0` (or any limit that intentionally
-        // returns zero edges), pageInfo must still surface the existence of more rows.
-        return Connection(T){
-            .edges = &[_]Edge(T){},
-            .page_info = PageInfo{
-                .has_next_page = if (params.direction == .forward) has_more else (params.cursor != null),
-                .has_previous_page = if (params.direction == .backward) has_more else (params.cursor != null),
-                .start_cursor = null,
-                .end_cursor = null,
-            },
-            .total_count = total_count,
-        };
-    }
-
-    // Build edges with cursors
-    const edges = try allocator.alloc(Edge(T), items.len);
-    errdefer {
-        for (edges) |edge| {
-            allocator.free(edge.cursor);
-        }
-        allocator.free(edges);
-    }
-
-    for (items, 0..) |item, i| {
-        const id = getId(item);
-        edges[i] = Edge(T){
-            .cursor = try CursorCodec.encodeInt(allocator, id),
-            .node = item,
-        };
-    }
-
-    const page_info = PageInfo{
-        .has_next_page = if (params.direction == .forward) has_more else (params.cursor != null),
-        .has_previous_page = if (params.direction == .backward) has_more else (params.cursor != null),
-        .start_cursor = if (edges.len > 0) try allocator.dupe(u8, edges[0].cursor) else null,
-        .end_cursor = if (edges.len > 0) try allocator.dupe(u8, edges[edges.len - 1].cursor) else null,
-    };
-
-    return Connection(T){
-        .edges = edges,
-        .page_info = page_info,
-        .total_count = total_count,
-    };
-}
-
-/// Build a connection from a slice of items with string IDs. See buildConnectionInt
-/// for the has_more contract.
 pub fn buildConnectionString(
     comptime T: type,
     allocator: std.mem.Allocator,

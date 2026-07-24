@@ -19,11 +19,8 @@ pub const loaders = @import("../loaders.zig");
 // Re-export shared helpers/constants from the neutral api/common.zig so resolver
 // files can access them via the same `common.*` namespace.
 const api_common = @import("../common.zig");
-pub const Pagination = api_common.Pagination;
 pub const parsePagination = api_common.parsePagination;
 pub const parseOrderDirection = api_common.parseOrderDirection;
-pub const MAX_FIRST = api_common.MAX_FIRST;
-pub const DEFAULT_SKIP = api_common.DEFAULT_SKIP;
 pub const getObjectArg = api_common.getObjectArg;
 pub const matchStringArg = api_common.matchStringArg;
 pub const matchIntArg = api_common.matchIntArg;

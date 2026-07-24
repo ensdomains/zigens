@@ -56,9 +56,6 @@ pub const Capabilities = struct {
     pooled: bool = false,
 };
 
-/// Connection access mode for the Phase-4 `Pool`; defined here as part of the SPI.
-pub const AccessMode = enum { writer, reader };
-
 /// Transaction mode. `immediate` takes a write lock up front (SQLite `BEGIN IMMEDIATE`);
 /// `deferred` is a plain `BEGIN`. `read_snapshot` is a read-only transaction giving a
 /// STABLE snapshot across statements — SQLite plain `BEGIN` (WAL snapshots on first read),
