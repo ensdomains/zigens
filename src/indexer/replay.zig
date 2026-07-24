@@ -2132,3 +2132,49 @@ test "reconstructV2AtBlock matches truncated live replay at every lifecycle chec
         }
     }
 }
+
+pub const REPLAY_VERSION: i64 = 1;
+
+/// Clear the completion marker before a rebuild starts, so a crash mid-replay
+/// can never masquerade as a finished backfill.
+pub fn clearReplayStatus(self: *Indexer) !void {
+    try self.database.exec("DELETE FROM replay_status");
+}
+
+/// Record a completed rebuild: the replay-logic version, the highest event
+/// block covered, and the resulting names count. Refuses to mark complete if
+/// creation-shaped events exist but the rebuild produced zero names.
+pub fn writeReplayStatus(self: *Indexer) !void {
+    const database = self.database;
+    var names_count: i64 = 0;
+    {
+        var q = try Query.init(database, "SELECT COUNT(*) FROM names");
+        defer q.deinit();
+        if (try q.step()) names_count = q.getInt64(0);
+    }
+    var creation_events: i64 = 0;
+    {
+        var q = try Query.init(database, "SELECT COUNT(*) FROM events WHERE event_type IN ('NameRegistered', 'NewOwner', 'NewSubname')");
+        defer q.deinit();
+        if (try q.step()) creation_events = q.getInt64(0);
+    }
+    if (creation_events > 0 and names_count == 0) {
+        std.log.err("backfill produced 0 names from {d} creation events - refusing to mark complete", .{creation_events});
+        return error.BackfillIncomplete;
+    }
+    var completed_block: i64 = 0;
+    {
+        var q = try Query.init(database, "SELECT COALESCE(MAX(block_number), 0) FROM events");
+        defer q.deinit();
+        if (try q.step()) completed_block = q.getInt64(0);
+    }
+    try database.exec("DELETE FROM replay_status");
+    var q = try Query.init(database, "INSERT INTO replay_status (id, replay_version, completed_block, names_count, completed_at) VALUES (1, ?, ?, ?, ?)");
+    defer q.deinit();
+    try q.bindInt64(REPLAY_VERSION);
+    try q.bindInt64(completed_block);
+    try q.bindInt64(names_count);
+    try q.bindInt64(zsys.timestamp());
+    try q.exec();
+    std.log.info("Replay status recorded: version {d}, completed through block {d}, {d} names", .{ REPLAY_VERSION, completed_block, names_count });
+}

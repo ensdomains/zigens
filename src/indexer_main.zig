@@ -174,6 +174,7 @@ pub fn main(init: std.process.Init) !void {
     // their source rows, then V2), then exit without entering the live index loop.
     if (args.backfill) {
         std.log.info("Running in --backfill mode: rebuilding names + records + roles + registrations from stored events (V1 then V2)", .{});
+        try idx.clearReplayStatus();
         try idx.replayEventsToRebuildNames();
         try idx.replayV2NamesCore();
         try idx.replayV2RecordsCore();
@@ -181,6 +182,7 @@ pub fn main(init: std.process.Init) !void {
         try idx.replayV2RegistrationsCore();
         try idx.replayV2RegistriesCore(); // after names (pointer cascade fixes subregistry reachability)
         try idx.replayAccountsCore(); // after names + registrations (backfill seed reads them)
+        try idx.writeReplayStatus();
         std.log.info("Backfill complete. Exiting.", .{});
         return;
     }

@@ -39,6 +39,18 @@ CREATE TABLE IF NOT EXISTS sync_state (
   last_synced_at BIGINT NOT NULL
 );
 
+-- Durable marker for a COMPLETED --backfill projection rebuild. Cleared at
+-- replay start, written only after every core finishes — a crashed rebuild is
+-- therefore distinguishable from a finished one. replay_version is the code
+-- version of the replay logic; a version bump invalidates older rebuilds.
+CREATE TABLE IF NOT EXISTS replay_status (
+  id BIGINT PRIMARY KEY,
+  replay_version BIGINT NOT NULL,
+  completed_block BIGINT NOT NULL,
+  names_count BIGINT NOT NULL,
+  completed_at BIGINT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS block_hashes (
   protocol TEXT NOT NULL,
   block_number BIGINT NOT NULL,
