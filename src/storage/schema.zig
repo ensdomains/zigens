@@ -201,205 +201,171 @@ pub fn migrate(self: *Database) !void {
 /// - idx_v1_labels_*, idx_v1_controllers_active (V1 handler lookups)
 /// - idx_registries_*, idx_known_*_last_indexed, idx_orphaned_* (sync tracking)
 /// - idx_block_hashes_timestamp (block tracking)
+const SYNC_DROP_INDEXES = [_][]const u8{
+    "idx_events_protocol",
+    "idx_events_type",
+    "idx_events_block",
+    "idx_events_namehash",
+    "idx_events_contract_address",
+    "idx_events_protocol_type_block",
+    "idx_events_block_log",
+    "idx_names_protocol",
+    "idx_names_name",
+    "idx_names_label",
+    "idx_names_owner",
+    "idx_names_expiry",
+    "idx_names_registry",
+    "idx_names_resolver",
+    "idx_names_created_block",
+    "idx_names_registrant",
+    "idx_names_v1_label_hash",
+    "idx_names_parent_namehash",
+    "idx_names_is_wrapped",
+    "idx_names_is_v1_name",
+    "idx_names_wrapper_expiry",
+    "idx_resolvers_protocol",
+    "idx_resolvers_namehash",
+    "idx_resolver_addresses_namehash",
+    "idx_resolver_addresses_resolver",
+    "idx_resolver_contenthashes_namehash",
+    "idx_resolver_contenthashes_resolver",
+    "idx_resolver_texts_namehash",
+    "idx_resolver_texts_resolver",
+    "idx_resolver_texts_key",
+    "idx_resolver_aliases_resolver",
+    "idx_resolver_pubkeys_namehash",
+    "idx_resolver_abis_namehash",
+    "idx_resolver_names_namehash",
+    "idx_resolver_interfaces_namehash",
+    "idx_resolver_metadata_protocol",
+    "idx_resolver_metadata_resolver",
+    "idx_resolver_approvals_protocol",
+    "idx_resolver_approvals_namehash",
+    "idx_resolver_approvals_delegate",
+    "idx_resolver_approvals_context",
+    "idx_approvals_protocol",
+    "idx_approvals_token_id",
+    "idx_approvals_owner",
+    "idx_name_history_namehash",
+    "idx_name_history_protocol_name",
+    "idx_name_history_change_type",
+    "idx_name_history_block",
+    "idx_name_history_timestamp",
+    "idx_eac_roles_protocol",
+    "idx_eac_roles_resource",
+    "idx_eac_roles_account",
+    "idx_eac_roles_block",
+    "idx_eac_roles_contract",
+    "idx_temp_pre_migration_label_hash",
+    "idx_temp_pre_migration_protocol",
+    "idx_rainbow_source",
+    "idx_rainbow_block",
+    "idx_unknown_labels_backfill",
+    "idx_unknown_labels_tx_hash",
+    "idx_unknown_labels_labelhash",
+};
+
+const SYNC_CREATE_INDEXES = [_][]const u8{
+    "CREATE INDEX IF NOT EXISTS idx_events_protocol ON events(protocol)",
+    "CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)",
+    "CREATE INDEX IF NOT EXISTS idx_events_block ON events(block_number)",
+    "CREATE INDEX IF NOT EXISTS idx_events_name ON events(name)",
+    "CREATE INDEX IF NOT EXISTS idx_events_namehash ON events(namehash)",
+    "CREATE INDEX IF NOT EXISTS idx_events_contract_address ON events(contract_address)",
+    "CREATE INDEX IF NOT EXISTS idx_events_protocol_type_block ON events(protocol, event_type, block_number)",
+    "CREATE INDEX IF NOT EXISTS idx_events_block_log ON events(block_number, log_index)",
+    "CREATE INDEX IF NOT EXISTS idx_names_protocol ON names(protocol)",
+    "CREATE INDEX IF NOT EXISTS idx_names_name ON names(name)",
+    "CREATE INDEX IF NOT EXISTS idx_names_label ON names(label)",
+    "CREATE INDEX IF NOT EXISTS idx_names_owner ON names(owner)",
+    "CREATE INDEX IF NOT EXISTS idx_names_expiry ON names(expiry)",
+    "CREATE INDEX IF NOT EXISTS idx_names_registry ON names(protocol, registry)",
+    "CREATE INDEX IF NOT EXISTS idx_names_resolver ON names(protocol, resolver)",
+    "CREATE INDEX IF NOT EXISTS idx_names_created_block ON names(protocol, created_block)",
+    "CREATE INDEX IF NOT EXISTS idx_names_registrant ON names(registrant)",
+    "CREATE INDEX IF NOT EXISTS idx_names_v1_label_hash ON names(v1_label_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_names_parent_namehash ON names(parent_namehash)",
+    "CREATE INDEX IF NOT EXISTS idx_names_is_wrapped ON names(is_wrapped)",
+    "CREATE INDEX IF NOT EXISTS idx_names_is_v1_name ON names(is_v1_name)",
+    "CREATE INDEX IF NOT EXISTS idx_names_wrapper_expiry ON names(wrapper_expiry)",
+    "CREATE INDEX IF NOT EXISTS idx_resolvers_protocol ON resolvers(protocol)",
+    "CREATE INDEX IF NOT EXISTS idx_resolvers_namehash ON resolvers(namehash)",
+    "CREATE INDEX IF NOT EXISTS idx_resolver_addresses_namehash ON resolver_addresses(namehash)",
+    "CREATE INDEX IF NOT EXISTS idx_resolver_addresses_resolver ON resolver_addresses(resolver)",
+    "CREATE INDEX IF NOT EXISTS idx_resolver_contenthashes_namehash ON resolver_contenthashes(namehash)",
+    "CREATE INDEX IF NOT EXISTS idx_resolver_contenthashes_resolver ON resolver_contenthashes(resolver)",
+    "CREATE INDEX IF NOT EXISTS idx_resolver_texts_namehash ON resolver_texts(namehash)",
+    "CREATE INDEX IF NOT EXISTS idx_resolver_texts_resolver ON resolver_texts(resolver)",
+    "CREATE INDEX IF NOT EXISTS idx_resolver_texts_key ON resolver_texts(key)",
+    "CREATE INDEX IF NOT EXISTS idx_resolver_aliases_resolver ON resolver_aliases(resolver)",
+    "CREATE INDEX IF NOT EXISTS idx_resolver_pubkeys_namehash ON resolver_pubkeys(namehash)",
+    "CREATE INDEX IF NOT EXISTS idx_resolver_abis_namehash ON resolver_abis(namehash)",
+    "CREATE INDEX IF NOT EXISTS idx_resolver_names_namehash ON resolver_names(namehash)",
+    "CREATE INDEX IF NOT EXISTS idx_resolver_interfaces_namehash ON resolver_interfaces(namehash)",
+    "CREATE INDEX IF NOT EXISTS idx_resolver_metadata_protocol ON resolver_metadata(protocol)",
+    "CREATE INDEX IF NOT EXISTS idx_resolver_metadata_resolver ON resolver_metadata(protocol, resolver)",
+    "CREATE INDEX IF NOT EXISTS idx_resolver_approvals_protocol ON resolver_approvals(protocol)",
+    "CREATE INDEX IF NOT EXISTS idx_resolver_approvals_namehash ON resolver_approvals(protocol, namehash)",
+    "CREATE INDEX IF NOT EXISTS idx_resolver_approvals_delegate ON resolver_approvals(protocol, delegate)",
+    "CREATE INDEX IF NOT EXISTS idx_resolver_approvals_context ON resolver_approvals(protocol, context)",
+    "CREATE INDEX IF NOT EXISTS idx_approvals_protocol ON approvals(protocol)",
+    "CREATE INDEX IF NOT EXISTS idx_approvals_token_id ON approvals(token_id)",
+    "CREATE INDEX IF NOT EXISTS idx_approvals_owner ON approvals(owner)",
+    "CREATE INDEX IF NOT EXISTS idx_name_history_namehash ON name_history(namehash)",
+    "CREATE INDEX IF NOT EXISTS idx_name_history_protocol_name ON name_history(protocol, name)",
+    "CREATE INDEX IF NOT EXISTS idx_name_history_change_type ON name_history(change_type)",
+    "CREATE INDEX IF NOT EXISTS idx_name_history_block ON name_history(protocol, block_number)",
+    "CREATE INDEX IF NOT EXISTS idx_name_history_timestamp ON name_history(timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_eac_roles_protocol ON eac_roles(protocol)",
+    "CREATE INDEX IF NOT EXISTS idx_eac_roles_resource ON eac_roles(protocol, resource)",
+    "CREATE INDEX IF NOT EXISTS idx_eac_roles_account ON eac_roles(protocol, account)",
+    "CREATE INDEX IF NOT EXISTS idx_eac_roles_block ON eac_roles(protocol, block_number)",
+    "CREATE INDEX IF NOT EXISTS idx_eac_roles_contract ON eac_roles(protocol, contract_address)",
+    "CREATE INDEX IF NOT EXISTS idx_temp_pre_migration_label_hash ON temp_pre_migration_names(label_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_temp_pre_migration_protocol ON temp_pre_migration_names(protocol)",
+    "CREATE INDEX IF NOT EXISTS idx_rainbow_source ON rainbow_labels(source)",
+    "CREATE INDEX IF NOT EXISTS idx_rainbow_block ON rainbow_labels(first_seen_block)",
+    "CREATE INDEX IF NOT EXISTS idx_unknown_labels_backfill ON unknown_labels(backfill_attempts, created_at) WHERE backfill_attempts < 3",
+    "CREATE INDEX IF NOT EXISTS idx_unknown_labels_tx_hash ON unknown_labels(transaction_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_unknown_labels_labelhash ON unknown_labels(labelhash)",
+};
+
+// Drops the non-essential indexes for bulk sync. KEEP idx_events_name — the
+// per-event placeholder patch (updatePlaceholderEventsByName: `UPDATE events ...
+// WHERE name = ?`) runs throughout sync; without this index it degrades to a
+// full seq scan over the growing events table, i.e. O(n^2) across a bulk sync.
+// Every statement is attempted even if one fails, so a single bad DDL cannot
+// strand the rest of the list; the first error is still surfaced at the end.
 pub fn dropSyncIndexes(self: *Database) !void {
     std.log.info("Dropping non-essential indexes for bulk sync...", .{});
-
-    // Events table: drop 7 of 8 indexes. KEEP idx_events_name — the per-event
-    // placeholder patch (updatePlaceholderEventsByName: `UPDATE events ... WHERE
-    // name = ?`) runs throughout sync; without this index it degrades to a full
-    // seq scan over the growing events table, i.e. O(n^2) across a bulk sync.
-    try self.exec("DROP INDEX IF EXISTS idx_events_protocol");
-    try self.exec("DROP INDEX IF EXISTS idx_events_type");
-    try self.exec("DROP INDEX IF EXISTS idx_events_block");
-    try self.exec("DROP INDEX IF EXISTS idx_events_namehash");
-    try self.exec("DROP INDEX IF EXISTS idx_events_contract_address");
-    try self.exec("DROP INDEX IF EXISTS idx_events_protocol_type_block");
-    try self.exec("DROP INDEX IF EXISTS idx_events_block_log");
-
-    // Names table: drop 13 of 16 indexes (keep namehash, token_id, canonical_id)
-    try self.exec("DROP INDEX IF EXISTS idx_names_protocol");
-    try self.exec("DROP INDEX IF EXISTS idx_names_name");
-    try self.exec("DROP INDEX IF EXISTS idx_names_label");
-    try self.exec("DROP INDEX IF EXISTS idx_names_owner");
-    try self.exec("DROP INDEX IF EXISTS idx_names_expiry");
-    try self.exec("DROP INDEX IF EXISTS idx_names_registry");
-    try self.exec("DROP INDEX IF EXISTS idx_names_resolver");
-    try self.exec("DROP INDEX IF EXISTS idx_names_created_block");
-    try self.exec("DROP INDEX IF EXISTS idx_names_registrant");
-    try self.exec("DROP INDEX IF EXISTS idx_names_v1_label_hash");
-    try self.exec("DROP INDEX IF EXISTS idx_names_parent_namehash");
-    try self.exec("DROP INDEX IF EXISTS idx_names_is_wrapped");
-    try self.exec("DROP INDEX IF EXISTS idx_names_is_v1_name");
-    try self.exec("DROP INDEX IF EXISTS idx_names_wrapper_expiry");
-
-    // Resolvers table: drop all 2 indexes (write-only during sync)
-    try self.exec("DROP INDEX IF EXISTS idx_resolvers_protocol");
-    try self.exec("DROP INDEX IF EXISTS idx_resolvers_namehash");
-
-    // Resolver addresses: drop all 3 indexes
-    try self.exec("DROP INDEX IF EXISTS idx_resolver_addresses_namehash");
-    try self.exec("DROP INDEX IF EXISTS idx_resolver_addresses_resolver");
-    try self.exec("DROP INDEX IF EXISTS idx_resolver_addresses_context");
-
-    // Resolver contenthashes: drop all 3 indexes
-    try self.exec("DROP INDEX IF EXISTS idx_resolver_contenthashes_namehash");
-    try self.exec("DROP INDEX IF EXISTS idx_resolver_contenthashes_resolver");
-    try self.exec("DROP INDEX IF EXISTS idx_resolver_contenthashes_context");
-
-    // Resolver texts: drop all 4 indexes
-    try self.exec("DROP INDEX IF EXISTS idx_resolver_texts_namehash");
-    try self.exec("DROP INDEX IF EXISTS idx_resolver_texts_resolver");
-    try self.exec("DROP INDEX IF EXISTS idx_resolver_texts_key");
-    try self.exec("DROP INDEX IF EXISTS idx_resolver_texts_context");
-
-    // Resolver records (aliases, pubkeys, abis, names, interfaces): drop all 5
-    try self.exec("DROP INDEX IF EXISTS idx_resolver_aliases_resolver");
-    try self.exec("DROP INDEX IF EXISTS idx_resolver_pubkeys_namehash");
-    try self.exec("DROP INDEX IF EXISTS idx_resolver_abis_namehash");
-    try self.exec("DROP INDEX IF EXISTS idx_resolver_names_namehash");
-    try self.exec("DROP INDEX IF EXISTS idx_resolver_interfaces_namehash");
-
-    // Resolver metadata & approvals (ENSIP-16): drop all 6
-    try self.exec("DROP INDEX IF EXISTS idx_resolver_metadata_protocol");
-    try self.exec("DROP INDEX IF EXISTS idx_resolver_metadata_resolver");
-    try self.exec("DROP INDEX IF EXISTS idx_resolver_approvals_protocol");
-    try self.exec("DROP INDEX IF EXISTS idx_resolver_approvals_namehash");
-    try self.exec("DROP INDEX IF EXISTS idx_resolver_approvals_delegate");
-    try self.exec("DROP INDEX IF EXISTS idx_resolver_approvals_context");
-
-    // Approvals table: drop all 3 indexes
-    try self.exec("DROP INDEX IF EXISTS idx_approvals_protocol");
-    try self.exec("DROP INDEX IF EXISTS idx_approvals_token_id");
-    try self.exec("DROP INDEX IF EXISTS idx_approvals_owner");
-
-    // Name history: drop all 5 indexes
-    try self.exec("DROP INDEX IF EXISTS idx_name_history_namehash");
-    try self.exec("DROP INDEX IF EXISTS idx_name_history_protocol_name");
-    try self.exec("DROP INDEX IF EXISTS idx_name_history_change_type");
-    try self.exec("DROP INDEX IF EXISTS idx_name_history_block");
-    try self.exec("DROP INDEX IF EXISTS idx_name_history_timestamp");
-
-    // EAC roles: drop all 5 indexes
-    try self.exec("DROP INDEX IF EXISTS idx_eac_roles_protocol");
-    try self.exec("DROP INDEX IF EXISTS idx_eac_roles_resource");
-    try self.exec("DROP INDEX IF EXISTS idx_eac_roles_account");
-    try self.exec("DROP INDEX IF EXISTS idx_eac_roles_block");
-    try self.exec("DROP INDEX IF EXISTS idx_eac_roles_contract");
-
-    // Temporary registrar pre-migration table indexes (the
-    // temp_auctions/temp_bids/temp_bid_reveals/temp_invalidations tables
-    // were removed; only temp_pre_migration_names remains).
-    try self.exec("DROP INDEX IF EXISTS idx_temp_pre_migration_label_hash");
-    try self.exec("DROP INDEX IF EXISTS idx_temp_pre_migration_protocol");
-
-    // Rainbow labels & unknown labels: drop all 5 indexes
-    try self.exec("DROP INDEX IF EXISTS idx_rainbow_source");
-    try self.exec("DROP INDEX IF EXISTS idx_rainbow_block");
-    try self.exec("DROP INDEX IF EXISTS idx_unknown_labels_backfill");
-    try self.exec("DROP INDEX IF EXISTS idx_unknown_labels_tx_hash");
-    try self.exec("DROP INDEX IF EXISTS idx_unknown_labels_labelhash");
-
+    var first_err: ?anyerror = null;
+    for (SYNC_DROP_INDEXES) |name| {
+        var buf: [128]u8 = undefined;
+        const sql = std.fmt.bufPrint(&buf, "DROP INDEX IF EXISTS {s}", .{name}) catch unreachable;
+        self.exec(sql) catch |err| {
+            std.log.err("drop index {s} failed: {}", .{ name, err });
+            if (first_err == null) first_err = err;
+        };
+    }
+    if (first_err) |err| return err;
     std.log.info("Dropped non-essential indexes for bulk sync performance", .{});
 }
 
 /// Recreate all indexes after bulk sync is complete.
 /// This is much faster than maintaining indexes during bulk inserts.
+/// Every statement is attempted even if one fails, so a single bad DDL cannot
+/// strand the rest of the list; the first error is still surfaced at the end.
 pub fn createSyncIndexes(self: *Database) !void {
     const timer = zsys.milliTimestamp();
     std.log.info("Recreating indexes after bulk sync...", .{});
-
-    // Events table indexes (8)
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_events_protocol ON events(protocol)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_events_block ON events(block_number)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_events_name ON events(name)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_events_namehash ON events(namehash)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_events_contract_address ON events(contract_address)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_events_protocol_type_block ON events(protocol, event_type, block_number)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_events_block_log ON events(block_number, log_index)");
-
-    // Names table indexes (14)
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_names_protocol ON names(protocol)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_names_name ON names(name)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_names_label ON names(label)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_names_owner ON names(owner)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_names_expiry ON names(expiry)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_names_registry ON names(protocol, registry)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_names_resolver ON names(protocol, resolver)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_names_created_block ON names(protocol, created_block)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_names_registrant ON names(registrant)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_names_v1_label_hash ON names(v1_label_hash)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_names_parent_namehash ON names(parent_namehash)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_names_is_wrapped ON names(is_wrapped)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_names_is_v1_name ON names(is_v1_name)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_names_wrapper_expiry ON names(wrapper_expiry)");
-
-    // Resolvers table indexes (2)
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolvers_protocol ON resolvers(protocol)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolvers_namehash ON resolvers(namehash)");
-
-    // Resolver addresses indexes (3)
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_addresses_namehash ON resolver_addresses(namehash)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_addresses_resolver ON resolver_addresses(resolver)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_addresses_context ON resolver_addresses(protocol, namehash, context)");
-
-    // Resolver contenthashes indexes (3)
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_contenthashes_namehash ON resolver_contenthashes(namehash)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_contenthashes_resolver ON resolver_contenthashes(resolver)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_contenthashes_context ON resolver_contenthashes(protocol, namehash, context)");
-
-    // Resolver texts indexes (4)
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_texts_namehash ON resolver_texts(namehash)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_texts_resolver ON resolver_texts(resolver)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_texts_key ON resolver_texts(key)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_texts_context ON resolver_texts(protocol, namehash, context)");
-
-    // Resolver records indexes (5)
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_aliases_resolver ON resolver_aliases(resolver)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_pubkeys_namehash ON resolver_pubkeys(namehash)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_abis_namehash ON resolver_abis(namehash)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_names_namehash ON resolver_names(namehash)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_interfaces_namehash ON resolver_interfaces(namehash)");
-
-    // Resolver metadata & approvals (ENSIP-16) indexes (6)
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_metadata_protocol ON resolver_metadata(protocol)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_metadata_resolver ON resolver_metadata(protocol, resolver)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_approvals_protocol ON resolver_approvals(protocol)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_approvals_namehash ON resolver_approvals(protocol, namehash)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_approvals_delegate ON resolver_approvals(protocol, delegate)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_approvals_context ON resolver_approvals(protocol, context)");
-
-    // Approvals table indexes (3)
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_approvals_protocol ON approvals(protocol)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_approvals_token_id ON approvals(token_id)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_approvals_owner ON approvals(owner)");
-
-    // Name history indexes (5)
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_name_history_namehash ON name_history(namehash)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_name_history_protocol_name ON name_history(protocol, name)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_name_history_change_type ON name_history(change_type)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_name_history_block ON name_history(protocol, block_number)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_name_history_timestamp ON name_history(timestamp)");
-
-    // EAC roles indexes (5)
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_protocol ON eac_roles(protocol)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_resource ON eac_roles(protocol, resource)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_account ON eac_roles(protocol, account)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_block ON eac_roles(protocol, block_number)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_contract ON eac_roles(protocol, contract_address)");
-
-    // Temporary registrar pre-migration table indexes (only
-    // temp_pre_migration_names remains after the V1 audit cleanup).
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_pre_migration_label_hash ON temp_pre_migration_names(label_hash)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_temp_pre_migration_protocol ON temp_pre_migration_names(protocol)");
-
-    // Rainbow labels & unknown labels indexes (5)
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_rainbow_source ON rainbow_labels(source)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_rainbow_block ON rainbow_labels(first_seen_block)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_unknown_labels_backfill ON unknown_labels(backfill_attempts, created_at) WHERE backfill_attempts < 3");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_unknown_labels_tx_hash ON unknown_labels(transaction_hash)");
-    try self.exec("CREATE INDEX IF NOT EXISTS idx_unknown_labels_labelhash ON unknown_labels(labelhash)");
-
+    var first_err: ?anyerror = null;
+    for (SYNC_CREATE_INDEXES) |sql| {
+        self.exec(sql) catch |err| {
+            std.log.err("index recreate failed ({s}): {}", .{ sql, err });
+            if (first_err == null) first_err = err;
+        };
+    }
     const elapsed = zsys.milliTimestamp() - timer;
+    if (first_err) |err| return err;
     std.log.info("Index recreation complete ({d}ms)", .{elapsed});
 }
