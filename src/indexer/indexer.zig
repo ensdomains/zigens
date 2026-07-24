@@ -108,6 +108,7 @@ pub const Indexer = struct {
 
         const v1_client = try rpc.Client.initWithSharedHttpClient(allocator, cfg.rpc_url, http_client);
         errdefer v1_client.deinit();
+        v1_client.max_batch_requests = cfg.rpc_max_batch_requests;
 
         var webhook_manager: ?*webhooks.WebhookManager = null;
         if (cfg.webhooks_enabled) {
@@ -204,6 +205,7 @@ pub const Indexer = struct {
 
         const client = try rpc.Client.initWithSharedHttpClient(allocator, cfg.rpc_url, http_client);
         errdefer client.deinit();
+        client.max_batch_requests = cfg.rpc_max_batch_requests;
 
         var webhook_manager: ?*webhooks.WebhookManager = null;
         if (cfg.webhooks_enabled) {
@@ -358,6 +360,8 @@ pub const Indexer = struct {
     pub const resolveLabel = caches.resolveLabel;
     /// Replay all stored events to rebuild the names table (--backfill mode).
     pub const replayEventsToRebuildNames = replay_mod.replayEventsToRebuildNames;
+    pub const clearReplayStatus = replay_mod.clearReplayStatus;
+    pub const writeReplayStatus = replay_mod.writeReplayStatus;
     /// Rebuild the V2 names projection from stored V2 events. In a combined --backfill this
     /// MUST run AFTER replayEventsToRebuildNames so V1→V2 migration lookups find their V1 rows.
     pub const replayV2NamesCore = replay_mod.replayV2NamesCore;
@@ -400,11 +404,6 @@ pub const Indexer = struct {
         return .none;
     }
 
-    /// Boolean wrapper kept for call sites that only need yes/no.
-    pub inline fn isMigrationController(self: *Indexer, addr: Address) bool {
-        return self.getMigrationKind(addr) != .none;
-    }
-
     pub inline fn getClient(self: *Indexer, protocol: models.Protocol) *rpc.Client {
         _ = protocol;
         return self.v1_client;
@@ -430,11 +429,8 @@ pub const Indexer = struct {
     // V1 indexing orchestration (extracted to v1_indexing.zig)
     pub const indexV1EventsChunked = v1_indexing.indexV1EventsChunked;
     pub const indexAllV1Events = v1_indexing.indexAllV1Events;
+    pub const v1EraStart = sync_driver.v1EraStart;
     pub const indexPreMigrationRegistryEvents = v1_indexing.indexPreMigrationRegistryEvents;
-    pub const indexV1RegistryEvents = v1_indexing.indexV1RegistryEvents;
-    pub const indexV1NameWrapperEvents = v1_indexing.indexV1NameWrapperEvents;
-    pub const indexV1BaseRegistrarEvents = v1_indexing.indexV1BaseRegistrarEvents;
-    pub const indexV1ReverseRegistrarEvents = v1_indexing.indexV1ReverseRegistrarEvents;
 
     // Persistence chokepoints — implementations in persistence.zig.
     pub const insertEventAndNotify = persistence.insertEventAndNotify;

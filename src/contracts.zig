@@ -107,6 +107,9 @@ pub const ContractAddresses = struct {
     // ═══════════════════════════════════════════════════════════════════════
     v1_deployment_block: u64, // V1 Permanent Registrar (Base Registrar) deployment
     v2_deployment_block: u64, // V2 protocol deployment (0 if not deployed on this network)
+    // Last block of the V1 era on this network; 0 = V1 has no sunset. Deployment
+    // data, not a code constant — set it only when a real cutover is decided.
+    v1_end_block: u64 = 0,
 
     // V1 historical markers (mainnet specific; 0 on testnets)
     temp_registrar_start_block: u64, // Temporary Registrar deployment (May 2017)

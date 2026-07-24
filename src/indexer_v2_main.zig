@@ -10,6 +10,65 @@ pub const std_options: std.Options = .{
     .log_level = .info, // Only show info, warn, err (no debug)
 };
 
+const CliMode = enum { index, backfill };
+
+fn printHelp() void {
+    std.debug.print(
+        \\ENSv2 V2 Indexer
+        \\
+        \\Usage: ensv2-indexer-v2 [OPTIONS]
+        \\
+        \\Options:
+        \\  --from-block <BLOCK>    Start indexing from this block number
+        \\  --to-block <BLOCK>      Stop indexing at this block number (default: continuous)
+        \\  --backfill              Rebuild V2 projections from stored events (no RPC needed)
+        \\  --help                  Show this help message
+        \\
+        \\Configuration is loaded from .env file. Command-line flags override .env values.
+        \\
+    , .{});
+}
+
+const CliArgs = struct { mode: CliMode, from_block: ?u64 };
+
+fn parseArgs(process_args: std.process.Args, cfg: *config.Config) !CliArgs {
+    var args = process_args.iterate();
+
+    var mode: CliMode = .index;
+    var from_block: ?u64 = null;
+
+    // Skip program name
+    _ = args.skip();
+
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            printHelp();
+            std.process.exit(0);
+        } else if (std.mem.eql(u8, arg, "--backfill")) {
+            mode = .backfill;
+        } else if (std.mem.eql(u8, arg, "--from-block")) {
+            if (args.next()) |block_str| {
+                from_block = try std.fmt.parseInt(u64, block_str, 10);
+                cfg.start_block = from_block.?;
+            } else {
+                std.log.err("--from-block requires a block number", .{});
+                return error.InvalidArgument;
+            }
+        } else if (std.mem.eql(u8, arg, "--to-block")) {
+            if (args.next()) |block_str| {
+                cfg.end_block = try std.fmt.parseInt(u64, block_str, 10);
+            } else {
+                std.log.err("--to-block requires a block number", .{});
+                return error.InvalidArgument;
+            }
+        } else {
+            std.log.warn("Unknown argument: {s}", .{arg});
+        }
+    }
+
+    return .{ .mode = mode, .from_block = from_block };
+}
+
 pub fn main(init: std.process.Init) !void {
     // Configure SQLite for thread safety BEFORE any other operations
     db.configureSqliteThreadSafety();
@@ -23,6 +82,16 @@ pub fn main(init: std.process.Init) !void {
     // Load configuration from .env
     var cfg = try config.Config.fromEnv(allocator);
     defer cfg.deinit();
+
+    // Parse command-line arguments (override .env values)
+    const cli = try parseArgs(init.minimal.args, &cfg);
+    const mode = cli.mode;
+
+    // In backfill mode, disable status server and webhooks to avoid DB lock contention
+    if (mode == .backfill) {
+        cfg.status_port = null;
+        cfg.webhooks_enabled = false;
+    }
 
     std.log.info("ENSv2 Indexer starting...", .{});
     std.log.info("Network: {s}", .{cfg.network.toString()});
@@ -41,6 +110,13 @@ pub fn main(init: std.process.Init) !void {
         .postgres => std.log.info("Database initialized: postgres (via DATABASE_URL)", .{}),
     }
 
+    // --from-block resets this protocol's cursor, mirroring the combined binary,
+    // so all three binaries interpret the flag identically.
+    if (cli.from_block) |fb| {
+        std.log.info("Resetting sync state to block {d}...", .{fb});
+        try database.setSyncState(.v2, fb);
+    }
+
     // Check database integrity on startup
     const integrity_ok = try database.checkIntegrity();
     if (!integrity_ok) {
@@ -51,8 +127,22 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("Database integrity check passed", .{});
 
     // Initialize indexer with only V2 client
-    var idx = try indexer.Indexer.initSingleProtocol(allocator, io, cfg, &database, .v2, null);
+    var idx = try indexer.Indexer.initSingleProtocol(allocator, io, cfg, &database, .v2, cfg.end_block);
     defer idx.deinit();
+
+    if (mode == .backfill) {
+        std.log.info("Running in --backfill mode: rebuilding V2 projections from stored events", .{});
+        try idx.clearReplayStatus();
+        try idx.replayV2NamesCore();
+        try idx.replayV2RecordsCore();
+        try idx.replayV2EacRolesCore();
+        try idx.replayV2RegistrationsCore();
+        try idx.replayV2RegistriesCore();
+        try idx.replayAccountsCore();
+        try idx.writeReplayStatus();
+        std.log.info("Backfill complete. Exiting.", .{});
+        return;
+    }
 
     std.log.info("V2 Indexer started - indexing blocks...", .{});
 

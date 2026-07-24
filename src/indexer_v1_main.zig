@@ -29,10 +29,13 @@ fn printHelp() void {
     , .{});
 }
 
-fn parseArgs(process_args: std.process.Args, cfg: *config.Config) !CliMode {
+const CliArgs = struct { mode: CliMode, from_block: ?u64 };
+
+fn parseArgs(process_args: std.process.Args, cfg: *config.Config) !CliArgs {
     var args = process_args.iterate();
 
     var mode: CliMode = .index;
+    var from_block: ?u64 = null;
 
     // Skip program name
     _ = args.skip();
@@ -45,7 +48,8 @@ fn parseArgs(process_args: std.process.Args, cfg: *config.Config) !CliMode {
             mode = .backfill;
         } else if (std.mem.eql(u8, arg, "--from-block")) {
             if (args.next()) |block_str| {
-                cfg.start_block = try std.fmt.parseInt(u64, block_str, 10);
+                from_block = try std.fmt.parseInt(u64, block_str, 10);
+                cfg.start_block = from_block.?;
             } else {
                 std.log.err("--from-block requires a block number", .{});
                 return error.InvalidArgument;
@@ -62,7 +66,7 @@ fn parseArgs(process_args: std.process.Args, cfg: *config.Config) !CliMode {
         }
     }
 
-    return mode;
+    return .{ .mode = mode, .from_block = from_block };
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -80,7 +84,8 @@ pub fn main(init: std.process.Init) !void {
     defer cfg.deinit();
 
     // Parse command-line arguments (override .env values)
-    const mode = try parseArgs(init.minimal.args, &cfg);
+    const cli = try parseArgs(init.minimal.args, &cfg);
+    const mode = cli.mode;
 
     std.log.info("ENSv2 V1 Indexer starting...", .{});
     std.log.info("Network: {s}", .{cfg.network.toString()});
@@ -96,6 +101,13 @@ pub fn main(init: std.process.Init) !void {
         .postgres => std.log.info("Database initialized: postgres (via DATABASE_URL)", .{}),
     }
 
+    // --from-block resets this protocol's cursor, mirroring the combined binary,
+    // so all three binaries interpret the flag identically.
+    if (cli.from_block) |fb| {
+        std.log.info("Resetting sync state to block {d}...", .{fb});
+        try database.setSyncState(.v1, fb);
+    }
+
     // In backfill mode, disable status server and webhooks to avoid DB lock contention
     if (mode == .backfill) {
         cfg.status_port = null;
@@ -109,7 +121,9 @@ pub fn main(init: std.process.Init) !void {
     switch (mode) {
         .backfill => {
             std.log.info("Running in --backfill mode: rebuilding names from stored events", .{});
+            try idx.clearReplayStatus();
             try idx.replayEventsToRebuildNames();
+            try idx.writeReplayStatus();
             std.log.info("Backfill complete. Exiting.", .{});
         },
         .index => {

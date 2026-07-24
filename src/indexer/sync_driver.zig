@@ -77,6 +77,24 @@ pub fn start(self: *Indexer) !void {
             self.materializePccUncaptured();
             self.reconcileReachabilityUncaptured();
 
+            // One-shot V1 heals, mirroring the single-protocol loop so the
+            // combined and split binaries produce the same database. The reorg
+            // cursor is disarmed here (materializePccUncaptured cleared it), so
+            // these do NOT self-capture into the undo-log; keep any new backfill
+            // inside this disarmed block. All three no-op without V1 data.
+            std.log.info("Running pre-migration names backfill...", .{});
+            self.backfillPreMigrationNames() catch |err| {
+                std.log.err("Failed to backfill pre-migration names: {}", .{err});
+            };
+            std.log.info("Running unknown labels backfill...", .{});
+            self.backfillUnknownLabels() catch |err| {
+                std.log.err("Failed to backfill unknown labels: {}", .{err});
+            };
+            std.log.info("Running missing .eth 2LD names backfill...", .{});
+            self.backfillMissingEth2LDNames() catch |err| {
+                std.log.err("Failed to backfill missing .eth 2LD names: {}", .{err});
+            };
+
             if (self.webhook_manager) |wm| {
                 std.log.info("Initial sync complete - starting 8 webhook workers", .{});
                 try wm.startWorkers(8);
@@ -85,6 +103,20 @@ pub fn start(self: *Indexer) !void {
 
         // Best-effort finality signalling (Task 09); no-op unless FINALITY_ENABLED.
         fetchFinality(self);
+
+        // A configured end block is a hard stop, not just a per-iteration cap —
+        // without this the loop keeps polling toward the live head past the
+        // requested range.
+        if (self.end_block) |eb| {
+            const v1_done = ((self.database.getSyncState(.v1) catch null) orelse 0) >= eb or
+                self.v1EraStart() > eb;
+            const v2_done = ((self.database.getSyncState(.v2) catch null) orelse 0) >= eb or
+                self.config.v2_contracts.v2_deployment_block > eb;
+            if (v1_done and v2_done) {
+                std.log.info("Reached end block {d} for both protocols; stopping", .{eb});
+                break;
+            }
+        }
 
         // Sleep for poll interval before next iteration; wakes early on SIGTERM.
         _ = shutdown.sleepInterruptible(self.config.poll_interval * std.time.ns_per_s);
@@ -228,6 +260,20 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
         // finality just like the combined indexer's `start` loop.
         fetchFinality(self);
 
+        // A configured end block is a hard stop, matching the combined loop. A
+        // protocol whose deployment lies beyond the end block can never reach
+        // it — stop instead of polling forever.
+        if (self.end_block) |eb| {
+            const deployed_at = switch (protocol) {
+                .v1 => self.v1EraStart(),
+                .v2 => self.config.v2_contracts.v2_deployment_block,
+            };
+            if (((self.database.getSyncState(protocol) catch null) orelse 0) >= eb or deployed_at > eb) {
+                std.log.info("Reached end block {d} for {s}; stopping", .{ eb, protocol.toString() });
+                break;
+            }
+        }
+
         // Sleep for poll interval before next iteration; wakes early on SIGTERM.
         _ = shutdown.sleepInterruptible(self.config.poll_interval * std.time.ns_per_s);
     }
@@ -289,10 +335,20 @@ pub fn rollbackToLastValidBlock(self: *Indexer, protocol: models.Protocol, clien
     return rollback_to;
 }
 
+/// First block of the V1 era on this network: the temporary-registrar start
+/// where pre-permanent-registrar history exists (mainnet), else the V1
+/// deployment block. Everything reasoning about "where does V1 begin" must use
+/// this, not v1_deployment_block, or the 2017-2019 era is silently skipped.
+pub fn v1EraStart(self: *Indexer) u64 {
+    const temp = self.config.v1_contracts.temp_registrar_start_block;
+    return if (temp > 0) temp else self.config.v1_contracts.v1_deployment_block;
+}
+
 pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Client) !void {
-    // Use protocol-specific deployment block as fallback for fresh databases
+    // Fresh databases start at the protocol's era start (for V1 that includes
+    // the pre-permanent-registrar history on networks that have it).
     const deployment_block = switch (protocol) {
-        .v1 => self.config.v1_contracts.v1_deployment_block,
+        .v1 => self.v1EraStart(),
         .v2 => self.config.v2_contracts.v2_deployment_block,
     };
 
@@ -505,16 +561,18 @@ pub fn indexBlockRange(self: *Indexer, protocol: models.Protocol, client: *rpc.C
 
     // Block range constants from contract config (protocol-specific)
     const v1_contracts = self.config.v1_contracts;
-    const temp_registrar_start = v1_contracts.temp_registrar_start_block;
 
-    // === V1 EVENTS (ENS V1 - Mainnet V1 only) ===
-    // Only index V1 events if the block range overlaps with V1 deployment period
-    // Skip if entire range is before temp registrar start OR if V2 is deployed and range is entirely after V2
-    // V2 deployment block is the same regardless of which protocol (protocol) we're indexing —
-    // this gate asks "are we still in the V1 era?".
+    // === V1 EVENTS ===
+    // The V1 era starts at the earliest configured V1 marker for this network:
+    // the temporary-registrar start where pre-permanent-registrar history exists
+    // (mainnet), else the V1 deployment block. It ends at the explicit per-network
+    // v1_end_block (0 = no sunset) — never at a code constant, so V1 activity
+    // after a V2 launch keeps indexing until a real cutover is configured.
     const v2_deployment = self.config.v2_contracts.v2_deployment_block;
-    const should_index_v1 = (temp_registrar_start > 0) and (to_block >= temp_registrar_start) and
-        (v2_deployment == 0 or from_block < v2_deployment + 10);
+    const v1_start = self.v1EraStart();
+    const v1_end = v1_contracts.v1_end_block;
+    const should_index_v1 = (v1_start > 0) and (to_block >= v1_start) and
+        (v1_end == 0 or from_block <= v1_end);
 
     if (should_index_v1) {
         // EFFICIENT: Index all V1 events together per chunk (Registry, Name Wrapper, Base Registrar, Reverse Registrar)
