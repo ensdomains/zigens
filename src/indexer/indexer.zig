@@ -57,6 +57,20 @@ pub const Indexer = struct {
     block_timestamp_cache: std.AutoHashMap(u64, i64),
     // Cached active V1 controllers (invalidated on ControllerAdded/Removed)
     v1_active_controllers: ?[]Address = null,
+    // Adaptive fetch state persisted across driver batches: learned V1 event
+    // density and the RPC overflow ceiling. 0 = not yet learned (era defaults
+    // apply). Without these the fetcher re-learns from scratch every batch.
+    v1_events_per_block: f64 = 0,
+    v1_rpc_chunk_ceiling: u64 = 0,
+    // Memoized rainbow-table lookups (hit AND miss — the empty-string sentinel).
+    // A cold probe into the multi-GB rainbow DB is disk-latency-priced; the same
+    // labelhash recurs on every event touching that node, so memoization collapses
+    // repeat probes to a hash lookup. Values are cache-owned (callers borrow).
+    rainbow_cache: std.AutoHashMap([32]u8, []const u8),
+    // Per-chunk rainbow probe instrumentation (printed in the chunk timing line).
+    rainbow_probe_count: u64 = 0,
+    newowner_phase_ns: [5]i128 = [_]i128{0} ** 5,
+    rainbow_probe_ns: u64 = 0,
     // Cached V1 token_id → label mappings (populated on miss from DB)
     v1_label_cache: std.StringHashMap([]const u8),
     // In-memory dedup of registered resolvers (membership-only — known_resolvers'
@@ -183,6 +197,7 @@ pub const Indexer = struct {
             .status_server = status_server,
             .block_timestamp_cache = std.AutoHashMap(u64, i64).init(allocator),
             .v1_label_cache = std.StringHashMap([]const u8).init(allocator),
+            .rainbow_cache = std.AutoHashMap([32]u8, []const u8).init(allocator),
             .known_resolver_cache = std.StringHashMap(void).init(allocator),
             .account_obs_cache = std.StringHashMap(void).init(allocator),
             .name_by_namehash_cache = std.AutoHashMap(Hash, []const u8).init(allocator),
@@ -284,6 +299,7 @@ pub const Indexer = struct {
             .status_server = status_server,
             .block_timestamp_cache = std.AutoHashMap(u64, i64).init(allocator),
             .v1_label_cache = std.StringHashMap([]const u8).init(allocator),
+            .rainbow_cache = std.AutoHashMap([32]u8, []const u8).init(allocator),
             .known_resolver_cache = std.StringHashMap(void).init(allocator),
             .account_obs_cache = std.StringHashMap(void).init(allocator),
             .name_by_namehash_cache = std.AutoHashMap(Hash, []const u8).init(allocator),
@@ -333,6 +349,10 @@ pub const Indexer = struct {
         }
         self.v1_label_cache.deinit();
 
+        var rb_it = self.rainbow_cache.valueIterator();
+        while (rb_it.next()) |v| self.allocator.free(v.*);
+        self.rainbow_cache.deinit();
+
         // Free cached resolver-dedup keys
         var rk_it = self.known_resolver_cache.keyIterator();
         while (rk_it.next()) |k| self.allocator.free(k.*);
@@ -378,6 +398,7 @@ pub const Indexer = struct {
     pub const trackBlockHash = caches.trackBlockHash;
     pub const resetBlockHashTracking = caches.resetBlockHashTracking;
     pub const getBlockTimestamp = caches.getBlockTimestamp;
+    pub const warmBlockTimestampCache = caches.warmBlockTimestampCache;
     pub const clearBlockTimestampCache = caches.clearBlockTimestampCache;
     pub const getNameFromNamehash = caches.getNameFromNamehash;
 

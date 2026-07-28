@@ -103,14 +103,19 @@ pub fn indexV1EventsChunked(
             const batch_results = client.getLogsBatch(batch_requests) catch |err| {
                 // Handle both RPC provider buffer overflow (error.RpcError) and http buffer overflow (error.StreamTooLong)
                 if ((err == error.RpcError or err == error.StreamTooLong) and retry_chunk_size > ABSOLUTE_MIN_CHUNK) {
-                    max_rpc_chunk_size = retry_chunk_size; // Learn from overflow
+                    // Learn the halved size, not the failed one: a ceiling set to the
+                    // failing size lets the predictor re-attempt it while the +10%
+                    // regrowth climbs back over a provider's hard range cap within a
+                    // few chunks — one wasted error round-trip per cycle, forever.
                     retry_chunk_size = @max(ABSOLUTE_MIN_CHUNK, retry_chunk_size / 2);
+                    max_rpc_chunk_size = retry_chunk_size;
                     std.log.warn("  Buffer overflow! Retrying with {d} blocks (rpc ceiling now {d})", .{ retry_chunk_size, max_rpc_chunk_size });
                     continue :retry_loop;
                 }
                 return err; // Other errors or hit minimum chunk size
             };
             defer utils.deinitBatchResults(self.allocator, batch_results);
+            self.warmBlockTimestampCache(protocol, batch_results);
 
             // Process each event type and count total events
             var total_events: usize = 0;
@@ -173,7 +178,7 @@ pub fn indexV1EventsChunked(
             chunk_start = chunk_end + 1;
             // Rate limit: wait between batches to avoid hitting RPC provider limits
             if (chunk_start <= to_block) {
-                zsys.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms); // 50ms delay between batches
+                self.rate_limiter.acquire();
             }
             break :retry_loop; // Success - move to next chunk
         }
@@ -202,11 +207,21 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
     // Pre-migration era has ~0.01 events/block, post-migration is denser
     const v1_migration_block = self.config.v1_contracts.v1_migration_block;
     var current_chunk_size: u64 = if (v1_migration_block > 0 and from_block < v1_migration_block) 10000 else 100;
-    var events_per_block: f64 = if (v1_migration_block > 0 and from_block < v1_migration_block) 0.1 else 5.0;
+    var events_per_block: f64 = if (self.v1_events_per_block > 0)
+        self.v1_events_per_block
+    else if (v1_migration_block > 0 and from_block < v1_migration_block) 0.1 else 5.0;
     var chunk_start = from_block;
     // RPC overflow ceiling — learned from actual overflow failures.
     // Prevents the density predictor from overshooting into sizes that will overflow.
-    var max_rpc_chunk_size: u64 = MAX_CHUNK_SIZE;
+    var max_rpc_chunk_size: u64 = if (self.v1_rpc_chunk_ceiling > 0)
+        @min(self.v1_rpc_chunk_ceiling, MAX_CHUNK_SIZE)
+    else
+        MAX_CHUNK_SIZE;
+    // Persist what this batch learned so the next batch starts warm.
+    defer {
+        self.v1_events_per_block = events_per_block;
+        self.v1_rpc_chunk_ceiling = max_rpc_chunk_size;
+    }
 
     // Name Wrapper deployment block (from contract config)
     const NAME_WRAPPER_DEPLOYMENT_BLOCK = self.config.v1_contracts.name_wrapper_deployment_block;
@@ -361,17 +376,24 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
             }
 
             // Execute combined batch RPC call - retry with smaller chunks if buffer overflow
+            const fetch_timer = zsys.milliTimestamp();
             const batch_results = client.getLogsMultiAddressBatch(requests) catch |err| {
                 if ((err == error.RpcError or err == error.StreamTooLong) and retry_chunk_size > ABSOLUTE_MIN_CHUNK) {
-                    // Learn from overflow: cap future predictions to avoid repeated failures
-                    max_rpc_chunk_size = retry_chunk_size; // The size that failed
+                    // Learn the halved size, not the failed one: a ceiling set to the
+                    // failing size lets the predictor re-attempt it while the +10%
+                    // regrowth climbs back over a provider's hard range cap (Alchemy:
+                    // 10k blocks) within 2-3 chunks — a wasted error round-trip and a
+                    // half-sized chunk per cycle, forever.
                     retry_chunk_size = @max(ABSOLUTE_MIN_CHUNK, retry_chunk_size / 2);
+                    max_rpc_chunk_size = retry_chunk_size;
                     std.log.warn("  Buffer overflow! Retrying with {d} blocks (rpc ceiling now {d})", .{ retry_chunk_size, max_rpc_chunk_size });
                     continue :retry_loop;
                 }
                 return err;
             };
             defer utils.deinitBatchResults(self.allocator, batch_results);
+            self.warmBlockTimestampCache(protocol, batch_results);
+            const fetch_elapsed = zsys.milliTimestamp() - fetch_timer;
 
             // Track controller count before processing to detect new controllers
             const controller_count_before = active_controllers.len;
@@ -385,7 +407,11 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
             // Near the tip we therefore write direct per-event so each mutation is
             // captured at its own block; the RPC batch is unaffected (still one call).
             const REORG_WINDOW: u64 = 1000; // matches sync.zig REORG_RETENTION_BLOCKS / pruneOldBlockHashes
-            const near_tip = to_block >= REORG_WINDOW and chunk_end > to_block - REORG_WINDOW;
+            // reorg_arm distinguishes the real chain tip from a mere batch end: the
+            // driver arms it only when the batch lands within the reorg window of the
+            // chain head. Gating on to_block alone made the last REORG_WINDOW blocks
+            // of EVERY bulk batch run unbuffered (direct per-event SQL, ~3x slower).
+            const near_tip = self.reorg_arm and to_block >= REORG_WINDOW and chunk_end > to_block - REORG_WINDOW;
             self.write_buffer.active = !near_tip;
             errdefer {
                 self.write_buffer.active = false;
@@ -430,17 +456,43 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
             const registry_timer = zsys.milliTimestamp();
             const registry_logs = batch_results[2];
             total_events += registry_logs.len;
+            var reg_type_ns = [_]i128{0} ** Indexer.V1_REGISTRY_EVENTS.len;
+            var reg_type_count = [_]usize{0} ** Indexer.V1_REGISTRY_EVENTS.len;
+            self.newowner_phase_ns = [_]i128{0} ** 5;
             for (registry_logs) |log| {
                 if (log.topics.len == 0) continue;
                 self.markEventBlock(protocol, log.block_number);
-                inline for (Indexer.V1_REGISTRY_EVENTS) |cfg| {
+                inline for (Indexer.V1_REGISTRY_EVENTS, 0..) |cfg, type_i| {
                     if (log.topics[0].eql(cfg.event_hash)) {
+                        const h0 = zsys.nanoTimestamp();
                         try cfg.handler(self, protocol, log);
+                        reg_type_ns[type_i] += zsys.nanoTimestamp() - h0;
+                        reg_type_count[type_i] += 1;
                         break;
                     }
                 }
             }
             const registry_elapsed = zsys.milliTimestamp() - registry_timer;
+            // Spike forensics: when the registry group ran hot, name the handler.
+            if (registry_elapsed > 5000) {
+                inline for (Indexer.V1_REGISTRY_EVENTS, 0..) |cfg, type_i| {
+                    if (reg_type_count[type_i] > 0) {
+                        std.log.info("    reg breakdown: {s} {d} events in {d}ms", .{
+                            cfg.name,
+                            reg_type_count[type_i],
+                            @as(i64, @intCast(@divTrunc(reg_type_ns[type_i], std.time.ns_per_ms))),
+                        });
+                    }
+                }
+                const ph = self.newowner_phase_ns;
+                std.log.info("    NewOwner phases: resolve={d}ms parent={d}ms rw={d}ms unknown={d}ms emit={d}ms", .{
+                    @as(i64, @intCast(@divTrunc(ph[0], std.time.ns_per_ms))),
+                    @as(i64, @intCast(@divTrunc(ph[1], std.time.ns_per_ms))),
+                    @as(i64, @intCast(@divTrunc(ph[2], std.time.ns_per_ms))),
+                    @as(i64, @intCast(@divTrunc(ph[3], std.time.ns_per_ms))),
+                    @as(i64, @intCast(@divTrunc(ph[4], std.time.ns_per_ms))),
+                });
+            }
 
             // 4. Name Wrapper events (if included)
             var wrapper_count: usize = 0;
@@ -485,9 +537,14 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
             try self.write_buffer.flush(self.database);
 
             const total_with_flush = zsys.milliTimestamp() - chunk_timer;
-            std.log.info("  Processed {d} events in {d}ms, flushed in {d}ms (eth={d}/{d}ms base={d}/{d}ms reg={d}/{d}ms wrap={d}/{d}ms rev={d})", .{
+            const rb_ms = self.rainbow_probe_ns / std.time.ns_per_ms;
+            const rb_count = self.rainbow_probe_count;
+            self.rainbow_probe_ns = 0;
+            self.rainbow_probe_count = 0;
+            std.log.info("  Processed {d} events in {d}ms, fetched in {d}ms, flushed in {d}ms (eth={d}/{d}ms base={d}/{d}ms reg={d}/{d}ms wrap={d}/{d}ms rev={d} rb={d}/{d}ms)", .{
                 total_events,
                 total_process_elapsed,
+                fetch_elapsed,
                 total_with_flush - total_process_elapsed,
                 eth_logs.len,
                 eth_elapsed,
@@ -498,6 +555,8 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
                 wrapper_count,
                 wrapper_elapsed,
                 reverse_logs.len,
+                rb_count,
+                rb_ms,
             });
 
             // Check if new controllers were added during processing
@@ -546,9 +605,18 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
             current_chunk_size = next_chunk_size;
 
             if (!needs_controller_reprocess) {
+                // Bulk sync: seal this chunk's work (data + cursor stay atomic) and
+                // drain the WAL while its pages are still hot, so the wal-index
+                // never grows past one chunk. Near the tip the batch remains a
+                // single transaction for reorg-undo consistency.
+                if (!self.reorg_arm) {
+                    try self.database.commitTransaction();
+                    self.database.checkpointWalPassive();
+                    try self.database.beginTransaction();
+                }
                 chunk_start = chunk_end + 1;
                 if (chunk_start <= to_block) {
-                    zsys.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
+                    self.rate_limiter.acquire();
                 }
             }
             break :retry_loop;
@@ -667,6 +735,7 @@ pub fn indexPreMigrationRegistryEvents(self: *Indexer, protocol: models.Protocol
                 return err;
             };
             defer utils.deinitBatchResults(self.allocator, batch_results);
+            self.warmBlockTimestampCache(protocol, batch_results);
 
             var total_events: usize = 0;
             for (&pairs, 0..) |*pair, i| {

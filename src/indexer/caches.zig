@@ -10,6 +10,7 @@
 const std = @import("std");
 const zsys = @import("../utils/system.zig");
 const models = @import("../types/models.zig");
+const rpc = @import("../rpc/client.zig");
 const Hash = @import("../types/hash.zig").Hash;
 const Address = @import("../types/address.zig").Address;
 const Indexer = @import("indexer.zig").Indexer;
@@ -65,16 +66,26 @@ pub fn getOrLoadActiveControllers(self: *Indexer) ![]const Address {
     return controllers;
 }
 
-/// Look up a label from v1_label_cache, falling back to DB on miss
+/// Look up a label from v1_label_cache, falling back to DB on miss. Misses are
+/// cached as an empty-string sentinel: unknown-label tokens fire 2-3 events each
+/// (mint, transfer, renewals) and would otherwise re-query v1_labels every time.
+/// The sentinel is overwritten by putCachedV1Label once the label is learned.
 pub fn getCachedV1Label(self: *Indexer, token_id_hex: []const u8) !?[]const u8 {
     // Check cache first
     if (self.v1_label_cache.get(token_id_hex)) |label| {
-        return label;
+        return if (label.len == 0) null else label;
     }
 
     // Cache miss - query DB
     const v1_names = @import("../utils/v1_names.zig");
-    const label = try v1_names.tokenIdToLabel(self.allocator, self.database, token_id_hex) orelse return null;
+    const label = try v1_names.tokenIdToLabel(self.allocator, self.database, token_id_hex) orelse {
+        const key_copy = try self.allocator.dupe(u8, token_id_hex);
+        errdefer self.allocator.free(key_copy);
+        const sentinel = try self.allocator.dupe(u8, "");
+        errdefer self.allocator.free(sentinel);
+        try self.v1_label_cache.put(key_copy, sentinel);
+        return null;
+    };
 
     // Store in cache (need to dupe the key since token_id_hex may be temporary)
     const key_copy = try self.allocator.dupe(u8, token_id_hex);
@@ -86,8 +97,14 @@ pub fn getCachedV1Label(self: *Indexer, token_id_hex: []const u8) !?[]const u8 {
 
 /// Add a label to the v1_label_cache (called when storeTokenIdLabel succeeds)
 pub fn putCachedV1Label(self: *Indexer, token_id_hex: []const u8, label: []const u8) !void {
-    // Check if already cached
-    if (self.v1_label_cache.contains(token_id_hex)) return;
+    // Already cached with a real label: done. A cached miss-sentinel must be
+    // replaced now that the label is known.
+    if (self.v1_label_cache.get(token_id_hex)) |existing| {
+        if (existing.len != 0) return;
+        const kv = self.v1_label_cache.fetchRemove(token_id_hex).?;
+        self.allocator.free(kv.key);
+        self.allocator.free(kv.value);
+    }
 
     const key_copy = try self.allocator.dupe(u8, token_id_hex);
     errdefer self.allocator.free(key_copy);
@@ -97,10 +114,30 @@ pub fn putCachedV1Label(self: *Indexer, token_id_hex: []const u8, label: []const
 }
 
 /// Resolve a labelhash to its plaintext label using the rainbow table.
-/// Returns owned string (caller must free) or null if not found.
+/// Returns a BORROWED string (owned by rainbow_cache) or null. Both hits and
+/// misses are memoized; probe count/time accumulate for the chunk timing line.
 pub fn resolveLabel(self: *Indexer, labelhash: Hash) ?[]const u8 {
+    if (self.rainbow_cache.get(labelhash.bytes)) |cached| {
+        return if (cached.len == 0) null else cached;
+    }
     var r = self.rainbow orelse return null;
-    return r.lookup(labelhash.bytes) catch null;
+    const t0 = zsys.nanoTimestamp();
+    const looked_up = r.lookup(labelhash.bytes) catch null;
+    self.rainbow_probe_ns += @intCast(zsys.nanoTimestamp() - t0);
+    self.rainbow_probe_count += 1;
+    // Bound the memo: distinct labelhashes over a full backfill are finite but
+    // large; reset rather than grow without limit.
+    if (self.rainbow_cache.count() >= 4_000_000) {
+        var it = self.rainbow_cache.valueIterator();
+        while (it.next()) |v| self.allocator.free(v.*);
+        self.rainbow_cache.clearRetainingCapacity();
+    }
+    const value: []const u8 = looked_up orelse self.allocator.dupe(u8, "") catch return looked_up;
+    self.rainbow_cache.put(labelhash.bytes, value) catch {
+        if (looked_up == null) self.allocator.free(value);
+        return looked_up;
+    };
+    return if (value.len == 0) null else value;
 }
 
 /// Track block hash from a processed log (for reorg detection without extra RPC calls)
@@ -117,6 +154,43 @@ pub fn trackBlockHash(self: *Indexer, log_block_number: u64, log_block_hash: ?Ha
 pub fn resetBlockHashTracking(self: *Indexer) void {
     self.last_seen_block_hash = null;
     self.last_seen_block_number = 0;
+}
+
+/// Best-effort pre-resolution of every unique event block the provider didn't
+/// annotate with blockTimestamp: one batched header call per 200 blocks instead
+/// of a lazy per-block RPC inside dispatch. Failures degrade silently to the
+/// lazy path in getBlockTimestamp; single-threaded, so WASM-portable as-is.
+pub fn warmBlockTimestampCache(self: *Indexer, protocol: models.Protocol, logs_groups: []const []rpc.Log) void {
+    var missing: std.ArrayList(u64) = .empty;
+    defer missing.deinit(self.allocator);
+    var seen = std.AutoHashMap(u64, void).init(self.allocator);
+    defer seen.deinit();
+    for (logs_groups) |logs| {
+        for (logs) |log| {
+            if (log.block_timestamp != null) continue;
+            if (self.block_timestamp_cache.contains(log.block_number)) continue;
+            const gop = seen.getOrPut(log.block_number) catch return;
+            if (gop.found_existing) continue;
+            missing.append(self.allocator, log.block_number) catch return;
+        }
+    }
+    if (missing.items.len == 0) return;
+    const client = self.getClient(protocol);
+    var warmed: usize = 0;
+    var start: usize = 0;
+    while (start < missing.items.len) {
+        const end = @min(start + 200, missing.items.len);
+        const headers = client.getBlockHeadersBatch(missing.items[start..end]) catch return;
+        defer self.allocator.free(headers);
+        for (headers) |maybe_header| {
+            const header = maybe_header orelse continue;
+            const ts = std.math.cast(i64, header.timestamp) orelse continue;
+            self.block_timestamp_cache.put(header.number, ts) catch {};
+            warmed += 1;
+        }
+        start = end;
+    }
+    if (warmed > 0) std.log.info("Warmed {d} block timestamps in {d} batched call(s)", .{ warmed, (missing.items.len + 199) / 200 });
 }
 
 /// Get block timestamp: log-provided value if available, then cache, then RPC.
@@ -169,6 +243,14 @@ pub fn getNameFromNamehash(self: *Indexer, namehash: Hash) ?[]const u8 {
     // placeholder→real name patch is picked up on the next batch.
     if (self.name_by_namehash_cache.get(namehash)) |cached| {
         return self.allocator.dupe(u8, cached) catch null;
+    }
+    // Names INSERT'd this chunk live in the write buffer, not the DB — without
+    // this, same-chunk lookups (e.g. events.name) silently resolve to null.
+    // Not cached: the pending record is mutable until flush.
+    if (self.write_buffer.active) {
+        if (self.write_buffer.pendingNewName(namehash)) |pr| {
+            if (pr.name) |n| return self.allocator.dupe(u8, n) catch null;
+        }
     }
     const name = (self.database.getNameStringByNamehash(namehash, self.allocator) catch null) orelse return null;
     const copy = self.allocator.dupe(u8, name) catch return name;

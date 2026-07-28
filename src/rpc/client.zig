@@ -831,6 +831,58 @@ pub const Client = struct {
         };
     }
 
+    /// A full block header (number, hash, parent, timestamp).
+    pub const BlockHeader = struct { number: u64, hash: Hash, parent_hash: Hash, timestamp: u64 };
+
+    fn parseHeaderEntry(item: std.json.Value) ?BlockHeader {
+        if (item != .object) return null;
+        const result = item.object.get("result") orelse return null;
+        if (result != .object) return null;
+        const obj = result.object;
+        const num_v = obj.get("number") orelse return null;
+        const hash_v = obj.get("hash") orelse return null;
+        const parent_v = obj.get("parentHash") orelse return null;
+        const ts_v = obj.get("timestamp") orelse return null;
+        if (num_v != .string or hash_v != .string or parent_v != .string or ts_v != .string) return null;
+        const num_s = if (std.mem.startsWith(u8, num_v.string, "0x")) num_v.string[2..] else num_v.string;
+        const ts_s = if (std.mem.startsWith(u8, ts_v.string, "0x")) ts_v.string[2..] else ts_v.string;
+        return BlockHeader{
+            .number = std.fmt.parseInt(u64, num_s, 16) catch return null,
+            .hash = Hash.fromHex(hash_v.string) catch return null,
+            .parent_hash = Hash.fromHex(parent_v.string) catch return null,
+            .timestamp = std.fmt.parseInt(u64, ts_s, 16) catch return null,
+        };
+    }
+
+    /// Fetch many block headers in one JSON-RPC batch (auto-split per
+    /// max_batch_requests). Result is aligned with `numbers`; an entry the
+    /// provider returned malformed or null decodes as null instead of failing
+    /// the whole call. Caller owns the returned slice.
+    pub fn getBlockHeadersBatch(self: *Client, numbers: []const u64) ![]?BlockHeader {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        var batch_requests = try arena_allocator.alloc(BatchRequest, numbers.len);
+        for (numbers, 0..) |n, i| {
+            const hexnum = try std.fmt.allocPrint(arena_allocator, "0x{x}", .{n});
+            var params = std.json.Array.init(arena_allocator);
+            try params.append(.{ .string = hexnum });
+            try params.append(.{ .bool = false });
+            batch_requests[i] = .{ .method = "eth_getBlockByNumber", .params = .{ .array = params } };
+        }
+
+        const parsed = try self.makeBatchRpcCall(batch_requests);
+        defer parsed.deinit();
+        const items = parsed.value.array.items;
+        if (items.len != numbers.len) return error.RpcError;
+
+        const out = try self.allocator.alloc(?BlockHeader, numbers.len);
+        errdefer self.allocator.free(out);
+        for (items, 0..) |item, i| out[i] = parseHeaderEntry(item);
+        return out;
+    }
+
     /// A block position by tier (number + hash). Used for finality (Task 09).
     pub const TaggedBlock = struct { number: u64, hash: Hash };
 

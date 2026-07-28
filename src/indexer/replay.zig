@@ -350,7 +350,7 @@ fn replayNewOwner(self: *Indexer, q: *Query) !void {
     if (resolved_label == null) {
         if (self.resolveLabel(labelhash)) |rainbow_label| {
             resolved_label = rainbow_label;
-            label_is_allocated = true;
+            label_is_allocated = false; // borrowed from rainbow_cache
         }
     }
 
