@@ -113,7 +113,7 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
                 const new_size = retry_chunk_size / 2;
                 std.log.info("    ENS chunk {d}-{d} too large ({any}), reducing to {d} blocks", .{ ens_chunk_from, chunk_to, err, new_size });
                 retry_chunk_size = new_size;
-                zsys.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
+                self.rate_limiter.acquire();
                 continue;
             };
 
@@ -182,7 +182,7 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
 
         // Rate limit between chunks
         if (ens_chunk_from <= to_block) {
-            zsys.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
+            self.rate_limiter.acquire();
         }
     }
 
@@ -344,7 +344,7 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
 
         // Rate limit between batches
         if (batch_start_chunk < total_chunks) {
-            zsys.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
+            self.rate_limiter.acquire();
         }
     }
 
@@ -468,12 +468,54 @@ pub fn indexLabelStoreEvents(self: *Indexer, protocol: models.Protocol, client: 
     );
 }
 
+fn processResolverChunk(
+    self: *Indexer,
+    protocol: models.Protocol,
+    logs: []rpc.Log,
+    known_resolver_set: *const std.AutoHashMap([20]u8, void),
+    processed_count: *usize,
+    skipped_count: *usize,
+    type_ns: *[Indexer.RESOLVER_EVENTS.len]i128,
+    type_count: *[Indexer.RESOLVER_EVENTS.len]usize,
+) !void {
+    for (logs) |log| {
+        if (log.topics.len == 0) continue;
+
+        // Filter: only process events from known resolvers
+        if (!known_resolver_set.contains(log.address.bytes)) {
+            skipped_count.* += 1;
+            continue;
+        }
+
+        const event_sig = log.topics[0];
+        const resolver = log.address;
+
+        // Find matching handler by comparing event signature
+        self.markEventBlock(protocol, log.block_number);
+        inline for (Indexer.RESOLVER_EVENTS, 0..) |event_cfg, i| {
+            if (event_sig.eql(event_cfg.event_hash)) {
+                const handler_t = zsys.nanoTimestamp();
+                event_cfg.handler(self, protocol, resolver, log) catch |err| {
+                    if (!utils.isMalformedEventError(err)) return err;
+                    utils.skipMalformedEvent(log, err);
+                };
+                type_ns[i] += zsys.nanoTimestamp() - handler_t;
+                type_count[i] += 1;
+                processed_count.* += 1;
+                break;
+            }
+        }
+    }
+}
+
 pub fn indexResolverEvents(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64, to_block: u64) !void {
     const resolvers_mod = @import("../storage/resolvers.zig");
+    const pass_timer = zsys.milliTimestamp();
 
     // Discover new resolvers and get all known resolvers
     var discovery = try resolvers_mod.discoverAndGetResolvers(self.database, protocol, from_block, to_block);
     defer discovery.deinit(self.allocator);
+    const discover_ms = zsys.milliTimestamp() - pass_timer;
 
     // Backfill historical events for newly discovered resolvers.
     // When a resolver is first set on a domain, it may have already emitted events
@@ -517,53 +559,63 @@ pub fn indexResolverEvents(self: *Indexer, protocol: models.Protocol, client: *r
         event_topics[i] = event_cfg.event_hash;
     }
 
-    // Single RPC call: query by topics only, no address filter
-    // This returns events from ANY contract with matching signatures
-    const logs = try client.getLogsMultiAddress(.{
-        .from_block = from_block,
-        .to_block = to_block,
-        .addresses = &[_]Address{}, // Empty = no address filter
-        .topic0_or = &event_topics,
-    });
-    defer {
-        for (logs) |*log| {
-            log.deinit(self.allocator);
-        }
-        self.allocator.free(logs);
-    }
-
-    // Process logs, filtering by known resolvers
+    // Topic-only query, no address filter: returns events from ANY contract with
+    // matching signatures; known-resolver filtering happens client-side below.
+    // Chunked with overflow halving — one unchunked call over a large outer batch
+    // exceeds provider response caps and, being the LAST phase, used to abort the
+    // whole already-processed batch.
     var processed_count: usize = 0;
     var skipped_count: usize = 0;
-
-    for (logs) |log| {
-        if (log.topics.len == 0) continue;
-
-        // Filter: only process events from known resolvers
-        if (!known_resolver_set.contains(log.address.bytes)) {
-            skipped_count += 1;
-            continue;
+    var fetch_ms: i64 = 0;
+    var process_ms: i64 = 0;
+    var fetch_count: usize = 0;
+    var type_ns: [Indexer.RESOLVER_EVENTS.len]i128 = @splat(0);
+    var type_count: [Indexer.RESOLVER_EVENTS.len]usize = @splat(0);
+    var chunk_lo = from_block;
+    var resolver_chunk: u64 = @max(1, @min(self.config.batch_size, 5000));
+    while (chunk_lo <= to_block) {
+        const chunk_hi = @min(to_block, chunk_lo + resolver_chunk - 1);
+        const fetch_t = zsys.milliTimestamp();
+        const logs = client.getLogsMultiAddress(.{
+            .from_block = chunk_lo,
+            .to_block = chunk_hi,
+            .addresses = &[_]Address{}, // Empty = no address filter
+            .topic0_or = &event_topics,
+        }) catch |err| {
+            fetch_ms += zsys.milliTimestamp() - fetch_t;
+            if ((err == error.RpcError or err == error.StreamTooLong) and resolver_chunk > 10) {
+                resolver_chunk = @max(10, resolver_chunk / 2);
+                std.log.warn("  Resolver-events chunk too large, retrying {d}-{d} at {d} blocks", .{ chunk_lo, chunk_hi, resolver_chunk });
+                continue;
+            }
+            return err;
+        };
+        fetch_ms += zsys.milliTimestamp() - fetch_t;
+        fetch_count += 1;
+        defer {
+            for (logs) |*log| {
+                log.deinit(self.allocator);
+            }
+            self.allocator.free(logs);
         }
 
-        const event_sig = log.topics[0];
-        const resolver = log.address;
+        self.warmBlockTimestampCache(protocol, &.{logs});
 
-        // Find matching handler by comparing event signature
-        self.markEventBlock(protocol, log.block_number);
-        inline for (Indexer.RESOLVER_EVENTS) |event_cfg| {
-            if (event_sig.eql(event_cfg.event_hash)) {
-                event_cfg.handler(self, protocol, resolver, log) catch |err| {
-                    if (!utils.isMalformedEventError(err)) return err;
-                    utils.skipMalformedEvent(log, err);
-                };
-                processed_count += 1;
-                break;
+        const process_t = zsys.milliTimestamp();
+        try processResolverChunk(self, protocol, logs, &known_resolver_set, &processed_count, &skipped_count, &type_ns, &type_count);
+        process_ms += zsys.milliTimestamp() - process_t;
+        chunk_lo = chunk_hi + 1;
+        if (chunk_lo <= to_block) self.rate_limiter.acquire();
+    }
+    if (processed_count > 0) {
+        if (process_ms > 5000) {
+            inline for (Indexer.RESOLVER_EVENTS, 0..) |event_cfg, i| {
+                if (type_count[i] > 0) {
+                    std.log.info("    resolver breakdown: {s} {d} events in {d}ms", .{ event_cfg.name, type_count[i], @as(i64, @intCast(@divTrunc(type_ns[i], std.time.ns_per_ms))) });
+                }
             }
         }
-    }
-
-    if (processed_count > 0) {
-        std.log.info("Resolver indexing: {d} events processed, {d} skipped (unknown resolvers)", .{ processed_count, skipped_count });
+        std.log.info("Resolver indexing: {d} events processed, {d} skipped (unknown resolvers) in {d}ms (discover={d}ms fetch={d}ms/{d} calls process={d}ms)", .{ processed_count, skipped_count, zsys.milliTimestamp() - pass_timer, discover_ms, fetch_ms, fetch_count, process_ms });
     }
 }
 
@@ -670,7 +722,7 @@ fn backfillSubregistryEvents(self: *Indexer, protocol: models.Protocol, client: 
                 const new_size = retry_chunk_size / 2;
                 std.log.info("    Backfill chunk {d}-{d} too large ({any}), reducing to {d} blocks", .{ chunk_from, chunk_to, err, new_size });
                 retry_chunk_size = new_size;
-                zsys.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
+                self.rate_limiter.acquire();
                 continue;
             };
 
@@ -731,7 +783,7 @@ fn backfillSubregistryEvents(self: *Indexer, protocol: models.Protocol, client: 
 
         // Rate limit between chunks
         if (chunk_from <= to_block) {
-            zsys.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
+            self.rate_limiter.acquire();
         }
     }
 

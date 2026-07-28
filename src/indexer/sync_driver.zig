@@ -359,6 +359,11 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
         .v2 => self.config.v2_contracts.v2_deployment_block,
     };
 
+    // A protocol that is not deployed on this network has nothing to index.
+    // Without this guard the combined binary walks the entire chain for the
+    // inert protocol, paying reorg-check and lineage RPCs per empty batch.
+    if (deployment_block == 0) return;
+
     // Get last synced block from database (resumability)
     var last_synced = try self.database.getSyncState(protocol) orelse deployment_block;
 
@@ -394,6 +399,16 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
 
     const total_blocks = target_block - last_synced;
     std.log.info("Indexing {s} from block {d} to {d} ({d} blocks)", .{ protocol.toString(), last_synced + 1, target_block, total_blocks });
+
+    // Defensively clear the undo-capture cursor before processing. The in-loop
+    // stale-cursor guard only fires when the in-memory mirror knows a cursor was
+    // set (reorg_cursor_block != -1) — after a process restart the mirror is
+    // always -1, so a cursor row left armed by a crashed near-tip run would
+    // silently turn every protected-table write into a full-row undo capture
+    // for the rest of the bulk sync. Armed batches re-set the cursor per block.
+    reorg_undo.clearCursor(self.database, protocol) catch |err|
+        std.log.warn("reorg undo-log: failed to clear cursor at sync start: {}", .{err});
+    self.invalidateReorgCursor();
 
     // Index in batches with adaptive batch sizing
     // Starts at configured size, halves on RPC response size errors, grows back on success
@@ -454,6 +469,11 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
 
             if ((err == error.RpcError or err == error.StreamTooLong) and current_batch_size > ABSOLUTE_MIN_BATCH) {
                 current_batch_size = @max(ABSOLUTE_MIN_BATCH, current_batch_size / 2);
+                // The retry restarts at the batch head, often in a different density
+                // regime than the tail this state was learned from — a stale estimate
+                // predicts oversized chunks and cascades through overflow retries.
+                self.v1_events_per_block = 0;
+                self.v1_rpc_chunk_ceiling = 0;
                 std.log.warn("RPC response too large for blocks {d}-{d}! Reducing batch size to {d} blocks and retrying", .{ from_block, to_block, current_batch_size });
                 continue; // Retry same from_block with smaller batch
             }
@@ -484,19 +504,30 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
         var lineage: std.ArrayList(BlockLineage) = .empty;
         defer lineage.deinit(self.allocator);
         if (store_per_block) {
+            // For to_block, prefer the hash observed while indexing its logs: it is
+            // consistent with the committed events, so a reorg landing after indexing
+            // can't mask itself from the next poll's reorg check (which examines exactly
+            // this height). Intermediate blocks are fetched for their real headers in
+            // ONE batched call instead of up to 128 sequential round-trips.
+            const reuse_boundary = self.last_seen_block_hash != null and self.last_seen_block_number == to_block;
+            var numbers: std.ArrayList(u64) = .empty;
+            defer numbers.deinit(self.allocator);
             var b = from_block;
             while (b <= to_block) : (b += 1) {
-                // For to_block, prefer the hash observed while indexing its logs: it is
-                // consistent with the committed events, so a reorg landing after indexing
-                // can't mask itself from the next poll's reorg check (which examines exactly
-                // this height). Intermediate blocks are re-fetched for their real header.
-                if (b == to_block and self.last_seen_block_hash != null and self.last_seen_block_number == to_block) {
-                    try lineage.append(self.allocator, .{ .number = b, .hash = self.last_seen_block_hash.?, .parent_hash = Hash.zero });
-                } else {
-                    self.rate_limiter.acquire();
-                    const info = try client.getBlockByNumber(b, false);
-                    try lineage.append(self.allocator, .{ .number = b, .hash = info.hash, .parent_hash = info.parent_hash });
+                if (b == to_block and reuse_boundary) continue;
+                try numbers.append(self.allocator, b);
+            }
+            if (numbers.items.len > 0) {
+                self.rate_limiter.acquire();
+                const headers = try client.getBlockHeadersBatch(numbers.items);
+                defer self.allocator.free(headers);
+                for (headers, numbers.items) |maybe_header, number| {
+                    const info = maybe_header orelse return error.BlockNotFound;
+                    try lineage.append(self.allocator, .{ .number = number, .hash = info.hash, .parent_hash = info.parent_hash });
                 }
+            }
+            if (reuse_boundary) {
+                try lineage.append(self.allocator, .{ .number = to_block, .hash = self.last_seen_block_hash.?, .parent_hash = Hash.zero });
             }
         }
 
@@ -543,8 +574,13 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
             // Clear block timestamp cache to prevent memory growth
             self.clearBlockTimestampCache();
 
+            // Flatten the WAL once per outer batch: chunk-processing reads slow
+            // down as WAL depth grows, so trade random mid-chunk stalls for one
+            // bounded checkpoint here.
+            self.database.checkpointWal();
+
             // Force a brief pause to allow memory to be reclaimed
-            zsys.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
+            self.rate_limiter.acquire();
         }
 
         from_block = to_block + 1;
