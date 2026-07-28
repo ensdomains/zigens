@@ -11,11 +11,39 @@ const models = @import("../types/models.zig");
 const Hash = @import("../types/hash.zig").Hash;
 const Address = @import("../types/address.zig").Address;
 const ens_normalize = @import("../utils/ens_normalize.zig");
+const json_utils = @import("../utils/json.zig");
 const Indexer = @import("indexer.zig").Indexer;
+
+/// The events table carries expression indexes over json_extract(data, ...), so
+/// SQLite (and the PG jsonb cast) evaluates the payload on every INSERT — one
+/// invalid payload aborts the whole chunk. Producers interpolate on-chain strings
+/// (labels, text-record values) into JSON, so hostile bytes must never reach the
+/// table unvalidated: invalid payloads are re-wrapped as valid JSON that preserves
+/// the original bytes, with coordinates logged so the producer can be fixed.
+pub fn quarantineMalformedData(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+    const escaped = try json_utils.escapeString(allocator, data);
+    defer allocator.free(escaped);
+    return std.fmt.allocPrint(allocator, "{{\"malformed\":true,\"raw\":\"{s}\"}}", .{escaped});
+}
+
+fn ensureValidEventData(self: *Indexer, event: models.Event) !models.Event {
+    if (try std.json.validate(self.allocator, event.data)) return event;
+    const quarantined = try quarantineMalformedData(self.allocator, event.data);
+    var tx_buf: [66]u8 = undefined;
+    std.log.warn("event {s} at block {d} tx {s} log_index {d}: malformed JSON payload quarantined", .{
+        @tagName(event.event_type), event.block_number, event.tx_hash.toHexBuf(&tx_buf), event.log_index,
+    });
+    self.allocator.free(event.data);
+    var fixed = event;
+    fixed.data = quarantined;
+    return fixed;
+}
 
 /// Helper function to insert an event and trigger webhooks with proper memory cleanup
 /// This ensures that event.name and event.data are ALWAYS freed after use
-pub fn insertEventAndNotify(self: *Indexer, event: models.Event) !void {
+pub fn insertEventAndNotify(self: *Indexer, raw_event: models.Event) !void {
+    const event = try ensureValidEventData(self, raw_event);
+
     // When write buffer is active, buffer the event instead of writing to DB.
     // Buffer takes ownership of the strings — do NOT free them here.
     if (self.write_buffer.active) {
@@ -100,4 +128,19 @@ pub fn insertName(self: *Indexer, name: models.Name) !void {
         };
     }
     try self.database.insertName(n);
+}
+
+test "quarantineMalformedData produces valid JSON preserving raw bytes" {
+    const allocator = std.testing.allocator;
+    const poison = "{\"name\":\"a\"b.eth\",\"owner\":\"0xabc\"}";
+    try std.testing.expect(!try std.json.validate(allocator, poison));
+
+    const fixed = try quarantineMalformedData(allocator, poison);
+    defer allocator.free(fixed);
+    try std.testing.expect(try std.json.validate(allocator, fixed));
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, fixed, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("malformed").?.bool);
+    try std.testing.expectEqualStrings(poison, parsed.value.object.get("raw").?.string);
 }

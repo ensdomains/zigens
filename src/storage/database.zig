@@ -71,6 +71,11 @@ pub const Database = struct {
     /// fails loudly if a path forgets to populate it (the emitted id would be
     /// `0-v1-…` — visibly wrong but not unsafe).
     chain_id: u64 = 0,
+    /// SQLite page-cache size (MB) applied by dropSyncIndexes for bulk sync.
+    /// Set by the indexer from Config (SYNC_CACHE_MB, .env-aware); process env
+    /// still overrides inside dropSyncIndexes. Paths that never bulk-sync
+    /// (API, tools, tests) keep the default.
+    sync_cache_mb: u64 = 512,
 
     /// Records the chain ID this database serves data for. The value flows
     /// into Resolver entity IDs at JSON-build time. Called by both the
@@ -290,6 +295,21 @@ pub const Database = struct {
     /// This is much faster than maintaining indexes during bulk inserts.
     pub fn createSyncIndexes(self: *Database) !void {
         return schema.createSyncIndexes(self);
+    }
+
+    /// Truncate the SQLite WAL and log its depth (no-op on PostgreSQL).
+    pub fn checkpointWal(self: *Database) void {
+        return schema.checkpointWal(self);
+    }
+
+    /// Drain the WAL between bulk-sync chunks without truncating (no-op on PostgreSQL).
+    /// Current -wal file size in bytes (SQLite only; null when unavailable).
+    pub fn walFileSize(self: *Database) ?u64 {
+        return schema.walFileSize(self);
+    }
+
+    pub fn checkpointWalPassive(self: *Database) void {
+        return schema.checkpointWalPassive(self);
     }
 
     // ========================================================================

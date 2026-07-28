@@ -781,6 +781,10 @@ CREATE INDEX IF NOT EXISTS idx_unknown_labels_backfill
     WHERE backfill_attempts < 3;
 CREATE INDEX IF NOT EXISTS idx_unknown_labels_tx_hash ON unknown_labels(transaction_hash);
 CREATE INDEX IF NOT EXISTS idx_unknown_labels_labelhash ON unknown_labels(labelhash);
+-- The NameWrapped DNS-heal path deletes by namehash for every label level of
+-- every wrap event; without this index each delete (and its reorg-capture
+-- SELECT) full-scans the table.
+CREATE INDEX IF NOT EXISTS idx_unknown_labels_namehash ON unknown_labels(namehash);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_unknown_labels_unique ON unknown_labels(labelhash, parent_node);
 
 

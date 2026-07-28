@@ -523,34 +523,43 @@ pub fn getTextRecord(db: *Database, resolver: Address, namehash: Hash, key: []co
     return null;
 }
 
-/// Get resolvers to index for a block range
-pub fn deleteResolverAddresses(db: *Database, namehash: Hash, resolver: Address) !void {
-    try reorg_undo.captureWhere(db, "resolver_addresses", "D", "namehash = ? AND resolver = ?", .{ namehash, resolver });
-    const sql = "DELETE FROM resolver_addresses WHERE namehash = ? AND resolver = ?";
+/// VersionChanged record clears. The predicate MUST include protocol: every
+/// record table's only sync-surviving index is its UNIQUE(protocol, resolver,
+/// namehash, ...) constraint, and without the protocol equality the leftmost
+/// prefix can't be used — each delete degraded to a full table scan during
+/// bulk sync (measured 26s per VersionChanged event across the 7 tables).
+/// Protocol scoping is also the correct semantics: the tables are
+/// protocol-partitioned, and an unscoped delete could cross protocols.
+pub fn deleteResolverAddresses(db: *Database, protocol: models.Protocol, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "resolver_addresses", "D", "protocol = ? AND resolver = ? AND namehash = ?", .{ protocol, resolver, namehash });
+    const sql = "DELETE FROM resolver_addresses WHERE protocol = ? AND resolver = ? AND namehash = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
-    try q.bindHash(namehash);
+    try q.bindTextStatic(protocol.toString());
     try q.bindAddress(resolver);
+    try q.bindHash(namehash);
     try q.exec();
 }
 
-pub fn deleteResolverContentHash(db: *Database, namehash: Hash, resolver: Address) !void {
-    try reorg_undo.captureWhere(db, "resolver_contenthashes", "D", "namehash = ? AND resolver = ?", .{ namehash, resolver });
-    const sql = "DELETE FROM resolver_contenthashes WHERE namehash = ? AND resolver = ?";
+pub fn deleteResolverContentHash(db: *Database, protocol: models.Protocol, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "resolver_contenthashes", "D", "protocol = ? AND resolver = ? AND namehash = ?", .{ protocol, resolver, namehash });
+    const sql = "DELETE FROM resolver_contenthashes WHERE protocol = ? AND resolver = ? AND namehash = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
-    try q.bindHash(namehash);
+    try q.bindTextStatic(protocol.toString());
     try q.bindAddress(resolver);
+    try q.bindHash(namehash);
     try q.exec();
 }
 
-pub fn deleteResolverTexts(db: *Database, namehash: Hash, resolver: Address) !void {
-    try reorg_undo.captureWhere(db, "resolver_texts", "D", "namehash = ? AND resolver = ?", .{ namehash, resolver });
-    const sql = "DELETE FROM resolver_texts WHERE namehash = ? AND resolver = ?";
+pub fn deleteResolverTexts(db: *Database, protocol: models.Protocol, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "resolver_texts", "D", "protocol = ? AND resolver = ? AND namehash = ?", .{ protocol, resolver, namehash });
+    const sql = "DELETE FROM resolver_texts WHERE protocol = ? AND resolver = ? AND namehash = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
-    try q.bindHash(namehash);
+    try q.bindTextStatic(protocol.toString());
     try q.bindAddress(resolver);
+    try q.bindHash(namehash);
     try q.exec();
 }
 
@@ -564,43 +573,47 @@ pub fn deleteResolverAlias(db: *Database, resolver: Address, from_name: []const 
     try q.exec();
 }
 
-pub fn deleteResolverPubkeys(db: *Database, namehash: Hash, resolver: Address) !void {
-    try reorg_undo.captureWhere(db, "resolver_pubkeys", "D", "namehash = ? AND resolver = ?", .{ namehash, resolver });
-    const sql = "DELETE FROM resolver_pubkeys WHERE namehash = ? AND resolver = ?";
+pub fn deleteResolverPubkeys(db: *Database, protocol: models.Protocol, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "resolver_pubkeys", "D", "protocol = ? AND resolver = ? AND namehash = ?", .{ protocol, resolver, namehash });
+    const sql = "DELETE FROM resolver_pubkeys WHERE protocol = ? AND resolver = ? AND namehash = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
-    try q.bindHash(namehash);
+    try q.bindTextStatic(protocol.toString());
     try q.bindAddress(resolver);
+    try q.bindHash(namehash);
     try q.exec();
 }
 
-pub fn deleteResolverAbis(db: *Database, namehash: Hash, resolver: Address) !void {
-    try reorg_undo.captureWhere(db, "resolver_abis", "D", "namehash = ? AND resolver = ?", .{ namehash, resolver });
-    const sql = "DELETE FROM resolver_abis WHERE namehash = ? AND resolver = ?";
+pub fn deleteResolverAbis(db: *Database, protocol: models.Protocol, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "resolver_abis", "D", "protocol = ? AND resolver = ? AND namehash = ?", .{ protocol, resolver, namehash });
+    const sql = "DELETE FROM resolver_abis WHERE protocol = ? AND resolver = ? AND namehash = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
-    try q.bindHash(namehash);
+    try q.bindTextStatic(protocol.toString());
     try q.bindAddress(resolver);
+    try q.bindHash(namehash);
     try q.exec();
 }
 
-pub fn deleteResolverNames(db: *Database, namehash: Hash, resolver: Address) !void {
-    try reorg_undo.captureWhere(db, "resolver_names", "D", "namehash = ? AND resolver = ?", .{ namehash, resolver });
-    const sql = "DELETE FROM resolver_names WHERE namehash = ? AND resolver = ?";
+pub fn deleteResolverNames(db: *Database, protocol: models.Protocol, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "resolver_names", "D", "protocol = ? AND resolver = ? AND namehash = ?", .{ protocol, resolver, namehash });
+    const sql = "DELETE FROM resolver_names WHERE protocol = ? AND resolver = ? AND namehash = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
-    try q.bindHash(namehash);
+    try q.bindTextStatic(protocol.toString());
     try q.bindAddress(resolver);
+    try q.bindHash(namehash);
     try q.exec();
 }
 
-pub fn deleteResolverInterfaces(db: *Database, namehash: Hash, resolver: Address) !void {
-    try reorg_undo.captureWhere(db, "resolver_interfaces", "D", "namehash = ? AND resolver = ?", .{ namehash, resolver });
-    const sql = "DELETE FROM resolver_interfaces WHERE namehash = ? AND resolver = ?";
+pub fn deleteResolverInterfaces(db: *Database, protocol: models.Protocol, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "resolver_interfaces", "D", "protocol = ? AND resolver = ? AND namehash = ?", .{ protocol, resolver, namehash });
+    const sql = "DELETE FROM resolver_interfaces WHERE protocol = ? AND resolver = ? AND namehash = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
-    try q.bindHash(namehash);
+    try q.bindTextStatic(protocol.toString());
     try q.bindAddress(resolver);
+    try q.bindHash(namehash);
     try q.exec();
 }
 

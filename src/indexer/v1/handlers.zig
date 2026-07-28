@@ -16,6 +16,7 @@ const utils = @import("../utils.zig");
 const dns = @import("../../utils/dns.zig");
 const names_storage = @import("../../storage/names.zig");
 const ens_normalize = @import("../../utils/ens_normalize.zig");
+const json_utils = @import("../../utils/json.zig");
 const v1_names = @import("../../utils/v1_names.zig");
 
 /// Returns true when the log came from the legacy pre-2020 ENS Registry
@@ -124,6 +125,7 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
     // 1. addr.reverse: label = lowercase(owner_address)
     // 2. Rainbow table lookup
     // 3. Fallback to [labelhash] notation
+    var ph_t = zsys.nanoTimestamp();
     var resolved_label: ?[]const u8 = null;
     var label_is_allocated = false;
     defer if (label_is_allocated) {
@@ -151,7 +153,7 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
     if (resolved_label == null) {
         if (self.resolveLabel(labelhash)) |rainbow_label| {
             resolved_label = rainbow_label;
-            label_is_allocated = true;
+            label_is_allocated = false; // borrowed from rainbow_cache
         }
     }
 
@@ -165,6 +167,8 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
         break :blk label_buf[0..66];
     };
 
+    self.newowner_phase_ns[0] += zsys.nanoTimestamp() - ph_t;
+    ph_t = zsys.nanoTimestamp();
     // Look up parent name to construct full name
     var parent_name_str: ?[]const u8 = null;
     var parent_record_to_free: ?models.Name = null;
@@ -178,6 +182,8 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
         parent_name_str = parent_record.name;
     }
 
+    self.newowner_phase_ns[1] += zsys.nanoTimestamp() - ph_t;
+    ph_t = zsys.nanoTimestamp();
     const full_name = try ens_name.join(self.allocator, label_str, parent_name_str);
     defer self.allocator.free(full_name);
 
@@ -188,6 +194,12 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
     const now = zsys.timestamp();
     const blk_ts = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
 
+    // Subname writes stay DIRECT deliberately: measured on live data, routing
+    // them through the write buffer moved the same per-row statements to flush
+    // time (no statement reduction, only update-dedup) while every burn event
+    // forced a whole-buffer flush for GC visibility — a net loss in burn-heavy
+    // eras. The buffer's same-chunk visibility fixes (pendingNewName gates in
+    // NewResolver/NewTTL/RegistryTransfer) are independent and remain.
     if (try names_storage.getNameByNamehash(self.database, subdomain_namehash)) |existing| {
         // Name already exists — update owner
         var existing_mut = existing;
@@ -258,6 +270,8 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
         };
     }
 
+    self.newowner_phase_ns[2] += zsys.nanoTimestamp() - ph_t;
+    ph_t = zsys.nanoTimestamp();
     // Still record unresolved labels for backfill (calldata decoding may find them later)
     if (resolved_label == null) {
         unknown_labels_storage.insertUnknownLabel(
@@ -274,11 +288,14 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
         };
     }
 
+    self.newowner_phase_ns[3] += zsys.nanoTimestamp() - ph_t;
+    ph_t = zsys.nanoTimestamp();
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"parentNode\":\"{s}\",\"labelhash\":\"{s}\",\"subdomain\":\"{s}\",\"owner\":\"{s}\"}}", .{
         parent_hex, labelhash_hex, subdomain_hex, owner_hex,
     });
 
     try utils.emitEvent(self, protocol, log, .transfer, null, subdomain_namehash, event_data);
+    self.newowner_phase_ns[4] += zsys.nanoTimestamp() - ph_t;
 }
 
 /// Handle V1 ENS Registry Transfer event
@@ -309,14 +326,19 @@ pub fn handleV1RegistryTransfer(self: *Indexer, protocol: models.Protocol, log: 
     // ownership update has nothing to attach to and a synthetic orphan row
     // would lack name/label/parent context.
     if (self.write_buffer.active) {
-        try self.write_buffer.updateNameOwner(node, owner);
+        if (self.write_buffer.pendingNewName(node)) |pr| {
+            pr.owner = owner;
+            pr.is_legacy = isFromLegacyRegistry(self, log.address);
+        } else {
+            try self.write_buffer.updateNameOwner(node, owner);
+            names_storage.updateNameIsLegacy(self.database, node, isFromLegacyRegistry(self, log.address)) catch {};
+        }
     } else {
         try names_storage.updateNameOwner(self.database, node, owner);
+        // Track provenance: this event came from either the legacy pre-2020
+        // Registry or the canonical post-2020 Registry. No-op if no row exists.
+        names_storage.updateNameIsLegacy(self.database, node, isFromLegacyRegistry(self, log.address)) catch {};
     }
-
-    // Track provenance: this event came from either the legacy pre-2020
-    // Registry or the canonical post-2020 Registry. No-op if no row exists.
-    names_storage.updateNameIsLegacy(self.database, node, isFromLegacyRegistry(self, log.address)) catch {};
 
     // Subgraph parity: a Transfer to the zero address is a burn. If the row
     // is also fully cleared (resolver=0, no expiry) AND has no live subdomains,
@@ -369,6 +391,32 @@ pub fn handleV1NewResolver(self: *Indexer, protocol: models.Protocol, log: rpc.L
     // NewResolver arrives first, the later NewOwner will create the row
     // without the resolver set. This trades a small completeness gap for
     // schema integrity.
+    if (self.write_buffer.active) blk: {
+        const pr = self.write_buffer.pendingNewName(node) orelse break :blk;
+        if (!resolver.isZero()) {
+            self.database.upsertResolverEntity(
+                protocol,
+                resolver_hex,
+                node_hex,
+                pr.name orelse "[unknown]",
+                log.block_number,
+                try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+            ) catch |err| {
+                std.log.debug("upsertResolverEntity failed: {}", .{err});
+            };
+        }
+        pr.resolver = resolver;
+        pr.is_legacy = isFromLegacyRegistry(self, log.address);
+        try self.registerResolverOnce(protocol, resolver_hex, log.block_number);
+        // Mirror the shared tail: the ResolverUpdate event is emitted for the
+        // pending-row case exactly as for the DB-row case.
+        const pending_event_data = try std.fmt.allocPrint(self.allocator, "{{\"node\":\"{s}\",\"resolver\":\"{s}\"}}", .{
+            node_hex, resolver_hex,
+        });
+        try utils.emitEvent(self, protocol, log, .resolver_update, null, node, pending_event_data);
+        return;
+    }
+
     const existing = names_storage.getNameByNamehash(self.database, node) catch null;
     if (existing) |row| {
         var row_mut = row;
@@ -461,11 +509,23 @@ pub fn handleV1NewTTL(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !
 
     // Persist TTL on the Name row. No-op if the row doesn't exist yet —
     // V1 NewTTL on an unregistered node has nothing to attach to.
-    names_storage.updateNameTTL(self.database, node, ttl) catch |err| {
-        std.log.debug("V1 NewTTL: updateNameTTL failed for {s}: {}", .{ node_hex, err });
-    };
-    // Track legacy/canonical Registry provenance on the same event.
-    names_storage.updateNameIsLegacy(self.database, node, isFromLegacyRegistry(self, log.address)) catch {};
+    if (self.write_buffer.active) {
+        if (self.write_buffer.pendingNewName(node)) |pr| {
+            pr.ttl = ttl;
+            pr.is_legacy = isFromLegacyRegistry(self, log.address);
+        } else {
+            names_storage.updateNameTTL(self.database, node, ttl) catch |err| {
+                std.log.debug("V1 NewTTL: updateNameTTL failed for {s}: {}", .{ node_hex, err });
+            };
+            names_storage.updateNameIsLegacy(self.database, node, isFromLegacyRegistry(self, log.address)) catch {};
+        }
+    } else {
+        names_storage.updateNameTTL(self.database, node, ttl) catch |err| {
+            std.log.debug("V1 NewTTL: updateNameTTL failed for {s}: {}", .{ node_hex, err });
+        };
+        // Track legacy/canonical Registry provenance on the same event.
+        names_storage.updateNameIsLegacy(self.database, node, isFromLegacyRegistry(self, log.address)) catch {};
+    }
 
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"node\":\"{s}\",\"ttl\":{d}}}", .{ node_hex, ttl });
     try utils.emitEvent(self, protocol, log, .resolver_update, null, node, event_data);
@@ -951,9 +1011,11 @@ fn writeBaseRegistrarRegistration(self: *Indexer, protocol: models.Protocol, log
         };
 
         // Store event with name and namehash
+        const escaped_name = try json_utils.escapeString(self.allocator, full_name);
+        defer self.allocator.free(escaped_name);
         const event_data = try std.fmt.allocPrint(self.allocator, "{{\"id\":\"{s}\",\"name\":\"{s}\",\"owner\":\"{s}\",\"expires\":{d}}}", .{
             token_id_hex,
-            full_name,
+            escaped_name,
             owner_hex,
             expires,
         });
@@ -1281,18 +1343,20 @@ fn writeControllerRegistration(
     // existing clients that read `.cost` from legacy-variant events still work
     // across all three signatures.
     const total = base_cost + premium;
+    const escaped_name = try json_utils.escapeString(self.allocator, name);
+    defer self.allocator.free(escaped_name);
     const event_data = if (referrer_opt) |referrer_hash| blk: {
         var referrer_buf: [66]u8 = undefined;
         const referrer_hex = referrer_hash.toHexBuf(&referrer_buf);
         break :blk try std.fmt.allocPrint(
             self.allocator,
             "{{\"name\":\"{s}\",\"label\":\"{s}\",\"owner\":\"{s}\",\"baseCost\":{d},\"premium\":{d},\"cost\":{d},\"expires\":{d},\"referrer\":\"{s}\"}}",
-            .{ name, label_hash_hex, owner_hex, base_cost, premium, total, expires, referrer_hex },
+            .{ escaped_name, label_hash_hex, owner_hex, base_cost, premium, total, expires, referrer_hex },
         );
     } else try std.fmt.allocPrint(
         self.allocator,
         "{{\"name\":\"{s}\",\"label\":\"{s}\",\"owner\":\"{s}\",\"baseCost\":{d},\"premium\":{d},\"cost\":{d},\"expires\":{d}}}",
-        .{ name, label_hash_hex, owner_hex, base_cost, premium, total, expires },
+        .{ escaped_name, label_hash_hex, owner_hex, base_cost, premium, total, expires },
     );
 
     try utils.emitEvent(self, protocol, log, .name_registered, name, namehash, event_data);
@@ -1770,10 +1834,12 @@ pub fn handleV2NameForAddrChanged(self: *Indexer, protocol: models.Protocol, log
     // Store event (JSON payload mirrors the on-chain event shape)
     var nh_buf: [66]u8 = undefined;
     const nh_hex = namehash.toHexBuf(&nh_buf);
+    const escaped_name = try json_utils.escapeString(self.allocator, name);
+    defer self.allocator.free(escaped_name);
     const event_data = try std.fmt.allocPrint(
         self.allocator,
         "{{\"address\":\"{s}\",\"name\":\"{s}\",\"namehash\":\"{s}\"}}",
-        .{ addr_hex, name, nh_hex },
+        .{ addr_hex, escaped_name, nh_hex },
     );
 
     try utils.emitEvent(self, protocol, log, .name_changed, name, namehash, event_data);

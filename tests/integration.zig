@@ -938,7 +938,7 @@ test "reorg undo-log re-inserts a resolver record cleared after the reorg block"
 
     // Block 200: cleared (DELETE — captured by the AFTER DELETE trigger, tagged 200).
     try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
-    try database.deleteResolverAddresses(nh, resolver);
+    try database.deleteResolverAddresses(.v2, nh, resolver);
     try testing.expectEqual(@as(i64, 0), try resolverAddrCount(&database, nh));
 
     // Reorg to 150: the cleared record (created 100 ≤ 150) is re-inserted.

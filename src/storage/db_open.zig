@@ -34,7 +34,9 @@ pub fn selectBackend(
 /// here. This is the entry point the indexer/API mains adopt in place of `Database.init`.
 pub fn openFromConfig(allocator: std.mem.Allocator, cfg: config.Config) !Database {
     const be = try selectBackend(allocator, cfg.backend_kind, cfg.database_path, cfg.database_url);
-    return Database.initWithBackend(allocator, be);
+    var database = try Database.initWithBackend(allocator, be);
+    database.sync_cache_mb = cfg.sync_cache_mb;
+    return database;
 }
 
 /// Config-driven read-only open: select the backend per `cfg` but SKIP schema bootstrap

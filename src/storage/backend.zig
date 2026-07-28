@@ -226,16 +226,36 @@ pub const Statement = struct {
     param_idx: c_int = 1,
     /// Cached statements are reset (not finalized) on deinit; the cache owns them.
     is_cached: bool = false,
+    /// Value-copied SQL prefix so execution failures can name their query.
+    sql_prefix: [160]u8 = undefined,
+    sql_prefix_len: u8 = 0,
     /// Tracked bound-string copies, freed on reset/deinit (SQLITE_STATIC model).
     bound_strings: [MAX_BOUND_STRINGS]?[]u8 = [_]?[]u8{null} ** MAX_BOUND_STRINGS,
     bound_string_count: usize = 0,
 
     pub fn init(database: *Database, sql: []const u8) !Statement {
-        return database.prepare(sql);
+        var stmt = try database.prepare(sql);
+        stmt.rememberSql(sql);
+        return stmt;
     }
 
     pub fn initCached(database: *Database, sql: []const u8) !Statement {
-        return database.prepareCached(sql);
+        var stmt = try database.prepareCached(sql);
+        stmt.rememberSql(sql);
+        return stmt;
+    }
+
+    /// Keep a value-copied prefix of the SQL so execution failures can name the
+    /// query. Copied (not borrowed): some call sites free their SQL string
+    /// before the statement is executed.
+    pub fn rememberSql(self: *Statement, sql: []const u8) void {
+        const n = @min(sql.len, self.sql_prefix.len);
+        @memcpy(self.sql_prefix[0..n], sql[0..n]);
+        self.sql_prefix_len = @intCast(n);
+    }
+
+    fn sqlPrefix(self: *const Statement) []const u8 {
+        return self.sql_prefix[0..self.sql_prefix_len];
     }
 
     pub fn deinit(self: *Statement) void {
@@ -366,7 +386,7 @@ pub const Statement = struct {
 
     pub fn exec(self: *Statement) !void {
         if (!self.vtable.exec(self.ctx)) {
-            std.log.err("Failed to execute query: {s}", .{self.vtable.lastError(self.ctx)});
+            std.log.err("Failed to execute query: {s} [sql: {s}]", .{ self.vtable.lastError(self.ctx), self.sqlPrefix() });
             return error.ExecFailed;
         }
     }

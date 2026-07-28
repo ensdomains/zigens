@@ -130,6 +130,17 @@ pub const WriteBuffer = struct {
         gop.value_ptr.record.?.is_normalized = ens_normalize.nameIsNormalized(self.allocator, name.name);
     }
 
+    /// Mutable view of a name INSERT'd this chunk but not yet flushed. Update
+    /// handlers use it so same-chunk creation+update sequences behave exactly
+    /// like the direct path: field updates land on the pending record in-place
+    /// instead of no-op'ing against a DB row that doesn't exist yet. The
+    /// pointer is invalidated by the next names-map mutation — use immediately.
+    pub fn pendingNewName(self: *WriteBuffer, namehash: Hash) ?*models.Name {
+        const entry = self.names.getPtr(namehash.bytes) orelse return null;
+        if (!entry.is_new) return null;
+        return &entry.record.?;
+    }
+
     /// Buffer an owner update. If the name was INSERT'd this chunk, updates in-place.
     pub fn updateNameOwner(self: *WriteBuffer, namehash: Hash, owner: Address) !void {
         const key = namehash.bytes;
@@ -309,6 +320,12 @@ pub const WriteBuffer = struct {
         const timer = zsys.milliTimestamp();
         var names_inserted: usize = 0;
         var names_updated: usize = 0;
+        var names_ms: i64 = 0;
+        // Per-statement-type forensics: [insert, unwrap, wrapper_state, migrate/owner,
+        // expiry, resolver, fuses, wrapper_expiry]. Printed when the names phase runs hot.
+        var op_ns: [8]i128 = @splat(0);
+        var op_count: [8]usize = @splat(0);
+        const wal_before = db.walFileSize() orelse 0;
 
         // 1. Flush names (events may reference names)
         var it = self.names.iterator();
@@ -317,7 +334,10 @@ pub const WriteBuffer = struct {
 
             if (bn.is_new) {
                 // Single INSERT with all updates already applied to the record
+                const t0 = zsys.nanoTimestamp();
                 try names_storage.insertName(db, bn.record.?);
+                op_ns[0] += zsys.nanoTimestamp() - t0;
+                op_count[0] += 1;
                 names_inserted += 1;
             } else {
                 // Apply individual updates to existing DB record
@@ -325,49 +345,88 @@ pub const WriteBuffer = struct {
 
                 // Unwrap must come before other wrapper updates
                 if (bn.unwrap) {
+                    const t0 = zsys.nanoTimestamp();
                     try names_storage.updateNameUnwrapperState(db, namehash);
+                    op_ns[1] += zsys.nanoTimestamp() - t0;
+                    op_count[1] += 1;
                 }
 
                 // Full wrapper state (from NameWrapped)
                 if (bn.wrapper_state) |ws| {
+                    const t0 = zsys.nanoTimestamp();
                     try names_storage.updateNameWrapperState(db, namehash, ws.fuses, ws.expiry);
+                    op_ns[2] += zsys.nanoTimestamp() - t0;
+                    op_count[2] += 1;
                 }
 
                 // Migration takes precedence over plain owner update — it sets
                 // both `owner` and `migrated=true` in one statement.
                 if (bn.migrated_to) |controller| {
+                    const t0 = zsys.nanoTimestamp();
                     try names_storage.markNameMigrated(db, namehash, controller);
+                    op_ns[3] += zsys.nanoTimestamp() - t0;
+                    op_count[3] += 1;
                 } else if (bn.owner) |owner| {
+                    const t0 = zsys.nanoTimestamp();
                     try names_storage.updateNameOwner(db, namehash, owner);
+                    op_ns[3] += zsys.nanoTimestamp() - t0;
+                    op_count[3] += 1;
                 }
                 if (bn.expiry) |expiry| {
+                    const t0 = zsys.nanoTimestamp();
                     try names_storage.updateV1RenewalExpiry(db, namehash, expiry);
+                    op_ns[4] += zsys.nanoTimestamp() - t0;
+                    op_count[4] += 1;
                 }
                 if (bn.resolver) |resolver| {
+                    const t0 = zsys.nanoTimestamp();
                     try names_storage.updateNameResolver(db, namehash, resolver);
+                    op_ns[5] += zsys.nanoTimestamp() - t0;
+                    op_count[5] += 1;
                 }
                 if (bn.fuses_update) |fuses| {
+                    const t0 = zsys.nanoTimestamp();
                     try names_storage.updateNameWrapperFuses(db, namehash, fuses);
+                    op_ns[6] += zsys.nanoTimestamp() - t0;
+                    op_count[6] += 1;
                 }
                 if (bn.wrapper_expiry_update) |exp| {
+                    const t0 = zsys.nanoTimestamp();
                     try names_storage.updateNameWrapperExpiry(db, namehash, exp);
+                    op_ns[7] += zsys.nanoTimestamp() - t0;
+                    op_count[7] += 1;
                 }
                 names_updated += 1;
             }
         }
+        names_ms = zsys.milliTimestamp() - timer;
 
         // 2. Flush events
+        const events_timer = zsys.milliTimestamp();
         for (self.events.items) |event| {
             try events_storage.insertEvent(db, event);
         }
+        const events_ms = zsys.milliTimestamp() - events_timer;
+        const wal_after = db.walFileSize() orelse wal_before;
 
         const elapsed = zsys.milliTimestamp() - timer;
         if (self.events.items.len > 0 or names_inserted > 0 or names_updated > 0) {
-            std.log.info("  Buffer flush: {d} events, {d} name inserts, {d} name updates in {d}ms", .{
+            if (names_ms > 5000) {
+                const op_labels = [8][]const u8{ "ins", "unwrap", "wrapstate", "owner", "expiry", "resolver", "fuses", "wrapexp" };
+                for (op_labels, 0..) |label, i| {
+                    if (op_count[i] > 0) {
+                        std.log.info("    names breakdown: {s} {d} stmts in {d}ms", .{ label, op_count[i], @as(i64, @intCast(@divTrunc(op_ns[i], std.time.ns_per_ms))) });
+                    }
+                }
+            }
+            std.log.info("  Buffer flush: {d} events, {d} name inserts, {d} name updates in {d}ms (names={d}ms events={d}ms wal+={d}MB)", .{
                 self.events.items.len,
                 names_inserted,
                 names_updated,
                 elapsed,
+                names_ms,
+                events_ms,
+                (wal_after -| wal_before) / (1024 * 1024),
             });
         }
 

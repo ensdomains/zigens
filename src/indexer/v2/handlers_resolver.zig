@@ -1049,27 +1049,27 @@ pub fn handleVersionChanged(self: *Indexer, protocol: models.Protocol, resolver:
     // Clear all resolver records for this (resolver, namehash) pair only.
     // Scoping by resolver prevents wiping records owned by a different resolver
     // for the same name (e.g. resolver-A → resolver-B → resolver-A swap path).
-    self.database.deleteResolverAddresses(namehash, resolver) catch |err| {
+    self.database.deleteResolverAddresses(protocol, namehash, resolver) catch |err| {
         std.log.warn("Failed to delete resolver addresses: {}", .{err});
     };
-    self.database.deleteResolverContentHash(namehash, resolver) catch |err| {
+    self.database.deleteResolverContentHash(protocol, namehash, resolver) catch |err| {
         std.log.warn("Failed to delete resolver contenthash: {}", .{err});
     };
-    self.database.deleteResolverTexts(namehash, resolver) catch |err| {
+    self.database.deleteResolverTexts(protocol, namehash, resolver) catch |err| {
         std.log.warn("Failed to delete resolver texts: {}", .{err});
     };
     // Note: aliases are NOT versioned — they live in _storage().aliases, not _record(node).
     // So VersionChanged does NOT clear aliases.
-    self.database.deleteResolverPubkeys(namehash, resolver) catch |err| {
+    self.database.deleteResolverPubkeys(protocol, namehash, resolver) catch |err| {
         std.log.warn("Failed to delete resolver pubkeys: {}", .{err});
     };
-    self.database.deleteResolverAbis(namehash, resolver) catch |err| {
+    self.database.deleteResolverAbis(protocol, namehash, resolver) catch |err| {
         std.log.warn("Failed to delete resolver ABIs: {}", .{err});
     };
-    self.database.deleteResolverNames(namehash, resolver) catch |err| {
+    self.database.deleteResolverNames(protocol, namehash, resolver) catch |err| {
         std.log.warn("Failed to delete resolver names: {}", .{err});
     };
-    self.database.deleteResolverInterfaces(namehash, resolver) catch |err| {
+    self.database.deleteResolverInterfaces(protocol, namehash, resolver) catch |err| {
         std.log.warn("Failed to delete resolver interfaces: {}", .{err});
     };
 

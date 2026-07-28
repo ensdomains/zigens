@@ -1,6 +1,8 @@
 const std = @import("std");
 const zsys = @import("../utils/system.zig");
+const constants = @import("../constants.zig");
 const Database = @import("database.zig").Database;
+const Query = @import("database.zig").Query;
 const accounts = @import("accounts.zig");
 const resolvers = @import("resolvers.zig");
 
@@ -199,9 +201,18 @@ pub fn migrate(self: *Database) !void {
 /// - idx_names_namehash, idx_names_token_id, idx_names_canonical_id (handler lookups)
 /// - idx_events_name (the in-place event name-patch matches events by name)
 /// - idx_v1_labels_*, idx_v1_controllers_active (V1 handler lookups)
+/// - idx_names_created_block (resolver discovery ranges names per batch)
 /// - idx_registries_*, idx_known_*_last_indexed, idx_orphaned_* (sync tracking)
 /// - idx_block_hashes_timestamp (block tracking)
 const SYNC_DROP_INDEXES = [_][]const u8{
+    // The three json_extract expression indexes are the single largest bulk-sync
+    // write amplifier (measured 3.5x insert time, 2.1x WAL volume on a 2M-row
+    // table): every INSERT parses the payload three times and dirties three
+    // random-key btree leaves. They only serve the API-time address-involvement
+    // filter, so they sit out the sync and are recreated per-dialect at the end.
+    "idx_events_owner_extracted",
+    "idx_events_to_extracted",
+    "idx_events_from_extracted",
     "idx_events_protocol",
     "idx_events_type",
     "idx_events_block",
@@ -216,13 +227,26 @@ const SYNC_DROP_INDEXES = [_][]const u8{
     "idx_names_expiry",
     "idx_names_registry",
     "idx_names_resolver",
-    "idx_names_created_block",
+    // idx_names_created_block stays: resolver discovery runs once per batch with
+    // `WHERE protocol = ? AND created_block BETWEEN ? AND ?` — without the index
+    // that is a full scan of the multi-million-row names table inside the
+    // resolver pass (same sync-path-query class as idx_names_parent_namehash).
     "idx_names_registrant",
     "idx_names_v1_label_hash",
-    "idx_names_parent_namehash",
     "idx_names_is_wrapped",
     "idx_names_is_v1_name",
     "idx_names_wrapper_expiry",
+    // Added to schema.sql after this list was written and never enrolled — the
+    // NewOwner phase forensics showed every subname insert maintaining ~10
+    // btrees (1.74x insert cost measured on 1.5M rows). API-time only, except
+    // canonical_id where the kept (canonical_id, registry) composite covers
+    // the V2 sync-path lookup via its leftmost prefix.
+    "idx_names_canonical_id",
+    "idx_names_expiry_effective",
+    "idx_names_is_reachable",
+    "idx_names_registry_reachable",
+    "idx_names_is_normalized",
+    "idx_names_subdomain_count",
     "idx_resolvers_protocol",
     "idx_resolvers_namehash",
     "idx_resolver_addresses_namehash",
@@ -328,9 +352,22 @@ const SYNC_CREATE_INDEXES = [_][]const u8{
     "CREATE INDEX IF NOT EXISTS idx_unknown_labels_backfill ON unknown_labels(backfill_attempts, created_at) WHERE backfill_attempts < 3",
     "CREATE INDEX IF NOT EXISTS idx_unknown_labels_tx_hash ON unknown_labels(transaction_hash)",
     "CREATE INDEX IF NOT EXISTS idx_unknown_labels_labelhash ON unknown_labels(labelhash)",
+    "CREATE INDEX IF NOT EXISTS idx_unknown_labels_namehash ON unknown_labels(namehash)",
+    // registrations indexes live only in schema.sql, which loadSchemaFiles skips
+    // on existing DBs — a DB bootstrapped before they were added never gets them
+    // unless (re)created here. protocol_namehash is also ensured at sync start
+    // (sync-path: updateNameUnwrapperState's correlated expiry re-base).
+    "CREATE INDEX IF NOT EXISTS idx_registrations_protocol_registrant ON registrations(protocol, registrant)",
+    "CREATE INDEX IF NOT EXISTS idx_registrations_protocol_namehash ON registrations(protocol, namehash)",
+    "CREATE INDEX IF NOT EXISTS idx_registrations_protocol_registered_at ON registrations(protocol, registered_at)",
+    "CREATE INDEX IF NOT EXISTS idx_registrations_protocol_expiry ON registrations(protocol, expiry)",
 };
 
-// Drops the non-essential indexes for bulk sync. KEEP idx_events_name — the
+// Drops the non-essential indexes for bulk sync. KEEP idx_names_parent_namehash
+// — the burn-path live-subdomain check (`SELECT 1 FROM names WHERE
+// parent_namehash = ? LIMIT 1`) runs per NewOwner-to-zero event throughout sync;
+// without the index it full-scans a million-plus-row names table, turning
+// burn-heavy chunks into minute-long stalls. KEEP idx_events_name — the
 // per-event placeholder patch (updatePlaceholderEventsByName: `UPDATE events ...
 // WHERE name = ?`) runs throughout sync; without this index it degrades to a
 // full seq scan over the growing events table, i.e. O(n^2) across a bulk sync.
@@ -338,6 +375,32 @@ const SYNC_CREATE_INDEXES = [_][]const u8{
 // strand the rest of the list; the first error is still surfaced at the end.
 pub fn dropSyncIndexes(self: *Database) !void {
     std.log.info("Dropping non-essential indexes for bulk sync...", .{});
+
+    // Bulk sync writes several MB per commit, so SQLite's auto-checkpoint
+    // (every ~4 MB of WAL) fires constantly and stalls whichever chunk is
+    // mid-processing. Disable it for the sync; the driver checkpoints the WAL
+    // once per outer batch instead (checkpointWal), and createSyncIndexes
+    // restores the default when the sync completes.
+    if (!self.isPostgres()) {
+        self.exec("PRAGMA wal_autocheckpoint=0") catch |err|
+            std.log.warn("disabling wal_autocheckpoint failed: {}", .{err});
+        std.log.info("WAL auto-checkpoint disabled for bulk sync (batch-boundary checkpoints only)", .{});
+        // Bulk-sync reads are page-cache-bound: the registry group's random
+        // btree descents into the multi-GB names table swing 10-20x in cost
+        // with cache hit rate, and once the names/events btrees outgrow the
+        // cache every flush statement pays a random disk read. 512 MB default;
+        // SYNC_CACHE_MB raises it on machines with RAM to spare. The default
+        // is restored when the sync completes.
+        const cache_mb: u64 = blk: {
+            const v = zsys.getenv("SYNC_CACHE_MB") orelse break :blk self.sync_cache_mb;
+            break :blk std.fmt.parseInt(u64, v, 10) catch self.sync_cache_mb;
+        };
+        var cache_buf: [64]u8 = undefined;
+        const cache_sql = std.fmt.bufPrint(&cache_buf, "PRAGMA cache_size = -{d}", .{cache_mb * 1024}) catch unreachable;
+        self.exec(cache_sql) catch |err|
+            std.log.warn("raising sync cache_size failed: {}", .{err});
+        std.log.info("SQLite page cache raised to {d} MB for bulk sync (set SYNC_CACHE_MB to tune)", .{cache_mb});
+    }
     var first_err: ?anyerror = null;
     for (SYNC_DROP_INDEXES) |name| {
         var buf: [128]u8 = undefined;
@@ -348,6 +411,30 @@ pub fn dropSyncIndexes(self: *Database) !void {
         };
     }
     if (first_err) |err| return err;
+
+    // The kept sync-path indexes must EXIST, not merely survive the drop list: a
+    // database that previously ran a build which dropped them is mid-backfill
+    // WITHOUT them, and nothing else recreates indexes until sync completes.
+    self.exec("CREATE INDEX IF NOT EXISTS idx_events_name ON events(name)") catch |err|
+        std.log.err("ensure idx_events_name failed: {}", .{err});
+    self.exec("CREATE INDEX IF NOT EXISTS idx_names_parent_namehash ON names(parent_namehash)") catch |err|
+        std.log.err("ensure idx_names_parent_namehash failed: {}", .{err});
+    self.exec("CREATE INDEX IF NOT EXISTS idx_names_created_block ON names(protocol, created_block)") catch |err|
+        std.log.err("ensure idx_names_created_block failed: {}", .{err});
+    // The NameWrapped DNS-heal path deletes unknown_labels by namehash per label
+    // level per wrap event; the schema historically had no namehash index at all,
+    // so each delete (and its reorg-capture SELECT) full-scanned the table.
+    self.exec("CREATE INDEX IF NOT EXISTS idx_unknown_labels_namehash ON unknown_labels(namehash)") catch |err|
+        std.log.err("ensure idx_unknown_labels_namehash failed: {}", .{err});
+    // updateNameUnwrapperState's expiry re-base runs a correlated MAX() subquery
+    // against registrations per unwrap; without this index each one scans the
+    // whole table (measured ~10s/stmt on a mainnet-sized DB). schema.sql has it,
+    // but loadSchemaFiles short-circuits on existing DBs and nothing else
+    // creates registrations indexes — a DB bootstrapped by an older build
+    // (pre-2026-05-22) never got it.
+    self.exec("CREATE INDEX IF NOT EXISTS idx_registrations_protocol_namehash ON registrations(protocol, namehash)") catch |err|
+        std.log.err("ensure idx_registrations_protocol_namehash failed: {}", .{err});
+
     std.log.info("Dropped non-essential indexes for bulk sync performance", .{});
 }
 
@@ -355,10 +442,53 @@ pub fn dropSyncIndexes(self: *Database) !void {
 /// This is much faster than maintaining indexes during bulk inserts.
 /// Every statement is attempted even if one fails, so a single bad DDL cannot
 /// strand the rest of the list; the first error is still surfaced at the end.
+const SYNC_CREATE_NAMES_INDEXES = [_][]const u8{
+    "CREATE INDEX IF NOT EXISTS idx_names_canonical_id ON names(canonical_id)",
+    "CREATE INDEX IF NOT EXISTS idx_names_expiry_effective ON names(expiry_effective)",
+    "CREATE INDEX IF NOT EXISTS idx_names_is_reachable ON names(protocol, is_reachable)",
+    "CREATE INDEX IF NOT EXISTS idx_names_registry_reachable ON names(protocol, registry, is_reachable)",
+    "CREATE INDEX IF NOT EXISTS idx_names_is_normalized ON names(is_normalized)",
+    "CREATE INDEX IF NOT EXISTS idx_names_subdomain_count ON names(parent_name) WHERE is_reachable = 1 AND NOT (owner = '0x0000000000000000000000000000000000000000' AND resolver = '0x0000000000000000000000000000000000000000')",
+};
+
+const SYNC_CREATE_EXPRESSION_INDEXES_SQLITE = [_][]const u8{
+    "CREATE INDEX IF NOT EXISTS idx_events_owner_extracted ON events (LOWER(json_extract(data, '$.owner')))",
+    "CREATE INDEX IF NOT EXISTS idx_events_to_extracted ON events (LOWER(json_extract(data, '$.to')))",
+    "CREATE INDEX IF NOT EXISTS idx_events_from_extracted ON events (LOWER(json_extract(data, '$.from')))",
+};
+
+const SYNC_CREATE_EXPRESSION_INDEXES_PG = [_][]const u8{
+    "CREATE INDEX IF NOT EXISTS idx_events_owner_extracted ON events (LOWER((data::jsonb ->> 'owner')))",
+    "CREATE INDEX IF NOT EXISTS idx_events_to_extracted ON events (LOWER((data::jsonb ->> 'to')))",
+    "CREATE INDEX IF NOT EXISTS idx_events_from_extracted ON events (LOWER((data::jsonb ->> 'from')))",
+};
+
 pub fn createSyncIndexes(self: *Database) !void {
     const timer = zsys.milliTimestamp();
     std.log.info("Recreating indexes after bulk sync...", .{});
+    if (!self.isPostgres()) {
+        self.exec("PRAGMA wal_autocheckpoint=1000") catch |err|
+            std.log.warn("restoring wal_autocheckpoint failed: {}", .{err});
+        self.exec(std.fmt.comptimePrint("PRAGMA cache_size = {d}", .{constants.SQLite.cache_size_kb})) catch |err|
+            std.log.warn("restoring cache_size failed: {}", .{err});
+    }
     var first_err: ?anyerror = null;
+    for (SYNC_CREATE_NAMES_INDEXES) |sql| {
+        self.exec(sql) catch |err| {
+            std.log.err("create names index failed: {} [sql: {s}]", .{ err, sql });
+            if (first_err == null) first_err = err;
+        };
+    }
+    const expression_indexes: []const []const u8 = if (self.isPostgres())
+        &SYNC_CREATE_EXPRESSION_INDEXES_PG
+    else
+        &SYNC_CREATE_EXPRESSION_INDEXES_SQLITE;
+    for (expression_indexes) |sql| {
+        self.exec(sql) catch |err| {
+            std.log.err("create expression index failed: {} [sql: {s}]", .{ err, sql });
+            if (first_err == null) first_err = err;
+        };
+    }
     for (SYNC_CREATE_INDEXES) |sql| {
         self.exec(sql) catch |err| {
             std.log.err("index recreate failed ({s}): {}", .{ sql, err });
@@ -368,4 +498,98 @@ pub fn createSyncIndexes(self: *Database) !void {
     const elapsed = zsys.milliTimestamp() - timer;
     if (first_err) |err| return err;
     std.log.info("Index recreation complete ({d}ms)", .{elapsed});
+}
+
+/// Truncate the SQLite WAL at a batch boundary and report its depth. Bulk sync
+/// writes hundreds of MB into the WAL between auto-checkpoints, and read latency
+/// inside chunk processing grows with WAL depth — one bounded, visible stall per
+/// outer batch replaces random mid-chunk ones. No-op on PostgreSQL.
+/// WAL size threshold for the between-chunks drain. Reads probe one wal-index
+/// segment per 4096 frames (16 MB), so ~512 MB keeps reads at ~32 probes —
+/// far from the ~190 that crawled — while letting hot pages coalesce across
+/// chunks instead of being re-copied every chunk. In sparse eras the WAL never
+/// reaches this and the drain costs one stat() per chunk.
+const WAL_DRAIN_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
+
+pub fn walFileSize(self: *Database) ?u64 {
+    if (self.isPostgres()) return null;
+    var q = Query.init(self, "SELECT file FROM pragma_database_list WHERE name='main'") catch return null;
+    defer q.deinit();
+    const has_row = q.step() catch return null;
+    if (!has_row) return null;
+    const db_path = q.getTextSlice(0) orelse return null;
+    var buf: [4096]u8 = undefined;
+    const wal_path = std.fmt.bufPrint(&buf, "{s}-wal", .{db_path}) catch return null;
+    return zsys.fileSize(wal_path);
+}
+
+/// Drain the WAL into the main database without truncating (PASSIVE mode —
+/// backs off if readers interfere). Called between bulk-sync chunks: SQLite
+/// reads probe one wal-index segment per 4096 WAL frames, so keeping the WAL
+/// bounded keeps read cost flat through the whole batch. Skips entirely while
+/// the WAL is below the drain threshold. No-op on PostgreSQL.
+pub fn checkpointWalPassive(self: *Database) void {
+    if (self.isPostgres()) return;
+    if (walFileSize(self)) |bytes| {
+        if (bytes < WAL_DRAIN_THRESHOLD_BYTES) return;
+    }
+    const t0 = zsys.milliTimestamp();
+    var q = Query.init(self, "PRAGMA wal_checkpoint(PASSIVE)") catch |err| {
+        std.log.warn("WAL passive checkpoint failed: {}", .{err});
+        return;
+    };
+    defer q.deinit();
+    const has_row = q.step() catch |err| {
+        std.log.warn("WAL passive checkpoint failed: {}", .{err});
+        return;
+    };
+    if (!has_row) return;
+    const frames = q.getInt64(1);
+    const elapsed = zsys.milliTimestamp() - t0;
+    if (elapsed > 2000 or frames > 65536) {
+        std.log.info("  WAL drain: {d} frames (~{d} MB) in {d}ms", .{ frames, @divTrunc(frames * 4096, 1024 * 1024), elapsed });
+    } else {
+        std.log.debug("  WAL drain: {d} frames in {d}ms", .{ frames, elapsed });
+    }
+}
+
+pub fn checkpointWal(self: *Database) void {
+    if (self.isPostgres()) return;
+    const t0 = zsys.milliTimestamp();
+    // Two steps because TRUNCATE reports its counters AFTER truncating (always
+    // zeros): PASSIVE does the page-copy work and returns the real WAL depth,
+    // then TRUNCATE resets the emptied log so the file shrinks to zero.
+    var frames: i64 = 0;
+    var checkpointed: i64 = 0;
+    var busy: i64 = 0;
+    {
+        var q = Query.init(self, "PRAGMA wal_checkpoint(PASSIVE)") catch |err| {
+            std.log.warn("WAL checkpoint prepare failed: {}", .{err});
+            return;
+        };
+        defer q.deinit();
+        const has_row = q.step() catch |err| {
+            std.log.warn("WAL checkpoint failed: {}", .{err});
+            return;
+        };
+        if (!has_row) return;
+        busy = q.getInt64(0);
+        frames = q.getInt64(1);
+        checkpointed = q.getInt64(2);
+    }
+    {
+        var q = Query.init(self, "PRAGMA wal_checkpoint(TRUNCATE)") catch |err| {
+            std.log.warn("WAL truncate prepare failed: {}", .{err});
+            return;
+        };
+        defer q.deinit();
+        _ = q.step() catch |err| {
+            std.log.warn("WAL truncate failed: {}", .{err});
+            return;
+        };
+    }
+    const elapsed = zsys.milliTimestamp() - t0;
+    std.log.info("WAL checkpoint: {d} frames (~{d} MB), checkpointed={d}, busy={d} in {d}ms", .{
+        frames, @divTrunc(frames * 4096, 1024 * 1024), checkpointed, busy, elapsed,
+    });
 }
