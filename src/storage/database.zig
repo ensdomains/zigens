@@ -424,6 +424,7 @@ pub const Database = struct {
     pub const ensureSyncPathIndexes = schema.ensureSyncPathIndexes;
     pub const registerSubregistry = sync.registerSubregistry;
     pub const registerResolver = sync.registerResolver;
+    pub const registerResolverIfNew = sync.registerResolverIfNew;
     pub const isKnownResolver = sync.isKnownResolver;
     pub const discoverAndGetSubregistries = sync.discoverAndGetSubregistries;
     pub const getSubregistryCreatedBlock = sync.getSubregistryCreatedBlock;

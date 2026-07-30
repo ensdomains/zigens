@@ -29,6 +29,24 @@ pub fn registerResolverOnce(self: *Indexer, protocol: models.Protocol, address_h
     try self.known_resolver_cache.put(key_copy, {});
 }
 
+/// Like registerResolverOnce, but reports whether this was the resolver's FIRST
+/// sighting ever (not in the dedup cache AND not in known_resolvers). First
+/// sightings queue a historical backfill: factory-deployed resolvers emit their
+/// initialize()-time EACRolesChanged role grants blocks before the
+/// ResolverUpdated that makes them known — without the backfill those roles
+/// never reach resolver.roles (the discovery-path backfill can't recover them;
+/// registering here makes its `kr.address IS NULL` filter false first).
+pub fn registerResolverOnceIfNew(self: *Indexer, protocol: models.Protocol, address_hex: []const u8, block_number: u64) !bool {
+    var key_buf: [64]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}:{s}", .{ protocol.toString(), address_hex }) catch address_hex;
+    if (self.known_resolver_cache.contains(key)) return false;
+    const was_new = try self.database.registerResolverIfNew(protocol, address_hex, block_number);
+    const key_copy = try self.allocator.dupe(u8, key);
+    errdefer self.allocator.free(key_copy);
+    try self.known_resolver_cache.put(key_copy, {});
+    return was_new;
+}
+
 /// Drop the in-memory resolver dedup cache. MUST be called whenever a batch
 /// transaction is rolled back: the rollback also reverts any known_resolvers inserts
 /// the batch made, so a cached-but-reverted resolver would otherwise be skipped

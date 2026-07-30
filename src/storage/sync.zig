@@ -411,6 +411,26 @@ pub fn getSubregistryCreatedBlock(db: *Database, protocol: models.Protocol, addr
     return 0;
 }
 
+/// Like registerResolver, but reports whether this was the resolver's FIRST
+/// sighting. First sightings must trigger a historical event backfill: a
+/// factory-deployed resolver emits its initialize()-time events (EACRolesChanged
+/// role grants) blocks BEFORE the ResolverUpdated that makes it known, and the
+/// resolver pass only fetches known-resolver events within the current batch —
+/// without a backfill those init events are lost (the discovery-path backfill
+/// cannot fire for resolvers registered here: its `kr.address IS NULL` filter
+/// is already false by the time it runs).
+pub fn registerResolverIfNew(db: *Database, protocol: models.Protocol, address: []const u8, block_number: u64) !bool {
+    const exists = blk: {
+        var q = try Query.init(db, "SELECT 1 FROM known_resolvers WHERE protocol = ? AND address = ? LIMIT 1");
+        defer q.deinit();
+        try q.bindTextStatic(protocol.toString());
+        try q.bindText(address);
+        break :blk try q.step();
+    };
+    try registerResolver(db, protocol, address, block_number);
+    return !exists;
+}
+
 /// Register or update a known resolver
 pub fn registerResolver(db: *Database, protocol: models.Protocol, address: []const u8, block_number: u64) !void {
     const sql = try std.fmt.allocPrint(db.allocator,

@@ -174,6 +174,13 @@ pub fn start(self: *Indexer) !void {
                     std.log.warn("reorg undo-log: failed to clear v2 cursor before heals: {}", .{err});
                 self.invalidateReorgCursor();
             }
+            // One-shot heal (marker-gated): resolvers registered before the
+            // first-sighting backfill existed are missing their pre-attachment
+            // init events (EACRolesChanged) — backfill each known resolver's
+            // deployment→first_seen window once.
+            self.backfillResolverInitGaps(.v2, self.v1_client) catch |err| {
+                std.log.err("Failed to backfill resolver init gaps: {}", .{err});
+            };
             std.log.info("Running unknown labels backfill...", .{});
             self.backfillUnknownLabels() catch |err| {
                 std.log.err("Failed to backfill unknown labels: {}", .{err});
@@ -298,6 +305,13 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
                     reorg_undo.clearCursor(self.database, protocol) catch |err|
                         std.log.warn("reorg undo-log: failed to clear cursor before heals: {}", .{err});
                     self.invalidateReorgCursor();
+                }
+
+                if (protocol == .v2) {
+                    // One-shot heal (marker-gated) — see the combined loop.
+                    self.backfillResolverInitGaps(.v2, client) catch |err| {
+                        std.log.err("Failed to backfill resolver init gaps: {}", .{err});
+                    };
                 }
 
                 if (self.webhook_manager) |wm| {
@@ -546,6 +560,9 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
             // drop those dedup caches so the entries get re-inserted on retry.
             self.clearKnownResolverCache();
             self.clearAccountObsCache();
+            // The queued first-sighting backfills belonged to the reverted
+            // registrations; the retry re-registers and re-queues them.
+            self.pending_resolver_backfills.clearRetainingCapacity();
 
             if ((err == error.RpcError or err == error.StreamTooLong) and current_batch_size > ABSOLUTE_MIN_BATCH) {
                 current_batch_size = @max(ABSOLUTE_MIN_BATCH, current_batch_size / 2);

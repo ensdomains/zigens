@@ -70,6 +70,12 @@ pub const Indexer = struct {
     // Per-chunk rainbow probe instrumentation (printed in the chunk timing line).
     rainbow_probe_count: u64 = 0,
     newowner_phase_ns: [5]i128 = [_]i128{0} ** 5,
+    /// Resolvers first sighted this batch (via ResolverUpdated registration).
+    /// Drained by indexResolverEvents, which backfills each one's pre-attachment
+    /// history (initialize()-time EACRolesChanged role grants fire blocks before
+    /// the resolver becomes known). Cleared alongside clearKnownResolverCache on
+    /// batch rollback (the registrations were reverted with the transaction).
+    pending_resolver_backfills: std.ArrayList(Address) = .empty,
     /// Whether this process actually dropped the bulk-sync indexes. The
     /// completion path only pays the index rebuild + ANALYZE when a drop
     /// happened — a caught-up restart (gap below SYNC_INDEX_MIN_GAP_BLOCKS)
@@ -339,6 +345,7 @@ pub const Indexer = struct {
         }
         self.block_timestamp_cache.deinit();
         self.write_buffer.deinit();
+        self.pending_resolver_backfills.deinit(self.allocator);
         if (self.rainbow) |*r| r.deinit();
 
         // Free cached controllers
@@ -376,6 +383,7 @@ pub const Indexer = struct {
 
     // In-memory cache / dedup accessors — implementations in caches.zig.
     pub const registerResolverOnce = caches.registerResolverOnce;
+    pub const registerResolverOnceIfNew = caches.registerResolverOnceIfNew;
     pub const clearKnownResolverCache = caches.clearKnownResolverCache;
     pub const clearAccountObsCache = caches.clearAccountObsCache;
     pub const invalidateControllerCache = caches.invalidateControllerCache;
@@ -481,6 +489,7 @@ pub const Indexer = struct {
     pub const indexSubregistryEvents = event_fetchers.indexSubregistryEvents;
     pub const indexTransferEvents = event_fetchers.indexTransferEvents;
     pub const indexResolverEvents = event_fetchers.indexResolverEvents;
+    pub const backfillResolverInitGaps = event_fetchers.backfillResolverInitGaps;
     pub const indexV2ReverseRegistrarEvents = event_fetchers.indexV2ReverseRegistrarEvents;
     pub const indexV2RenewerEvents = event_fetchers.indexV2RenewerEvents;
     pub const indexLabelStoreEvents = event_fetchers.indexLabelStoreEvents;
