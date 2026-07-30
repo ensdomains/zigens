@@ -22,7 +22,7 @@ services:
       - DOWNLOAD_RAINBOW=true
       - RPC_URL=${RPC_URL}
       - NETWORK=${NETWORK:-sepolia}
-      - BATCH_SIZE=10000
+      - BATCH_SIZE=${BATCH_SIZE:-2000}
       - POLL_INTERVAL=12
       - RATE_LIMIT_PER_SECOND=25
       - STATUS_PORT=3001
