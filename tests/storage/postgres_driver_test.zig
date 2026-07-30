@@ -736,3 +736,43 @@ test "postgres driver: cached prepares reuse one server-side prepared statement"
 
     try be.vtable.execRaw(be.ptr, "DROP TABLE cache_probe");
 }
+
+test "postgres driver: pinned connection revives after server-side termination" {
+    var be = openBe() catch return error.SkipZigTest;
+    defer be.vtable.close(be.ptr);
+
+    // Healthy baseline through the prepared path.
+    {
+        var st = try be.vtable.prepare(be.ptr, "SELECT 1", false);
+        defer st.deinit();
+        try testing.expect(try st.step());
+    }
+
+    // Kill our own server session (what Neon does on idle timeout / restart).
+    // The terminate statement itself may succeed or fail depending on how fast
+    // the server drops the socket — either way the pinned connection is dead.
+    {
+        var st = be.vtable.prepare(be.ptr, "SELECT pg_terminate_backend(pg_backend_pid())", false) catch return;
+        defer st.deinit();
+        // Raw vtable step: the statement is EXPECTED to fail as the server
+        // drops the session (SQLSTATE 57P01) — the Statement wrapper would
+        // err-log that, which the test runner treats as a failure.
+        _ = st.vtable.step(st.ctx);
+    }
+
+    // The next prepare observes the dead socket, fails, and — the fix —
+    // replaces the pinned connection. Pre-fix, this NEVER recovered: every
+    // statement failed on the same corpse forever (the staging
+    // SSLWriteFailed loop). A couple of attempts absorb teardown races.
+    var recovered = false;
+    var attempt: usize = 0;
+    while (attempt < 5) : (attempt += 1) {
+        var st = be.vtable.prepare(be.ptr, "SELECT 1", false) catch continue;
+        defer st.deinit();
+        if (st.vtable.step(st.ctx) == .row) {
+            recovered = true;
+            break;
+        }
+    }
+    try testing.expect(recovered);
+}
