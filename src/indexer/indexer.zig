@@ -70,6 +70,11 @@ pub const Indexer = struct {
     // Per-chunk rainbow probe instrumentation (printed in the chunk timing line).
     rainbow_probe_count: u64 = 0,
     newowner_phase_ns: [5]i128 = [_]i128{0} ** 5,
+    /// Whether this process actually dropped the bulk-sync indexes. The
+    /// completion path only pays the index rebuild + ANALYZE when a drop
+    /// happened — a caught-up restart (gap below SYNC_INDEX_MIN_GAP_BLOCKS)
+    /// keeps its indexes and skips the whole cycle.
+    sync_indexes_dropped: bool = false,
     rainbow_probe_ns: u64 = 0,
     // Cached V1 token_id → label mappings (populated on miss from DB)
     v1_label_cache: std.StringHashMap([]const u8),

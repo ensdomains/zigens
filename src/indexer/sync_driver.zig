@@ -63,6 +63,31 @@ fn handleSyncError(self: *Indexer, protocol: models.Protocol, err: anyerror) voi
     }
 }
 
+/// Blocks of remaining sync below which the bulk index drop/rebuild cycle
+/// costs more than it saves: dropping ~40 indexes only pays off when millions
+/// of rows are coming. Without the gate, a caught-up restart (a few blocks
+/// behind the tip) paid a multi-minute full index rebuild + ANALYZE to sync
+/// seconds of chain.
+const SYNC_INDEX_MIN_GAP_BLOCKS: u64 = 10_000;
+
+/// Whether the remaining sync gap justifies dropping indexes for bulk mode.
+/// An unknown head (RPC error) counts as a large gap: a needless drop is
+/// recoverable at completion, a wrongly skipped drop just syncs slower.
+fn syncGapWantsIndexDrop(self: *Indexer, protocols: []const models.Protocol, client: *rpc.Client) bool {
+    const head = client.getBlockNumber() catch return true;
+    for (protocols) |protocol| {
+        const era = switch (protocol) {
+            .v1 => self.v1EraStart(),
+            .v2 => self.config.v2_contracts.v2_deployment_block,
+        };
+        if (era == 0) continue; // protocol not deployed on this network
+        const synced = (self.database.getSyncState(protocol) catch null) orelse era;
+        if (head -| synced >= SYNC_INDEX_MIN_GAP_BLOCKS) return true;
+    }
+    std.log.info("Sync gap below {d} blocks for all protocols - keeping indexes (no bulk drop/rebuild cycle)", .{SYNC_INDEX_MIN_GAP_BLOCKS});
+    return false;
+}
+
 pub fn start(self: *Indexer) !void {
     std.log.info("Indexer starting...", .{});
 
@@ -71,10 +96,15 @@ pub fn start(self: *Indexer) !void {
     };
 
     // Drop non-essential indexes for faster bulk inserts during initial sync
-    if (!self.initial_sync_complete.load(.acquire)) {
+    if (!self.initial_sync_complete.load(.acquire) and
+        syncGapWantsIndexDrop(self, &.{ .v1, .v2 }, self.v1_client))
+    {
         self.database.dropSyncIndexes() catch |err| {
             std.log.warn("Failed to drop sync indexes (non-fatal): {}", .{err});
         };
+        self.sync_indexes_dropped = true;
+    } else {
+        self.database.ensureSyncPathIndexes();
     }
 
     while (!self.should_stop.load(.acquire) and !shutdown.isRequested()) {
@@ -92,37 +122,61 @@ pub fn start(self: *Indexer) !void {
 
         // After first successful sync of both chains, recreate indexes and start webhook workers
         if (!self.initial_sync_complete.load(.acquire)) {
-            self.database.createSyncIndexes() catch |err| {
-                std.log.err("Failed to recreate sync indexes: {}", .{err});
-            };
+            // Only pay the rebuild + ANALYZE when this process dropped them —
+            // a small-gap start kept its indexes throughout.
+            if (self.sync_indexes_dropped) {
+                self.database.createSyncIndexes() catch |err| {
+                    std.log.err("Failed to recreate sync indexes: {}", .{err});
+                };
+            }
 
             self.initial_sync_complete.store(true, .release);
 
-            // PCC fuse → Domain.expiry mirror (V1 NameWrapper). The per-event
-            // mirror in handleV1NameWrapped/FusesSet/ExpiryExtended needs to
-            // read existing wrapper state, which the write_buffer can't
-            // service during bulk sync. Run a one-shot bulk UPDATE now that
-            // the buffer is flushed and indexes are restored (cursor disarmed
-            // so it doesn't self-capture into the reorg undo-log).
-            self.materializePccUncaptured();
-            self.reconcileReachabilityUncaptured();
+            // The one-shot recomputes and heals below exist to repair what
+            // BULK-mode buffering skipped (buffer-invisible wrapper state,
+            // labels discovered after their names, pre-migration rows). A
+            // small-gap start never entered bulk mode — every event was
+            // processed direct with full fidelity — so the table-wide scans
+            // have nothing to repair and are skipped. backfillUnknownLabels
+            // stays unconditional: it drains a persistent backlog and is
+            // self-limiting (attempts capped, partial-index probe).
+            if (self.sync_indexes_dropped) {
+                // PCC fuse → Domain.expiry mirror (V1 NameWrapper). The
+                // per-event mirror in handleV1NameWrapped/FusesSet/
+                // ExpiryExtended needs to read existing wrapper state, which
+                // the write_buffer can't service during bulk sync. Run a
+                // one-shot bulk UPDATE now that the buffer is flushed and
+                // indexes are restored (cursor disarmed so it doesn't
+                // self-capture into the reorg undo-log).
+                self.materializePccUncaptured();
+                self.reconcileReachabilityUncaptured();
 
-            // One-shot V1 heals, mirroring the single-protocol loop so the
-            // combined and split binaries produce the same database. The reorg
-            // cursor is disarmed here (materializePccUncaptured cleared it), so
-            // these do NOT self-capture into the undo-log; keep any new backfill
-            // inside this disarmed block. All three no-op without V1 data.
-            std.log.info("Running pre-migration names backfill...", .{});
-            self.backfillPreMigrationNames() catch |err| {
-                std.log.err("Failed to backfill pre-migration names: {}", .{err});
-            };
+                // One-shot V1 heals, mirroring the single-protocol loop so the
+                // combined and split binaries produce the same database. The reorg
+                // cursor is disarmed here (materializePccUncaptured cleared it), so
+                // these do NOT self-capture into the undo-log; keep any new backfill
+                // inside this disarmed block. All three no-op without V1 data.
+                std.log.info("Running pre-migration names backfill...", .{});
+                self.backfillPreMigrationNames() catch |err| {
+                    std.log.err("Failed to backfill pre-migration names: {}", .{err});
+                };
+                std.log.info("Running missing .eth 2LD names backfill...", .{});
+                self.backfillMissingEth2LDNames() catch |err| {
+                    std.log.err("Failed to backfill missing .eth 2LD names: {}", .{err});
+                };
+            } else {
+                // materializePccUncaptured normally disarms the cursor for the
+                // heal below; disarm explicitly on the skip path so it doesn't
+                // self-capture.
+                reorg_undo.clearCursor(self.database, .v1) catch |err|
+                    std.log.warn("reorg undo-log: failed to clear v1 cursor before heals: {}", .{err});
+                reorg_undo.clearCursor(self.database, .v2) catch |err|
+                    std.log.warn("reorg undo-log: failed to clear v2 cursor before heals: {}", .{err});
+                self.invalidateReorgCursor();
+            }
             std.log.info("Running unknown labels backfill...", .{});
             self.backfillUnknownLabels() catch |err| {
                 std.log.err("Failed to backfill unknown labels: {}", .{err});
-            };
-            std.log.info("Running missing .eth 2LD names backfill...", .{});
-            self.backfillMissingEth2LDNames() catch |err| {
-                std.log.err("Failed to backfill missing .eth 2LD names: {}", .{err});
             };
 
             if (self.webhook_manager) |wm| {
@@ -196,34 +250,54 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
     const client = self.getClient(protocol);
 
     // Drop non-essential indexes for faster bulk inserts during initial sync
-    if (!self.initial_sync_complete.load(.acquire)) {
+    if (!self.initial_sync_complete.load(.acquire) and
+        syncGapWantsIndexDrop(self, &.{protocol}, client))
+    {
         self.database.dropSyncIndexes() catch |err| {
             std.log.warn("Failed to drop sync indexes (non-fatal): {}", .{err});
         };
+        self.sync_indexes_dropped = true;
+    } else {
+        self.database.ensureSyncPathIndexes();
     }
 
     while (!self.should_stop.load(.acquire) and !shutdown.isRequested()) {
         if (self.indexProtocol(protocol, client)) |_| {
             // Success - after first successful sync, recreate indexes and start webhook workers
             if (!self.initial_sync_complete.load(.acquire)) {
-                // Recreate all indexes before marking sync complete
-                self.database.createSyncIndexes() catch |err| {
-                    std.log.err("Failed to recreate sync indexes: {}", .{err});
-                };
+                // Only pay the rebuild + ANALYZE when this process dropped
+                // them — a small-gap start kept its indexes throughout.
+                if (self.sync_indexes_dropped) {
+                    self.database.createSyncIndexes() catch |err| {
+                        std.log.err("Failed to recreate sync indexes: {}", .{err});
+                    };
+                }
 
                 self.initial_sync_complete.store(true, .release);
 
-                // PCC fuse → Domain.expiry mirror (V1 NameWrapper, runs only
-                // on V1 protocol since V2 doesn't have NameWrapper). The
-                // per-event mirror in handleV1NameWrapped/FusesSet/
-                // ExpiryExtended needs to read existing wrapper state, which
-                // the write_buffer can't service during bulk sync. Run a
-                // one-shot bulk UPDATE now that the buffer is flushed.
-                if (protocol == .v1) {
-                    self.materializePccUncaptured();
-                }
-                if (protocol == .v2) {
-                    self.reconcileReachabilityUncaptured();
+                // The one-shot recomputes and heals below repair what BULK-mode
+                // buffering skipped; a small-gap start processed everything
+                // direct, so the table-wide scans are skipped (see start()).
+                if (self.sync_indexes_dropped) {
+                    // PCC fuse → Domain.expiry mirror (V1 NameWrapper, runs only
+                    // on V1 protocol since V2 doesn't have NameWrapper). The
+                    // per-event mirror in handleV1NameWrapped/FusesSet/
+                    // ExpiryExtended needs to read existing wrapper state, which
+                    // the write_buffer can't service during bulk sync. Run a
+                    // one-shot bulk UPDATE now that the buffer is flushed.
+                    if (protocol == .v1) {
+                        self.materializePccUncaptured();
+                    }
+                    if (protocol == .v2) {
+                        self.reconcileReachabilityUncaptured();
+                    }
+                } else {
+                    // materializePccUncaptured normally disarms the cursor for
+                    // the heals below; disarm explicitly on the skip path so
+                    // the unknown-labels heal doesn't self-capture.
+                    reorg_undo.clearCursor(self.database, protocol) catch |err|
+                        std.log.warn("reorg undo-log: failed to clear cursor before heals: {}", .{err});
+                    self.invalidateReorgCursor();
                 }
 
                 if (self.webhook_manager) |wm| {
@@ -232,29 +306,35 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
                 }
 
                 // Backfill pre-migration names after initial sync completes.
-                // INVARIANT: the reorg cursor is disarmed here — materializePccUncaptured
-                // above cleared it and nothing re-arms it until the next indexProtocol —
+                // INVARIANT: the reorg cursor is disarmed here (either branch
+                // above) and nothing re-arms it until the next indexProtocol —
                 // so these one-shot backfills (which UPDATE/DELETE protected & reorg_active
                 // tables, incl. unknown_labels) do NOT self-capture into the undo-log, per the
                 // backfill-doesn't-capture rule. Keep any new backfill inside this disarmed block.
                 if (protocol == .v1) {
-                    std.log.info("Running pre-migration names backfill...", .{});
-                    self.backfillPreMigrationNames() catch |err| {
-                        std.log.err("Failed to backfill pre-migration names: {}", .{err});
-                    };
+                    if (self.sync_indexes_dropped) {
+                        std.log.info("Running pre-migration names backfill...", .{});
+                        self.backfillPreMigrationNames() catch |err| {
+                            std.log.err("Failed to backfill pre-migration names: {}", .{err});
+                        };
+                    }
 
-                    // Backfill unknown subdomain labels from transaction calldata
+                    // Backfill unknown subdomain labels from transaction calldata.
+                    // Unconditional: drains a persistent backlog and is
+                    // self-limiting (attempts capped, partial-index probe).
                     std.log.info("Running unknown labels backfill...", .{});
                     self.backfillUnknownLabels() catch |err| {
                         std.log.err("Failed to backfill unknown labels: {}", .{err});
                     };
 
-                    // Retroactive recovery: create name records for .eth 2LDs
-                    // where the label was resolved but no name record was created
-                    std.log.info("Running missing .eth 2LD names backfill...", .{});
-                    self.backfillMissingEth2LDNames() catch |err| {
-                        std.log.err("Failed to backfill missing .eth 2LD names: {}", .{err});
-                    };
+                    if (self.sync_indexes_dropped) {
+                        // Retroactive recovery: create name records for .eth 2LDs
+                        // where the label was resolved but no name record was created
+                        std.log.info("Running missing .eth 2LD names backfill...", .{});
+                        self.backfillMissingEth2LDNames() catch |err| {
+                            std.log.err("Failed to backfill missing .eth 2LD names: {}", .{err});
+                        };
+                    }
                 }
             }
         } else |err| {
