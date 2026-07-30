@@ -75,14 +75,22 @@ pub fn main(init: std.process.Init) !void {
     });
     defer db_pool.deinit();
 
-    // Check database integrity
+    // Liveness probe by default; API_INTEGRITY_CHECK=true restores the deep
+    // quick_check scan (minutes of full-file I/O on a mainnet-scale DB while
+    // the indexer writes — the read-only API can't act on the result anyway).
     {
         const session = try db_pool.acquire();
         defer db_pool.release(session);
-        const integrity_ok = try session.checkIntegrity();
-        if (!integrity_ok) {
-            std.log.err("Database integrity check failed!", .{});
-            return error.DatabaseCorrupted;
+        if (cfg.api_integrity_check) {
+            std.log.info("Running deep integrity check (API_INTEGRITY_CHECK=true)...", .{});
+            const integrity_ok = try session.checkIntegrity();
+            if (!integrity_ok) {
+                std.log.err("Database integrity check failed!", .{});
+                return error.DatabaseCorrupted;
+            }
+        } else if (!try session.probeLiveness()) {
+            std.log.err("Database liveness probe failed!", .{});
+            return error.DatabaseUnavailable;
         }
     }
 

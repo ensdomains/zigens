@@ -326,6 +326,17 @@ pub fn pruneOldBlockHashes(db: *Database, protocol: models.Protocol, current_blo
 }
 
 /// Verify database integrity (uses quick_check for performance on large databases)
+/// Cheap connectivity/liveness probe: one trivial query, no page scans.
+/// The API uses this at startup instead of checkIntegrity — quick_check reads
+/// every btree page, which on a mainnet-scale DB is minutes of full-file I/O
+/// against a live writer, and a read-only consumer can't act on the result
+/// anyway (corruption surfaces at query time regardless).
+pub fn probeLiveness(db: *Database) !bool {
+    var q = try Query.init(db, "SELECT 1");
+    defer q.deinit();
+    return try q.step();
+}
+
 pub fn checkIntegrity(db: *Database) !bool {
     if (db.isPostgres()) {
         // Postgres has no PRAGMA quick_check; a successful trivial query is the

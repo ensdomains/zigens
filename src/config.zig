@@ -27,6 +27,10 @@ pub const Config = struct {
     /// SQLite page-cache size (MB) during bulk sync. Plumbed to the Database so
     /// .env values work (schema.zig can't see the .env map, only process env).
     sync_cache_mb: u64 = 512,
+    /// Opt-in deep integrity check (PRAGMA quick_check) at API startup. Off by
+    /// default: quick_check reads every btree page — minutes of full-file I/O
+    /// on a mainnet-scale DB — and the read-only API can't act on the result.
+    api_integrity_check: bool = false,
     rate_limit_per_second: u32,
     /// Provider ceiling on JSON-RPC batch sizes (requests per HTTP batch);
     /// 0 = unlimited. Set when a provider rejects large batches.
@@ -159,6 +163,7 @@ pub const Config = struct {
             .poll_interval = env_mod.getEnvInt(&env_map, u64, "POLL_INTERVAL", 12),
             .batch_size = env_mod.getEnvInt(&env_map, u64, "BATCH_SIZE", 2000),
             .sync_cache_mb = env_mod.getEnvInt(&env_map, u64, "SYNC_CACHE_MB", 512),
+            .api_integrity_check = env_mod.getEnvBool(&env_map, "API_INTEGRITY_CHECK", false),
             .rate_limit_per_second = env_mod.getEnvInt(&env_map, u32, "RATE_LIMIT_PER_SECOND", 15),
             .rpc_max_batch_requests = env_mod.getEnvInt(&env_map, u32, "RPC_MAX_BATCH_REQUESTS", 0),
             .trusted_proxy_hops = env_mod.getEnvInt(&env_map, u32, "TRUSTED_PROXY_HOPS", 0),
