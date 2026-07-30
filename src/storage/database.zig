@@ -698,6 +698,7 @@ pub const Database = struct {
     pub const isSubregistryKnown = sync.isSubregistryKnown;
     pub const registerSubregistry = sync.registerSubregistry;
     pub const registerResolver = sync.registerResolver;
+    pub const registerResolverIfNew = sync.registerResolverIfNew;
     pub const discoverAndGetSubregistries = sync.discoverAndGetSubregistries;
     pub const deleteDataAfterBlock = sync.deleteDataAfterBlock;
     pub const OrphanedRegistration = sync.OrphanedRegistration;

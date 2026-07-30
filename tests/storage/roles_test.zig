@@ -264,3 +264,22 @@ test "EAC row from a known resolver classifies as resolver and decodes resolver 
     // Resolver name for nybble 6 — the bug previously yielded registry's SET_RESOLVER.
     try testing.expectEqualStrings("SET_NAME", perms[0]);
 }
+
+test "registerResolverIfNew reports first sighting exactly once" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    var resolver_buf: [42]u8 = undefined;
+    const resolver_hex = helpers.TEST_RESOLVER.toHexBuf(&resolver_buf);
+
+    // First sighting must report new: this is what queues the historical
+    // backfill that recovers initialize()-time EACRolesChanged grants emitted
+    // before the resolver was attached to any name (the deploy→attach gap
+    // that left factory-set roles out of resolver.roles).
+    try testing.expect(try database.registerResolverIfNew(.v2, resolver_hex, 100));
+    // Every later ResolverUpdated re-registration: not new, no re-backfill.
+    try testing.expect(!try database.registerResolverIfNew(.v2, resolver_hex, 200));
+    // The same address under the other protocol is its own first sighting.
+    try testing.expect(try database.registerResolverIfNew(.v1, resolver_hex, 300));
+}

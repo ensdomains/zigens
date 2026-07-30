@@ -417,6 +417,24 @@ pub fn indexV2ReverseRegistrarEvents(self: *Indexer, protocol: models.Protocol, 
 pub fn indexResolverEvents(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64, to_block: u64) !void {
     const resolvers_mod = @import("../storage/resolvers.zig");
 
+    // Backfill pre-attachment history for resolvers FIRST SIGHTED this batch
+    // (queued by handleResolverUpdated's registerResolverIfNew). Their
+    // initialize()-time events — EACRolesChanged role grants — fired blocks
+    // before the resolver became known, so the pass below can't see them.
+    // Events within [from_block, to_block] are the pass's job (the resolver is
+    // in the known set now), hence the window ends at from_block - 1.
+    if (self.pending_resolver_backfills.items.len > 0) {
+        const backfill_from = self.config.start_block;
+        for (self.pending_resolver_backfills.items) |addr| {
+            if (from_block > backfill_from) {
+                backfillResolverEvents(self, protocol, client, addr, backfill_from, from_block - 1) catch |err| {
+                    std.log.warn("First-sighting resolver backfill failed: {}", .{err});
+                };
+            }
+        }
+        self.pending_resolver_backfills.clearRetainingCapacity();
+    }
+
     // Discover new resolvers and get all known resolvers
     var discovery = try resolvers_mod.discoverAndGetResolvers(self.database, protocol, from_block, to_block);
     defer discovery.deinit(self.allocator);
@@ -563,6 +581,62 @@ fn backfillResolverEvents(self: *Indexer, protocol: models.Protocol, client: *rp
     }
 
     std.log.info("  Backfilled {d} historical events for resolver {s}", .{ processed, resolver_hex });
+}
+
+/// One-shot heal for resolvers registered before the first-sighting backfill
+/// existed: their pre-attachment init events (EACRolesChanged role grants
+/// emitted during factory initialize(), before the ResolverUpdated that made
+/// them known) were never indexed. For every known resolver, fetch its events
+/// from the sync start to just before its first sighting. Marker-gated so it
+/// runs once per database; the handlers are idempotent upserts, so
+/// re-processing already-indexed events is harmless.
+pub fn backfillResolverInitGaps(self: *Indexer, protocol: models.Protocol, client: *rpc.Client) !void {
+    if (protocol != .v2) return;
+    const db_mod = @import("../storage/database.zig");
+
+    {
+        var check = db_mod.Query.init(self.database, "SELECT completed FROM backfill_status WHERE task = 'resolver_init_gaps'") catch return;
+        defer check.deinit();
+        if (check.step() catch false) {
+            if (check.getInt(0) == 1) return;
+        }
+    }
+    std.log.info("Running resolver init-gap heal (one-shot)...", .{});
+
+    const Target = struct { addr: Address, first_seen: u64 };
+    const backfill_from = self.config.start_block;
+    var targets: std.ArrayList(Target) = .{};
+    defer targets.deinit(self.allocator);
+    {
+        var q = try db_mod.Query.init(self.database, "SELECT address, first_seen_block FROM known_resolvers WHERE protocol = ?");
+        defer q.deinit();
+        try q.bindTextStatic(protocol.toString());
+        while (try q.step()) {
+            const addr_slice = q.getTextSlice(0) orelse continue;
+            const addr = Address.fromHex(addr_slice) catch continue;
+            try targets.append(self.allocator, .{ .addr = addr, .first_seen = @intCast(q.getInt64(1)) });
+        }
+    }
+
+    var healed: usize = 0;
+    for (targets.items) |t| {
+        if (t.first_seen <= backfill_from) continue;
+        backfillResolverEvents(self, protocol, client, t.addr, backfill_from, t.first_seen - 1) catch |err| {
+            std.log.warn("Resolver init-gap backfill failed: {}", .{err});
+            continue;
+        };
+        healed += 1;
+    }
+    std.log.info("Resolver init-gap heal complete: {d}/{d} resolver(s) backfilled", .{ healed, targets.items.len });
+
+    var mq = db_mod.Query.init(self.database,
+        \\INSERT OR REPLACE INTO backfill_status (task, completed, completed_at, records_processed)
+        \\VALUES ('resolver_init_gaps', 1, ?, ?)
+    ) catch return;
+    defer mq.deinit();
+    mq.bindInt64(std.time.timestamp()) catch return;
+    mq.bindInt64(@intCast(healed)) catch return;
+    mq.exec() catch {};
 }
 
 /// Backfill historical events for a specific subregistry contract.
