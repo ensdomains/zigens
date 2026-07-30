@@ -139,6 +139,11 @@ pub fn handleAddressChanged(self: *Indexer, protocol: models.Protocol, resolver:
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "AddressChanged")) return;
 
+    // ENSIP-11 coin types fit u32 (0x80000000 | chainId); the column is a
+    // 64-bit INTEGER. A hostile contract can emit any uint256 — reject it as
+    // malformed (skipped with coordinates) instead of @intCast panicking.
+    const coin_type_i64 = std.math.cast(i64, coin_type) orelse return error.ValueOutOfRange;
+
     const nh_hex_log = try namehash.toHex(self.allocator);
     defer self.allocator.free(nh_hex_log);
     std.log.debug("AddressChanged: namehash={s} coinType={d} address={s}", .{
@@ -151,7 +156,7 @@ pub fn handleAddressChanged(self: *Indexer, protocol: models.Protocol, resolver:
     try self.database.storeResolverAddress(
         namehash,
         resolver,
-        @intCast(coin_type),
+        @intCast(coin_type_i64),
         address_hex,
         protocol,
         log.block_number,
@@ -266,37 +271,46 @@ pub fn handleTextChanged(self: *Indexer, protocol: models.Protocol, resolver: Ad
     const key = data_values[0].string;
     const value = data_values[1].string;
 
-    // Validate key and value are valid UTF-8 and contain no dangerous control characters
-    unicode.validateString(key) catch |err| {
-        std.log.warn("Invalid UTF-8 in text record key: {any}", .{err});
-        return;
-    };
-    unicode.validateString(value) catch |err| {
-        std.log.warn("Invalid UTF-8 in text record value: {any}", .{err});
-        return;
-    };
-
     if (!try utils.resolveNamehash(self, &namehash, resolver, "TextChanged")) return;
 
-    // Subgraph parity: strip embedded NULs from key/value (SQLite TEXT + JSON
-    // output safety), and treat an empty value as "clear" by deleting the
-    // existing key instead of writing an empty string row.
+    // Subgraph parity: strip embedded NULs BEFORE validating — clients that
+    // pass fixed-width padded strings emit keys like "com.twitter\x00", which
+    // the subgraph stores stripped; validating the raw bytes first rejected
+    // the whole event. Then validate the cleaned strings: a bad KEY is
+    // unaddressable, so the event is skipped (with coordinates); a bad VALUE
+    // clears the key like an empty value would — dropping the event outright
+    // left the previous value serving stale while on-chain state changed.
     const clean_key = try stripNulls(self.allocator, key);
     defer self.allocator.free(clean_key);
     const clean_value = try stripNulls(self.allocator, value);
     defer self.allocator.free(clean_value);
+
+    unicode.validateString(clean_key) catch |err| {
+        var tx_buf: [66]u8 = undefined;
+        std.log.warn("TextChanged key rejected ({any}) at block {d} tx {s} log_index {d} — event skipped", .{ err, log.block_number, log.transaction_hash.toHexBuf(&tx_buf), log.log_index });
+        return;
+    };
+    const value_ok = blk: {
+        unicode.validateString(clean_value) catch |err| {
+            var tx_buf: [66]u8 = undefined;
+            std.log.warn("TextChanged value rejected ({any}) at block {d} tx {s} log_index {d} — clearing key", .{ err, log.block_number, log.transaction_hash.toHexBuf(&tx_buf), log.log_index });
+            break :blk false;
+        };
+        break :blk true;
+    };
+    const effective_value: []const u8 = if (value_ok) clean_value else "";
 
     const nh_hex_log = try namehash.toHex(self.allocator);
     defer self.allocator.free(nh_hex_log);
     std.log.debug("TextChanged: namehash={s} key={s} value={s}", .{
         nh_hex_log,
         clean_key,
-        clean_value,
+        effective_value,
     });
 
-    if (clean_value.len == 0) {
-        // Empty value → treat as a clear. Skip INSERT, still emit the event
-        // row so audit history is preserved.
+    if (effective_value.len == 0) {
+        // Empty or unusable value → treat as a clear. Skip INSERT, still emit
+        // the event row so audit history is preserved.
         self.database.deleteResolverText(protocol, namehash, resolver, clean_key) catch |err| {
             std.log.warn("Failed to delete cleared resolver text: {}", .{err});
         };
@@ -305,7 +319,7 @@ pub fn handleTextChanged(self: *Indexer, protocol: models.Protocol, resolver: Ad
             namehash,
             resolver,
             clean_key,
-            clean_value,
+            effective_value,
             protocol,
             log.block_number,
             log.transaction_hash,
@@ -322,7 +336,7 @@ pub fn handleTextChanged(self: *Indexer, protocol: models.Protocol, resolver: Ad
     // Escape key and value for safe JSON inclusion
     const escaped_key = try json_utils.escapeString(self.allocator, clean_key);
     defer self.allocator.free(escaped_key);
-    const escaped_value = try json_utils.escapeString(self.allocator, clean_value);
+    const escaped_value = try json_utils.escapeString(self.allocator, effective_value);
     defer self.allocator.free(escaped_value);
 
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"key\":\"{s}\",\"value\":\"{s}\"}}", .{
@@ -359,11 +373,6 @@ pub fn handleLegacyTextChanged(self: *Indexer, protocol: models.Protocol, resolv
     defer abi.freeValues(data_values, self.allocator);
     const value = data_values[0].string;
 
-    unicode.validateString(value) catch |err| {
-        std.log.warn("Invalid UTF-8 in legacy text record value: {any}", .{err});
-        return;
-    };
-
     if (!try utils.resolveNamehash(self, &namehash, resolver, "TextChanged (legacy)")) return;
 
     // Use the hashed indexed key as the storage key (prefixed to mark it as
@@ -379,10 +388,21 @@ pub fn handleLegacyTextChanged(self: *Indexer, protocol: models.Protocol, resolv
     };
     defer self.allocator.free(key_storage);
 
+    // Same order as the modern handler: strip NULs first, then validate; an
+    // unusable value clears the (hashed) key rather than dropping the event.
     const clean_value = try stripNulls(self.allocator, value);
     defer self.allocator.free(clean_value);
+    const value_ok = blk: {
+        unicode.validateString(clean_value) catch |err| {
+            var tx_buf: [66]u8 = undefined;
+            std.log.warn("TextChanged (legacy) value rejected ({any}) at block {d} tx {s} log_index {d} — clearing key", .{ err, log.block_number, log.transaction_hash.toHexBuf(&tx_buf), log.log_index });
+            break :blk false;
+        };
+        break :blk true;
+    };
+    const effective_value: []const u8 = if (value_ok) clean_value else "";
 
-    if (clean_value.len == 0) {
+    if (effective_value.len == 0) {
         self.database.deleteResolverText(protocol, namehash, resolver, key_storage) catch |err| {
             std.log.warn("Failed to delete legacy resolver text: {}", .{err});
         };
@@ -391,7 +411,7 @@ pub fn handleLegacyTextChanged(self: *Indexer, protocol: models.Protocol, resolv
             namehash,
             resolver,
             key_storage,
-            clean_value,
+            effective_value,
             protocol,
             log.block_number,
             log.transaction_hash,
@@ -406,7 +426,7 @@ pub fn handleLegacyTextChanged(self: *Indexer, protocol: models.Protocol, resolv
 
     const escaped_key = try json_utils.escapeString(self.allocator, key_storage);
     defer self.allocator.free(escaped_key);
-    const escaped_value = try json_utils.escapeString(self.allocator, clean_value);
+    const escaped_value = try json_utils.escapeString(self.allocator, effective_value);
     defer self.allocator.free(escaped_value);
 
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"key\":\"{s}\",\"value\":\"{s}\"}}", .{

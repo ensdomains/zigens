@@ -118,6 +118,10 @@ fn dispatchEntryLessThan(_: void, a: DispatchEntry, b: DispatchEntry) bool {
 pub fn isMalformedEventError(err: anyerror) bool {
     return switch (err) {
         error.DataTooShort, error.ArrayDataTooShort => true,
+        // Decoded fine but a numeric field exceeds what the schema can hold
+        // (e.g. a hostile uint256 coinType) — same skip-with-coordinates
+        // treatment as an undecodable payload.
+        error.ValueOutOfRange => true,
         else => false,
     };
 }
