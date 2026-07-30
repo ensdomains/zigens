@@ -56,6 +56,12 @@ pub const Indexer = struct {
     // Cached namehash("eth") — constant value used by every V2 LabelRegistered/
     // NameRegistered/LabelReserved handler. Two keccak rounds saved per event.
     eth_namehash: Hash,
+    // Resolvers first sighted this batch (via ResolverUpdated registration).
+    // Drained by indexResolverEvents, which backfills each one's pre-attachment
+    // history (initialize()-time EACRolesChanged role grants fire blocks before
+    // the resolver becomes known — without this they are lost; see
+    // registerResolverIfNew).
+    pending_resolver_backfills: std.ArrayList(Address) = .{},
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.Config, database: *db.Database, end_block: ?u64) !Indexer {
         // Create ONE shared HTTP client
@@ -262,6 +268,7 @@ pub const Indexer = struct {
         }
         self.block_timestamp_cache.deinit();
         self.write_buffer.deinit();
+        self.pending_resolver_backfills.deinit(self.allocator);
         if (self.rainbow) |*r| r.deinit();
 
         // Free cached controllers
@@ -680,6 +687,14 @@ pub const Indexer = struct {
                 };
                 std.log.info("PCC Domain.expiry mirror materialized: {d} row(s) updated", .{pcc_rows});
 
+                // One-shot heal (marker-gated): resolvers registered before the
+                // first-sighting backfill existed are missing their pre-attachment
+                // init events (EACRolesChanged role grants) — backfill each known
+                // resolver's deployment→first_seen window once.
+                self.backfillResolverInitGaps(.v2, self.v1_client) catch |err| {
+                    std.log.err("Failed to backfill resolver init gaps: {}", .{err});
+                };
+
                 if (self.webhook_manager) |wm| {
                     std.log.info("Initial sync complete - starting 8 webhook workers", .{});
                     try wm.startWorkers(8);
@@ -740,6 +755,12 @@ pub const Indexer = struct {
                             break :blk 0;
                         };
                         std.log.info("PCC Domain.expiry mirror materialized: {d} row(s) updated", .{pcc_rows});
+                    }
+                    if (protocol == .v2) {
+                        // One-shot heal (marker-gated) — see the combined loop.
+                        self.backfillResolverInitGaps(.v2, client) catch |err| {
+                            std.log.err("Failed to backfill resolver init gaps: {}", .{err});
+                        };
                     }
 
                     if (self.webhook_manager) |wm| {
@@ -1033,6 +1054,7 @@ pub const Indexer = struct {
     pub const indexTransferEvents = event_fetchers.indexTransferEvents;
     pub const indexResolverEvents = event_fetchers.indexResolverEvents;
     pub const indexV2ReverseRegistrarEvents = event_fetchers.indexV2ReverseRegistrarEvents;
+    pub const backfillResolverInitGaps = event_fetchers.backfillResolverInitGaps;
 
     // V2 registry handlers (extracted to handlers_v2_registry.zig)
     pub const processOrphanedRegistration = handlers_v2_registry.processOrphanedRegistration;

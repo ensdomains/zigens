@@ -1933,10 +1933,19 @@ pub fn handleResolverUpdated(self: *Indexer, protocol: models.Protocol, log: rpc
 
     std.log.debug("ResolverUpdated: tokenId={d}, resolver={any}, sender={any}", .{ token_id, resolver_addr, sender });
 
-    // Register the resolver for record indexing
+    // Register the resolver for record indexing. A FIRST sighting is queued for
+    // a historical backfill (drained by indexResolverEvents): factory-deployed
+    // resolvers emit their initialize()-time EACRolesChanged role grants blocks
+    // BEFORE this ResolverUpdated, when the resolver pass still skipped them as
+    // unknown — without the backfill those roles never reach resolver.roles.
+    // The discovery-path backfill can't recover them: registering here makes
+    // its `kr.address IS NULL` filter false before it ever runs.
     var resolver_hex_buf: [42]u8 = undefined;
     const resolver_hex = resolver_addr.toHexBuf(&resolver_hex_buf);
-    try self.database.registerResolver(protocol, resolver_hex, log.block_number);
+    const newly_known = try self.database.registerResolverIfNew(protocol, resolver_hex, log.block_number);
+    if (newly_known and !resolver_addr.isZero()) {
+        try self.pending_resolver_backfills.append(self.allocator, resolver_addr);
+    }
 
     const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
 
