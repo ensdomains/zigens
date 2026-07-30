@@ -137,6 +137,12 @@ pub fn handleAddressChanged(self: *Indexer, protocol: models.Protocol, resolver:
 
     if (!try utils.resolveNamehash(self, &namehash, resolver, "AddressChanged")) return;
 
+    // ENSIP-11 coin types fit u32 (0x80000000 | chainId); the column is a
+    // 64-bit INTEGER. A hostile contract can emit any uint256 — reject it as
+    // malformed (skipped with coordinates) instead of @intCast panicking and
+    // killing the process.
+    const coin_type_i64 = std.math.cast(i64, coin_type) orelse return error.ValueOutOfRange;
+
     const nh_hex_log = try namehash.toHex(self.allocator);
     defer self.allocator.free(nh_hex_log);
     std.log.debug("AddressChanged: namehash={s} coinType={d} address={s}", .{
@@ -149,7 +155,7 @@ pub fn handleAddressChanged(self: *Indexer, protocol: models.Protocol, resolver:
     try self.database.storeResolverAddress(
         namehash,
         resolver,
-        @intCast(coin_type),
+        @intCast(coin_type_i64),
         address_hex,
         protocol,
         log.block_number,

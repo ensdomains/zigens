@@ -112,3 +112,22 @@ pub fn dispatchOrdered(
         try entry.handler(self, protocol, entry.log);
     }
 }
+
+/// Malformed-payload errors from decoding a hostile or unexpected event shape.
+/// One undecodable event must be skipped with its coordinates logged, never
+/// allowed to abort the batch — a deterministic poison log would pin the sync
+/// cursor forever (the batch aborts, rolls back, and retries the same event).
+/// Database and I/O errors still propagate: skipping those would drop valid data.
+pub fn isMalformedEventError(err: anyerror) bool {
+    return switch (err) {
+        error.DataTooShort, error.ArrayDataTooShort, error.InvalidTopicCount => true,
+        // Decoded fine but a numeric field exceeds what the schema can hold
+        // (e.g. a hostile uint256 coinType) — same skip treatment.
+        error.ValueOutOfRange => true,
+        else => false,
+    };
+}
+
+pub fn skipMalformedEvent(log: rpc.Log, err: anyerror) void {
+    std.log.warn("skipping undecodable event at block {d} tx {any} log_index {d}: {}", .{ log.block_number, log.transaction_hash, log.log_index, err });
+}

@@ -211,9 +211,15 @@ pub const Client = struct {
         var attempt: u32 = 0;
         var last_error: ?anyerror = null;
 
+        // Identity encoding, NOT gzip/deflate: Zig 0.15.2's flate decompressor
+        // panics (`unreachable` in unreachableRebase) mid-stream on large
+        // compressed bodies — a hard process kill, not a catchable error, and
+        // large getLogs responses (the batch-wide resolver pass, catch-up
+        // batches) cross the threshold routinely. The override must go through
+        // `.headers.accept_encoding` — an extra_headers entry DUPLICATES the
+        // client's default Accept-Encoding header instead of replacing it.
         const extra_headers = [_]std.http.Header{
             .{ .name = "Content-Type", .value = "application/json" },
-            .{ .name = "Accept-Encoding", .value = "gzip, deflate" },
         };
 
         while (attempt < max_retries) : (attempt += 1) {
@@ -233,6 +239,7 @@ pub const Client = struct {
                 .method = .POST,
                 .payload = request_body,
                 .extra_headers = &extra_headers,
+                .headers = .{ .accept_encoding = .{ .override = "identity" } },
                 .response_writer = &response_buf.writer,
                 .keep_alive = true,
             }) catch |err| {

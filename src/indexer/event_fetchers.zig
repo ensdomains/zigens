@@ -481,45 +481,66 @@ pub fn indexResolverEvents(self: *Indexer, protocol: models.Protocol, client: *r
         event_topics[i] = event_cfg.event_hash;
     }
 
-    // Single RPC call: query by topics only, no address filter
-    // This returns events from ANY contract with matching signatures
-    const logs = try client.getLogsMultiAddress(.{
-        .from_block = from_block,
-        .to_block = to_block,
-        .addresses = &[_]Address{}, // Empty = no address filter
-        .topic0_or = &event_topics,
-    });
-    defer {
-        for (logs) |*log| {
-            log.deinit(self.allocator);
-        }
-        self.allocator.free(logs);
-    }
-
-    // Process logs, filtering by known resolvers
+    // Topic-only query, no address filter: returns events from ANY contract
+    // with matching signatures; known-resolver filtering happens client-side.
+    // Chunked with overflow halving — a single unchunked call over a large
+    // batch (catch-up after downtime, big BATCH_SIZE deployments) produced
+    // responses that either hit provider caps or, worse, compressed bodies
+    // large enough to panic Zig 0.15.2's flate decompressor. Being the LAST
+    // phase, a failure here used to abort the whole already-processed batch.
     var processed_count: usize = 0;
     var skipped_count: usize = 0;
-
-    for (logs) |log| {
-        if (log.topics.len == 0) continue;
-
-        // Filter: only process events from known resolvers
-        if (!known_resolver_set.contains(log.address.bytes)) {
-            skipped_count += 1;
-            continue;
+    var chunk_lo = from_block;
+    var resolver_chunk: u64 = @max(1, @min(self.config.batch_size, 5000));
+    while (chunk_lo <= to_block) {
+        const chunk_hi = @min(to_block, chunk_lo + resolver_chunk - 1);
+        const logs = client.getLogsMultiAddress(.{
+            .from_block = chunk_lo,
+            .to_block = chunk_hi,
+            .addresses = &[_]Address{}, // Empty = no address filter
+            .topic0_or = &event_topics,
+        }) catch |err| {
+            if ((err == error.RpcError or err == error.StreamTooLong) and resolver_chunk > 10) {
+                resolver_chunk = @max(10, resolver_chunk / 2);
+                std.log.warn("  Resolver-events chunk too large, retrying {d}-{d} at {d} blocks", .{ chunk_lo, chunk_hi, resolver_chunk });
+                continue;
+            }
+            return err;
+        };
+        defer {
+            for (logs) |*log| {
+                log.deinit(self.allocator);
+            }
+            self.allocator.free(logs);
         }
 
-        const event_sig = log.topics[0];
-        const resolver = log.address;
+        for (logs) |log| {
+            if (log.topics.len == 0) continue;
 
-        // Find matching handler by comparing event signature
-        inline for (Indexer.RESOLVER_EVENTS) |event_cfg| {
-            if (event_sig.eql(event_cfg.event_hash)) {
-                try event_cfg.handler(self, protocol, resolver, log);
-                processed_count += 1;
-                break;
+            // Filter: only process events from known resolvers
+            if (!known_resolver_set.contains(log.address.bytes)) {
+                skipped_count += 1;
+                continue;
+            }
+
+            const event_sig = log.topics[0];
+            const resolver = log.address;
+
+            // Find matching handler by comparing event signature. A malformed
+            // payload is skipped with coordinates, never allowed to abort the
+            // batch — a deterministic poison log would pin the cursor forever.
+            inline for (Indexer.RESOLVER_EVENTS) |event_cfg| {
+                if (event_sig.eql(event_cfg.event_hash)) {
+                    event_cfg.handler(self, protocol, resolver, log) catch |err| {
+                        if (!utils.isMalformedEventError(err)) return err;
+                        utils.skipMalformedEvent(log, err);
+                    };
+                    processed_count += 1;
+                    break;
+                }
             }
         }
+        chunk_lo = chunk_hi + 1;
     }
 
     if (processed_count > 0) {
