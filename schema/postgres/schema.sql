@@ -206,6 +206,10 @@ CREATE INDEX IF NOT EXISTS idx_names_expiry_effective ON names(expiry_effective)
 CREATE INDEX IF NOT EXISTS idx_names_registry ON names(protocol, registry);
 CREATE INDEX IF NOT EXISTS idx_names_resolver ON names(protocol, resolver);
 CREATE INDEX IF NOT EXISTS idx_names_created_block ON names(protocol, created_block);
+-- domains(first:N) defaults to ORDER BY created_at, namehash (keyset pagination
+-- tiebreak). The composite lets the planner stream the newest/oldest N rows
+-- instead of scan+sorting the whole table (measured 19s -> 9ms on 3M rows).
+CREATE INDEX IF NOT EXISTS idx_names_created_at ON names(created_at, namehash);
 CREATE INDEX IF NOT EXISTS idx_names_namehash ON names(namehash);
 CREATE INDEX IF NOT EXISTS idx_names_is_wrapped ON names(is_wrapped);
 CREATE INDEX IF NOT EXISTS idx_names_is_v1_name ON names(is_v1_name);

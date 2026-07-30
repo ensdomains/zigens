@@ -232,6 +232,11 @@ const SYNC_DROP_INDEXES = [_][]const u8{
     // that is a full scan of the multi-million-row names table inside the
     // resolver pass (same sync-path-query class as idx_names_parent_namehash).
     "idx_names_registrant",
+    // idx_names_created_at is deliberately NOT dropped: created_at is
+    // monotonically increasing during sync, so maintenance is right-edge
+    // btree appends (same economics as the kept created_block index) — and
+    // keeping it makes the API's default domains ordering streamable even
+    // mid-backfill instead of a full scan+sort.
     "idx_names_v1_label_hash",
     "idx_names_is_wrapped",
     "idx_names_is_v1_name",
@@ -306,6 +311,9 @@ const SYNC_CREATE_INDEXES = [_][]const u8{
     "CREATE INDEX IF NOT EXISTS idx_names_registry ON names(protocol, registry)",
     "CREATE INDEX IF NOT EXISTS idx_names_resolver ON names(protocol, resolver)",
     "CREATE INDEX IF NOT EXISTS idx_names_created_block ON names(protocol, created_block)",
+    // domains(first:N) defaults to ORDER BY created_at, namehash — without this
+    // composite the planner scan+sorts the whole table (19s -> 9ms on 3M rows).
+    "CREATE INDEX IF NOT EXISTS idx_names_created_at ON names(created_at, namehash)",
     "CREATE INDEX IF NOT EXISTS idx_names_registrant ON names(registrant)",
     "CREATE INDEX IF NOT EXISTS idx_names_v1_label_hash ON names(v1_label_hash)",
     "CREATE INDEX IF NOT EXISTS idx_names_parent_namehash ON names(parent_namehash)",
@@ -412,9 +420,17 @@ pub fn dropSyncIndexes(self: *Database) !void {
     }
     if (first_err) |err| return err;
 
-    // The kept sync-path indexes must EXIST, not merely survive the drop list: a
-    // database that previously ran a build which dropped them is mid-backfill
-    // WITHOUT them, and nothing else recreates indexes until sync completes.
+    ensureSyncPathIndexes(self);
+
+    std.log.info("Dropped non-essential indexes for bulk sync performance", .{});
+}
+
+/// The kept sync-path indexes must EXIST, not merely survive the drop list: a
+/// database that previously ran a build which dropped them (or predates their
+/// addition — loadSchemaFiles short-circuits on existing DBs) would run the
+/// sync WITHOUT them. Called both by dropSyncIndexes and by the small-gap
+/// startup path that skips the drop entirely. All idempotent.
+pub fn ensureSyncPathIndexes(self: *Database) void {
     self.exec("CREATE INDEX IF NOT EXISTS idx_events_name ON events(name)") catch |err|
         std.log.err("ensure idx_events_name failed: {}", .{err});
     self.exec("CREATE INDEX IF NOT EXISTS idx_names_parent_namehash ON names(parent_namehash)") catch |err|
@@ -428,14 +444,11 @@ pub fn dropSyncIndexes(self: *Database) !void {
         std.log.err("ensure idx_unknown_labels_namehash failed: {}", .{err});
     // updateNameUnwrapperState's expiry re-base runs a correlated MAX() subquery
     // against registrations per unwrap; without this index each one scans the
-    // whole table (measured ~10s/stmt on a mainnet-sized DB). schema.sql has it,
-    // but loadSchemaFiles short-circuits on existing DBs and nothing else
-    // creates registrations indexes — a DB bootstrapped by an older build
-    // (pre-2026-05-22) never got it.
+    // whole table (measured ~10s/stmt on a mainnet-sized DB).
     self.exec("CREATE INDEX IF NOT EXISTS idx_registrations_protocol_namehash ON registrations(protocol, namehash)") catch |err|
         std.log.err("ensure idx_registrations_protocol_namehash failed: {}", .{err});
-
-    std.log.info("Dropped non-essential indexes for bulk sync performance", .{});
+    self.exec("CREATE INDEX IF NOT EXISTS idx_names_created_at ON names(created_at, namehash)") catch |err|
+        std.log.err("ensure idx_names_created_at failed: {}", .{err});
 }
 
 /// Recreate all indexes after bulk sync is complete.
@@ -494,6 +507,21 @@ pub fn createSyncIndexes(self: *Database) !void {
             std.log.err("index recreate failed ({s}): {}", .{ sql, err });
             if (first_err == null) first_err = err;
         };
+    }
+    // Refresh planner statistics after the rebuild. Load-bearing, not hygiene:
+    // without sqlite_stat1 the planner prefers a "selective-looking" equality
+    // index (is_normalized=?) + temp sort over streaming an ordering index —
+    // measured as the difference between 17s and 9ms for the default
+    // domains(first:N) page on a 3M-row table. One-time cost at sync
+    // completion (~40s on 3M rows). PG runs its own ANALYZE.
+    if (!self.isPostgres()) {
+        const analyze_timer = zsys.milliTimestamp();
+        self.exec("ANALYZE") catch |err|
+            std.log.warn("post-sync ANALYZE failed: {}", .{err});
+        std.log.info("ANALYZE complete ({d}ms)", .{zsys.milliTimestamp() - analyze_timer});
+    } else {
+        self.exec("ANALYZE") catch |err|
+            std.log.warn("post-sync ANALYZE failed: {}", .{err});
     }
     const elapsed = zsys.milliTimestamp() - timer;
     if (first_err) |err| return err;
