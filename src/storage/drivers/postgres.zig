@@ -239,26 +239,7 @@ pub fn open(allocator: std.mem.Allocator, opts: ConnectOpts) !backend.Backend {
     const conn = try pool.acquire();
     errdefer pool.release(conn);
 
-    // Bound statement runtime so a stuck query fails loudly (see statementTimeoutSecs).
-    // Non-fatal: on a transaction-mode pooler a session SET may not persist — the real
-    // fix there is a session/direct endpoint — but a failed SET must not block startup.
-    const stmt_timeout_s = statementTimeoutSecs(allocator);
-    if (stmt_timeout_s > 0) {
-        var tbuf: [64]u8 = undefined;
-        const tsql = std.fmt.bufPrint(&tbuf, "SET statement_timeout = {d}", .{@as(u64, stmt_timeout_s) * 1000}) catch unreachable;
-        _ = conn.exec(tsql, .{}) catch |err| {
-            std.log.warn("postgres: could not set statement_timeout ({d}s): {}", .{ stmt_timeout_s, err });
-        };
-    }
-
-    // Optional durability/speed trade-off for bulk sync (see synchronousCommitSetting).
-    if (synchronousCommitSetting(allocator)) |sc| {
-        var scbuf: [64]u8 = undefined;
-        const scsql = std.fmt.bufPrint(&scbuf, "SET synchronous_commit = {s}", .{sc}) catch unreachable;
-        _ = conn.exec(scsql, .{}) catch |err| {
-            std.log.warn("postgres: could not set synchronous_commit={s}: {}", .{ sc, err });
-        };
-    }
+    applySessionSettings(allocator, conn);
 
     const self = try allocator.create(PgConn);
     self.* = .{
@@ -279,6 +260,88 @@ pub const capabilities = backend.Capabilities{
     .server_side_undo = true,
     .pooled = true,
 };
+
+/// Session GUCs applied to the pinned connection — at open() AND after every
+/// reconnect (session settings die with the session; see the Neon lost-GUCs
+/// incident). Best-effort: a failed SET must not block startup or recovery.
+fn applySessionSettings(allocator: std.mem.Allocator, conn: *pg.Conn) void {
+    // Bound statement runtime so a stuck query fails loudly (see statementTimeoutSecs).
+    // Non-fatal: on a transaction-mode pooler a session SET may not persist — the real
+    // fix there is a session/direct endpoint — but a failed SET must not block startup.
+    const stmt_timeout_s = statementTimeoutSecs(allocator);
+    if (stmt_timeout_s > 0) {
+        var tbuf: [64]u8 = undefined;
+        const tsql = std.fmt.bufPrint(&tbuf, "SET statement_timeout = {d}", .{@as(u64, stmt_timeout_s) * 1000}) catch unreachable;
+        _ = conn.exec(tsql, .{}) catch |err| {
+            std.log.warn("postgres: could not set statement_timeout ({d}s): {}", .{ stmt_timeout_s, err });
+        };
+    }
+
+    // Optional durability/speed trade-off for bulk sync (see synchronousCommitSetting).
+    if (synchronousCommitSetting(allocator)) |sc| {
+        var scbuf: [64]u8 = undefined;
+        const scsql = std.fmt.bufPrint(&scbuf, "SET synchronous_commit = {s}", .{sc}) catch unreachable;
+        _ = conn.exec(scsql, .{}) catch |err| {
+            std.log.warn("postgres: could not set synchronous_commit={s}: {}", .{ sc, err });
+        };
+    }
+}
+
+/// Transport-layer failures that mean the pinned connection's socket/TLS session
+/// is dead (Neon idles out or restarts connections; networks blip). Server-side
+/// SQL errors (error.PG) and everything else are NOT connection deaths.
+fn isConnectionDead(err: anyerror) bool {
+    return switch (err) {
+        error.SSLWriteFailed,
+        error.SSLReadFailed,
+        error.WriteFailed,
+        error.ReadFailed,
+        error.BrokenPipe,
+        error.ConnectionResetByPeer,
+        error.ConnectionRefused,
+        error.ConnectionTimedOut,
+        error.EndOfStream,
+        error.NotOpenForWriting,
+        error.NotOpenForReading,
+        => true,
+        else => false,
+    };
+}
+
+/// Replace the dead pinned connection with a fresh one. The statement that
+/// observed the death still FAILS to its caller — the indexer's batch machinery
+/// rolls back and retries the whole batch, which is the only correct recovery
+/// (the dead session took any in-flight transaction with it; transparently
+/// retrying a single statement would resume mid-batch outside a transaction).
+/// Without this, every subsequent statement failed on the same corpse forever —
+/// the observed staging SSLWriteFailed loop.
+fn reviveConnection(self: *PgConn, err: anyerror) void {
+    if (!isConnectionDead(err)) return;
+    std.log.warn("postgres: pinned connection lost ({}); reconnecting", .{err});
+    // Mark the corpse failed so pool.release destroys it and provisions a
+    // replacement instead of returning it to the free list. Release BEFORE
+    // acquire: the pool is size 1 (single pinned writer), so acquiring while
+    // still holding the corpse would block on ourselves.
+    self.conn._state = .fail;
+    self.pool.release(self.conn);
+    // The old conn is destroyed now — self.conn must not be used until
+    // replaced. A single-writer indexer cannot make progress without a DB
+    // connection, so wait as long as it takes (same philosophy as the RPC
+    // outage absorber): the pool's background reconnector keeps provisioning,
+    // and each failed acquire backs off before retrying.
+    var attempt: u32 = 0;
+    const fresh = while (true) {
+        if (self.pool.acquire()) |c| break c else |aerr| {
+            attempt += 1;
+            const backoff_s: u64 = @min(60, @as(u64, 5) * attempt);
+            std.log.warn("postgres: reconnect attempt {d} failed ({}); retrying in {d}s", .{ attempt, aerr, backoff_s });
+            zsys.sleep(backoff_s * std.time.ns_per_s);
+        }
+    };
+    applySessionSettings(self.allocator, fresh);
+    self.conn = fresh;
+    std.log.info("postgres: connection re-established", .{});
+}
 
 fn close(ctx: *anyopaque) void {
     const self = asConn(ctx);
@@ -301,27 +364,47 @@ fn execRaw(ctx: *anyopaque, sql: []const u8) anyerror!void {
             }
         }
         std.log.err("postgres execRaw failed: {}\nSQL: {s}", .{ err, sql });
+        reviveConnection(self, err);
         return error.ExecFailed;
     };
 }
 
 fn begin(ctx: *anyopaque, mode: backend.TxMode) anyerror!void {
-    const conn = asConn(ctx).conn;
-    try conn.begin(); // plain BEGIN; PG locks lazily (no BEGIN IMMEDIATE)
+    const self = asConn(ctx);
+    // Plain BEGIN; PG locks lazily (no BEGIN IMMEDIATE). A transport-dead
+    // failure replaces the pinned connection before erroring (staging fix) —
+    // the caller's batch retry then runs on a live session.
+    self.conn.begin() catch |err| {
+        reviveConnection(self, err);
+        return err;
+    };
     if (mode == .read_snapshot) {
         // First statement in the tx: upgrade to a stable read-only snapshot. Best-effort —
         // if a pooler rejects it the read simply runs at the default isolation, never worse.
-        _ = conn.exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY", .{}) catch |err|
+        _ = self.conn.exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY", .{}) catch |err|
             std.log.warn("postgres: could not set read-snapshot isolation: {}", .{err});
     }
 }
 
 fn commit(ctx: *anyopaque) anyerror!void {
-    try asConn(ctx).conn.commit();
+    const self = asConn(ctx);
+    self.conn.commit() catch |err| {
+        reviveConnection(self, err);
+        return err;
+    };
 }
 
 fn rollback(ctx: *anyopaque) void {
-    asConn(ctx).conn.rollback() catch |err| {
+    const self = asConn(ctx);
+    self.conn.rollback() catch |err| {
+        // A rollback on a DEAD connection is not critical: the server already
+        // aborted the transaction when the session died; replacing the
+        // connection is the recovery. Genuine rollback failures stay loud.
+        if (isConnectionDead(err)) {
+            std.log.warn("postgres rollback on dead connection ({}); session abort already discarded the transaction", .{err});
+            reviveConnection(self, err);
+            return;
+        }
         std.log.err("CRITICAL: postgres rollback failed: {}", .{err});
     };
 }
@@ -436,6 +519,9 @@ fn prepare(ctx: *anyopaque, sql: []const u8, cached: bool) anyerror!Statement {
         // its own context (and the conformance suite exercises this path — the
         // default test runner fails any test that emits an err-level log).
         std.log.warn("postgres prepare failed: {}\nSQL: {s}", .{ err, renumbered });
+        // A dead socket/TLS session is replaced before failing, so the batch
+        // retry runs on a live connection instead of the corpse forever.
+        reviveConnection(self, err);
         return error.PrepareFailed;
     };
     errdefer stmt.deinit();
