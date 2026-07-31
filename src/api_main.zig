@@ -112,7 +112,8 @@ pub fn main(init: std.process.Init) !void {
     // RPC client. Leaving both unset creates no RPC client and changes no served value.
     if (cfg.primary_verify_enabled or cfg.resolve_live_enabled) {
         try server.enableResolution(cfg.resolve_rpc_url, cfg.resolve_cache_ttl_s, cfg.network.chainId(), cfg.v1_contracts.ens_registry, cfg.resolve_universal_resolver, cfg.resolve_live_enabled, cfg.primary_verify_enabled, cfg.resolve_ccip_enabled, cfg.ccip_max_redirects, cfg.ccip_gateway_timeout_ms);
-        std.log.info("On-chain resolution enabled (primary_verify={}, live={}, rpc={s})", .{ cfg.primary_verify_enabled, cfg.resolve_live_enabled, cfg.resolve_rpc_url });
+        // The resolve RPC URL embeds the provider API key — never log it.
+        std.log.info("On-chain resolution enabled (primary_verify={}, live={}, rpc=[CONFIGURED])", .{ cfg.primary_verify_enabled, cfg.resolve_live_enabled });
     }
 
     if (cfg.webhook_admin_username != null and cfg.webhook_admin_password != null) {
