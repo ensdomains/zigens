@@ -29,6 +29,7 @@
     .blocks = .{
         .v1_deployment_block = 9380410,
         .v2_deployment_block = 0,
+        .v1_end_block = 0,
         .temp_registrar_start_block = 3327417,
         .v1_migration_block = 9380410,
         .name_wrapper_deployment_block = 15628465,
