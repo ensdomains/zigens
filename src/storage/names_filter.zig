@@ -182,6 +182,8 @@ fn appendNameScalarConditions(
     }
     if (filters.resolver != null) try conditions.append(db.allocator, "resolver = ?");
     if (filters.registry != null) try conditions.append(db.allocator, "registry = ?");
+    if (filters.token_id != null) try conditions.append(db.allocator, "token_id = ?");
+    if (filters.canonical_id != null) try conditions.append(db.allocator, "canonical_id = ?");
     if (filters.subregistry_pointer != null) {
         try conditions.append(db.allocator, "EXISTS (SELECT 1 FROM registry_entries re WHERE re.protocol = names.protocol AND re.parent_registry = names.registry AND re.canonical_id = names.canonical_id AND re.subregistry = ?)");
     }
@@ -308,6 +310,8 @@ fn bindNameScalars(q: *Query, filters: NameFilters) !void {
     if (filters.resolved_address) |addr| try q.bindAddress(addr);
     if (filters.resolver) |addr| try q.bindAddress(addr);
     if (filters.registry) |addr| try q.bindAddress(addr);
+    if (filters.token_id) |v| try q.bindText(v);
+    if (filters.canonical_id) |v| try q.bindText(v);
     if (filters.subregistry_pointer) |addr| try q.bindAddress(addr);
     // migrated, has_subdomains contribute no binds (literal SQL)
     if (filters.subdomain_count_gt) |v| try q.bindInt64(v);
@@ -499,6 +503,15 @@ pub const NameFilters = struct {
     resolver: ?Address = null,
     // Registry contract address filter (the contract that owns this name's label)
     registry: ?Address = null,
+    /// Exact match on the CURRENT versioned ERC-1155 token id (0x + 64 hex,
+    /// normalized at the API boundary). This is what marketplaces send: the
+    /// labelhash with the low 32 bits replaced by the token's version counter.
+    /// Hashing is one-way, so this filter is the only tokenId -> name path.
+    token_id: ?[]const u8 = null,
+    /// Exact match on the version-masked canonical id (0x + 64 hex, low 32
+    /// bits zeroed) — stable across version bumps, for callers that hold a
+    /// possibly-stale token id.
+    canonical_id: ?[]const u8 = null,
     /// Inverse subregistry-pointer filter: match names whose CURRENT subregistry pointer
     /// (the `registry_entries.subregistry` value for this name) equals this address. Powers
     /// `RegistryInfo.referencedBy` — the names that use a registry as their subname registry.

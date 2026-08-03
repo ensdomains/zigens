@@ -1523,3 +1523,86 @@ test "registrations list dedups protocol twins preferring v2" {
     }
     try testing.expectEqual(@as(usize, 2), regs.len);
 }
+
+test "getFilteredNames: token_id and canonical_id exact filters (marketplace tokenId reverse path)" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const nh = try namehash_fn(allocator, "ninetails.eth");
+    const label_hash = try labelhash_fn(allocator, "ninetails");
+    const parent_nh = try namehash_fn(allocator, "eth");
+    const registry = try Address.fromHex("0xbdc85dd5b15d7ecb354cd7cb6f2c50b4f2c4f0e2");
+
+    // Versioned ERC-1155 token id: labelhash with the low 32 bits replaced by
+    // the version counter (here version 3); canonical id = version-masked.
+    const canonical: u256 = 0xabcdef1234567890_abcdef1234567890_abcdef1234567890_abcdef1200000000;
+    const versioned: u256 = canonical | 3;
+
+    try database.insertName(models.Name{
+        .protocol = .v2,
+        .name = "ninetails.eth",
+        .namehash = nh,
+        .label = "ninetails",
+        .label_hash = label_hash,
+        .parent_name = "eth",
+        .parent_namehash = parent_nh,
+        .registry = registry,
+        .owner = helpers.TEST_OWNER_1,
+        .registrant = helpers.TEST_OWNER_1,
+        .resolver = Address.zero,
+        .token_id = versioned,
+        .canonical_id = canonical,
+        .token_version = 3,
+        .expiry = 1800_000_000,
+        .registry_locked = false,
+        .migrated = false,
+        .created_block = 11_383_900,
+        .created_at = 1785_500_000,
+        .registered_at = 1785_500_000,
+        .updated_block = 11_383_900,
+        .updated_at = 1785_500_000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    });
+    _ = try helpers.createTestName(allocator, database, "decoy.eth", helpers.TEST_OWNER_2);
+
+    // Stored format: 0x + 64 lowercase hex (formatU256HexBuf).
+    var tid_buf: [80]u8 = undefined;
+    const tid_hex = try std.fmt.bufPrint(&tid_buf, "0x{x:0>64}", .{versioned});
+    var cid_buf: [80]u8 = undefined;
+    const cid_hex = try std.fmt.bufPrint(&cid_buf, "0x{x:0>64}", .{canonical});
+
+    // token_id exact match finds exactly the versioned holder.
+    {
+        const names = try database.getFilteredNames(.{ .token_id = tid_hex }, 0, 10, .asc, .name);
+        defer {
+            for (names) |*n| n.deinit(allocator);
+            allocator.free(names);
+        }
+        try testing.expectEqual(@as(usize, 1), names.len);
+        try testing.expectEqualStrings("ninetails.eth", names[0].name.?);
+    }
+
+    // canonical_id matches regardless of version; combined with registry scoping.
+    {
+        const names = try database.getFilteredNames(.{ .canonical_id = cid_hex, .registry = registry }, 0, 10, .asc, .name);
+        defer {
+            for (names) |*n| n.deinit(allocator);
+            allocator.free(names);
+        }
+        try testing.expectEqual(@as(usize, 1), names.len);
+    }
+
+    // A stale (different-version) token id must NOT match token_id.
+    var stale_buf: [80]u8 = undefined;
+    const stale_hex = try std.fmt.bufPrint(&stale_buf, "0x{x:0>64}", .{canonical | 2});
+    {
+        const names = try database.getFilteredNames(.{ .token_id = stale_hex }, 0, 10, .asc, .name);
+        defer allocator.free(names);
+        try testing.expectEqual(@as(usize, 0), names.len);
+    }
+}
