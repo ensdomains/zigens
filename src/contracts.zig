@@ -156,13 +156,8 @@ fn sepoliaAddresses() ContractAddresses {
         // Source: ensdomains/contracts-v2 @ 97a5729 — contracts/docs/addresses/sepolia.md
         // (deployed 2026-07-30, block 11383818)
         .root_registry = Address.fromHex("0x8115186e8f2e0b0281e86ab91f0f48ba90364354") catch unreachable,
-        // TBD: 97a5729 values for the renewer and LabelStore are absent from the
-        // main-based address commit (these fields exist only on this branch).
-        // Zero = the indexer SKIPS those event sources (isZero gates) — safer
-        // than pointing at the previous deployment's contracts. Fill in from
-        // contracts-v2 sepolia.md when published.
-        .eth_renewer_v1 = Address.zero,
-        .eth_label_store = Address.zero,
+        .eth_renewer_v1 = Address.fromHex("0x4ad56feb5fc7b8298db06e88fd5cbc41d64602fa") catch unreachable, // ETHRenewerV1 (97a5729 sepolia.md)
+        .eth_label_store = Address.fromHex("0x532cd0cc4ac0793d838f71a67d29b2d790d18777") catch unreachable, // LabelStore (97a5729 sepolia.md)
         .eth_registry = Address.fromHex("0xbdc85dd5b15d7ecb354cd7cb6f2c50b4f2c4f0e2") catch unreachable,
         .eth_registrar_v2 = Address.fromHex("0xa88553f454b77203b0d036a05c894d555eaaa2cc") catch unreachable,
         .eth_reverse_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable, // TBD (deployment exposes only ReverseRegistrarAdapter 0x035ae6188ac22ab79b5018039dfbda4ffe7990e9)
@@ -189,7 +184,7 @@ fn sepoliaAddresses() ContractAddresses {
         .v1_migration_block = 0,
         .name_wrapper_deployment_block = 0,
 
-        .universal_resolver = Address.fromHex("0x85edf8b6b7d4211e2b07aa687506b746357b92cf") catch unreachable, // Sepolia URv2 (manifest data; RESOLVE_UNIVERSAL_RESOLVER overrides at deploy time)
+        .universal_resolver = Address.fromHex("0x4a1817d13e9cf196f471725176355c1234b63c70") catch unreachable, // UniversalResolverV2 (97a5729 sepolia.md); the UpgradableUniversalResolverProxy 0xeEeE…EeEe survives UR upgrades — point RESOLVE_UNIVERSAL_RESOLVER at it at deploy time if preferred
     };
 }
 
