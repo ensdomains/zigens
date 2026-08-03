@@ -23,7 +23,6 @@ pub const OrderDir = names.OrderDir;
 pub const NameSortField = names.NameSortField;
 pub const NameFilters = names.NameFilters;
 pub const KeysetAnchor = names.KeysetAnchor;
-pub const KeysetResult = names.KeysetResult;
 const sync = @import("sync.zig");
 const events = @import("events.zig");
 pub const EventOrderDir = events.OrderDir;
@@ -43,7 +42,6 @@ pub const AccountFilters = accounts.AccountFilters;
 pub const AccountSortField = accounts.AccountSortField;
 pub const Account = accounts.Account;
 pub const NamedResource = named_resources.NamedResource;
-pub const ResolverEntity = resolvers.ResolverEntity;
 pub const ResolverEntityFilters = resolvers.ResolverEntityFilters;
 pub const ResolverEntitySortField = resolvers.ResolverEntitySortField;
 
@@ -57,12 +55,8 @@ pub const Query = query.Query;
 const backend_mod = @import("backend.zig");
 const sqlite_driver = @import("drivers/sqlite.zig");
 const schema_keys = @import("schema_keys.zig");
-/// RAII transaction guard + mode, re-exported for storage modules.
+/// RAII transaction guard, re-exported for storage modules.
 pub const Tx = backend_mod.Tx;
-pub const TxMode = backend_mod.TxMode;
-/// SQL-dialect builders, re-exported for storage modules.
-pub const Dialect = backend_mod.Dialect;
-pub const ConflictAction = backend_mod.ConflictAction;
 /// SQLite serialized-mode setup; call once at process start before any DB open.
 pub const configureSqliteThreadSafety = sqlite_driver.configureSerialized;
 
@@ -77,6 +71,11 @@ pub const Database = struct {
     /// fails loudly if a path forgets to populate it (the emitted id would be
     /// `0-v1-…` — visibly wrong but not unsafe).
     chain_id: u64 = 0,
+    /// SQLite page-cache size (MB) applied by dropSyncIndexes for bulk sync.
+    /// Set by the indexer from Config (SYNC_CACHE_MB, .env-aware); process env
+    /// still overrides inside dropSyncIndexes. Paths that never bulk-sync
+    /// (API, tools, tests) keep the default.
+    sync_cache_mb: u64 = 512,
 
     /// Records the chain ID this database serves data for. The value flows
     /// into Resolver entity IDs at JSON-build time. Called by both the
@@ -298,6 +297,21 @@ pub const Database = struct {
         return schema.createSyncIndexes(self);
     }
 
+    /// Truncate the SQLite WAL and log its depth (no-op on PostgreSQL).
+    pub fn checkpointWal(self: *Database) void {
+        return schema.checkpointWal(self);
+    }
+
+    /// Drain the WAL between bulk-sync chunks without truncating (no-op on PostgreSQL).
+    /// Current -wal file size in bytes (SQLite only; null when unavailable).
+    pub fn walFileSize(self: *Database) ?u64 {
+        return schema.walFileSize(self);
+    }
+
+    pub fn checkpointWalPassive(self: *Database) void {
+        return schema.checkpointWalPassive(self);
+    }
+
     // ========================================================================
     // RE-EXPORTED FUNCTIONS FROM MODULES
     // ========================================================================
@@ -312,7 +326,6 @@ pub const Database = struct {
     pub const getNameByNamehashAndProtocol = names.getNameByNamehashAndProtocol;
     pub const getNamehashByResolver = names.getNamehashByResolver;
     pub const updateNameExpiry = names.updateNameExpiry;
-    pub const clearNameExpiry = names.clearNameExpiry;
     pub const updateDomainExpiryIfGreater = names.updateDomainExpiryIfGreater;
     pub const materializePccDomainExpiry = names.materializePccDomainExpiry;
     pub const updateNameOwner = names.updateNameOwner;
@@ -320,10 +333,7 @@ pub const Database = struct {
     pub const upsertReverseRecord = resolvers.upsertReverseRecord;
     pub const getReverseRecordNamehash = resolvers.getReverseRecordNamehash;
     pub const updateNameResolver = names.updateNameResolver;
-    pub const updateResolvedAddressToNull = names.updateResolvedAddressToNull;
     pub const recursivelyGcEmptyDomain = names.recursivelyGcEmptyDomain;
-    pub const updateNameTTL = names.updateNameTTL;
-    pub const updateNameIsLegacy = names.updateNameIsLegacy;
     pub const applyLatestResolverFromEvents = resolvers.applyLatestResolverFromEvents;
     pub const getNameByTokenIdAndRegistry = names.getNameByTokenIdAndRegistry;
     pub const deleteNameByNamehash = names.deleteNameByNamehash;
@@ -334,8 +344,6 @@ pub const Database = struct {
     pub const getFilteredNames = names.getFilteredNames;
     pub const countRowsBeforeNamehash = names.countRowsBeforeNamehash;
     pub const getFilteredNamesKeyset = names.getFilteredNamesKeyset;
-    pub const OrderDir = names.OrderDir;
-    pub const NameSortField = names.NameSortField;
     pub const NameFilters = names.NameFilters;
     pub const getRegistriesByOwner = names.getRegistriesByOwner;
     pub const getRegistry = names.getRegistry;
@@ -358,14 +366,10 @@ pub const Database = struct {
     pub const getAddressRecordsBatch = resolvers.getAddressRecordsBatch;
     pub const getContentHashesBatch = resolvers.getContentHashesBatch;
     pub const getTextRecordsBatch = resolvers.getTextRecordsBatch;
-    pub const ResolverRecordRow = resolvers.ResolverRecordRow;
     pub const getTextRecordKeys = resolvers.getTextRecordKeys;
     pub const getTextRecord = resolvers.getTextRecord;
-    pub const getResolversToIndex = resolvers.getResolversToIndex;
     pub const getResolversByOwner = resolvers.getResolversByOwner;
     pub const upsertResolverEntity = resolvers.upsertResolverEntity;
-    pub const getResolverEntityCount = resolvers.getResolverEntityCount;
-    pub const backfillResolverEntitiesFromNames = resolvers.backfillResolverEntitiesFromNames;
     pub const getFilteredResolverEntities = resolvers.getFilteredResolverEntities;
     pub const deleteResolverAddresses = resolvers.deleteResolverAddresses;
     pub const deleteResolverContentHash = resolvers.deleteResolverContentHash;
@@ -381,19 +385,16 @@ pub const Database = struct {
     pub const deleteResolverNames = resolvers.deleteResolverNames;
     pub const deleteResolverInterfaces = resolvers.deleteResolverInterfaces;
     pub const storeResolverAlias = resolvers.storeResolverAlias;
-    pub const AliasRecord = resolvers.AliasRecord;
     pub const getResolverAliases = resolvers.getResolverAliases;
     pub const storeResolverPubkey = resolvers.storeResolverPubkey;
     pub const storeResolverABI = resolvers.storeResolverABI;
     pub const storeResolverName = resolvers.storeResolverName;
     pub const storeResolverInterface = resolvers.storeResolverInterface;
     pub const storeResolverVersion = resolvers.storeResolverVersion;
-    pub const PubkeyRecord = resolvers.PubkeyRecord;
     pub const getPubkeyRecord = resolvers.getPubkeyRecord;
     pub const getAbiContentTypes = resolvers.getAbiContentTypes;
     pub const getReverseNameRecord = resolvers.getReverseNameRecord;
     pub const getLatestNameByNamehash = resolvers.getLatestNameByNamehash;
-    pub const InterfaceRecord = resolvers.InterfaceRecord;
     pub const getInterfaceRecords = resolvers.getInterfaceRecords;
     pub const getNodeRecordVersion = resolvers.getNodeRecordVersion;
     pub const getResolverNodeCount = resolvers.getResolverNodeCount;
@@ -409,17 +410,21 @@ pub const Database = struct {
 
     // Sync module (14 functions)
     pub const getSyncState = sync.getSyncState;
+    pub const getSyncStateFull = sync.getSyncStateFull;
+    pub const ProtocolSync = sync.ProtocolSync;
     pub const setSyncState = sync.setSyncState;
     pub const storeBlockHash = sync.storeBlockHash;
     pub const getBlockHash = sync.getBlockHash;
     pub const setFinality = finality.setFinality;
     pub const getFinality = finality.getFinality;
-    pub const FinalityTier = finality.Tier;
     pub const rollbackToBlock = sync.rollbackToBlock;
     pub const pruneOldBlockHashes = sync.pruneOldBlockHashes;
     pub const checkIntegrity = sync.checkIntegrity;
+    pub const probeLiveness = sync.probeLiveness;
+    pub const ensureSyncPathIndexes = schema.ensureSyncPathIndexes;
     pub const registerSubregistry = sync.registerSubregistry;
     pub const registerResolver = sync.registerResolver;
+    pub const registerResolverIfNew = sync.registerResolverIfNew;
     pub const isKnownResolver = sync.isKnownResolver;
     pub const discoverAndGetSubregistries = sync.discoverAndGetSubregistries;
     pub const getSubregistryCreatedBlock = sync.getSubregistryCreatedBlock;
@@ -432,10 +437,6 @@ pub const Database = struct {
     // Events module
     pub const insertEvent = events.insertEvent;
     pub const getRecentEvents = events.getRecentEvents;
-    pub const getRecentEventsWithOrder = events.getRecentEventsWithOrder;
-    pub const EventOrderDir = events.OrderDir;
-    pub const EventSortField = events.EventSortField;
-    pub const EventFilterOptions = events.EventFilterOptions;
     pub const getEventsFiltered = events.getEventsFiltered;
     pub const getEventsByNamehash = events.getEventsByNamehash;
     pub const getEventsByDomain = events.getEventsByDomain;
@@ -461,11 +462,9 @@ pub const Database = struct {
     pub const getRolesByResource = roles.getRolesByResource;
     pub const getRolesByAccount = roles.getRolesByAccount;
     pub const deleteEACRole = roles.deleteEACRole;
-    pub const RolePaginationOptions = roles.RolePaginationOptions;
     pub const getRolesWithPagination = roles.getRolesWithPagination;
     pub const getTotalRoleCount = roles.getTotalRoleCount;
     pub const getRoleCountFiltered = roles.getRoleCountFiltered;
-    pub const RoleCountFilters = roles.RoleCountFilters;
     pub const getLabelRoleHolderCount = roles.getLabelRoleHolderCount;
 
     // ENSIP-16 module (7 functions)
@@ -483,7 +482,6 @@ pub const Database = struct {
     // Registrations read directly from the dedicated `registrations` table
     // (schema/021), not derived from `events`. Single canonical writer per
     // (protocol, namehash) — see registrations.zig for the full rationale.
-    pub const RegistrationFilterOptions = registrations.RegistrationFilterOptions;
     pub const getRegistrations = registrations.getRegistrations;
     pub const getRegistrationCount = registrations.getRegistrationCount;
     pub const insertRegistration = registrations.insertRegistration;
@@ -505,6 +503,5 @@ pub const Database = struct {
     // Accounts module — first-class Account entity (subgraph parity)
     pub const upsertAccount = accounts.upsertAccount;
     pub const getAccount = accounts.getAccount;
-    pub const getAccountCount = accounts.getAccountCount;
     pub const getFilteredAccounts = accounts.getFilteredAccounts;
 };

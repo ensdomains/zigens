@@ -270,6 +270,23 @@ fn isRegularEntry(entry_type: u8, dir_path: []const u8, name: []const u8) bool {
     return false;
 }
 
+/// Size of the file at `path` in bytes, or null if it cannot be opened.
+/// Goes through libc fopen/fseeko like the rest of this file (no versioned
+/// stat symbols).
+pub fn fileSize(path: []const u8) ?u64 {
+    var zbuf: [path_buf_len]u8 = undefined;
+    const z = pathZ(&zbuf, path) catch return null;
+    const f = c.fopen(z, "rb") orelse return null;
+    defer _ = c.fclose(f);
+    if (fseeko(f, 0, 2) != 0) return null; // whence 2 = SEEK_END
+    const off = ftello(f);
+    if (off < 0) return null;
+    return @intCast(off);
+}
+
+extern "c" fn fseeko(stream: *c.FILE, offset: i64, whence: c_int) c_int;
+extern "c" fn ftello(stream: *c.FILE) i64;
+
 pub fn randomBytes(buf: []u8) void {
     const file = c.fopen("/dev/urandom", "rb") orelse @panic("open /dev/urandom failed");
     defer _ = c.fclose(file);

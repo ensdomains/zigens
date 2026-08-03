@@ -141,6 +141,19 @@ fn expirySortExpr(db: *Database, with_expiration: bool) ![]u8 {
     return std.fmt.allocPrint(db.allocator, "COALESCE({s}, timestamp + {s})", .{ expiry, duration });
 }
 
+/// The ORDER BY column expression for a sort field, shared by getEventsFiltered and
+/// countEventsBeforeCursor so the fetch order and the cursor-position count agree exactly.
+/// `.name` is COALESCE'd so NULL names order deterministically; `.expiry` is the JSON expr.
+/// Caller owns the returned string.
+fn sortColExpr(db: *Database, sort_field: EventSortField) ![]u8 {
+    return switch (sort_field) {
+        .block_number => db.allocator.dupe(u8, "block_number"),
+        .timestamp => db.allocator.dupe(u8, "timestamp"),
+        .name => db.allocator.dupe(u8, "COALESCE(name, '')"),
+        .expiry => expirySortExpr(db, true),
+    };
+}
+
 pub fn getRecentEvents(db: *Database, protocol: ?models.Protocol, event_type: ?models.EventType, limit: u32) ![]models.Event {
     return getRecentEventsWithOrder(db, protocol, event_type, limit, .desc);
 }
@@ -236,6 +249,8 @@ pub const EventFilterOptions = struct {
     timestamp_lte: ?i64 = null,
     data_json_owner: ?[]const u8 = null,
     data_json_owners: ?[]const []const u8 = null,
+    /// Address involvement (owner OR from OR to in event data) — per-address history.
+    involved: ?[]const u8 = null,
     // Expiry filters - uses json_extract(data, '$.expiration')
     expiry_gt: ?i64 = null,
     expiry_gte: ?i64 = null,
@@ -348,6 +363,19 @@ fn appendEventScalarConditions(
         try allocated_clauses.append(db.allocator, clause);
         try conditions.append(db.allocator, clause);
     }
+    if (filter.involved != null) {
+        // Address involvement across the three actor roles; each disjunct hits its own
+        // expression index (idx_events_{owner,to,from}_extracted).
+        const owner_lower = try jsonDataLower(db, "owner");
+        defer db.allocator.free(owner_lower);
+        const to_lower = try jsonDataLower(db, "to");
+        defer db.allocator.free(to_lower);
+        const from_lower = try jsonDataLower(db, "from");
+        defer db.allocator.free(from_lower);
+        const clause = try std.fmt.allocPrint(db.allocator, "({s} = LOWER(?) OR {s} = LOWER(?) OR {s} = LOWER(?))", .{ owner_lower, to_lower, from_lower });
+        try allocated_clauses.append(db.allocator, clause);
+        try conditions.append(db.allocator, clause);
+    }
     // Registration-style expiry filter (V2: data.$.expiry; V1: timestamp + data.$.duration).
     if (filter.expiry_gt != null or filter.expiry_gte != null or filter.expiry_lt != null or filter.expiry_lte != null) {
         const expiry_expr = try expirySortExpr(db, false); // filter omits the $.expiration fallback
@@ -444,6 +472,12 @@ fn bindEventScalars(q: *Query, filter: EventFilterOptions) !void {
     if (filter.data_json_owners) |owners| {
         for (owners) |o| try q.bindText(o);
     }
+    if (filter.involved) |v| {
+        // Three binds — one per OR disjunct in the involvement clause.
+        try q.bindText(v);
+        try q.bindText(v);
+        try q.bindText(v);
+    }
     if (filter.expiry_gt) |v| try q.bindInt64(v);
     if (filter.expiry_gte) |v| try q.bindInt64(v);
     if (filter.expiry_lt) |v| try q.bindInt64(v);
@@ -465,27 +499,35 @@ pub fn countEventsBeforeCursor(
     order_dir: OrderDir,
     filter: EventFilterOptions,
 ) !u32 {
-    // First resolve the cursor event's block_number.
-    var lookup = try Query.init(db, "SELECT block_number FROM events WHERE tx_hash = ? AND log_index = ? LIMIT 1");
+    // Count in the SAME total order the row query uses: (sort_col, block_number, log_index).
+    // A cursor identifies a unique row; count rows strictly before it in that order, so
+    // OFFSET = count + 1 lands exactly on the next page with no dropped/duplicated rows.
+    const sort_expr = try sortColExpr(db, filter.sort_field);
+    defer db.allocator.free(sort_expr);
+    const is_text_sort = filter.sort_field == .name;
+
+    // Resolve the cursor row's full sort tuple (sort_value, block_number, log_index).
+    const lookup_sql = try std.fmt.allocPrint(db.allocator, "SELECT {s}, block_number, log_index FROM events WHERE tx_hash = ? AND log_index = ? LIMIT 1", .{sort_expr});
+    defer db.allocator.free(lookup_sql);
+    var lookup = try Query.init(db, lookup_sql);
     defer lookup.deinit();
     try lookup.bindText(tx_hash);
     try lookup.bindInt(@intCast(log_index));
     if (!try lookup.step()) return 0;
-    const cursor_block = lookup.getInt64(0);
+    const cursor_sort_int: i64 = if (is_text_sort) 0 else lookup.getInt64(0);
+    const cursor_sort_text: []const u8 = try db.allocator.dupe(u8, if (is_text_sort) (lookup.getTextSlice(0) orelse "") else "");
+    defer db.allocator.free(cursor_sort_text);
+    const cursor_block = lookup.getInt64(1);
+    const cursor_log = lookup.getInt64(2);
 
-    // Build SQL: cursor-based position predicate AND every filter that the row query applies.
-    // Without the filters, the offset is computed over the unfiltered superset and pagination
-    // skips too many rows (e.g. with blockNumber_gte/lte bounds, ~60% of edges were missing
-    // before this fix). DESC (newest first): "before" = higher (block_number, log_index);
-    // ASC: "before" = lower.
+    // "before" in the display order: DESC → higher tuple, ASC → lower tuple. Filters must
+    // match the row query or the offset is taken over the wrong (super)set.
+    const op: []const u8 = if (order_dir == .desc) ">" else "<";
     var sql_buf: std.ArrayList(u8) = .empty;
     defer sql_buf.deinit(db.allocator);
-
-    const base = if (order_dir == .desc)
-        "SELECT COUNT(*) FROM events WHERE (block_number > ? OR (block_number = ? AND log_index > ?))"
-    else
-        "SELECT COUNT(*) FROM events WHERE (block_number < ? OR (block_number = ? AND log_index < ?))";
-    try sql_buf.appendSlice(db.allocator, base);
+    const pred = try std.fmt.allocPrint(db.allocator, "SELECT COUNT(*) FROM events WHERE ({s} {s} ? OR ({s} = ? AND (block_number {s} ? OR (block_number = ? AND log_index {s} ?))))", .{ sort_expr, op, sort_expr, op, op });
+    defer db.allocator.free(pred);
+    try sql_buf.appendSlice(db.allocator, pred);
 
     var conditions: std.ArrayList([]const u8) = .empty;
     defer conditions.deinit(db.allocator);
@@ -502,9 +544,16 @@ pub fn countEventsBeforeCursor(
 
     var q = try Query.initCached(db, sql_buf.items);
     defer q.deinit();
+    if (is_text_sort) {
+        try q.bindText(cursor_sort_text);
+        try q.bindText(cursor_sort_text);
+    } else {
+        try q.bindInt64(cursor_sort_int);
+        try q.bindInt64(cursor_sort_int);
+    }
     try q.bindInt64(cursor_block);
     try q.bindInt64(cursor_block);
-    try q.bindInt(@intCast(log_index));
+    try q.bindInt64(cursor_log);
     try bindEventFilters(&q, filter);
     if (!try q.step()) return 0;
     return @intCast(q.getInt64(0));
@@ -555,11 +604,10 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     @memcpy(sql_buf[sql_len..][0..order_by_prefix.len], order_by_prefix);
     sql_len += order_by_prefix.len;
 
-    // `.expiry` extracts JSON data fields, so it's dialect-dependent (built here); the
-    // other sort columns are plain column names valid verbatim on both backends.
-    const expiry_sort: ?[]u8 = if (filter.sort_field == .expiry) try expirySortExpr(db, true) else null;
-    defer if (expiry_sort) |e| db.allocator.free(e);
-    const sort_col = expiry_sort orelse filter.sort_field.toSql();
+    // Shared sort-column expression (see sortColExpr) so the fetch order matches the
+    // cursor-position count exactly.
+    const sort_col = try sortColExpr(db, filter.sort_field);
+    defer db.allocator.free(sort_col);
     @memcpy(sql_buf[sql_len..][0..sort_col.len], sort_col);
     sql_len += sort_col.len;
 
@@ -567,12 +615,14 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     @memcpy(sql_buf[sql_len..][0..dir_str.len], dir_str);
     sql_len += dir_str.len;
 
-    // Add secondary sort for block_number to maintain stable ordering
-    if (filter.sort_field == .block_number) {
-        const secondary = if (filter.order_dir == .desc) ", log_index DESC" else ", log_index ASC";
-        @memcpy(sql_buf[sql_len..][0..secondary.len], secondary);
-        sql_len += secondary.len;
-    }
+    // Total order: (block_number, log_index) is unique, so appending it as a final
+    // tiebreaker makes pagination deterministic for every sort field (no two rows tie).
+    const tiebreak = if (filter.sort_field == .block_number)
+        (if (filter.order_dir == .desc) ", log_index DESC" else ", log_index ASC")
+    else
+        (if (filter.order_dir == .desc) ", block_number DESC, log_index DESC" else ", block_number ASC, log_index ASC");
+    @memcpy(sql_buf[sql_len..][0..tiebreak.len], tiebreak);
+    sql_len += tiebreak.len;
 
     const limit_prefix = " LIMIT ";
     @memcpy(sql_buf[sql_len..][0..limit_prefix.len], limit_prefix);
@@ -1224,5 +1274,84 @@ test "EventFilterOptions - all V2 event types" {
 
         try std.testing.expectEqual(@as(usize, 1), type_events.len);
         try std.testing.expectEqual(et, type_events[0].event_type);
+    }
+}
+
+test "connection pagination reproduces the full ordered result with no drops/dupes (all sort fields)" {
+    const allocator = std.testing.allocator;
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    // Insert events with deliberate TIES on every sort field: same block (diff log_index),
+    // same timestamp across blocks, repeated + NULL names — so a non-total order would drop
+    // or duplicate rows across pages.
+    const Row = struct { blk: u64, log: u32, ts: i64, name: ?[]const u8 };
+    const rows = [_]Row{
+        .{ .blk = 100, .log = 0, .ts = 1000, .name = "b.eth" },
+        .{ .blk = 100, .log = 1, .ts = 1000, .name = "a.eth" },
+        .{ .blk = 100, .log = 2, .ts = 1000, .name = null },
+        .{ .blk = 101, .log = 0, .ts = 1000, .name = "a.eth" },
+        .{ .blk = 101, .log = 1, .ts = 1001, .name = "c.eth" },
+        .{ .blk = 102, .log = 0, .ts = 1001, .name = null },
+        .{ .blk = 102, .log = 1, .ts = 1002, .name = "b.eth" },
+        .{ .blk = 103, .log = 0, .ts = 1002, .name = "a.eth" },
+    };
+    for (rows, 0..) |r, i| {
+        var tx = [_]u8{0} ** 32;
+        std.mem.writeInt(u32, tx[0..4], @intCast(i + 1), .big);
+        var ev = models.Event{
+            .event_type = .transfer,
+            .protocol = .v2,
+            .block_number = r.blk,
+            .tx_hash = Hash{ .bytes = tx },
+            .log_index = r.log,
+            .contract_address = Address.zero,
+            .name = if (r.name) |n| try allocator.dupe(u8, n) else null,
+            .namehash = null,
+            .data = try allocator.dupe(u8, "{}"),
+            .timestamp = r.ts,
+        };
+        defer ev.deinit(allocator);
+        try insertEvent(&database, ev);
+    }
+
+    const sorts = [_]EventSortField{ .block_number, .timestamp, .name };
+    const dirs = [_]OrderDir{ .desc, .asc };
+    for (sorts) |sf| {
+        for (dirs) |dir| {
+            // Ground truth: the full ordered result.
+            const full = try getEventsFiltered(&database, .{ .sort_field = sf, .order_dir = dir, .limit = 1000 });
+            defer {
+                for (full) |*e| e.deinit(database.allocator);
+                database.allocator.free(full);
+            }
+
+            // Paginate in pages of 3, walking the cursor exactly like the connection resolver.
+            var collected: std.ArrayList(struct { blk: u64, log: u32 }) = .empty;
+            defer collected.deinit(allocator);
+            var skip: u32 = 0;
+            while (true) {
+                const page = try getEventsFiltered(&database, .{ .sort_field = sf, .order_dir = dir, .limit = 3, .skip = skip });
+                defer {
+                    for (page) |*e| e.deinit(database.allocator);
+                    database.allocator.free(page);
+                }
+                if (page.len == 0) break;
+                for (page) |e| try collected.append(allocator, .{ .blk = e.block_number, .log = e.log_index });
+                const last = page[page.len - 1];
+                const tx_hex = try last.tx_hash.toHex(allocator);
+                defer allocator.free(tx_hex);
+                const before = try countEventsBeforeCursor(&database, tx_hex, last.log_index, dir, .{ .sort_field = sf, .order_dir = dir });
+                skip = before + 1;
+                if (page.len < 3) break;
+            }
+
+            // Paginated sequence must equal the full sequence exactly (order + membership).
+            try std.testing.expectEqual(full.len, collected.items.len);
+            for (full, collected.items) |f, c| {
+                try std.testing.expectEqual(f.block_number, c.blk);
+                try std.testing.expectEqual(f.log_index, c.log);
+            }
+        }
     }
 }

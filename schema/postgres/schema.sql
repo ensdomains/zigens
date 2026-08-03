@@ -39,6 +39,18 @@ CREATE TABLE IF NOT EXISTS sync_state (
   last_synced_at BIGINT NOT NULL
 );
 
+-- Durable marker for a COMPLETED --backfill projection rebuild. Cleared at
+-- replay start, written only after every core finishes — a crashed rebuild is
+-- therefore distinguishable from a finished one. replay_version is the code
+-- version of the replay logic; a version bump invalidates older rebuilds.
+CREATE TABLE IF NOT EXISTS replay_status (
+  id BIGINT PRIMARY KEY,
+  replay_version BIGINT NOT NULL,
+  completed_block BIGINT NOT NULL,
+  names_count BIGINT NOT NULL,
+  completed_at BIGINT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS block_hashes (
   protocol TEXT NOT NULL,
   block_number BIGINT NOT NULL,
@@ -194,6 +206,10 @@ CREATE INDEX IF NOT EXISTS idx_names_expiry_effective ON names(expiry_effective)
 CREATE INDEX IF NOT EXISTS idx_names_registry ON names(protocol, registry);
 CREATE INDEX IF NOT EXISTS idx_names_resolver ON names(protocol, resolver);
 CREATE INDEX IF NOT EXISTS idx_names_created_block ON names(protocol, created_block);
+-- domains(first:N) defaults to ORDER BY created_at, namehash (keyset pagination
+-- tiebreak). The composite lets the planner stream the newest/oldest N rows
+-- instead of scan+sorting the whole table (measured 19s -> 9ms on 3M rows).
+CREATE INDEX IF NOT EXISTS idx_names_created_at ON names(created_at, namehash);
 CREATE INDEX IF NOT EXISTS idx_names_namehash ON names(namehash);
 CREATE INDEX IF NOT EXISTS idx_names_is_wrapped ON names(is_wrapped);
 CREATE INDEX IF NOT EXISTS idx_names_is_v1_name ON names(is_v1_name);
@@ -279,7 +295,6 @@ CREATE TABLE IF NOT EXISTS resolver_addresses (
   resolver TEXT NOT NULL,
   coin_type BIGINT NOT NULL,
   address TEXT NOT NULL,
-  context TEXT,
   protocol TEXT NOT NULL,
   block_number BIGINT NOT NULL,
   transaction_hash TEXT NOT NULL,
@@ -289,14 +304,12 @@ CREATE TABLE IF NOT EXISTS resolver_addresses (
 
 CREATE INDEX IF NOT EXISTS idx_resolver_addresses_namehash ON resolver_addresses(namehash);
 CREATE INDEX IF NOT EXISTS idx_resolver_addresses_resolver ON resolver_addresses(resolver);
-CREATE INDEX IF NOT EXISTS idx_resolver_addresses_context ON resolver_addresses(protocol, namehash, context);
 
 CREATE TABLE IF NOT EXISTS resolver_contenthashes (
   id BIGSERIAL PRIMARY KEY,
   namehash TEXT NOT NULL,
   resolver TEXT NOT NULL,
   contenthash TEXT NOT NULL,
-  context TEXT,
   protocol TEXT NOT NULL,
   block_number BIGINT NOT NULL,
   transaction_hash TEXT NOT NULL,
@@ -306,7 +319,6 @@ CREATE TABLE IF NOT EXISTS resolver_contenthashes (
 
 CREATE INDEX IF NOT EXISTS idx_resolver_contenthashes_namehash ON resolver_contenthashes(namehash);
 CREATE INDEX IF NOT EXISTS idx_resolver_contenthashes_resolver ON resolver_contenthashes(resolver);
-CREATE INDEX IF NOT EXISTS idx_resolver_contenthashes_context ON resolver_contenthashes(protocol, namehash, context);
 
 CREATE TABLE IF NOT EXISTS resolver_texts (
   id BIGSERIAL PRIMARY KEY,
@@ -314,7 +326,6 @@ CREATE TABLE IF NOT EXISTS resolver_texts (
   resolver TEXT NOT NULL,
   key TEXT NOT NULL,
   value TEXT NOT NULL,
-  context TEXT,
   protocol TEXT NOT NULL,
   block_number BIGINT NOT NULL,
   transaction_hash TEXT NOT NULL,
@@ -325,7 +336,6 @@ CREATE TABLE IF NOT EXISTS resolver_texts (
 CREATE INDEX IF NOT EXISTS idx_resolver_texts_namehash ON resolver_texts(namehash);
 CREATE INDEX IF NOT EXISTS idx_resolver_texts_resolver ON resolver_texts(resolver);
 CREATE INDEX IF NOT EXISTS idx_resolver_texts_key ON resolver_texts(key);
-CREATE INDEX IF NOT EXISTS idx_resolver_texts_context ON resolver_texts(protocol, namehash, context);
 
 
 -- ============================================================================
@@ -563,6 +573,8 @@ CREATE INDEX IF NOT EXISTS idx_events_contract_address ON events(contract_addres
 CREATE INDEX IF NOT EXISTS idx_events_protocol_type_block ON events(protocol, event_type, block_number);
 CREATE INDEX IF NOT EXISTS idx_events_block_log ON events(block_number, log_index);
 CREATE INDEX IF NOT EXISTS idx_events_owner_extracted ON events (LOWER((data::jsonb ->> 'owner')));
+CREATE INDEX IF NOT EXISTS idx_events_to_extracted ON events (LOWER((data::jsonb ->> 'to')));
+CREATE INDEX IF NOT EXISTS idx_events_from_extracted ON events (LOWER((data::jsonb ->> 'from')));
 
 
 -- ============================================================================
@@ -773,6 +785,10 @@ CREATE INDEX IF NOT EXISTS idx_unknown_labels_backfill
     WHERE backfill_attempts < 3;
 CREATE INDEX IF NOT EXISTS idx_unknown_labels_tx_hash ON unknown_labels(transaction_hash);
 CREATE INDEX IF NOT EXISTS idx_unknown_labels_labelhash ON unknown_labels(labelhash);
+-- The NameWrapped DNS-heal path deletes by namehash for every label level of
+-- every wrap event; without this index each delete (and its reorg-capture
+-- SELECT) full-scans the table.
+CREATE INDEX IF NOT EXISTS idx_unknown_labels_namehash ON unknown_labels(namehash);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_unknown_labels_unique ON unknown_labels(labelhash, parent_node);
 
 

@@ -21,6 +21,7 @@ const rpc = @import("../rpc/client.zig");
 const resolve_client = @import("../resolve/client.zig");
 const resolve_primary = @import("../resolve/primary.zig");
 const zsys = @import("../utils/system.zig");
+const shutdown = @import("../utils/shutdown.zig");
 const auth = @import("auth.zig");
 
 /// On-chain resolution state, created only when primary-name verification is enabled.
@@ -183,10 +184,17 @@ pub const Server = struct {
         });
         const listener = &self.server.?;
 
+        // Publish the listener so the signal handler can unblock accept: 0.16's
+        // accept retries EINTR, so only shutdown(2) on this fd wakes the loop
+        // (it then fails with error.SocketNotListening).
+        shutdown.setWakeFd(listener.socket.handle);
+        defer shutdown.clearWakeFd();
+
         std.log.info("API server listening on port {d}", .{self.port});
 
-        while (true) {
+        while (!shutdown.isRequested()) {
             const stream = listener.accept(self.io) catch |err| {
+                if (shutdown.isRequested() or err == error.SocketNotListening) break;
                 std.log.warn("Failed to accept connection: {}", .{err});
                 continue;
             };
@@ -219,6 +227,27 @@ pub const Server = struct {
             };
             thread.detach();
         }
+
+        self.drainConnections();
+    }
+
+    /// Bounded wait for detached handler threads after the accept loop exits.
+    /// Handlers can't outlive the per-socket timeout by much, so the deadline is
+    /// generous; if stragglers remain anyway, exit without running destructors —
+    /// a detached thread touching freed Server state would be a UAF.
+    fn drainConnections(self: *Server) void {
+        const active = self.active_conns.load(.monotonic);
+        if (active > 0) std.log.info("Draining {d} in-flight connection(s)...", .{active});
+        const deadline_ms = zsys.milliTimestamp() + @as(i64, @max(self.request_timeout_ms, 15_000));
+        while (self.active_conns.load(.monotonic) > 0 and zsys.milliTimestamp() < deadline_ms) {
+            zsys.sleep(50 * std.time.ns_per_ms);
+        }
+        const stragglers = self.active_conns.load(.monotonic);
+        if (stragglers > 0) {
+            std.log.warn("Drain timed out with {d} connection(s) active; exiting without teardown", .{stragglers});
+            std.process.exit(0);
+        }
+        std.log.info("API server stopped.", .{});
     }
 
     fn handleConnectionThread(self: *Server, conn: http_util.Conn) void {
@@ -403,6 +432,8 @@ pub const Server = struct {
             try self.handleWebhooksAPI(conn, method, path, request);
         } else if (std.mem.startsWith(u8, path, "/api/name/")) {
             try self.handleNameQuery(conn, path);
+        } else if (std.mem.startsWith(u8, path, "/api/profiles/") or std.mem.startsWith(u8, path, "/profiles/")) {
+            try self.handleProfileQuery(conn, path);
         } else if (std.mem.startsWith(u8, path, "/api/owner/")) {
             try self.handleOwnerQuery(conn, path);
         } else if (std.mem.startsWith(u8, path, "/api/events")) {
@@ -422,7 +453,25 @@ pub const Server = struct {
                 return;
             }
             try self.handleVerifyPrimary(conn, path);
-        } else if (std.mem.startsWith(u8, path, "/api/health")) {
+        } else if (self.resolve != null and self.resolve.?.live_enabled and std.mem.startsWith(u8, path, "/internal/explain/")) {
+            // Same internal-ops posture as verify-primary: admin credential required
+            // (fail-closed) + the dedicated low rate limit — a cold explain is an
+            // on-chain read per request.
+            if (!self.admin_auth.configured() or !self.admin_auth.checkRequest(request)) {
+                try self.sendUnauthorized(conn);
+                return;
+            }
+            const internal_client = resolveClientAddress(conn.address(), request, self.trusted_proxy_hops);
+            if (!self.internal_rate_limiter.tryAcquireFor(internal_client)) {
+                try self.sendRateLimited(conn);
+                return;
+            }
+            try self.handleExplain(conn, path);
+        } else if (std.mem.startsWith(u8, path, "/api/ready") or std.mem.startsWith(u8, path, "/ready")) {
+            try self.handleReadiness(conn);
+        } else if (std.mem.startsWith(u8, path, "/api/coverage") or std.mem.startsWith(u8, path, "/coverage")) {
+            try self.handleCoverage(conn);
+        } else if (std.mem.startsWith(u8, path, "/api/health") or std.mem.startsWith(u8, path, "/health")) {
             try self.handleHealthCheck(conn);
         } else if (std.mem.startsWith(u8, path, "/metrics")) {
             try self.handleMetrics(conn);
@@ -441,6 +490,10 @@ pub const Server = struct {
     pub const handleOwnerQuery = api_endpoints.handleOwnerQuery;
     pub const handleEventsQuery = api_endpoints.handleEventsQuery;
     pub const handleHealthCheck = api_endpoints.handleHealthCheck;
+    pub const handleReadiness = api_endpoints.handleReadiness;
+    pub const handleCoverage = api_endpoints.handleCoverage;
+    pub const handleProfileQuery = api_endpoints.handleProfileQuery;
+    pub const handleExplain = api_endpoints.handleExplain;
     pub const handleMetrics = api_endpoints.handleMetrics;
     pub const handleGraphQLQuery = api_endpoints.handleGraphQLQuery;
     pub const handleGraphQLGet = api_endpoints.handleGraphQLGet;

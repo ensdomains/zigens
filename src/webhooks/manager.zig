@@ -103,6 +103,9 @@ pub const WebhookManager = struct {
     rate_limit_ms: u64, // Milliseconds between requests to same endpoint
     db_mutex: zsys.Mutex, // Protects database access from worker threads
     last_cleanup_at: std.atomic.Value(i64), // Timestamp of last queue cleanup
+    // Detached delivery threads still inside http_client.fetch; deinit must not
+    // free the client while nonzero (see the bounded wait there).
+    inflight_deliveries: std.atomic.Value(usize),
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, webhook_db_path: []const u8, max_retries: u32, rate_limit_ms: u64) !*WebhookManager {
         const manager = try allocator.create(WebhookManager);
@@ -130,16 +133,35 @@ pub const WebhookManager = struct {
             .rate_limit_ms = rate_limit_ms,
             .db_mutex = zsys.Mutex{},
             .last_cleanup_at = std.atomic.Value(i64).init(0), // Will run cleanup on first check
+            .inflight_deliveries = std.atomic.Value(usize).init(0),
         };
         return manager;
     }
 
     pub fn deinit(self: *WebhookManager) void {
-        self.http_client.deinit();
+        // Workers first: joining them bounds new delivery spawns, and a worker
+        // mid-delivery blocks in sendHttpPost at most HTTP_DELIVERY_DEADLINE_MS.
+        self.should_stop.store(true, .release);
         for (self.worker_threads.items) |thread| {
             thread.join();
         }
         self.worker_threads.deinit(self.allocator);
+
+        // Abandoned (timed-out) delivery threads may still be inside
+        // http_client.fetch. Bounded wait; on timeout, deliberately LEAK the
+        // client rather than free it under a live thread — the process is
+        // exiting, and a leak report beats a use-after-free.
+        const deadline_ms = zsys.milliTimestamp() + HTTP_DELIVERY_DEADLINE_MS + 2_000;
+        while (self.inflight_deliveries.load(.acquire) > 0 and zsys.milliTimestamp() < deadline_ms) {
+            zsys.sleep(50 * std.time.ns_per_ms);
+        }
+        const stuck = self.inflight_deliveries.load(.acquire);
+        if (stuck == 0) {
+            self.http_client.deinit();
+        } else {
+            std.log.warn("{d} webhook delivery thread(s) stuck in OS-level timeouts; leaking http client on exit", .{stuck});
+        }
+
         self.database.deinit();
         self.allocator.destroy(self.database);
         self.allocator.destroy(self);
@@ -610,6 +632,10 @@ pub const WebhookManager = struct {
         // Stable idempotency key (webhook_queue row id). Constant across retries
         // so receivers can dedup the same delivery; sent as X-Webhook-Id.
         queue_id: u64,
+        // Manager's in-flight counter; decremented when the thread is done
+        // touching `client`. Points at the manager, which outlives every
+        // delivery via the bounded wait in deinit.
+        inflight: *std.atomic.Value(usize),
         // Result, written by the thread, read by the worker.
         // 0 = running, 1 = 2xx success, 2 = non-2xx response, 3 = transport error
         done: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
@@ -630,6 +656,8 @@ pub const WebhookManager = struct {
     /// MUST NOT touch `args` after `release()` — the worker may have raced ahead and freed.
     fn deliveryThreadFn(args: *DeliveryArgs) void {
         defer args.release();
+        // Runs before release (LIFO): signals "no longer touching client".
+        defer _ = args.inflight.fetchSub(1, .acq_rel);
 
         // Compute HMAC-SHA256 over "{timestamp}.{payload}" for the X-Webhook-Signature header.
         const timestamp = zsys.timestamp();
@@ -710,12 +738,15 @@ pub const WebhookManager = struct {
             .payload = try self.allocator.dupe(u8, payload),
             .secret = try self.allocator.dupe(u8, secret),
             .queue_id = queue_id,
+            .inflight = &self.inflight_deliveries,
         };
         // Worker holds one ref; thread will hold the other once spawned.
         defer args.release();
 
+        _ = self.inflight_deliveries.fetchAdd(1, .acq_rel);
         const thread = std.Thread.spawn(.{ .stack_size = 1 * 1024 * 1024 }, deliveryThreadFn, .{args}) catch |err| {
             std.log.err("Failed to spawn webhook delivery thread: {}", .{err});
+            _ = self.inflight_deliveries.fetchSub(1, .acq_rel);
             // Roll back the thread's pre-allocated ref since no thread will run.
             args.release();
             return error.HttpError;

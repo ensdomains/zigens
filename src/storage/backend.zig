@@ -56,13 +56,13 @@ pub const Capabilities = struct {
     pooled: bool = false,
 };
 
-/// Connection access mode for the Phase-4 `Pool`; defined here as part of the SPI.
-pub const AccessMode = enum { writer, reader };
-
-/// Transaction mode. `immediate` takes a write lock up front (SQLite
-/// `BEGIN IMMEDIATE`); `deferred` is a plain `BEGIN`. On Postgres both map to a
-/// plain `BEGIN` (it locks lazily and isolation handles serialization).
-pub const TxMode = enum { deferred, immediate };
+/// Transaction mode. `immediate` takes a write lock up front (SQLite `BEGIN IMMEDIATE`);
+/// `deferred` is a plain `BEGIN`. `read_snapshot` is a read-only transaction giving a
+/// STABLE snapshot across statements — SQLite plain `BEGIN` (WAL snapshots on first read),
+/// Postgres `REPEATABLE READ, READ ONLY` — so several reads in one request observe one
+/// consistent state. On Postgres `deferred`/`immediate` both map to a plain `BEGIN` (it
+/// locks lazily and isolation handles serialization).
+pub const TxMode = enum { deferred, immediate, read_snapshot };
 
 /// Upsert conflict behaviour: `.replace` overwrites the conflicting row,
 /// `.ignore` keeps it. (SQLite `INSERT OR REPLACE`/`OR IGNORE`; Postgres
@@ -226,16 +226,36 @@ pub const Statement = struct {
     param_idx: c_int = 1,
     /// Cached statements are reset (not finalized) on deinit; the cache owns them.
     is_cached: bool = false,
+    /// Value-copied SQL prefix so execution failures can name their query.
+    sql_prefix: [160]u8 = undefined,
+    sql_prefix_len: u8 = 0,
     /// Tracked bound-string copies, freed on reset/deinit (SQLITE_STATIC model).
     bound_strings: [MAX_BOUND_STRINGS]?[]u8 = [_]?[]u8{null} ** MAX_BOUND_STRINGS,
     bound_string_count: usize = 0,
 
     pub fn init(database: *Database, sql: []const u8) !Statement {
-        return database.prepare(sql);
+        var stmt = try database.prepare(sql);
+        stmt.rememberSql(sql);
+        return stmt;
     }
 
     pub fn initCached(database: *Database, sql: []const u8) !Statement {
-        return database.prepareCached(sql);
+        var stmt = try database.prepareCached(sql);
+        stmt.rememberSql(sql);
+        return stmt;
+    }
+
+    /// Keep a value-copied prefix of the SQL so execution failures can name the
+    /// query. Copied (not borrowed): some call sites free their SQL string
+    /// before the statement is executed.
+    pub fn rememberSql(self: *Statement, sql: []const u8) void {
+        const n = @min(sql.len, self.sql_prefix.len);
+        @memcpy(self.sql_prefix[0..n], sql[0..n]);
+        self.sql_prefix_len = @intCast(n);
+    }
+
+    fn sqlPrefix(self: *const Statement) []const u8 {
+        return self.sql_prefix[0..self.sql_prefix_len];
     }
 
     pub fn deinit(self: *Statement) void {
@@ -366,7 +386,7 @@ pub const Statement = struct {
 
     pub fn exec(self: *Statement) !void {
         if (!self.vtable.exec(self.ctx)) {
-            std.log.err("Failed to execute query: {s}", .{self.vtable.lastError(self.ctx)});
+            std.log.err("Failed to execute query: {s} [sql: {s}]", .{ self.vtable.lastError(self.ctx), self.sqlPrefix() });
             return error.ExecFailed;
         }
     }

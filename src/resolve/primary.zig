@@ -6,10 +6,12 @@
 //! reads — `registry.resolver(node)` then `resolver.addr(node)` — and compares
 //! the result to the claiming address.
 //!
-//! It is deliberately fail-closed: any ambiguity (missing resolver, empty/zero
-//! record, revert, or transport failure) yields `.unverified`, never a false
-//! `.verified`. The claimed value itself is never altered by this check — callers
-//! use the verdict only to annotate provenance.
+//! It is deliberately fail-closed: the claimed name must be ENSIP-15 normalized
+//! (else `.invalid_name`, so a confusable/spoofed name can never be stamped
+//! verified), and any remaining ambiguity — no resolver or empty record
+//! (`.not_found`), a revert or transport failure (`.unverified`) — never yields a
+//! false `.verified`. The claimed value itself is never altered by this check;
+//! callers use the verdict only to annotate provenance.
 
 const std = @import("std");
 const client = @import("client.zig");
@@ -18,6 +20,7 @@ const Resolver = client.Resolver;
 const Address = @import("../types/address.zig").Address;
 const hash_mod = @import("../types/hash.zig");
 const Hash = hash_mod.Hash;
+const ens_normalize = @import("../utils/ens_normalize.zig");
 
 /// `resolver(bytes32)` on the ENS registry — selector keccak256("resolver(bytes32)")[0..4].
 const sel_resolver = [4]u8{ 0x01, 0x78, 0xb8, 0xbf };
@@ -31,9 +34,25 @@ pub const Verdict = enum {
     verified,
     /// The name resolves forward to a *different* address.
     mismatch,
-    /// No usable forward evidence (no resolver, no record, revert, or RPC error).
+    /// The claimed name is not ENSIP-15 normalized (e.g. confusable/spoofed); never verified.
+    invalid_name,
+    /// No forward evidence exists: no resolver, or an empty/zero address record.
+    not_found,
+    /// The on-chain read could not be completed (revert or RPC error).
     unverified,
 };
+
+/// Return the ENSIP-15 normalized form of `name` (owned by `allocator`) IFF `name` is
+/// already in normalized form, else null. A claimed primary name that is not already
+/// normalized is a confusable/spoof and must never verify.
+pub fn normalizedClaimOwned(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
+    if (name.len == 0) return null; // an empty name is not a verifiable claim
+    var res = ens_normalize.normalizeName(allocator, name);
+    defer res.deinit(allocator);
+    const norm = res.normalized orelse return null;
+    if (!res.is_valid or !std.mem.eql(u8, norm, name)) return null;
+    return try allocator.dupe(u8, norm);
+}
 
 /// Build calldata for a `<selector>(bytes32 node)` call: selector ++ 32-byte node.
 fn buildNodeCall(selector: [4]u8, node: Hash) [36]u8 {
@@ -66,21 +85,25 @@ pub fn verify(
     block_hash: Hash,
     now: i64,
 ) !Verdict {
-    const node = try hash_mod.namehash(allocator, claimed_name);
+    // A non-normalized claim is a confusable/spoof and never verifies. Namehash the
+    // normalized form so the forward check and any display agree.
+    const norm = (try normalizedClaimOwned(allocator, claimed_name)) orelse return .invalid_name;
+    defer allocator.free(norm);
+    const node = try hash_mod.namehash(allocator, norm);
 
     // 1. Which resolver does the registry name to for this node?
     const resolver_call = buildNodeCall(sel_resolver, node);
     const r_entry = try resolver.callCached(allocator, registry, "resolver", &resolver_call, block_num, block_hash, now);
     defer r_entry.deinit(allocator);
     if (r_entry.status != .success) return .unverified;
-    const resolver_addr = addressFromReturn(r_entry.value orelse return .unverified) orelse return .unverified;
+    const resolver_addr = addressFromReturn(r_entry.value orelse return .not_found) orelse return .not_found;
 
     // 2. What forward address does that resolver report for the node?
     const addr_call = buildNodeCall(sel_addr, node);
     const a_entry = try resolver.callCached(allocator, resolver_addr, "addr:60", &addr_call, block_num, block_hash, now);
     defer a_entry.deinit(allocator);
     if (a_entry.status != .success) return .unverified;
-    const forward = addressFromReturn(a_entry.value orelse return .unverified) orelse return .unverified;
+    const forward = addressFromReturn(a_entry.value orelse return .not_found) orelse return .not_found;
 
     return if (forward.eql(address)) .verified else .mismatch;
 }
@@ -184,4 +207,25 @@ test "verify: verified / mismatch / unverified from seeded cache (canned eth_cal
         try cache.put(&db, .{ .chain_id = chain_id, .target = registry, .selector_key = "resolver", .arg_hash = cache.argHash(&rcall), .block_dep_num = block_num, .block_dep_hash = block_hash }, .reverted, null, .resolved_live, now);
         try testing.expectEqual(Verdict.unverified, try verify(&resolver, a, registry, claimant, "bob.eth", block_num, block_hash, now));
     }
+
+    // INVALID_NAME — a non-normalized claim (uppercase) is rejected before any read.
+    try testing.expectEqual(Verdict.invalid_name, try verify(&resolver, a, registry, claimant, "Alice.eth", block_num, block_hash, now));
+
+    // NOT_FOUND — registry.resolver(node) succeeds but reports the zero address (no resolver).
+    {
+        const node = try hash_mod.namehash(a, "dave.eth");
+        const rcall = buildNodeCall(sel_resolver, node);
+        const zero_word = [_]u8{0} ** 32;
+        try cache.put(&db, .{ .chain_id = chain_id, .target = registry, .selector_key = "resolver", .arg_hash = cache.argHash(&rcall), .block_dep_num = block_num, .block_dep_hash = block_hash }, .success, &zero_word, .resolved_live, now);
+        try testing.expectEqual(Verdict.not_found, try verify(&resolver, a, registry, claimant, "dave.eth", block_num, block_hash, now));
+    }
+}
+
+test "normalizedClaimOwned accepts normalized names and rejects non-normalized" {
+    const a = testing.allocator;
+    const ok = (try normalizedClaimOwned(a, "alice.eth")) orelse return error.ExpectedNormalized;
+    defer a.free(ok);
+    try testing.expectEqualStrings("alice.eth", ok);
+    try testing.expect((try normalizedClaimOwned(a, "Alice.eth")) == null); // uppercase -> not normalized
+    try testing.expect((try normalizedClaimOwned(a, "")) == null); // empty -> invalid
 }

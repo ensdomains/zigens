@@ -100,7 +100,7 @@ pub fn insertName(db: *Database, name: models.Name) !void {
     try q.bindOptionalText(name.v1_label_hash);
     try q.bindInt(if (name.is_reachable) 1 else 0);
     try q.bindOptionalInt64(name.unreachable_since);
-    try q.bindOptionalInt64(if (name.ttl) |t| @intCast(t) else null);
+    try q.bindOptionalInt64(if (name.ttl) |t| safeU64ToI64(t) else null);
     try q.bindInt(if (name.is_legacy) 1 else 0);
     if (name.resolved_address) |addr| {
         var resolved_buf: [42]u8 = undefined;
@@ -218,13 +218,15 @@ pub fn updateResolvedAddressToNull(db: *Database, namehash: Hash) !void {
 
 /// Update TTL for a name (V1 ENS Registry NewTTL event).
 /// No-op if no row exists with this namehash — consistent with NewResolver:
-/// V1 NewTTL on a non-existent name has nothing to attach to.
+/// V1 NewTTL on a non-existent name has nothing to attach to. TTL is an
+/// arbitrary caller-set u64 on-chain; values beyond i64 collapse to the 0
+/// sentinel like expiry does.
 pub fn updateNameTTL(db: *Database, namehash: Hash, ttl: u64) !void {
     try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     var q = try Query.initCached(db, "UPDATE names SET ttl = ?, updated_at = ? WHERE namehash = ?");
     defer q.deinit();
 
-    try q.bindInt64(@intCast(ttl));
+    try q.bindInt64(safeU64ToI64(ttl));
     try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
@@ -373,10 +375,18 @@ pub fn updateNameUnwrapperState(db: *Database, namehash: Hash) !void {
     // grace, so leaving the inflated value would over-report expiryDate by
     // 180d. registrations stores the bare expires (subgraph Registration
     // parity); rows without one (temp-registrar era) keep their value.
+    //
+    // MAX(r.expiry + 0), not MAX(r.expiry): a bare MAX over an indexed column
+    // triggers SQLite's min/max shortcut, which here picks the (protocol,
+    // expiry) index and walks it from the top testing namehash row by row —
+    // measured ~10s per unwrap on a 3.4M-row mainnet table. The expression
+    // form disables the shortcut so the planner takes the (protocol, namehash)
+    // equality index (plan-verified; same semantics, MAX ignores NULLs either
+    // way, and Postgres plans both forms identically).
     var q = try Query.initCached(db,
         \\UPDATE names SET is_wrapped = 0, wrapper_fuses = NULL, wrapper_expiry = NULL,
         \\expiry = CASE WHEN protocol = 'v1' AND parent_name = 'eth'
-        \\  THEN COALESCE((SELECT MAX(r.expiry) FROM registrations r WHERE r.protocol = names.protocol AND r.namehash = names.namehash), expiry)
+        \\  THEN COALESCE((SELECT MAX(r.expiry + 0) FROM registrations r WHERE r.protocol = names.protocol AND r.namehash = names.namehash), expiry)
         \\  ELSE expiry END,
         \\updated_at = ? WHERE namehash = ?
     );

@@ -39,6 +39,12 @@ pub const NestedContext = struct {
     /// nested-context construction, so a missed propagation just disables the fallback
     /// on that branch (fail-safe = pre-existing indexed-only behavior).
     resolve: ?*anyopaque = null,
+    /// Optional at-block reconstruction state (cast to storage.at_block.AtBlockState).
+    /// Set ONLY on the single at-block entity's serve path (resolveDomain -> its own
+    /// resolver/record fields); deliberately NOT propagated into nested domain entities
+    /// (parent/subdomains), which serve current state — a missed site fails safe to
+    /// current-state reads, never to mixed history.
+    at_block: ?*const anyopaque = null,
 };
 
 /// Nested field handler function type
@@ -146,9 +152,9 @@ pub fn buildEntityJson(
         // or `name { foo }` on a String field).
         if (field.selections.len > 0) {
             for (config.field_defs) |def| {
-                if (std.mem.eql(u8, def.name, field.name) and def.field_type != .custom) {
-                    // FieldDef.custom = object/list writer (sub-selections honored by writer).
-                    // All other types (including custom_scalar) are scalars and must reject sub-selections.
+                if (std.mem.eql(u8, def.name, field.name)) {
+                    // All FieldDef types (including custom_scalar) are scalars and must
+                    // reject sub-selections; object/list fields go through NestedFieldDef.
                     return error.SubSelectionOnScalar;
                 }
             }

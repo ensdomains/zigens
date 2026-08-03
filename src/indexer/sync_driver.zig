@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const zsys = @import("../utils/system.zig");
+const shutdown = @import("../utils/shutdown.zig");
 const config = @import("../config.zig");
 const constants = @import("../constants.zig");
 const db = @import("../storage/database.zig");
@@ -30,6 +31,63 @@ const WriteBuffer = @import("write_buffer.zig").WriteBuffer;
 const Rainbow = @import("../rainbow/rainbow.zig").Rainbow;
 const Indexer = @import("indexer.zig").Indexer;
 
+/// Near the tip, block lineage is stored per-block (not just at batch boundaries) so a
+/// reorg's fork point is located exactly. A batch larger than this is stored at the
+/// boundary only, bounding per-batch header RPC during catch-up (those far-from-tip
+/// blocks finalize long before the tip reaches them).
+const PER_BLOCK_LINEAGE_MAX: u64 = 128;
+
+const BlockLineage = struct { number: u64, hash: Hash, parent_hash: Hash };
+
+/// Classify and absorb a sync-iteration error so the run loop never dies on a
+/// transient failure: network errors wait for connectivity to return (the RPC
+/// being down for hours must stall indexing, not kill it); anything else gets a
+/// bounded pause. The cursor is unchanged, so the next iteration resumes where
+/// this one failed.
+fn handleSyncError(self: *Indexer, protocol: models.Protocol, err: anyerror) void {
+    switch (err) {
+        error.HttpError, error.NetworkUnreachable, error.ConnectionRefused, error.ConnectionTimedOut, error.ConnectionResetByPeer, error.WriteFailed, error.BrokenPipe, error.EndOfStream, error.UnexpectedReadFailure => {
+            std.log.warn("{s} network error detected: {}, waiting for connection...", .{ protocol.toString(), err });
+            self.v1_network_health.waitForHealthy();
+            std.log.info("{s} network restored, continuing...", .{protocol.toString()});
+            // 1s breather before retry. Bounds log volume during a sustained
+            // outage and prevents the tight spin we'd otherwise hit when
+            // `waitForHealthy` (which uses a fresh http.Client) reports healthy
+            // while the indexer's pooled client is still failing.
+            _ = shutdown.sleepInterruptible(std.time.ns_per_s);
+        },
+        else => {
+            std.log.err("{s} indexing error: {}", .{ protocol.toString(), err });
+            _ = shutdown.sleepInterruptible(constants.Timing.error_recovery_delay_ms * std.time.ns_per_ms);
+        },
+    }
+}
+
+/// Blocks of remaining sync below which the bulk index drop/rebuild cycle
+/// costs more than it saves: dropping ~40 indexes only pays off when millions
+/// of rows are coming. Without the gate, a caught-up restart (a few blocks
+/// behind the tip) paid a multi-minute full index rebuild + ANALYZE to sync
+/// seconds of chain.
+const SYNC_INDEX_MIN_GAP_BLOCKS: u64 = 10_000;
+
+/// Whether the remaining sync gap justifies dropping indexes for bulk mode.
+/// An unknown head (RPC error) counts as a large gap: a needless drop is
+/// recoverable at completion, a wrongly skipped drop just syncs slower.
+fn syncGapWantsIndexDrop(self: *Indexer, protocols: []const models.Protocol, client: *rpc.Client) bool {
+    const head = client.getBlockNumber() catch return true;
+    for (protocols) |protocol| {
+        const era = switch (protocol) {
+            .v1 => self.v1EraStart(),
+            .v2 => self.config.v2_contracts.v2_deployment_block,
+        };
+        if (era == 0) continue; // protocol not deployed on this network
+        const synced = (self.database.getSyncState(protocol) catch null) orelse era;
+        if (head -| synced >= SYNC_INDEX_MIN_GAP_BLOCKS) return true;
+    }
+    std.log.info("Sync gap below {d} blocks for all protocols - keeping indexes (no bulk drop/rebuild cycle)", .{SYNC_INDEX_MIN_GAP_BLOCKS});
+    return false;
+}
+
 pub fn start(self: *Indexer) !void {
     std.log.info("Indexer starting...", .{});
 
@@ -38,47 +96,121 @@ pub fn start(self: *Indexer) !void {
     };
 
     // Drop non-essential indexes for faster bulk inserts during initial sync
-    if (!self.initial_sync_complete.load(.acquire)) {
+    if (!self.initial_sync_complete.load(.acquire) and
+        syncGapWantsIndexDrop(self, &.{ .v1, .v2 }, self.v1_client))
+    {
         self.database.dropSyncIndexes() catch |err| {
             std.log.warn("Failed to drop sync indexes (non-fatal): {}", .{err});
         };
+        self.sync_indexes_dropped = true;
+    } else {
+        self.database.ensureSyncPathIndexes();
     }
 
-    while (!self.should_stop.load(.acquire)) {
+    while (!self.should_stop.load(.acquire) and !shutdown.isRequested()) {
         // Index V1 first (SQLite doesn't support concurrent writes from different threads)
-        try self.indexProtocol(.v1, self.v1_client);
+        self.indexProtocol(.v1, self.v1_client) catch |err| {
+            handleSyncError(self, .v1, err);
+            continue;
+        };
 
         // Then index V2
-        try self.indexProtocol(.v2, self.v1_client);
+        self.indexProtocol(.v2, self.v1_client) catch |err| {
+            handleSyncError(self, .v2, err);
+            continue;
+        };
 
         // After first successful sync of both chains, recreate indexes and start webhook workers
         if (!self.initial_sync_complete.load(.acquire)) {
-            self.database.createSyncIndexes() catch |err| {
-                std.log.err("Failed to recreate sync indexes: {}", .{err});
-            };
+            // Only pay the rebuild + ANALYZE when this process dropped them —
+            // a small-gap start kept its indexes throughout.
+            if (self.sync_indexes_dropped) {
+                self.database.createSyncIndexes() catch |err| {
+                    std.log.err("Failed to recreate sync indexes: {}", .{err});
+                };
+            }
 
             self.initial_sync_complete.store(true, .release);
 
-            // PCC fuse → Domain.expiry mirror (V1 NameWrapper). The per-event
-            // mirror in handleV1NameWrapped/FusesSet/ExpiryExtended needs to
-            // read existing wrapper state, which the write_buffer can't
-            // service during bulk sync. Run a one-shot bulk UPDATE now that
-            // the buffer is flushed and indexes are restored (cursor disarmed
-            // so it doesn't self-capture into the reorg undo-log).
-            self.materializePccUncaptured();
-            self.reconcileReachabilityUncaptured();
+            // The one-shot recomputes and heals below exist to repair what
+            // BULK-mode buffering skipped (buffer-invisible wrapper state,
+            // labels discovered after their names, pre-migration rows). A
+            // small-gap start never entered bulk mode — every event was
+            // processed direct with full fidelity — so the table-wide scans
+            // have nothing to repair and are skipped. backfillUnknownLabels
+            // stays unconditional: it drains a persistent backlog and is
+            // self-limiting (attempts capped, partial-index probe).
+            if (self.sync_indexes_dropped) {
+                // PCC fuse → Domain.expiry mirror (V1 NameWrapper). The
+                // per-event mirror in handleV1NameWrapped/FusesSet/
+                // ExpiryExtended needs to read existing wrapper state, which
+                // the write_buffer can't service during bulk sync. Run a
+                // one-shot bulk UPDATE now that the buffer is flushed and
+                // indexes are restored (cursor disarmed so it doesn't
+                // self-capture into the reorg undo-log).
+                self.materializePccUncaptured();
+                self.reconcileReachabilityUncaptured();
+
+                // One-shot V1 heals, mirroring the single-protocol loop so the
+                // combined and split binaries produce the same database. The reorg
+                // cursor is disarmed here (materializePccUncaptured cleared it), so
+                // these do NOT self-capture into the undo-log; keep any new backfill
+                // inside this disarmed block. All three no-op without V1 data.
+                std.log.info("Running pre-migration names backfill...", .{});
+                self.backfillPreMigrationNames() catch |err| {
+                    std.log.err("Failed to backfill pre-migration names: {}", .{err});
+                };
+                std.log.info("Running missing .eth 2LD names backfill...", .{});
+                self.backfillMissingEth2LDNames() catch |err| {
+                    std.log.err("Failed to backfill missing .eth 2LD names: {}", .{err});
+                };
+            } else {
+                // materializePccUncaptured normally disarms the cursor for the
+                // heal below; disarm explicitly on the skip path so it doesn't
+                // self-capture.
+                reorg_undo.clearCursor(self.database, .v1) catch |err|
+                    std.log.warn("reorg undo-log: failed to clear v1 cursor before heals: {}", .{err});
+                reorg_undo.clearCursor(self.database, .v2) catch |err|
+                    std.log.warn("reorg undo-log: failed to clear v2 cursor before heals: {}", .{err});
+                self.invalidateReorgCursor();
+            }
+            // One-shot heal (marker-gated): resolvers registered before the
+            // first-sighting backfill existed are missing their pre-attachment
+            // init events (EACRolesChanged) — backfill each known resolver's
+            // deployment→first_seen window once.
+            self.backfillResolverInitGaps(.v2, self.v1_client) catch |err| {
+                std.log.err("Failed to backfill resolver init gaps: {}", .{err});
+            };
+            std.log.info("Running unknown labels backfill...", .{});
+            self.backfillUnknownLabels() catch |err| {
+                std.log.err("Failed to backfill unknown labels: {}", .{err});
+            };
 
             if (self.webhook_manager) |wm| {
                 std.log.info("Initial sync complete - starting 8 webhook workers", .{});
-                try wm.startWorkers(8);
+                wm.startWorkers(8) catch |err| std.log.err("webhook workers failed to start: {}", .{err});
             }
         }
 
         // Best-effort finality signalling (Task 09); no-op unless FINALITY_ENABLED.
         fetchFinality(self);
 
-        // Sleep for poll interval before next iteration
-        zsys.sleep(self.config.poll_interval * std.time.ns_per_s);
+        // A configured end block is a hard stop, not just a per-iteration cap —
+        // without this the loop keeps polling toward the live head past the
+        // requested range.
+        if (self.end_block) |eb| {
+            const v1_done = ((self.database.getSyncState(.v1) catch null) orelse 0) >= eb or
+                self.v1EraStart() > eb;
+            const v2_done = ((self.database.getSyncState(.v2) catch null) orelse 0) >= eb or
+                self.config.v2_contracts.v2_deployment_block > eb;
+            if (v1_done and v2_done) {
+                std.log.info("Reached end block {d} for both protocols; stopping", .{eb});
+                break;
+            }
+        }
+
+        // Sleep for poll interval before next iteration; wakes early on SIGTERM.
+        _ = shutdown.sleepInterruptible(self.config.poll_interval * std.time.ns_per_s);
     }
 
     std.log.info("Indexer stopped.", .{});
@@ -123,95 +255,105 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
     }
 
     const client = self.getClient(protocol);
-    var network_health = &self.v1_network_health;
 
     // Drop non-essential indexes for faster bulk inserts during initial sync
-    if (!self.initial_sync_complete.load(.acquire)) {
+    if (!self.initial_sync_complete.load(.acquire) and
+        syncGapWantsIndexDrop(self, &.{protocol}, client))
+    {
         self.database.dropSyncIndexes() catch |err| {
             std.log.warn("Failed to drop sync indexes (non-fatal): {}", .{err});
         };
+        self.sync_indexes_dropped = true;
+    } else {
+        self.database.ensureSyncPathIndexes();
     }
 
-    while (!self.should_stop.load(.acquire)) {
+    while (!self.should_stop.load(.acquire) and !shutdown.isRequested()) {
         if (self.indexProtocol(protocol, client)) |_| {
             // Success - after first successful sync, recreate indexes and start webhook workers
             if (!self.initial_sync_complete.load(.acquire)) {
-                // Recreate all indexes before marking sync complete
-                self.database.createSyncIndexes() catch |err| {
-                    std.log.err("Failed to recreate sync indexes: {}", .{err});
-                };
+                // Only pay the rebuild + ANALYZE when this process dropped
+                // them — a small-gap start kept its indexes throughout.
+                if (self.sync_indexes_dropped) {
+                    self.database.createSyncIndexes() catch |err| {
+                        std.log.err("Failed to recreate sync indexes: {}", .{err});
+                    };
+                }
 
                 self.initial_sync_complete.store(true, .release);
 
-                // PCC fuse → Domain.expiry mirror (V1 NameWrapper, runs only
-                // on V1 protocol since V2 doesn't have NameWrapper). The
-                // per-event mirror in handleV1NameWrapped/FusesSet/
-                // ExpiryExtended needs to read existing wrapper state, which
-                // the write_buffer can't service during bulk sync. Run a
-                // one-shot bulk UPDATE now that the buffer is flushed.
-                if (protocol == .v1) {
-                    self.materializePccUncaptured();
+                // The one-shot recomputes and heals below repair what BULK-mode
+                // buffering skipped; a small-gap start processed everything
+                // direct, so the table-wide scans are skipped (see start()).
+                if (self.sync_indexes_dropped) {
+                    // PCC fuse → Domain.expiry mirror (V1 NameWrapper, runs only
+                    // on V1 protocol since V2 doesn't have NameWrapper). The
+                    // per-event mirror in handleV1NameWrapped/FusesSet/
+                    // ExpiryExtended needs to read existing wrapper state, which
+                    // the write_buffer can't service during bulk sync. Run a
+                    // one-shot bulk UPDATE now that the buffer is flushed.
+                    if (protocol == .v1) {
+                        self.materializePccUncaptured();
+                    }
+                    if (protocol == .v2) {
+                        self.reconcileReachabilityUncaptured();
+                    }
+                } else {
+                    // materializePccUncaptured normally disarms the cursor for
+                    // the heals below; disarm explicitly on the skip path so
+                    // the unknown-labels heal doesn't self-capture.
+                    reorg_undo.clearCursor(self.database, protocol) catch |err|
+                        std.log.warn("reorg undo-log: failed to clear cursor before heals: {}", .{err});
+                    self.invalidateReorgCursor();
                 }
+
                 if (protocol == .v2) {
-                    self.reconcileReachabilityUncaptured();
+                    // One-shot heal (marker-gated) — see the combined loop.
+                    self.backfillResolverInitGaps(.v2, client) catch |err| {
+                        std.log.err("Failed to backfill resolver init gaps: {}", .{err});
+                    };
                 }
 
                 if (self.webhook_manager) |wm| {
                     std.log.info("Initial sync complete - starting webhook workers", .{});
-                    try wm.startWorkers(1);
+                    wm.startWorkers(1) catch |err| std.log.err("webhook workers failed to start: {}", .{err});
                 }
 
                 // Backfill pre-migration names after initial sync completes.
-                // INVARIANT: the reorg cursor is disarmed here — materializePccUncaptured
-                // above cleared it and nothing re-arms it until the next indexProtocol —
+                // INVARIANT: the reorg cursor is disarmed here (either branch
+                // above) and nothing re-arms it until the next indexProtocol —
                 // so these one-shot backfills (which UPDATE/DELETE protected & reorg_active
                 // tables, incl. unknown_labels) do NOT self-capture into the undo-log, per the
                 // backfill-doesn't-capture rule. Keep any new backfill inside this disarmed block.
                 if (protocol == .v1) {
-                    std.log.info("Running pre-migration names backfill...", .{});
-                    self.backfillPreMigrationNames() catch |err| {
-                        std.log.err("Failed to backfill pre-migration names: {}", .{err});
-                    };
+                    if (self.sync_indexes_dropped) {
+                        std.log.info("Running pre-migration names backfill...", .{});
+                        self.backfillPreMigrationNames() catch |err| {
+                            std.log.err("Failed to backfill pre-migration names: {}", .{err});
+                        };
+                    }
 
-                    // Backfill unknown subdomain labels from transaction calldata
+                    // Backfill unknown subdomain labels from transaction calldata.
+                    // Unconditional: drains a persistent backlog and is
+                    // self-limiting (attempts capped, partial-index probe).
                     std.log.info("Running unknown labels backfill...", .{});
                     self.backfillUnknownLabels() catch |err| {
                         std.log.err("Failed to backfill unknown labels: {}", .{err});
                     };
 
-                    // Retroactive recovery: create name records for .eth 2LDs
-                    // where the label was resolved but no name record was created
-                    std.log.info("Running missing .eth 2LD names backfill...", .{});
-                    self.backfillMissingEth2LDNames() catch |err| {
-                        std.log.err("Failed to backfill missing .eth 2LD names: {}", .{err});
-                    };
+                    if (self.sync_indexes_dropped) {
+                        // Retroactive recovery: create name records for .eth 2LDs
+                        // where the label was resolved but no name record was created
+                        std.log.info("Running missing .eth 2LD names backfill...", .{});
+                        self.backfillMissingEth2LDNames() catch |err| {
+                            std.log.err("Failed to backfill missing .eth 2LD names: {}", .{err});
+                        };
+                    }
                 }
             }
         } else |err| {
-            // Handle errors gracefully based on type
-            switch (err) {
-                error.HttpError, error.NetworkUnreachable, error.ConnectionRefused, error.ConnectionTimedOut, error.ConnectionResetByPeer, error.WriteFailed, error.BrokenPipe, error.EndOfStream, error.UnexpectedReadFailure => {
-                    // Network error - wait for connection to be restored.
-                    std.log.warn("{s} network error detected: {}, waiting for connection...", .{ protocol.toString(), err });
-                    network_health.waitForHealthy();
-                    std.log.info("{s} network restored, continuing...", .{protocol.toString()});
-                    // 1s breather before retry. Bounds log volume during a
-                    // sustained outage and prevents the tight spin we'd
-                    // otherwise hit when `network_health.waitForHealthy()`
-                    // (which uses a fresh http.Client) reports healthy
-                    // while the indexer's pooled client is still failing.
-                    // Inner `executeHttpRequest` retries already cover
-                    // transient TLS/socket recovery, so anything beyond
-                    // 1s is redundant.
-                    zsys.sleep(std.time.ns_per_s);
-                    continue;
-                },
-                else => {
-                    // Other errors (database, parsing, etc) - log and wait briefly
-                    std.log.err("{s} indexing error: {}", .{ protocol.toString(), err });
-                    zsys.sleep(constants.Timing.error_recovery_delay_ms * std.time.ns_per_ms); // Wait 5s for non-network errors
-                },
-            }
+            handleSyncError(self, protocol, err);
+            continue;
         }
 
         // Best-effort finality signalling (Task 09); no-op unless FINALITY_ENABLED.
@@ -219,8 +361,22 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
         // finality just like the combined indexer's `start` loop.
         fetchFinality(self);
 
-        // Sleep for poll interval before next iteration
-        zsys.sleep(self.config.poll_interval * std.time.ns_per_s);
+        // A configured end block is a hard stop, matching the combined loop. A
+        // protocol whose deployment lies beyond the end block can never reach
+        // it — stop instead of polling forever.
+        if (self.end_block) |eb| {
+            const deployed_at = switch (protocol) {
+                .v1 => self.v1EraStart(),
+                .v2 => self.config.v2_contracts.v2_deployment_block,
+            };
+            if (((self.database.getSyncState(protocol) catch null) orelse 0) >= eb or deployed_at > eb) {
+                std.log.info("Reached end block {d} for {s}; stopping", .{ eb, protocol.toString() });
+                break;
+            }
+        }
+
+        // Sleep for poll interval before next iteration; wakes early on SIGTERM.
+        _ = shutdown.sleepInterruptible(self.config.poll_interval * std.time.ns_per_s);
     }
 
     std.log.info("{s} indexer stopped.", .{protocol.toString()});
@@ -239,16 +395,39 @@ pub fn verifyStoredBlockHash(self: *Indexer, protocol: models.Protocol, client: 
     return std.mem.eql(u8, &stored.bytes, &actual.hash.bytes);
 }
 
-/// Walk back from `from_block` until a block whose stored hash matches the protocol is found,
-/// then roll the database back to that block. Returns the block number rolled back to.
+/// Walk back from `from_block` to the most recent stored checkpoint whose hash still
+/// matches the canonical chain, then roll the database back to it. Returns the block
+/// number rolled back to, or `error.ReorgTooDeep` when no matching checkpoint exists
+/// within the retained window.
+///
+/// Two properties keep this fail-closed: (1) a height with no stored hash is skipped
+/// rather than treated as a safe stopping point (hashes are dense near the tip, sparse
+/// during catch-up), so stopping early would leave orphaned-branch state below it; (2) an RPC
+/// error while confirming a checkpoint is propagated, so the round aborts and retries
+/// rather than committing a rollback to an unverified height.
 pub fn rollbackToLastValidBlock(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64) !u64 {
+    // Bound the walk to the hash-retention window; beyond it there are no stored hashes to
+    // validate against, so a deeper rollback would be a blind guess (rollbackToBlock guards
+    // the same depth). Matches cleanupOldBlockHashes / REORG_ARM_WINDOW.
+    const RETENTION_BLOCKS: u64 = 1000;
+    const floor = @max(self.config.start_block, from_block -| RETENTION_BLOCKS);
+
     var rollback_to = from_block;
-    while (rollback_to > self.config.start_block) : (rollback_to -= 1) {
+    var matched = false;
+    while (rollback_to > floor) : (rollback_to -= 1) {
         const stored = try self.database.getBlockHash(protocol, rollback_to);
-        if (stored == null) break; // past stored history — treat as safe
-        const actual = client.getBlockByNumber(rollback_to, false) catch break;
-        if (std.mem.eql(u8, &stored.?.bytes, &actual.hash.bytes)) break;
+        if (stored == null) continue; // not a stored checkpoint — keep descending
+        const actual = try client.getBlockByNumber(rollback_to, false); // propagate RPC errors
+        if (std.mem.eql(u8, &stored.?.bytes, &actual.hash.bytes)) {
+            matched = true;
+            break;
+        }
     }
+    if (!matched) {
+        std.log.err("Reorg on {s} from block {d} has no matching checkpoint within {d}-block retention; refusing blind rollback", .{ protocol.toString(), from_block, RETENTION_BLOCKS });
+        return error.ReorgTooDeep;
+    }
+
     std.log.warn("Rolling back {s} to block {d}", .{ protocol.toString(), rollback_to });
     try self.database.rollbackToBlock(protocol, rollback_to);
     // rollbackToBlock cleared the reorg_cursor row; drop the in-memory mirror so the
@@ -257,12 +436,27 @@ pub fn rollbackToLastValidBlock(self: *Indexer, protocol: models.Protocol, clien
     return rollback_to;
 }
 
+/// First block of the V1 era on this network: the temporary-registrar start
+/// where pre-permanent-registrar history exists (mainnet), else the V1
+/// deployment block. Everything reasoning about "where does V1 begin" must use
+/// this, not v1_deployment_block, or the 2017-2019 era is silently skipped.
+pub fn v1EraStart(self: *Indexer) u64 {
+    const temp = self.config.v1_contracts.temp_registrar_start_block;
+    return if (temp > 0) temp else self.config.v1_contracts.v1_deployment_block;
+}
+
 pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Client) !void {
-    // Use protocol-specific deployment block as fallback for fresh databases
+    // Fresh databases start at the protocol's era start (for V1 that includes
+    // the pre-permanent-registrar history on networks that have it).
     const deployment_block = switch (protocol) {
-        .v1 => self.config.v1_contracts.v1_deployment_block,
+        .v1 => self.v1EraStart(),
         .v2 => self.config.v2_contracts.v2_deployment_block,
     };
+
+    // A protocol that is not deployed on this network has nothing to index.
+    // Without this guard the combined binary walks the entire chain for the
+    // inert protocol, paying reorg-check and lineage RPCs per empty batch.
+    if (deployment_block == 0) return;
 
     // Get last synced block from database (resumability)
     var last_synced = try self.database.getSyncState(protocol) orelse deployment_block;
@@ -300,6 +494,16 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
     const total_blocks = target_block - last_synced;
     std.log.info("Indexing {s} from block {d} to {d} ({d} blocks)", .{ protocol.toString(), last_synced + 1, target_block, total_blocks });
 
+    // Defensively clear the undo-capture cursor before processing. The in-loop
+    // stale-cursor guard only fires when the in-memory mirror knows a cursor was
+    // set (reorg_cursor_block != -1) — after a process restart the mirror is
+    // always -1, so a cursor row left armed by a crashed near-tip run would
+    // silently turn every protected-table write into a full-row undo capture
+    // for the rest of the bulk sync. Armed batches re-set the cursor per block.
+    reorg_undo.clearCursor(self.database, protocol) catch |err|
+        std.log.warn("reorg undo-log: failed to clear cursor at sync start: {}", .{err});
+    self.invalidateReorgCursor();
+
     // Index in batches with adaptive batch sizing
     // Starts at configured size, halves on RPC response size errors, grows back on success
     var current_batch_size = self.config.batch_size;
@@ -311,7 +515,7 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
     var from_block = last_synced + 1;
     var blocks_indexed: u64 = 0;
 
-    while (from_block <= target_block and !self.should_stop.load(.acquire)) {
+    while (from_block <= target_block and !self.should_stop.load(.acquire) and !shutdown.isRequested()) {
         const to_block = @min(from_block + current_batch_size - 1, target_block);
         const batch_blocks = to_block - from_block + 1;
 
@@ -356,9 +560,17 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
             // drop those dedup caches so the entries get re-inserted on retry.
             self.clearKnownResolverCache();
             self.clearAccountObsCache();
+            // The queued first-sighting backfills belonged to the reverted
+            // registrations; the retry re-registers and re-queues them.
+            self.pending_resolver_backfills.clearRetainingCapacity();
 
             if ((err == error.RpcError or err == error.StreamTooLong) and current_batch_size > ABSOLUTE_MIN_BATCH) {
                 current_batch_size = @max(ABSOLUTE_MIN_BATCH, current_batch_size / 2);
+                // The retry restarts at the batch head, often in a different density
+                // regime than the tail this state was learned from — a stale estimate
+                // predicts oversized chunks and cascades through overflow retries.
+                self.v1_events_per_block = 0;
+                self.v1_rpc_chunk_ceiling = 0;
                 std.log.warn("RPC response too large for blocks {d}-{d}! Reducing batch size to {d} blocks and retrying", .{ from_block, to_block, current_batch_size });
                 continue; // Retry same from_block with smaller batch
             }
@@ -379,13 +591,51 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
         const progress = (@as(f64, @floatFromInt(blocks_indexed)) / @as(f64, @floatFromInt(total_blocks))) * 100.0;
         std.log.info("Progress: {d:.1}% ({d}/{d} blocks) - Batch {d}-{d} indexed", .{ progress, blocks_indexed, total_blocks, from_block, to_block });
 
-        // Store block hashes for reorg detection and update sync state ATOMICALLY
+        // --- Block-hash lineage (reorg detection) ---
+        // Near the tip, store per-block (hash, parent_hash) so a reorg's fork point is
+        // located exactly and the parent chain is reliable; far from the tip a single
+        // boundary hash suffices. Bounded: only a small armed batch is stored per-block.
+        const store_per_block = self.reorg_arm and (to_block - from_block + 1) <= PER_BLOCK_LINEAGE_MAX;
+
+        // Gather headers OUTSIDE the write transaction so RPC never holds the DB lock.
+        var lineage: std.ArrayList(BlockLineage) = .empty;
+        defer lineage.deinit(self.allocator);
+        if (store_per_block) {
+            // For to_block, prefer the hash observed while indexing its logs: it is
+            // consistent with the committed events, so a reorg landing after indexing
+            // can't mask itself from the next poll's reorg check (which examines exactly
+            // this height). Intermediate blocks are fetched for their real headers in
+            // ONE batched call instead of up to 128 sequential round-trips.
+            const reuse_boundary = self.last_seen_block_hash != null and self.last_seen_block_number == to_block;
+            var numbers: std.ArrayList(u64) = .empty;
+            defer numbers.deinit(self.allocator);
+            var b = from_block;
+            while (b <= to_block) : (b += 1) {
+                if (b == to_block and reuse_boundary) continue;
+                try numbers.append(self.allocator, b);
+            }
+            if (numbers.items.len > 0) {
+                self.rate_limiter.acquire();
+                const headers = try client.getBlockHeadersBatch(numbers.items);
+                defer self.allocator.free(headers);
+                for (headers, numbers.items) |maybe_header, number| {
+                    const info = maybe_header orelse return error.BlockNotFound;
+                    try lineage.append(self.allocator, .{ .number = number, .hash = info.hash, .parent_hash = info.parent_hash });
+                }
+            }
+            if (reuse_boundary) {
+                try lineage.append(self.allocator, .{ .number = to_block, .hash = self.last_seen_block_hash.?, .parent_hash = Hash.zero });
+            }
+        }
+
+        // Store block hashes for reorg detection and update sync state ATOMICALLY.
         try self.database.beginTransaction();
         errdefer self.database.rollbackTransaction();
 
-        // Use block hash from processed logs if available (avoids extra RPC call)
-        // Fall back to getBlockByNumber only when no logs were processed in this range
-        if (self.last_seen_block_hash != null and self.last_seen_block_number == to_block) {
+        if (store_per_block) {
+            for (lineage.items) |bl| try self.database.storeBlockHash(protocol, bl.number, bl.hash, bl.parent_hash);
+        } else if (self.last_seen_block_hash != null and self.last_seen_block_number == to_block) {
+            // Bulk sync: reuse the log hash to avoid an extra RPC (parent_hash unused off-tip).
             try self.database.storeBlockHash(protocol, to_block, self.last_seen_block_hash.?, Hash.zero);
         } else {
             const block_info = try client.getBlockByNumber(to_block, false);
@@ -421,8 +671,13 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
             // Clear block timestamp cache to prevent memory growth
             self.clearBlockTimestampCache();
 
+            // Flatten the WAL once per outer batch: chunk-processing reads slow
+            // down as WAL depth grows, so trade random mid-chunk stalls for one
+            // bounded checkpoint here.
+            self.database.checkpointWal();
+
             // Force a brief pause to allow memory to be reclaimed
-            zsys.sleep(constants.Timing.rpc_batch_delay_ms * std.time.ns_per_ms);
+            self.rate_limiter.acquire();
         }
 
         from_block = to_block + 1;
@@ -446,16 +701,18 @@ pub fn indexBlockRange(self: *Indexer, protocol: models.Protocol, client: *rpc.C
 
     // Block range constants from contract config (protocol-specific)
     const v1_contracts = self.config.v1_contracts;
-    const temp_registrar_start = v1_contracts.temp_registrar_start_block;
 
-    // === V1 EVENTS (ENS V1 - Mainnet V1 only) ===
-    // Only index V1 events if the block range overlaps with V1 deployment period
-    // Skip if entire range is before temp registrar start OR if V2 is deployed and range is entirely after V2
-    // V2 deployment block is the same regardless of which protocol (protocol) we're indexing —
-    // this gate asks "are we still in the V1 era?".
+    // === V1 EVENTS ===
+    // The V1 era starts at the earliest configured V1 marker for this network:
+    // the temporary-registrar start where pre-permanent-registrar history exists
+    // (mainnet), else the V1 deployment block. It ends at the explicit per-network
+    // v1_end_block (0 = no sunset) — never at a code constant, so V1 activity
+    // after a V2 launch keeps indexing until a real cutover is configured.
     const v2_deployment = self.config.v2_contracts.v2_deployment_block;
-    const should_index_v1 = (temp_registrar_start > 0) and (to_block >= temp_registrar_start) and
-        (v2_deployment == 0 or from_block < v2_deployment + 10);
+    const v1_start = self.v1EraStart();
+    const v1_end = v1_contracts.v1_end_block;
+    const should_index_v1 = (v1_start > 0) and (to_block >= v1_start) and
+        (v1_end == 0 or from_block <= v1_end);
 
     if (should_index_v1) {
         // EFFICIENT: Index all V1 events together per chunk (Registry, Name Wrapper, Base Registrar, Reverse Registrar)

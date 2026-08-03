@@ -58,6 +58,11 @@ fn parseEventWhereArgs(where_args: []const parser.Argument, allocator: std.mem.A
             opts.contract_address = try addr.toHex(allocator);
             continue;
         }
+        if (std.mem.eql(u8, a.name, "involved") and a.value == .string) {
+            const addr = Address.fromHex(a.value.string) catch return error.InvalidInvolvedAddress;
+            opts.involved = try addr.toHex(allocator);
+            continue;
+        }
         if (std.mem.eql(u8, a.name, "protocol") and a.value == .string) {
             opts.protocol = models.Protocol.fromString(a.value.string) catch return error.InvalidProtocol;
             continue;

@@ -73,10 +73,10 @@ pub fn processOrphanedRegistration(
         .registry_locked = false,
         .migrated = false,
         .created_block = orphan.block_number,
-        .created_at = self.getBlockTimestamp(protocol, orphan.block_number, null),
-        .registered_at = self.getBlockTimestamp(protocol, orphan.block_number, null),
+        .created_at = try self.getBlockTimestamp(protocol, orphan.block_number, null),
+        .registered_at = try self.getBlockTimestamp(protocol, orphan.block_number, null),
         .updated_block = orphan.block_number,
-        .updated_at = self.getBlockTimestamp(protocol, orphan.block_number, null),
+        .updated_at = try self.getBlockTimestamp(protocol, orphan.block_number, null),
         .is_wrapped = false,
         .wrapper_fuses = null,
         .wrapper_expiry = null,
@@ -362,8 +362,8 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
         // names created via this path are always fresh V2 registrations.
         .migrated = false,
         .created_block = log.block_number,
-        .created_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-        .registered_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        .created_at = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        .registered_at = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
         .updated_block = log.block_number,
         .updated_at = zsys.timestamp(),
         .is_wrapped = false,
@@ -594,7 +594,7 @@ pub fn handleETHNameRegistered(self: *Indexer, protocol: models.Protocol, log: r
     const label_hash = try @import("../../types/hash.zig").keccak256(self.allocator, label_str);
 
     // Calculate expiry from registration block timestamp + duration
-    const block_timestamp = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
+    const block_timestamp = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
     const expiry: u64 = @as(u64, @intCast(block_timestamp)) + @as(u64, @truncate(duration));
 
     // Extract canonical_id and version from token_id
@@ -630,8 +630,8 @@ pub fn handleETHNameRegistered(self: *Indexer, protocol: models.Protocol, log: r
         .registry_locked = false,
         .migrated = false,
         .created_block = log.block_number,
-        .created_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-        .registered_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        .created_at = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        .registered_at = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
         .updated_block = log.block_number,
         .updated_at = zsys.timestamp(),
         .is_wrapped = false,
@@ -652,7 +652,7 @@ pub fn handleETHNameRegistered(self: *Indexer, protocol: models.Protocol, log: r
             .namehash = namehash,
             .parent_registry = self.getEthRegistry(protocol),
             .created_block = log.block_number,
-            .created_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+            .created_at = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
         };
         self.database.insertRegistry(registry_entry) catch |err| {
             std.log.warn("Failed to insert subregistry for {s}: {any}", .{ full_name, err });
@@ -1292,7 +1292,7 @@ pub fn handleLabelRegistered(self: *Indexer, protocol: models.Protocol, log: rpc
     const parent_name_dup = try self.allocator.dupe(u8, parent_name);
     defer self.allocator.free(parent_name_dup);
 
-    const block_timestamp = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
+    const block_timestamp = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
 
     // For migrations, look up the corresponding V1 row by namehash so we can
     // (a) link via v1_label_hash, (b) carry over wrapper fuses for LOCKED
@@ -1526,10 +1526,10 @@ pub fn handleLabelReserved(self: *Indexer, protocol: models.Protocol, log: rpc.L
         .registry_locked = false,
         .migrated = false,
         .created_block = log.block_number,
-        .created_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-        .registered_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        .created_at = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        .registered_at = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
         .updated_block = log.block_number,
-        .updated_at = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        .updated_at = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
         .is_wrapped = false,
         .wrapper_fuses = null,
         .wrapper_expiry = null,
@@ -1578,7 +1578,7 @@ pub fn handleLabelUnregistered(self: *Indexer, protocol: models.Protocol, log: r
 
     std.log.debug("LabelUnregistered: tokenId={d}, sender={any}", .{ token_id, sender });
 
-    const block_timestamp = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
+    const block_timestamp = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
 
     // Cascade-invalidate descendants of the entry's current subregistry.
     const prev_subregistry = try self.database.getRegistryEntrySubregistry(
@@ -1793,7 +1793,7 @@ fn processSubregistryPointerChange(
     const token_id_utils = @import("../../types/token_id.zig");
     const canonical_id = token_id_utils.getCanonicalId(token_id);
 
-    const block_timestamp = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
+    const block_timestamp = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
 
     const prev_subregistry = try self.database.upsertRegistryEntrySubregistry(
         protocol,
@@ -1937,10 +1937,19 @@ pub fn handleResolverUpdated(self: *Indexer, protocol: models.Protocol, log: rpc
 
     std.log.debug("ResolverUpdated: tokenId={d}, resolver={any}, sender={any}", .{ token_id, resolver_addr, sender });
 
-    // Register the resolver for record indexing
+    // Register the resolver for record indexing. A FIRST sighting is queued
+    // for a historical backfill (drained by indexResolverEvents): factory-
+    // deployed resolvers emit their initialize()-time EACRolesChanged role
+    // grants blocks BEFORE this ResolverUpdated, when the resolver pass still
+    // skipped them as unknown — without the backfill those roles never reach
+    // resolver.roles. The discovery-path backfill can't recover them:
+    // registering here makes its `kr.address IS NULL` filter false first.
     var resolver_hex_buf: [42]u8 = undefined;
     const resolver_hex = resolver_addr.toHexBuf(&resolver_hex_buf);
-    try self.registerResolverOnce(protocol, resolver_hex, log.block_number);
+    const newly_known = try self.registerResolverOnceIfNew(protocol, resolver_hex, log.block_number);
+    if (newly_known and !resolver_addr.isZero()) {
+        try self.pending_resolver_backfills.append(self.allocator, resolver_addr);
+    }
 
     const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
 
@@ -1965,7 +1974,7 @@ pub fn handleResolverUpdated(self: *Indexer, protocol: models.Protocol, log: rpc
                 namehash_hex,
                 name_str,
                 log.block_number,
-                self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+                try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
             ) catch |err| {
                 std.log.debug("upsertResolverEntity failed: {}", .{err});
             };

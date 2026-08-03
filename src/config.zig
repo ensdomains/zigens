@@ -24,8 +24,17 @@ pub const Config = struct {
     end_block: ?u64, // null means index continuously
     poll_interval: u64,
     batch_size: u64,
-    max_blocks_per_request: u64,
+    /// SQLite page-cache size (MB) during bulk sync. Plumbed to the Database so
+    /// .env values work (schema.zig can't see the .env map, only process env).
+    sync_cache_mb: u64 = 512,
+    /// Opt-in deep integrity check (PRAGMA quick_check) at API startup. Off by
+    /// default: quick_check reads every btree page — minutes of full-file I/O
+    /// on a mainnet-scale DB — and the read-only API can't act on the result.
+    api_integrity_check: bool = false,
     rate_limit_per_second: u32,
+    /// Provider ceiling on JSON-RPC batch sizes (requests per HTTP batch);
+    /// 0 = unlimited. Set when a provider rejects large batches.
+    rpc_max_batch_requests: u32 = 0,
     /// Trusted reverse-proxy hops for rate limiting. 0 (default) = key on the direct TCP
     /// peer. > 0 = trust X-Forwarded-For from this many hops (e.g. 1 for a single LB) and
     /// key on the real client IP. Only enable behind a proxy you control that sets XFF.
@@ -53,7 +62,6 @@ pub const Config = struct {
     /// Explicit dev opt-in to serve webhook admin routes WITHOUT authentication.
     /// Default false = fail-closed (unconfigured credentials -> routes reject).
     webhooks_allow_unauthenticated: bool,
-    max_memory_mb: u64,
     checkpoint_interval: u64,
     graphql_max_depth: u32,
     graphql_max_cost: u32,
@@ -103,7 +111,12 @@ pub const Config = struct {
         const v1_contract_addrs = if (manifest_path.len > 0)
             try manifest.loadManifest(allocator, manifest_path, network)
         else
-            try contracts.getContractAddresses(network);
+            contracts.getContractAddresses(network) catch |err| {
+                if (err == error.ManifestRequired) {
+                    std.log.err("NETWORK={s} has no built-in contract defaults — set MANIFEST_PATH (see manifests/README.txt)", .{network.toString()});
+                }
+                return err;
+            };
         // Same network → the V1 and V2 sets are the same struct (the code path also
         // returned identical copies); ContractAddresses is a by-value copy.
         const v2_contract_addrs = v1_contract_addrs;
@@ -149,8 +162,10 @@ pub const Config = struct {
             },
             .poll_interval = env_mod.getEnvInt(&env_map, u64, "POLL_INTERVAL", 12),
             .batch_size = env_mod.getEnvInt(&env_map, u64, "BATCH_SIZE", 2000),
-            .max_blocks_per_request = env_mod.getEnvInt(&env_map, u64, "MAX_BLOCKS_PER_REQUEST", 2000),
+            .sync_cache_mb = env_mod.getEnvInt(&env_map, u64, "SYNC_CACHE_MB", 512),
+            .api_integrity_check = env_mod.getEnvBool(&env_map, "API_INTEGRITY_CHECK", false),
             .rate_limit_per_second = env_mod.getEnvInt(&env_map, u32, "RATE_LIMIT_PER_SECOND", 15),
+            .rpc_max_batch_requests = env_mod.getEnvInt(&env_map, u32, "RPC_MAX_BATCH_REQUESTS", 0),
             .trusted_proxy_hops = env_mod.getEnvInt(&env_map, u32, "TRUSTED_PROXY_HOPS", 0),
             .request_timeout_ms = env_mod.getEnvInt(&env_map, u32, "REQUEST_TIMEOUT_MS", 10000),
             .max_concurrent_connections = env_mod.getEnvInt(&env_map, u32, "MAX_CONCURRENT_CONNECTIONS", 512),
@@ -190,7 +205,6 @@ pub const Config = struct {
             },
             .internal_rate_limit_per_second = env_mod.getEnvInt(&env_map, u32, "INTERNAL_RATE_LIMIT_PER_SECOND", 2),
             .webhooks_allow_unauthenticated = env_mod.getEnvBool(&env_map, "WEBHOOKS_ALLOW_UNAUTHENTICATED", false),
-            .max_memory_mb = env_mod.getEnvInt(&env_map, u64, "MAX_MEMORY_MB", 512),
             .checkpoint_interval = env_mod.getEnvInt(&env_map, u64, "CHECKPOINT_INTERVAL", 100),
             .graphql_max_depth = env_mod.getEnvInt(&env_map, u32, "GRAPHQL_MAX_DEPTH", 10),
             .graphql_max_cost = env_mod.getEnvInt(&env_map, u32, "GRAPHQL_MAX_COST", 10000),

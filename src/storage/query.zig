@@ -64,40 +64,6 @@ pub fn joinWrapped(allocator: std.mem.Allocator, items: []const []const u8, sep:
     return buf.toOwnedSlice(allocator);
 }
 
-/// Execute a simple statement with no parameters or results
-pub fn exec(database: *Database, sql: []const u8) !void {
-    var q = try Query.init(database, sql);
-    defer q.deinit();
-    try q.exec();
-}
-
-/// Query a single value
-pub fn queryOne(comptime T: type, database: *Database, sql: []const u8, binder: anytype) !?T {
-    var q = try Query.init(database, sql);
-    defer q.deinit();
-    try binder(&q);
-    if (try q.step()) {
-        return switch (T) {
-            i64 => q.getInt64(0),
-            i32 => q.getInt(0),
-            bool => q.getBool(0),
-            else => @compileError("queryOne only supports i64, i32, bool"),
-        };
-    }
-    return null;
-}
-
-/// Query a single text value
-pub fn queryText(database: *Database, sql: []const u8, binder: anytype) !?[]u8 {
-    var q = try Query.init(database, sql);
-    defer q.deinit();
-    try binder(&q);
-    if (try q.step()) {
-        return try q.getText(0);
-    }
-    return null;
-}
-
 // ============================================================================
 // TESTS
 // ============================================================================

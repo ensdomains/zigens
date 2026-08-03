@@ -50,6 +50,21 @@ pub fn computeEthNamehash(label: []const u8) Hash {
     return result;
 }
 
+/// Namehash of `<label>.<root>` from a precomputed root node — the root-aware
+/// sibling of computeEthNamehash. On .eth networks root_node = namehash("eth");
+/// on Base it is namehash("base.eth"), so registrar/controller 2LDs land under
+/// the right parent.
+pub fn computeChildNamehash(root_node: Hash, label: []const u8) Hash {
+    const label_hash = keccak256Runtime(label);
+    var input: [64]u8 = undefined;
+    @memcpy(input[0..32], &root_node.bytes);
+    @memcpy(input[32..64], &label_hash);
+    const node = keccak256Runtime(&input);
+    var result: Hash = undefined;
+    @memcpy(&result.bytes, &node);
+    return result;
+}
+
 /// Computes the V1 label hash for a given label
 /// In V1, tokenID = uint256(keccak256(label))
 /// Returns the hash as a Hash type

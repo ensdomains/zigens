@@ -46,6 +46,71 @@ fn setStreamTimeout(handle: std.posix.socket_t, timeout_ms: u32) void {
     std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, bytes) catch {};
 }
 
+/// Parse a dotted-quad IPv4 literal into its four octets, or null if `host` is not one.
+fn parseIpv4Octets(host: []const u8) ?[4]u8 {
+    var out: [4]u8 = undefined;
+    var it = std.mem.splitScalar(u8, host, '.');
+    var i: usize = 0;
+    while (it.next()) |part| : (i += 1) {
+        if (i >= 4 or part.len == 0 or part.len > 3) return null;
+        var v: u16 = 0;
+        for (part) |c| {
+            if (c < '0' or c > '9') return null;
+            v = v * 10 + (c - '0');
+        }
+        if (v > 255) return null;
+        out[i] = @intCast(v);
+    }
+    if (i != 4) return null;
+    return out;
+}
+
+/// True for IPv4 ranges that must never be reached from a name-controlled gateway URL:
+/// this-network, loopback, RFC1918 private, link-local (incl. cloud metadata), and CGNAT.
+fn isPrivateIpv4(o: [4]u8) bool {
+    return switch (o[0]) {
+        0, 10, 127 => true,
+        169 => o[1] == 254,
+        172 => o[1] >= 16 and o[1] <= 31,
+        192 => o[1] == 168,
+        100 => o[1] >= 64 and o[1] <= 127,
+        else => false,
+    };
+}
+
+/// Conservative textual check for IPv6 literals that resolve to the local host or a
+/// private network: loopback, unspecified, ULA (fc00::/7), link-local (fe80::/10), and
+/// IPv4-mapped addresses whose embedded v4 is private.
+fn isBlockedIpv6Text(host_in: []const u8) bool {
+    var buf: [64]u8 = undefined;
+    if (host_in.len == 0 or host_in.len > buf.len) return true;
+    const host = std.ascii.lowerString(buf[0..host_in.len], host_in);
+    if (std.mem.eql(u8, host, "::1") or std.mem.eql(u8, host, "::")) return true;
+    if (std.mem.startsWith(u8, host, "fc") or std.mem.startsWith(u8, host, "fd")) return true;
+    if (host.len >= 3 and host[0] == 'f' and host[1] == 'e' and
+        (host[2] == '8' or host[2] == '9' or host[2] == 'a' or host[2] == 'b')) return true;
+    if (std.mem.startsWith(u8, host, "::ffff:")) {
+        if (parseIpv4Octets(host["::ffff:".len..])) |o| return isPrivateIpv4(o);
+        return true; // hex-form or unparseable mapped address -> reject conservatively
+    }
+    return false;
+}
+
+/// SSRF guard for CCIP gateway URLs. The host comes from an OffchainLookup revert whose
+/// resolver is name/contract-controlled, so an attacker could otherwise aim the fetch at
+/// the indexer's own host or an internal service. Public DNS names and public IPs pass;
+/// only "localhost" and IP-literal hosts in local/private ranges are blocked.
+fn isBlockedGatewayHost(raw_host: []const u8) bool {
+    var host = raw_host;
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') host = host[1 .. host.len - 1];
+    if (std.mem.indexOfScalar(u8, host, '%')) |z| host = host[0..z]; // strip IPv6 zone id
+    if (host.len == 0) return true;
+    if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
+    if (parseIpv4Octets(host)) |o| return isPrivateIpv4(o);
+    if (std.mem.indexOfScalar(u8, host, ':') != null) return isBlockedIpv6Text(host);
+    return false; // DNS name -> allowed
+}
+
 /// Per-request real transport. Build one on the stack per GraphQL request that may resolve
 /// offchain, and pass `.transport()` into universal.CcipParams. Its lifetime must span the
 /// synchronous resolution call.
@@ -67,6 +132,20 @@ pub const RealTransport = struct {
         if (!std.mem.startsWith(u8, url, "https://")) return null;
 
         const uri = std.Uri.parse(url) catch return null;
+        // SSRF hardening: reject gateways pointing at the local host or a private network.
+        // Percent-decode the host first so an encoded literal can't slip past the check.
+        {
+            const host_comp = uri.host orelse return null;
+            const raw = switch (host_comp) {
+                .raw => |h| h,
+                .percent_encoded => |h| h,
+            };
+            var hbuf: [256]u8 = undefined;
+            if (raw.len > hbuf.len) return null;
+            @memcpy(hbuf[0..raw.len], raw);
+            const host = std.Uri.percentDecodeInPlace(hbuf[0..raw.len]);
+            if (isBlockedGatewayHost(host)) return null;
+        }
         const m: std.http.Method = if (method == .get) .GET else .POST;
         const extra_headers = [_]std.http.Header{
             .{ .name = "Content-Type", .value = "application/json" },
@@ -155,6 +234,27 @@ fn captureHeadAndRespond(io: std.Io, srv: *std.Io.net.Server, out: *std.ArrayLis
     var writer = conn.writer(io, &write_buf);
     writer.interface.writeAll(response) catch return;
     writer.interface.flush() catch return;
+}
+
+test "isBlockedGatewayHost blocks local/private hosts and allows public ones" {
+    const testing = std.testing;
+    const blocked = [_][]const u8{
+        "localhost",        "LocalHost",      "127.0.0.1",    "127.9.9.9",
+        "10.0.0.5",         "172.16.0.1",     "172.31.255.1", "192.168.1.1",
+        "169.254.169.254",  "0.0.0.0",        "100.64.0.1",   "::1",
+        "[::1]",            "fe80::1",        "fc00::1",      "fd12:3456::1",
+        "::ffff:127.0.0.1", "[fe80::1%eth0]",
+    };
+    for (blocked) |h| try testing.expect(isBlockedGatewayHost(h));
+
+    const allowed = [_][]const u8{
+        "gateway.example.com", "ccip.ens.domains", "1.2.3.4", "8.8.8.8",
+        "172.32.0.1", // just outside the private 172.16/12 range
+        "100.128.0.1", // just outside CGNAT 100.64/10
+        "2606:4700:4700::1111", // public IPv6
+        "::ffff:8.8.8.8", // mapped public v4
+    };
+    for (allowed) |h| try testing.expect(!isBlockedGatewayHost(h));
 }
 
 test "identity accept_encoding override emits exactly one accept-encoding header" {

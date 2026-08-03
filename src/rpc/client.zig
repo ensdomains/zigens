@@ -302,6 +302,10 @@ pub const Client = struct {
     request_id: std.atomic.Value(u64),
     /// Borrowed: the caller owns the http.Client (every consumer shares one).
     http_client: *std.http.Client,
+    /// Provider batch-size ceiling for JSON-RPC batch calls; some providers cap
+    /// the number of requests per batch. 0 = unlimited. When set, oversized
+    /// batches are split into sequential sub-batches and the responses merged.
+    max_batch_requests: usize = 0,
 
     pub fn initWithSharedHttpClient(allocator: std.mem.Allocator, rpc_url: []const u8, http_client: *std.http.Client) !*Client {
         const client = try allocator.create(Client);
@@ -625,32 +629,61 @@ pub const Client = struct {
         params: std.json.Value,
     };
 
+    fn writeBatchRequestJson(self: *Client, writer: *std.Io.Writer, requests: []const BatchRequest) !void {
+        try writer.writeAll("[");
+        for (requests, 0..) |req, i| {
+            const request_id = self.nextRequestId();
+            if (i > 0) try writer.writeAll(",");
+            try writer.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":", .{ request_id, req.method });
+            try writeJsonValue(writer, req.params);
+            try writer.writeAll("}");
+        }
+        try writer.writeAll("]");
+    }
+
     /// Make multiple RPC calls in a single HTTP request (JSON-RPC batch)
-    /// Returns array of responses in the same order as requests
+    /// Returns array of responses in the same order as requests. When the
+    /// provider caps batch sizes (max_batch_requests > 0), oversized batches
+    /// are transparently split into sequential sub-batches and the response
+    /// arrays merged before parsing — ids are globally unique, so the id-sort
+    /// below restores request order across sub-batches.
     fn makeBatchRpcCall(self: *Client, requests: []const BatchRequest) !std.json.Parsed(std.json.Value) {
         // Use arena allocator for request/response buffers
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_allocator = arena.allocator();
 
-        // Build JSON-RPC batch request array
-        var request_buf: std.Io.Writer.Allocating = .init(arena_allocator);
-        const writer = &request_buf.writer;
-        try writer.writeAll("[");
-
-        for (requests, 0..) |req, i| {
-            const request_id = self.nextRequestId();
-
-            if (i > 0) try writer.writeAll(",");
-            try writer.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":", .{ request_id, req.method });
-            try writeJsonValue(writer, req.params);
-            try writer.writeAll("}");
-        }
-
-        try writer.writeAll("]");
-
-        // Execute HTTP request with retry logic
-        const response_body = try self.executeHttpRequest(arena_allocator, request_buf.written());
+        const max = self.max_batch_requests;
+        const response_body = if (max == 0 or requests.len <= max) blk: {
+            var request_buf: std.Io.Writer.Allocating = .init(arena_allocator);
+            try self.writeBatchRequestJson(&request_buf.writer, requests);
+            break :blk try self.executeHttpRequest(arena_allocator, request_buf.written());
+        } else blk: {
+            var merged: std.Io.Writer.Allocating = .init(arena_allocator);
+            try merged.writer.writeAll("[");
+            var wrote_any = false;
+            var i: usize = 0;
+            while (i < requests.len) : (i += max) {
+                const chunk = requests[i..@min(i + max, requests.len)];
+                var request_buf: std.Io.Writer.Allocating = .init(arena_allocator);
+                try self.writeBatchRequestJson(&request_buf.writer, chunk);
+                const chunk_body = try self.executeHttpRequest(arena_allocator, request_buf.written());
+                const trimmed = std.mem.trim(u8, chunk_body, " \t\r\n");
+                if (trimmed.len < 2 or trimmed[0] != '[' or trimmed[trimmed.len - 1] != ']') {
+                    const preview_len = @min(trimmed.len, 200);
+                    std.log.err("Expected array response for batch sub-request: {s}", .{trimmed[0..preview_len]});
+                    return error.RpcError;
+                }
+                const inner = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+                if (inner.len > 0) {
+                    if (wrote_any) try merged.writer.writeAll(",");
+                    try merged.writer.writeAll(inner);
+                    wrote_any = true;
+                }
+            }
+            try merged.writer.writeAll("]");
+            break :blk merged.written();
+        };
 
         // Parse JSON response with main allocator (result will outlive this function)
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response_body, .{}) catch |err| {
@@ -724,8 +757,12 @@ pub const Client = struct {
             .number => |n| try params_arr.append(.{ .string = try std.fmt.allocPrint(a, "0x{x}", .{n}) }),
             .hash => |h| {
                 // EIP-1898 block-hash reference so the read is pinned to an exact block.
+                // requireCanonical rejects a read against a block that has been reorged
+                // out, so a result cached during the reorg window can't be a wrong-branch
+                // answer; a provider that errors on the field degrades to the indexed value.
                 var blk_obj: std.json.ObjectMap = .empty;
                 try blk_obj.put(a, "blockHash", .{ .string = try h.toHex(a) });
+                try blk_obj.put(a, "requireCanonical", .{ .bool = true });
                 try params_arr.append(.{ .object = blk_obj });
             },
         }
@@ -758,8 +795,11 @@ pub const Client = struct {
             .latest => try params_arr.append(.{ .string = "latest" }),
             .number => |n| try params_arr.append(.{ .string = try std.fmt.allocPrint(a, "0x{x}", .{n}) }),
             .hash => |h| {
+                // EIP-1898 pinned read; requireCanonical rejects a reorged-out block so a
+                // revert/answer can't be decoded from a wrong-branch state.
                 var blk_obj: std.json.ObjectMap = .empty;
                 try blk_obj.put(a, "blockHash", .{ .string = try h.toHex(a) });
+                try blk_obj.put(a, "requireCanonical", .{ .bool = true });
                 try params_arr.append(.{ .object = blk_obj });
             },
         }
@@ -789,6 +829,58 @@ pub const Client = struct {
             .parent_hash = try Hash.fromHex(block_obj.get("parentHash").?.string),
             .timestamp = try std.fmt.parseInt(u64, block_obj.get("timestamp").?.string[2..], 16),
         };
+    }
+
+    /// A full block header (number, hash, parent, timestamp).
+    pub const BlockHeader = struct { number: u64, hash: Hash, parent_hash: Hash, timestamp: u64 };
+
+    fn parseHeaderEntry(item: std.json.Value) ?BlockHeader {
+        if (item != .object) return null;
+        const result = item.object.get("result") orelse return null;
+        if (result != .object) return null;
+        const obj = result.object;
+        const num_v = obj.get("number") orelse return null;
+        const hash_v = obj.get("hash") orelse return null;
+        const parent_v = obj.get("parentHash") orelse return null;
+        const ts_v = obj.get("timestamp") orelse return null;
+        if (num_v != .string or hash_v != .string or parent_v != .string or ts_v != .string) return null;
+        const num_s = if (std.mem.startsWith(u8, num_v.string, "0x")) num_v.string[2..] else num_v.string;
+        const ts_s = if (std.mem.startsWith(u8, ts_v.string, "0x")) ts_v.string[2..] else ts_v.string;
+        return BlockHeader{
+            .number = std.fmt.parseInt(u64, num_s, 16) catch return null,
+            .hash = Hash.fromHex(hash_v.string) catch return null,
+            .parent_hash = Hash.fromHex(parent_v.string) catch return null,
+            .timestamp = std.fmt.parseInt(u64, ts_s, 16) catch return null,
+        };
+    }
+
+    /// Fetch many block headers in one JSON-RPC batch (auto-split per
+    /// max_batch_requests). Result is aligned with `numbers`; an entry the
+    /// provider returned malformed or null decodes as null instead of failing
+    /// the whole call. Caller owns the returned slice.
+    pub fn getBlockHeadersBatch(self: *Client, numbers: []const u64) ![]?BlockHeader {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        var batch_requests = try arena_allocator.alloc(BatchRequest, numbers.len);
+        for (numbers, 0..) |n, i| {
+            const hexnum = try std.fmt.allocPrint(arena_allocator, "0x{x}", .{n});
+            var params = std.json.Array.init(arena_allocator);
+            try params.append(.{ .string = hexnum });
+            try params.append(.{ .bool = false });
+            batch_requests[i] = .{ .method = "eth_getBlockByNumber", .params = .{ .array = params } };
+        }
+
+        const parsed = try self.makeBatchRpcCall(batch_requests);
+        defer parsed.deinit();
+        const items = parsed.value.array.items;
+        if (items.len != numbers.len) return error.RpcError;
+
+        const out = try self.allocator.alloc(?BlockHeader, numbers.len);
+        errdefer self.allocator.free(out);
+        for (items, 0..) |item, i| out[i] = parseHeaderEntry(item);
+        return out;
     }
 
     /// A block position by tier (number + hash). Used for finality (Task 09).

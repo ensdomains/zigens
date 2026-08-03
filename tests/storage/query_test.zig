@@ -6,8 +6,6 @@ const Query = lib.storage.Query;
 const Database = lib.Database;
 const Address = lib.Address;
 const Hash = lib.Hash;
-// Module-level helpers (exec/queryOne/queryText) live in the query module.
-const query = lib.storage.database.query;
 
 /// Test helper: Create an in-memory database
 fn createTestDb(allocator: std.mem.Allocator) !*Database {
@@ -287,52 +285,6 @@ test "Query: Hash binding" {
     const retrieved = try select_q.getHash(0);
     try testing.expect(retrieved != null);
     try testing.expect(retrieved.?.eql(hash));
-}
-
-// ============================================================================
-// CONVENIENCE FUNCTION TESTS
-// ============================================================================
-
-test "query.exec convenience function" {
-    const allocator = testing.allocator;
-    const database = try createTestDb(allocator);
-    defer destroyTestDb(allocator, database);
-
-    try query.exec(database, "CREATE TABLE simple (id INTEGER)");
-
-    // Verify table exists
-    var select_q = try Query.init(database, "SELECT name FROM sqlite_master WHERE type='table' AND name='simple'");
-    defer select_q.deinit();
-    try testing.expect(try select_q.step());
-}
-
-test "query.queryOne convenience function" {
-    const allocator = testing.allocator;
-    const database = try createTestDb(allocator);
-    defer destroyTestDb(allocator, database);
-
-    try query.exec(database, "CREATE TABLE nums (val INTEGER)");
-    try query.exec(database, "INSERT INTO nums VALUES (42)");
-
-    const result = try query.queryOne(i64, database, "SELECT val FROM nums", struct {
-        fn bind(_: *Query) !void {}
-    }.bind);
-    try testing.expectEqual(@as(?i64, 42), result);
-}
-
-test "query.queryText convenience function" {
-    const allocator = testing.allocator;
-    const database = try createTestDb(allocator);
-    defer destroyTestDb(allocator, database);
-
-    try query.exec(database, "CREATE TABLE texts (val TEXT)");
-    try query.exec(database, "INSERT INTO texts VALUES ('hello world')");
-
-    const result = try query.queryText(database, "SELECT val FROM texts", struct {
-        fn bind(_: *Query) !void {}
-    }.bind);
-    defer if (result) |r| allocator.free(r);
-    try testing.expectEqualStrings("hello world", result.?);
 }
 
 // ============================================================================

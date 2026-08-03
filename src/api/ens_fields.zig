@@ -29,25 +29,16 @@ pub const FieldType = enum {
     optional_string,
     /// Integer field
     int,
-    /// Optional integer field
-    optional_int,
     /// Boolean field
     bool_field,
-    /// Optional boolean field
-    optional_bool,
     /// Address field (rendered as hex string)
     address,
-    /// Optional address field
-    optional_address,
     /// Hash field (rendered as hex string)
     hash,
     /// Optional hash field
     optional_hash,
     /// Custom writer that produces a scalar value (sub-selections invalid).
     custom_scalar,
-    /// Custom writer that produces an object/list (sub-selections may be valid; the
-    /// writer is responsible for honoring them).
-    custom,
 };
 
 /// Result of getting a field value (ENS-extended)
@@ -61,15 +52,10 @@ pub const FieldValue = union(enum) {
     /// Allocator-owned optional string — freed after writing when present.
     owned_optional_string: ?[]const u8,
     int: i64,
-    optional_int: ?i64,
     bool_val: bool,
-    optional_bool: ?bool,
     address: Address,
-    optional_address: ?Address,
     hash: Hash,
     optional_hash: ?Hash,
-    /// Custom handlers write directly to the writer and return true if handled
-    custom: bool,
     /// Field not found or error
     none: void,
 };
@@ -106,19 +92,9 @@ pub const FieldDef = struct {
         return .{ .name = name, .field_type = .int, .getter = getter, .custom_writer = null };
     }
 
-    /// Create an optional integer field
-    pub fn optionalInt(name: []const u8, getter: FieldGetter) FieldDef {
-        return .{ .name = name, .field_type = .optional_int, .getter = getter, .custom_writer = null };
-    }
-
     /// Create a boolean field
     pub fn boolean(name: []const u8, getter: FieldGetter) FieldDef {
         return .{ .name = name, .field_type = .bool_field, .getter = getter, .custom_writer = null };
-    }
-
-    /// Create an optional boolean field
-    pub fn optionalBoolean(name: []const u8, getter: FieldGetter) FieldDef {
-        return .{ .name = name, .field_type = .optional_bool, .getter = getter, .custom_writer = null };
     }
 
     /// Create an address field
@@ -134,12 +110,6 @@ pub const FieldDef = struct {
     /// Create an optional hash field
     pub fn optionalHash(name: []const u8, getter: FieldGetter) FieldDef {
         return .{ .name = name, .field_type = .optional_hash, .getter = getter, .custom_writer = null };
-    }
-
-    /// Create a custom field with direct writer access. Use this for fields whose JSON
-    /// shape is an object or list — the writer is expected to honor sub-selections itself.
-    pub fn custom(name: []const u8, writer_fn: CustomWriter) FieldDef {
-        return .{ .name = name, .field_type = .custom, .getter = null, .custom_writer = writer_fn };
     }
 
     /// Create a custom field whose value is scalar (e.g. a formatted string or number).
@@ -176,8 +146,8 @@ fn writeFieldValue(
     allocator: std.mem.Allocator,
     def: FieldDef,
 ) !bool {
-    // Handle custom fields (both scalar and object kinds dispatch through the writer)
-    if (def.field_type == .custom or def.field_type == .custom_scalar) {
+    // Custom-scalar fields dispatch through the writer directly
+    if (def.field_type == .custom_scalar) {
         if (def.custom_writer) |custom_fn| {
             return try custom_fn(ctx, output_key, writer, allocator);
         }
@@ -227,40 +197,14 @@ fn writeFieldValue(
             try writer.print("\"{s}\":{d}", .{ output_key, i });
             return true;
         },
-        .optional_int => |maybe_i| {
-            if (maybe_i) |i| {
-                try writer.print("\"{s}\":{d}", .{ output_key, i });
-            } else {
-                try writer.print("\"{s}\":null", .{output_key});
-            }
-            return true;
-        },
         .bool_val => |b| {
             try writer.print("\"{s}\":{s}", .{ output_key, if (b) "true" else "false" });
-            return true;
-        },
-        .optional_bool => |maybe_b| {
-            if (maybe_b) |b| {
-                try writer.print("\"{s}\":{s}", .{ output_key, if (b) "true" else "false" });
-            } else {
-                try writer.print("\"{s}\":null", .{output_key});
-            }
             return true;
         },
         .address => |addr| {
             const hex = try addr.toHex(allocator);
             defer allocator.free(hex);
             try writer.print("\"{s}\":\"{s}\"", .{ output_key, hex });
-            return true;
-        },
-        .optional_address => |maybe_addr| {
-            if (maybe_addr) |addr| {
-                const hex = try addr.toHex(allocator);
-                defer allocator.free(hex);
-                try writer.print("\"{s}\":\"{s}\"", .{ output_key, hex });
-            } else {
-                try writer.print("\"{s}\":null", .{output_key});
-            }
             return true;
         },
         .hash => |h| {
@@ -278,9 +222,6 @@ fn writeFieldValue(
                 try writer.print("\"{s}\":null", .{output_key});
             }
             return true;
-        },
-        .custom => |handled| {
-            return handled;
         },
         .none => {
             return false;

@@ -11,7 +11,8 @@
 //! Scope: FALLBACK only. Indexed answers always win; this fires on an indexed MISS.
 
 const std = @import("std");
-const Hash = @import("../types/hash.zig").Hash;
+const hash_mod = @import("../types/hash.zig");
+const Hash = hash_mod.Hash;
 const Address = @import("../types/address.zig").Address;
 const dns = @import("../utils/dns.zig");
 const cache = @import("cache.zig");
@@ -192,6 +193,31 @@ pub fn decodeDynamicBytes(result: []const u8) !?[]const u8 {
     return result[off + 32 .. off + 32 + len];
 }
 
+/// Ordered step trace for the explain surface. Optional everywhere: resolve()
+/// records only when a sink is attached, so the hot path allocates nothing.
+pub const Trace = struct {
+    allocator: std.mem.Allocator,
+    steps: std.ArrayList(Step) = .empty,
+
+    pub const Step = struct { name: []const u8, detail: []u8 };
+
+    pub fn add(self: *Trace, name: []const u8, comptime fmt: []const u8, args: anytype) void {
+        const detail = std.fmt.allocPrint(self.allocator, fmt, args) catch return;
+        self.steps.append(self.allocator, .{ .name = name, .detail = detail }) catch {
+            self.allocator.free(detail);
+        };
+    }
+
+    pub fn deinit(self: *Trace) void {
+        for (self.steps.items) |st| self.allocator.free(st.detail);
+        self.steps.deinit(self.allocator);
+    }
+};
+
+fn traceAdd(trace: ?*Trace, name: []const u8, comptime fmt: []const u8, args: anytype) void {
+    if (trace) |t| t.add(name, fmt, args);
+}
+
 /// Live-resolve `record` for `name` (ENSIP-15-normalized) at node `node` through the
 /// Universal Resolver at `ur_address`, cache-first and block-hash-pinned. Returns the
 /// decoded value as a string in the SAME shape the indexed path serves (address hex,
@@ -209,8 +235,13 @@ pub fn resolve(
     block_hash: Hash,
     now: i64,
     ccip: ?CcipParams,
+    trace: ?*Trace,
 ) !?[]u8 {
-    if (ur_address.isZero()) return null; // not configured for this network -> degrade
+    if (ur_address.isZero()) {
+        traceAdd(trace, "degrade", "no universal resolver configured for this network", .{});
+        return null; // not configured for this network -> degrade
+    }
+    traceAdd(trace, "start", "name={s} block={d} (hash-pinned)", .{ name, block_num });
 
     const inner = try encodeInner(allocator, node, record);
     defer allocator.free(inner);
@@ -222,11 +253,20 @@ pub fn resolve(
     const cp = ccip orelse {
         // Task 06 path (unchanged): cached live read via callCached. An OffchainLookup
         // revert collapses to rpc_error there -> unresolved (degrade).
-        const entry = r.callCached(allocator, ur_address, selector_key, calldata, block_num, block_hash, now) catch return null;
+        const entry = r.callCached(allocator, ur_address, selector_key, calldata, block_num, block_hash, now) catch {
+            traceAdd(trace, "degrade", "cached UR call failed (rpc/cache error)", .{});
+            return null;
+        };
         defer entry.deinit(allocator);
+        traceAdd(trace, "cached_call", "resolution_cache/eth_call status={s}", .{@tagName(entry.status)});
         if (entry.status != .success) return null;
         const raw = entry.value orelse return null;
-        return decodeRecordFromReturn(allocator, record, raw) catch return null;
+        const decoded = decodeRecordFromReturn(allocator, record, raw) catch {
+            traceAdd(trace, "degrade", "return-data decode failed", .{});
+            return null;
+        };
+        traceAdd(trace, "decoded", "record={s} present={}", .{ @tagName(record), decoded != null });
+        return decoded;
     };
 
     // CCIP-enabled: same resolution_cache + block-hash pinning, but revert-aware so an
@@ -242,28 +282,39 @@ pub fn resolve(
     if (try cache.get(allocator, r.db, key)) |cached| {
         defer cached.deinit(allocator);
         if (isFresh(cached.fetched_at, now, r.ttl_s)) {
+            traceAdd(trace, "cache_hit", "fresh resolution_cache entry status={s}", .{@tagName(cached.status)});
             if (cached.status != .success) return null;
             return decodeRecordFromReturn(allocator, record, cached.value.?) catch return null;
         }
+        traceAdd(trace, "cache_stale", "entry past ttl; refetching", .{});
     }
+    traceAdd(trace, "ur_call", "eth_call UniversalResolver.resolve at block {d}", .{block_num});
     const call = r.rpc_client.ethCallAllowRevert(ur_address, calldata, .{ .hash = block_hash }) catch {
+        traceAdd(trace, "rpc_error", "eth_call failed; cached as rpc_error", .{});
         cache.put(r.db, key, .rpc_error, null, .resolved_live, now) catch {};
         return null;
     };
     defer call.deinit(r.rpc_client.allocator);
     switch (call) {
         .ok => |data| {
+            traceAdd(trace, "ur_ok", "onchain answer, {d} bytes; cached as resolved_live", .{data.len});
             cache.put(r.db, key, .success, data, .resolved_live, now) catch {};
             return decodeRecordFromReturn(allocator, record, data) catch return null;
         },
         .reverted => |revert| {
             const ol = ccip_mod.decode(allocator, revert) catch {
+                traceAdd(trace, "plain_revert", "revert is not an OffchainLookup; cached as reverted", .{});
                 cache.put(r.db, key, .reverted, null, .resolved_live, now) catch {};
                 return null; // an ordinary revert, not an OffchainLookup
             };
             defer ol.deinit(allocator);
-            const final = (ccip_mod.resolve(allocator, cp.transport, ol, ur_address, cp.max_redirects) catch null) orelse return null;
+            traceAdd(trace, "offchain_lookup", "EIP-3668 OffchainLookup: {d} gateway url(s)", .{ol.urls.len});
+            const final = (ccip_mod.resolve(allocator, cp.transport, ol, ur_address, cp.max_redirects) catch null) orelse {
+                traceAdd(trace, "ccip_failed", "gateway loop yielded no answer; degraded", .{});
+                return null;
+            };
             defer allocator.free(final);
+            traceAdd(trace, "ccip_ok", "offchain answer, {d} bytes; cached as resolved_ccip", .{final.len});
             cache.put(r.db, key, .success, final, .resolved_ccip, now) catch {};
             return decodeRecordFromReturn(allocator, record, final) catch return null;
         },
@@ -292,17 +343,37 @@ pub const LiveContext = struct {
     registry: Address = Address.zero,
     /// Whether primary-name verification (Task 05) is enabled (PRIMARY_VERIFY_ENABLED).
     primary_verify_enabled: bool = false,
+    /// Optional explain-trace sink; hot paths leave it null.
+    trace: ?*Trace = null,
 
     /// ENSIP-3 forward-verify (Task 05) that `claimed_name` resolves to `address`, pinned
     /// to this context's block. Never throws on a resolution failure (→ `.unverified`).
+    ///
+    /// When a Universal Resolver is configured, the forward `addr(node)` read is routed
+    /// through it so inherited, wildcard (ENSIP-10) and offchain (CCIP) resolvers verify
+    /// correctly; without one, it falls back to the direct registry+resolver check. Both
+    /// paths reject a non-normalized claimed name as `.invalid_name`.
     pub fn verifyPrimary(self: *LiveContext, allocator: std.mem.Allocator, address: Address, claimed_name: []const u8) !primary_mod.Verdict {
-        return primary_mod.verify(self.resolver, allocator, self.registry, address, claimed_name, self.block_num, self.block_hash, self.now);
+        if (self.ur_address.isZero()) {
+            return primary_mod.verify(self.resolver, allocator, self.registry, address, claimed_name, self.block_num, self.block_hash, self.now);
+        }
+
+        const norm = (try primary_mod.normalizedClaimOwned(allocator, claimed_name)) orelse return .invalid_name;
+        defer allocator.free(norm);
+        const node = try hash_mod.namehash(allocator, norm);
+
+        // resolve() returns the forward address as a hex string, or null for no record /
+        // any failure — both of which are "no usable evidence" here.
+        const forward_hex = (resolve(self.resolver, allocator, self.ur_address, norm, node, .addr, self.block_num, self.block_hash, self.now, self.ccip, self.trace) catch null) orelse return .unverified;
+        defer allocator.free(forward_hex);
+        const forward = Address.fromHex(forward_hex) catch return .unverified;
+        return if (forward.eql(address)) .verified else .mismatch;
     }
 
     /// Live-resolve `record` for `name`/`node`, returning the value string (owned by
     /// `allocator`) or null (no record / any failure → caller degrades to the miss).
     pub fn resolveRecord(self: *LiveContext, allocator: std.mem.Allocator, name: []const u8, node: Hash, record: Record) !?[]u8 {
-        return resolve(self.resolver, allocator, self.ur_address, name, node, record, self.block_num, self.block_hash, self.now, self.ccip);
+        return resolve(self.resolver, allocator, self.ur_address, name, node, record, self.block_num, self.block_hash, self.now, self.ccip, self.trace);
     }
 };
 
@@ -483,12 +554,12 @@ test "resolve() serves a cached UR addr answer without touching RPC" {
     // dereference it. If the fallback wrongly hit the network, this would crash.
     var resolver = Resolver.init(@as(*rpc.Client, undefined), &database, 1, 300);
 
-    const val = try resolve(&resolver, a, ur_addr, name, node, rec, block_num, block_hash, now, null);
+    const val = try resolve(&resolver, a, ur_addr, name, node, rec, block_num, block_hash, now, null, null);
     defer if (val) |v| a.free(v);
     try testing.expectEqualStrings("0x2222222222222222222222222222222222222222", val.?);
 
     // Unconfigured (zero UR address) degrades to null with no lookup.
-    const none = try resolve(&resolver, a, Address.zero, name, node, rec, block_num, block_hash, now, null);
+    const none = try resolve(&resolver, a, Address.zero, name, node, rec, block_num, block_hash, now, null, null);
     try testing.expect(none == null);
 }
 
@@ -557,7 +628,68 @@ test "resolve(): CCIP-enabled path serves a resolved_ccip cache hit without any 
         .transport = .{ .ctx = undefined, .httpFetch = neverFetch, .ethCall = neverCall },
         .max_redirects = 4,
     };
-    const val = try resolve(&resolver, a, ur_addr, name, node, rec, block_num, block_hash, now, cp);
+    const val = try resolve(&resolver, a, ur_addr, name, node, rec, block_num, block_hash, now, cp, null);
     defer if (val) |v| a.free(v);
     try testing.expectEqualStrings("0x3333333333333333333333333333333333333333", val.?);
+}
+
+test "resolve() records an explain trace on the cache-hit path" {
+    const a = testing.allocator;
+    const db_mod = @import("../storage/database.zig");
+    const rpc = @import("../rpc/client.zig");
+
+    var database = try db_mod.Database.init(a, ":memory:");
+    defer database.deinit();
+
+    const ur_addr = Address{ .bytes = [_]u8{0xcc} ** 20 };
+    const node = Hash{ .bytes = [_]u8{0xab} ** 32 };
+    const now: i64 = 1_700_000_000;
+    const block_hash = Hash{ .bytes = [_]u8{0xbb} ** 32 };
+    var blob: [128]u8 = [_]u8{0} ** 128;
+    blob[31] = 0x40;
+    @memset(blob[44..64], 0x11);
+    blob[95] = 32;
+    @memset(blob[108..128], 0x22);
+
+    const inner = try encodeInner(a, node, .addr);
+    defer a.free(inner);
+    const calldata = try encodeResolveCall(a, "traced.eth", inner);
+    defer a.free(calldata);
+    const selector_key = try Record.cacheKey(.addr, a);
+    defer a.free(selector_key);
+    try cache.put(&database, .{
+        .chain_id = 1,
+        .target = ur_addr,
+        .selector_key = selector_key,
+        .arg_hash = cache.argHash(calldata),
+        .block_dep_num = 100,
+        .block_dep_hash = block_hash,
+    }, .success, &blob, .resolved_live, now);
+
+    var resolver = Resolver.init(@as(*rpc.Client, undefined), &database, 1, 300);
+    var trace = Trace{ .allocator = a };
+    defer trace.deinit();
+
+    // CCIP-params-present path (its cache branch is the one the explain surface
+    // exercises); undefined transport proves the cache hit never reaches it.
+    const cp = CcipParams{ .transport = undefined, .max_redirects = 4 };
+    const val = try resolve(&resolver, a, ur_addr, "traced.eth", node, .addr, 100, block_hash, now, cp, &trace);
+    defer if (val) |v| a.free(v);
+    try testing.expect(val != null);
+
+    var saw_start = false;
+    var saw_cache_hit = false;
+    for (trace.steps.items) |st| {
+        if (std.mem.eql(u8, st.name, "start")) saw_start = true;
+        if (std.mem.eql(u8, st.name, "cache_hit")) saw_cache_hit = true;
+    }
+    try testing.expect(saw_start);
+    try testing.expect(saw_cache_hit);
+
+    // Unconfigured degrade records its reason too.
+    var trace2 = Trace{ .allocator = a };
+    defer trace2.deinit();
+    _ = try resolve(&resolver, a, Address.zero, "traced.eth", node, .addr, 100, block_hash, now, null, &trace2);
+    try testing.expect(trace2.steps.items.len == 1);
+    try testing.expect(std.mem.eql(u8, trace2.steps.items[0].name, "degrade"));
 }

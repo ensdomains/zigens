@@ -57,6 +57,31 @@ pub const Indexer = struct {
     block_timestamp_cache: std.AutoHashMap(u64, i64),
     // Cached active V1 controllers (invalidated on ControllerAdded/Removed)
     v1_active_controllers: ?[]Address = null,
+    // Adaptive fetch state persisted across driver batches: learned V1 event
+    // density and the RPC overflow ceiling. 0 = not yet learned (era defaults
+    // apply). Without these the fetcher re-learns from scratch every batch.
+    v1_events_per_block: f64 = 0,
+    v1_rpc_chunk_ceiling: u64 = 0,
+    // Memoized rainbow-table lookups (hit AND miss — the empty-string sentinel).
+    // A cold probe into the multi-GB rainbow DB is disk-latency-priced; the same
+    // labelhash recurs on every event touching that node, so memoization collapses
+    // repeat probes to a hash lookup. Values are cache-owned (callers borrow).
+    rainbow_cache: std.AutoHashMap([32]u8, []const u8),
+    // Per-chunk rainbow probe instrumentation (printed in the chunk timing line).
+    rainbow_probe_count: u64 = 0,
+    newowner_phase_ns: [5]i128 = [_]i128{0} ** 5,
+    /// Resolvers first sighted this batch (via ResolverUpdated registration).
+    /// Drained by indexResolverEvents, which backfills each one's pre-attachment
+    /// history (initialize()-time EACRolesChanged role grants fire blocks before
+    /// the resolver becomes known). Cleared alongside clearKnownResolverCache on
+    /// batch rollback (the registrations were reverted with the transaction).
+    pending_resolver_backfills: std.ArrayList(Address) = .empty,
+    /// Whether this process actually dropped the bulk-sync indexes. The
+    /// completion path only pays the index rebuild + ANALYZE when a drop
+    /// happened — a caught-up restart (gap below SYNC_INDEX_MIN_GAP_BLOCKS)
+    /// keeps its indexes and skips the whole cycle.
+    sync_indexes_dropped: bool = false,
+    rainbow_probe_ns: u64 = 0,
     // Cached V1 token_id → label mappings (populated on miss from DB)
     v1_label_cache: std.StringHashMap([]const u8),
     // In-memory dedup of registered resolvers (membership-only — known_resolvers'
@@ -91,6 +116,12 @@ pub const Indexer = struct {
     // NameRegistered/LabelReserved handler. Two keccak rounds saved per event.
     eth_namehash: Hash,
 
+    // Registrar root for the V1-shaped path: "eth" on ENS networks, "base.eth"
+    // on Base (Basenames). 2LDs from the base-registrar/controller surface are
+    // `<label>.<root_name>` with parent node `root_node`.
+    root_name: []const u8,
+    root_node: Hash,
+
     pub fn init(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, database: *db.Database, end_block: ?u64) !Indexer {
         // Create ONE shared HTTP client
         const http_client = try allocator.create(std.http.Client);
@@ -102,6 +133,7 @@ pub const Indexer = struct {
 
         const v1_client = try rpc.Client.initWithSharedHttpClient(allocator, cfg.rpc_url, http_client);
         errdefer v1_client.deinit();
+        v1_client.max_batch_requests = cfg.rpc_max_batch_requests;
 
         var webhook_manager: ?*webhooks.WebhookManager = null;
         if (cfg.webhooks_enabled) {
@@ -176,12 +208,15 @@ pub const Indexer = struct {
             .status_server = status_server,
             .block_timestamp_cache = std.AutoHashMap(u64, i64).init(allocator),
             .v1_label_cache = std.StringHashMap([]const u8).init(allocator),
+            .rainbow_cache = std.AutoHashMap([32]u8, []const u8).init(allocator),
             .known_resolver_cache = std.StringHashMap(void).init(allocator),
             .account_obs_cache = std.StringHashMap(void).init(allocator),
             .name_by_namehash_cache = std.AutoHashMap(Hash, []const u8).init(allocator),
             .write_buffer = WriteBuffer.init(allocator),
             .rainbow = rainbow,
             .eth_namehash = try @import("../types/hash.zig").namehash(allocator, "eth"),
+            .root_name = cfg.network.rootName(),
+            .root_node = try @import("../types/hash.zig").namehash(allocator, cfg.network.rootName()),
         };
     }
 
@@ -196,6 +231,7 @@ pub const Indexer = struct {
 
         const client = try rpc.Client.initWithSharedHttpClient(allocator, cfg.rpc_url, http_client);
         errdefer client.deinit();
+        client.max_batch_requests = cfg.rpc_max_batch_requests;
 
         var webhook_manager: ?*webhooks.WebhookManager = null;
         if (cfg.webhooks_enabled) {
@@ -274,12 +310,15 @@ pub const Indexer = struct {
             .status_server = status_server,
             .block_timestamp_cache = std.AutoHashMap(u64, i64).init(allocator),
             .v1_label_cache = std.StringHashMap([]const u8).init(allocator),
+            .rainbow_cache = std.AutoHashMap([32]u8, []const u8).init(allocator),
             .known_resolver_cache = std.StringHashMap(void).init(allocator),
             .account_obs_cache = std.StringHashMap(void).init(allocator),
             .name_by_namehash_cache = std.AutoHashMap(Hash, []const u8).init(allocator),
             .write_buffer = WriteBuffer.init(allocator),
             .rainbow = rainbow,
             .eth_namehash = try @import("../types/hash.zig").namehash(allocator, "eth"),
+            .root_name = cfg.network.rootName(),
+            .root_node = try @import("../types/hash.zig").namehash(allocator, cfg.network.rootName()),
         };
     }
 
@@ -306,6 +345,7 @@ pub const Indexer = struct {
         }
         self.block_timestamp_cache.deinit();
         self.write_buffer.deinit();
+        self.pending_resolver_backfills.deinit(self.allocator);
         if (self.rainbow) |*r| r.deinit();
 
         // Free cached controllers
@@ -320,6 +360,10 @@ pub const Indexer = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.v1_label_cache.deinit();
+
+        var rb_it = self.rainbow_cache.valueIterator();
+        while (rb_it.next()) |v| self.allocator.free(v.*);
+        self.rainbow_cache.deinit();
 
         // Free cached resolver-dedup keys
         var rk_it = self.known_resolver_cache.keyIterator();
@@ -339,6 +383,7 @@ pub const Indexer = struct {
 
     // In-memory cache / dedup accessors — implementations in caches.zig.
     pub const registerResolverOnce = caches.registerResolverOnce;
+    pub const registerResolverOnceIfNew = caches.registerResolverOnceIfNew;
     pub const clearKnownResolverCache = caches.clearKnownResolverCache;
     pub const clearAccountObsCache = caches.clearAccountObsCache;
     pub const invalidateControllerCache = caches.invalidateControllerCache;
@@ -348,9 +393,25 @@ pub const Indexer = struct {
     pub const resolveLabel = caches.resolveLabel;
     /// Replay all stored events to rebuild the names table (--backfill mode).
     pub const replayEventsToRebuildNames = replay_mod.replayEventsToRebuildNames;
+    pub const clearReplayStatus = replay_mod.clearReplayStatus;
+    pub const writeReplayStatus = replay_mod.writeReplayStatus;
+    /// Rebuild the V2 names projection from stored V2 events. In a combined --backfill this
+    /// MUST run AFTER replayEventsToRebuildNames so V1→V2 migration lookups find their V1 rows.
+    pub const replayV2NamesCore = replay_mod.replayV2NamesCore;
+    /// Rebuild the V2 resolver-record projections (addresses/texts/contenthashes) from events.
+    pub const replayV2RecordsCore = replay_mod.replayV2RecordsCore;
+    /// Rebuild the V2 eac_roles projection from stored EACRolesChanged events.
+    pub const replayV2EacRolesCore = replay_mod.replayV2EacRolesCore;
+    /// Rebuild the V2 registrations projection from stored LabelRegistered/NameRegistered events.
+    pub const replayV2RegistrationsCore = replay_mod.replayV2RegistrationsCore;
+    /// Rebuild the accounts projection (V1+V2 observations + backfill seed) from events.
+    pub const replayAccountsCore = replay_mod.replayAccountsCore;
+    /// Rebuild the V2 registries + registry_entries projections (bootstrap + pointer changes).
+    pub const replayV2RegistriesCore = replay_mod.replayV2RegistriesCore;
     pub const trackBlockHash = caches.trackBlockHash;
     pub const resetBlockHashTracking = caches.resetBlockHashTracking;
     pub const getBlockTimestamp = caches.getBlockTimestamp;
+    pub const warmBlockTimestampCache = caches.warmBlockTimestampCache;
     pub const clearBlockTimestampCache = caches.clearBlockTimestampCache;
     pub const getNameFromNamehash = caches.getNameFromNamehash;
 
@@ -375,11 +436,6 @@ pub const Indexer = struct {
         if (contract_defs.isActiveContract(addr, c.locked_migration_controller)) return .locked;
         if (contract_defs.isActiveContract(addr, c.unlocked_migration_controller)) return .unlocked;
         return .none;
-    }
-
-    /// Boolean wrapper kept for call sites that only need yes/no.
-    pub inline fn isMigrationController(self: *Indexer, addr: Address) bool {
-        return self.getMigrationKind(addr) != .none;
     }
 
     pub inline fn getClient(self: *Indexer, protocol: models.Protocol) *rpc.Client {
@@ -407,11 +463,8 @@ pub const Indexer = struct {
     // V1 indexing orchestration (extracted to v1_indexing.zig)
     pub const indexV1EventsChunked = v1_indexing.indexV1EventsChunked;
     pub const indexAllV1Events = v1_indexing.indexAllV1Events;
+    pub const v1EraStart = sync_driver.v1EraStart;
     pub const indexPreMigrationRegistryEvents = v1_indexing.indexPreMigrationRegistryEvents;
-    pub const indexV1RegistryEvents = v1_indexing.indexV1RegistryEvents;
-    pub const indexV1NameWrapperEvents = v1_indexing.indexV1NameWrapperEvents;
-    pub const indexV1BaseRegistrarEvents = v1_indexing.indexV1BaseRegistrarEvents;
-    pub const indexV1ReverseRegistrarEvents = v1_indexing.indexV1ReverseRegistrarEvents;
 
     // Persistence chokepoints — implementations in persistence.zig.
     pub const insertEventAndNotify = persistence.insertEventAndNotify;
@@ -436,6 +489,7 @@ pub const Indexer = struct {
     pub const indexSubregistryEvents = event_fetchers.indexSubregistryEvents;
     pub const indexTransferEvents = event_fetchers.indexTransferEvents;
     pub const indexResolverEvents = event_fetchers.indexResolverEvents;
+    pub const backfillResolverInitGaps = event_fetchers.backfillResolverInitGaps;
     pub const indexV2ReverseRegistrarEvents = event_fetchers.indexV2ReverseRegistrarEvents;
     pub const indexV2RenewerEvents = event_fetchers.indexV2RenewerEvents;
     pub const indexLabelStoreEvents = event_fetchers.indexLabelStoreEvents;
@@ -509,6 +563,9 @@ pub const Indexer = struct {
     pub const handleV1ETHControllerNameRegistered7Arg = handlers_v1.handleV1ETHControllerNameRegistered7Arg;
     pub const handleV1ETHControllerNameRenewed = handlers_v1.handleV1ETHControllerNameRenewed;
     pub const handleV1ETHControllerNameRenewedWithReferrer = handlers_v1.handleV1ETHControllerNameRenewedWithReferrer;
+    pub const handleBasenamesControllerNameRegistered = handlers_v1.handleBasenamesControllerNameRegistered;
+    pub const handleBasenamesControllerNameRenewed = handlers_v1.handleBasenamesControllerNameRenewed;
+    pub const handleBasenamesRegistrarNameRegisteredWithRecord = handlers_v1.handleBasenamesRegistrarNameRegisteredWithRecord;
     pub const handleV1ReverseClaimed = handlers_v1.handleV1ReverseClaimed;
     pub const handleV2NameForAddrChanged = handlers_v1.handleV2NameForAddrChanged;
 

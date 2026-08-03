@@ -50,17 +50,15 @@ pub fn loadEnv(allocator: std.mem.Allocator, path: []const u8) !std.StringHashMa
     return env_map;
 }
 
-/// Get environment variable with fallback to .env map
+/// Get environment variable with fallback to .env map.
+///
+/// The result is BORROWED (valid while env_map + the process environ live); callers that keep
+/// a value dupe it. Use the borrowed `getenv` (points into the process environ) rather than
+/// `getEnvOwned` — an owned dup would leak here since callers treat the result as borrowed.
 pub fn getEnv(env_map: *const std.StringHashMap([]const u8), key: []const u8, default: []const u8) []const u8 {
-    // First check actual environment
-    if (zsys.getEnvOwned(env_map.allocator, key)) |value| {
-        return value;
-    } else |_| {
-        // Fall back to .env file
-        if (env_map.get(key)) |value| {
-            return value;
-        }
-    }
+    // Actual process environment takes precedence over the .env file.
+    if (zsys.getenv(key)) |value| return value;
+    if (env_map.get(key)) |value| return value;
     return default;
 }
 

@@ -120,6 +120,32 @@ fn seedFixture(db: *Database, a: std.mem.Allocator) !void {
     try db.upsertAccount(.v2, owner1.toHexBuf(&o1_buf), FIXED_BLOCK, FIXED_TS);
     try db.upsertAccount(.v2, owner2.toHexBuf(&o2_buf), FIXED_BLOCK, FIXED_TS);
 
+    // V2 event lifecycle for alice.eth, feeding domain(id:, atBlock:) reconstruction:
+    // register(200) -> resolver set(210) -> addr record(220) -> transfer(230). Distinct
+    // log_index per event — the events UNIQUE is (protocol, tx_hash, log_index).
+    const ab_registry = try Address.fromHex("0x7777777777777777777777777777777777777777");
+    const AbEv = struct { et: models.EventType, blk: u64, li: u32, contract: Address, data: []const u8 };
+    const ab_events = [_]AbEv{
+        .{ .et = .label_registered, .blk = 200, .li = 9000, .contract = ab_registry, .data = "{\"name\":\"alice.eth\",\"tokenId\":4242,\"owner\":\"0x1111111111111111111111111111111111111111\",\"expiry\":1950000000,\"registry\":\"0x7777777777777777777777777777777777777777\"}" },
+        .{ .et = .resolver_updated, .blk = 210, .li = 9001, .contract = ab_registry, .data = "{\"tokenId\":4242,\"resolver\":\"0xcccccccccccccccccccccccccccccccccccccccc\"}" },
+        .{ .et = .address_changed, .blk = 220, .li = 9002, .contract = resolver, .data = "{\"resolver\":\"0xcccccccccccccccccccccccccccccccccccccccc\",\"coinType\":60,\"address\":\"0xdddddddddddddddddddddddddddddddddddddddd\"}" },
+        .{ .et = .transfer, .blk = 230, .li = 9003, .contract = ab_registry, .data = "{\"to\":\"0x2222222222222222222222222222222222222222\"}" },
+    };
+    for (ab_events) |e| {
+        try db.insertEvent(.{
+            .event_type = e.et,
+            .protocol = .v2,
+            .block_number = e.blk,
+            .tx_hash = Hash.zero,
+            .log_index = e.li,
+            .contract_address = e.contract,
+            .name = "alice.eth",
+            .namehash = alice,
+            .data = e.data,
+            .timestamp = FIXED_TS,
+        });
+    }
+
     // Primary (reverse) name: owner1 -> alice.eth. primaryName resolves in two hops —
     // reverse_records[owner1] -> namehash, then resolver_names[namehash] -> the name()
     // record. We use alice's namehash as the reverse target and store its name() record
@@ -294,6 +320,8 @@ test "conformance goldens" {
         .{ .name = "registrations_expiry_gt", .query = "{ registrations(where:{expiryDate_gt:1900000000}, orderBy:name, orderDirection:asc){ id name expiryDate } }" },
         // --- finality signalling (Task 09; _finality is additive, subgraph _meta unchanged) ---
         .{ .name = "finality", .query = "{ _finality { head { number } safe { number hash } finalized { number } isStale } }" },
+        // --- coverage declaration (additive; lastSyncedAt is wall-clock so not selected) ---
+        .{ .name = "coverage", .query = "{ _coverage { chainId stale protocols { protocol indexedHead } } }" },
         // --- error-shape ops: lock the GraphQL error envelope for cases that DO error ---
         .{ .name = "err_missing_required_arg", .query = "{ domain { id } }" },
         .{ .name = "err_unknown_query", .query = "{ notARealQueryField { id } }" },
@@ -304,6 +332,23 @@ test "conformance goldens" {
         //     silent change either way.
         .{ .name = "lenient_unknown_field", .query = "{ domains(first:1){ notARealField } }" },
         .{ .name = "lenient_invalid_orderby", .query = "{ domains(orderBy: notARealField){ id } }" },
+        // An empty selection set is spec-invalid but accepted; the fast path must
+        // emit the namehash id like every other Domain serialization.
+        .{ .name = "lenient_empty_selection", .query = "query($id:String!){ domain(id:$id) }", .vars = alice_vars },
+        // --- atBlock time travel (V2 event-log reconstruction; fixture lifecycle at
+        //     blocks 200/210/220/230, sync head 12345) ---
+        .{ .name = "atblock_mid", .query = "query($id:String!){ domain(id:$id, atBlock: 215){ id name owner { id } resolver { address addr } tokenId } }", .vars = alice_vars },
+        .{ .name = "atblock_late", .query = "query($id:String!){ domain(id:$id, atBlock: 235){ id owner { id } resolver { addr text(key:\"avatar\") } } }", .vars = alice_vars },
+        .{ .name = "atblock_prereg", .query = "query($id:String!){ domain(id:$id, atBlock: 150){ id name } }", .vars = alice_vars },
+        .{ .name = "atblock_future", .query = "query($id:String!){ domain(id:$id, atBlock: 999999999){ id name } }", .vars = alice_vars },
+        // --- history surfaces over the events log ---
+        .{ .name = "history_name", .query = "query($id:String!){ events(where:{namehash:$id}, orderBy: blockNumber, orderDirection: asc){ type blockNumber } }", .vars = alice_vars },
+        .{ .name = "history_address", .query = "{ events(where:{involved:\"0x2222222222222222222222222222222222222222\"}, orderBy: blockNumber, orderDirection: asc){ type blockNumber } }" },
+        // Two aliases of the same list re-run the batch record prefetch over the same
+        // (resolver, namehash) pairs; locks output and, under CONFORMANCE_LEAKCHECK,
+        // the repeat-populate value replacement in loaders.zig. name_in (not name:)
+        // so the general list path runs — the name-exact fast path skips the prefetch.
+        .{ .name = "aliased_batch_records", .query = "{ a: domains(where:{name_in:[\"alice.eth\"]}){ resolver { addr text(key:\"avatar\") } } b: domains(where:{name_in:[\"alice.eth\"]}){ resolver { addr text(key:\"avatar\") } } }" },
     };
 
     for (ops) |op| try checkOp(a, &handler, db, op, mode);

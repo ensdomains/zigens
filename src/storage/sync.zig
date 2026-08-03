@@ -131,6 +131,24 @@ pub fn getSyncState(db: *Database, protocol: models.Protocol) !?u64 {
     return null;
 }
 
+pub const ProtocolSync = struct { block: u64, at: i64 };
+
+/// Like getSyncState but also returns when the head was last advanced —
+/// the freshness signal for the coverage surface.
+pub fn getSyncStateFull(db: *Database, protocol: models.Protocol) !?ProtocolSync {
+    const sql = "SELECT last_synced_block, last_synced_at FROM sync_state WHERE protocol = ?";
+
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+
+    try q.bindTextStatic(protocol.toString());
+
+    if (try q.step()) {
+        return .{ .block = @intCast(q.getInt64(0)), .at = q.getInt64(1) };
+    }
+    return null;
+}
+
 pub fn setSyncState(db: *Database, protocol: models.Protocol, block: u64) !void {
     const sql = try db.upsertSql(db.allocator, "sync_state", &.{ "protocol", "last_synced_block", "last_synced_at" }, .replace);
     defer db.allocator.free(sql);
@@ -308,6 +326,17 @@ pub fn pruneOldBlockHashes(db: *Database, protocol: models.Protocol, current_blo
 }
 
 /// Verify database integrity (uses quick_check for performance on large databases)
+/// Cheap connectivity/liveness probe: one trivial query, no page scans.
+/// The API uses this at startup instead of checkIntegrity — quick_check reads
+/// every btree page, which on a mainnet-scale DB is minutes of full-file I/O
+/// against a live writer, and a read-only consumer can't act on the result
+/// anyway (corruption surfaces at query time regardless).
+pub fn probeLiveness(db: *Database) !bool {
+    var q = try Query.init(db, "SELECT 1");
+    defer q.deinit();
+    return try q.step();
+}
+
 pub fn checkIntegrity(db: *Database) !bool {
     if (db.isPostgres()) {
         // Postgres has no PRAGMA quick_check; a successful trivial query is the
@@ -380,6 +409,26 @@ pub fn getSubregistryCreatedBlock(db: *Database, protocol: models.Protocol, addr
     try q.bindText(address);
     if (try q.step()) return @intCast(q.getInt64(0));
     return 0;
+}
+
+/// Like registerResolver, but reports whether this was the resolver's FIRST
+/// sighting. First sightings must trigger a historical event backfill: a
+/// factory-deployed resolver emits its initialize()-time events (EACRolesChanged
+/// role grants) blocks BEFORE the ResolverUpdated that makes it known, and the
+/// resolver pass only fetches known-resolver events within the current batch —
+/// without a backfill those init events are lost (the discovery-path backfill
+/// cannot fire for resolvers registered here: its `kr.address IS NULL` filter
+/// is already false by the time it runs).
+pub fn registerResolverIfNew(db: *Database, protocol: models.Protocol, address: []const u8, block_number: u64) !bool {
+    const exists = blk: {
+        var q = try Query.init(db, "SELECT 1 FROM known_resolvers WHERE protocol = ? AND address = ? LIMIT 1");
+        defer q.deinit();
+        try q.bindTextStatic(protocol.toString());
+        try q.bindText(address);
+        break :blk try q.step();
+    };
+    try registerResolver(db, protocol, address, block_number);
+    return !exists;
 }
 
 /// Register or update a known resolver

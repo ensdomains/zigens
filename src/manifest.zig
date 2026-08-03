@@ -40,6 +40,7 @@ pub const Contract = struct {
 pub const Blocks = struct {
     v1_deployment_block: u64,
     v2_deployment_block: u64,
+    v1_end_block: u64 = 0,
     temp_registrar_start_block: u64,
     v1_migration_block: u64,
     name_wrapper_deployment_block: u64,
@@ -105,6 +106,7 @@ pub fn toContractAddresses(m: Manifest, network: Network) !ContractAddresses {
     }
     ca.v1_deployment_block = m.blocks.v1_deployment_block;
     ca.v2_deployment_block = m.blocks.v2_deployment_block;
+    ca.v1_end_block = m.blocks.v1_end_block;
     ca.temp_registrar_start_block = m.blocks.temp_registrar_start_block;
     ca.v1_migration_block = m.blocks.v1_migration_block;
     ca.name_wrapper_deployment_block = m.blocks.name_wrapper_deployment_block;
@@ -178,6 +180,7 @@ pub fn serialize(writer: anytype, ca: ContractAddresses, network: Network) !void
         \\    .blocks = .{{
         \\        .v1_deployment_block = {d},
         \\        .v2_deployment_block = {d},
+        \\        .v1_end_block = {d},
         \\        .temp_registrar_start_block = {d},
         \\        .v1_migration_block = {d},
         \\        .name_wrapper_deployment_block = {d},
@@ -187,6 +190,7 @@ pub fn serialize(writer: anytype, ca: ContractAddresses, network: Network) !void
     , .{
         ca.v1_deployment_block,
         ca.v2_deployment_block,
+        ca.v1_end_block,
         ca.temp_registrar_start_block,
         ca.v1_migration_block,
         ca.name_wrapper_deployment_block,

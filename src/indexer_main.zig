@@ -4,6 +4,7 @@ const indexer = @import("indexer/indexer.zig");
 const db = @import("storage/database.zig");
 const db_open = @import("storage/db_open.zig");
 const models = @import("types/models.zig");
+const shutdown = @import("utils/shutdown.zig");
 
 // Configure logging: filter debug logs, use file redirection in production
 // Run with: ./ensv2-indexer > logs/indexer.log 2>&1 &
@@ -15,6 +16,8 @@ const CliArgs = struct {
     from_block: ?u64 = null,
     to_block: ?u64 = null,
     clean: bool = false,
+    backfill: bool = false,
+    cdp_backfill: bool = false,
     help: bool = false,
 };
 
@@ -45,6 +48,10 @@ fn parseArgs(process_args: std.process.Args) !CliArgs {
             }
         } else if (std.mem.eql(u8, arg, "--clean")) {
             result.clean = true;
+        } else if (std.mem.eql(u8, arg, "--backfill")) {
+            result.backfill = true;
+        } else if (std.mem.eql(u8, arg, "--cdp-backfill")) {
+            result.cdp_backfill = true;
         } else {
             std.log.warn("Unknown argument: {s}", .{arg});
         }
@@ -64,6 +71,8 @@ fn printHelp() void {
         \\  --from-block <N>    Re-index from block N (resets sync state)
         \\  --to-block <N>      Stop indexing at block N (default: current block)
         \\  --clean             Delete all data after --from-block before re-indexing
+        \\  --backfill          Rebuild the names table from stored events (V1 then V2), no RPC, then exit
+        \\  --cdp-backfill      Bulk-ingest Base history from the CDP SQL API (BASE_CDP_CLIENT_KEY/BASE_CDP_SECRET_KEY), then exit
         \\  --help, -h          Show this help message
         \\
         \\Examples:
@@ -129,33 +138,70 @@ pub fn main(init: std.process.Init) !void {
     }
     std.log.info("Database integrity check passed", .{});
 
-    // Handle re-indexing if --from-block is specified
-    if (args.from_block) |from_block| {
-        std.log.info("Re-indexing requested from block {d}", .{from_block});
+    // --backfill: offline rebuild of the names projection from stored events. Disable the status
+    // server and webhooks (no RPC, no lock contention); live-index setup below is skipped.
+    if (args.backfill) {
+        cfg.status_port = null;
+        cfg.webhooks_enabled = false;
+    }
 
-        if (args.clean) {
-            std.log.warn("--clean mode: Deleting all data after block {d}...", .{from_block});
-            try database.deleteDataAfterBlock(from_block);
-            std.log.info("Data cleanup complete", .{});
-        } else {
-            std.log.info("Idempotent re-index: Keeping existing data, will skip duplicates", .{});
+    // Handle re-indexing if --from-block is specified (not applicable in --backfill mode)
+    if (!args.backfill) {
+        if (args.from_block) |from_block| {
+            std.log.info("Re-indexing requested from block {d}", .{from_block});
+
+            if (args.clean) {
+                std.log.warn("--clean mode: Deleting all data after block {d}...", .{from_block});
+                try database.deleteDataAfterBlock(from_block);
+                std.log.info("Data cleanup complete", .{});
+            } else {
+                std.log.info("Idempotent re-index: Keeping existing data, will skip duplicates", .{});
+            }
+
+            // Reset sync state for both chains
+            std.log.info("Resetting sync state to block {d}...", .{from_block});
+            try database.setSyncState(.v1, from_block);
+            try database.setSyncState(.v2, from_block);
+            std.log.info("Sync state reset complete. Indexer will resume from block {d}", .{from_block});
         }
-
-        // Reset sync state for both chains
-        std.log.info("Resetting sync state to block {d}...", .{from_block});
-        try database.setSyncState(.v1, from_block);
-        try database.setSyncState(.v2, from_block);
-        std.log.info("Sync state reset complete. Indexer will resume from block {d}", .{from_block});
     }
 
     // Initialize and start indexer
     var idx = try indexer.Indexer.init(allocator, io, cfg, &database, args.to_block);
     defer idx.deinit();
 
+    // --backfill: rebuild names from stored events (V1 first so V1→V2 migration lookups find
+    // their source rows, then V2), then exit without entering the live index loop.
+    if (args.backfill) {
+        std.log.info("Running in --backfill mode: rebuilding names + records + roles + registrations from stored events (V1 then V2)", .{});
+        try idx.clearReplayStatus();
+        try idx.replayEventsToRebuildNames();
+        try idx.replayV2NamesCore();
+        try idx.replayV2RecordsCore();
+        try idx.replayV2EacRolesCore();
+        try idx.replayV2RegistrationsCore();
+        try idx.replayV2RegistriesCore(); // after names (pointer cascade fixes subregistry reachability)
+        try idx.replayAccountsCore(); // after names + registrations (backfill seed reads them)
+        try idx.writeReplayStatus();
+        std.log.info("Backfill complete. Exiting.", .{});
+        return;
+    }
+
+    if (args.cdp_backfill) {
+        std.log.info("Running in --cdp-backfill mode: ingesting history from the CDP SQL API", .{});
+        try @import("indexer/cdp_intake.zig").runCdpBackfill(&idx, args.from_block, args.to_block);
+        std.log.info("CDP backfill complete. Exiting.", .{});
+        return;
+    }
+
     std.log.info("Indexer started - indexing blocks...", .{});
 
-    // Run indexer in main thread (no spawning needed)
+    // Run indexer in main thread (no spawning needed). SIGTERM/SIGINT flips the
+    // shutdown flag; the sync loops exit at the next batch boundary and the
+    // deferred idx.deinit/database.deinit chain runs in order.
+    shutdown.install();
     try idx.start();
+    std.log.info("Shutdown complete.", .{});
 }
 
 test {

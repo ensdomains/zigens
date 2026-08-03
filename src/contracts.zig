@@ -4,17 +4,24 @@ const Address = @import("types/address.zig").Address;
 pub const Network = enum {
     sepolia,
     mainnet,
+    /// Base mainnet (chain id 8453). Manifest-only: there are no built-in
+    /// contract defaults — a deployment MUST set MANIFEST_PATH (the committed
+    /// manifests/base.zon is the all-disabled substrate until a Basenames
+    /// adapter wires real contracts).
+    base,
 
     pub fn toString(self: Network) []const u8 {
         return switch (self) {
             .sepolia => "sepolia",
             .mainnet => "mainnet",
+            .base => "base",
         };
     }
 
     pub fn fromString(s: []const u8) !Network {
         if (std.ascii.eqlIgnoreCase(s, "sepolia")) return .sepolia;
         if (std.ascii.eqlIgnoreCase(s, "mainnet")) return .mainnet;
+        if (std.ascii.eqlIgnoreCase(s, "base")) return .base;
         return error.UnknownNetwork;
     }
 
@@ -27,6 +34,16 @@ pub const Network = enum {
         return switch (self) {
             .sepolia => 11155111,
             .mainnet => 1,
+            .base => 8453,
+        };
+    }
+
+    /// The registrar root: 2LDs registered through the base-registrar/controller
+    /// surface become `<label>.<rootName()>`. Basenames registers under base.eth.
+    pub fn rootName(self: Network) []const u8 {
+        return switch (self) {
+            .sepolia, .mainnet => "eth",
+            .base => "base.eth",
         };
     }
 };
@@ -90,6 +107,9 @@ pub const ContractAddresses = struct {
     // ═══════════════════════════════════════════════════════════════════════
     v1_deployment_block: u64, // V1 Permanent Registrar (Base Registrar) deployment
     v2_deployment_block: u64, // V2 protocol deployment (0 if not deployed on this network)
+    // Last block of the V1 era on this network; 0 = V1 has no sunset. Deployment
+    // data, not a code constant — set it only when a real cutover is decided.
+    v1_end_block: u64 = 0,
 
     // V1 historical markers (mainnet specific; 0 on testnets)
     temp_registrar_start_block: u64, // Temporary Registrar deployment (May 2017)
@@ -111,6 +131,9 @@ pub fn getContractAddresses(network: Network) !ContractAddresses {
     return switch (network) {
         .sepolia => sepoliaAddresses(),
         .mainnet => mainnetAddresses(),
+        // Manifest-only network: silent all-zero defaults would violate the
+        // "required present or explicitly disabled; never silent mis-index" rule.
+        .base => error.ManifestRequired,
     };
 }
 

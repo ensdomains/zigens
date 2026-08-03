@@ -75,6 +75,7 @@ pub const GraphQLHandler = struct {
         try executor.registerResolver("wrappedDomains", resolvers.resolveWrappedDomains);
         try executor.registerResolver("_meta", resolvers.resolveMeta);
         try executor.registerResolver("_finality", resolvers.resolveFinality);
+        try executor.registerResolver("_coverage", resolvers.resolveCoverage);
 
         // Build the schema validator once from the embedded introspection JSON.
         // It indexes the introspection types into hash maps used to reject
@@ -167,7 +168,9 @@ pub const GraphQLHandler = struct {
 
         // Parse the query using the arena allocator
         var document = parser.parseQuery(request_alloc, query) catch |err| {
-            std.log.err("Failed to parse GraphQL query: {}", .{err});
+            // warn, not err: this is client-controlled input (any visitor can send an
+            // unparseable query); err-level would let clients spam error alerts.
+            std.log.warn("Failed to parse GraphQL query: {}", .{err});
             self.metrics.recordError();
             return try self.buildErrorResponseWithCode("Invalid GraphQL syntax", ErrorCode.SYNTAX_ERROR);
         };
@@ -288,7 +291,9 @@ pub const GraphQLHandler = struct {
 
         // Execute the parsed query with the per-request executor (arena-backed)
         const result = request_executor.executeDocument(&document, variables, operation_name) catch |err| {
-            std.log.err("Failed to execute GraphQL query: {}", .{err});
+            // warn, not err: execution failures include client-driven rejections
+            // (complexity LimitExceeded, bad arguments) — not server faults.
+            std.log.warn("Failed to execute GraphQL query: {}", .{err});
             self.metrics.recordError();
             if (err == error.OperationNotFound) {
                 return try self.buildErrorResponseWithCode("Operation not found", ErrorCode.VALIDATION_ERROR);

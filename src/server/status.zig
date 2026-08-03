@@ -83,6 +83,10 @@ pub const StatusServer = struct {
 
     pub fn stop(self: *StatusServer) void {
         self.running.store(false, .seq_cst);
+        // Wake the blocked accept: shutdown(2) makes it fail with
+        // error.SocketNotListening (which run() treats as stop) — without this,
+        // join blocks until one more connection happens to arrive.
+        _ = std.c.shutdown(self.listener.socket.handle, std.c.SHUT.RDWR);
         if (self.thread) |thread| {
             thread.join();
         }

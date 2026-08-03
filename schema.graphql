@@ -2,8 +2,17 @@
 # This schema defines the GraphQL API for querying ENS V2 data
 
 type Query {
-  """Get a single domain by name or namehash. Exact get: returns the row even if non-normalized (unlike domains/where.name, which default-hide non-normalized names); unreachable rows are still hidden (returns null)."""
-  domain(id: String!): Domain
+  """
+  Get a single domain by name or namehash. Exact get: returns the row even if
+  non-normalized (unlike domains/where.name, which default-hide non-normalized
+  names); unreachable rows are still hidden (returns null). `atBlock` (ensv2
+  extension) reconstructs the domain's state as of that block from the event
+  log — V2 names only; scalar fields, `resolver { addr text(key:) contentHash }`
+  and `resolvedAddress` are historical; list record fields return empty at-block;
+  nested domain entities (parent/subdomains) reflect current state; an
+  out-of-range block or a name without V2 event history resolves to null.
+  """
+  domain(id: String!, atBlock: Int): Domain
 
   """Get multiple domains with pagination and filtering (legacy offset-based)"""
   domains(first: Int = 100, skip: Int = 0, where: DomainFilter, orderBy: Domain_orderBy, orderDirection: OrderDirection): [Domain!]!
@@ -116,6 +125,33 @@ type Query {
   `safe`/`finalized` are null until FINALITY_ENABLED and the indexer has fetched them.
   """
   _finality: Finality!
+
+  """
+  What this deployment indexes (ensv2 extension): chain id, per-protocol indexed
+  head + last-sync time, and a staleness flag. `stale` is false when finality data
+  is absent (default deployments); `_finality.isStale` is the conservative variant.
+  """
+  _coverage: Coverage!
+}
+
+"""Deployment coverage declaration (ensv2 extension)."""
+type Coverage {
+  """EVM chain id this deployment indexes."""
+  chainId: Int!
+  """True only when finality data shows the indexed head behind the chain's safe point."""
+  stale: Boolean!
+  """Per-protocol indexed positions."""
+  protocols: [ProtocolCoverage!]!
+}
+
+"""One protocol's indexed position within `Coverage`."""
+type ProtocolCoverage {
+  """Protocol name: "v1" or "v2"."""
+  protocol: String!
+  """Highest block synced for this protocol (0 = never synced)."""
+  indexedHead: Int!
+  """When the head last advanced (unix seconds), or null when never synced."""
+  lastSyncedAt: Int
 }
 
 """Finality positions + a staleness signal (ensv2 extension)."""
@@ -390,6 +426,9 @@ type Domain {
   """Whether the name passes ENSIP-15 normalization (computed at query time)"""
   isNormalized: Boolean!
 
+  """Finality tier of this domain's CURRENT state — how settled it is against chain finality. FINALIZED = the last change is at/below the finalized head (will not reorg); SAFE = at/below the safe head; HEAD = in the unsafe zone (may still reorg). Null when finality tracking is disabled (FINALITY_ENABLED off), so a client can distinguish 'unknown' from 'unsafe'."""
+  finality: DomainFinality
+
   """Events associated with this domain"""
   events(first: Int = 100, where: EventFilter): [Event!]!
 
@@ -431,7 +470,7 @@ type Account {
   """Reverse-resolved primary name for this address (V1 ReverseRegistrar + NameChanged path). Null if not claimed."""
   primaryName: String
 
-  """ENSIP-3 forward verification of `primaryName` (Task 05). Additive — does NOT alter `primaryName`. VERIFIED = the name's resolver.addr(node) forward-resolves back to this address; MISMATCH = it resolves to a different address; UNVERIFIED = no forward record / the on-chain read reverted / not checked. Null unless PRIMARY_VERIFY_ENABLED, and computed only for single-entity lookups (never per-row in a list)."""
+  """ENSIP-3 forward verification of `primaryName` (Task 05). Additive — does NOT alter `primaryName`. VERIFIED = the name's forward resolution (via the Universal Resolver when configured) points back to this address; MISMATCH = it resolves to a different address; INVALID_NAME = the claimed name is not ENSIP-15 normalized; NOT_FOUND = no resolver/record; UNVERIFIED = the on-chain read reverted / errored / not checked. Null unless PRIMARY_VERIFY_ENABLED, and computed only for single-entity lookups (never per-row in a list)."""
   primaryNameVerification: PrimaryNameVerification
 
   """V1 NameWrapper wrapped-domain records owned by this account."""
@@ -1081,6 +1120,14 @@ input EventFilter {
   """Filter by contract address"""
   contractAddress: String
 
+  """
+  Address involvement (ensv2 extension): matches events where the address is the
+  owner, sender (`from`), or recipient (`to`). Per-address history is
+  `events(where:{involved:"0x…"}, orderBy: blockNumber, orderDirection: asc)`;
+  per-name history is `events(where:{namehash:"0x…"})`.
+  """
+  involved: String
+
   """Filter by namehash"""
   namehash: String
 
@@ -1336,12 +1383,26 @@ enum OrderDirection {
 }
 
 """ENSIP-3 forward-verification verdict for an account's `primaryName` (Task 05)."""
+"""How settled a domain's current state is against chain finality (finality-tiered reads)."""
+enum DomainFinality {
+  """The last change is at/below the finalized head; it will not reorg."""
+  FINALIZED
+  """The last change is at/below the safe head but above finalized."""
+  SAFE
+  """The last change is in the unsafe zone above the safe head; it may still reorg."""
+  HEAD
+}
+
 enum PrimaryNameVerification {
   """The name's resolver.addr(node) resolves back to this address."""
   VERIFIED
   """The name resolves forward to a DIFFERENT address."""
   MISMATCH
-  """No usable forward evidence (no resolver/record, revert, RPC error, or not checked)."""
+  """The claimed name is not ENSIP-15 normalized (e.g. confusable/spoofed); never verified."""
+  INVALID_NAME
+  """No forward evidence exists: no resolver, or an empty/zero address record."""
+  NOT_FOUND
+  """The on-chain read could not be completed (revert or RPC error)."""
   UNVERIFIED
 }
 

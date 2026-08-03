@@ -147,6 +147,8 @@ pub const LoaderContext = struct {
                 rk[row.resolver.len] = '|';
                 @memcpy(rk[row.resolver.len + 1 ..], row.namehash);
                 if (map.getEntry(rk[0..])) |e| {
+                    // A repeat populate (aliased lists) already owns a value here.
+                    if (e.value_ptr.*) |old| self.db_allocator.free(old);
                     e.value_ptr.* = row.value;
                 } else {
                     self.db_allocator.free(row.value);
@@ -215,6 +217,8 @@ pub const LoaderContext = struct {
                 rk[109] = '|';
                 @memcpy(rk[110 .. 110 + key.len], key);
                 if (self.texts.getEntry(rk[0 .. 110 + key.len])) |e| {
+                    // A repeat populate (aliased lists) already owns a value here.
+                    if (e.value_ptr.*) |old| self.db_allocator.free(old);
                     e.value_ptr.* = row.value;
                 } else {
                     self.db_allocator.free(row.value);
@@ -244,6 +248,10 @@ pub const LoaderContext = struct {
             return null;
         }
         const fetched = try database.getAccount(address);
+        errdefer if (fetched) |acct| {
+            var row = acct;
+            row.deinit(self.db_allocator);
+        };
         // Dupe the key onto the arena so the cache key outlives the caller's `address`.
         const key_owned = try self.allocator.dupe(u8, address);
         try self.account_cache.put(key_owned, fetched);
