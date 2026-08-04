@@ -77,6 +77,23 @@ pub fn parseOrderDirection(field: *const parser.Field, comptime T: type, default
     return default;
 }
 
+/// Parse the `orderBy` arg of an `Event_orderBy` field onto a storage sort
+/// enum. Falls back to `default` when the arg is missing or unrecognized.
+///
+/// Comptime type parameter for the same reason as `parseOrderDirection`: it
+/// keeps this module free of a storage dependency. Callers pass
+/// `db.EventSortField`.
+///
+/// Keep the accepted names in sync with the `Event_orderBy` enum in
+/// `schema.graphql`.
+pub fn parseEventOrderBy(field: *const parser.Field, comptime T: type, default: T) T {
+    const order_by = parser.getStringArg(field, "orderBy", null) orelse return default;
+    if (std.mem.eql(u8, order_by, "blockNumber")) return @as(T, .block_number);
+    if (std.mem.eql(u8, order_by, "timestamp")) return @as(T, .timestamp);
+    if (std.mem.eql(u8, order_by, "name")) return @as(T, .name);
+    return default;
+}
+
 // ============================================================================
 // FILTER (where: { ... }) PARSING
 // ============================================================================
@@ -289,4 +306,85 @@ test "getObjectArg returns inner object or null" {
     try testing.expectEqualStrings("name", obj.?[0].name);
 
     try testing.expect(getObjectArg(&field, "missing") == null);
+}
+
+// `parseEventOrderBy` is generic so this module stays free of a storage
+// dependency, so exercise it against the real `EventSortField` — a local stub
+// would not catch a variant renamed on the storage side.
+const EventSortField = @import("../storage/events.zig").EventSortField;
+const EventOrderDir = @import("../storage/events.zig").OrderDir;
+
+test "parseEventOrderBy maps every Event_orderBy value" {
+    // Keep in sync with the `Event_orderBy` enum in schema.graphql.
+    const cases = [_]struct { arg: []const u8, want: EventSortField }{
+        .{ .arg = "blockNumber", .want = .block_number },
+        .{ .arg = "timestamp", .want = .timestamp },
+        .{ .arg = "name", .want = .name },
+    };
+    for (cases) |c| {
+        var args = [_]parser.Argument{
+            .{ .name = "orderBy", .value = .{ .string = c.arg } },
+        };
+        try testing.expectEqual(
+            c.want,
+            parseEventOrderBy(&makeField(&args), EventSortField, .block_number),
+        );
+    }
+}
+
+test "parseEventOrderBy falls back to default when missing or unrecognized" {
+    // Missing arg: Domain.events omits orderBy on most queries, and must then
+    // keep whatever the caller already resolved rather than silently resetting.
+    var none = [_]parser.Argument{};
+    try testing.expectEqual(
+        EventSortField.timestamp,
+        parseEventOrderBy(&makeField(&none), EventSortField, .timestamp),
+    );
+
+    // Unrecognized value: reject rather than guess. `expiry` is a real
+    // EventSortField variant but is NOT exposed by Event_orderBy, so it must
+    // not be reachable from client input.
+    var bogus = [_]parser.Argument{
+        .{ .name = "orderBy", .value = .{ .string = "expiry" } },
+    };
+    try testing.expectEqual(
+        EventSortField.timestamp,
+        parseEventOrderBy(&makeField(&bogus), EventSortField, .timestamp),
+    );
+
+    // Wrong type: an int where a string is expected must not be coerced.
+    var wrong_type = [_]parser.Argument{
+        .{ .name = "orderBy", .value = .{ .int = 1 } },
+    };
+    try testing.expectEqual(
+        EventSortField.name,
+        parseEventOrderBy(&makeField(&wrong_type), EventSortField, .name),
+    );
+}
+
+test "parseOrderDirection round-trips both directions for events" {
+    // Domain.events pairs orderBy with orderDirection; the pair is what makes
+    // `{ first: n, orderDirection: asc }` return the OLDEST n rather than the
+    // newest n rearranged, so cover the event enum explicitly.
+    var asc = [_]parser.Argument{
+        .{ .name = "orderDirection", .value = .{ .string = "asc" } },
+    };
+    try testing.expectEqual(
+        EventOrderDir.asc,
+        parseOrderDirection(&makeField(&asc), EventOrderDir, .desc),
+    );
+
+    var desc = [_]parser.Argument{
+        .{ .name = "orderDirection", .value = .{ .string = "desc" } },
+    };
+    try testing.expectEqual(
+        EventOrderDir.desc,
+        parseOrderDirection(&makeField(&desc), EventOrderDir, .asc),
+    );
+
+    var none = [_]parser.Argument{};
+    try testing.expectEqual(
+        EventOrderDir.desc,
+        parseOrderDirection(&makeField(&none), EventOrderDir, .desc),
+    );
 }

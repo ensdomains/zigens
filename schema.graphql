@@ -430,7 +430,7 @@ type Domain {
   finality: DomainFinality
 
   """Events associated with this domain"""
-  events(first: Int = 100, where: EventFilter): [Event!]!
+  events(first: Int = 100, where: EventFilter, orderBy: Event_orderBy, orderDirection: OrderDirection): [Event!]!
 
   """Count of direct subdomains (one level only). Filtered by `isReachable = 1` AND excluding fully-burned names (owner=0 AND resolver=0, mirroring subgraph's GC deletion criteria). DEPRECATED: prefer `subdomainCount` (subgraph-compatible name)."""
   subdomainsCount: Int!

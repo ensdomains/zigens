@@ -21,6 +21,7 @@ pub const loaders = @import("../loaders.zig");
 const api_common = @import("../common.zig");
 pub const parsePagination = api_common.parsePagination;
 pub const parseOrderDirection = api_common.parseOrderDirection;
+pub const parseEventOrderBy = api_common.parseEventOrderBy;
 pub const getObjectArg = api_common.getObjectArg;
 pub const matchStringArg = api_common.matchStringArg;
 pub const matchIntArg = api_common.matchIntArg;
