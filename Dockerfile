@@ -52,13 +52,21 @@ RUN ok=0; \
 COPY . .
 
 # Build all applications (generates introspection.json, builds indexer + API).
-# ReleaseSafe keeps bounds/overflow/optional-unwrap checks active in production —
-# the indexer parses untrusted RPC/ABI bytes, so safety checks are worth the cost.
+# ZIG_OPTIMIZE selects the release profile per deployment (compose passes it
+# through from the environment). Default stays ReleaseSafe: it keeps bounds/
+# overflow/optional-unwrap checks active in production, and the indexer parses
+# untrusted RPC/ABI bytes — ReleaseFast trades exactly those checks for speed,
+# so opt into it deliberately, per deploy.
 # -Dtools=false skips test-db-reader and rainbow-backfill, which the image never ships.
 # -j2 bounds concurrent compiles: peak build memory stays ~3.3GB (the api compile
 # alone needs ~2GB+ on Zig 0.16) so the build can't starve the host it shares
 # with the deployment platform.
-RUN zig build -Doptimize=ReleaseSafe -Dpg-tls=true -Dtools=false -j2
+ARG ZIG_OPTIMIZE=ReleaseSafe
+RUN case "$ZIG_OPTIMIZE" in \
+        ReleaseSafe|ReleaseFast) ;; \
+        *) echo "ZIG_OPTIMIZE must be ReleaseSafe or ReleaseFast, got: '$ZIG_OPTIMIZE'" >&2; exit 1 ;; \
+    esac && \
+    zig build -Doptimize="$ZIG_OPTIMIZE" -Dpg-tls=true -Dtools=false -j2
 
 # Stage 2: Runtime
 FROM alpine:3.22
