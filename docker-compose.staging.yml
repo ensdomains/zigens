@@ -7,6 +7,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Release profile for the Zig build: ReleaseSafe (default; keeps
+        # runtime safety checks) or ReleaseFast. Set ZIG_OPTIMIZE in the
+        # deploy environment; keep both services' args identical so they
+        # share one image build.
+        - ZIG_OPTIMIZE=${ZIG_OPTIMIZE:-ReleaseSafe}
     container_name: ensv2-indexer-v2-staging
     restart: unless-stopped
     command: ["/app/ensv2-indexer-v2"]
@@ -69,6 +75,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        - ZIG_OPTIMIZE=${ZIG_OPTIMIZE:-ReleaseSafe}
     container_name: ensv2-api-staging
     restart: unless-stopped
     command: ["/app/api-entrypoint.sh"]
