@@ -8,7 +8,35 @@ set -e
 
 RAINBOW_DB="${RAINBOW_PATH:-/app/data/ens_rainbow.db}"
 RAINBOW_DATA_DIR="/app/rainbow_data"
+export RAINBOW_DATA_DIR # read by the parallel download subshells
 RAINBOW_DOWNLOADING_MARKER="/app/data/.rainbow_downloading"
+# Never leave a stale "downloading" marker: set -e can abort the script mid-
+# download/parse, which would otherwise pin the health check at "downloading"
+# until restart. The trap does not fire on the final exec (process replaced) —
+# by then the marker has already been removed after build_rainbow.
+trap 'rm -f "$RAINBOW_DOWNLOADING_MARKER"' EXIT
+
+# List preimage object names in the public bucket via the anonymous GCS JSON
+# API (paginated), one per line. No SDK/credentials: the bucket is public —
+# this script never carried any, gsutil was accessing it anonymously too.
+list_preimage_objects() {
+    python3 - <<'PY'
+import json
+import urllib.request
+
+base = "https://storage.googleapis.com/storage/v1/b/ens-files/o?prefix=preimages/preimages-&fields=items/name,nextPageToken&maxResults=1000"
+token = None
+while True:
+    url = base + ("&pageToken=" + token if token else "")
+    with urllib.request.urlopen(url, timeout=60) as resp:
+        page = json.load(resp)
+    for item in page.get("items", []):
+        print(item["name"])
+    token = page.get("nextPageToken")
+    if not token:
+        break
+PY
+}
 
 # Function to download and build rainbow table
 build_rainbow() {
@@ -21,9 +49,8 @@ build_rainbow() {
     echo "╚════════════════════════════════════════════╝"
     echo ""
 
-    # Check if gsutil is available
-    if ! command -v gsutil &> /dev/null; then
-        echo "WARNING: gsutil not found, skipping rainbow table download"
+    if ! command -v curl &> /dev/null || ! command -v python3 &> /dev/null; then
+        echo "WARNING: curl/python3 not found, skipping rainbow table download"
         echo "Labels will show as [unknown] for unhashed names"
         return 0
     fi
@@ -34,8 +61,11 @@ build_rainbow() {
 
     mkdir -p "$RAINBOW_DATA_DIR"
 
-    # Download preimage files
-    if gsutil -m cp "gs://ens-files/preimages/preimages-*" "$RAINBOW_DATA_DIR/"; then
+    # Download preimage files (4-way parallel, per-file retries)
+    local objects
+    objects=$(list_preimage_objects) || objects=""
+    if [ -n "$objects" ] && printf '%s\n' "$objects" | xargs -P 4 -I{} sh -c \
+        'curl -fsSL --retry 3 --retry-delay 5 -o "$RAINBOW_DATA_DIR/$(basename "$1")" "https://storage.googleapis.com/ens-files/$1"' _ {}; then
         echo "Download complete, building database..."
 
         # Build database using parse_rainbow.py
@@ -52,12 +82,8 @@ build_rainbow() {
                 # Cleanup downloaded files to save space
                 rm -rf "$RAINBOW_DATA_DIR"
                 echo "Cleaned up temporary files"
-
-                # Remove downloading marker
-                rm -f "$RAINBOW_DOWNLOADING_MARKER"
             else
                 echo "ERROR: Rainbow database was not created"
-                rm -f "$RAINBOW_DOWNLOADING_MARKER"
             fi
         else
             echo "ERROR: parse_rainbow.py not found"
@@ -86,6 +112,9 @@ if [ "$DOWNLOAD_RAINBOW" = "true" ] && [ ! -f "$RAINBOW_DB" ]; then
     echo "Rainbow table not found at $RAINBOW_DB"
     echo "Starting download..."
     build_rainbow
+    # Every build_rainbow outcome — success, soft failure, missing tools —
+    # ends the "downloading" state the health check keys on.
+    rm -f "$RAINBOW_DOWNLOADING_MARKER"
 elif [ -f "$RAINBOW_DB" ]; then
     echo "Rainbow table found at $RAINBOW_DB ($(du -h "$RAINBOW_DB" | cut -f1))"
 fi

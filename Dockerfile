@@ -78,9 +78,8 @@ RUN apk add --no-cache \
 # Install Python packages for rainbow table parsing
 RUN pip3 install --break-system-packages eth-hash[pycryptodome]
 
-# Install Google Cloud SDK for gsutil (needed for rainbow table download)
-RUN curl -sSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --install-dir=/opt
-ENV PATH="/opt/google-cloud-sdk/bin:${PATH}"
+# No Google Cloud SDK: the rainbow preimages bucket is public, so
+# docker-entrypoint.sh lists and downloads it with curl/python3 (installed above).
 
 # Create app user
 RUN addgroup -g 1000 ens && \
