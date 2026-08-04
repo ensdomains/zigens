@@ -53,6 +53,9 @@ pub fn mapDomainOrderBy(order_by: ?[]const u8) db.NameSortField {
 /// centralises both the slot layout AND the parsing so they stay in sync by
 /// construction.
 const ParsedDomainFilter = struct {
+    token_id: ?[]const u8 = null,
+    canonical_id: ?[]const u8 = null,
+    registry: ?Address = null,
     name: ?[]const u8 = null,
     name_in: ?[][]const u8 = null,
     name_not: ?[]const u8 = null,
@@ -217,6 +220,9 @@ fn parseWhereArgs(where_args: []const parser.Argument, allocator: std.mem.Alloca
             (try common.matchAddressArg(a, "owner", &out.owner)) or
             (try common.matchAddressArg(a, "owner_not", &out.owner_not)) or
             (try common.matchAddressArg(a, "resolvedAddress", &out.resolved_address)) or
+            common.matchStringArg(a, "tokenId", &out.token_id) or
+            common.matchStringArg(a, "canonicalId", &out.canonical_id) or
+            (try common.matchAddressArg(a, "registry", &out.registry)) or
             (try common.matchAddressArg(a, "resolver", &out.resolver)) or
             common.matchBoolArg(a, "hasSubdomains", &out.has_subdomains) or
             common.matchIntArg(a, "subdomainCount_gt", &out.subdomain_count_gt) or
@@ -241,8 +247,21 @@ fn parseWhereArgs(where_args: []const parser.Argument, allocator: std.mem.Alloca
 
 /// Map a parsed DomainFilter (one node) to a storage `NameFilters`, recursively
 /// translating the `and`/`or` groups. Allocations are request-arena-backed.
+/// Normalize a client-supplied u256 token/canonical id to the stored column
+/// format (0x + 64 lowercase hex). Accepts 0x-hex of any length or a decimal
+/// string — marketplaces send ERC-1155 token ids as decimals. Rejects
+/// non-numeric input so a typo'd filter errors instead of silently matching
+/// nothing.
+fn normalizeU256Id(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    const v = std.fmt.parseInt(u256, raw, 0) catch return error.InvalidArgument;
+    return std.fmt.allocPrint(allocator, "0x{x:0>64}", .{v});
+}
+
 fn toNameFilters(p: *const ParsedDomainFilter, allocator: std.mem.Allocator) anyerror!db.NameFilters {
     return db.NameFilters{
+        .token_id = if (p.token_id) |v| try normalizeU256Id(allocator, v) else null,
+        .canonical_id = if (p.canonical_id) |v| try normalizeU256Id(allocator, v) else null,
+        .registry = p.registry,
         .owner = p.owner,
         .owner_in = p.owner_in,
         .owner_not = p.owner_not,
@@ -442,6 +461,7 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
         filter_label_name_ends_with == null and filter_label_name_ends_with_nocase == null;
 
     const only_name_filter = filter_name != null and
+        parsed.token_id == null and parsed.canonical_id == null and parsed.registry == null and
         filter_name_not == null and filter_name_not_in == null and
         filter_owner == null and filter_owner_in == null and
         filter_owner_not == null and filter_owner_not_in == null and
@@ -510,7 +530,8 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
     }
 
     // Check if any filters are set
-    const has_filters = filter_name != null or filter_name_in != null or
+    const has_filters = parsed.token_id != null or parsed.canonical_id != null or parsed.registry != null or
+        filter_name != null or filter_name_in != null or
         filter_name_not != null or filter_name_not_in != null or
         filter_name_contains != null or filter_name_contains_nocase != null or
         filter_name_not_contains != null or
@@ -539,6 +560,9 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
     // Use filtered query with all filters pushed to DB
     const names = if (has_filters)
         try database.getFilteredNames(.{
+            .token_id = if (parsed.token_id) |v| try normalizeU256Id(allocator, v) else null,
+            .canonical_id = if (parsed.canonical_id) |v| try normalizeU256Id(allocator, v) else null,
+            .registry = parsed.registry,
             .owner = filter_owner,
             .owner_in = filter_owner_in,
             .owner_not = filter_owner_not,
@@ -703,6 +727,9 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
     const include_unnormalized = parsed.include_unnormalized orelse false;
 
     const name_filters = db.NameFilters{
+        .token_id = if (parsed.token_id) |v| try normalizeU256Id(allocator, v) else null,
+        .canonical_id = if (parsed.canonical_id) |v| try normalizeU256Id(allocator, v) else null,
+        .registry = parsed.registry,
         .owner = filter_owner,
         .owner_in = filter_owner_in,
         .owner_not = filter_owner_not,
@@ -750,7 +777,8 @@ pub fn resolveDomainConnection(ctx: parser.ExecutionContext, field: *const parse
         .or_group = try mapFilterGroup(parsed.or_filters, allocator),
     };
 
-    const has_filters = filter_name != null or filter_name_in != null or
+    const has_filters = parsed.token_id != null or parsed.canonical_id != null or parsed.registry != null or
+        filter_name != null or filter_name_in != null or
         filter_name_not != null or filter_name_not_in != null or
         filter_name_contains != null or filter_name_contains_nocase != null or
         filter_name_not_contains != null or

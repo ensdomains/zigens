@@ -911,6 +911,15 @@ type Event {
 
 """Filter criteria for querying domains"""
 input DomainFilter {
+  """Exact match on the current versioned ERC-1155 token id (ensv2 extension) — the labelhash with its low 32 bits replaced by the token's version counter, exactly what NFT platforms send. Accepts 0x-hex or decimal. Hashing is one-way, so this is the tokenId-to-name reverse path; combine with `registry` to scope to one registry contract."""
+  tokenId: String
+
+  """Exact match on the version-masked canonical id (ensv2 extension; low 32 bits zeroed) — stable across token version bumps, for callers holding a possibly-stale token id. Accepts 0x-hex or decimal."""
+  canonicalId: String
+
+  """Registry contract address filter (ensv2 extension) — the V2 registry that owns this name's label. Combine with tokenId/canonicalId to scope a marketplace tokenId lookup to one registry."""
+  registry: String
+
   """Exact name match (list filter). Unlike domain(id:), the domains/domainConnection list default-hides non-normalized, unreachable, and synthetic-root rows unless includeUnnormalized / includeUnreachable / isNormalized override."""
   name: String
 
