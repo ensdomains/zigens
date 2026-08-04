@@ -181,6 +181,12 @@ pub fn start(self: *Indexer) !void {
             self.backfillResolverInitGaps(.v2, self.v1_client) catch |err| {
                 std.log.err("Failed to backfill resolver init gaps: {}", .{err});
             };
+            // Same bug on the registry side: subregistry init events (role
+            // grants) predate the SubregistryUpdated that made them known, so
+            // they fell below the old `created_block`-anchored backfill floor.
+            self.backfillSubregistryInitGaps(.v2, self.v1_client) catch |err| {
+                std.log.err("Failed to backfill subregistry init gaps: {}", .{err});
+            };
             std.log.info("Running unknown labels backfill...", .{});
             self.backfillUnknownLabels() catch |err| {
                 std.log.err("Failed to backfill unknown labels: {}", .{err});
@@ -311,6 +317,9 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
                     // One-shot heal (marker-gated) — see the combined loop.
                     self.backfillResolverInitGaps(.v2, client) catch |err| {
                         std.log.err("Failed to backfill resolver init gaps: {}", .{err});
+                    };
+                    self.backfillSubregistryInitGaps(.v2, client) catch |err| {
+                        std.log.err("Failed to backfill subregistry init gaps: {}", .{err});
                     };
                 }
 

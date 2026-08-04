@@ -35,14 +35,27 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
         });
         for (discovery.newly_discovered) |subreg_str| {
             const addr = Address.fromHex(subreg_str) catch continue;
-            // Scope to the subregistry's own creation block, not the indexer's start_block:
-            // a contract emits no events before it exists, so [start_block, created_block)
-            // is millions of provably-empty blocks of wasted getLogs. Fall back to
-            // start_block if the created_block is unknown (0). backfillSubregistryEvents
-            // short-circuits a from>to range (subregistry created in/after this batch).
-            const created = self.database.getSubregistryCreatedBlock(protocol, subreg_str) catch 0;
-            const backfill_from = @max(self.config.start_block, created);
-            backfillSubregistryEvents(self, protocol, client, addr, backfill_from, backfill_to) catch |err| {
+            // Anchor at start_block, NOT `registries.created_block`.
+            //
+            // `created_block` is the block of the first SubregistryUpdated — when the
+            // parent→subregistry POINTER was created (see insertRegistry, which uses
+            // INSERT OR IGNORE precisely to keep that first sighting). It is NOT the
+            // block the contract was deployed. A UserRegistry is deployed and
+            // `initialize`d — granting roles, emitting EACRolesChanged — BEFORE the
+            // parent is repointed at it, so its initialization events sit below
+            // `created_block` and no backfill anchored there can ever reach them.
+            //
+            // Observed on Sepolia: foxxx.eth's registry has created_block 11416800
+            // while its own earliest event is at 11416799. The registry was known to
+            // the indexer with ZERO indexed events, so its role holders never
+            // appeared in the app.
+            //
+            // The sweep is address-filtered and runs once per registry on first
+            // discovery, so the cost is one chunked getLogs range rather than the
+            // per-block scan the old comment implied. If that ever becomes material
+            // on a long mainnet range, the principled floor is the true deployment
+            // block from VerifiableFactory's ProxyDeployed (not currently indexed).
+            backfillSubregistryEvents(self, protocol, client, addr, self.config.start_block, backfill_to) catch |err| {
                 std.log.warn("Failed to backfill subregistry {s}: {}", .{ subreg_str, err });
             };
         }
@@ -88,9 +101,12 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
     const ENS_MAX_CHUNK: u64 = 10000; // ENS events are less common, can use larger chunks
     const ENS_MIN_CHUNK: u64 = 500; // Minimum before giving up
 
-    // Process ENS events, auto-registering unknown subregistries
+    // Process ENS events, skipping contracts that are not known subregistries.
+    // NOTE: nothing is auto-registered here — an unknown address is DROPPED. The
+    // counter was previously named `ens_auto_registered`, which made that silent
+    // loss read like a recovery and hid a whole class of missing events.
     var ens_processed: usize = 0;
-    var ens_auto_registered: usize = 0;
+    var ens_skipped_unknown: usize = 0;
     var ens_total_fetched: usize = 0;
 
     var ens_chunk_size: u64 = ENS_MAX_CHUNK;
@@ -150,7 +166,7 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
             // Only process events from known subregistries (registered via SubregistryUpdate)
             // Topic-only queries can match non-ENS contracts with similar event signatures
             if (!known_subreg_set.contains(log.address.bytes)) {
-                ens_auto_registered += 1;
+                ens_skipped_unknown += 1;
                 continue;
             }
 
@@ -190,7 +206,7 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
         std.log.info("    Fetched {d} events, processed {d}, skipped {d} (unknown contracts)", .{
             ens_total_fetched,
             ens_processed,
-            ens_auto_registered,
+            ens_skipped_unknown,
         });
     }
 
@@ -744,6 +760,76 @@ pub fn backfillResolverInitGaps(self: *Indexer, protocol: models.Protocol, clien
     var mq = db_mod.Query.init(self.database, mark_sql) catch return;
     defer mq.deinit();
     mq.bindTextStatic("resolver_init_gaps") catch return;
+    mq.bindInt(1) catch return;
+    mq.bindInt64(zsys.timestamp()) catch return;
+    mq.bindInt64(@intCast(healed)) catch return;
+    mq.exec() catch {};
+}
+
+/// One-shot heal for subregistries whose initialization events were never
+/// indexed because the newly-discovered backfill was anchored at
+/// `registries.created_block`.
+///
+/// `created_block` is the block of the first SubregistryUpdated — when the
+/// parent→subregistry POINTER was created — not the block the contract was
+/// deployed. A UserRegistry is deployed and `initialize`d (granting roles,
+/// emitting EACRolesChanged) BEFORE the parent is repointed at it, so those
+/// events sit below the old floor and were structurally unreachable.
+///
+/// Existing databases keep that gap even after the floor is corrected, because
+/// the affected registries are no longer "newly discovered". Re-sweep every
+/// known subregistry from the sync start once. Marker-gated so it runs once per
+/// database; handlers are idempotent upserts, so re-processing is harmless.
+///
+/// Mirrors `backfillResolverInitGaps`, which heals the identical bug on the
+/// resolver side.
+pub fn backfillSubregistryInitGaps(self: *Indexer, protocol: models.Protocol, client: *rpc.Client) !void {
+    if (protocol != .v2) return;
+    const db_mod = @import("../storage/database.zig");
+
+    {
+        var check = db_mod.Query.init(self.database, "SELECT completed FROM backfill_status WHERE task = 'subregistry_init_gaps'") catch return;
+        defer check.deinit();
+        if (check.step() catch false) {
+            if (check.getInt(0) == 1) return;
+        }
+    }
+    std.log.info("Running subregistry init-gap heal (one-shot)...", .{});
+
+    const backfill_from = self.config.start_block;
+    var targets: std.ArrayList(Address) = .empty;
+    defer targets.deinit(self.allocator);
+    {
+        var q = try db_mod.Query.init(self.database, "SELECT address FROM known_subregistries WHERE protocol = ?");
+        defer q.deinit();
+        try q.bindTextStatic(protocol.toString());
+        while (try q.step()) {
+            const addr_slice = q.getTextSlice(0) orelse continue;
+            const addr = Address.fromHex(addr_slice) catch continue;
+            try targets.append(self.allocator, addr);
+        }
+    }
+
+    // Sweep to the last block already indexed: anything past it is covered by
+    // the normal batch path, and re-fetching it would duplicate RPC work.
+    const to_block = (self.database.getSyncState(protocol) catch null) orelse 0;
+
+    var healed: usize = 0;
+    for (targets.items) |addr| {
+        if (to_block < backfill_from) break;
+        backfillSubregistryEvents(self, protocol, client, addr, backfill_from, to_block) catch |err| {
+            std.log.warn("Subregistry init-gap backfill failed: {}", .{err});
+            continue;
+        };
+        healed += 1;
+    }
+    std.log.info("Subregistry init-gap heal complete: {d}/{d} subregistr{s} backfilled", .{ healed, targets.items.len, if (targets.items.len == 1) "y" else "ies" });
+
+    const mark_sql = try self.database.upsertSql(self.allocator, "backfill_status", &.{ "task", "completed", "completed_at", "records_processed" }, .replace);
+    defer self.allocator.free(mark_sql);
+    var mq = db_mod.Query.init(self.database, mark_sql) catch return;
+    defer mq.deinit();
+    mq.bindTextStatic("subregistry_init_gaps") catch return;
     mq.bindInt(1) catch return;
     mq.bindInt64(zsys.timestamp()) catch return;
     mq.bindInt64(@intCast(healed)) catch return;

@@ -490,6 +490,7 @@ pub const Indexer = struct {
     pub const indexTransferEvents = event_fetchers.indexTransferEvents;
     pub const indexResolverEvents = event_fetchers.indexResolverEvents;
     pub const backfillResolverInitGaps = event_fetchers.backfillResolverInitGaps;
+    pub const backfillSubregistryInitGaps = event_fetchers.backfillSubregistryInitGaps;
     pub const indexV2ReverseRegistrarEvents = event_fetchers.indexV2ReverseRegistrarEvents;
     pub const indexV2RenewerEvents = event_fetchers.indexV2RenewerEvents;
     pub const indexLabelStoreEvents = event_fetchers.indexLabelStoreEvents;
