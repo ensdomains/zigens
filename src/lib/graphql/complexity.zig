@@ -77,9 +77,9 @@ pub const ComplexityAnalysis = struct {
 ///   1. Fragments are expanded (named + inline) — otherwise `...Frag { deep }`
 ///      bypasses depth and cost.
 ///   2. `first: $var` resolution order: runtime variable value (if request
-///      supplied one) → declared default → `max_pagination_assumption` (worst
-///      case). Reading the runtime value is what makes `first: 6` actually
-///      cost 6× and not 1000×.
+///      supplied one) → declared default → treated as not provided, charged
+///      like an omitted argument (the resolver's default page). Reading the
+///      runtime value is what makes `first: 6` actually cost 6× and not 1000×.
 ///   3. The pagination multiplier is NOT capped — `domains(first: 1000)` costs
 ///      1000, not 100. This lets cost properly catch nested-list amplification.
 ///   4. Each request is analyzed against its OWN variables. The same query
@@ -231,8 +231,9 @@ pub const ComplexityAnalyzer = struct {
     /// Without (1), a query parameterized as `first: $n` would always cost the
     /// worst case even when the client sends `n: 6`, blocking legitimate use.
     /// With (1), each request is analyzed against its own values: small `first`
-    /// pays small cost, large `first` pays large cost. The worst case still
-    /// applies when no runtime value is supplied.
+    /// pays small cost, large `first` pays large cost. A hostile SUPPLIED value
+    /// is still priced (and clamped at `max_pagination_assumption`); only the
+    /// unsupplied case drops to the omitted-argument charge.
     fn getFieldMultiplier(self: *ComplexityAnalyzer, field: *const parser.Field, current_depth: u32) u32 {
         args: for (field.arguments) |arg| {
             if (!std.mem.eql(u8, arg.name, "first") and !std.mem.eql(u8, arg.name, "limit")) continue;
