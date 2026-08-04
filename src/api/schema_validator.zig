@@ -22,6 +22,44 @@
 const std = @import("std");
 const parser = @import("../lib/graphql/parser.zig");
 
+/// Last validation failure detail for the CURRENT THREAD — the offending
+/// field/argument names plus the byte offset of the offending node, for the
+/// client-facing error message and its `locations` entry. Zig errors carry
+/// no payload and the validator instance is shared across request threads, so
+/// the diagnostic rides in a threadlocal: written at the error site, read by
+/// the handler on the same thread immediately after the failed call.
+threadlocal var diag_buf: [192]u8 = undefined;
+threadlocal var diag_len: usize = 0;
+threadlocal var diag_pos: ?usize = null;
+
+fn setDiag(pos: usize, comptime fmt: []const u8, args: anytype) void {
+    diag_pos = pos;
+    const written = std.fmt.bufPrint(&diag_buf, fmt, args) catch {
+        diag_len = 0;
+        return;
+    };
+    diag_len = written.len;
+}
+
+/// The current thread's last validation diagnostic, or null. Only meaningful
+/// immediately after an error return; call `clearDiag` before validating.
+pub fn lastDiagnostic() ?[]const u8 {
+    return if (diag_len == 0) null else diag_buf[0..diag_len];
+}
+
+/// Byte offset (into the query source) of the node behind the last
+/// diagnostic — the handler converts it to the error's line/column.
+pub fn lastDiagnosticPos() ?usize {
+    return diag_pos;
+}
+
+/// Reset the thread's diagnostic so a validation pass can never surface a
+/// stale detail from an earlier request on the same thread.
+pub fn clearDiag() void {
+    diag_len = 0;
+    diag_pos = null;
+}
+
 pub const SchemaValidator = struct {
     allocator: std.mem.Allocator,
 
@@ -143,10 +181,11 @@ pub const SchemaValidator = struct {
             defer self.allocator.free(composite);
             const spec = self.root_field_args.get(composite) orelse {
                 std.log.warn("validateRootField: `{s}` got unknown arg `{s}`", .{ field.name, arg.name });
+                setDiag(arg.pos, "`{s}` has no argument `{s}`", .{ field.name, arg.name });
                 return error.UnknownArgument;
             };
             if (arg.value == .object) {
-                try self.validateInputObject(spec.inner_type_name, arg.value.object);
+                try self.validateInputObject(spec.inner_type_name, arg.value.object, arg.pos);
             }
         }
 
@@ -161,12 +200,16 @@ pub const SchemaValidator = struct {
             const arg_name = key[prefix.len..];
             if (!hasArg(field, arg_name)) {
                 std.log.warn("validateRootField: `{s}` requires arg `{s}`", .{ field.name, arg_name });
+                setDiag(field.pos, "`{s}` requires argument `{s}`", .{ field.name, arg_name });
                 return error.MissingRequiredArg;
             }
         }
     }
 
-    fn validateInputObject(self: *SchemaValidator, type_name: []const u8, args: []parser.Argument) Error!void {
+    /// `ctx_pos` — byte offset of the argument/field that holds this input
+    /// object; anchors the missing-required-field error, which has no node
+    /// of its own to point at.
+    fn validateInputObject(self: *SchemaValidator, type_name: []const u8, args: []parser.Argument, ctx_pos: usize) Error!void {
         if (!self.input_object_types_present.contains(type_name)) return;
 
         for (args) |a| {
@@ -174,10 +217,11 @@ pub const SchemaValidator = struct {
             defer self.allocator.free(composite);
             const spec = self.input_object_fields.get(composite) orelse {
                 std.log.warn("validateInputObject: `{s}` has no field `{s}`", .{ type_name, a.name });
+                setDiag(a.pos, "`{s}` has no field `{s}`", .{ type_name, a.name });
                 return error.UnknownInputObjectField;
             };
             if (a.value == .object) {
-                try self.validateInputObject(spec.inner_type_name, a.value.object);
+                try self.validateInputObject(spec.inner_type_name, a.value.object, a.pos);
             }
         }
 
@@ -196,7 +240,10 @@ pub const SchemaValidator = struct {
                     break;
                 }
             }
-            if (!found) return error.MissingRequiredArg;
+            if (!found) {
+                setDiag(ctx_pos, "`{s}` requires field `{s}`", .{ type_name, field_name });
+                return error.MissingRequiredArg;
+            }
         }
     }
 };
@@ -244,4 +291,82 @@ fn parseArgSpec(type_val: std.json.Value, allocator: std.mem.Allocator, owned_ke
         .inner_kind = kind_owned,
         .inner_type_name = name_owned,
     };
+}
+
+const testing = std.testing;
+
+// Minimal introspection: `thing(id: String!, where: ThingFilter)` where
+// ThingFilter declares `ok: Int` and `must: Int!` — enough to drive all four
+// diagnostic paths without depending on the real schema.
+const TEST_INTROSPECTION =
+    \\{"data":{"__schema":{"queryType":{"name":"Query"},"types":[
+    \\{"kind":"OBJECT","name":"Query","fields":[
+    \\{"name":"thing","args":[
+    \\{"name":"id","type":{"kind":"NON_NULL","name":null,"ofType":{"kind":"SCALAR","name":"String"}}},
+    \\{"name":"where","type":{"kind":"INPUT_OBJECT","name":"ThingFilter"}}]}]},
+    \\{"kind":"INPUT_OBJECT","name":"ThingFilter","inputFields":[
+    \\{"name":"ok","type":{"kind":"SCALAR","name":"Int"}},
+    \\{"name":"must","type":{"kind":"NON_NULL","name":null,"ofType":{"kind":"SCALAR","name":"Int"}}}]}
+    \\]}}}
+;
+
+// Validate `query` against TEST_INTROSPECTION and assert the error, the
+// diagnostic text, and that the diagnostic position lands on `anchor`
+// (its first occurrence in the query source).
+fn expectDiag(query: []const u8, expected_err: anyerror, expected_text: []const u8, anchor: []const u8) !void {
+    var validator = try SchemaValidator.init(testing.allocator, TEST_INTROSPECTION);
+    defer validator.deinit();
+    var doc = try parser.parseQuery(testing.allocator, query);
+    defer doc.deinit(testing.allocator);
+    clearDiag();
+    try testing.expectError(expected_err, validator.validateRootField(&doc.operations[0].fields[0]));
+    try testing.expectEqualStrings(expected_text, lastDiagnostic().?);
+    try testing.expectEqual(std.mem.indexOf(u8, query, anchor).?, lastDiagnosticPos().?);
+}
+
+test "unknown argument: diagnostic names it and anchors at the argument" {
+    try expectDiag(
+        "{ thing(id: \"x\", nope: 1) { id } }",
+        error.UnknownArgument,
+        "`thing` has no argument `nope`",
+        "nope",
+    );
+}
+
+test "missing required root argument: anchors at the field" {
+    try expectDiag(
+        "{ thing(where: {ok: 1, must: 2}) { id } }",
+        error.MissingRequiredArg,
+        "`thing` requires argument `id`",
+        "thing",
+    );
+}
+
+test "unknown input-object field: anchors at the offending field" {
+    try expectDiag(
+        "{ thing(id: \"x\", where: {bogus: 1, must: 2}) { id } }",
+        error.UnknownInputObjectField,
+        "`ThingFilter` has no field `bogus`",
+        "bogus",
+    );
+}
+
+test "missing required input-object field: anchors at the enclosing argument" {
+    try expectDiag(
+        "{ thing(id: \"x\", where: {ok: 1}) { id } }",
+        error.MissingRequiredArg,
+        "`ThingFilter` requires field `must`",
+        "where",
+    );
+}
+
+test "valid query leaves no diagnostic" {
+    var validator = try SchemaValidator.init(testing.allocator, TEST_INTROSPECTION);
+    defer validator.deinit();
+    var doc = try parser.parseQuery(testing.allocator, "{ thing(id: \"x\", where: {ok: 1, must: 2}) { id } }");
+    defer doc.deinit(testing.allocator);
+    clearDiag();
+    try validator.validateRootField(&doc.operations[0].fields[0]);
+    try testing.expect(lastDiagnostic() == null);
+    try testing.expectEqual(@as(?usize, null), lastDiagnosticPos());
 }

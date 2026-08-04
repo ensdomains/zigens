@@ -111,6 +111,7 @@ pub const GraphQLHandler = struct {
     /// and unknown root field names (those are surfaced separately by the
     /// executor as `UnknownRootField`).
     fn validateDocumentArgs(self: *GraphQLHandler, document: *const parser.Document) schema_validator_mod.SchemaValidator.Error!void {
+        schema_validator_mod.clearDiag();
         for (document.operations) |op| {
             for (op.fields) |*field| {
                 try self.schema_validator.validateRootField(field);
@@ -172,7 +173,9 @@ pub const GraphQLHandler = struct {
             // unparseable query); err-level would let clients spam error alerts.
             std.log.warn("Failed to parse GraphQL query: {}", .{err});
             self.metrics.recordError();
-            return try self.buildErrorResponseWithCode("Invalid GraphQL syntax", ErrorCode.SYNTAX_ERROR);
+            var loc_buf: [1]ErrorLocation = undefined;
+            const locations = locationFor(query, parser.lastSyntaxErrorPos(), &loc_buf);
+            return try self.buildErrorResponseWithCodeAt("Invalid GraphQL syntax", ErrorCode.SYNTAX_ERROR, locations);
         };
         defer document.deinit(request_alloc);
 
@@ -280,13 +283,24 @@ pub const GraphQLHandler = struct {
         // context that schema validation can't see).
         if (self.validateDocumentArgs(&document)) {} else |val_err| {
             self.metrics.recordError();
-            const msg = switch (val_err) {
-                error.MissingRequiredArg => "Missing required argument: see the schema for the required `Type!`-marked fields.",
-                error.UnknownArgument => "Unknown argument: the query references a root-field argument that does not exist in the schema.",
-                error.UnknownInputObjectField => "Unknown field in input object: the `where` (or similar input) contains a field not declared in its filter type.",
+            // Stable message-family prefixes (external detectors match on them and
+            // on extensions.code); the tail names the offending field/argument and
+            // `locations` carries its line/column, both via the validator's
+            // threadlocal diagnostic.
+            const base_msg = switch (val_err) {
+                error.MissingRequiredArg => "Missing required argument",
+                error.UnknownArgument => "Unknown argument",
+                error.UnknownInputObjectField => "Unknown field in input object",
                 else => "Query validation failed",
             };
-            return try self.buildErrorResponseWithCode(msg, ErrorCode.VALIDATION_ERROR);
+            var msg_buf: [280]u8 = undefined;
+            const msg = if (schema_validator_mod.lastDiagnostic()) |detail|
+                std.fmt.bufPrint(&msg_buf, "{s}: {s}.", .{ base_msg, detail }) catch base_msg
+            else
+                base_msg;
+            var loc_buf: [1]ErrorLocation = undefined;
+            const locations = locationFor(query, schema_validator_mod.lastDiagnosticPos(), &loc_buf);
+            return try self.buildErrorResponseWithCodeAt(msg, ErrorCode.VALIDATION_ERROR, locations);
         }
 
         // Execute the parsed query with the per-request executor (arena-backed)
@@ -407,6 +421,16 @@ pub const GraphQLHandler = struct {
         column: u32,
     };
 
+    /// Materialize an error `locations` slice (backed by caller-owned
+    /// `loc_buf`) from a byte offset into the query source, or null when
+    /// there is no position to report.
+    fn locationFor(query: []const u8, pos: ?usize, loc_buf: *[1]ErrorLocation) ?[]const ErrorLocation {
+        const p = pos orelse return null;
+        const loc = parser.sourceLocation(query, p);
+        loc_buf[0] = .{ .line = loc.line, .column = loc.column };
+        return loc_buf[0..1];
+    }
+
     pub const ErrorCode = enum {
         SYNTAX_ERROR,
         VALIDATION_ERROR,
@@ -430,9 +454,13 @@ pub const GraphQLHandler = struct {
     };
 
     fn buildErrorResponseWithCode(self: *GraphQLHandler, message: []const u8, code: ErrorCode) ![]u8 {
+        return self.buildErrorResponseWithCodeAt(message, code, null);
+    }
+
+    fn buildErrorResponseWithCodeAt(self: *GraphQLHandler, message: []const u8, code: ErrorCode, locations: ?[]const ErrorLocation) ![]u8 {
         const extensions = try std.fmt.allocPrint(self.allocator, "{{\"code\":\"{s}\"}}", .{code.toString()});
         defer self.allocator.free(extensions);
-        return self.buildErrorResponseFull(message, null, null, extensions);
+        return self.buildErrorResponseFull(message, locations, null, extensions);
     }
 
     /// Build a full GraphQL spec-compliant error response with all optional fields
@@ -523,6 +551,59 @@ test "handleQuery: operation named IntrospectionQuery still executes its data fi
 
 test "handleQuery: __type( inside a string argument is data, not introspection" {
     try expectQueryReturnsData("{ domains(where:{name_contains:\"__type(\"}){ id } }", null);
+}
+
+// Full-pipeline check of the error envelope: message detail, spec `locations`
+// (1-based line/column of the offending node), and extensions code.
+fn expectErrorEnvelope(query: []const u8, expected_message: []const u8, expected_locations: []const u8, expected_code: []const u8) !void {
+    const allocator = testing.allocator;
+    var database = try db.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var handler = try GraphQLHandler.init(allocator, 10, 10000, false);
+    defer handler.deinit();
+
+    const result = try handler.handleQuery(&database, query, null, null, false);
+    defer allocator.free(result);
+
+    try testing.expect(std.mem.indexOf(u8, result, expected_message) != null);
+    try testing.expect(std.mem.indexOf(u8, result, expected_locations) != null);
+    try testing.expect(std.mem.indexOf(u8, result, expected_code) != null);
+}
+
+test "handleQuery: missing required argument error carries the field's line/column" {
+    try expectErrorEnvelope(
+        "{\n  domain {\n    id\n  }\n}",
+        "Missing required argument: `domain` requires argument `id`.",
+        "\"locations\":[{\"line\":2,\"column\":3}]",
+        "\"code\":\"VALIDATION_ERROR\"",
+    );
+}
+
+test "handleQuery: unknown argument error carries the argument's line/column" {
+    try expectErrorEnvelope(
+        "{ domains(bogusArg: 1) { id } }",
+        "Unknown argument: `domains` has no argument `bogusArg`.",
+        "\"locations\":[{\"line\":1,\"column\":11}]",
+        "\"code\":\"VALIDATION_ERROR\"",
+    );
+}
+
+test "handleQuery: unknown where-field error carries the field's line/column" {
+    try expectErrorEnvelope(
+        "{ domains(where: {totallyBogus: 1}) { id } }",
+        "Unknown field in input object: `DomainFilter` has no field `totallyBogus`.",
+        "\"locations\":[{\"line\":1,\"column\":19}]",
+        "\"code\":\"VALIDATION_ERROR\"",
+    );
+}
+
+test "handleQuery: syntax error carries the failing token's line/column" {
+    try expectErrorEnvelope(
+        "{\n  domains(\n}",
+        "Invalid GraphQL syntax",
+        "\"locations\":[{\"line\":3,\"column\":1}]",
+        "\"code\":\"SYNTAX_ERROR\"",
+    );
 }
 
 test "handleQuery: real __schema query still returns introspection" {

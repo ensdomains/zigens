@@ -1,0 +1,1 @@
+{"errors":[{"message":"Unknown field in input object: `DomainFilter` has no field `totallyBogus`.","locations":[{"line":1,"column":19}],"extensions":{"code":"VALIDATION_ERROR"}}],"data":null}

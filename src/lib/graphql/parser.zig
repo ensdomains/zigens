@@ -271,6 +271,37 @@ pub const Lexer = struct {
 // AST (Abstract Syntax Tree)
 // ============================================================================
 
+pub const SourceLocation = struct {
+    line: u32,
+    column: u32,
+};
+
+/// Convert a byte offset into the 1-based line/column of GraphQL error
+/// `locations`. Treats \n, \r, and \r\n as single line terminators (GraphQL
+/// LineTerminator). Columns count Unicode code points (UTF-8 continuation
+/// bytes don't advance), matching graphql-js for all non-astral text.
+/// Offsets past the end clamp to the end of the source.
+pub fn sourceLocation(source: []const u8, offset: usize) SourceLocation {
+    const end = @min(offset, source.len);
+    var line: u32 = 1;
+    var column: u32 = 1;
+    var i: usize = 0;
+    while (i < end) : (i += 1) {
+        const byte = source[i];
+        if (byte == '\n') {
+            line += 1;
+            column = 1;
+        } else if (byte == '\r') {
+            line += 1;
+            column = 1;
+            if (i + 1 < end and source[i + 1] == '\n') i += 1;
+        } else if (byte & 0xC0 != 0x80) {
+            column += 1;
+        }
+    }
+    return .{ .line = line, .column = column };
+}
+
 pub const Value = union(enum) {
     int: i64,
     float: f64,
@@ -306,6 +337,7 @@ pub const Value = union(enum) {
 pub const Argument = struct {
     name: []const u8,
     value: Value,
+    pos: usize = 0, // Byte offset of the name token in the source (0 when synthesized from variables)
 
     pub fn deinit(self: *Argument, allocator: std.mem.Allocator) void {
         self.value.deinit(allocator);
@@ -332,6 +364,7 @@ pub const Field = struct {
     selections: []Field,
     fragment_spread: ?[]const u8, // If this is a fragment spread (...FragmentName), this is the fragment name
     directives: []Directive, // Field directives (e.g., @skip, @include)
+    pos: usize = 0, // Byte offset of the field's first token in the source (alias when aliased)
 
     pub fn deinit(self: *Field, allocator: std.mem.Allocator) void {
         for (self.arguments) |*arg| {
@@ -876,6 +909,7 @@ pub const Parser = struct {
         if (self.current_token.type != .spread) {
             return error.ExpectedSpread;
         }
+        const start_pos = self.current_token.start;
         self.advance();
 
         // Check for inline fragment (... on Type { ... })
@@ -902,6 +936,7 @@ pub const Parser = struct {
                 .selections = selections,
                 .fragment_spread = null, // Not a named fragment spread
                 .directives = directives,
+                .pos = start_pos,
             };
         }
 
@@ -923,6 +958,7 @@ pub const Parser = struct {
             .selections = &.{},
             .fragment_spread = frag_name,
             .directives = directives,
+            .pos = start_pos,
         };
     }
 
@@ -931,6 +967,7 @@ pub const Parser = struct {
             return error.ExpectedFieldName;
         }
 
+        const start_pos = self.current_token.start;
         const name = self.current_token.value;
         var alias: ?[]const u8 = null;
         self.advance();
@@ -969,6 +1006,7 @@ pub const Parser = struct {
             .selections = selections,
             .fragment_spread = null,
             .directives = directives,
+            .pos = start_pos,
         };
     }
 
@@ -1040,6 +1078,7 @@ pub const Parser = struct {
             return error.ExpectedArgumentName;
         }
 
+        const arg_pos = self.current_token.start;
         const arg_name = self.current_token.value;
         self.advance();
 
@@ -1053,6 +1092,7 @@ pub const Parser = struct {
         return Argument{
             .name = arg_name,
             .value = value,
+            .pos = arg_pos,
         };
     }
 
@@ -1164,6 +1204,7 @@ pub const Parser = struct {
             if (self.current_token.type != .name) {
                 return error.ExpectedFieldName;
             }
+            const field_pos = self.current_token.start;
             const field_name = self.current_token.value;
             self.advance();
 
@@ -1179,6 +1220,7 @@ pub const Parser = struct {
             try fields.append(self.allocator, Argument{
                 .name = field_name,
                 .value = field_value,
+                .pos = field_pos,
             });
 
             // Skip optional comma
@@ -1326,6 +1368,7 @@ pub const Executor = struct {
                     resolved_args[i] = Argument{
                         .name = arg.name,
                         .value = try self.resolveValue(&arg.value),
+                        .pos = arg.pos,
                     };
                     resolved_count += 1;
                 }
@@ -1591,6 +1634,7 @@ pub const Executor = struct {
             resolved_args[i] = Argument{
                 .name = arg.name,
                 .value = try self.resolveValue(&arg.value),
+                .pos = arg.pos,
             };
             resolved_count += 1;
         }
@@ -1810,9 +1854,22 @@ pub fn getValueTypeName(value: Value) []const u8 {
 // UTILITY FUNCTIONS
 // ============================================================================
 
+/// Byte offset where the last `parseQuery` on this thread failed (the token
+/// the parser was looking at), or null if it succeeded. Feeds syntax-error
+/// `locations`; reset at the start of every `parseQuery`.
+threadlocal var last_syntax_error_pos: ?usize = null;
+
+pub fn lastSyntaxErrorPos() ?usize {
+    return last_syntax_error_pos;
+}
+
 pub fn parseQuery(allocator: std.mem.Allocator, query: []const u8) !Document {
+    last_syntax_error_pos = null;
     var parser = try Parser.init(allocator, query);
-    return try parser.parseDocument();
+    return parser.parseDocument() catch |err| {
+        last_syntax_error_pos = parser.current_token.start;
+        return err;
+    };
 }
 
 test "decodeStringValue decodes GraphQL escapes into owned buffer (leak-checked)" {
@@ -1875,4 +1932,52 @@ test "parseValue produces an owned, unescaped string argument (full-parse leak c
             }
         }
     }
+}
+
+test "sourceLocation maps byte offsets to 1-based line/column" {
+    const src = "{ a }\n{ b\xc3\xa9, c }\r\nx";
+    try std.testing.expectEqual(SourceLocation{ .line = 1, .column = 1 }, sourceLocation(src, 0));
+    try std.testing.expectEqual(SourceLocation{ .line = 1, .column = 3 }, sourceLocation(src, 2));
+    try std.testing.expectEqual(SourceLocation{ .line = 2, .column = 3 }, sourceLocation(src, std.mem.indexOfScalar(u8, src, 'b').?));
+    // 'c' sits after the 2-byte e-acute: columns count code points, not bytes
+    try std.testing.expectEqual(SourceLocation{ .line = 2, .column = 7 }, sourceLocation(src, std.mem.indexOfScalar(u8, src, 'c').?));
+    // \r\n is a single line terminator
+    try std.testing.expectEqual(SourceLocation{ .line = 3, .column = 1 }, sourceLocation(src, std.mem.indexOfScalar(u8, src, 'x').?));
+    try std.testing.expectEqual(sourceLocation(src, src.len), sourceLocation(src, 9999));
+}
+
+test "parseQuery records the failure position for syntax errors" {
+    const a = std.testing.allocator;
+
+    const bad = "{ domains( } }";
+    try std.testing.expectError(error.ExpectedArgumentName, parseQuery(a, bad));
+    try std.testing.expectEqual(std.mem.indexOfScalar(u8, bad, '}').?, lastSyntaxErrorPos().?);
+
+    // Unterminated document fails at EOF; sourceLocation clamps to the end.
+    const eof = "{ domains { id }";
+    if (parseQuery(a, eof)) |doc| {
+        var d = doc;
+        d.deinit(a);
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try std.testing.expectEqual(eof.len, lastSyntaxErrorPos().?);
+
+    // A successful parse resets the thread's failure position.
+    var doc = try parseQuery(a, "{ domains { id } }");
+    doc.deinit(a);
+    try std.testing.expectEqual(@as(?usize, null), lastSyntaxErrorPos());
+}
+
+test "parser records source positions for fields, arguments, and object fields" {
+    const a = std.testing.allocator;
+    const query = "{\n  domains(first: 1, where: {name_contains: \"x\"}) {\n    id\n  }\n}";
+    var doc = try parseQuery(a, query);
+    defer doc.deinit(a);
+    const field = doc.operations[0].fields[0];
+    try std.testing.expectEqual(std.mem.indexOf(u8, query, "domains").?, field.pos);
+    try std.testing.expectEqual(std.mem.indexOf(u8, query, "first").?, field.arguments[0].pos);
+    const where_arg = field.arguments[1];
+    try std.testing.expectEqual(std.mem.indexOf(u8, query, "where").?, where_arg.pos);
+    try std.testing.expectEqual(std.mem.indexOf(u8, query, "name_contains").?, where_arg.value.object[0].pos);
+    try std.testing.expectEqual(std.mem.indexOf(u8, query, "id").?, field.selections[0].pos);
 }
