@@ -1642,6 +1642,12 @@ fn domainEventsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: 
         .limit = first_arg,
     };
 
+    // Ordering is applied in SQL, BEFORE `first` truncates. Sorting the page
+    // client-side cannot substitute for this: `{ first: 10, orderDirection:
+    // asc }` must return the OLDEST 10 events, not the newest 10 rearranged.
+    filter_opts.sort_field = api_common.parseEventOrderBy(field, db.EventSortField, filter_opts.sort_field);
+    filter_opts.order_dir = api_common.parseOrderDirection(field, db.EventOrderDir, filter_opts.order_dir);
+
     var event_types_list: std.ArrayList([]const u8) = .empty;
     defer event_types_list.deinit(nested_ctx.allocator);
 

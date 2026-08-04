@@ -108,11 +108,7 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
     else
         db.EventFilterOptions{};
 
-    if (parser.getStringArg(field, "orderBy", null)) |order_by| {
-        if (std.mem.eql(u8, order_by, "blockNumber")) filter_opts.sort_field = .block_number;
-        if (std.mem.eql(u8, order_by, "timestamp")) filter_opts.sort_field = .timestamp;
-        if (std.mem.eql(u8, order_by, "name")) filter_opts.sort_field = .name;
-    }
+    filter_opts.sort_field = common.parseEventOrderBy(field, db.EventSortField, filter_opts.sort_field);
     filter_opts.order_dir = common.parseOrderDirection(field, db.EventOrderDir, filter_opts.order_dir);
 
     // Check which top-level fields are requested (for totalCount-only fast path)
@@ -403,11 +399,7 @@ fn resolveEventsWithForced(ctx: parser.ExecutionContext, field: *const parser.Fi
         filter_opts.event_types_not = null;
     }
 
-    if (parser.getStringArg(field, "orderBy", null)) |order_by| {
-        if (std.mem.eql(u8, order_by, "blockNumber")) filter_opts.sort_field = .block_number;
-        if (std.mem.eql(u8, order_by, "timestamp")) filter_opts.sort_field = .timestamp;
-        if (std.mem.eql(u8, order_by, "name")) filter_opts.sort_field = .name;
-    }
+    filter_opts.sort_field = common.parseEventOrderBy(field, db.EventSortField, filter_opts.sort_field);
     filter_opts.order_dir = common.parseOrderDirection(field, db.EventOrderDir, filter_opts.order_dir);
 
     // Get events from database with filters
