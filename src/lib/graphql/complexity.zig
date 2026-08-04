@@ -77,9 +77,9 @@ pub const ComplexityAnalysis = struct {
 ///   1. Fragments are expanded (named + inline) — otherwise `...Frag { deep }`
 ///      bypasses depth and cost.
 ///   2. `first: $var` resolution order: runtime variable value (if request
-///      supplied one) → declared default → `max_pagination_assumption` (worst
-///      case). Reading the runtime value is what makes `first: 6` actually
-///      cost 6× and not 1000×.
+///      supplied one) → declared default → treated as not provided, charged
+///      like an omitted argument (the resolver's default page). Reading the
+///      runtime value is what makes `first: 6` actually cost 6× and not 1000×.
 ///   3. The pagination multiplier is NOT capped — `domains(first: 1000)` costs
 ///      1000, not 100. This lets cost properly catch nested-list amplification.
 ///   4. Each request is analyzed against its OWN variables. The same query
@@ -226,14 +226,16 @@ pub const ComplexityAnalyzer = struct {
     ///   1. Runtime variable value from the request body (the actual `first`
     ///      the client sent — `first: 6` truly costs 6×).
     ///   2. Declared default in the operation's variable definitions.
-    ///   3. `max_pagination_assumption` worst case.
+    ///   3. Neither → the argument is not provided at execution time, so treat
+    ///      it exactly like an omitted `first` (see the tail of this function).
     /// Without (1), a query parameterized as `first: $n` would always cost the
     /// worst case even when the client sends `n: 6`, blocking legitimate use.
     /// With (1), each request is analyzed against its own values: small `first`
-    /// pays small cost, large `first` pays large cost. The worst case still
-    /// applies when no runtime value is supplied.
+    /// pays small cost, large `first` pays large cost. A hostile SUPPLIED value
+    /// is still priced (and clamped at `max_pagination_assumption`); only the
+    /// unsupplied case drops to the omitted-argument charge.
     fn getFieldMultiplier(self: *ComplexityAnalyzer, field: *const parser.Field, current_depth: u32) u32 {
-        for (field.arguments) |arg| {
+        args: for (field.arguments) |arg| {
             if (!std.mem.eql(u8, arg.name, "first") and !std.mem.eql(u8, arg.name, "limit")) continue;
 
             switch (arg.value) {
@@ -252,9 +254,22 @@ pub const ComplexityAnalyzer = struct {
                         break;
                     }
 
-                    // 3) No runtime value, no default → worst case so an attacker
-                    //    can't hide behind `first: $n` to bypass cost analysis.
-                    return self.limits.max_pagination_assumption;
+                    // 3) No runtime value, no default. Per GraphQL semantics an
+                    //    unsupplied variable means the argument is simply NOT
+                    //    PROVIDED, so the resolver falls back to its own default
+                    //    page — 100 or less at every `parsePagination` call site.
+                    //    Charging the worst case here is a 10x overestimate of
+                    //    what the server can actually return, and it rejected
+                    //    legitimate queries: three sibling `events(first: $first)`
+                    //    selections with `$first` omitted cost 18003 against a
+                    //    10000 limit, while the identical query with the argument
+                    //    left out entirely cost almost nothing.
+                    //
+                    //    There is nothing to hide behind: omitting the variable
+                    //    cannot yield more rows than omitting the argument. Fall
+                    //    through to the no-argument path, which already accounts
+                    //    for depth and the default page size.
+                    break :args;
                 },
                 else => {},
             }
@@ -475,11 +490,36 @@ test "first: $var resolves to runtime value when provided" {
 
     const limits = ComplexityLimits{ .max_cost = 1000 };
 
-    // Without runtime variables: worst-case multiplier kicks in, cost explodes.
+    // Without runtime variables the argument is NOT PROVIDED at execution time,
+    // so the resolver falls back to its own default page. Cost must therefore
+    // match the identical query with `first` left out entirely — asserted by
+    // construction rather than against a hardcoded number, so it stays true if
+    // the selection or the default page size changes.
+    //
+    // This previously charged `max_pagination_assumption`, which overestimated
+    // by 10x and rejected legitimate queries. The adversarial case is still
+    // covered by the `first: 9999` block below: a value the client actually
+    // supplies is costed at that value.
     {
-        var analyzer = ComplexityAnalyzer.init(allocator, limits);
-        const analysis = try analyzer.analyzeDocument(&document, null);
-        try testing.expect(analysis.exceeded_cost);
+        const omitted_query =
+            \\query Domains {
+            \\  domains {
+            \\    id name owner { id } resolver { address }
+            \\  }
+            \\}
+        ;
+        var op = try parser.Parser.init(allocator, omitted_query);
+        var omitted_doc = try op.parseDocument();
+        defer omitted_doc.deinit(allocator);
+
+        var var_analyzer = ComplexityAnalyzer.init(allocator, limits);
+        const with_var = try var_analyzer.analyzeDocument(&document, null);
+
+        var omitted_analyzer = ComplexityAnalyzer.init(allocator, limits);
+        const omitted = try omitted_analyzer.analyzeDocument(&omitted_doc, null);
+
+        try testing.expectEqual(omitted.cost, with_var.cost);
+        try testing.expect(!with_var.exceeded_cost);
     }
 
     // With runtime `first: 6`: multiplier is 6, query fits comfortably.
@@ -545,4 +585,48 @@ test "top-level list without first is charged a page; nested list-in-list is not
     // Each unparameterized top-level `domains{name}` is charged ~200 (page 100),
     // so a fanout reaches the cost ceiling — vs ~2 each (≈100 total) without the fix.
     try testing.expect(a2.cost >= 10000);
+}
+
+test "unsupplied first on sibling nested lists is not charged the worst case" {
+    const allocator = testing.allocator;
+
+    // Shape of the subgraph-parity `getNameHistory` query: three sibling
+    // `events(first: $first)` selections under one `domain`, with `$first`
+    // declared but not supplied. Charging each the 1000-row worst case cost
+    // 18003 against a 10000 limit and rejected the query outright, even though
+    // the server would have returned at most a default page per selection.
+    const query =
+        \\query getNameHistory($id: String!, $first: Int) {
+        \\  domain(id: $id) {
+        \\    events(first: $first) { id blockNumber transactionID }
+        \\    registration { events(first: $first) { id blockNumber transactionID } }
+        \\    resolver { events(first: $first) { id blockNumber transactionID } }
+        \\  }
+        \\}
+    ;
+
+    var p = try parser.Parser.init(allocator, query);
+    var document = try p.parseDocument();
+    defer document.deinit(allocator);
+
+    const limits = ComplexityLimits{};
+
+    // Variables carry `id` but deliberately not `first`.
+    const vars_json = "{\"id\": \"0x604073b1cf8b1578bbe23d00f95384b273633ce92abe51e3a174578359fdaef2\"}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, vars_json, .{});
+    defer parsed.deinit();
+
+    var analyzer = ComplexityAnalyzer.init(allocator, limits);
+    const analysis = try analyzer.analyzeDocument(&document, parsed.value);
+    try testing.expect(!analysis.exceeded_cost);
+
+    // A supplied value is still honoured, and a hostile one still rejected —
+    // the fix must not become a way to opt out of cost analysis.
+    const big_json = "{\"id\": \"0x00\", \"first\": 1000}";
+    const big = try std.json.parseFromSlice(std.json.Value, allocator, big_json, .{});
+    defer big.deinit();
+
+    var big_analyzer = ComplexityAnalyzer.init(allocator, limits);
+    const big_analysis = try big_analyzer.analyzeDocument(&document, big.value);
+    try testing.expect(big_analysis.exceeded_cost);
 }

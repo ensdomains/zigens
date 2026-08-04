@@ -203,7 +203,7 @@ test "complexity limits can be customized" {
     try testing.expect(lenient_analysis.isValid());
 }
 
-test "first: $var resolves from runtime variables, worst-case without them" {
+test "first: $var resolves from runtime variables, default page without them" {
     const allocator = testing.allocator;
 
     const var_query =
@@ -240,11 +240,15 @@ test "first: $var resolves from runtime variables, worst-case without them" {
     const inline_analysis = try inline_analyzer.analyzeDocument(&inline_doc, null);
     try testing.expectEqual(inline_analysis.cost, var_analysis.cost);
 
-    // Without a value the analyzer must assume the worst case, not multiplier 1 —
-    // otherwise parameterizing every page size bypasses cost analysis entirely.
+    // Without a value the argument is not provided at execution time (GraphQL
+    // variable coercion), so the charge is the resolver's default page — no
+    // longer the 1000-row worst case, which rejected legitimate parameterized
+    // queries. This is not a bypass: a SUPPLIED page size is always priced
+    // (see the proportional-pricing test below), and an unsupplied one cannot
+    // return more rows than omitting the argument.
     var blind_analyzer = complexity.ComplexityAnalyzer.init(allocator, limits);
     const blind_analysis = try blind_analyzer.analyzeDocument(&var_doc, null);
-    try testing.expect(blind_analysis.cost >= limits.max_pagination_assumption);
+    try testing.expect(blind_analysis.cost < limits.max_pagination_assumption);
     try testing.expect(blind_analysis.cost > var_analysis.cost);
 }
 
