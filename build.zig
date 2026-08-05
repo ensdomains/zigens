@@ -30,6 +30,14 @@ pub fn build(b: *std.Build) void {
     // the Docker image; -Dtools=false drops them from the default install to cut the
     // deployment build by two ReleaseSafe compilations.
     const tools = b.option(bool, "tools", "Install auxiliary tool binaries (test-db-reader, rainbow-backfill)") orelse true;
+
+    // Deployments that run only the split V2 indexer + API (the staging and
+    // production compose files) can skip compiling the combined and V1-only
+    // indexers entirely: each executable is a separate whole-program optimized
+    // compile (minutes each at 2GB+ peak), so -Dexes=v2api roughly halves the
+    // Docker image build. Enum-typed, so an invalid value fails the build.
+    const ExeSet = enum { all, v2api };
+    const exes = b.option(ExeSet, "exes", "Executables to install: all (default) | v2api (ensv2-indexer-v2 + ensv2-api only)") orelse .all;
     const pg_dep = if (pg_tls)
         b.dependency("pg", .{ .target = target, .optimize = optimize, .openssl_lib_name = @as([]const u8, "ssl") })
     else
@@ -59,7 +67,7 @@ pub fn build(b: *std.Build) void {
     });
     indexer_exe.root_module.link_libc = true;
     indexer_exe.root_module.linkSystemLibrary("sqlite3", .{});
-    b.installArtifact(indexer_exe);
+    if (exes == .all) b.installArtifact(indexer_exe);
 
     // V1-only indexer executable (separate process)
     const indexer_v1_exe = b.addExecutable(.{
@@ -77,7 +85,7 @@ pub fn build(b: *std.Build) void {
     });
     indexer_v1_exe.root_module.link_libc = true;
     indexer_v1_exe.root_module.linkSystemLibrary("sqlite3", .{});
-    b.installArtifact(indexer_v1_exe);
+    if (exes == .all) b.installArtifact(indexer_v1_exe);
 
     // V2-only indexer executable (separate process)
     const indexer_v2_exe = b.addExecutable(.{

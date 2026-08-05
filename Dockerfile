@@ -34,6 +34,16 @@ RUN ARCH=$(case ${TARGETARCH:-$(uname -m)} in \
 # Set working directory
 WORKDIR /app
 
+# Zig caches live in BuildKit cache mounts so they persist across builds on
+# the same builder node: fetched packages (global) survive base-layer rebuilds,
+# and compiled C/translate-c artifacts (local) shave repeat builds. NOTE: Zig
+# release builds are whole-program, so any source change still recompiles each
+# executable's Zig code — the mounts trim the constant overhead, they don't
+# make builds incremental. If the mounts are pruned, `zig build` re-fetches
+# inside the build step (one-time, network-dependent).
+ENV ZIG_GLOBAL_CACHE_DIR=/zig-cache/global \
+    ZIG_LOCAL_CACHE_DIR=/zig-cache/local
+
 # Fetch the dependency tree straight from the manifest (single source of truth,
 # nothing duplicated here) before sources are copied, so the layer stays cached
 # until build.zig/build.zig.zon change. Retried in the shell because zig's
@@ -41,7 +51,8 @@ WORKDIR /app
 # git host as a hard ProtocolError — which broke deploys fetching translate-c
 # (transitive via pg.zig) from codeberg.org.
 COPY build.zig build.zig.zon ./
-RUN ok=0; \
+RUN --mount=type=cache,id=zig-cache,target=/zig-cache \
+    ok=0; \
     for i in 1 2 3 4 5; do \
       zig build --fetch && ok=1 && break; \
       echo "dependency fetch attempt $i failed; retrying in 5s"; sleep 5; \
@@ -51,22 +62,33 @@ RUN ok=0; \
 # Copy source code
 COPY . .
 
-# Build all applications (generates introspection.json, builds indexer + API).
+# Build the applications (generates introspection.json first).
 # ZIG_OPTIMIZE selects the release profile per deployment (compose passes it
 # through from the environment). Default stays ReleaseSafe: it keeps bounds/
 # overflow/optional-unwrap checks active in production, and the indexer parses
 # untrusted RPC/ABI bytes — ReleaseFast trades exactly those checks for speed,
-# so opt into it deliberately, per deploy.
+# so opt into it deliberately, per deploy. The profile barely changes BUILD
+# time (both are full LLVM builds); what does is ZIG_TARGETS below.
+# ZIG_TARGETS picks the executable set: each one is a separate whole-program
+# optimized compile (minutes, 2GB+ peak), so v2api — enough for every compose
+# service, which only ever runs ensv2-indexer-v2 and ensv2-api — roughly
+# halves the build vs compiling the combined + V1 binaries nobody launches.
 # -Dtools=false skips test-db-reader and rainbow-backfill, which the image never ships.
 # -j2 bounds concurrent compiles: peak build memory stays ~3.3GB (the api compile
 # alone needs ~2GB+ on Zig 0.16) so the build can't starve the host it shares
 # with the deployment platform.
 ARG ZIG_OPTIMIZE=ReleaseSafe
-RUN case "$ZIG_OPTIMIZE" in \
+ARG ZIG_TARGETS=all
+RUN --mount=type=cache,id=zig-cache,target=/zig-cache \
+    case "$ZIG_OPTIMIZE" in \
         ReleaseSafe|ReleaseFast) ;; \
         *) echo "ZIG_OPTIMIZE must be ReleaseSafe or ReleaseFast, got: '$ZIG_OPTIMIZE'" >&2; exit 1 ;; \
     esac && \
-    zig build -Doptimize="$ZIG_OPTIMIZE" -Dpg-tls=true -Dtools=false -j2
+    case "$ZIG_TARGETS" in \
+        all|v2api) ;; \
+        *) echo "ZIG_TARGETS must be all or v2api, got: '$ZIG_TARGETS'" >&2; exit 1 ;; \
+    esac && \
+    zig build -Doptimize="$ZIG_OPTIMIZE" -Dexes="$ZIG_TARGETS" -Dpg-tls=true -Dtools=false -j2
 
 # Stage 2: Runtime
 FROM alpine:3.22
@@ -96,11 +118,12 @@ RUN addgroup -g 1000 ens && \
 # Set working directory
 WORKDIR /app
 
-# Copy binaries from builder
-COPY --from=builder /app/zig-out/bin/ensv2-indexer /app/ensv2-indexer
-COPY --from=builder /app/zig-out/bin/ensv2-indexer-v1 /app/ensv2-indexer-v1
-COPY --from=builder /app/zig-out/bin/ensv2-indexer-v2 /app/ensv2-indexer-v2
-COPY --from=builder /app/zig-out/bin/ensv2-api /app/ensv2-api
+# Copy whatever binary set ZIG_TARGETS produced (all four, or just
+# ensv2-indexer-v2 + ensv2-api). Paths stay /app/<name> either way. NOTE: in a
+# v2api image the default CMD (/app/ensv2-indexer) does not exist — every
+# compose service sets its own command, so this only matters for bare
+# `docker run` without one.
+COPY --from=builder /app/zig-out/bin/ /app/
 
 # Copy schema files (needed for database initialization)
 COPY --from=builder /app/schema /app/schema
