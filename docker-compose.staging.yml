@@ -13,6 +13,11 @@ services:
         # deploy environment; keep both services' args identical so they
         # share one image build.
         - ZIG_OPTIMIZE=${ZIG_OPTIMIZE:-ReleaseSafe}
+        # Staging only ever runs ensv2-indexer-v2 and ensv2-api, so skip
+        # compiling the combined + V1 binaries (each is a separate whole-
+        # program optimized compile — this roughly halves the image build).
+        # Set ZIG_TARGETS=all to get the full binary set.
+        - ZIG_TARGETS=${ZIG_TARGETS:-v2api}
     container_name: ensv2-indexer-v2-staging
     restart: unless-stopped
     command: ["/app/ensv2-indexer-v2"]
@@ -77,6 +82,7 @@ services:
       dockerfile: Dockerfile
       args:
         - ZIG_OPTIMIZE=${ZIG_OPTIMIZE:-ReleaseSafe}
+        - ZIG_TARGETS=${ZIG_TARGETS:-v2api}
     container_name: ensv2-api-staging
     restart: unless-stopped
     command: ["/app/api-entrypoint.sh"]
