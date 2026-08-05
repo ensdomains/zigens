@@ -127,6 +127,21 @@ pub fn migrate(self: *Database) !void {
     try self.exec("CREATE INDEX IF NOT EXISTS idx_accounts_seen_v1 ON accounts(seen_v1) WHERE seen_v1 = 1");
     try self.exec("CREATE INDEX IF NOT EXISTS idx_accounts_seen_v2 ON accounts(seen_v2) WHERE seen_v2 = 1");
 
+    // Per-target ledger for init-gap heal sweeps (see storage/heal_targets.zig).
+    // Both backends: CREATE TABLE IF NOT EXISTS is a no-op where it exists, and
+    // deployed DBs never re-run schema.sql, so this is their only creation path.
+    try self.exec(
+        \\CREATE TABLE IF NOT EXISTS init_gap_heal_targets (
+        \\  task TEXT NOT NULL,
+        \\  protocol TEXT NOT NULL,
+        \\  address TEXT NOT NULL,
+        \\  completed INTEGER NOT NULL DEFAULT 0,
+        \\  attempts INTEGER NOT NULL DEFAULT 0,
+        \\  last_error_at INTEGER NOT NULL DEFAULT 0,
+        \\  PRIMARY KEY (task, protocol, address)
+        \\)
+    );
+
     // One-time backfill of the new entity tables. Skipped when the
     // backfill source tables (`names`, `sync_state`) don't exist yet —
     // that happens in `initWithoutSchema` test fixtures that create

@@ -41,6 +41,7 @@ const conflict_keys = std.StaticStringMap([]const []const u8).initComptime(.{
     .{ "name_history", &[_][]const u8{ "protocol", "namehash", "change_type", "block_number", "log_index" } },
     .{ "temp_pre_migration_names", &[_][]const u8{ "protocol", "namehash" } },
     .{ "backfill_status", &[_][]const u8{"task"} },
+    .{ "init_gap_heal_targets", &[_][]const u8{ "task", "protocol", "address" } },
     .{ "orphaned_registrations", &[_][]const u8{ "protocol", "tx_hash", "log_index" } },
     .{ "registrations", &[_][]const u8{ "protocol", "transaction_hash", "log_index" } },
     // Reorg-captured tables that are NOT dialect-upsert sites — present here solely so
@@ -71,7 +72,7 @@ pub fn conflictColsFor(table: []const u8) ?[]const []const u8 {
 }
 
 test "conflictColsFor matches every schema-derived key" {
-    // Pins all 25 entries against schema/schema.sql — the sole guard on these
+    // Pins all 26 entries against schema/schema.sql — the sole guard on these
     // keys, since SQLite ignores them and only Postgres (Phase 4) exercises them.
     const expected = .{
         .{ "sync_state", &[_][]const u8{"protocol"} },
@@ -97,6 +98,7 @@ test "conflictColsFor matches every schema-derived key" {
         .{ "name_history", &[_][]const u8{ "protocol", "namehash", "change_type", "block_number", "log_index" } },
         .{ "temp_pre_migration_names", &[_][]const u8{ "protocol", "namehash" } },
         .{ "backfill_status", &[_][]const u8{"task"} },
+        .{ "init_gap_heal_targets", &[_][]const u8{ "task", "protocol", "address" } },
         .{ "orphaned_registrations", &[_][]const u8{ "protocol", "tx_hash", "log_index" } },
         .{ "registrations", &[_][]const u8{ "protocol", "transaction_hash", "log_index" } },
         .{ "registry_entries", &[_][]const u8{ "protocol", "parent_registry", "canonical_id" } },

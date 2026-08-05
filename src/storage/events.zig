@@ -56,6 +56,15 @@ fn parseEventRow(q: *Query, allocator: std.mem.Allocator) !models.Event {
 // ============================================================================
 
 pub fn insertEvent(db: *Database, event: models.Event) !void {
+    _ = try insertEventIfNew(db, event);
+}
+
+/// Like `insertEvent`, but reports whether a row actually landed. The insert
+/// conflict-ignores on (protocol, tx_hash, log_index), so re-sweeps of
+/// already-indexed history (init-gap heals, discovery-backfill retries)
+/// revisit stored events — callers gating side effects on genuinely-new
+/// events (webhook notification) need the distinction.
+pub fn insertEventIfNew(db: *Database, event: models.Event) !bool {
     const sql = try db.upsertSql(db.allocator, "events", &.{ "event_type", "protocol", "block_number", "tx_hash", "log_index", "contract_address", "name", "namehash", "data", "timestamp" }, .ignore);
     defer db.allocator.free(sql);
 
@@ -77,6 +86,7 @@ pub fn insertEvent(db: *Database, event: models.Event) !void {
     try q.bindInt64(event.timestamp);
 
     try q.exec();
+    return q.changes() > 0;
 }
 
 /// Order direction for event queries
