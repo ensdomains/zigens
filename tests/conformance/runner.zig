@@ -323,7 +323,10 @@ test "conformance goldens" {
         // --- coverage declaration (additive; lastSyncedAt is wall-clock so not selected) ---
         .{ .name = "coverage", .query = "{ _coverage { chainId stale protocols { protocol indexedHead } } }" },
         // --- error-shape ops: lock the GraphQL error envelope for cases that DO error ---
+        .{ .name = "err_syntax", .query = "{ domains( }" },
         .{ .name = "err_missing_required_arg", .query = "{ domain { id } }" },
+        .{ .name = "err_unknown_argument", .query = "{ domains(bogusArg: 1) { id } }" },
+        .{ .name = "err_unknown_where_field", .query = "{ domains(where: {totallyBogus: 1}) { id } }" },
         .{ .name = "err_unknown_query", .query = "{ notARealQueryField { id } }" },
         // --- leniency ops: document (and lock) where zigens is LENIENT in non-strict
         //     mode rather than raising a validation error — an unknown field resolves to

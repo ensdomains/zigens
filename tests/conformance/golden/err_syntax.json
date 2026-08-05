@@ -1,0 +1,1 @@
+{"errors":[{"message":"Invalid GraphQL syntax","locations":[{"line":1,"column":12}],"extensions":{"code":"SYNTAX_ERROR"}}],"data":null}

@@ -1,1 +1,1 @@
-{"errors":[{"message":"Missing required argument: see the schema for the required `Type!`-marked fields.","extensions":{"code":"VALIDATION_ERROR"}}],"data":null}
+{"errors":[{"message":"Missing required argument: `domain` requires argument `id`.","locations":[{"line":1,"column":3}],"extensions":{"code":"VALIDATION_ERROR"}}],"data":null}
