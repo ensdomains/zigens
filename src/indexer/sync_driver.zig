@@ -174,13 +174,16 @@ pub fn start(self: *Indexer) !void {
                     std.log.warn("reorg undo-log: failed to clear v2 cursor before heals: {}", .{err});
                 self.invalidateReorgCursor();
             }
-            // One-shot heal (marker-gated): resolvers registered before the
-            // first-sighting backfill existed are missing their pre-attachment
-            // init events (EACRolesChanged) — backfill each known resolver's
-            // deployment→first_seen window once.
-            self.backfillResolverInitGaps(.v2, self.v1_client) catch |err| {
-                std.log.err("Failed to backfill resolver init gaps: {}", .{err});
+            // Init-gap heals over the durable per-target ledger: resolver and
+            // subregistry init events (EACRolesChanged role grants) predate the
+            // on-chain pointer that made the contract known, so the normal scan
+            // never sees them. Seed registers every known contract once; drain
+            // sweeps owed targets with per-target retry accounting. Cursor is
+            // disarmed here (either branch above), which drain requires.
+            self.seedInitGapHealTargets(.v2) catch |err| {
+                std.log.err("Failed to seed init-gap heal targets: {}", .{err});
             };
+            self.drainInitGapHeals(.v2, self.v1_client);
             std.log.info("Running unknown labels backfill...", .{});
             self.backfillUnknownLabels() catch |err| {
                 std.log.err("Failed to backfill unknown labels: {}", .{err});
@@ -207,6 +210,20 @@ pub fn start(self: *Indexer) !void {
                 std.log.info("Reached end block {d} for both protocols; stopping", .{eb});
                 break;
             }
+        }
+
+        // Retry owed init-gap heal sweeps (e.g. a discovery backfill that hit
+        // a transient RPC failure). Gated on a cheap existence probe; the
+        // sweeps write historical events, so disarm the reorg cursor exactly
+        // like the completion-path heals — a captured write would let a later
+        // rollback delete healed rows. The next indexProtocol re-arms it.
+        if (self.initial_sync_complete.load(.acquire) and self.hasDueInitGapHeals(.v2)) {
+            reorg_undo.clearCursor(self.database, .v1) catch |err|
+                std.log.warn("reorg undo-log: failed to clear v1 cursor before heal drain: {}", .{err});
+            reorg_undo.clearCursor(self.database, .v2) catch |err|
+                std.log.warn("reorg undo-log: failed to clear v2 cursor before heal drain: {}", .{err});
+            self.invalidateReorgCursor();
+            self.drainInitGapHeals(.v2, self.v1_client);
         }
 
         // Sleep for poll interval before next iteration; wakes early on SIGTERM.
@@ -308,10 +325,13 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
                 }
 
                 if (protocol == .v2) {
-                    // One-shot heal (marker-gated) — see the combined loop.
-                    self.backfillResolverInitGaps(.v2, client) catch |err| {
-                        std.log.err("Failed to backfill resolver init gaps: {}", .{err});
+                    // Init-gap heals over the durable per-target ledger — see
+                    // the combined loop. Cursor is disarmed here (either branch
+                    // above), which drainInitGapHeals requires.
+                    self.seedInitGapHealTargets(.v2) catch |err| {
+                        std.log.err("Failed to seed init-gap heal targets: {}", .{err});
                     };
+                    self.drainInitGapHeals(.v2, client);
                 }
 
                 if (self.webhook_manager) |wm| {
@@ -373,6 +393,15 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
                 std.log.info("Reached end block {d} for {s}; stopping", .{ eb, protocol.toString() });
                 break;
             }
+        }
+
+        // Retry owed init-gap heal sweeps — see the combined loop for the
+        // cursor-disarm rationale. The next indexProtocol re-arms it.
+        if (protocol == .v2 and self.initial_sync_complete.load(.acquire) and self.hasDueInitGapHeals(.v2)) {
+            reorg_undo.clearCursor(self.database, .v2) catch |err|
+                std.log.warn("reorg undo-log: failed to clear v2 cursor before heal drain: {}", .{err});
+            self.invalidateReorgCursor();
+            self.drainInitGapHeals(.v2, client);
         }
 
         // Sleep for poll interval before next iteration; wakes early on SIGTERM.

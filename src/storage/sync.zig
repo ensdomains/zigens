@@ -7,6 +7,7 @@ const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
 const reorg_undo = @import("reorg_undo.zig");
+const heal_targets = @import("heal_targets.zig");
 
 // ── Reorg rollback delete-lists ────────────────────────────────────────────────
 // Single source of truth for the tables whose post-N rows `rollbackToBlock` deletes.
@@ -300,6 +301,14 @@ pub fn rollbackToBlock(db: *Database, protocol: models.Protocol, block_number: u
         try cq.bindInt64(block_i64);
         try cq.exec();
     }
+
+    // Re-arm the init-gap heal ledger: heal sweeps write with undo capture
+    // deliberately disarmed, so the created-after deletes above may have
+    // removed healed rows — a surviving `completed` marker would make that
+    // loss permanent. Re-opening every target costs one idempotent full
+    // re-sweep that converges projections to the surviving chain; attempts
+    // reset too, since prior failures say nothing about this chain.
+    try heal_targets.resetHealTargets(db, protocol);
 
     // Update sync state
     try db.setSyncState(protocol, block_number);

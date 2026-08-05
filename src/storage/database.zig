@@ -12,6 +12,7 @@ const Hash = @import("../types/hash.zig").Hash;
 // Import all module functions
 const names = @import("names.zig");
 const resolvers = @import("resolvers.zig");
+const heal_targets = @import("heal_targets.zig");
 const registry_entries = @import("registry_entries.zig");
 const reorg_undo = @import("reorg_undo.zig");
 const resolve_cache = @import("../resolve/cache.zig");
@@ -318,6 +319,15 @@ pub const Database = struct {
     // All functions below delegate to their respective module implementations.
     // This maintains the exact same API: db.insertName(...) still works!
 
+    // Init-gap heal ledger (storage/heal_targets.zig)
+    pub const enqueueHealTarget = heal_targets.enqueueHealTarget;
+    pub const recordHealTargetSuccess = heal_targets.recordHealTargetSuccess;
+    pub const recordHealTargetFailure = heal_targets.recordHealTargetFailure;
+    pub const pendingHealTargets = heal_targets.pendingHealTargets;
+    pub const hasPendingHealTargets = heal_targets.hasPendingHealTargets;
+    pub const countExhaustedHealTargets = heal_targets.countExhaustedHealTargets;
+    pub const resetHealTargets = heal_targets.resetHealTargets;
+
     // Names module (15 functions)
     pub const insertRegistry = names.insertRegistry;
     pub const insertName = names.insertName;
@@ -436,6 +446,7 @@ pub const Database = struct {
 
     // Events module
     pub const insertEvent = events.insertEvent;
+    pub const insertEventIfNew = events.insertEventIfNew;
     pub const getRecentEvents = events.getRecentEvents;
     pub const getEventsFiltered = events.getEventsFiltered;
     pub const getEventsByNamehash = events.getEventsByNamehash;

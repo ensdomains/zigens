@@ -59,10 +59,13 @@ pub fn insertEventAndNotify(self: *Indexer, raw_event: models.Event) !void {
     }
 
     // Try to insert the event
-    try self.database.insertEvent(event);
+    const inserted = try self.database.insertEventIfNew(event);
 
-    // Trigger webhook if enabled (only after initial sync to avoid notifying about historical events)
-    if (self.initial_sync_complete.load(.acquire)) {
+    // Trigger webhook only after initial sync (historical events must not
+    // notify) AND only when the row actually landed: the insert is
+    // conflict-ignoring, so init-gap heal sweeps and backfill retries revisit
+    // already-stored events, and those must never re-notify subscribers.
+    if (inserted and self.initial_sync_complete.load(.acquire)) {
         if (self.webhook_manager) |wm| {
             wm.notify(event) catch |err| {
                 // Webhook failed but event was inserted successfully

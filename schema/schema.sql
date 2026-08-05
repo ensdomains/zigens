@@ -756,6 +756,20 @@ CREATE TABLE IF NOT EXISTS backfill_status (
   records_processed INTEGER DEFAULT 0
 );
 
+-- Durable per-target ledger for init-gap heal sweeps (resolver/subregistry
+-- contracts whose initialization events predate their first sighting). One row
+-- per owed sweep; failures retry with attempt caps instead of being silently
+-- absorbed by a task-level completion marker.
+CREATE TABLE IF NOT EXISTS init_gap_heal_targets (
+  task TEXT NOT NULL,
+  protocol TEXT NOT NULL,
+  address TEXT NOT NULL,
+  completed INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (task, protocol, address)
+);
+
 
 -- ============================================================================
 -- UNKNOWN LABELS (labelhash → label backfill queue; migration 010)
