@@ -165,6 +165,22 @@ fn seedFixture(db: *Database, a: std.mem.Allocator) !void {
         0,
         resolver,
     );
+    // Same resource on a SECOND contract: locks the cross-contract semantics —
+    // the unscoped query returns both rows (with contractAddress telling them
+    // apart) and `contract:` isolates one. This is the shape that made a
+    // ROOT-resource role holder from another contract look like a mystery
+    // address on a name's roles page.
+    const other_contract = Address{ .bytes = [_]u8{0x77} ** 20 };
+    try db.upsertEACRole(
+        .v2,
+        "0x0000000000000000000000000000000000000000000000000000000000000001",
+        owner2,
+        "0x0000000000000000000000000000000000000000000000000000000000000001",
+        FIXED_BLOCK,
+        tx,
+        1,
+        other_contract,
+    );
 
     // Registration rows: the `registrations` query reads a dedicated table that
     // insertName does not touch, so seed the .eth 2LDs (subnames are not registrations).
@@ -297,7 +313,10 @@ test "conformance goldens" {
         // --- broadened coverage ---
         .{ .name = "primary_name", .query = "query($id:String!){ account(id:$id){ id primaryName } }", .vars = owner_vars },
         .{ .name = "expired_domain", .query = "query($id:String!){ domain(id:$id){ name expiryDate gracePeriodEnd isReachable } }", .vars = exp_vars },
-        .{ .name = "eac_roles", .query = "{ roles(resource: \"0x0000000000000000000000000000000000000000000000000000000000000001\") { id resource account roleBitmap permissions blockNumber } }" },
+        .{ .name = "eac_roles", .query = "{ roles(resource: \"0x0000000000000000000000000000000000000000000000000000000000000001\") { id resource account contractAddress roleBitmap permissions blockNumber } }" },
+        // `contract:` scopes a shared resource to one emitting contract — the
+        // unscoped op above returns rows from BOTH fixture contracts.
+        .{ .name = "eac_roles_scoped", .query = "{ roles(resource: \"0x0000000000000000000000000000000000000000000000000000000000000001\", contract: \"0x7777777777777777777777777777777777777777\") { account contractAddress roleBitmap } }" },
         .{ .name = "pagination_skip", .query = "{ domains(first: 2, skip: 1, orderBy: createdAt, orderDirection: asc) { id name } }" },
         .{ .name = "domain_connection", .query = "{ domainConnection(first: 2, orderBy: createdAt, orderDirection: asc) { edges { cursor node { id name } } pageInfo { hasNextPage hasPreviousPage startCursor endCursor } } }" },
         // --- where-filter matrix (deterministic order via orderBy createdAt asc, namehash tie-break) ---

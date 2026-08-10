@@ -17,6 +17,7 @@ pub const getRegistry = names_registry.getRegistry;
 
 // Name insert / mutation operations
 pub const insertName = names_write.insertName;
+pub const insertNamesBatch = names_write.insertNamesBatch;
 pub const updateNameIsLegacy = names_write.updateNameIsLegacy;
 pub const updateNameExpiry = names_write.updateNameExpiry;
 pub const updateV1RenewalExpiry = names_write.updateV1RenewalExpiry;
@@ -56,6 +57,7 @@ pub const getNameStringByNamehash = names_read.getNameStringByNamehash;
 pub const getNameByNamehashAndProtocol = names_read.getNameByNamehashAndProtocol;
 pub const getNamehashByResolver = names_read.getNamehashByResolver;
 pub const getNameByTokenIdAndRegistry = names_read.getNameByTokenIdAndRegistry;
+pub const getUniqueNameByCanonicalId = names_read.getUniqueNameByCanonicalId;
 pub const getNamesByOwner = names_read.getNamesByOwner;
 pub const getNamesByResolver = names_read.getNamesByResolver;
 pub const WrappedDomainFilters = names_read.WrappedDomainFilters;

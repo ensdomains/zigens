@@ -66,7 +66,8 @@ pub fn upsertEACRole(db: *Database, protocol: models.Protocol, resource: []const
 const EAC_SELECT_COLUMNS =
     \\SELECT r.id, r.protocol, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp,
     \\       COALESCE(reg_name.name, resolver_name.name) AS name,
-    \\       CASE WHEN kr.address IS NOT NULL THEN 1 ELSE 0 END AS is_resolver
+    \\       CASE WHEN kr.address IS NOT NULL THEN 1 ELSE 0 END AS is_resolver,
+    \\       r.contract_address
     \\FROM eac_roles r
     \\LEFT JOIN names reg_name ON r.resource = reg_name.canonical_id AND r.contract_address = reg_name.registry
     \\LEFT JOIN resolvers res ON r.contract_address = res.address AND r.resource = res.namehash AND res.protocol = r.protocol
@@ -94,18 +95,36 @@ fn parseEACRoleRow(q: *Query, allocator: std.mem.Allocator) !models.EACRoleAssig
     // is decoded against the resolver role table; otherwise it's a registry.
     const contract_kind: models.EACContractKind = if (q.getInt(10) != 0) .resolver else .registry;
 
+    const contract_col = q.getTextSlice(11) orelse return error.MissingContractAddress;
+
+    // Every fallible conversion runs BEFORE the dupes below: a conversion
+    // failure mid-literal would leak the dupes already evaluated (only `name`
+    // carries an errdefer).
+    const protocol = try models.Protocol.fromString(protocol_col);
+    const account = try Address.fromHex(account_col);
+    const tx_hash = try Hash.fromHex(tx_hash_col);
+    // The DDL declares `contract_address TEXT NOT NULL DEFAULT ''`; every
+    // current writer binds a real address, but a legacy '' row must render as
+    // Address.zero ("unknown") rather than fail the whole result set.
+    // Non-empty garbage still errors loudly — that's corruption, not legacy.
+    const contract_address = if (contract_col.len == 0) Address.zero else try Address.fromHex(contract_col);
+
+    const resource = try allocator.dupe(u8, resource_col);
+    errdefer allocator.free(resource);
+
     return models.EACRoleAssignment{
         .id = @intCast(q.getInt64(0)),
-        .protocol = try models.Protocol.fromString(protocol_col),
-        .resource = try allocator.dupe(u8, resource_col),
-        .account = try Address.fromHex(account_col),
+        .protocol = protocol,
+        .resource = resource,
+        .account = account,
         .role_bitmap = try allocator.dupe(u8, role_bitmap_col),
         .block_number = @intCast(q.getInt64(5)),
-        .tx_hash = try Hash.fromHex(tx_hash_col),
+        .tx_hash = tx_hash,
         .log_index = @intCast(q.getInt(7)),
         .timestamp = q.getInt64(8),
         .name = name,
         .contract_kind = contract_kind,
+        .contract_address = contract_address,
     };
 }
 
@@ -120,48 +139,69 @@ fn parseEACRoleRow(q: *Query, allocator: std.mem.Allocator) !models.EACRoleAssig
 ///      per-namehash resolver EAC (`resource = namehash`); none is emitted today (verified on
 ///      Sepolia 2026-06-02: all resolver EAC rows have resource 0).
 pub fn getRolesByResource(db: *Database, protocol: models.Protocol, resource: []const u8) ![]models.EACRoleAssignment {
-    const sql = EAC_SELECT_COLUMNS ++
-        \\
-        \\WHERE r.protocol = ? AND r.resource = ?
-        \\ORDER BY r.timestamp DESC
-    ;
-
-    var q = try Query.init(db, sql);
-    defer q.deinit();
-
-    try q.bindTextStatic(protocol.toString());
-    try q.bindText(resource);
-
-    var roles: std.ArrayList(models.EACRoleAssignment) = .empty;
-    errdefer {
-        for (roles.items) |*role| {
-            role.deinit(db.allocator);
-        }
-        roles.deinit(db.allocator);
-    }
-
-    while (try q.step()) {
-        const role = try parseEACRoleRow(&q, db.allocator);
-        try roles.append(db.allocator, role);
-    }
-
-    return roles.toOwnedSlice(db.allocator);
+    return getRolesFiltered(db, protocol, .{ .resource = resource });
 }
 
 /// Get all role assignments for an account.
 /// Resolves name via registry or resolver paths (see getRolesByResource).
 pub fn getRolesByAccount(db: *Database, protocol: models.Protocol, account: Address) ![]models.EACRoleAssignment {
-    const sql = EAC_SELECT_COLUMNS ++
-        \\
-        \\WHERE r.protocol = ? AND r.account = ?
-        \\ORDER BY r.timestamp DESC
-    ;
+    return getRolesFiltered(db, protocol, .{ .account = account });
+}
 
-    var q = try Query.init(db, sql);
+pub const RoleFilters = struct {
+    resource: ?[]const u8 = null,
+    account: ?Address = null,
+    /// Scope to one emitting contract. Load-bearing for shared resource
+    /// values: ROOT (0x0) exists on every EAC-enabled contract, so an
+    /// unscoped ROOT query mixes role holders across contracts.
+    contract_address: ?Address = null,
+};
+
+/// Get all role assignments matching every provided filter, newest first.
+/// The id tiebreak keeps equal-timestamp rows in a deterministic order on
+/// both backends.
+pub fn getRolesFiltered(db: *Database, protocol: models.Protocol, filters: RoleFilters) ![]models.EACRoleAssignment {
+    var sql_buf: [2048]u8 = undefined;
+    var sql_len: usize = 0;
+
+    const base = EAC_SELECT_COLUMNS ++
+        \\
+        \\WHERE r.protocol = ?
+    ;
+    @memcpy(sql_buf[sql_len .. sql_len + base.len], base);
+    sql_len += base.len;
+
+    if (filters.resource != null) {
+        const clause = " AND r.resource = ?";
+        @memcpy(sql_buf[sql_len .. sql_len + clause.len], clause);
+        sql_len += clause.len;
+    }
+
+    if (filters.account != null) {
+        const clause = " AND r.account = ?";
+        @memcpy(sql_buf[sql_len .. sql_len + clause.len], clause);
+        sql_len += clause.len;
+    }
+
+    if (filters.contract_address != null) {
+        const clause = " AND r.contract_address = ?";
+        @memcpy(sql_buf[sql_len .. sql_len + clause.len], clause);
+        sql_len += clause.len;
+    }
+
+    {
+        const order = " ORDER BY r.timestamp DESC, r.id DESC";
+        @memcpy(sql_buf[sql_len .. sql_len + order.len], order);
+        sql_len += order.len;
+    }
+
+    var q = try Query.init(db, sql_buf[0..sql_len]);
     defer q.deinit();
 
     try q.bindTextStatic(protocol.toString());
-    try q.bindAddress(account);
+    if (filters.resource) |resource| try q.bindText(resource);
+    if (filters.account) |account| try q.bindAddress(account);
+    if (filters.contract_address) |contract| try q.bindAddress(contract);
 
     var roles: std.ArrayList(models.EACRoleAssignment) = .empty;
     errdefer {
@@ -172,7 +212,10 @@ pub fn getRolesByAccount(db: *Database, protocol: models.Protocol, account: Addr
     }
 
     while (try q.step()) {
-        const role = try parseEACRoleRow(&q, db.allocator);
+        var role = try parseEACRoleRow(&q, db.allocator);
+        // Covers the append-fails gap: a parsed-but-unappended row is invisible
+        // to the list errdefer above.
+        errdefer role.deinit(db.allocator);
         try roles.append(db.allocator, role);
     }
 
@@ -275,7 +318,10 @@ pub fn getRolesWithPagination(db: *Database, protocol: models.Protocol, options:
     }
 
     while (try q.step()) {
-        const role = try parseEACRoleRow(&q, db.allocator);
+        var role = try parseEACRoleRow(&q, db.allocator);
+        // Covers the append-fails gap: a parsed-but-unappended row is invisible
+        // to the list errdefer above.
+        errdefer role.deinit(db.allocator);
         try roles.append(db.allocator, role);
     }
 

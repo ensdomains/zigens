@@ -283,3 +283,95 @@ test "registerResolverIfNew reports first sighting exactly once" {
     // The same address under the other protocol is its own first sighting.
     try testing.expect(try database.registerResolverIfNew(.v1, resolver_hex, 300));
 }
+
+// ============================================================================
+// CONTRACT SCOPING (getRolesFiltered)
+// ============================================================================
+// The same resource value — ROOT (0x0) on every EAC-enabled contract being the
+// guaranteed case — can carry role rows on MANY contracts. These pin the
+// disambiguation: contract_address is populated on every returned row, and the
+// contract filter isolates one emitting contract.
+
+test "rows carry the emitting contract and the contract filter isolates it" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const root_resource = "0x0000000000000000000000000000000000000000000000000000000000000000";
+    const contract_a = Address{ .bytes = [_]u8{0xAA} ** 20 };
+    const contract_b = Address{ .bytes = [_]u8{0xBB} ** 20 };
+
+    try roles.upsertEACRole(database, .v2, root_resource, helpers.TEST_OWNER_1, "0x01", 1000, helpers.randomHash(), 0, contract_a);
+    try roles.upsertEACRole(database, .v2, root_resource, helpers.TEST_OWNER_2, "0x02", 1000, helpers.randomHash(), 1, contract_b);
+
+    // Unscoped: both contracts' rows, each stamped with its emitting contract.
+    const all = try roles.getRolesFiltered(database, .v2, .{ .resource = root_resource });
+    defer {
+        for (all) |*r| r.deinit(allocator);
+        allocator.free(all);
+    }
+    try testing.expectEqual(@as(usize, 2), all.len);
+    for (all) |r| {
+        const expected: Address = if (r.account.eql(helpers.TEST_OWNER_1)) contract_a else contract_b;
+        try testing.expectEqualSlices(u8, &expected.bytes, &r.contract_address.bytes);
+    }
+
+    // Scoped: exactly the one contract's row.
+    const scoped = try roles.getRolesFiltered(database, .v2, .{ .resource = root_resource, .contract_address = contract_b });
+    defer {
+        for (scoped) |*r| r.deinit(allocator);
+        allocator.free(scoped);
+    }
+    try testing.expectEqual(@as(usize, 1), scoped.len);
+    try testing.expectEqualSlices(u8, &contract_b.bytes, &scoped[0].contract_address.bytes);
+    try testing.expectEqualSlices(u8, &helpers.TEST_OWNER_2.bytes, &scoped[0].account.bytes);
+}
+
+test "contract filter combines with account and works alone" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const contract_a = Address{ .bytes = [_]u8{0xAA} ** 20 };
+    const contract_b = Address{ .bytes = [_]u8{0xBB} ** 20 };
+
+    // Same account holds roles on two contracts; a second account on one.
+    try roles.upsertEACRole(database, .v2, "0x01", helpers.TEST_OWNER_1, "0x01", 1000, helpers.randomHash(), 0, contract_a);
+    try roles.upsertEACRole(database, .v2, "0x02", helpers.TEST_OWNER_1, "0x01", 1000, helpers.randomHash(), 1, contract_b);
+    try roles.upsertEACRole(database, .v2, "0x03", helpers.TEST_OWNER_2, "0x01", 1000, helpers.randomHash(), 2, contract_b);
+
+    const by_account_and_contract = try roles.getRolesFiltered(database, .v2, .{ .account = helpers.TEST_OWNER_1, .contract_address = contract_b });
+    defer {
+        for (by_account_and_contract) |*r| r.deinit(allocator);
+        allocator.free(by_account_and_contract);
+    }
+    try testing.expectEqual(@as(usize, 1), by_account_and_contract.len);
+    try testing.expectEqualStrings("0x02", by_account_and_contract[0].resource);
+
+    const by_contract = try roles.getRolesFiltered(database, .v2, .{ .contract_address = contract_b });
+    defer {
+        for (by_contract) |*r| r.deinit(allocator);
+        allocator.free(by_contract);
+    }
+    try testing.expectEqual(@as(usize, 2), by_contract.len);
+}
+
+test "equal-timestamp rows order deterministically (id tiebreak)" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const resource = "0xdead";
+    // Same block => same timestamp; insertion order fixes ids.
+    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_1, "0x01", 1000, helpers.randomHash(), 0, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_2, "0x02", 1000, helpers.randomHash(), 1, helpers.TEST_RESOLVER);
+
+    const list = try roles.getRolesFiltered(database, .v2, .{ .resource = resource });
+    defer {
+        for (list) |*r| r.deinit(allocator);
+        allocator.free(list);
+    }
+    try testing.expectEqual(@as(usize, 2), list.len);
+    // timestamp DESC, id DESC: the later insert (higher id) comes first.
+    try testing.expect(list[0].id > list[1].id);
+}

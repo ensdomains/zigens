@@ -753,6 +753,23 @@ pub fn indexBlockRange(self: *Indexer, protocol: models.Protocol, client: *rpc.C
     // Only index V2 events if V2 is deployed and the block range includes deployment block or later
     const should_index_v2 = (v2_deployment > 0) and (to_block >= v2_deployment);
 
+    // Events-only write buffering for the V2 passes (and the resolver-record
+    // pass below), mirroring the V1 bulk path's tradeoff: V2 handlers never
+    // buffer NAMES — their read-own-writes flows (token-id lookups) need
+    // direct DB visibility — but events are append-only within a batch, so
+    // buffering them turns thousands of per-event round trips into a few
+    // multi-row inserts at flush. That per-statement RTT was the measured
+    // Neon bulk-sync bottleneck. Near the tip (reorg_arm) writes stay direct,
+    // exactly like V1. Known, accepted skew shared with V1 bulk: a
+    // placeholder→real name patch during this batch misses same-batch
+    // buffered events (denorm-only; see the events reorg-capture waiver).
+    const buffer_v2_events = should_index_v2 and !self.reorg_arm and self.config.v2_event_buffer;
+    if (buffer_v2_events) self.write_buffer.active = true;
+    errdefer if (buffer_v2_events) {
+        self.write_buffer.active = false;
+        self.write_buffer.reset();
+    };
+
     if (should_index_v2) {
         // Phase 1: Fetch EthRegistry + ETHRegistrar + Datastore events in a single batch RPC call
         // (1 HTTP request instead of 3, eliminates ~100ms of inter-batch sleeps)
@@ -796,5 +813,23 @@ pub fn indexBlockRange(self: *Indexer, protocol: models.Protocol, client: *rpc.C
     // known_resolvers row would flip it to indexing V1 logs as 'v2'.
     if ((should_index_v1 and protocol == .v1) or should_index_v2) {
         try self.indexResolverEvents(protocol, client, from_block, to_block);
+    }
+
+    // Flush AFTER the resolver pass — it emits a large share of the batch's
+    // events and runs outside the V2 gate above. Runs before the caller's
+    // block-lineage + sync-state writes, so a crash between flush and commit
+    // re-processes the batch into conflict-ignored inserts.
+    if (buffer_v2_events) {
+        self.write_buffer.active = false;
+        try self.write_buffer.flush(self.database);
+    } else if (should_index_v2) {
+        // Direct-mode twin of the flush repair: phase 1 writes datastore
+        // events before phase 2 creates the root-registry names they name, so
+        // same-batch rows need re-resolving after all passes ran.
+        const repaired = self.database.repairPlaceholderEvents(protocol, from_block, to_block) catch |err| blk: {
+            std.log.warn("placeholder event repair failed: {}", .{err});
+            break :blk 0;
+        };
+        if (repaired > 0) std.log.info("  Repaired {d} placeholder event name(s)", .{repaired});
     }
 }

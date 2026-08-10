@@ -473,6 +473,7 @@ pub fn getResolverRoles(db: *Database, resolver: Address) ![]models.EACRoleAssig
             // This query is scoped to a single resolver contract, so every row
             // is a resolver-EAC assignment — decode against the resolver table.
             .contract_kind = .resolver,
+            .contract_address = resolver,
         };
         try roles.append(db.allocator, role);
     }

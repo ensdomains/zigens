@@ -390,6 +390,10 @@ pub fn build(b: *std.Build) void {
     });
     api_tests.root_module.link_libc = true;
     api_tests.root_module.linkSystemLibrary("sqlite3", .{});
+    // The handler @embedFiles introspection.json; without this dependency a
+    // schema.graphql change compiles tests against the STALE embedded schema
+    // (the validator then rejects newly declared arguments).
+    api_tests.step.dependOn(&generate_schema.step);
     const run_api_tests = b.addRunArtifact(api_tests);
     run_api_tests.setCwd(b.path("."));
     const api_test_step = b.step("test-api", "Run api-module inline tests");
@@ -571,6 +575,24 @@ pub fn build(b: *std.Build) void {
     const run_storage_heal_targets_tests = b.addRunArtifact(storage_heal_targets_tests);
     run_storage_heal_targets_tests.setCwd(b.path("."));
 
+    // Storage tests - bulk-flush batch inserts (events + names)
+    const storage_batch_insert_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/storage/batch_insert_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "helpers", .module = helpers_mod },
+                .{ .name = "lib", .module = lib_mod },
+            },
+        }),
+    });
+    storage_batch_insert_tests.root_module.link_libc = true;
+    storage_batch_insert_tests.root_module.linkSystemLibrary("sqlite3", .{});
+
+    const run_storage_batch_insert_tests = b.addRunArtifact(storage_batch_insert_tests);
+    run_storage_batch_insert_tests.setCwd(b.path("."));
+
     // Storage tests - registry_entries (on-chain Entry mirror + reachability cascade)
     const storage_registry_entries_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -717,6 +739,7 @@ pub fn build(b: *std.Build) void {
     storage_test_step.dependOn(&run_storage_roles_tests.step);
     storage_test_step.dependOn(&run_storage_webhooks_tests.step);
     storage_test_step.dependOn(&run_storage_heal_targets_tests.step);
+    storage_test_step.dependOn(&run_storage_batch_insert_tests.step);
     storage_test_step.dependOn(&run_storage_registry_entries_tests.step);
     storage_test_step.dependOn(&run_storage_query_tests.step);
     storage_test_step.dependOn(&run_storage_schema_keys_tests.step);
@@ -737,6 +760,7 @@ pub fn build(b: *std.Build) void {
         storage_query_tests,
         storage_webhooks_tests,
         storage_heal_targets_tests,
+        storage_batch_insert_tests,
         backend_conformance_tests,
         pool_tests,
     }) |compile| {
@@ -759,6 +783,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_storage_roles_tests.step);
     test_step.dependOn(&run_storage_webhooks_tests.step);
     test_step.dependOn(&run_storage_heal_targets_tests.step);
+    test_step.dependOn(&run_storage_batch_insert_tests.step);
     test_step.dependOn(&run_storage_registry_entries_tests.step);
     test_step.dependOn(&run_backend_conformance_tests.step);
     test_step.dependOn(&run_pool_tests.step);
@@ -827,6 +852,9 @@ pub fn build(b: *std.Build) void {
     });
     conformance_tests.root_module.link_libc = true;
     conformance_tests.root_module.linkSystemLibrary("sqlite3", .{});
+    // Same stale-introspection guard as api_tests: golden runs must compile
+    // against the schema in the working tree, not a leftover generated file.
+    conformance_tests.step.dependOn(&generate_schema.step);
     const run_conformance_tests = b.addRunArtifact(conformance_tests);
     run_conformance_tests.setCwd(b.path("."));
     const conformance_test_step = b.step("test-conformance", "Run GraphQL conformance golden harness");

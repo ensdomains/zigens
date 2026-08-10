@@ -77,11 +77,11 @@ type Query {
   """Subgraph parity: top-level `RegistryTransfer` events. Inspect via `asRegistryTransfer { ... }`."""
   registryTransfers(first: Int = 100, skip: Int = 0, where: EventFilter, orderBy: Event_orderBy, orderDirection: OrderDirection): [Event!]!
 
-  """Get EAC role assignments"""
-  roles(resource: String, account: String): [EACRoleAssignment!]!
+  """Get EAC role assignments. Filters combine; `contract` scopes shared resource values (ROOT, 0x0, exists on every EAC-enabled contract) to one registry/resolver. `protocol` selects v1/v2 (default v2)."""
+  roles(resource: String, account: String, contract: String, protocol: String): [EACRoleAssignment!]!
 
   """Get EAC role assignments with cursor-based pagination (recommended)"""
-  roleConnection(first: Int, after: String, last: Int, before: String, resource: String, account: String): EACRoleAssignmentConnection!
+  roleConnection(first: Int, after: String, last: Int, before: String, resource: String, account: String, contract: String, protocol: String): EACRoleAssignmentConnection!
 
   """
   List resolver contracts owned by a specific account (admin view).
@@ -1184,6 +1184,9 @@ type EACRoleAssignment {
 
   """Account that has the role"""
   account: String!
+
+  """Contract that emitted the role event. Disambiguates shared resource values: ROOT (0x0) exists on every EAC-enabled contract, so a role row is only meaningful together with its contract."""
+  contractAddress: String!
 
   """Role bitmap (hex string). Preserved verbatim for clients that decode it directly."""
   roleBitmap: String!

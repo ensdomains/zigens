@@ -96,6 +96,12 @@ pub const Dialect = struct {
     /// a literal like `'migration'`/`NULL`/`0`, or a wrapper like `LOWER(?)`); pass
     /// an empty slice for the common all-`?` case (one placeholder per column).
     upsert: *const fn (allocator: std.mem.Allocator, table: []const u8, cols: []const []const u8, value_exprs: []const []const u8, conflict_cols: []const []const u8, action: ConflictAction) anyerror![]u8,
+    /// Multi-row form of `upsert`, all-`?` placeholders: `VALUES (…), (…) …`
+    /// × `rows`. Bind row-major in column order. Callers must ensure no two
+    /// rows share a conflict key within one statement — Postgres rejects
+    /// "affect row a second time", unlike the silent per-row semantics of
+    /// sequential single-row upserts.
+    upsertMulti: *const fn (allocator: std.mem.Allocator, table: []const u8, cols: []const []const u8, rows: usize, conflict_cols: []const []const u8, action: ConflictAction) anyerror![]u8,
     /// `INSERT OR REPLACE/IGNORE INTO t (cols) <select_body>` (SQLite) /
     /// `INSERT INTO t (cols) <select_body> ON CONFLICT(conflict) DO UPDATE/NOTHING` (PG).
     /// `select_body` is the caller's `SELECT … FROM … [WHERE …]` (driver renumbers `?`).

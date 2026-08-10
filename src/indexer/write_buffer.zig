@@ -327,18 +327,20 @@ pub const WriteBuffer = struct {
         var op_count: [8]usize = @splat(0);
         const wal_before = db.walFileSize() orelse 0;
 
-        // 1. Flush names (events may reference names)
+        // 1. Flush names (events may reference names). New names are collected
+        // and written in one multi-row upsert pass below — on a remote
+        // Postgres the per-row round trips dominated the flush.
+        var new_names: std.ArrayList(models.Name) = .empty;
+        defer new_names.deinit(self.allocator);
+
         var it = self.names.iterator();
         while (it.next()) |entry| {
             const bn = entry.value_ptr;
 
             if (bn.is_new) {
-                // Single INSERT with all updates already applied to the record
-                const t0 = zsys.nanoTimestamp();
-                try names_storage.insertName(db, bn.record.?);
-                op_ns[0] += zsys.nanoTimestamp() - t0;
-                op_count[0] += 1;
-                names_inserted += 1;
+                // Record has all updates already applied; strings stay owned by
+                // the buffer until reset(), which outlives the batch insert.
+                try new_names.append(self.allocator, bn.record.?);
             } else {
                 // Apply individual updates to existing DB record
                 const namehash = Hash{ .bytes = entry.key_ptr.* };
@@ -399,13 +401,46 @@ pub const WriteBuffer = struct {
                 names_updated += 1;
             }
         }
+        if (new_names.items.len > 0) {
+            const t0 = zsys.nanoTimestamp();
+            try names_storage.insertNamesBatch(db, new_names.items);
+            op_ns[0] += zsys.nanoTimestamp() - t0;
+            op_count[0] += new_names.items.len;
+            names_inserted = new_names.items.len;
+        }
         names_ms = zsys.milliTimestamp() - timer;
 
-        // 2. Flush events
-        const events_timer = zsys.milliTimestamp();
-        for (self.events.items) |event| {
-            try events_storage.insertEvent(db, event);
+        // 2. Repair placeholder-named buffered events before they land: the
+        // mid-batch placeholder→real patch (updatePlaceholderEventsByName)
+        // only reaches rows already in the table, so buffered events would
+        // keep the "tokenId:…" denorm name and null namehash. The names table
+        // is fully current at this point (names flushed above; V2 names write
+        // direct), so one token-id lookup per placeholder event restores
+        // byte-identical output vs the direct per-event path. A miss (or a
+        // still-placeholder name) is left as-is — identical to direct mode
+        // when no patch ever fired.
+        for (self.events.items) |*event| {
+            const placeholder = event.name orelse continue;
+            if (!std.mem.startsWith(u8, placeholder, "tokenId:")) continue;
+            const token = std.fmt.parseInt(u256, placeholder["tokenId:".len..], 10) catch continue;
+            // Registry-LESS lookup on purpose: the emitting contract of the
+            // event is not necessarily the registry that owns the token (the
+            // direct-mode patch matches by placeholder string, no registry).
+            // The helper returns null on cross-registry canonical collisions,
+            // so an ambiguous token conservatively keeps its placeholder.
+            var found = (names_storage.getUniqueNameByCanonicalId(db, event.protocol, token) catch null) orelse continue;
+            defer found.deinit(db.allocator);
+            const real_name = found.name orelse continue;
+            if (std.mem.startsWith(u8, real_name, "tokenId:")) continue;
+            const dup = try self.allocator.dupe(u8, real_name);
+            self.allocator.free(placeholder);
+            event.name = dup;
+            event.namehash = found.namehash;
         }
+
+        // 3. Flush events — one multi-row conflict-ignoring INSERT per chunk.
+        const events_timer = zsys.milliTimestamp();
+        try events_storage.insertEventsBatch(db, self.events.items);
         const events_ms = zsys.milliTimestamp() - events_timer;
         const wal_after = db.walFileSize() orelse wal_before;
 
