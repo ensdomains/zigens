@@ -247,6 +247,22 @@ pub const Database = struct {
         return self.backend.dialect.upsert(allocator, table, cols, &.{}, conflict_cols, action);
     }
 
+    /// Multi-row `upsertSql` (all-`?` placeholders, bound row-major). Callers
+    /// must guarantee no two rows share the table's conflict key in one
+    /// statement — Postgres rejects that outright where sequential single-row
+    /// upserts were silently per-row.
+    pub fn upsertMultiSql(
+        self: *Database,
+        allocator: std.mem.Allocator,
+        table: []const u8,
+        cols: []const []const u8,
+        rows: usize,
+        action: backend_mod.ConflictAction,
+    ) ![]u8 {
+        const conflict_cols = schema_keys.conflictColsFor(table) orelse return error.UnknownUpsertTable;
+        return self.backend.dialect.upsertMulti(allocator, table, cols, rows, conflict_cols, action);
+    }
+
     /// Like `upsertSql`, but each column's value is given by `value_exprs[i]` — a
     /// `?` placeholder, a SQL literal (`'migration'`/`NULL`/`0`), or a wrapper
     /// (`LOWER(?)`). For upserts whose original `VALUES` mixed binds with literals.
@@ -331,6 +347,7 @@ pub const Database = struct {
     // Names module (15 functions)
     pub const insertRegistry = names.insertRegistry;
     pub const insertName = names.insertName;
+    pub const insertNamesBatch = names.insertNamesBatch;
     pub const getNameByNamehash = names.getNameByNamehash;
     pub const getNameStringByNamehash = names.getNameStringByNamehash;
     pub const getNameByNamehashAndProtocol = names.getNameByNamehashAndProtocol;
@@ -446,6 +463,7 @@ pub const Database = struct {
 
     // Events module
     pub const insertEvent = events.insertEvent;
+    pub const insertEventsBatch = events.insertEventsBatch;
     pub const insertEventIfNew = events.insertEventIfNew;
     pub const getRecentEvents = events.getRecentEvents;
     pub const getEventsFiltered = events.getEventsFiltered;

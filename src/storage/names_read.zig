@@ -264,6 +264,37 @@ pub fn getNameByTokenIdAndRegistry(db: *Database, token_id: u256, registry: Addr
     return null;
 }
 
+/// The single name matching this canonical token id under `protocol`, or null
+/// when none — or MORE THAN ONE — matches. The uniqueness guard matters: the
+/// same label under different parents yields the same token id in different
+/// registries (the documented cross-registry collision class), and callers of
+/// this registry-less lookup (the write-buffer's placeholder-event repair)
+/// must skip rather than guess in that case.
+pub fn getUniqueNameByCanonicalId(db: *Database, protocol: models.Protocol, token_id: u256) !?models.Name {
+    var q = try Query.initCached(db, SQL_SELECT_NAMES ++ " WHERE canonical_id = ? AND protocol = ? LIMIT 2");
+    defer q.deinit();
+
+    const token_id_utils = @import("../types/token_id.zig");
+    const canonical_id = token_id_utils.getCanonicalId(token_id);
+    var canonical_id_buf: [66]u8 = undefined;
+    const canonical_id_hex = formatU256HexBuf(&canonical_id_buf, canonical_id);
+
+    try q.bindText(canonical_id_hex);
+    try q.bindTextStatic(protocol.toString());
+
+    if (!try q.step()) return null;
+    var first = try parseNameRow(&q, db.allocator);
+    // The ambiguity-check step can itself fail (SQLITE_BUSY/IOERR) — without
+    // this, `first`'s duped strings leak on that error path, silently and
+    // repeatedly under the repair loop's `catch null`.
+    errdefer first.deinit(db.allocator);
+    if (try q.step()) {
+        first.deinit(db.allocator);
+        return null;
+    }
+    return first;
+}
+
 /// Get all names owned by an address. Unreachable rows (orphaned by a
 /// subregistry repoint or LabelUnregistered) are filtered out.
 pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Name {

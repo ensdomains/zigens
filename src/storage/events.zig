@@ -89,6 +89,84 @@ pub fn insertEventIfNew(db: *Database, event: models.Event) !bool {
     return q.changes() > 0;
 }
 
+const EVENT_COLS = [_][]const u8{ "event_type", "protocol", "block_number", "tx_hash", "log_index", "contract_address", "name", "namehash", "data", "timestamp" };
+
+/// Rows per multi-row INSERT: 10 params each → 900 params, under even the
+/// pre-3.32 SQLite SQLITE_MAX_VARIABLE_NUMBER floor of 999.
+const EVENT_BATCH_ROWS = 90;
+
+/// Bulk-sync insert path: one multi-row conflict-ignoring INSERT per chunk of
+/// up to EVENT_BATCH_ROWS events, instead of one round trip per event — on a
+/// remote Postgres (Neon) the per-statement RTT dominated bulk sync.
+///
+/// Semantics match sequential `insertEvent` calls exactly:
+///   - conflict-ignore on (protocol, tx_hash, log_index); rows whose key
+///     already exists in the table are skipped by the engine,
+///   - duplicates WITHIN the slice are deduped here keep-first, because
+///     Postgres rejects two rows with one conflict key in a single statement
+///     ("cannot affect row a second time") where sequential inserts silently
+///     ignored the second.
+///
+/// All text is bound with static lifetime (the caller's event slice must stay
+/// alive through this call — the write buffer guarantees it): the SQLite
+/// driver binds SQLITE_STATIC, and per-row tracked copies would blow the
+/// statement's MAX_BOUND_STRINGS cap. Derived hex strings live in a per-chunk
+/// arena that outlives the statement (LIFO defers).
+pub fn insertEventsBatch(db: *Database, events_slice: []const models.Event) !void {
+    if (events_slice.len == 0) return;
+
+    const DedupKey = struct { protocol: models.Protocol, tx_hash: [32]u8, log_index: u32 };
+    var seen = std.AutoHashMap(DedupKey, void).init(db.allocator);
+    defer seen.deinit();
+    try seen.ensureTotalCapacity(@intCast(events_slice.len));
+
+    var deduped: std.ArrayList(*const models.Event) = .empty;
+    defer deduped.deinit(db.allocator);
+    try deduped.ensureTotalCapacity(db.allocator, events_slice.len);
+    for (events_slice) |*event| {
+        const gop = seen.getOrPutAssumeCapacity(.{ .protocol = event.protocol, .tx_hash = event.tx_hash.bytes, .log_index = event.log_index });
+        if (gop.found_existing) continue;
+        deduped.appendAssumeCapacity(event);
+    }
+
+    var start: usize = 0;
+    while (start < deduped.items.len) {
+        const rows = @min(EVENT_BATCH_ROWS, deduped.items.len - start);
+        const chunk = deduped.items[start .. start + rows];
+
+        const sql = try db.upsertMultiSql(db.allocator, "events", &EVENT_COLS, rows, .ignore);
+        defer db.allocator.free(sql);
+
+        // Declared before the Query so its hex strings outlive exec (LIFO defers).
+        var arena = std.heap.ArenaAllocator.init(db.allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+
+        var q = try Query.initCached(db, sql);
+        defer q.deinit();
+
+        for (chunk) |event| {
+            try q.bindTextStatic(event.event_type.toString());
+            try q.bindTextStatic(event.protocol.toString());
+            try q.bindInt64(@intCast(event.block_number));
+            const tx_buf = try scratch.create([66]u8);
+            try q.bindTextStatic(event.tx_hash.toHexBuf(tx_buf));
+            try q.bindInt(@intCast(event.log_index));
+            const addr_buf = try scratch.create([42]u8);
+            try q.bindTextStatic(event.contract_address.toHexBuf(addr_buf));
+            if (event.name) |n| try q.bindTextStatic(n) else try q.bindNull();
+            if (event.namehash) |h| {
+                const nh_buf = try scratch.create([66]u8);
+                try q.bindTextStatic(h.toHexBuf(nh_buf));
+            } else try q.bindNull();
+            try q.bindTextStatic(event.data);
+            try q.bindInt64(event.timestamp);
+        }
+        try q.exec();
+        start += rows;
+    }
+}
+
 /// Order direction for event queries
 pub const OrderDir = enum {
     asc,

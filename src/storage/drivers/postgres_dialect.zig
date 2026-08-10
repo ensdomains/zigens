@@ -48,6 +48,30 @@ fn dialectUpsert(allocator: std.mem.Allocator, table: []const u8, cols: []const 
     return buf.toOwnedSlice(allocator);
 }
 
+fn dialectUpsertMulti(allocator: std.mem.Allocator, table: []const u8, cols: []const []const u8, rows: usize, conflict_cols: []const []const u8, action: backend.ConflictAction) anyerror![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "INSERT INTO ");
+    try appendQuotedIdent(allocator, &buf, table);
+    try buf.appendSlice(allocator, " (");
+    for (cols, 0..) |col, i| {
+        if (i > 0) try buf.appendSlice(allocator, ", ");
+        try appendQuotedIdent(allocator, &buf, col);
+    }
+    try buf.appendSlice(allocator, ") VALUES ");
+    for (0..rows) |r| {
+        if (r > 0) try buf.appendSlice(allocator, ", ");
+        try buf.append(allocator, '(');
+        for (cols, 0..) |_, i| {
+            if (i > 0) try buf.appendSlice(allocator, ", ");
+            try buf.append(allocator, '?');
+        }
+        try buf.append(allocator, ')');
+    }
+    try appendOnConflict(allocator, &buf, cols, conflict_cols, action);
+    return buf.toOwnedSlice(allocator);
+}
+
 /// `INSERT INTO "t" (cols) <select_body> ON CONFLICT … DO NOTHING/UPDATE`.
 fn dialectInsertSelect(allocator: std.mem.Allocator, table: []const u8, cols: []const []const u8, select_body: []const u8, conflict_cols: []const []const u8, action: backend.ConflictAction) anyerror![]u8 {
     var buf: std.ArrayList(u8) = .empty;
@@ -125,6 +149,7 @@ pub const pg_dialect = backend.Dialect{
     .scalar_max = "GREATEST",
     .scalar_min = "LEAST",
     .upsert = dialectUpsert,
+    .upsertMulti = dialectUpsertMulti,
     .insertSelect = dialectInsertSelect,
     .returning = dialectReturning,
     .jsonObject = dialectJsonObject,

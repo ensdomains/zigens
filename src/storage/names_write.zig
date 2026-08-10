@@ -18,72 +18,107 @@ const names_common = @import("names_common.zig");
 const safeU64ToI64 = names_common.safeU64ToI64;
 const formatU256HexBuf = names_common.formatU256HexBuf;
 
+// The names upsert, factored so the single-row path and the bulk-flush batch
+// path share one SQL definition and one bind sequence — they cannot drift.
+// NOTE the tail's deliberate asymmetries: created_block/created_at are NOT
+// updated on conflict (first-sighting preservation), and resolved_address
+// COALESCEs so a null in the incoming row keeps the existing value.
+const NAMES_UPSERT_HEAD =
+    \\INSERT INTO names
+    \\(namehash, name, label, label_hash, parent_name, parent_namehash, protocol,
+    \\ registry, owner, registrant, resolver, token_id, canonical_id, token_version, expiry,
+    \\ registry_locked, migrated, created_block, created_at, registered_at, updated_block, updated_at,
+    \\ is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash,
+    \\ is_reachable, unreachable_since, ttl, is_legacy, resolved_address, is_normalized)
+    \\VALUES
+;
+
+const NAMES_UPSERT_TUPLE = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+/// 33 bound columns per row.
+const NAMES_UPSERT_PARAMS = 33;
+
+const NAMES_UPSERT_TAIL =
+    \\ON CONFLICT(protocol, namehash) DO UPDATE SET
+    \\ name = excluded.name,
+    \\ label = excluded.label,
+    \\ label_hash = excluded.label_hash,
+    \\ parent_name = excluded.parent_name,
+    \\ parent_namehash = excluded.parent_namehash,
+    \\ registry = excluded.registry,
+    \\ owner = excluded.owner,
+    \\ registrant = excluded.registrant,
+    \\ resolver = excluded.resolver,
+    \\ token_id = excluded.token_id,
+    \\ canonical_id = excluded.canonical_id,
+    \\ token_version = excluded.token_version,
+    \\ expiry = excluded.expiry,
+    \\ registry_locked = excluded.registry_locked,
+    \\ migrated = excluded.migrated,
+    \\ registered_at = excluded.registered_at,
+    \\ updated_block = excluded.updated_block,
+    \\ updated_at = excluded.updated_at,
+    \\ is_wrapped = excluded.is_wrapped,
+    \\ wrapper_fuses = excluded.wrapper_fuses,
+    \\ wrapper_expiry = excluded.wrapper_expiry,
+    \\ is_v1_name = excluded.is_v1_name,
+    \\ v1_label_hash = excluded.v1_label_hash,
+    \\ is_reachable = excluded.is_reachable,
+    \\ unreachable_since = excluded.unreachable_since,
+    \\ ttl = excluded.ttl,
+    \\ is_legacy = excluded.is_legacy,
+    \\ resolved_address = COALESCE(excluded.resolved_address, names.resolved_address),
+    \\ is_normalized = excluded.is_normalized
+;
+
 pub fn insertName(db: *Database, name: models.Name) !void {
     try reorg_undo.captureUpsert(db, "names", .{ name.protocol, name.namehash });
-    var q = try Query.initCached(db,
-        \\INSERT INTO names
-        \\(namehash, name, label, label_hash, parent_name, parent_namehash, protocol,
-        \\ registry, owner, registrant, resolver, token_id, canonical_id, token_version, expiry,
-        \\ registry_locked, migrated, created_block, created_at, registered_at, updated_block, updated_at,
-        \\ is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash,
-        \\ is_reachable, unreachable_since, ttl, is_legacy, resolved_address, is_normalized)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        \\ON CONFLICT(protocol, namehash) DO UPDATE SET
-        \\ name = excluded.name,
-        \\ label = excluded.label,
-        \\ label_hash = excluded.label_hash,
-        \\ parent_name = excluded.parent_name,
-        \\ parent_namehash = excluded.parent_namehash,
-        \\ registry = excluded.registry,
-        \\ owner = excluded.owner,
-        \\ registrant = excluded.registrant,
-        \\ resolver = excluded.resolver,
-        \\ token_id = excluded.token_id,
-        \\ canonical_id = excluded.canonical_id,
-        \\ token_version = excluded.token_version,
-        \\ expiry = excluded.expiry,
-        \\ registry_locked = excluded.registry_locked,
-        \\ migrated = excluded.migrated,
-        \\ registered_at = excluded.registered_at,
-        \\ updated_block = excluded.updated_block,
-        \\ updated_at = excluded.updated_at,
-        \\ is_wrapped = excluded.is_wrapped,
-        \\ wrapper_fuses = excluded.wrapper_fuses,
-        \\ wrapper_expiry = excluded.wrapper_expiry,
-        \\ is_v1_name = excluded.is_v1_name,
-        \\ v1_label_hash = excluded.v1_label_hash,
-        \\ is_reachable = excluded.is_reachable,
-        \\ unreachable_since = excluded.unreachable_since,
-        \\ ttl = excluded.ttl,
-        \\ is_legacy = excluded.is_legacy,
-        \\ resolved_address = COALESCE(excluded.resolved_address, names.resolved_address),
-        \\ is_normalized = excluded.is_normalized
-    );
+
+    // Arena declared before the statement so bound SQLITE_STATIC pointers
+    // outlive it (LIFO defers).
+    var arena = std.heap.ArenaAllocator.init(db.allocator);
+    defer arena.deinit();
+
+    var q = try Query.initCached(db, NAMES_UPSERT_HEAD ++ " " ++ NAMES_UPSERT_TUPLE ++ "\n" ++ NAMES_UPSERT_TAIL);
     defer q.deinit();
 
-    // Format token IDs as hex strings into stack buffers — both are exactly 66 chars
-    // ("0x" + 64 hex). Avoids two heap allocs per insertName call.
-    var token_id_buf: [66]u8 = undefined;
-    const token_id_hex = formatU256HexBuf(&token_id_buf, name.token_id);
-    var canonical_id_buf: [66]u8 = undefined;
-    const canonical_id_hex = formatU256HexBuf(&canonical_id_buf, name.canonical_id);
+    try bindNameValues(&q, name, arena.allocator());
+    try q.exec();
+}
 
-    try q.bindHash(name.namehash);
-    try q.bindOptionalText(name.name);
-    try q.bindOptionalText(name.label);
-    try q.bindHash(name.label_hash);
+/// Bind one name's 33 upsert values in NAMES_UPSERT_HEAD column order. Shared
+/// by the single-row and batch paths. All text binds are static: the caller's
+/// `name` strings must stay alive through exec (they do at every call site —
+/// live handlers exec before returning, the flush batch execs while the write
+/// buffer still owns them), and derived hex goes into `scratch`, which the
+/// caller keeps alive past exec. Static binds keep the batch path clear of
+/// the statement's MAX_BOUND_STRINGS tracked-copy cap.
+fn bindNameValues(q: *Query, name: models.Name, scratch: std.mem.Allocator) !void {
+    const namehash_buf = try scratch.create([66]u8);
+    try q.bindTextStatic(name.namehash.toHexBuf(namehash_buf));
+    if (name.name) |v| try q.bindTextStatic(v) else try q.bindNull();
+    if (name.label) |v| try q.bindTextStatic(v) else try q.bindNull();
+    const label_hash_buf = try scratch.create([66]u8);
+    try q.bindTextStatic(name.label_hash.toHexBuf(label_hash_buf));
     // parent_name is NOT NULL: a root child is the empty string, never SQL NULL.
     // Coerce here so the schema invariant holds for every caller (a null would
     // otherwise abort the insert on the NOT NULL constraint). See ens_name.ROOT_PARENT.
-    try q.bindText(name.parent_name orelse "");
-    try q.bindHash(name.parent_namehash);
+    try q.bindTextStatic(name.parent_name orelse "");
+    const parent_hash_buf = try scratch.create([66]u8);
+    try q.bindTextStatic(name.parent_namehash.toHexBuf(parent_hash_buf));
     try q.bindTextStatic(name.protocol.toString());
-    try q.bindAddress(name.registry);
-    try q.bindAddress(name.owner);
-    try q.bindAddress(name.registrant);
-    try q.bindAddress(name.resolver);
-    try q.bindText(token_id_hex);
-    try q.bindText(canonical_id_hex);
+    const registry_buf = try scratch.create([42]u8);
+    try q.bindTextStatic(name.registry.toHexBuf(registry_buf));
+    const owner_buf = try scratch.create([42]u8);
+    try q.bindTextStatic(name.owner.toHexBuf(owner_buf));
+    const registrant_buf = try scratch.create([42]u8);
+    try q.bindTextStatic(name.registrant.toHexBuf(registrant_buf));
+    const resolver_buf = try scratch.create([42]u8);
+    try q.bindTextStatic(name.resolver.toHexBuf(resolver_buf));
+    const token_id_buf = try scratch.create([66]u8);
+    try q.bindTextStatic(formatU256HexBuf(token_id_buf, name.token_id));
+    const canonical_id_buf = try scratch.create([66]u8);
+    try q.bindTextStatic(formatU256HexBuf(canonical_id_buf, name.canonical_id));
     try q.bindInt64(@intCast(name.token_version));
     try q.bindInt64(safeU64ToI64(name.expiry));
     try q.bindInt(if (name.registry_locked) 1 else 0);
@@ -94,23 +129,87 @@ pub fn insertName(db: *Database, name: models.Name) !void {
     try q.bindInt64(@intCast(name.updated_block));
     try q.bindInt64(name.updated_at);
     try q.bindInt(if (name.is_wrapped) 1 else 0);
-    try q.bindOptionalText(name.wrapper_fuses);
+    if (name.wrapper_fuses) |v| try q.bindTextStatic(v) else try q.bindNull();
     try q.bindOptionalInt64(name.wrapper_expiry);
     try q.bindInt(if (name.is_v1_name) 1 else 0);
-    try q.bindOptionalText(name.v1_label_hash);
+    if (name.v1_label_hash) |v| try q.bindTextStatic(v) else try q.bindNull();
     try q.bindInt(if (name.is_reachable) 1 else 0);
     try q.bindOptionalInt64(name.unreachable_since);
     try q.bindOptionalInt64(if (name.ttl) |t| safeU64ToI64(t) else null);
     try q.bindInt(if (name.is_legacy) 1 else 0);
     if (name.resolved_address) |addr| {
-        var resolved_buf: [42]u8 = undefined;
-        const resolved_hex = addr.toHexBuf(&resolved_buf);
-        try q.bindText(resolved_hex);
+        const resolved_buf = try scratch.create([42]u8);
+        try q.bindTextStatic(addr.toHexBuf(resolved_buf));
     } else {
         try q.bindNull();
     }
     try q.bindInt(if (name.is_normalized) 1 else 0);
-    try q.exec();
+}
+
+/// Rows per multi-row names upsert: 33 params each → 990 params, under even
+/// the pre-3.32 SQLite SQLITE_MAX_VARIABLE_NUMBER floor of 999.
+const NAMES_BATCH_ROWS = 30;
+
+/// Bulk-flush insert path: multi-row upserts instead of one round trip per
+/// name — same SQL head/tail as `insertName`, so semantics are identical row
+/// for row (incl. created_* preservation and the resolved_address COALESCE).
+/// Duplicates by (protocol, namehash) within the slice are deduped keep-LAST
+/// (equal to sequential last-write-wins; Postgres rejects intra-statement
+/// conflict-key repeats). Per-row reorg capture mirrors `insertName`.
+pub fn insertNamesBatch(db: *Database, names_slice: []const models.Name) !void {
+    if (names_slice.len == 0) return;
+
+    const DedupKey = struct { protocol: models.Protocol, namehash: [32]u8 };
+    var seen = std.AutoHashMap(DedupKey, void).init(db.allocator);
+    defer seen.deinit();
+    try seen.ensureTotalCapacity(@intCast(names_slice.len));
+
+    // Reverse scan keep-first == forward keep-last. Order among distinct keys
+    // is irrelevant: independent rows, one statement.
+    var deduped: std.ArrayList(*const models.Name) = .empty;
+    defer deduped.deinit(db.allocator);
+    try deduped.ensureTotalCapacity(db.allocator, names_slice.len);
+    var i: usize = names_slice.len;
+    while (i > 0) {
+        i -= 1;
+        const name = &names_slice[i];
+        const gop = seen.getOrPutAssumeCapacity(.{ .protocol = name.protocol, .namehash = name.namehash.bytes });
+        if (gop.found_existing) continue;
+        deduped.appendAssumeCapacity(name);
+    }
+
+    var start: usize = 0;
+    while (start < deduped.items.len) {
+        const rows = @min(NAMES_BATCH_ROWS, deduped.items.len - start);
+        const chunk = deduped.items[start .. start + rows];
+
+        for (chunk) |name| {
+            try reorg_undo.captureUpsert(db, "names", .{ name.protocol, name.namehash });
+        }
+
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(db.allocator);
+        try sql.appendSlice(db.allocator, NAMES_UPSERT_HEAD);
+        for (0..rows) |r| {
+            try sql.appendSlice(db.allocator, if (r == 0) " " else ", ");
+            try sql.appendSlice(db.allocator, NAMES_UPSERT_TUPLE);
+        }
+        try sql.append(db.allocator, '\n');
+        try sql.appendSlice(db.allocator, NAMES_UPSERT_TAIL);
+
+        // Declared before the Query so hex strings outlive exec (LIFO defers).
+        var arena = std.heap.ArenaAllocator.init(db.allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+
+        var q = try Query.initCached(db, sql.items);
+        defer q.deinit();
+        for (chunk) |name| {
+            try bindNameValues(&q, name.*, scratch);
+        }
+        try q.exec();
+        start += rows;
+    }
 }
 
 /// Update the `is_legacy` flag on an existing name row. Called by V1 Registry
