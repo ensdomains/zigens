@@ -167,6 +167,58 @@ pub fn insertEventsBatch(db: *Database, events_slice: []const models.Event) !voi
     }
 }
 
+/// Direct-mode twin of the write-buffer flush repair: re-resolve
+/// placeholder-named events written in [from_block, to_block]. Phase 1 writes
+/// datastore events (ResolverUpdated) BEFORE phase 2 creates the
+/// root-registry names they reference, so same-batch rows land with a
+/// "tokenId:…" name and null namehash — and the names-side placeholder patch
+/// never fires for names that were never placeholders themselves. Runs after
+/// all batch passes; the registry-less canonical lookup is ambiguity-guarded
+/// (collision → row keeps its placeholder). The in-place events name patch is
+/// the documented reorg-capture waiver (denorm-only), same as
+/// updatePlaceholderEventsByName.
+pub fn repairPlaceholderEvents(db: *Database, protocol: models.Protocol, from_block: u64, to_block: u64) !usize {
+    const names_mod = @import("names.zig");
+
+    const Candidate = struct { id: i64, token: u256 };
+    var candidates: std.ArrayList(Candidate) = .empty;
+    defer candidates.deinit(db.allocator);
+
+    {
+        var q = try Query.init(db,
+            \\SELECT id, name FROM events
+            \\WHERE protocol = ? AND block_number >= ? AND block_number <= ? AND name LIKE 'tokenId:%'
+        );
+        defer q.deinit();
+        try q.bindTextStatic(protocol.toString());
+        try q.bindInt64(@intCast(from_block));
+        try q.bindInt64(@intCast(to_block));
+        while (try q.step()) {
+            const name = q.getTextSlice(1) orelse continue;
+            const token = std.fmt.parseInt(u256, name["tokenId:".len..], 10) catch continue;
+            try candidates.append(db.allocator, .{ .id = q.getInt64(0), .token = token });
+        }
+    }
+
+    var repaired: usize = 0;
+    for (candidates.items) |cand| {
+        var found = (names_mod.getUniqueNameByCanonicalId(db, protocol, cand.token) catch null) orelse continue;
+        defer found.deinit(db.allocator);
+        const real_name = found.name orelse continue;
+        if (std.mem.startsWith(u8, real_name, "tokenId:")) continue;
+
+        var u = try Query.init(db, "UPDATE events SET name = ?, namehash = ? WHERE id = ?");
+        defer u.deinit();
+        try u.bindTextStatic(real_name);
+        var nh_buf: [66]u8 = undefined;
+        try u.bindTextStatic(found.namehash.toHexBuf(&nh_buf));
+        try u.bindInt64(cand.id);
+        try u.exec();
+        repaired += 1;
+    }
+    return repaired;
+}
+
 /// Order direction for event queries
 pub const OrderDir = enum {
     asc,

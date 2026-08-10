@@ -94,6 +94,35 @@ fn nthName(n: u8, owner: Address, name_str: []const u8) models.Name {
     };
 }
 
+test "getUniqueNameByCanonicalId: unique hit resolves, cross-registry collision returns null" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const owner = Address{ .bytes = [_]u8{0xA1} ** 20 };
+    // Realistic token id: the low 32 bits are the VERSION counter and get
+    // masked by getCanonicalId, so a canonical id must have them zeroed.
+    const tok: u256 = @as(u256, 9) << 32;
+
+    var solo = nthName(9, owner, "solo.eth");
+    solo.token_id = tok;
+    solo.canonical_id = tok;
+    try database.insertName(solo);
+    const hit = (try database.getUniqueNameByCanonicalId(.v2, tok)) orelse return error.MissingRow;
+    var hit_mut = hit;
+    defer hit_mut.deinit(database.allocator);
+    try testing.expectEqualStrings("solo.eth", hit.name.?);
+
+    // Same canonical id in a SECOND registry (the documented cross-registry
+    // collision class): the lookup must refuse to guess.
+    var twin = nthName(10, owner, "twin.eth");
+    twin.canonical_id = tok;
+    twin.token_id = tok;
+    twin.registry = Address{ .bytes = [_]u8{0xDD} ** 20 };
+    try database.insertName(twin);
+    try testing.expectEqual(@as(?models.Name, null), try database.getUniqueNameByCanonicalId(.v2, tok));
+}
+
 test "insertNamesBatch matches insertName semantics: conflict update, created preservation, keep-last dedup" {
     const allocator = testing.allocator;
     const database = try helpers.createTestDatabase(allocator);

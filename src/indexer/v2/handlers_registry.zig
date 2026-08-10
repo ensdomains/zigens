@@ -1979,7 +1979,28 @@ pub fn handleResolverUpdated(self: *Indexer, protocol: models.Protocol, log: rpc
                 std.log.debug("upsertResolverEntity failed: {}", .{err});
             };
         }
-    } else {
+    } else fallback: {
+        // Event-enrichment fallback ONLY — the mutations above stay strictly
+        // behind the paired (token, emitting contract) lookup. The emitter is
+        // not always the owning registry (TLD ResolverUpdated arrives from
+        // the datastore while the name's row records the root registry), and
+        // that miss used to leave a PERMANENT "tokenId:…" placeholder with a
+        // null namehash — rows invisible to name-scoped history queries.
+        // Ambiguity-guarded: a cross-registry canonical collision returns
+        // null and keeps the placeholder rather than guessing. Mirrors the
+        // write-buffer flush repair (A/B-verified 180/180 on real data), so
+        // direct and buffered mode now agree.
+        if (try self.database.getUniqueNameByCanonicalId(protocol, token_id)) |fb| {
+            var fb_copy = fb;
+            defer fb_copy.deinit(self.allocator);
+            if (fb_copy.name) |real| {
+                if (!std.mem.startsWith(u8, real, "tokenId:")) {
+                    name_str = try self.allocator.dupe(u8, real);
+                    namehash_opt = fb_copy.namehash;
+                    break :fallback;
+                }
+            }
+        }
         name_str = try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{token_id});
     }
     defer self.allocator.free(name_str);

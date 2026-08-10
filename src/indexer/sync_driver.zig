@@ -822,5 +822,14 @@ pub fn indexBlockRange(self: *Indexer, protocol: models.Protocol, client: *rpc.C
     if (buffer_v2_events) {
         self.write_buffer.active = false;
         try self.write_buffer.flush(self.database);
+    } else if (should_index_v2) {
+        // Direct-mode twin of the flush repair: phase 1 writes datastore
+        // events before phase 2 creates the root-registry names they name, so
+        // same-batch rows need re-resolving after all passes ran.
+        const repaired = self.database.repairPlaceholderEvents(protocol, from_block, to_block) catch |err| blk: {
+            std.log.warn("placeholder event repair failed: {}", .{err});
+            break :blk 0;
+        };
+        if (repaired > 0) std.log.info("  Repaired {d} placeholder event name(s)", .{repaired});
     }
 }
