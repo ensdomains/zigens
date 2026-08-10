@@ -472,6 +472,7 @@ pub const Database = struct {
     pub const upsertEACRole = roles.upsertEACRole;
     pub const getRolesByResource = roles.getRolesByResource;
     pub const getRolesByAccount = roles.getRolesByAccount;
+    pub const getRolesFiltered = roles.getRolesFiltered;
     pub const deleteEACRole = roles.deleteEACRole;
     pub const getRolesWithPagination = roles.getRolesWithPagination;
     pub const getTotalRoleCount = roles.getTotalRoleCount;

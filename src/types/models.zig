@@ -434,6 +434,11 @@ pub const EACRoleAssignment = struct {
     /// Kind of contract that emitted the role event. Used to decode `role_bitmap`
     /// into named permissions. Defaults to `.registry` (the primary EAC path).
     contract_kind: EACContractKind = .registry,
+    /// Contract that emitted the role event. Load-bearing for disambiguation:
+    /// the same resource value (especially ROOT, 0x0) exists on every
+    /// EAC-enabled contract, so a role row is only meaningful together with
+    /// its contract.
+    contract_address: Address = Address.zero,
 
     pub fn deinit(self: *EACRoleAssignment, allocator: std.mem.Allocator) void {
         allocator.free(self.resource);

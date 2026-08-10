@@ -38,14 +38,30 @@ pub fn resolveRoles(ctx: parser.ExecutionContext, field: *const parser.Field) !p
     // Get optional arguments
     const resource_arg = parser.getStringArg(field, "resource", null);
     const account_arg = parser.getStringArg(field, "account", null);
+    const contract_arg = parser.getStringArg(field, "contract", null);
 
-    // Determine which database method to call based on arguments
-    const roles = if (resource_arg) |resource|
-        try database.getRolesByResource(protocol, resource)
-    else if (account_arg) |account_str| blk: {
-        const account_addr = Address.fromHex(account_str) catch return error.InvalidAddress;
-        break :blk try database.getRolesByAccount(protocol, account_addr);
-    } else try allocator.alloc(models.EACRoleAssignment, 0); // Requires resource or account filter
+    // Invalid filter input is an error, not a silent drop — a typo'd address
+    // would otherwise widen (or empty) the result set while looking like data.
+    var account_addr: ?Address = null;
+    if (account_arg) |account_str| {
+        account_addr = Address.fromHex(account_str) catch return error.InvalidAddress;
+    }
+    var contract_addr: ?Address = null;
+    if (contract_arg) |contract_str| {
+        contract_addr = Address.fromHex(contract_str) catch return error.InvalidContractAddress;
+    }
+
+    // All provided filters apply together. `contract` is what scopes shared
+    // resource values (ROOT, 0x0, exists on EVERY EAC contract) to one
+    // registry/resolver. No filters at all keeps the historical empty result.
+    const roles = if (resource_arg == null and account_addr == null and contract_addr == null)
+        try allocator.alloc(models.EACRoleAssignment, 0)
+    else
+        try database.getRolesFiltered(protocol, .{
+            .resource = resource_arg,
+            .account = account_addr,
+            .contract_address = contract_addr,
+        });
 
     defer {
         for (roles) |*role| {
@@ -108,6 +124,11 @@ pub fn resolveRolesConnection(ctx: parser.ExecutionContext, field: *const parser
     if (account_arg) |account_str| {
         account_addr = Address.fromHex(account_str) catch return error.InvalidAddress;
     }
+    const contract_arg = parser.getStringArg(field, "contract", null);
+    var contract_addr: ?Address = null;
+    if (contract_arg) |contract_str| {
+        contract_addr = Address.fromHex(contract_str) catch return error.InvalidContractAddress;
+    }
 
     // Decode cursor if present — fail loud on malformed cursor instead of silently
     // restarting from the first page.
@@ -128,7 +149,12 @@ pub fn resolveRolesConnection(ctx: parser.ExecutionContext, field: *const parser
 
     // Fast path: only totalCount requested — skip row fetching entirely
     if (wants_total_count and !wants_edges and !wants_page_info) {
-        const count = try database.getTotalRoleCount(protocol, resource_arg, account_addr);
+        const count = try database.getRoleCountFiltered(.{
+            .protocol = protocol,
+            .resource = resource_arg,
+            .account = account_addr,
+            .contract_address = contract_addr,
+        });
         const result = try std.fmt.allocPrint(allocator, "{{\"totalCount\":{d}}}", .{count});
         return parser.FieldResult{ .json = result };
     }
@@ -153,6 +179,7 @@ pub fn resolveRolesConnection(ctx: parser.ExecutionContext, field: *const parser
     const roles = try database.getRolesWithPagination(protocol, .{
         .resource = resource_arg,
         .account = account_addr,
+        .contract_address = contract_addr,
         .limit = fetch_limit,
         .cursor_id = cursor_id,
         .direction = if (params.direction == .backward) .backward else .forward,
@@ -177,7 +204,12 @@ pub fn resolveRolesConnection(ctx: parser.ExecutionContext, field: *const parser
 
     // Only compute total count when requested (reuse wants_total_count from earlier scan)
     const total_count: ?usize = if (wants_total_count)
-        try database.getTotalRoleCount(protocol, resource_arg, account_addr)
+        try database.getRoleCountFiltered(.{
+            .protocol = protocol,
+            .resource = resource_arg,
+            .account = account_addr,
+            .contract_address = contract_addr,
+        })
     else
         null;
 
@@ -863,6 +895,11 @@ fn handleEACRoleField(ctx: *anyopaque, output_key: []const u8, field_name: []con
         const account_hex = try role.account.toHex(allocator);
         defer allocator.free(account_hex);
         try writer.print("\"{s}\":\"{s}\"", .{ output_key, account_hex });
+        return true;
+    } else if (std.mem.eql(u8, field_name, "contractAddress")) {
+        const contract_hex = try role.contract_address.toHex(allocator);
+        defer allocator.free(contract_hex);
+        try writer.print("\"{s}\":\"{s}\"", .{ output_key, contract_hex });
         return true;
     } else if (std.mem.eql(u8, field_name, "roleBitmap")) {
         const escaped = try json_utils.escapeString(allocator, role.role_bitmap);

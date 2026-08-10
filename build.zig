@@ -390,6 +390,10 @@ pub fn build(b: *std.Build) void {
     });
     api_tests.root_module.link_libc = true;
     api_tests.root_module.linkSystemLibrary("sqlite3", .{});
+    // The handler @embedFiles introspection.json; without this dependency a
+    // schema.graphql change compiles tests against the STALE embedded schema
+    // (the validator then rejects newly declared arguments).
+    api_tests.step.dependOn(&generate_schema.step);
     const run_api_tests = b.addRunArtifact(api_tests);
     run_api_tests.setCwd(b.path("."));
     const api_test_step = b.step("test-api", "Run api-module inline tests");
@@ -827,6 +831,9 @@ pub fn build(b: *std.Build) void {
     });
     conformance_tests.root_module.link_libc = true;
     conformance_tests.root_module.linkSystemLibrary("sqlite3", .{});
+    // Same stale-introspection guard as api_tests: golden runs must compile
+    // against the schema in the working tree, not a leftover generated file.
+    conformance_tests.step.dependOn(&generate_schema.step);
     const run_conformance_tests = b.addRunArtifact(conformance_tests);
     run_conformance_tests.setCwd(b.path("."));
     const conformance_test_step = b.step("test-conformance", "Run GraphQL conformance golden harness");
