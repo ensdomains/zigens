@@ -71,26 +71,45 @@ fn parseNameRow(q: *Query, allocator: std.mem.Allocator) !models.Name {
     else
         try Address.fromHex(owner_str);
 
-    // Parse wrapper fields (optional)
+    // Every fallible non-allocating parse FIRST, then the owned dupes under an
+    // errdefer chain — a mid-literal parse failure used to leak the dupes made
+    // before it (same hoist shape as the roles parser).
+    const label_hash = try Hash.fromHex(label_hash_str);
+    const parent_namehash_val = try Hash.fromHex(parent_hash_str);
+    const protocol = try models.Protocol.fromString(protocol_str);
+    const registry = try Address.fromHex(registry_str);
+    const owner = try Address.fromHex(owner_str);
+    const resolver = try Address.fromHex(resolver_str);
+    const token_id = try parseU256Hex(token_id_str);
+    const canonical_id = try parseU256Hex(canonical_id_str);
+    const namehash_val = try Hash.fromHex(namehash_str);
+
+    const name_owned = try allocator.dupe(u8, name_str);
+    errdefer allocator.free(name_owned);
+    const label_owned = try allocator.dupe(u8, label_str);
+    errdefer allocator.free(label_owned);
+    const parent_name_owned = try allocator.dupe(u8, parent_name_str);
+    errdefer allocator.free(parent_name_owned);
     const wrapper_fuses = if (q.getTextSlice(23)) |fuses| try allocator.dupe(u8, fuses) else null;
+    errdefer if (wrapper_fuses) |f| allocator.free(f);
     const wrapper_expiry = q.getOptionalInt64(24);
     const v1_label_hash = if (q.getTextSlice(26)) |hash| try allocator.dupe(u8, hash) else null;
 
     return models.Name{
-        .name = try allocator.dupe(u8, name_str),
-        .label = try allocator.dupe(u8, label_str),
-        .label_hash = try Hash.fromHex(label_hash_str),
-        .parent_name = try allocator.dupe(u8, parent_name_str),
-        .parent_namehash = try Hash.fromHex(parent_hash_str),
-        .protocol = try models.Protocol.fromString(protocol_str),
-        .registry = try Address.fromHex(registry_str),
-        .owner = try Address.fromHex(owner_str),
+        .name = name_owned,
+        .label = label_owned,
+        .label_hash = label_hash,
+        .parent_name = parent_name_owned,
+        .parent_namehash = parent_namehash_val,
+        .protocol = protocol,
+        .registry = registry,
+        .owner = owner,
         .registrant = registrant,
-        .resolver = try Address.fromHex(resolver_str),
-        .token_id = try parseU256Hex(token_id_str),
-        .canonical_id = try parseU256Hex(canonical_id_str),
+        .resolver = resolver,
+        .token_id = token_id,
+        .canonical_id = canonical_id,
         .token_version = @intCast(q.getInt64(12)),
-        .namehash = try Hash.fromHex(namehash_str),
+        .namehash = namehash_val,
         .expiry = @bitCast(q.getInt64(14)),
         .registry_locked = q.getBool(15),
         .migrated = q.getBool(16),
@@ -137,24 +156,42 @@ fn parseNameRowShort(q: *Query, allocator: std.mem.Allocator) !models.Name {
     else
         try Address.fromHex(owner_str);
 
+    // Same hoist-then-errdefer discipline as parseNameRow above.
+    const label_hash = try Hash.fromHex(label_hash_str);
+    const parent_namehash_val = try Hash.fromHex(parent_hash_str);
+    const protocol = try models.Protocol.fromString(protocol_str);
+    const registry = try Address.fromHex(registry_str);
+    const owner = try Address.fromHex(owner_str);
+    const resolver = try Address.fromHex(resolver_str);
+    const token_id = try parseU256Hex(token_id_str);
+    const canonical_id = try parseU256Hex(canonical_id_str);
+    const namehash_val = try Hash.fromHex(namehash_str);
+
+    const name_owned = try allocator.dupe(u8, name_str);
+    errdefer allocator.free(name_owned);
+    const label_owned = try allocator.dupe(u8, label_str);
+    errdefer allocator.free(label_owned);
+    const parent_name_owned = try allocator.dupe(u8, parent_name_str);
+    errdefer allocator.free(parent_name_owned);
     const wrapper_fuses = if (q.getTextSlice(29)) |fuses| try allocator.dupe(u8, fuses) else null;
+    errdefer if (wrapper_fuses) |f| allocator.free(f);
     const v1_label_hash = if (q.getTextSlice(32)) |hash| try allocator.dupe(u8, hash) else null;
 
     return models.Name{
-        .name = try allocator.dupe(u8, name_str),
-        .label = try allocator.dupe(u8, label_str),
-        .label_hash = try Hash.fromHex(label_hash_str),
-        .parent_name = try allocator.dupe(u8, parent_name_str),
-        .parent_namehash = try Hash.fromHex(parent_hash_str),
-        .protocol = try models.Protocol.fromString(protocol_str),
-        .registry = try Address.fromHex(registry_str),
-        .owner = try Address.fromHex(owner_str),
+        .name = name_owned,
+        .label = label_owned,
+        .label_hash = label_hash,
+        .parent_name = parent_name_owned,
+        .parent_namehash = parent_namehash_val,
+        .protocol = protocol,
+        .registry = registry,
+        .owner = owner,
         .registrant = registrant,
-        .resolver = try Address.fromHex(resolver_str),
-        .token_id = try parseU256Hex(token_id_str),
-        .canonical_id = try parseU256Hex(canonical_id_str),
+        .resolver = resolver,
+        .token_id = token_id,
+        .canonical_id = canonical_id,
         .token_version = @intCast(q.getInt64(12)),
-        .namehash = try Hash.fromHex(namehash_str),
+        .namehash = namehash_val,
         .expiry = @bitCast(q.getInt64(14)),
         .registry_locked = q.getBool(15),
         .migrated = q.getBool(16),
@@ -293,6 +330,164 @@ pub fn getUniqueNameByCanonicalId(db: *Database, protocol: models.Protocol, toke
         return null;
     }
     return first;
+}
+
+/// Every row whose canonical_id is in `canonical_ids` — deliberately no
+/// protocol or registry filter, so the caller (the dispatch-scoped name
+/// prefetch) holds the COMPLETE row set per id and can mirror both point
+/// lookups above exactly, authoritative misses included. Rows and the
+/// returned slice are allocated with `allocator`.
+pub fn getNamesByCanonicalIds(db: *Database, canonical_ids: []const u256, allocator: std.mem.Allocator) ![]models.Name {
+    var out: std.ArrayList(models.Name) = .empty;
+    errdefer {
+        for (out.items) |*n| n.deinit(allocator);
+        out.deinit(allocator);
+    }
+
+    const CHUNK = 200;
+    var start: usize = 0;
+    while (start < canonical_ids.len) {
+        const chunk = canonical_ids[start..@min(start + CHUNK, canonical_ids.len)];
+        start += chunk.len;
+
+        var scratch = std.heap.ArenaAllocator.init(db.allocator);
+        defer scratch.deinit();
+
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.appendSlice(scratch.allocator(), SQL_SELECT_NAMES ++ " WHERE canonical_id IN (");
+        for (chunk, 0..) |_, i| {
+            if (i != 0) try sql.append(scratch.allocator(), ',');
+            try sql.append(scratch.allocator(), '?');
+        }
+        try sql.append(scratch.allocator(), ')');
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        for (chunk) |cid| {
+            const buf = try scratch.allocator().create([66]u8);
+            try q.bindTextStatic(formatU256HexBuf(buf, cid));
+        }
+        while (try q.step()) {
+            var row = try parseNameRow(&q, allocator);
+            errdefer row.deinit(allocator);
+            try out.append(allocator, row);
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Every row whose namehash is in `namehashes` — no protocol filter, no
+/// LIMIT, exactly the row universe getNameByNamehash steps over. The API-page
+/// domain loader groups these per namehash and only serves namehashes with a
+/// SINGLE row (multi-row namehashes fall back to the point query, whose
+/// unordered first-row pick only SQL can reproduce). Rows and the returned
+/// slice are allocated with `allocator`.
+pub fn getNamesByNamehashes(db: *Database, namehashes: []const Hash, allocator: std.mem.Allocator) ![]models.Name {
+    var out: std.ArrayList(models.Name) = .empty;
+    errdefer {
+        for (out.items) |*n| n.deinit(allocator);
+        out.deinit(allocator);
+    }
+
+    const CHUNK = 200;
+    var start: usize = 0;
+    while (start < namehashes.len) {
+        const chunk = namehashes[start..@min(start + CHUNK, namehashes.len)];
+        start += chunk.len;
+
+        var scratch = std.heap.ArenaAllocator.init(db.allocator);
+        defer scratch.deinit();
+
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.appendSlice(scratch.allocator(), SQL_SELECT_NAMES ++ " WHERE namehash IN (");
+        for (chunk, 0..) |_, i| {
+            if (i != 0) try sql.append(scratch.allocator(), ',');
+            try sql.append(scratch.allocator(), '?');
+        }
+        try sql.append(scratch.allocator(), ')');
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        for (chunk) |nh| {
+            const buf = try scratch.allocator().create([66]u8);
+            try q.bindTextStatic(nh.toHexBuf(buf));
+        }
+        while (try q.step()) {
+            var row = try parseNameRow(&q, allocator);
+            errdefer row.deinit(allocator);
+            try out.append(allocator, row);
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+pub const CanonicalNameResolution = struct {
+    name: ?[]const u8,
+    namehash: Hash,
+};
+
+/// Batched mirror of getUniqueNameByCanonicalId over many token ids: one
+/// IN-list sweep instead of one point query each (the placeholder-repair
+/// passes issue thousands of these per bulk-sync batch). The returned map is
+/// keyed by CANONICAL id and holds an entry only for ids that resolve
+/// uniquely under `protocol` — zero rows and the cross-registry ambiguity are
+/// both absent, exactly like the point lookup's null. Valid only when no
+/// names write happens between here and the lookups it replaces (the repair
+/// passes write events only). Names are duped with `allocator`; release via
+/// freeCanonicalNameResolutions.
+pub fn resolveUniqueNamesByCanonicalIds(db: *Database, protocol: models.Protocol, token_ids: []const u256, allocator: std.mem.Allocator) !std.AutoHashMap(u256, CanonicalNameResolution) {
+    var out = std.AutoHashMap(u256, CanonicalNameResolution).init(allocator);
+    errdefer freeCanonicalNameResolutions(&out, allocator);
+
+    var seen = std.AutoHashMap(u256, void).init(allocator);
+    defer seen.deinit();
+    var cids: std.ArrayList(u256) = .empty;
+    defer cids.deinit(allocator);
+    const token_id_utils = @import("../types/token_id.zig");
+    for (token_ids) |tok| {
+        const cid = token_id_utils.getCanonicalId(tok);
+        const gop = try seen.getOrPut(cid);
+        if (!gop.found_existing) try cids.append(allocator, cid);
+    }
+    if (cids.items.len == 0) return out;
+
+    var arena = std.heap.ArenaAllocator.init(db.allocator);
+    defer arena.deinit();
+    const rows = try getNamesByCanonicalIds(db, cids.items, arena.allocator());
+
+    const Tally = struct { count: usize, row_index: usize };
+    var tally = std.AutoHashMap(u256, Tally).init(allocator);
+    defer tally.deinit();
+    for (rows, 0..) |row, i| {
+        if (row.protocol != protocol) continue;
+        const gop = try tally.getOrPut(row.canonical_id);
+        if (gop.found_existing) {
+            gop.value_ptr.count += 1;
+        } else {
+            gop.value_ptr.* = .{ .count = 1, .row_index = i };
+        }
+    }
+
+    var it = tally.iterator();
+    while (it.next()) |kv| {
+        if (kv.value_ptr.count != 1) continue;
+        const row = rows[kv.value_ptr.row_index];
+        try out.put(kv.key_ptr.*, .{
+            .name = if (row.name) |nm| try allocator.dupe(u8, nm) else null,
+            .namehash = row.namehash,
+        });
+    }
+    return out;
+}
+
+pub fn freeCanonicalNameResolutions(map: *std.AutoHashMap(u256, CanonicalNameResolution), allocator: std.mem.Allocator) void {
+    var it = map.valueIterator();
+    while (it.next()) |v| {
+        if (v.name) |nm| allocator.free(nm);
+    }
+    map.deinit();
 }
 
 /// Get all names owned by an address. Unreachable rows (orphaned by a

@@ -10,6 +10,7 @@ const std = @import("std");
 const zsys = @import("../utils/system.zig");
 const models = @import("../types/models.zig");
 const Hash = @import("../types/hash.zig").Hash;
+const token_id_utils = @import("../types/token_id.zig");
 const Address = @import("../types/address.zig").Address;
 const Database = @import("../storage/database.zig").Database;
 const names_storage = @import("../storage/names.zig");
@@ -419,23 +420,47 @@ pub const WriteBuffer = struct {
         // byte-identical output vs the direct per-event path. A miss (or a
         // still-placeholder name) is left as-is — identical to direct mode
         // when no patch ever fired.
+        // Registry-LESS resolution on purpose: the emitting contract of the
+        // event is not necessarily the registry that owns the token (the
+        // direct-mode patch matches by placeholder string, no registry).
+        // Ambiguous tokens are absent from the map, so they conservatively
+        // keep their placeholder. Batched: one IN-list sweep per protocol
+        // instead of one point lookup per placeholder event (~7k per storm
+        // batch) — exact, because nothing here writes the names table.
+        var tokens_v1: std.ArrayList(u256) = .empty;
+        defer tokens_v1.deinit(self.allocator);
+        var tokens_v2: std.ArrayList(u256) = .empty;
+        defer tokens_v2.deinit(self.allocator);
         for (self.events.items) |*event| {
             const placeholder = event.name orelse continue;
             if (!std.mem.startsWith(u8, placeholder, "tokenId:")) continue;
             const token = std.fmt.parseInt(u256, placeholder["tokenId:".len..], 10) catch continue;
-            // Registry-LESS lookup on purpose: the emitting contract of the
-            // event is not necessarily the registry that owns the token (the
-            // direct-mode patch matches by placeholder string, no registry).
-            // The helper returns null on cross-registry canonical collisions,
-            // so an ambiguous token conservatively keeps its placeholder.
-            var found = (names_storage.getUniqueNameByCanonicalId(db, event.protocol, token) catch null) orelse continue;
-            defer found.deinit(db.allocator);
-            const real_name = found.name orelse continue;
-            if (std.mem.startsWith(u8, real_name, "tokenId:")) continue;
-            const dup = try self.allocator.dupe(u8, real_name);
-            self.allocator.free(placeholder);
-            event.name = dup;
-            event.namehash = found.namehash;
+            switch (event.protocol) {
+                .v1 => try tokens_v1.append(self.allocator, token),
+                .v2 => try tokens_v2.append(self.allocator, token),
+            }
+        }
+        if (tokens_v1.items.len > 0 or tokens_v2.items.len > 0) {
+            var res_v1 = try names_storage.resolveUniqueNamesByCanonicalIds(db, .v1, tokens_v1.items, self.allocator);
+            defer names_storage.freeCanonicalNameResolutions(&res_v1, self.allocator);
+            var res_v2 = try names_storage.resolveUniqueNamesByCanonicalIds(db, .v2, tokens_v2.items, self.allocator);
+            defer names_storage.freeCanonicalNameResolutions(&res_v2, self.allocator);
+            for (self.events.items) |*event| {
+                const placeholder = event.name orelse continue;
+                if (!std.mem.startsWith(u8, placeholder, "tokenId:")) continue;
+                const token = std.fmt.parseInt(u256, placeholder["tokenId:".len..], 10) catch continue;
+                const resolutions = switch (event.protocol) {
+                    .v1 => &res_v1,
+                    .v2 => &res_v2,
+                };
+                const found = resolutions.get(token_id_utils.getCanonicalId(token)) orelse continue;
+                const real_name = found.name orelse continue;
+                if (std.mem.startsWith(u8, real_name, "tokenId:")) continue;
+                const dup = try self.allocator.dupe(u8, real_name);
+                self.allocator.free(placeholder);
+                event.name = dup;
+                event.namehash = found.namehash;
+            }
         }
 
         // 3. Flush events — one multi-row conflict-ignoring INSERT per chunk.

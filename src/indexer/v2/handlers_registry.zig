@@ -1951,17 +1951,39 @@ pub fn handleResolverUpdated(self: *Indexer, protocol: models.Protocol, log: rpc
         try self.pending_resolver_backfills.append(self.allocator, resolver_addr);
     }
 
-    const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
+    // Paired identity — (namehash, display name) — via the dispatch-scoped
+    // prefetch when it answers (authoritative, see storage/name_prefetch.zig),
+    // via the DB point lookup on fall-through.
+    var paired_namehash: ?Hash = null;
+    var paired_name: ?[]const u8 = null;
+    defer if (paired_name) |nm| self.allocator.free(nm);
+    resolved: {
+        if (self.name_prefetch) |np| {
+            switch (try np.pairedLookup(token_id, log.address, self.allocator)) {
+                .unknown => {},
+                .miss => break :resolved,
+                .hit => |hit| {
+                    paired_namehash = hit.namehash;
+                    paired_name = hit.name;
+                    break :resolved;
+                },
+            }
+        }
+        if (try self.database.getNameByTokenIdAndRegistry(token_id, log.address)) |n| {
+            var n_copy = n;
+            defer n_copy.deinit(self.allocator);
+            paired_namehash = n_copy.namehash;
+            if (n_copy.name) |nm| paired_name = try self.allocator.dupe(u8, nm);
+        }
+    }
 
     var name_str: []const u8 = undefined;
     var namehash_opt: ?Hash = null;
 
-    if (maybe_name) |n| {
-        try self.database.updateNameResolver(n.namehash, resolver_addr);
-        name_str = try self.allocator.dupe(u8, n.name orelse "[unknown]");
-        namehash_opt = n.namehash;
-        var name_copy = n;
-        name_copy.deinit(self.allocator);
+    if (paired_namehash) |paired_hash| {
+        try self.database.updateNameResolver(paired_hash, resolver_addr);
+        name_str = try self.allocator.dupe(u8, paired_name orelse "[unknown]");
+        namehash_opt = paired_hash;
         // Record the Resolver entity binding (subgraph parity). Only when we
         // know which name the resolver is bound to; orphan ResolverUpdated
         // events skip this just like the resolver-on-names update above.
@@ -1990,15 +2012,33 @@ pub fn handleResolverUpdated(self: *Indexer, protocol: models.Protocol, log: rpc
         // null and keeps the placeholder rather than guessing. Mirrors the
         // write-buffer flush repair (A/B-verified 180/180 on real data), so
         // direct and buffered mode now agree.
-        if (try self.database.getUniqueNameByCanonicalId(protocol, token_id)) |fb| {
-            var fb_copy = fb;
-            defer fb_copy.deinit(self.allocator);
-            if (fb_copy.name) |real| {
-                if (!std.mem.startsWith(u8, real, "tokenId:")) {
-                    name_str = try self.allocator.dupe(u8, real);
-                    namehash_opt = fb_copy.namehash;
-                    break :fallback;
+        var fb_namehash: ?Hash = null;
+        var fb_name: ?[]const u8 = null;
+        defer if (fb_name) |nm| self.allocator.free(nm);
+        fb_resolved: {
+            if (self.name_prefetch) |np| {
+                switch (try np.uniqueLookup(protocol, token_id, self.allocator)) {
+                    .unknown => {},
+                    .miss => break :fb_resolved,
+                    .hit => |hit| {
+                        fb_namehash = hit.namehash;
+                        fb_name = hit.name;
+                        break :fb_resolved;
+                    },
                 }
+            }
+            if (try self.database.getUniqueNameByCanonicalId(protocol, token_id)) |fb| {
+                var fb_copy = fb;
+                defer fb_copy.deinit(self.allocator);
+                fb_namehash = fb_copy.namehash;
+                if (fb_copy.name) |nm| fb_name = try self.allocator.dupe(u8, nm);
+            }
+        }
+        if (fb_name) |real| {
+            if (!std.mem.startsWith(u8, real, "tokenId:")) {
+                name_str = try self.allocator.dupe(u8, real);
+                namehash_opt = fb_namehash;
+                break :fallback;
             }
         }
         name_str = try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{token_id});

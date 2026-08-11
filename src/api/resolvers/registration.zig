@@ -10,6 +10,7 @@ const parser = common.parser;
 const pagination = common.pagination;
 const builders = @import("../builders/builders.zig");
 const loaders = common.loaders;
+const domain_resolvers = @import("domain.zig");
 const NestedContext = builders.NestedContext;
 
 fn mapRegistrationOrderBy(order_by: ?[]const u8) db.EventSortField {
@@ -241,6 +242,11 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
 
     const items_slice = events[0..actual_items];
 
+    // Page-batch the nested domain rows + resolver records/texts so the
+    // per-row handlers serve them from memory (the domains-list treatment;
+    // without this, domain{resolver{text}} pays point queries per row).
+    domain_resolvers.prefetchDomainsForEventPage(database, allocator, ctx.loaders, items_slice, node_selections);
+
     // Wrapper type for registrations
     const RegistrationWithSelections = struct {
         event: *models.Event,
@@ -410,6 +416,11 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
     try json.appendSlice(allocator, "[");
     const start_idx: usize = @min(@as(usize, @intCast(skip)), events_result.len);
     const end_idx: usize = @min(start_idx + @as(usize, @intCast(first)), events_result.len);
+
+    // Page-batch the nested domain rows + resolver records/texts (see the
+    // connection path / domains list for rationale).
+    domain_resolvers.prefetchDomainsForEventPage(database, allocator, ctx.loaders, events_result[start_idx..end_idx], field.selections);
+
     for (events_result[start_idx..end_idx], 0..) |*event, i| {
         if (i > 0) try json.appendSlice(allocator, ",");
 

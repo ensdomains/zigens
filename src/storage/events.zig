@@ -200,10 +200,21 @@ pub fn repairPlaceholderEvents(db: *Database, protocol: models.Protocol, from_bl
         }
     }
 
+    if (candidates.items.len == 0) return 0;
+
+    // One IN-list sweep instead of one point lookup per candidate — exact,
+    // because nothing below writes the names table (events only).
+    var tokens: std.ArrayList(u256) = .empty;
+    defer tokens.deinit(db.allocator);
+    try tokens.ensureTotalCapacity(db.allocator, candidates.items.len);
+    for (candidates.items) |cand| tokens.appendAssumeCapacity(cand.token);
+    var resolutions = try names_mod.resolveUniqueNamesByCanonicalIds(db, protocol, tokens.items, db.allocator);
+    defer names_mod.freeCanonicalNameResolutions(&resolutions, db.allocator);
+
+    const token_id_utils = @import("../types/token_id.zig");
     var repaired: usize = 0;
     for (candidates.items) |cand| {
-        var found = (names_mod.getUniqueNameByCanonicalId(db, protocol, cand.token) catch null) orelse continue;
-        defer found.deinit(db.allocator);
+        const found = resolutions.get(token_id_utils.getCanonicalId(cand.token)) orelse continue;
         const real_name = found.name orelse continue;
         if (std.mem.startsWith(u8, real_name, "tokenId:")) continue;
 

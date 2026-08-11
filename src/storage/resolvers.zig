@@ -190,6 +190,7 @@ pub fn applyLatestResolverFromEvents(db: *Database, protocol: models.Protocol, n
     try q.bindTextStatic(protocol.toString());
     try q.bindHashBuf(namehash);
     try q.exec();
+    db.noteNameWriteByNamehash(namehash);
 }
 
 /// Latest addr record for a given (resolver, namehash, coin_type).
@@ -360,9 +361,15 @@ pub fn getAddressRecordsBatch(db: *Database, resolvers: []const Address, namehas
             try q.bindHash(nh);
         }
         while (try q.step()) {
+            // Loop-scoped errdefers: a later getText/append failure must free
+            // the columns already duped this iteration (the outer errdefer
+            // only sweeps rows already committed to the list).
             const r_opt = try q.getText(0);
+            errdefer if (r_opt) |x| db.allocator.free(x);
             const nh_opt = try q.getText(1);
+            errdefer if (nh_opt) |x| db.allocator.free(x);
             const val_opt = try q.getText(2);
+            errdefer if (val_opt) |x| db.allocator.free(x);
             if (r_opt == null or nh_opt == null or val_opt == null) {
                 if (r_opt) |x| db.allocator.free(x);
                 if (nh_opt) |x| db.allocator.free(x);
@@ -406,9 +413,15 @@ pub fn getContentHashesBatch(db: *Database, resolvers: []const Address, namehash
             try q.bindHash(nh);
         }
         while (try q.step()) {
+            // Loop-scoped errdefers: a later getText/append failure must free
+            // the columns already duped this iteration (the outer errdefer
+            // only sweeps rows already committed to the list).
             const r_opt = try q.getText(0);
+            errdefer if (r_opt) |x| db.allocator.free(x);
             const nh_opt = try q.getText(1);
+            errdefer if (nh_opt) |x| db.allocator.free(x);
             const val_opt = try q.getText(2);
+            errdefer if (val_opt) |x| db.allocator.free(x);
             if (r_opt == null or nh_opt == null or val_opt == null) {
                 if (r_opt) |x| db.allocator.free(x);
                 if (nh_opt) |x| db.allocator.free(x);
@@ -455,9 +468,15 @@ pub fn getTextRecordsBatch(db: *Database, resolvers: []const Address, namehashes
             try q.bindHash(nh);
         }
         while (try q.step()) {
+            // Loop-scoped errdefers: a later getText/append failure must free
+            // the columns already duped this iteration (the outer errdefer
+            // only sweeps rows already committed to the list).
             const r_opt = try q.getText(0);
+            errdefer if (r_opt) |x| db.allocator.free(x);
             const nh_opt = try q.getText(1);
+            errdefer if (nh_opt) |x| db.allocator.free(x);
             const val_opt = try q.getText(2);
+            errdefer if (val_opt) |x| db.allocator.free(x);
             if (r_opt == null or nh_opt == null or val_opt == null) {
                 if (r_opt) |x| db.allocator.free(x);
                 if (nh_opt) |x| db.allocator.free(x);
@@ -471,6 +490,65 @@ pub fn getTextRecordsBatch(db: *Database, resolvers: []const Address, namehashes
 }
 
 /// All text record keys set by (resolver, namehash).
+/// One row per (resolver, namehash, key) triple across all requested pairs —
+/// the batched mirror of getTextRecordKeys. Global ORDER BY key means each
+/// pair's keys arrive in the SAME ascending order the point query produces,
+/// so grouping by pair in scan order reproduces its output exactly.
+pub const PairTextKeyRow = struct { resolver: []u8, namehash: []u8, key: []u8 };
+
+pub fn getTextRecordKeysForPairs(db: *Database, resolvers_list: []const Address, namehashes: []const Hash) ![]PairTextKeyRow {
+    std.debug.assert(resolvers_list.len == namehashes.len);
+    var rows: std.ArrayList(PairTextKeyRow) = .empty;
+    errdefer {
+        for (rows.items) |row| {
+            db.allocator.free(row.resolver);
+            db.allocator.free(row.namehash);
+            db.allocator.free(row.key);
+        }
+        rows.deinit(db.allocator);
+    }
+    if (resolvers_list.len == 0) return try rows.toOwnedSlice(db.allocator);
+
+    var off: usize = 0;
+    while (off < resolvers_list.len) : (off += RECORD_BATCH_CHUNK) {
+        const end = @min(off + RECORD_BATCH_CHUNK, resolvers_list.len);
+        const n = end - off;
+
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(db.allocator);
+        try sql.appendSlice(db.allocator, "SELECT DISTINCT resolver, namehash, key FROM resolver_texts WHERE (resolver, namehash) IN (");
+        for (0..n) |i| {
+            if (i > 0) try sql.appendSlice(db.allocator, ", ");
+            try sql.appendSlice(db.allocator, "(?, ?)");
+        }
+        try sql.appendSlice(db.allocator, ") ORDER BY key");
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        for (resolvers_list[off..end], namehashes[off..end]) |r, nh| {
+            try q.bindAddress(r);
+            try q.bindHash(nh);
+        }
+        while (try q.step()) {
+            // Loop-scoped errdefers — see getTextRecordsBatch for rationale.
+            const r_opt = try q.getText(0);
+            errdefer if (r_opt) |x| db.allocator.free(x);
+            const nh_opt = try q.getText(1);
+            errdefer if (nh_opt) |x| db.allocator.free(x);
+            const key_opt = try q.getText(2);
+            errdefer if (key_opt) |x| db.allocator.free(x);
+            if (r_opt == null or nh_opt == null or key_opt == null) {
+                if (r_opt) |x| db.allocator.free(x);
+                if (nh_opt) |x| db.allocator.free(x);
+                if (key_opt) |x| db.allocator.free(x);
+                continue;
+            }
+            try rows.append(db.allocator, .{ .resolver = r_opt.?, .namehash = nh_opt.?, .key = key_opt.? });
+        }
+    }
+    return try rows.toOwnedSlice(db.allocator);
+}
+
 pub fn getTextRecordKeys(db: *Database, resolver: Address, namehash: Hash) ![][]u8 {
     const sql =
         \\SELECT DISTINCT key FROM resolver_texts
