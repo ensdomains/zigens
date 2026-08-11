@@ -361,9 +361,15 @@ pub fn getAddressRecordsBatch(db: *Database, resolvers: []const Address, namehas
             try q.bindHash(nh);
         }
         while (try q.step()) {
+            // Loop-scoped errdefers: a later getText/append failure must free
+            // the columns already duped this iteration (the outer errdefer
+            // only sweeps rows already committed to the list).
             const r_opt = try q.getText(0);
+            errdefer if (r_opt) |x| db.allocator.free(x);
             const nh_opt = try q.getText(1);
+            errdefer if (nh_opt) |x| db.allocator.free(x);
             const val_opt = try q.getText(2);
+            errdefer if (val_opt) |x| db.allocator.free(x);
             if (r_opt == null or nh_opt == null or val_opt == null) {
                 if (r_opt) |x| db.allocator.free(x);
                 if (nh_opt) |x| db.allocator.free(x);
@@ -407,9 +413,15 @@ pub fn getContentHashesBatch(db: *Database, resolvers: []const Address, namehash
             try q.bindHash(nh);
         }
         while (try q.step()) {
+            // Loop-scoped errdefers: a later getText/append failure must free
+            // the columns already duped this iteration (the outer errdefer
+            // only sweeps rows already committed to the list).
             const r_opt = try q.getText(0);
+            errdefer if (r_opt) |x| db.allocator.free(x);
             const nh_opt = try q.getText(1);
+            errdefer if (nh_opt) |x| db.allocator.free(x);
             const val_opt = try q.getText(2);
+            errdefer if (val_opt) |x| db.allocator.free(x);
             if (r_opt == null or nh_opt == null or val_opt == null) {
                 if (r_opt) |x| db.allocator.free(x);
                 if (nh_opt) |x| db.allocator.free(x);
@@ -456,9 +468,15 @@ pub fn getTextRecordsBatch(db: *Database, resolvers: []const Address, namehashes
             try q.bindHash(nh);
         }
         while (try q.step()) {
+            // Loop-scoped errdefers: a later getText/append failure must free
+            // the columns already duped this iteration (the outer errdefer
+            // only sweeps rows already committed to the list).
             const r_opt = try q.getText(0);
+            errdefer if (r_opt) |x| db.allocator.free(x);
             const nh_opt = try q.getText(1);
+            errdefer if (nh_opt) |x| db.allocator.free(x);
             const val_opt = try q.getText(2);
+            errdefer if (val_opt) |x| db.allocator.free(x);
             if (r_opt == null or nh_opt == null or val_opt == null) {
                 if (r_opt) |x| db.allocator.free(x);
                 if (nh_opt) |x| db.allocator.free(x);
@@ -512,9 +530,13 @@ pub fn getTextRecordKeysForPairs(db: *Database, resolvers_list: []const Address,
             try q.bindHash(nh);
         }
         while (try q.step()) {
+            // Loop-scoped errdefers — see getTextRecordsBatch for rationale.
             const r_opt = try q.getText(0);
+            errdefer if (r_opt) |x| db.allocator.free(x);
             const nh_opt = try q.getText(1);
+            errdefer if (nh_opt) |x| db.allocator.free(x);
             const key_opt = try q.getText(2);
+            errdefer if (key_opt) |x| db.allocator.free(x);
             if (r_opt == null or nh_opt == null or key_opt == null) {
                 if (r_opt) |x| db.allocator.free(x);
                 if (nh_opt) |x| db.allocator.free(x);
