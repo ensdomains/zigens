@@ -71,26 +71,45 @@ fn parseNameRow(q: *Query, allocator: std.mem.Allocator) !models.Name {
     else
         try Address.fromHex(owner_str);
 
-    // Parse wrapper fields (optional)
+    // Every fallible non-allocating parse FIRST, then the owned dupes under an
+    // errdefer chain — a mid-literal parse failure used to leak the dupes made
+    // before it (same hoist shape as the roles parser).
+    const label_hash = try Hash.fromHex(label_hash_str);
+    const parent_namehash_val = try Hash.fromHex(parent_hash_str);
+    const protocol = try models.Protocol.fromString(protocol_str);
+    const registry = try Address.fromHex(registry_str);
+    const owner = try Address.fromHex(owner_str);
+    const resolver = try Address.fromHex(resolver_str);
+    const token_id = try parseU256Hex(token_id_str);
+    const canonical_id = try parseU256Hex(canonical_id_str);
+    const namehash_val = try Hash.fromHex(namehash_str);
+
+    const name_owned = try allocator.dupe(u8, name_str);
+    errdefer allocator.free(name_owned);
+    const label_owned = try allocator.dupe(u8, label_str);
+    errdefer allocator.free(label_owned);
+    const parent_name_owned = try allocator.dupe(u8, parent_name_str);
+    errdefer allocator.free(parent_name_owned);
     const wrapper_fuses = if (q.getTextSlice(23)) |fuses| try allocator.dupe(u8, fuses) else null;
+    errdefer if (wrapper_fuses) |f| allocator.free(f);
     const wrapper_expiry = q.getOptionalInt64(24);
     const v1_label_hash = if (q.getTextSlice(26)) |hash| try allocator.dupe(u8, hash) else null;
 
     return models.Name{
-        .name = try allocator.dupe(u8, name_str),
-        .label = try allocator.dupe(u8, label_str),
-        .label_hash = try Hash.fromHex(label_hash_str),
-        .parent_name = try allocator.dupe(u8, parent_name_str),
-        .parent_namehash = try Hash.fromHex(parent_hash_str),
-        .protocol = try models.Protocol.fromString(protocol_str),
-        .registry = try Address.fromHex(registry_str),
-        .owner = try Address.fromHex(owner_str),
+        .name = name_owned,
+        .label = label_owned,
+        .label_hash = label_hash,
+        .parent_name = parent_name_owned,
+        .parent_namehash = parent_namehash_val,
+        .protocol = protocol,
+        .registry = registry,
+        .owner = owner,
         .registrant = registrant,
-        .resolver = try Address.fromHex(resolver_str),
-        .token_id = try parseU256Hex(token_id_str),
-        .canonical_id = try parseU256Hex(canonical_id_str),
+        .resolver = resolver,
+        .token_id = token_id,
+        .canonical_id = canonical_id,
         .token_version = @intCast(q.getInt64(12)),
-        .namehash = try Hash.fromHex(namehash_str),
+        .namehash = namehash_val,
         .expiry = @bitCast(q.getInt64(14)),
         .registry_locked = q.getBool(15),
         .migrated = q.getBool(16),
@@ -137,24 +156,42 @@ fn parseNameRowShort(q: *Query, allocator: std.mem.Allocator) !models.Name {
     else
         try Address.fromHex(owner_str);
 
+    // Same hoist-then-errdefer discipline as parseNameRow above.
+    const label_hash = try Hash.fromHex(label_hash_str);
+    const parent_namehash_val = try Hash.fromHex(parent_hash_str);
+    const protocol = try models.Protocol.fromString(protocol_str);
+    const registry = try Address.fromHex(registry_str);
+    const owner = try Address.fromHex(owner_str);
+    const resolver = try Address.fromHex(resolver_str);
+    const token_id = try parseU256Hex(token_id_str);
+    const canonical_id = try parseU256Hex(canonical_id_str);
+    const namehash_val = try Hash.fromHex(namehash_str);
+
+    const name_owned = try allocator.dupe(u8, name_str);
+    errdefer allocator.free(name_owned);
+    const label_owned = try allocator.dupe(u8, label_str);
+    errdefer allocator.free(label_owned);
+    const parent_name_owned = try allocator.dupe(u8, parent_name_str);
+    errdefer allocator.free(parent_name_owned);
     const wrapper_fuses = if (q.getTextSlice(29)) |fuses| try allocator.dupe(u8, fuses) else null;
+    errdefer if (wrapper_fuses) |f| allocator.free(f);
     const v1_label_hash = if (q.getTextSlice(32)) |hash| try allocator.dupe(u8, hash) else null;
 
     return models.Name{
-        .name = try allocator.dupe(u8, name_str),
-        .label = try allocator.dupe(u8, label_str),
-        .label_hash = try Hash.fromHex(label_hash_str),
-        .parent_name = try allocator.dupe(u8, parent_name_str),
-        .parent_namehash = try Hash.fromHex(parent_hash_str),
-        .protocol = try models.Protocol.fromString(protocol_str),
-        .registry = try Address.fromHex(registry_str),
-        .owner = try Address.fromHex(owner_str),
+        .name = name_owned,
+        .label = label_owned,
+        .label_hash = label_hash,
+        .parent_name = parent_name_owned,
+        .parent_namehash = parent_namehash_val,
+        .protocol = protocol,
+        .registry = registry,
+        .owner = owner,
         .registrant = registrant,
-        .resolver = try Address.fromHex(resolver_str),
-        .token_id = try parseU256Hex(token_id_str),
-        .canonical_id = try parseU256Hex(canonical_id_str),
+        .resolver = resolver,
+        .token_id = token_id,
+        .canonical_id = canonical_id,
         .token_version = @intCast(q.getInt64(12)),
-        .namehash = try Hash.fromHex(namehash_str),
+        .namehash = namehash_val,
         .expiry = @bitCast(q.getInt64(14)),
         .registry_locked = q.getBool(15),
         .migrated = q.getBool(16),
