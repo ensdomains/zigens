@@ -56,6 +56,26 @@ fn domainNestedHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: 
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
     if (event.namehash) |nh| {
+        // Page-batched row first (registrations/events lists prime the loader
+        // — one IN-list query per page instead of one point query per row);
+        // absent = not batched or a multi-row namehash → point query.
+        if (nested_ctx.loaders) |lp| {
+            const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+            if (lc.lookupDomain(nh)) |batched| {
+                const domain_row = batched orelse return try nested_ctx.allocator.dupe(u8, "null");
+                // By-value copy: the loader row lives in hashmap entry storage,
+                // which any nested re-priming could rehash mid-serialization.
+                // The strings stay loader-owned; buildDomainJson only reads.
+                const row_copy = domain_row.*;
+                return try buildDomainJson(&row_copy, field.selections, .{
+                    .database = database,
+                    .depth = nested_ctx.depth + 1,
+                    .allocator = nested_ctx.allocator,
+                    .loaders = nested_ctx.loaders,
+                    .resolve = nested_ctx.resolve,
+                });
+            }
+        }
         const domain_opt = try database.getNameByNamehash(nh);
         if (domain_opt) |domain| {
             var domain_mut = domain;

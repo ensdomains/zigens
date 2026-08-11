@@ -403,6 +403,7 @@ pub const Database = struct {
     pub const getNameByTokenIdAndRegistry = names.getNameByTokenIdAndRegistry;
     pub const getUniqueNameByCanonicalId = names.getUniqueNameByCanonicalId;
     pub const getNamesByCanonicalIds = names.getNamesByCanonicalIds;
+    pub const getNamesByNamehashes = names.getNamesByNamehashes;
     pub const deleteNameByNamehash = names.deleteNameByNamehash;
     pub const updateNameTokenIdByNamehash = names.updateNameTokenIdByNamehash;
     pub const getNamesByOwner = names.getNamesByOwner;

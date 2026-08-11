@@ -340,6 +340,52 @@ pub fn getNamesByCanonicalIds(db: *Database, canonical_ids: []const u256, alloca
     return try out.toOwnedSlice(allocator);
 }
 
+/// Every row whose namehash is in `namehashes` — no protocol filter, no
+/// LIMIT, exactly the row universe getNameByNamehash steps over. The API-page
+/// domain loader groups these per namehash and only serves namehashes with a
+/// SINGLE row (multi-row namehashes fall back to the point query, whose
+/// unordered first-row pick only SQL can reproduce). Rows and the returned
+/// slice are allocated with `allocator`.
+pub fn getNamesByNamehashes(db: *Database, namehashes: []const Hash, allocator: std.mem.Allocator) ![]models.Name {
+    var out: std.ArrayList(models.Name) = .empty;
+    errdefer {
+        for (out.items) |*n| n.deinit(allocator);
+        out.deinit(allocator);
+    }
+
+    const CHUNK = 200;
+    var start: usize = 0;
+    while (start < namehashes.len) {
+        const chunk = namehashes[start..@min(start + CHUNK, namehashes.len)];
+        start += chunk.len;
+
+        var scratch = std.heap.ArenaAllocator.init(db.allocator);
+        defer scratch.deinit();
+
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.appendSlice(scratch.allocator(), SQL_SELECT_NAMES ++ " WHERE namehash IN (");
+        for (chunk, 0..) |_, i| {
+            if (i != 0) try sql.append(scratch.allocator(), ',');
+            try sql.append(scratch.allocator(), '?');
+        }
+        try sql.append(scratch.allocator(), ')');
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        for (chunk) |nh| {
+            const buf = try scratch.allocator().create([66]u8);
+            try q.bindTextStatic(nh.toHexBuf(buf));
+        }
+        while (try q.step()) {
+            var row = try parseNameRow(&q, allocator);
+            errdefer row.deinit(allocator);
+            try out.append(allocator, row);
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
 pub const CanonicalNameResolution = struct {
     name: ?[]const u8,
     namehash: Hash,

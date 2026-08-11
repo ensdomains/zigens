@@ -337,6 +337,10 @@ test "conformance goldens" {
         .{ .name = "registrations_all", .query = "{ registrations(first:10, orderBy:name, orderDirection:asc){ id name registrant { id } registrationDate expiryDate protocol } }" },
         .{ .name = "registrations_by_registrant", .query = "{ registrations(where:{registrant:\"0x2222222222222222222222222222222222222222\"}, orderBy:name, orderDirection:asc){ id name } }" },
         .{ .name = "registrations_expiry_gt", .query = "{ registrations(where:{expiryDate_gt:1900000000}, orderBy:name, orderDirection:asc){ id name expiryDate } }" },
+        // Locks the page-batched nested path (domain rows + resolver texts served
+        // via the request loader): alice's resolver has a seeded avatar record, so
+        // this golden pins real values flowing through the batch, not just nulls.
+        .{ .name = "registrations_domain_resolver_texts", .query = "{ registrations(first:10, orderBy:name, orderDirection:asc){ name domain { name resolver { address avatar: text(key:\"avatar\") missing: text(key:\"com.twitter\") } } } }" },
         // --- finality signalling (Task 09; _finality is additive, subgraph _meta unchanged) ---
         .{ .name = "finality", .query = "{ _finality { head { number } safe { number hash } finalized { number } isStale } }" },
         // --- coverage declaration (additive; lastSyncedAt is wall-clock so not selected) ---

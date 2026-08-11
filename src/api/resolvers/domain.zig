@@ -365,7 +365,7 @@ fn collectTextKeys(selections: []const parser.Field, list: *std.ArrayList([]cons
 /// resolver handlers read them from memory (one batch query per record type / text
 /// key instead of one point query per row). Best-effort: any failure leaves the
 /// handlers to fall back to point queries.
-fn prefetchResolverRecords(database: *db.Database, allocator: std.mem.Allocator, loaders_ptr: ?*anyopaque, page: []models.Name, selections: []const parser.Field) void {
+pub fn prefetchResolverRecords(database: *db.Database, allocator: std.mem.Allocator, loaders_ptr: ?*anyopaque, page: []models.Name, selections: []const parser.Field) void {
     const want = wantsResolverRecords(selections);
     var text_keys: std.ArrayList([]const u8) = .empty;
     defer text_keys.deinit(allocator);
@@ -390,6 +390,52 @@ fn prefetchResolverRecords(database: *db.Database, allocator: std.mem.Allocator,
     if (text_keys.items.len > 0) {
         lc.populateTextRecords(database, resolvers_buf, namehashes_buf, text_keys.items);
     }
+}
+
+/// Page-level prefetch for event-shaped lists that resolve `domain { … }` per
+/// row (registrations, domain-events): one IN-list domains query into the
+/// request loader (multi-row namehashes excluded — the point query keeps its
+/// exact semantics), then the same resolver-record/text prefetch the domains
+/// list gets. Per-row handlers then serve everything from memory. Best-effort
+/// throughout: any failure just leaves handlers on their point-query paths.
+pub fn prefetchDomainsForEventPage(database: *db.Database, allocator: std.mem.Allocator, loaders_ptr: ?*anyopaque, events: []const models.Event, node_selections: []const parser.Field) void {
+    const lp = loaders_ptr orelse return;
+    const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+
+    const domain_sel: *const parser.Field = blk: {
+        for (node_selections) |*sel| {
+            if (std.mem.eql(u8, sel.name, "domain")) break :blk sel;
+        }
+        return;
+    };
+
+    var namehashes: std.ArrayList(Hash) = .empty;
+    defer namehashes.deinit(allocator);
+    var seen = std.AutoHashMap(Hash, void).init(allocator);
+    defer seen.deinit();
+    for (events) |*ev| {
+        const nh = ev.namehash orelse continue;
+        // Dedupe: a repeated namehash straddling two IN-list chunks would look
+        // like a multi-row namehash and get evicted from the batch (perf loss,
+        // not a correctness issue — but why pay it).
+        const gop = seen.getOrPut(nh) catch return;
+        if (gop.found_existing) continue;
+        namehashes.append(allocator, nh) catch return;
+    }
+    if (namehashes.items.len == 0) return;
+    lc.populateDomains(database, namehashes.items);
+
+    // Shallow copies of the loader-owned rows for the record prefetch — the
+    // strings stay loader-owned; nothing here frees them.
+    var page_rows: std.ArrayList(models.Name) = .empty;
+    defer page_rows.deinit(allocator);
+    for (namehashes.items) |nh| {
+        const batched = lc.lookupDomain(nh) orelse continue;
+        const row = batched orelse continue;
+        page_rows.append(allocator, row.*) catch return;
+    }
+    if (page_rows.items.len == 0) return;
+    prefetchResolverRecords(database, allocator, loaders_ptr, page_rows.items, domain_sel.selections);
 }
 
 pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {

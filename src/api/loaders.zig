@@ -1,5 +1,6 @@
 const std = @import("std");
 const db = @import("../storage/database.zig");
+const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
 
@@ -79,6 +80,14 @@ pub const LoaderContext = struct {
     contenthash: std.StringHashMap(?[]const u8),
     /// text(key:) records, keyed by "<resolver_hex>|<namehash_hex>|<text_key>".
     texts: std.StringHashMap(?[]const u8),
+    /// Per-page batch prefetch of Domain rows for event-shaped parents
+    /// (registrations/events lists resolving `domain { … }` per row). Key
+    /// present + null = "batched, no row"; key present + row = the namehash's
+    /// SINGLE row; key ABSENT = not batched OR the namehash has multiple rows
+    /// (v1/v2 same-namehash) — the handler falls back to the point query,
+    /// whose unordered first-row pick only SQL can reproduce. Rows are
+    /// db-allocator-owned.
+    domains: std.AutoHashMap(Hash, ?models.Name),
 
     pub fn init(allocator: std.mem.Allocator, database: *db.Database) !*LoaderContext {
         const ctx = try allocator.create(LoaderContext);
@@ -89,8 +98,83 @@ pub const LoaderContext = struct {
             .addr60 = std.StringHashMap(?[]const u8).init(allocator),
             .contenthash = std.StringHashMap(?[]const u8).init(allocator),
             .texts = std.StringHashMap(?[]const u8).init(allocator),
+            .domains = std.AutoHashMap(Hash, ?models.Name).init(allocator),
         };
         return ctx;
+    }
+
+    /// Batch-prefetch Domain rows for a page of namehashes: one IN-list query
+    /// instead of one getNameByNamehash per row. Namehashes with a single row
+    /// cache that row; zero rows cache an explicit "no row"; MULTIPLE rows
+    /// (v1/v2 same-namehash) are left absent so the handler's point query
+    /// keeps its exact (backend-row-order) semantics. Best-effort: failure
+    /// leaves the map un(der)populated and handlers fall back.
+    pub fn populateDomains(self: *LoaderContext, database: *db.Database, namehashes: []const Hash) void {
+        if (namehashes.len == 0) return;
+        const rows = database.getNamesByNamehashes(namehashes, self.db_allocator) catch return;
+        defer self.db_allocator.free(rows);
+        var consumed: usize = 0;
+        self.populateDomainsInner(namehashes, rows, &consumed) catch {
+            // Failure can strand "no row" sentinels for namehashes whose rows
+            // were never processed — a stale sentinel would serve domain:null
+            // for a row that exists. Downgrade every still-null sentinel to
+            // absent: handlers fall back to the point query, which is always
+            // correct (a legitimately-empty namehash just pays one query).
+            for (namehashes) |nh| {
+                if (self.domains.getPtr(nh)) |slot| {
+                    if (slot.* == null) _ = self.domains.remove(nh);
+                }
+            }
+        };
+        for (rows[consumed..]) |row| {
+            var mut = row;
+            mut.deinit(self.db_allocator);
+        }
+    }
+
+    fn populateDomainsInner(self: *LoaderContext, namehashes: []const Hash, rows: []models.Name, consumed: *usize) !void {
+        for (namehashes) |nh| {
+            _ = try self.domains.getOrPutValue(nh, null);
+        }
+        var kept = std.AutoHashMap(Hash, void).init(self.allocator);
+        defer kept.deinit();
+        for (rows) |row| {
+            const gop = try kept.getOrPut(row.namehash);
+            consumed.* += 1;
+            if (gop.found_existing) {
+                // Second row for this namehash: evict the cached one and leave
+                // the key absent — only the point query may decide row order.
+                if (self.domains.fetchRemove(row.namehash)) |old| {
+                    if (old.value) |cached| {
+                        var mut = cached;
+                        mut.deinit(self.db_allocator);
+                    }
+                }
+                var mut = row;
+                mut.deinit(self.db_allocator);
+                continue;
+            }
+            if (self.domains.getPtr(row.namehash)) |slot| {
+                // A prior populateDomains call may have cached this namehash
+                // already — replace, don't leak.
+                if (slot.*) |prior| {
+                    var mut = prior;
+                    mut.deinit(self.db_allocator);
+                }
+                slot.* = row;
+            } else {
+                var mut = row;
+                mut.deinit(self.db_allocator);
+            }
+        }
+    }
+
+    /// Outer null = not batched (caller point-queries); inner null = batched,
+    /// no row. The returned row is loader-owned — callers must NOT deinit it.
+    pub fn lookupDomain(self: *LoaderContext, namehash: Hash) ?(?*const models.Name) {
+        const slot = self.domains.getPtr(namehash) orelse return null;
+        if (slot.*) |*row| return @as(?*const models.Name, row);
+        return @as(?*const models.Name, null);
     }
 
     /// Prefetch the addr(coinType=60) and/or contenthash records for a page of
@@ -282,6 +366,16 @@ pub const LoaderContext = struct {
             map.deinit();
         }
 
+        // Domain rows are db-allocator-owned; keys are plain Hash values.
+        var dit = self.domains.iterator();
+        while (dit.next()) |entry| {
+            if (entry.value_ptr.*) |row| {
+                var mut = row;
+                mut.deinit(self.db_allocator);
+            }
+        }
+        self.domains.deinit();
+
         self.allocator.destroy(self);
     }
 };
@@ -302,6 +396,84 @@ test "LoaderContext: init and deinit" {
 
     const ctx = try LoaderContext.init(allocator, &test_db);
     defer ctx.deinit();
+}
+
+fn testDomainRow(n: u8, protocol: models.Protocol, name_str: []const u8) models.Name {
+    var h = Hash{ .bytes = [_]u8{0} ** 32 };
+    h.bytes[31] = n;
+    h.bytes[0] = 0x0D;
+    return models.Name{
+        .protocol = protocol,
+        .name = name_str,
+        .namehash = h,
+        .label = name_str,
+        .label_hash = h,
+        .parent_name = "",
+        .parent_namehash = Hash.zero,
+        .registry = Address{ .bytes = [_]u8{0xC1} ** 20 },
+        .owner = Address{ .bytes = [_]u8{0xA1} ** 20 },
+        .registrant = Address{ .bytes = [_]u8{0xA1} ** 20 },
+        .resolver = Address.zero,
+        .token_id = n,
+        .canonical_id = n,
+        .token_version = 1,
+        .expiry = 0,
+        .registry_locked = false,
+        .migrated = false,
+        .created_block = 100,
+        .created_at = 1700000000,
+        .registered_at = 1700000000,
+        .updated_block = 100,
+        .updated_at = 1700000000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    };
+}
+
+test "populateDomains: single-row cached, multi-row absent, zero-row sentinel, repeat-safe" {
+    const allocator = std.testing.allocator;
+
+    var test_db = try db.Database.init(allocator, ":memory:");
+    defer test_db.deinit();
+
+    try test_db.insertName(testDomainRow(1, .v2, "solo.eth"));
+    // Same namehash under BOTH protocols: the point query's row pick is
+    // backend-order-dependent, so the batch must refuse to cache it.
+    try test_db.insertName(testDomainRow(2, .v1, "dual.eth"));
+    try test_db.insertName(testDomainRow(2, .v2, "dual-v2.eth"));
+
+    const ctx = try LoaderContext.init(allocator, &test_db);
+    defer ctx.deinit();
+
+    const nh = struct {
+        fn of(n: u8) Hash {
+            var h = Hash{ .bytes = [_]u8{0} ** 32 };
+            h.bytes[31] = n;
+            h.bytes[0] = 0x0D;
+            return h;
+        }
+    }.of;
+
+    const page = [_]Hash{ nh(1), nh(2), nh(3) };
+    ctx.populateDomains(&test_db, &page);
+
+    const solo = ctx.lookupDomain(nh(1)) orelse return error.ExpectedBatched;
+    try std.testing.expectEqualStrings("solo.eth", solo.?.name.?);
+    // Multi-row namehash: absent — handler falls back to the point query.
+    try std.testing.expectEqual(@as(?(?*const models.Name), null), ctx.lookupDomain(nh(2)));
+    // Zero rows: batched "no row" sentinel.
+    const missing = ctx.lookupDomain(nh(3)) orelse return error.ExpectedBatched;
+    try std.testing.expectEqual(@as(?*const models.Name, null), missing);
+    // Unrequested namehash: never invented.
+    try std.testing.expectEqual(@as(?(?*const models.Name), null), ctx.lookupDomain(nh(9)));
+
+    // Repeat priming with overlap must not leak (testing.allocator enforces).
+    ctx.populateDomains(&test_db, &page);
+    const again = ctx.lookupDomain(nh(1)) orelse return error.ExpectedBatched;
+    try std.testing.expectEqualStrings("solo.eth", again.?.name.?);
 }
 
 // ============================================================================
