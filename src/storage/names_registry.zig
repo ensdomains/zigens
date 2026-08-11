@@ -64,6 +64,12 @@ pub fn updateRegistryPlaceholderName(db: *Database, placeholder_name: []const u8
     try names_q.bindText(placeholder_name);
     try names_q.exec();
     const names_changes = names_q.changes();
+    // Multi-row names rewrite keyed by placeholder parent — no per-row key,
+    // so conservatively clear the dispatch-scoped name prefetch. Gated: this
+    // runs once per registration and almost always matches zero rows; an
+    // unconditional clear would disable the prefetch in exactly the
+    // registration-heavy batches it exists for.
+    if (names_changes > 0) db.noteNamesBulkWrite();
 
     const event_changes = try updatePlaceholderEventsByName(db, placeholder_name, actual_name, namehash);
 

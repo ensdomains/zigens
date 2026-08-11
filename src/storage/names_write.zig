@@ -84,6 +84,7 @@ pub fn insertName(db: *Database, name: models.Name) !void {
 
     try bindNameValues(&q, name, arena.allocator());
     try q.exec();
+    db.noteNameUpsert(name.protocol, name.registry, name.canonical_id, name.namehash, name.name);
 }
 
 /// Bind one name's 33 upsert values in NAMES_UPSERT_HEAD column order. Shared
@@ -210,6 +211,10 @@ pub fn insertNamesBatch(db: *Database, names_slice: []const models.Name) !void {
         try q.exec();
         start += rows;
     }
+
+    for (deduped.items) |name| {
+        db.noteNameUpsert(name.protocol, name.registry, name.canonical_id, name.namehash, name.name);
+    }
 }
 
 /// Update the `is_legacy` flag on an existing name row. Called by V1 Registry
@@ -224,6 +229,7 @@ pub fn updateNameIsLegacy(db: *Database, namehash: Hash, is_legacy: bool) !void 
     try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
+    db.noteNameWriteByNamehash(namehash);
 }
 
 /// Update name expiry (for renewals)
@@ -236,6 +242,7 @@ pub fn updateNameExpiry(db: *Database, namehash: Hash, expiry: u64) !void {
     try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
+    db.noteNameWriteByNamehash(namehash);
 }
 
 /// Expiry update for BaseRegistrar NameRenewed (V1 .eth 2LDs only). Wrapped rows
@@ -260,6 +267,7 @@ pub fn updateV1RenewalExpiry(db: *Database, namehash: Hash, expires: u64) !void 
     try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
+    db.noteNameWriteByNamehash(namehash);
 }
 
 /// Update name owner (for transfers)
@@ -272,6 +280,7 @@ pub fn updateNameOwner(db: *Database, namehash: Hash, new_owner: Address) !void 
     try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
+    db.noteNameWriteByNamehash(namehash);
 }
 
 /// Mark a V1 name as migrated to V2, updating owner to the migration controller.
@@ -287,6 +296,7 @@ pub fn markNameMigrated(db: *Database, namehash: Hash, controller: Address) !voi
     try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
+    db.noteNameWriteByNamehash(namehash);
 }
 
 /// Update name resolver
@@ -299,6 +309,7 @@ pub fn updateNameResolver(db: *Database, namehash: Hash, resolver: Address) !voi
     try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
+    db.noteNameWriteByNamehash(namehash);
 }
 
 /// Clear `names.resolved_address` (set to NULL). Called when V1 NewResolver
@@ -313,6 +324,7 @@ pub fn updateResolvedAddressToNull(db: *Database, namehash: Hash) !void {
     try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
+    db.noteNameWriteByNamehash(namehash);
 }
 
 /// Update TTL for a name (V1 ENS Registry NewTTL event).
@@ -329,6 +341,7 @@ pub fn updateNameTTL(db: *Database, namehash: Hash, ttl: u64) !void {
     try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
+    db.noteNameWriteByNamehash(namehash);
 }
 
 /// Delete a name by its namehash (registry-safe: only deletes the exact name)
@@ -340,6 +353,7 @@ pub fn deleteNameByNamehash(db: *Database, namehash: Hash) !void {
 
     try q.bindHashBuf(namehash);
     try q.exec();
+    db.noteNameWriteByNamehash(namehash);
 }
 
 /// Recursively delete a domain and walk up parent chain GCing empty parents.
@@ -426,6 +440,7 @@ pub fn updateNameTokenIdByNamehash(db: *Database, namehash: Hash, new_token_id: 
     try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
+    db.noteNameWriteByNamehash(namehash);
 }
 
 /// Update wrapper state for a name
@@ -446,6 +461,7 @@ pub fn updateNameWrapperState(db: *Database, namehash: Hash, fuses: u32, expiry:
     try q.bindInt64(zsys.timestamp());
     try q.bindHash(namehash);
     try q.exec();
+    db.noteNameWriteByNamehash(namehash);
 }
 
 /// Clear `names.expiry` (set to NULL) for a namehash. Used on NameUnwrapped
@@ -463,6 +479,7 @@ pub fn clearNameExpiry(db: *Database, namehash: Hash) !void {
     try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
+    db.noteNameWriteByNamehash(namehash);
 }
 
 /// Clear wrapper state for a name (unwrap)
@@ -494,6 +511,7 @@ pub fn updateNameUnwrapperState(db: *Database, namehash: Hash) !void {
     try q.bindInt64(zsys.timestamp());
     try q.bindHash(namehash);
     try q.exec();
+    db.noteNameWriteByNamehash(namehash);
 }
 
 /// Update wrapper fuses only
@@ -511,6 +529,7 @@ pub fn updateNameWrapperFuses(db: *Database, namehash: Hash, fuses: u32) !void {
     try q.bindInt64(zsys.timestamp());
     try q.bindHash(namehash);
     try q.exec();
+    db.noteNameWriteByNamehash(namehash);
 }
 
 /// Update wrapper expiry only
@@ -525,6 +544,7 @@ pub fn updateNameWrapperExpiry(db: *Database, namehash: Hash, expiry: u64) !void
     try q.bindInt64(zsys.timestamp());
     try q.bindHash(namehash);
     try q.exec();
+    db.noteNameWriteByNamehash(namehash);
 }
 
 /// PCC-aware Domain expiry mirror. Subgraph parity: when the wrapped name's
@@ -552,6 +572,7 @@ pub fn updateDomainExpiryIfGreater(db: *Database, namehash: Hash, new_expiry: i6
     try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
     try q.exec();
+    db.noteNameWriteByNamehash(namehash);
 }
 
 /// Bulk-materialize the PCC (PARENT_CANNOT_CONTROL = 0x10000) fuse → Domain.expiry
@@ -591,6 +612,7 @@ pub fn materializePccDomainExpiry(db: *Database) !u32 {
     try q.bindInt64(zsys.timestamp());
     try q.bindInt64(PARENT_CANNOT_CONTROL);
     try q.exec();
+    db.noteNamesBulkWrite();
     return q.changes();
 }
 
@@ -613,6 +635,7 @@ pub fn updateNameLabel(database: *Database, protocol: models.Protocol, namehash:
     try q.bindHash(namehash);
     try q.bindTextStatic(protocol.toString());
     try q.exec();
+    database.noteNameText(protocol, namehash, name);
 }
 
 /// Update creation date if the new block is earlier (for backfill scenarios)
@@ -629,4 +652,5 @@ pub fn updateNameCreationDateIfEarlier(db: *Database, namehash: Hash, block_numb
     try q.bindHash(namehash);
     try q.bindInt64(@intCast(block_number));
     try q.exec();
+    db.noteNameWriteByNamehash(namehash);
 }

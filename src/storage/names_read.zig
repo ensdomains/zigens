@@ -295,6 +295,118 @@ pub fn getUniqueNameByCanonicalId(db: *Database, protocol: models.Protocol, toke
     return first;
 }
 
+/// Every row whose canonical_id is in `canonical_ids` — deliberately no
+/// protocol or registry filter, so the caller (the dispatch-scoped name
+/// prefetch) holds the COMPLETE row set per id and can mirror both point
+/// lookups above exactly, authoritative misses included. Rows and the
+/// returned slice are allocated with `allocator`.
+pub fn getNamesByCanonicalIds(db: *Database, canonical_ids: []const u256, allocator: std.mem.Allocator) ![]models.Name {
+    var out: std.ArrayList(models.Name) = .empty;
+    errdefer {
+        for (out.items) |*n| n.deinit(allocator);
+        out.deinit(allocator);
+    }
+
+    const CHUNK = 200;
+    var start: usize = 0;
+    while (start < canonical_ids.len) {
+        const chunk = canonical_ids[start..@min(start + CHUNK, canonical_ids.len)];
+        start += chunk.len;
+
+        var scratch = std.heap.ArenaAllocator.init(db.allocator);
+        defer scratch.deinit();
+
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.appendSlice(scratch.allocator(), SQL_SELECT_NAMES ++ " WHERE canonical_id IN (");
+        for (chunk, 0..) |_, i| {
+            if (i != 0) try sql.append(scratch.allocator(), ',');
+            try sql.append(scratch.allocator(), '?');
+        }
+        try sql.append(scratch.allocator(), ')');
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        for (chunk) |cid| {
+            const buf = try scratch.allocator().create([66]u8);
+            try q.bindTextStatic(formatU256HexBuf(buf, cid));
+        }
+        while (try q.step()) {
+            var row = try parseNameRow(&q, allocator);
+            errdefer row.deinit(allocator);
+            try out.append(allocator, row);
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+pub const CanonicalNameResolution = struct {
+    name: ?[]const u8,
+    namehash: Hash,
+};
+
+/// Batched mirror of getUniqueNameByCanonicalId over many token ids: one
+/// IN-list sweep instead of one point query each (the placeholder-repair
+/// passes issue thousands of these per bulk-sync batch). The returned map is
+/// keyed by CANONICAL id and holds an entry only for ids that resolve
+/// uniquely under `protocol` — zero rows and the cross-registry ambiguity are
+/// both absent, exactly like the point lookup's null. Valid only when no
+/// names write happens between here and the lookups it replaces (the repair
+/// passes write events only). Names are duped with `allocator`; release via
+/// freeCanonicalNameResolutions.
+pub fn resolveUniqueNamesByCanonicalIds(db: *Database, protocol: models.Protocol, token_ids: []const u256, allocator: std.mem.Allocator) !std.AutoHashMap(u256, CanonicalNameResolution) {
+    var out = std.AutoHashMap(u256, CanonicalNameResolution).init(allocator);
+    errdefer freeCanonicalNameResolutions(&out, allocator);
+
+    var seen = std.AutoHashMap(u256, void).init(allocator);
+    defer seen.deinit();
+    var cids: std.ArrayList(u256) = .empty;
+    defer cids.deinit(allocator);
+    const token_id_utils = @import("../types/token_id.zig");
+    for (token_ids) |tok| {
+        const cid = token_id_utils.getCanonicalId(tok);
+        const gop = try seen.getOrPut(cid);
+        if (!gop.found_existing) try cids.append(allocator, cid);
+    }
+    if (cids.items.len == 0) return out;
+
+    var arena = std.heap.ArenaAllocator.init(db.allocator);
+    defer arena.deinit();
+    const rows = try getNamesByCanonicalIds(db, cids.items, arena.allocator());
+
+    const Tally = struct { count: usize, row_index: usize };
+    var tally = std.AutoHashMap(u256, Tally).init(allocator);
+    defer tally.deinit();
+    for (rows, 0..) |row, i| {
+        if (row.protocol != protocol) continue;
+        const gop = try tally.getOrPut(row.canonical_id);
+        if (gop.found_existing) {
+            gop.value_ptr.count += 1;
+        } else {
+            gop.value_ptr.* = .{ .count = 1, .row_index = i };
+        }
+    }
+
+    var it = tally.iterator();
+    while (it.next()) |kv| {
+        if (kv.value_ptr.count != 1) continue;
+        const row = rows[kv.value_ptr.row_index];
+        try out.put(kv.key_ptr.*, .{
+            .name = if (row.name) |nm| try allocator.dupe(u8, nm) else null,
+            .namehash = row.namehash,
+        });
+    }
+    return out;
+}
+
+pub fn freeCanonicalNameResolutions(map: *std.AutoHashMap(u256, CanonicalNameResolution), allocator: std.mem.Allocator) void {
+    var it = map.valueIterator();
+    while (it.next()) |v| {
+        if (v.name) |nm| allocator.free(nm);
+    }
+    map.deinit();
+}
+
 /// Get all names owned by an address. Unreachable rows (orphaned by a
 /// subregistry repoint or LabelUnregistered) are filtered out.
 pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Name {

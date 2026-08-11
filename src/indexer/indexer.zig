@@ -3,6 +3,7 @@ const zsys = @import("../utils/system.zig");
 const config = @import("../config.zig");
 const constants = @import("../constants.zig");
 const db = @import("../storage/database.zig");
+const name_prefetch_mod = @import("../storage/name_prefetch.zig");
 const rpc = @import("../rpc/client.zig");
 const models = @import("../types/models.zig");
 // EventSignatures consumed via the eth.zig-backed shim (re-exports them).
@@ -98,6 +99,10 @@ pub const Indexer = struct {
     name_by_namehash_cache: std.AutoHashMap(Hash, []const u8),
     // Track block hash from processed logs to avoid extra getBlockByNumber RPC calls
     last_seen_block_hash: ?Hash = null,
+    // Dispatch-scoped names prefetch (see storage/name_prefetch.zig). Set by
+    // utils.dispatchOrdered for the duration of one ordered dispatch; null
+    // otherwise. Consulted only by handleResolverUpdated.
+    name_prefetch: ?*name_prefetch_mod.NamePrefetch = null,
     last_seen_block_number: u64 = 0,
     // Reorg undo-log cursor de-dup: last (protocol, block) the cursor was written for,
     // so `markEventBlock` only writes on a change (avoids a per-event upsert). -1 = unset.

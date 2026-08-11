@@ -276,6 +276,11 @@ pub fn setRegistriesReachability(
 ) !u64 {
     if (registries.len == 0) return 0;
 
+    // Multi-row names write without per-row keys: conservatively clear the
+    // whole dispatch-scoped name prefetch (rare — one cascade per
+    // SubregistryUpdated) rather than track which rows the IN-list touched.
+    db.noteNamesBulkWrite();
+
     // Chunked: each registry address is a tracked text bind, and Statement caps
     // tracked binds at 32 (error.TooManyBoundParams beyond that) — large
     // collectSubtreeRooted subtrees must therefore split the IN-list. The
@@ -396,4 +401,5 @@ pub fn markNameUnreachableByNamehash(
     try q.bindTextStatic(protocol.toString());
     try q.bindHash(namehash);
     try q.exec();
+    db.noteNameWriteByNamehash(namehash);
 }

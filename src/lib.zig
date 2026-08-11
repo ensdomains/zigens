@@ -21,6 +21,8 @@ pub const storage = struct {
     pub const v1_controllers = @import("storage/v1_controllers.zig");
     pub const unknown_labels = @import("storage/unknown_labels.zig");
     pub const registry_entries = @import("storage/registry_entries.zig");
+    pub const name_prefetch = @import("storage/name_prefetch.zig");
+    pub const names_registry = @import("storage/names_registry.zig");
     pub const db_open = @import("storage/db_open.zig");
     pub const pool = @import("storage/pool.zig");
 };

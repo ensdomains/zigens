@@ -58,6 +58,25 @@ const sqlite_driver = @import("drivers/sqlite.zig");
 const schema_keys = @import("schema_keys.zig");
 /// RAII transaction guard, re-exported for storage modules.
 pub const Tx = backend_mod.Tx;
+
+/// Observer for writes to the `names` table. Registered by the indexer's
+/// dispatch-scoped name prefetch (storage/name_prefetch.zig) so its in-memory
+/// rows can never go stale: every writer in names_write.zig (plus the
+/// reachability cascades in registry_entries.zig) notifies through this hook.
+/// Callbacks must be infallible and cheap — they run inline on the write path.
+pub const NameWriteListener = struct {
+    ctx: *anyopaque,
+    /// insertName/insertNamesBatch: the post-upsert values of the prefetch
+    /// projection are exactly these arguments (the conflict tail sets every
+    /// projection column to plain excluded.*).
+    on_upsert: *const fn (ctx: *anyopaque, protocol: models.Protocol, registry: Address, canonical_id: u256, namehash: Hash, name: ?[]const u8) void,
+    /// updateNameLabel: protocol-scoped rewrite of the display name text.
+    on_name_text: *const fn (ctx: *anyopaque, protocol: models.Protocol, namehash: Hash, name: []const u8) void,
+    /// Any other single-row write keyed by namehash.
+    on_namehash: *const fn (ctx: *anyopaque, namehash: Hash) void,
+    /// Multi-row writes without per-row keys.
+    on_bulk: *const fn (ctx: *anyopaque) void,
+};
 /// SQLite serialized-mode setup; call once at process start before any DB open.
 pub const configureSqliteThreadSafety = sqlite_driver.configureSerialized;
 
@@ -72,6 +91,9 @@ pub const Database = struct {
     /// fails loudly if a path forgets to populate it (the emitted id would be
     /// `0-v1-…` — visibly wrong but not unsafe).
     chain_id: u64 = 0,
+    /// Names-write observer (see NameWriteListener). Null outside the
+    /// indexer's dispatch-scoped prefetch window.
+    name_write_listener: ?NameWriteListener = null,
     /// SQLite page-cache size (MB) applied by dropSyncIndexes for bulk sync.
     /// Set by the indexer from Config (SYNC_CACHE_MB, .env-aware); process env
     /// still overrides inside dropSyncIndexes. Paths that never bulk-sync
@@ -207,6 +229,22 @@ pub const Database = struct {
     /// ROWID of the most recent successful INSERT on this connection.
     pub fn lastInsertId(self: *Database) i64 {
         return self.backend.vtable.lastInsertId(self.backend.ptr);
+    }
+
+    pub fn noteNameUpsert(self: *Database, protocol: models.Protocol, registry: Address, canonical_id: u256, namehash: Hash, name: ?[]const u8) void {
+        if (self.name_write_listener) |l| l.on_upsert(l.ctx, protocol, registry, canonical_id, namehash, name);
+    }
+
+    pub fn noteNameText(self: *Database, protocol: models.Protocol, namehash: Hash, name: []const u8) void {
+        if (self.name_write_listener) |l| l.on_name_text(l.ctx, protocol, namehash, name);
+    }
+
+    pub fn noteNameWriteByNamehash(self: *Database, namehash: Hash) void {
+        if (self.name_write_listener) |l| l.on_namehash(l.ctx, namehash);
+    }
+
+    pub fn noteNamesBulkWrite(self: *Database) void {
+        if (self.name_write_listener) |l| l.on_bulk(l.ctx);
     }
 
     /// The active backend's SQL-dialect builders.
@@ -364,6 +402,7 @@ pub const Database = struct {
     pub const applyLatestResolverFromEvents = resolvers.applyLatestResolverFromEvents;
     pub const getNameByTokenIdAndRegistry = names.getNameByTokenIdAndRegistry;
     pub const getUniqueNameByCanonicalId = names.getUniqueNameByCanonicalId;
+    pub const getNamesByCanonicalIds = names.getNamesByCanonicalIds;
     pub const deleteNameByNamehash = names.deleteNameByNamehash;
     pub const updateNameTokenIdByNamehash = names.updateNameTokenIdByNamehash;
     pub const getNamesByOwner = names.getNamesByOwner;

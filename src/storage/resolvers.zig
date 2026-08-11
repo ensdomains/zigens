@@ -190,6 +190,7 @@ pub fn applyLatestResolverFromEvents(db: *Database, protocol: models.Protocol, n
     try q.bindTextStatic(protocol.toString());
     try q.bindHashBuf(namehash);
     try q.exec();
+    db.noteNameWriteByNamehash(namehash);
 }
 
 /// Latest addr record for a given (resolver, namehash, coin_type).

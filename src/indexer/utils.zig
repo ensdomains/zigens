@@ -4,6 +4,7 @@ const rpc = @import("../rpc/client.zig");
 const Hash = @import("../types/hash.zig").Hash;
 const Address = @import("../types/address.zig").Address;
 const Indexer = @import("indexer.zig").Indexer;
+const name_prefetch_mod = @import("../storage/name_prefetch.zig");
 
 /// Record `addr` in the `accounts` entity table at the block/timestamp of
 /// the log that observed it. Skip the zero-address sentinel (burned / cleared,
@@ -139,6 +140,27 @@ pub fn dispatchOrdered(
     entries: []DispatchEntry,
 ) !void {
     std.mem.sort(DispatchEntry, entries, {}, dispatchEntryLessThan);
+
+    // Dispatch-scoped names prefetch: one IN-list load replaces the
+    // ResolverUpdated storm's per-event point lookups (~86% of V2 bulk-sync
+    // events on real ranges). The write listener keeps it exact — see
+    // storage/name_prefetch.zig for the correctness model. Guarded against
+    // nesting: an inner dispatch must never displace an outer map.
+    var prefetch: ?name_prefetch_mod.NamePrefetch = null;
+    defer if (prefetch) |*p| p.deinit();
+    if (self.config.name_prefetch and self.name_prefetch == null) {
+        buildNamePrefetch(self, entries, &prefetch);
+    }
+    if (prefetch != null) {
+        self.name_prefetch = &prefetch.?;
+        self.database.name_write_listener = prefetch.?.listener();
+    }
+    defer if (prefetch) |*p| {
+        self.name_prefetch = null;
+        self.database.name_write_listener = null;
+        p.logStats();
+    };
+
     for (entries) |entry| {
         self.markEventBlock(protocol, entry.log.block_number);
         entry.handler(self, protocol, entry.log) catch |err| {
@@ -146,4 +168,29 @@ pub fn dispatchOrdered(
             skipMalformedEvent(entry.log, err);
         };
     }
+}
+
+/// Collect the tokenIds of every ResolverUpdated entry and load their names
+/// rows. Best-effort: any failure (or an undecodable topic) just leaves the
+/// map unbuilt/incomplete and lookups fall back to the DB — the prefetch is
+/// never allowed to abort dispatch.
+fn buildNamePrefetch(self: *Indexer, entries: []const DispatchEntry, out: *?name_prefetch_mod.NamePrefetch) void {
+    var tokens: std.ArrayList(u256) = .empty;
+    defer tokens.deinit(self.allocator);
+    for (entries) |entry| {
+        if (entry.handler != @as(@TypeOf(entry.handler), Indexer.handleResolverUpdated)) continue;
+        if (entry.log.topics.len < 4) continue;
+        const tok = std.mem.readInt(u256, &entry.log.topics[1].bytes, .big);
+        tokens.append(self.allocator, tok) catch return;
+    }
+    if (tokens.items.len == 0) return;
+
+    // Construct in place before populate: rows live in the embedded arena and
+    // a populated NamePrefetch must never move.
+    out.* = name_prefetch_mod.NamePrefetch.init(self.allocator);
+    out.*.?.populate(self.database, tokens.items) catch |err| {
+        std.log.warn("name prefetch failed (falling back to per-event lookups): {}", .{err});
+        out.*.?.deinit();
+        out.* = null;
+    };
 }
