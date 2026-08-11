@@ -341,6 +341,10 @@ test "conformance goldens" {
         // via the request loader): alice's resolver has a seeded avatar record, so
         // this golden pins real values flowing through the batch, not just nulls.
         .{ .name = "registrations_domain_resolver_texts", .query = "{ registrations(first:10, orderBy:name, orderDirection:asc){ name domain { name resolver { address avatar: text(key:\"avatar\") missing: text(key:\"com.twitter\") } } } }" },
+        // Locks the batched `texts` key-LIST field on both primed list paths
+        // (domains + registrations→domain): alice = ["avatar"], others empty.
+        .{ .name = "domains_resolver_texts_list", .query = "{ domains(where:{name_in:[\"alice.eth\",\"bob.eth\"]}, orderBy:name, orderDirection:asc){ name resolver { texts } } }" },
+        .{ .name = "registrations_domain_texts_list", .query = "{ registrations(first:10, orderBy:name, orderDirection:asc){ name domain { resolver { texts } } } }" },
         // --- finality signalling (Task 09; _finality is additive, subgraph _meta unchanged) ---
         .{ .name = "finality", .query = "{ _finality { head { number } safe { number hash } finalized { number } isStale } }" },
         // --- coverage declaration (additive; lastSyncedAt is wall-clock so not selected) ---

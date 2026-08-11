@@ -1131,7 +1131,21 @@ fn resolverTextsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx:
     const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
-    // DataLoader path disabled — namehash-only batching would leak legacy-resolver records for migrated names.
+    // Page-batched list first — keyed by the COMPOSITE (resolver, namehash),
+    // which is what made the removed namehash-only DataLoader unsafe (it
+    // leaked legacy-resolver records for migrated names). Absent = fall back.
+    if (nested_ctx.loaders) |lp| {
+        const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+        if (lc.lookupTextKeys(rctx.resolver, rctx.namehash)) |batched_keys| {
+            var json: std.Io.Writer.Allocating = .init(nested_ctx.allocator);
+            errdefer json.deinit();
+            var arr = try jw.arrayOn(&json.writer);
+            for (batched_keys) |key| try arr.itemStr(key, nested_ctx.allocator);
+            try arr.end();
+            return try json.toOwnedSlice();
+        }
+    }
+
     const text_keys = try database.getTextRecordKeys(rctx.resolver, rctx.namehash);
     defer {
         for (text_keys) |key| database.allocator.free(key);

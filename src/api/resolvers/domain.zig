@@ -318,13 +318,14 @@ fn mapFilterGroup(group: ?[]const ParsedDomainFilter, allocator: std.mem.Allocat
     return arr;
 }
 
-const ResolverRecordWants = struct { addr: bool, contenthash: bool };
+const ResolverRecordWants = struct { addr: bool, contenthash: bool, text_keys: bool };
 
 /// Which batchable resolver records a `domains` selection reads: `resolvedAddress`
-/// or `resolver{ addr }` -> addr; `resolver{ contentHash }` -> contenthash. Used to
-/// skip the page prefetch entirely when the query doesn't select them.
+/// or `resolver{ addr }` -> addr; `resolver{ contentHash }` -> contenthash;
+/// `resolver{ texts }` -> text_keys. Used to skip the page prefetch entirely
+/// when the query doesn't select them.
 fn wantsResolverRecords(selections: []const parser.Field) ResolverRecordWants {
-    var want = ResolverRecordWants{ .addr = false, .contenthash = false };
+    var want = ResolverRecordWants{ .addr = false, .contenthash = false, .text_keys = false };
     for (selections) |*sel| {
         if (std.mem.eql(u8, sel.name, "resolvedAddress")) {
             want.addr = true;
@@ -332,6 +333,7 @@ fn wantsResolverRecords(selections: []const parser.Field) ResolverRecordWants {
             for (sel.selections) |*sub| {
                 if (std.mem.eql(u8, sub.name, "addr")) want.addr = true;
                 if (std.mem.eql(u8, sub.name, "contentHash")) want.contenthash = true;
+                if (std.mem.eql(u8, sub.name, "texts")) want.text_keys = true;
             }
         }
     }
@@ -370,7 +372,7 @@ pub fn prefetchResolverRecords(database: *db.Database, allocator: std.mem.Alloca
     var text_keys: std.ArrayList([]const u8) = .empty;
     defer text_keys.deinit(allocator);
     collectTextKeys(selections, &text_keys, allocator) catch {};
-    if (!want.addr and !want.contenthash and text_keys.items.len == 0) return;
+    if (!want.addr and !want.contenthash and !want.text_keys and text_keys.items.len == 0) return;
     const lp = loaders_ptr orelse return;
     const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
 
@@ -389,6 +391,9 @@ pub fn prefetchResolverRecords(database: *db.Database, allocator: std.mem.Alloca
     }
     if (text_keys.items.len > 0) {
         lc.populateTextRecords(database, resolvers_buf, namehashes_buf, text_keys.items);
+    }
+    if (want.text_keys) {
+        lc.populateTextKeyLists(database, resolvers_buf, namehashes_buf);
     }
 }
 
