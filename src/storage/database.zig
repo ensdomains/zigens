@@ -570,6 +570,7 @@ pub const Database = struct {
     pub const getRegistryEntryLiveParents = registry_entries.getLiveParents;
     pub const collectSubregistrySubtree = registry_entries.collectSubtreeRooted;
     pub const isRegistryReachable = registry_entries.isRegistryReachable;
+    pub const recomputeSubtreeReachability = registry_entries.recomputeSubtreeReachability;
     pub const reconcileV2Reachability = registry_entries.reconcileV2Reachability;
     pub const setRegistriesReachability = registry_entries.setRegistriesReachability;
     pub const markNameUnreachableByNamehash = registry_entries.markNameUnreachableByNamehash;

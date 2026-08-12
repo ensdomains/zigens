@@ -1580,35 +1580,17 @@ pub fn handleLabelUnregistered(self: *Indexer, protocol: models.Protocol, log: r
 
     const block_timestamp = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
 
-    // Cascade-invalidate descendants of the entry's current subregistry.
+    // Cascade-invalidate descendants of the entry's current subregistry —
+    // multi-parent-guarded, and with the mirror cleared FIRST so the guard's
+    // root-walk sees post-change edges (on-chain the expiry guard makes
+    // getSubregistry return zero; our mirror reflects that before deciding
+    // whether the old subtree is genuinely orphaned).
     const prev_subregistry = try self.database.getRegistryEntrySubregistry(
         protocol,
         log.address,
         token_id,
     );
     if (!prev_subregistry.isZero()) {
-        const subtree = try self.database.collectSubregistrySubtree(
-            self.allocator,
-            protocol,
-            prev_subregistry,
-        );
-        defer self.allocator.free(subtree);
-        if (subtree.len > 0) {
-            const affected = try self.database.setRegistriesReachability(
-                protocol,
-                subtree,
-                false,
-                log.block_number,
-                block_timestamp,
-            );
-            std.log.info(
-                "LabelUnregistered: cleared {any} from {any}; invalidated {d} descendant name(s) across {d} subregistries",
-                .{ log.address, prev_subregistry, affected, subtree.len },
-            );
-        }
-        // Clear the entry's subregistry pointer in the mirror — on-chain the
-        // expiry guard makes getSubregistry return zero, our mirror should
-        // reflect that.
         _ = try self.database.upsertRegistryEntrySubregistry(
             protocol,
             log.address,
@@ -1617,6 +1599,22 @@ pub fn handleLabelUnregistered(self: *Indexer, protocol: models.Protocol, log: r
             log.block_number,
             block_timestamp,
         );
+        const roots = [_]Address{ self.config.v2_contracts.eth_registry, self.config.v2_contracts.root_registry };
+        const seeds = [_]Address{prev_subregistry};
+        const recompute = try self.database.recomputeSubtreeReachability(
+            self.allocator,
+            protocol,
+            &seeds,
+            &roots,
+            log.block_number,
+            block_timestamp,
+        );
+        if (recompute.names_marked_unreachable > 0 or recompute.names_marked_reachable > 0) {
+            std.log.info(
+                "LabelUnregistered: cleared {any} from {any}; {d} name(s) marked unreachable, {d} reachable across {d} checked subregistries",
+                .{ log.address, prev_subregistry, recompute.names_marked_unreachable, recompute.names_marked_reachable, recompute.registries_checked },
+            );
+        }
     }
 
     const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
@@ -1804,50 +1802,30 @@ fn processSubregistryPointerChange(
         block_timestamp,
     );
 
-    // Repoint or clear: invalidate the previous subtree. The initial-pointer
-    // case (prev=0, e.g. fired from `_register` paired with LabelRegistered)
-    // falls through silently.
-    if (!prev_subregistry.isZero() and !prev_subregistry.eql(new_subregistry)) {
-        const orphaned_tree = try self.database.collectSubregistrySubtree(
+    // Edge change: recompute reachability PER REGISTRY over both affected
+    // subtrees (the region under the previous pointer and under the new one).
+    // The mirror was updated above, so the per-node root-walks see post-change
+    // edges. No blanket cascades in either direction: the graph permits
+    // multi-parent edges (a user pointing their own entry at a shared
+    // registry — even the root — must never orphan it on repoint-away, and a
+    // re-link through an orphaned parent must never resurrect a subtree).
+    // The initial-pointer case (prev=0 from `_register`) still recomputes the
+    // new subtree — a no-op against already-correct rows.
+    if (!prev_subregistry.eql(new_subregistry)) {
+        const roots = [_]Address{ self.config.v2_contracts.eth_registry, self.config.v2_contracts.root_registry };
+        const seeds = [_]Address{ prev_subregistry, new_subregistry };
+        const recompute = try self.database.recomputeSubtreeReachability(
             self.allocator,
             protocol,
-            prev_subregistry,
+            &seeds,
+            &roots,
+            log.block_number,
+            block_timestamp,
         );
-        defer self.allocator.free(orphaned_tree);
-
-        if (orphaned_tree.len > 0) {
-            const affected = try self.database.setRegistriesReachability(
-                protocol,
-                orphaned_tree,
-                false,
-                log.block_number,
-                block_timestamp,
-            );
+        if (recompute.names_marked_reachable > 0 or recompute.names_marked_unreachable > 0) {
             std.log.info(
-                "SubregistryUpdated: repoint of {any} canonicalId={d} from {any} → {any} invalidated {d} descendant name(s) across {d} subregistries",
-                .{ log.address, canonical_id, prev_subregistry, new_subregistry, affected, orphaned_tree.len },
-            );
-        }
-    }
-
-    // Re-link: if `new_subregistry` was previously orphaned, restore it. For
-    // a brand-new pointer the subtree is just `[new_subregistry]` and this
-    // is a no-op against currently-reachable rows.
-    if (!new_subregistry.isZero()) {
-        const new_tree = try self.database.collectSubregistrySubtree(
-            self.allocator,
-            protocol,
-            new_subregistry,
-        );
-        defer self.allocator.free(new_tree);
-
-        if (new_tree.len > 0) {
-            _ = try self.database.setRegistriesReachability(
-                protocol,
-                new_tree,
-                true,
-                log.block_number,
-                block_timestamp,
+                "SubregistryUpdated: repoint of {any} canonicalId={d} from {any} → {any}: {d} name(s) marked reachable, {d} unreachable across {d} checked subregistries",
+                .{ log.address, canonical_id, prev_subregistry, new_subregistry, recompute.names_marked_reachable, recompute.names_marked_unreachable, recompute.registries_checked },
             );
         }
     }

@@ -1309,18 +1309,14 @@ fn replayV2SubregistryPointer(self: *Indexer, q: *Query, clear: bool) !void {
 
     const prev = try self.database.upsertRegistryEntrySubregistry(.v2, registry, canonical_id, new_subregistry, block_number, ts);
 
-    // Repoint/clear: the previous subtree becomes unreachable.
-    if (!prev.isZero() and !prev.eql(new_subregistry)) {
-        const tree = try self.database.collectSubregistrySubtree(self.allocator, .v2, prev);
-        defer self.allocator.free(tree);
-        if (tree.len > 0) _ = try self.database.setRegistriesReachability(.v2, tree, false, block_number, ts);
-    }
-    // Re-link: the new subtree becomes reachable (also flips subregistry names the names pass left
-    // is_reachable=0 while registry_entries was empty).
-    if (!new_subregistry.isZero()) {
-        const tree = try self.database.collectSubregistrySubtree(self.allocator, .v2, new_subregistry);
-        defer self.allocator.free(tree);
-        if (tree.len > 0) _ = try self.database.setRegistriesReachability(.v2, tree, true, block_number, ts);
+    // Edge change: per-registry reachability recompute over both affected
+    // subtrees — identical to the live handler (no blanket cascades; the
+    // graph permits multi-parent edges). Also flips subregistry names the
+    // names pass left is_reachable=0 while registry_entries was empty.
+    if (!prev.eql(new_subregistry)) {
+        const roots = [_]Address{ self.config.v2_contracts.eth_registry, self.config.v2_contracts.root_registry };
+        const seeds = [_]Address{ prev, new_subregistry };
+        _ = try self.database.recomputeSubtreeReachability(self.allocator, .v2, &seeds, &roots, block_number, ts);
     }
 
     // Register the subregistry (INSERT OR IGNORE keeps the bootstrap eth row). Resolve its name
