@@ -89,3 +89,23 @@ Register a URL and event types; deliveries are HMAC-SHA256-signed —
 `X-Webhook-Signature: sha256=<hex>` over `{timestamp}.{payload}` with the
 timestamp in `X-Webhook-Timestamp` — retried with backoff, and carry a stable
 `X-Webhook-Id` for deduplication.
+
+## MCP (agents)
+
+`POST /mcp` — the same data over the
+[Model Context Protocol](https://modelcontextprotocol.io), so AI agents
+(Claude, IDE assistants, anything MCP-capable) discover and query ENSv2
+without custom integration. **Off by default**; enable with `MCP_ENABLED=1`
+(see [Deployment](deployment.md)).
+
+Stateless Streamable HTTP: plain JSON-RPC over POST, no sessions, no SSE.
+Read-only by construction — the `graphql-query` tool executes through the
+same pipeline as `/graphql`, so cost limits, per-IP rate limiting and live
+resolution behave identically on both surfaces.
+
+| Tool / resource | What it does |
+|---|---|
+| `graphql-query` tool | Runs any GraphQL query; its description teaches agents the entry points, filter conventions and pitfalls, and errors carry line/column locations for self-correction |
+| `get-graphql-schema` tool | Compact type index, or one type's full SDL on demand |
+| `examples` resource | Known-good queries with intents, mirrored from the conformance suite |
+| `coverage` resource | Live indexing coverage / freshness snapshot |

@@ -33,7 +33,7 @@ pub const Executor = struct {
 const GRAPHQL_QUERY_PRIMER =
     "Query the ENSv2 indexer with GraphQL. Read-only. " ++
     "ENTRY POINTS: domains(where, first, skip, orderBy, orderDirection) lists/filters domains; " ++
-    "domain(id) fetches one domain by NAMEHASH (0x-prefixed 32-byte hex; to look up by name use domains(where:{name:\"alice.eth\"})); " ++
+    "domain(id) fetches one domain by name or namehash (domain(id:\"alice.eth\") works); " ++
     "resolveDomain(id) fetches one domain WITH live on-chain resolution; " ++
     "registrations(...) is registration history (orderBy: registrationDate | expiryDate | name); " ++
     "accounts(...) / account(id: \"0x…address\") are owners and their domains; " ++
