@@ -597,6 +597,58 @@ test "writeFinalityGauges: emits the full finality gauge set with correct lag" {
     }
 }
 
+/// Run one GraphQL query through the full pipeline (pool session, live
+/// ENSIP-10 context when enabled, cost model, batch loaders). Shared by the
+/// HTTP POST/GET endpoints and the MCP `graphql-query` tool, so every
+/// transport gets byte-identical behavior. Block-scopes the session so it
+/// returns to the pool before response serialization / socket writes.
+pub fn executeQuery(self: *Server, query: []const u8, variables_value: ?std.json.Value, operation_name: ?[]const u8, strict: bool) ![]u8 {
+    return blk: {
+        const database = try self.pool.acquire();
+        defer self.pool.release(database);
+        // Live ENSIP-10 record fallback (Task 06): when RESOLVE_LIVE_ENABLED wired a
+        // Universal Resolver, thread a per-request LiveContext pinned to the head block
+        // the API is reading at (so cached live answers reorg-invalidate). When off, the
+        // plain indexed-only handleQuery below runs — byte-identical to before.
+        if (self.resolve) |rs| {
+            if (rs.live_enabled and !rs.universal_resolver.isZero()) {
+                const v1_head = (try database.getSyncState(.v1)) orelse 0;
+                const v2_head = (try database.getSyncState(.v2)) orelse 0;
+                const use_v1 = v1_head >= v2_head;
+                const head = if (use_v1) v1_head else v2_head;
+                const head_hash_opt = if (use_v1) try database.getBlockHash(.v1, head) else try database.getBlockHash(.v2, head);
+                if (head_hash_opt) |head_hash| {
+                    var resolver = resolve_client.Resolver.init(rs.rpc_client, database, rs.chain_id, rs.ttl_s);
+                    var live_ctx = universal.LiveContext{
+                        .resolver = &resolver,
+                        .ur_address = rs.universal_resolver,
+                        .block_num = head,
+                        .block_hash = head_hash,
+                        .now = zsys.timestamp(),
+                        .registry = rs.registry,
+                        .primary_verify_enabled = rs.primary_verify_enabled,
+                    };
+                    // CCIP-Read (Task 07): when enabled, attach a real gateway+callback
+                    // transport (pinned to the same head) so OffchainLookup reverts complete
+                    // offchain. Stack-scoped; lives for the synchronous handleQuery call.
+                    var ccip_rt: ccip_transport.RealTransport = undefined;
+                    if (rs.ccip_enabled) {
+                        ccip_rt = .{
+                            .http_client = rs.http_client,
+                            .rpc_client = rs.rpc_client,
+                            .block_hash = head_hash,
+                            .timeout_ms = rs.ccip_timeout_ms,
+                        };
+                        live_ctx.ccip = .{ .transport = ccip_rt.transport(), .max_redirects = rs.ccip_max_redirects };
+                    }
+                    break :blk try self.graphql_handler.handleQueryWithResolve(database, query, variables_value, operation_name, strict, @ptrCast(&live_ctx));
+                }
+            }
+        }
+        break :blk try self.graphql_handler.handleQuery(database, query, variables_value, operation_name, strict);
+    };
+}
+
 pub fn handleGraphQLQuery(self: *Server, conn: http_util.Conn, request: []const u8) !void {
     // GraphQL-over-HTTP content negotiation. Default (application/json, */*, or no
     // Accept header) keeps the legacy contract every ensjs / subgraph client relies
@@ -674,52 +726,7 @@ pub fn handleGraphQLQuery(self: *Server, conn: http_util.Conn, request: []const 
     }
 
     // Handle the query with variables and operation name
-    // Block-scope the session so it returns to the pool before response
-    // serialization and the (possibly slow) socket write to the client.
-    const result = blk: {
-        const database = try self.pool.acquire();
-        defer self.pool.release(database);
-        // Live ENSIP-10 record fallback (Task 06): when RESOLVE_LIVE_ENABLED wired a
-        // Universal Resolver, thread a per-request LiveContext pinned to the head block
-        // the API is reading at (so cached live answers reorg-invalidate). When off, the
-        // plain indexed-only handleQuery below runs — byte-identical to before.
-        if (self.resolve) |rs| {
-            if (rs.live_enabled and !rs.universal_resolver.isZero()) {
-                const v1_head = (try database.getSyncState(.v1)) orelse 0;
-                const v2_head = (try database.getSyncState(.v2)) orelse 0;
-                const use_v1 = v1_head >= v2_head;
-                const head = if (use_v1) v1_head else v2_head;
-                const head_hash_opt = if (use_v1) try database.getBlockHash(.v1, head) else try database.getBlockHash(.v2, head);
-                if (head_hash_opt) |head_hash| {
-                    var resolver = resolve_client.Resolver.init(rs.rpc_client, database, rs.chain_id, rs.ttl_s);
-                    var live_ctx = universal.LiveContext{
-                        .resolver = &resolver,
-                        .ur_address = rs.universal_resolver,
-                        .block_num = head,
-                        .block_hash = head_hash,
-                        .now = zsys.timestamp(),
-                        .registry = rs.registry,
-                        .primary_verify_enabled = rs.primary_verify_enabled,
-                    };
-                    // CCIP-Read (Task 07): when enabled, attach a real gateway+callback
-                    // transport (pinned to the same head) so OffchainLookup reverts complete
-                    // offchain. Stack-scoped; lives for the synchronous handleQuery call.
-                    var ccip_rt: ccip_transport.RealTransport = undefined;
-                    if (rs.ccip_enabled) {
-                        ccip_rt = .{
-                            .http_client = rs.http_client,
-                            .rpc_client = rs.rpc_client,
-                            .block_hash = head_hash,
-                            .timeout_ms = rs.ccip_timeout_ms,
-                        };
-                        live_ctx.ccip = .{ .transport = ccip_rt.transport(), .max_redirects = rs.ccip_max_redirects };
-                    }
-                    break :blk try self.graphql_handler.handleQueryWithResolve(database, query, variables_value, operation_name, strict, @ptrCast(&live_ctx));
-                }
-            }
-        }
-        break :blk try self.graphql_handler.handleQuery(database, query, variables_value, operation_name, strict);
-    };
+    const result = try self.executeQuery(query, variables_value, operation_name, strict);
     defer self.allocator.free(result);
 
     // Legacy mode: always 200 (errors travel in the body) — unchanged. Strict mode:

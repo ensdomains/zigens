@@ -35,6 +35,9 @@ pub const Config = struct {
     /// (V2_EVENT_BUFFER, default on). Ops escape hatch: 0 restores per-event
     /// direct writes.
     v2_event_buffer: bool = true,
+    /// MCP agent endpoint on the API server (MCP_ENABLED, default off).
+    /// POST /mcp — stateless Streamable HTTP; see docs/mcp-agent-endpoint-design.md.
+    mcp_enabled: bool = false,
     /// Prefetch names rows per ordered dispatch so the ResolverUpdated storm
     /// is served from memory instead of per-event point lookups
     /// (NAME_PREFETCH, default on). Ops escape hatch: 0 restores per-event
@@ -175,6 +178,7 @@ pub const Config = struct {
             .api_integrity_check = env_mod.getEnvBool(&env_map, "API_INTEGRITY_CHECK", false),
             .v2_event_buffer = env_mod.getEnvBool(&env_map, "V2_EVENT_BUFFER", true),
             .name_prefetch = env_mod.getEnvBool(&env_map, "NAME_PREFETCH", true),
+            .mcp_enabled = env_mod.getEnvBool(&env_map, "MCP_ENABLED", false),
             .rate_limit_per_second = env_mod.getEnvInt(&env_map, u32, "RATE_LIMIT_PER_SECOND", 15),
             .rpc_max_batch_requests = env_mod.getEnvInt(&env_map, u32, "RPC_MAX_BATCH_REQUESTS", 0),
             .trusted_proxy_hops = env_mod.getEnvInt(&env_map, u32, "TRUSTED_PROXY_HOPS", 0),

@@ -541,6 +541,12 @@ def main() -> None:
     with open(sys.argv[1]) as f:
         schema_text = f.read()
 
+    # Mirror the SDL next to the generated introspection so src/api/mcp.zig can
+    # @embedFile it (embedFile cannot reach outside the module directory).
+    sdl_copy = os.path.join(os.path.dirname(os.path.abspath(sys.argv[2])), "schema.graphql")
+    with open(sdl_copy, "w") as f:
+        f.write(schema_text)
+
     introspection = parse_graphql_schema(schema_text)
 
     # Defensive write: some filesystems (e.g. virtiofs mounts) can intermittently corrupt large

@@ -106,6 +106,7 @@ pub fn main(init: std.process.Init) !void {
     const webhook_path: ?[]const u8 = if (cfg.webhooks_enabled) cfg.webhook_db_path else null;
     var server = try api.Server.init(allocator, io, &db_pool, webhook_path, cfg.api_port, cfg.graphql_max_depth, cfg.graphql_max_cost, cfg.metrics_enabled, cfg.rate_limit_per_second, cfg.webhook_admin_username, cfg.webhook_admin_password, cfg.trusted_proxy_hops, cfg.request_timeout_ms, cfg.max_concurrent_connections, cfg.internal_admin_token, cfg.internal_rate_limit_per_second, cfg.webhooks_allow_unauthenticated);
     defer server.deinit();
+    server.mcp_enabled = cfg.mcp_enabled;
 
     // Opt-in on-chain resolution (default off). Covers primary-name verification (05)
     // and/or live Universal Resolver record fallback (06); either flag creates the shared

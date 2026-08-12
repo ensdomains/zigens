@@ -6,6 +6,7 @@ zig-pkg/
 # Generated from schema.graphql by tools/generate_introspection.py on every
 # `zig build` (see build.zig — api_exe.step.dependOn(&generate_schema.step)).
 src/api/introspection.json
+src/api/schema.graphql
 
 # Database
 *.db

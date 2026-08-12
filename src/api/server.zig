@@ -53,6 +53,7 @@ const http_util = @import("http_util.zig");
 const api_responses = @import("api_responses.zig");
 const webhook_handlers = @import("webhook_handlers.zig");
 const api_endpoints = @import("api_endpoints.zig");
+const mcp_mod = @import("mcp.zig");
 const resolveClientAddress = http_util.resolveClientAddress;
 const acceptsResponseJson = http_util.acceptsResponseJson;
 const graphqlContentType = http_util.graphqlContentType;
@@ -85,6 +86,9 @@ pub const Server = struct {
     /// peer. > 0 = trust X-Forwarded-For from this many hops and rate-limit on the real
     /// client IP (see handleConnection / resolveClientAddress).
     trusted_proxy_hops: u32,
+    /// MCP agent endpoint gate (MCP_ENABLED). Set by api_main after init;
+    /// default off so nothing changes unless explicitly opted in.
+    mcp_enabled: bool = false,
     /// On-chain resolution state; null unless primary-name verification is enabled
     /// via `enableResolution`. When null the server behaves exactly as before.
     resolve: ?ResolveState,
@@ -405,7 +409,16 @@ pub const Server = struct {
         }
 
         // Route request
-        if (std.mem.startsWith(u8, path, "/graphql")) {
+        if (std.mem.startsWith(u8, path, "/mcp")) {
+            // MCP agent endpoint (see docs/mcp-agent-endpoint-design.md).
+            if (!self.mcp_enabled) {
+                try self.sendNotFound(conn);
+            } else if (std.mem.eql(u8, method, "POST")) {
+                try self.handleMcp(conn, request);
+            } else {
+                try self.sendBadRequest(conn, "MCP is POST-only (stateless Streamable HTTP)");
+            }
+        } else if (std.mem.startsWith(u8, path, "/graphql")) {
             // Handle GraphQL queries (both GET and POST)
             if (std.mem.eql(u8, method, "POST")) {
                 try self.handleGraphQLQuery(conn, request);
@@ -496,6 +509,8 @@ pub const Server = struct {
     pub const handleExplain = api_endpoints.handleExplain;
     pub const handleMetrics = api_endpoints.handleMetrics;
     pub const handleGraphQLQuery = api_endpoints.handleGraphQLQuery;
+    pub const executeQuery = api_endpoints.executeQuery;
+    pub const handleMcp = mcp_mod.handleMcp;
     pub const handleGraphQLGet = api_endpoints.handleGraphQLGet;
     pub const handleGraphQLPlayground = api_endpoints.handleGraphQLPlayground;
 
