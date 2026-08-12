@@ -560,3 +560,133 @@ test "reconcileV2Reachability heals an orphan the repoint cascade never marked (
         try testing.expect(n.is_reachable); // bar (under reachable SUB_B) untouched
     }
 }
+
+test "recompute: repointing a user entry away from a shared registry must not orphan it (2026-08-12 incident)" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const ROOT = Address{ .bytes = [_]u8{0x11} ** 20 };
+    const USER_REG = Address{ .bytes = [_]u8{0x22} ** 20 };
+    const ELSEWHERE = Address{ .bytes = [_]u8{0x33} ** 20 };
+    const roots = [_]Address{ ETH_REGISTRY, ROOT };
+
+    // Deployment shape: ROOT --eth--> ETH_REGISTRY; a 2LD lives under it.
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ROOT, ONE_CANONICAL_ID, ETH_REGISTRY, 1000, 1700000000);
+    const ragnarok = try insertChildName(allocator, database, "ragnarok", "eth", ETH_REGISTRY, OWNER_1, FRESH_CANONICAL_ID);
+
+    // Incident: a user's own entry points at ROOT, then away. Mirror first,
+    // recompute after (as in the handler).
+    _ = try database.upsertRegistryEntrySubregistry(.v2, USER_REG, FRESH_CANONICAL_ID, ROOT, 2000, 1700001000);
+    const prev = try database.upsertRegistryEntrySubregistry(.v2, USER_REG, FRESH_CANONICAL_ID, ELSEWHERE, 2001, 1700001100);
+    try testing.expect(prev.eql(ROOT));
+
+    const seeds = [_]Address{ prev, ELSEWHERE };
+    const rc = try database.recomputeSubtreeReachability(allocator, .v2, &seeds, &roots, 2001, 1700001100);
+    try testing.expectEqual(@as(u64, 0), rc.names_marked_unreachable);
+
+    const row = (try database.getNameByNamehashAndProtocol(ragnarok, .v2)) orelse return error.MissingRow;
+    var row_mut = row;
+    defer row_mut.deinit(database.allocator);
+    try testing.expect(row.is_reachable);
+}
+
+test "recompute: genuinely orphaned subtree still goes unreachable when the last parent leaves" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const ROOT = Address{ .bytes = [_]u8{0x11} ** 20 };
+    const SHARED = Address{ .bytes = [_]u8{0x55} ** 20 };
+    const ELSEWHERE = Address{ .bytes = [_]u8{0x33} ** 20 };
+    const roots = [_]Address{ROOT};
+
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ROOT, FRESH_CANONICAL_ID, SHARED, 1001, 1700000100);
+    const child = try insertChildName(allocator, database, "kid", "shared.eth", SHARED, OWNER_1, ONE_CANONICAL_ID);
+
+    const prev = try database.upsertRegistryEntrySubregistry(.v2, ROOT, FRESH_CANONICAL_ID, ELSEWHERE, 2001, 1700001100);
+    try testing.expect(prev.eql(SHARED));
+    const seeds = [_]Address{ prev, ELSEWHERE };
+    const rc = try database.recomputeSubtreeReachability(allocator, .v2, &seeds, &roots, 2001, 1700001100);
+    try testing.expect(rc.names_marked_unreachable >= 1);
+
+    const row = (try database.getNameByNamehashAndProtocol(child, .v2)) orelse return error.MissingRow;
+    var row_mut = row;
+    defer row_mut.deinit(database.allocator);
+    try testing.expect(!row.is_reachable);
+}
+
+test "recompute: a DESCENDANT with an outside parent survives its ancestor subtree being orphaned" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const ROOT = Address{ .bytes = [_]u8{0x11} ** 20 };
+    const MID = Address{ .bytes = [_]u8{0x66} ** 20 };
+    const DEEP = Address{ .bytes = [_]u8{0x77} ** 20 };
+    const ELSEWHERE = Address{ .bytes = [_]u8{0x33} ** 20 };
+    const roots = [_]Address{ROOT};
+
+    // ROOT --m--> MID --d--> DEEP, and ALSO ROOT --d2--> DEEP (outside parent).
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ROOT, FRESH_CANONICAL_ID, MID, 1000, 1700000000);
+    const D_ID: u256 = 0x4444444444444444444444444444444444444444444444444444444444_000000;
+    _ = try database.upsertRegistryEntrySubregistry(.v2, MID, D_ID, DEEP, 1001, 1700000100);
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ROOT, ONE_CANONICAL_ID, DEEP, 1002, 1700000200);
+    const mid_name = try insertChildName(allocator, database, "mid", "eth", MID, OWNER_1, FRESH_CANONICAL_ID);
+    const deep_name = try insertChildName(allocator, database, "deep", "mid.eth", DEEP, OWNER_1, D_ID);
+
+    // MID's only parent leaves: MID's subtree is orphaned — but DEEP is not,
+    // it keeps its outside parent. A blanket cascade over subtree(MID) would
+    // wrongly take DEEP down; the per-node recompute must not.
+    const prev = try database.upsertRegistryEntrySubregistry(.v2, ROOT, FRESH_CANONICAL_ID, ELSEWHERE, 2000, 1700001000);
+    try testing.expect(prev.eql(MID));
+    const seeds = [_]Address{ prev, ELSEWHERE };
+    _ = try database.recomputeSubtreeReachability(allocator, .v2, &seeds, &roots, 2000, 1700001000);
+
+    const mid_row = (try database.getNameByNamehashAndProtocol(mid_name, .v2)) orelse return error.MissingRow;
+    var mid_mut = mid_row;
+    defer mid_mut.deinit(database.allocator);
+    try testing.expect(!mid_row.is_reachable);
+
+    const deep_row = (try database.getNameByNamehashAndProtocol(deep_name, .v2)) orelse return error.MissingRow;
+    var deep_mut = deep_row;
+    defer deep_mut.deinit(database.allocator);
+    try testing.expect(deep_row.is_reachable);
+}
+
+test "recompute: re-link through an ORPHANED parent must not resurrect the target subtree" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const ROOT = Address{ .bytes = [_]u8{0x11} ** 20 };
+    const ORPHAN = Address{ .bytes = [_]u8{0x88} ** 20 };
+    const TARGET = Address{ .bytes = [_]u8{0x99} ** 20 };
+    const roots = [_]Address{ROOT};
+
+    // TARGET starts orphaned (no path to ROOT); its name is unreachable.
+    const t_name = try insertChildName(allocator, database, "target", "eth", TARGET, OWNER_1, ONE_CANONICAL_ID);
+    _ = try database.setRegistriesReachability(.v2, &[_]Address{TARGET}, false, 1000, 1700000000);
+
+    // An ORPHANED registry (also no path to ROOT) points an entry at TARGET.
+    // The old blanket re-link cascade would mark subtree(TARGET) reachable;
+    // the per-node recompute must see there is still no path to a root.
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ORPHAN, FRESH_CANONICAL_ID, TARGET, 2000, 1700001000);
+    const seeds = [_]Address{TARGET};
+    const rc = try database.recomputeSubtreeReachability(allocator, .v2, &seeds, &roots, 2000, 1700001000);
+    try testing.expectEqual(@as(u64, 0), rc.names_marked_reachable);
+
+    const row = (try database.getNameByNamehashAndProtocol(t_name, .v2)) orelse return error.MissingRow;
+    var row_mut = row;
+    defer row_mut.deinit(database.allocator);
+    try testing.expect(!row.is_reachable);
+
+    // …and a re-link from ROOT genuinely resurrects it.
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ROOT, ONE_CANONICAL_ID, TARGET, 3000, 1700002000);
+    const rc2 = try database.recomputeSubtreeReachability(allocator, .v2, &seeds, &roots, 3000, 1700002000);
+    try testing.expect(rc2.names_marked_reachable >= 1);
+    const row2 = (try database.getNameByNamehashAndProtocol(t_name, .v2)) orelse return error.MissingRow;
+    var row2_mut = row2;
+    defer row2_mut.deinit(database.allocator);
+    try testing.expect(row2.is_reachable);
+}

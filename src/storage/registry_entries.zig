@@ -218,6 +218,91 @@ pub fn getSubregistry(
 /// entry for label `foo` points at C, then `collectSubtreeRooted(A)` returns
 /// `[A, B, C]`. This is the set of `names.registry` values that were sourced
 /// through A's subtree.
+pub const ReachabilityRecompute = struct {
+    /// Names flipped unreachable→reachable / reachable→unreachable.
+    names_marked_reachable: u64,
+    names_marked_unreachable: u64,
+    /// Registries whose reachability was evaluated (the affected region).
+    registries_checked: usize,
+};
+
+/// Recompute `is_reachable` PER REGISTRY over the region affected by a
+/// subregistry edge change: the union of the subtrees under every seed
+/// (typically the previous and the new pointer targets). Each registry gets
+/// the definition evaluated directly — `isRegistryReachable` root-walks the
+/// live mirror — rather than a blanket subtree cascade.
+///
+/// Why per-node and not a cascade: the registry graph permits MULTI-PARENT
+/// edges (nothing stops a user pointing their own entry at a shared registry
+/// — even the root itself; 2026-08-12 staging incident), and any blanket
+/// true/false over a subtree is wrong somewhere in that graph: a repoint-away
+/// cascade takes down descendants that other parents still reach (at ANY
+/// depth, not just the subtree root), and an unconditional re-link cascade
+/// resurrects a subtree through a parent that is itself orphaned. Evaluating
+/// the definition per node is exact for every ordering and every shape, and
+/// matches the insert chokepoint (persistence.insertName) and the replay
+/// sweep, which already evaluate per node.
+///
+/// Call with the live mirror ALREADY updated for the triggering change, so
+/// the walks see post-change edges. Fail-safe: a registry whose probe errors
+/// keeps its current state (skipped) — stale state heals on a later event or
+/// `--backfill`, while a wrong write is the incident class.
+pub fn recomputeSubtreeReachability(
+    db: *Database,
+    allocator: std.mem.Allocator,
+    protocol: models.Protocol,
+    seeds: []const Address,
+    roots: []const Address,
+    block_number: u64,
+    block_timestamp: i64,
+) !ReachabilityRecompute {
+    var region = std.AutoHashMap(Address, void).init(allocator);
+    defer region.deinit();
+    var ordered: std.ArrayList(Address) = .empty;
+    defer ordered.deinit(allocator);
+    for (seeds) |seed| {
+        if (seed.isZero()) continue;
+        const subtree = try collectSubtreeRooted(db, allocator, protocol, seed);
+        defer allocator.free(subtree);
+        for (subtree) |r| {
+            const gop = try region.getOrPut(r);
+            if (gop.found_existing) continue;
+            try ordered.append(allocator, r);
+        }
+    }
+
+    var to_reachable: std.ArrayList(Address) = .empty;
+    defer to_reachable.deinit(allocator);
+    var to_unreachable: std.ArrayList(Address) = .empty;
+    defer to_unreachable.deinit(allocator);
+    for (ordered.items) |r| {
+        const reachable = isRegistryReachable(db, allocator, protocol, r, roots) catch |err| {
+            std.log.warn("reachability probe failed for {any}: {} — keeping its current state (fail-safe)", .{ r, err });
+            continue;
+        };
+        if (reachable) {
+            try to_reachable.append(allocator, r);
+        } else {
+            try to_unreachable.append(allocator, r);
+        }
+    }
+
+    // setRegistriesReachability only touches rows currently in the OPPOSITE
+    // state, so both directions are idempotent and capture-minimal.
+    var result = ReachabilityRecompute{
+        .names_marked_reachable = 0,
+        .names_marked_unreachable = 0,
+        .registries_checked = ordered.items.len,
+    };
+    if (to_reachable.items.len > 0) {
+        result.names_marked_reachable = try setRegistriesReachability(db, protocol, to_reachable.items, true, block_number, block_timestamp);
+    }
+    if (to_unreachable.items.len > 0) {
+        result.names_marked_unreachable = try setRegistriesReachability(db, protocol, to_unreachable.items, false, block_number, block_timestamp);
+    }
+    return result;
+}
+
 pub fn collectSubtreeRooted(
     db: *Database,
     allocator: std.mem.Allocator,
