@@ -150,6 +150,7 @@ test "tools/list advertises both tools with the primer" {
     defer allocator.free(resp);
     try expectContains(resp, "\"graphql-query\"");
     try expectContains(resp, "\"get-graphql-schema\"");
+    try expectContains(resp, "\"resolve-name\"");
     try expectContains(resp, "ENTRY POINTS");
     try expectContains(resp, "inputSchema");
 }
@@ -256,4 +257,45 @@ test "resources: list and read examples + coverage" {
     )) orelse return error.ExpectedResponse;
     defer allocator.free(bad);
     try expectContains(bad, "-32602");
+}
+
+test "resolve-name resolves a seeded name and composes text aliases" {
+    const allocator = testing.allocator;
+    const fx = try Fixture.init(allocator);
+    defer fx.deinit(allocator);
+
+    const resp = (try call(fx, allocator,
+        \\{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"resolve-name","arguments":{"name":"solo.eth","texts":["avatar","com.twitter"]}}}
+    )) orelse return error.ExpectedResponse;
+    defer allocator.free(resp);
+    try expectContains(resp, "solo.eth");
+    try expectContains(resp, "\"isError\":false");
+}
+
+test "resolve-name rejects injection and bad arguments" {
+    const allocator = testing.allocator;
+    const fx = try Fixture.init(allocator);
+    defer fx.deinit(allocator);
+
+    // Quote/backslash in the name must be escaped into the composed query —
+    // the lookup just misses; it can never re-shape the document.
+    const inj = (try call(fx, allocator,
+        \\{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"resolve-name","arguments":{"name":"evil\") { registrations { name } } #.eth"}}}
+    )) orelse return error.ExpectedResponse;
+    defer allocator.free(inj);
+    try expectContains(inj, "\"isError\":false");
+    try expectContains(inj, "\\\"domain\\\":null");
+    try testing.expect(std.mem.indexOf(u8, inj, "registrations") == null);
+
+    const missing = (try call(fx, allocator,
+        \\{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"resolve-name","arguments":{}}}
+    )) orelse return error.ExpectedResponse;
+    defer allocator.free(missing);
+    try expectContains(missing, "\"isError\":true");
+
+    const bad_texts = (try call(fx, allocator,
+        \\{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"resolve-name","arguments":{"name":"solo.eth","texts":"avatar"}}}
+    )) orelse return error.ExpectedResponse;
+    defer allocator.free(bad_texts);
+    try expectContains(bad_texts, "\"isError\":true");
 }

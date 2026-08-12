@@ -33,8 +33,7 @@ pub const Executor = struct {
 const GRAPHQL_QUERY_PRIMER =
     "Query the ENSv2 indexer with GraphQL. Read-only. " ++
     "ENTRY POINTS: domains(where, first, skip, orderBy, orderDirection) lists/filters domains; " ++
-    "domain(id) fetches one domain by name or namehash (domain(id:\"alice.eth\") works); " ++
-    "resolveDomain(id) fetches one domain WITH live on-chain resolution; " ++
+    "domain(id) fetches one domain by name or namehash (domain(id:\"alice.eth\") works; single-domain lookups include live on-chain resolution when the deployment enables it); " ++
     "registrations(...) is registration history (orderBy: registrationDate | expiryDate | name); " ++
     "accounts(...) / account(id: \"0x…address\") are owners and their domains; " ++
     "events(...) are raw indexed events; _finality / _coverage report the indexing head, safe/finalized blocks, and staleness. " ++
@@ -56,6 +55,13 @@ const GET_SCHEMA_DESCRIPTION =
 /// Known-good queries, mirrored from the conformance corpus
 /// (tests/conformance/runner.zig) — they are verified against goldens on
 /// every test run, so the examples can't rot silently.
+const RESOLVE_NAME_DESCRIPTION =
+    "Resolve one ENS name: current address, resolver, and requested text records, " ++
+    "via the single-name resolution path (ENSIP-10 inheritance; live on-chain fallback " ++
+    "when the deployment enables it). Prefer this over hand-written queries for " ++
+    "\"what does X resolve to\". Requested text records come back as fields t0..tN " ++
+    "in the order given. Returns the standard GraphQL response for the composed lookup.";
+
 const EXAMPLES_MARKDOWN =
     \\# ENSv2 GraphQL examples (verified against the conformance suite)
     \\
@@ -220,6 +226,16 @@ fn handleToolsList(allocator: std.mem.Allocator, id: std.json.Value) ![]u8 {
         try t.end();
     }
 
+    {
+        var t = try tools.beginObject();
+        try t.fieldStr("name", "resolve-name", allocator);
+        try t.fieldStr("description", RESOLVE_NAME_DESCRIPTION, allocator);
+        try t.fieldRaw("inputSchema",
+            \\{"type":"object","properties":{"name":{"type":"string","description":"ENS name, e.g. alice.eth"},"texts":{"type":"array","items":{"type":"string"},"description":"Text-record keys to include, e.g. [\"avatar\",\"com.twitter\"]"}},"required":["name"]}
+        );
+        try t.end();
+    }
+
     try tools.end();
     try result.end();
     try o.end();
@@ -238,6 +254,8 @@ fn handleToolsCall(allocator: std.mem.Allocator, id: std.json.Value, params: ?st
         return try callGraphqlQuery(allocator, id, args, executor);
     } else if (std.mem.eql(u8, tool, "get-graphql-schema")) {
         return try callGetSchema(allocator, id, args);
+    } else if (std.mem.eql(u8, tool, "resolve-name")) {
+        return try callResolveName(allocator, id, args, executor);
     }
     return try rpcError(allocator, id, -32602, "unknown tool");
 }
@@ -266,6 +284,64 @@ fn callGraphqlQuery(allocator: std.mem.Allocator, id: std.json.Value, args: ?std
     // partial results (data + errors) are successes the agent should read.
     const is_error = graphqlResponseIsPureError(allocator, result_json);
     return try toolTextResult(allocator, id, result_json, is_error);
+}
+
+/// The one convenience tool: composes the curated single-name lookup over
+/// domain(id:) — the field that carries live ENSIP-10 resolution when the
+/// deployment enables it — so agents get authoritative answers without
+/// knowing the resolution model. Everything still runs through the shared
+/// GraphQL pipeline; this tool only knows WHICH query to write.
+fn callResolveName(allocator: std.mem.Allocator, id: std.json.Value, args: ?std.json.Value, executor: Executor) ![]u8 {
+    const a = args orelse return try toolError(allocator, id, "missing arguments: {\"name\":\"alice.eth\"} required");
+    if (a != .object) return try toolError(allocator, id, "arguments must be an object");
+    const name_val = a.object.get("name") orelse return try toolError(allocator, id, "missing required argument: name");
+    if (name_val != .string) return try toolError(allocator, id, "name must be a string");
+    const name = name_val.string;
+    if (name.len == 0 or name.len > 255) return try toolError(allocator, id, "name must be 1-255 characters");
+
+    var q: std.Io.Writer.Allocating = .init(allocator);
+    defer q.deinit();
+    try q.writer.writeAll("{ domain(id:\"");
+    writeGraphqlString(&q.writer, name) catch {
+        return try toolError(allocator, id, "name contains control characters");
+    };
+    try q.writer.writeAll("\"){ name protocol expiryDate resolvedAddress resolver { address addr");
+
+    if (a.object.get("texts")) |tv| {
+        if (tv != .array) return try toolError(allocator, id, "texts must be an array of record keys");
+        if (tv.array.items.len > 16) return try toolError(allocator, id, "texts: at most 16 keys per call");
+        for (tv.array.items, 0..) |item, i| {
+            if (item != .string) return try toolError(allocator, id, "texts entries must be strings");
+            const key = item.string;
+            if (key.len == 0 or key.len > 80) return try toolError(allocator, id, "texts keys must be 1-80 characters");
+            try q.writer.print(" t{d}: text(key:\"", .{i});
+            writeGraphqlString(&q.writer, key) catch {
+                return try toolError(allocator, id, "text key contains control characters");
+            };
+            try q.writer.writeAll("\")");
+        }
+    }
+    try q.writer.writeAll(" } } }");
+
+    const composed = try q.toOwnedSlice();
+    defer allocator.free(composed);
+    const result_json = executor.run(executor.ctx, allocator, composed, null) catch {
+        return try toolError(allocator, id, "resolution query failed");
+    };
+    defer allocator.free(result_json);
+    const is_error = graphqlResponseIsPureError(allocator, result_json);
+    return try toolTextResult(allocator, id, result_json, is_error);
+}
+
+/// GraphQL string-literal escaping for agent-supplied values embedded in a
+/// composed query: backslash and quote are escaped, control characters are
+/// rejected outright — the composed document can never be re-shaped by input.
+fn writeGraphqlString(w: anytype, s: []const u8) !void {
+    for (s) |c| {
+        if (c < 0x20) return error.ControlCharacter;
+        if (c == '\\' or c == '"') try w.writeByte('\\');
+        try w.writeByte(c);
+    }
 }
 
 fn graphqlResponseIsPureError(allocator: std.mem.Allocator, response: []const u8) bool {

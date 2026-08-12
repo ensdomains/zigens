@@ -107,5 +107,6 @@ resolution behave identically on both surfaces.
 |---|---|
 | `graphql-query` tool | Runs any GraphQL query; its description teaches agents the entry points, filter conventions and pitfalls, and errors carry line/column locations for self-correction |
 | `get-graphql-schema` tool | Compact type index, or one type's full SDL on demand |
+| `resolve-name` tool | One-call name resolution (address, resolver, chosen text records) over the live-capable single-name path |
 | `examples` resource | Known-good queries with intents, mirrored from the conformance suite |
 | `coverage` resource | Live indexing coverage / freshness snapshot |
