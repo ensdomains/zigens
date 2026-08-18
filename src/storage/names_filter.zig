@@ -753,6 +753,69 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
     return parseNameRows(&q, db.allocator);
 }
 
+/// Batched mirror of getAllNames for a page of owners: one windowed IN query
+/// instead of one point query per account row (the accounts-list N+1). Each
+/// owner gets EXACTLY the page getAllNames(owner, skip, limit) would return —
+/// same visibility filters, same ORDER BY created_at DESC, namehash DESC,
+/// same per-owner LIMIT/OFFSET, applied per partition via ROW_NUMBER. Rows
+/// come back grouped in partition order; the caller groups by owner.
+pub fn getNamesByOwnersPage(db: *Database, owners: []const Address, skip: u32, limit: u32, allocator: std.mem.Allocator) ![]models.Name {
+    if (owners.len == 0) return try allocator.alloc(models.Name, 0);
+
+    var out: std.ArrayList(models.Name) = .empty;
+    errdefer {
+        for (out.items) |*n| n.deinit(allocator);
+        out.deinit(allocator);
+    }
+
+    const CHUNK = 24; // tracked address binds are capped at 32 per statement
+    var off: usize = 0;
+    while (off < owners.len) : (off += CHUNK) {
+        const chunk = owners[off..@min(off + CHUNK, owners.len)];
+
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(db.allocator);
+        try sql.appendSlice(db.allocator,
+            \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, protocol,
+            \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated,
+            \\       created_at, registered_at, created_block, updated_at, updated_block,
+            \\       is_reachable, unreachable_since, ttl, is_legacy, is_normalized, is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash
+            \\FROM (
+            \\  SELECT names.*, ROW_NUMBER() OVER (PARTITION BY owner ORDER BY created_at DESC, namehash DESC) AS rn
+            \\  FROM names
+            \\  WHERE is_reachable = 1 AND is_normalized = 1
+            \\    AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000'
+            \\    AND NOT (names.protocol = 'v1' AND EXISTS (SELECT 1 FROM names v2twin WHERE v2twin.namehash = names.namehash AND v2twin.protocol = 'v2'))
+            \\    AND owner IN (
+        );
+        for (chunk, 0..) |_, i| {
+            if (i > 0) try sql.appendSlice(db.allocator, ", ");
+            try sql.append(db.allocator, '?');
+        }
+        try sql.appendSlice(db.allocator, ")\n) sub WHERE rn > ? AND rn <= ?");
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        for (chunk) |o| try q.bindAddress(o);
+        try q.bindInt(@intCast(skip));
+        try q.bindInt(@intCast(skip + limit));
+
+        const rows = try parseNameRows(&q, allocator);
+        defer allocator.free(rows);
+        // Reserve BEFORE moving rows in: a mid-loop append failure would leak
+        // the not-yet-moved tail (owned rows in a freed slice).
+        out.ensureUnusedCapacity(allocator, rows.len) catch |err| {
+            for (rows) |row| {
+                var mut = row;
+                mut.deinit(allocator);
+            }
+            return err;
+        };
+        for (rows) |row| out.appendAssumeCapacity(row);
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
 // ============================================================================
 // AGGREGATION OPERATIONS
 // ============================================================================

@@ -594,6 +594,36 @@ fn accountDomainsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx
 
     const page = try api_common.parsePagination(field, 10);
 
+    // Page-batched rows first (the accounts list primes one windowed query
+    // for the whole page — see resolveAccounts); absent or arg-mismatched →
+    // the original per-account point query.
+    if (nested_ctx.loaders) |lp| {
+        const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+        var owner_buf: [42]u8 = undefined;
+        const owner_hex = addr.toHexBuf(&owner_buf);
+        if (lc.lookupAccountDomains(owner_hex, page.skip, page.first)) |batched| {
+            var json: std.Io.Writer.Allocating = .init(nested_ctx.allocator);
+            errdefer json.deinit();
+            var arr = try jw.arrayOn(&json.writer);
+            for (batched) |*domain| {
+                // By-value copy against mid-serialization rehash; strings stay
+                // loader-owned (same discipline as the namehash domain map).
+                const row_copy = domain.*;
+                const domain_json = try buildDomainJson(&row_copy, field.selections, .{
+                    .database = database,
+                    .depth = nested_ctx.depth + 1,
+                    .allocator = nested_ctx.allocator,
+                    .loaders = nested_ctx.loaders,
+                    .resolve = null, // list rows: indexed-only; live resolution is single-name (never per-row)
+                });
+                defer nested_ctx.allocator.free(domain_json);
+                try arr.itemRaw(domain_json);
+            }
+            try arr.end();
+            return try json.toOwnedSlice();
+        }
+    }
+
     const domains = try database.getAllNames(addr.*, page.skip, page.first);
     defer {
         for (domains) |*domain| {

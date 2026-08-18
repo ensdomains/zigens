@@ -443,6 +443,46 @@ pub fn prefetchDomainsForEventPage(database: *db.Database, allocator: std.mem.Al
     prefetchResolverRecords(database, allocator, loaders_ptr, page_rows.items, domain_sel.selections);
 }
 
+/// Page-level prefetch for accounts lists: one windowed query loads every
+/// account's nested `domains` page into the request loader, then the shared
+/// resolver-record/text prefetch primes those domains' nested reads. The
+/// per-account handler serves it all from memory; absent entries fall back
+/// to the original point queries. Best-effort throughout.
+pub fn prefetchDomainsForAccountsPage(database: *db.Database, allocator: std.mem.Allocator, loaders_ptr: ?*anyopaque, accounts: []const db.Account, account_selections: []const parser.Field) void {
+    const lp = loaders_ptr orelse return;
+    const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+
+    const domains_sel: *const parser.Field = blk: {
+        for (account_selections) |*sel| {
+            if (std.mem.eql(u8, sel.name, "domains")) break :blk sel;
+        }
+        return;
+    };
+    const page = common.parsePagination(domains_sel, 10) catch return;
+
+    var owners: std.ArrayList(Address) = .empty;
+    defer owners.deinit(allocator);
+    for (accounts) |acct| {
+        const addr = Address.fromHex(acct.address) catch continue;
+        owners.append(allocator, addr) catch return;
+    }
+    if (owners.items.len == 0) return;
+    lc.populateAccountDomains(database, owners.items, page.skip, page.first);
+
+    // Prime the domains' nested resolver records/texts from the batched rows
+    // (shallow copies; strings stay loader-owned).
+    var page_rows: std.ArrayList(models.Name) = .empty;
+    defer page_rows.deinit(allocator);
+    for (owners.items) |owner| {
+        var owner_buf: [42]u8 = undefined;
+        const owner_hex = owner.toHexBuf(&owner_buf);
+        const batched = lc.lookupAccountDomains(owner_hex, page.skip, page.first) orelse continue;
+        for (batched) |row| page_rows.append(allocator, row) catch return;
+    }
+    if (page_rows.items.len == 0) return;
+    prefetchResolverRecords(database, allocator, loaders_ptr, page_rows.items, domains_sel.selections);
+}
+
 pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
     const allocator = ctx.allocator;
