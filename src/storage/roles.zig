@@ -7,6 +7,7 @@ const Query = db_module.Query;
 const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
+const names_common = @import("names_common.zig");
 
 // ============================================================================
 // EAC ROLE OPERATIONS
@@ -148,6 +149,33 @@ pub fn getRolesByAccount(db: *Database, protocol: models.Protocol, account: Addr
     return getRolesFiltered(db, protocol, .{ .account = account });
 }
 
+/// The two hex spellings a resource value can wear: chain events (and thus
+/// eac_roles storage, and names.canonical_id) carry 64-char zero-padded hex,
+/// while the API serializes Domain.tokenId zero-TRIMMED ("0x{x}"). A name
+/// whose hash starts with a zero nibble (~1/16 of names) therefore has two
+/// distinct spellings of the same value, and clients legitimately feed the
+/// trimmed one back into `roles(resource:)` — so the filter matches both
+/// (plus the verbatim input, so exotic strings keep exact-match semantics).
+/// Null when the input is not parseable hex.
+pub const ResourceForms = struct {
+    padded: [66]u8,
+    trimmed: [66]u8,
+    padded_len: usize,
+    trimmed_len: usize,
+
+    pub fn of(resource: []const u8) ?ResourceForms {
+        const body = if (std.mem.startsWith(u8, resource, "0x")) resource[2..] else resource;
+        if (body.len == 0 or body.len > 64) return null;
+        const v = std.fmt.parseInt(u256, body, 16) catch return null;
+        var out: ResourceForms = undefined;
+        const padded = std.fmt.bufPrint(&out.padded, "0x{x:0>64}", .{v}) catch return null;
+        out.padded_len = padded.len;
+        const trimmed = std.fmt.bufPrint(&out.trimmed, "0x{x}", .{v}) catch return null;
+        out.trimmed_len = trimmed.len;
+        return out;
+    }
+};
+
 pub const RoleFilters = struct {
     resource: ?[]const u8 = null,
     account: ?Address = null,
@@ -171,8 +199,11 @@ pub fn getRolesFiltered(db: *Database, protocol: models.Protocol, filters: RoleF
     @memcpy(sql_buf[sql_len .. sql_len + base.len], base);
     sql_len += base.len;
 
+    // Widened to the input's VERBATIM spelling plus both canonical hex forms
+    // when it parses (see ResourceForms); unparseable input keeps exact-match.
+    const resource_forms: ?ResourceForms = if (filters.resource) |r| ResourceForms.of(r) else null;
     if (filters.resource != null) {
-        const clause = " AND r.resource = ?";
+        const clause = if (resource_forms != null) " AND r.resource IN (?, ?, ?)" else " AND r.resource = ?";
         @memcpy(sql_buf[sql_len .. sql_len + clause.len], clause);
         sql_len += clause.len;
     }
@@ -199,7 +230,13 @@ pub fn getRolesFiltered(db: *Database, protocol: models.Protocol, filters: RoleF
     defer q.deinit();
 
     try q.bindTextStatic(protocol.toString());
-    if (filters.resource) |resource| try q.bindText(resource);
+    if (filters.resource) |resource| {
+        try q.bindText(resource);
+        if (resource_forms) |*forms| {
+            try q.bindText(forms.padded[0..forms.padded_len]);
+            try q.bindText(forms.trimmed[0..forms.trimmed_len]);
+        }
+    }
     if (filters.account) |account| try q.bindAddress(account);
     if (filters.contract_address) |contract| try q.bindAddress(contract);
 
