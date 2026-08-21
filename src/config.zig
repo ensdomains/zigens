@@ -24,6 +24,12 @@ pub const Config = struct {
     end_block: ?u64, // null means index continuously
     poll_interval: u64,
     batch_size: u64,
+    /// Fail-fast watchdog: exit(1) after this many minutes of continuous
+    /// sync-cycle failure while the network probe reports healthy, so the
+    /// container restart policy revives the process (restart is the proven
+    /// cure for process-local rot like a frozen TLS validation clock).
+    /// 0 disables. (SYNC_FAILURE_EXIT_MINUTES)
+    sync_failure_exit_minutes: u64 = 15,
     /// SQLite page-cache size (MB) during bulk sync. Plumbed to the Database so
     /// .env values work (schema.zig can't see the .env map, only process env).
     sync_cache_mb: u64 = 512,
@@ -171,6 +177,7 @@ pub const Config = struct {
             },
             .poll_interval = env_mod.getEnvInt(&env_map, u64, "POLL_INTERVAL", 12),
             .batch_size = env_mod.getEnvInt(&env_map, u64, "BATCH_SIZE", 2000),
+            .sync_failure_exit_minutes = env_mod.getEnvInt(&env_map, u64, "SYNC_FAILURE_EXIT_MINUTES", 15),
             .sync_cache_mb = env_mod.getEnvInt(&env_map, u64, "SYNC_CACHE_MB", 512),
             .api_integrity_check = env_mod.getEnvBool(&env_map, "API_INTEGRITY_CHECK", false),
             .v2_event_buffer = env_mod.getEnvBool(&env_map, "V2_EVENT_BUFFER", true),

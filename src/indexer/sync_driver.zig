@@ -30,6 +30,7 @@ const backfill_mod = @import("v1/backfill.zig");
 const WriteBuffer = @import("write_buffer.zig").WriteBuffer;
 const Rainbow = @import("../rainbow/rainbow.zig").Rainbow;
 const Indexer = @import("indexer.zig").Indexer;
+const SyncFailureWatchdog = @import("sync_watchdog.zig").SyncFailureWatchdog;
 
 /// Near the tip, block lineage is stored per-block (not just at batch boundaries) so a
 /// reorg's fork point is located exactly. A batch larger than this is stored at the
@@ -44,7 +45,12 @@ const BlockLineage = struct { number: u64, hash: Hash, parent_hash: Hash };
 /// being down for hours must stall indexing, not kill it); anything else gets a
 /// bounded pause. The cursor is unchanged, so the next iteration resumes where
 /// this one failed.
-fn handleSyncError(self: *Indexer, protocol: models.Protocol, err: anyerror) void {
+///
+/// Only the non-network branch feeds the fail-fast watchdog: cycles that keep
+/// failing while `waitForHealthy` (fresh http.Client, so immune to any rot in
+/// the indexer's long-lived one) says the endpoint is fine are exactly the
+/// process-local-state failures a restart cures.
+fn handleSyncError(self: *Indexer, watchdog: *SyncFailureWatchdog, protocol: models.Protocol, err: anyerror) void {
     switch (err) {
         error.HttpError, error.NetworkUnreachable, error.ConnectionRefused, error.ConnectionTimedOut, error.ConnectionResetByPeer, error.WriteFailed, error.BrokenPipe, error.EndOfStream, error.UnexpectedReadFailure => {
             std.log.warn("{s} network error detected: {}, waiting for connection...", .{ protocol.toString(), err });
@@ -58,6 +64,10 @@ fn handleSyncError(self: *Indexer, protocol: models.Protocol, err: anyerror) voi
         },
         else => {
             std.log.err("{s} indexing error: {}", .{ protocol.toString(), err });
+            if (watchdog.failureWindowElapsed(zsys.milliTimestamp())) {
+                std.log.err("no successful sync cycle in {d} minutes with the network reachable; exiting for a supervisor restart (SYNC_FAILURE_EXIT_MINUTES, 0 disables)", .{watchdog.exit_after_ms / std.time.ms_per_min});
+                std.process.exit(1);
+            }
             _ = shutdown.sleepInterruptible(constants.Timing.error_recovery_delay_ms * std.time.ns_per_ms);
         },
     }
@@ -107,18 +117,22 @@ pub fn start(self: *Indexer) !void {
         self.database.ensureSyncPathIndexes();
     }
 
+    var watchdog: SyncFailureWatchdog = .init(self.config.sync_failure_exit_minutes);
+
     while (!self.should_stop.load(.acquire) and !shutdown.isRequested()) {
         // Index V1 first (SQLite doesn't support concurrent writes from different threads)
         self.indexProtocol(.v1, self.v1_client) catch |err| {
-            handleSyncError(self, .v1, err);
+            handleSyncError(self, &watchdog, .v1, err);
             continue;
         };
 
         // Then index V2
         self.indexProtocol(.v2, self.v1_client) catch |err| {
-            handleSyncError(self, .v2, err);
+            handleSyncError(self, &watchdog, .v2, err);
             continue;
         };
+
+        watchdog.recordSuccess();
 
         // After first successful sync of both chains, recreate indexes and start webhook workers
         if (!self.initial_sync_complete.load(.acquire)) {
@@ -285,8 +299,11 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
         self.database.ensureSyncPathIndexes();
     }
 
+    var watchdog: SyncFailureWatchdog = .init(self.config.sync_failure_exit_minutes);
+
     while (!self.should_stop.load(.acquire) and !shutdown.isRequested()) {
         if (self.indexProtocol(protocol, client)) |_| {
+            watchdog.recordSuccess();
             // Success - after first successful sync, recreate indexes and start webhook workers
             if (!self.initial_sync_complete.load(.acquire)) {
                 // Only pay the rebuild + ANALYZE when this process dropped
@@ -372,7 +389,7 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
                 }
             }
         } else |err| {
-            handleSyncError(self, protocol, err);
+            handleSyncError(self, &watchdog, protocol, err);
             continue;
         }
 

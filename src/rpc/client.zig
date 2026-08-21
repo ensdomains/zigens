@@ -296,6 +296,24 @@ fn drainIdleHttpConnections(http_client: *std.http.Client) void {
     }
 }
 
+/// Zig 0.16's std.http.Client stamps its certificate-validation timestamp
+/// (`client.now`) on the process's FIRST https request and never refreshes it
+/// (http/Client.zig: `if (client.now != null) break :tls;`), so a long-lived
+/// process validates every TLS handshake against a clock frozen at startup.
+/// When the RPC provider rotates to a freshly issued leaf certificate whose
+/// not_before postdates that frozen clock, EVERY new handshake fails as
+/// TlsInitializationFailed until the process restarts (2026-08-20 production
+/// stall: 7-day-old indexer, ~14h outage, instant recovery on restart).
+/// Nulling `now` makes the next request rescan the CA bundle and stamp a
+/// fresh timestamp. Same ownership caveat as drainIdleHttpConnections: only
+/// the thread issuing requests on this http.Client may call it (std's own
+/// rescan path has a documented race on `now`).
+///
+/// Remove once std.http.Client refreshes `now` (or re-validates) itself.
+fn refreshTlsValidationClock(http_client: *std.http.Client) void {
+    http_client.now = null;
+}
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     rpc_url: []const u8,
@@ -454,6 +472,20 @@ pub const Client = struct {
                     drainIdleHttpConnections(self.http_client);
                     last_error = err;
                     std.log.warn("http request {} (likely stale pooled connection); evicted free pool, retrying", .{err});
+                    continue;
+                }
+                // TlsInitializationFailed on a fresh connection is the frozen
+                // validation-clock disease (see refreshTlsValidationClock) far
+                // more often than a genuinely bad peer; CertificateBundleLoadFailure
+                // is the same rescan path failing outright. Both heal by forcing
+                // a rescan + fresh timestamp, so the retry lands on a clean slate.
+                if (err == error.TlsInitializationFailed or
+                    err == error.CertificateBundleLoadFailure)
+                {
+                    refreshTlsValidationClock(self.http_client);
+                    drainIdleHttpConnections(self.http_client);
+                    last_error = err;
+                    std.log.warn("http request {}; reset frozen TLS validation clock + CA bundle, retrying", .{err});
                     continue;
                 }
                 last_error = err;
