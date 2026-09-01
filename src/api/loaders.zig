@@ -1,6 +1,7 @@
 const std = @import("std");
 const db = @import("../storage/database.zig");
 const models = @import("../types/models.zig");
+const names_filter = @import("../storage/names_filter.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
 
@@ -87,6 +88,16 @@ pub const LoaderContext = struct {
     /// can only mean absent-→-fallback, never a wrong empty list. Keys and
     /// values are arena-owned.
     text_key_lists: std.StringHashMap([]const []const u8),
+    /// Per-page batch prefetch of each account's nested `domains` page
+    /// (accounts lists resolve it per row otherwise — the N+1 behind the 36s
+    /// Grafana max). Keyed by 0x-lowercase owner hex; value = EXACTLY the
+    /// page getAllNames(owner, skip, first) returns (possibly empty). Valid
+    /// only for the (skip, first) recorded at populate time — lookups with
+    /// different args fall back. Rows are db-allocator-owned.
+    account_domains: std.StringHashMap([]models.Name),
+    account_domains_skip: u32 = 0,
+    account_domains_first: u32 = 0,
+
     /// Per-page batch prefetch of Domain rows for event-shaped parents
     /// (registrations/events lists resolving `domain { … }` per row). Key
     /// present + null = "batched, no row"; key present + row = the namehash's
@@ -107,8 +118,92 @@ pub const LoaderContext = struct {
             .texts = std.StringHashMap(?[]const u8).init(allocator),
             .text_key_lists = std.StringHashMap([]const []const u8).init(allocator),
             .domains = std.AutoHashMap(Hash, ?models.Name).init(allocator),
+            .account_domains = std.StringHashMap([]models.Name).init(allocator),
         };
         return ctx;
+    }
+
+    /// Batch-prefetch each owner's nested domains page: one windowed IN query
+    /// for the whole accounts page. Groups rows per owner and records the
+    /// page args; owners with no rows get an explicit empty entry so the
+    /// handler's absent-vs-empty distinction stays exact. Best-effort.
+    pub fn populateAccountDomains(self: *LoaderContext, database: *db.Database, owners: []const Address, skip: u32, first: u32) void {
+        if (owners.len == 0) return;
+        const rows = names_filter.getNamesByOwnersPage(database, owners, skip, first, self.db_allocator) catch return;
+        defer self.db_allocator.free(rows);
+        var consumed: usize = 0;
+        self.populateAccountDomainsInner(owners, rows, skip, first, &consumed) catch {};
+        for (rows[consumed..]) |row| {
+            var mut = row;
+            mut.deinit(self.db_allocator);
+        }
+    }
+
+    fn populateAccountDomainsInner(self: *LoaderContext, owners: []const Address, rows: []models.Name, skip: u32, first: u32, consumed: *usize) !void {
+        self.account_domains_skip = skip;
+        self.account_domains_first = first;
+
+        // Rows arrive grouped per owner (window partition order); slice them
+        // into per-owner sublists without copying the row structs twice.
+        var groups = std.StringHashMap(std.ArrayList(models.Name)).init(self.allocator);
+        defer {
+            var git = groups.iterator();
+            while (git.next()) |entry| {
+                for (entry.value_ptr.items) |*n| n.deinit(self.db_allocator);
+                entry.value_ptr.deinit(self.allocator);
+                self.allocator.free(entry.key_ptr.*);
+            }
+            groups.deinit();
+        }
+        for (rows) |row| {
+            var owner_buf: [42]u8 = undefined;
+            const owner_hex = row.owner.toHexBuf(&owner_buf);
+            const gop = try groups.getOrPut(owner_hex);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .empty;
+                // Key-dupe failure must remove the entry while the key still
+                // aliases the live stack buffer; the row stays unconsumed so
+                // the caller's tail sweep frees it.
+                gop.key_ptr.* = self.allocator.dupe(u8, owner_hex) catch |err| {
+                    _ = groups.remove(owner_hex);
+                    return err;
+                };
+            }
+            try gop.value_ptr.append(self.allocator, row);
+            // Only now does `groups` own the row — a failure above leaves it
+            // in the unconsumed tail.
+            consumed.* += 1;
+        }
+
+        // Atomic per-owner commit; every requested owner gets a complete page
+        // (possibly empty). Failure mid-commit leaves later owners absent —
+        // the handler falls back to the point query, which is always correct.
+        for (owners) |owner| {
+            var owner_buf: [42]u8 = undefined;
+            const owner_hex = owner.toHexBuf(&owner_buf);
+            if (self.account_domains.contains(owner_hex)) continue;
+            const list: []models.Name = blk: {
+                if (groups.getPtr(owner_hex)) |gl| break :blk try gl.toOwnedSlice(self.allocator);
+                break :blk try self.allocator.alloc(models.Name, 0);
+            };
+            errdefer {
+                for (list) |row| {
+                    var mut = row;
+                    mut.deinit(self.db_allocator);
+                }
+                self.allocator.free(list);
+            }
+            const key_owned = try self.allocator.dupe(u8, owner_hex);
+            errdefer self.allocator.free(key_owned);
+            try self.account_domains.put(key_owned, list);
+        }
+    }
+
+    /// Null = not batched for these args (caller point-queries); otherwise the
+    /// owner's complete page. Loader-owned; don't free or mutate.
+    pub fn lookupAccountDomains(self: *LoaderContext, owner_hex: []const u8, skip: u32, first: u32) ?[]const models.Name {
+        if (skip != self.account_domains_skip or first != self.account_domains_first) return null;
+        return self.account_domains.get(owner_hex);
     }
 
     /// Batch-prefetch Domain rows for a page of namehashes: one IN-list query
@@ -463,6 +558,18 @@ pub const LoaderContext = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.text_key_lists.deinit();
+
+        // Account-domains pages: rows db-allocator-owned, keys+slices arena-owned.
+        var adit = self.account_domains.iterator();
+        while (adit.next()) |entry| {
+            for (entry.value_ptr.*) |row| {
+                var mut = row;
+                mut.deinit(self.db_allocator);
+            }
+            self.allocator.free(entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.account_domains.deinit();
 
         // Domain rows are db-allocator-owned; keys are plain Hash values.
         var dit = self.domains.iterator();

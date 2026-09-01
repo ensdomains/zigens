@@ -341,6 +341,10 @@ test "conformance goldens" {
         // via the request loader): alice's resolver has a seeded avatar record, so
         // this golden pins real values flowing through the batch, not just nulls.
         .{ .name = "registrations_domain_resolver_texts", .query = "{ registrations(first:10, orderBy:name, orderDirection:asc){ name domain { name resolver { address avatar: text(key:\"avatar\") missing: text(key:\"com.twitter\") } } } }" },
+        // Locks the page-batched accounts→domains path (windowed per-owner
+        // query + primed resolver records) against the per-account point-query
+        // semantics it must reproduce exactly.
+        .{ .name = "accounts_domains_batched", .query = "{ accounts(orderBy: id, orderDirection: asc, first: 10){ id domains { name expiryDate resolver { address avatar: text(key:\"avatar\") } } } }" },
         // Locks the batched `texts` key-LIST field on both primed list paths
         // (domains + registrations→domain): alice = ["avatar"], others empty.
         .{ .name = "domains_resolver_texts_list", .query = "{ domains(where:{name_in:[\"alice.eth\",\"bob.eth\"]}, orderBy:name, orderDirection:asc){ name resolver { texts } } }" },
