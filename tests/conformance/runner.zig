@@ -317,6 +317,10 @@ test "conformance goldens" {
         // `contract:` scopes a shared resource to one emitting contract — the
         // unscoped op above returns rows from BOTH fixture contracts.
         .{ .name = "eac_roles_scoped", .query = "{ roles(resource: \"0x0000000000000000000000000000000000000000000000000000000000000001\", contract: \"0x7777777777777777777777777777777777777777\") { account contractAddress roleBitmap } }" },
+        // The SAME resource queried by its zero-TRIMMED spelling (what clients
+        // get back from Domain.tokenId) must return identical rows — locks the
+        // ResourceForms widening for leading-zero resources.
+        .{ .name = "eac_roles_trimmed_resource", .query = "{ roles(resource: \"0x1\") { id resource account contractAddress roleBitmap permissions blockNumber } }" },
         .{ .name = "pagination_skip", .query = "{ domains(first: 2, skip: 1, orderBy: createdAt, orderDirection: asc) { id name } }" },
         .{ .name = "domain_connection", .query = "{ domainConnection(first: 2, orderBy: createdAt, orderDirection: asc) { edges { cursor node { id name } } pageInfo { hasNextPage hasPreviousPage startCursor endCursor } } }" },
         // --- where-filter matrix (deterministic order via orderBy createdAt asc, namehash tie-break) ---

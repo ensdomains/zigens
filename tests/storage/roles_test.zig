@@ -375,3 +375,40 @@ test "equal-timestamp rows order deterministically (id tiebreak)" {
     // timestamp DESC, id DESC: the later insert (higher id) comes first.
     try testing.expect(list[0].id > list[1].id);
 }
+
+test "resource filter matches padded, trimmed, and verbatim spellings" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // A resource whose hash starts with a ZERO nibble: storage carries the
+    // 64-padded spelling (as chain events emit), the API serializes tokenId
+    // zero-trimmed — clients feed either back. Derive every form from ONE
+    // value so the fixture cannot drift.
+    const v: u256 = (@as(u256, 0x0a24) << 240) | (@as(u256, 0xff) << 32);
+    var padded_buf: [66]u8 = undefined;
+    const padded = try std.fmt.bufPrint(&padded_buf, "0x{x:0>64}", .{v});
+    var trimmed_buf: [66]u8 = undefined;
+    const trimmed = try std.fmt.bufPrint(&trimmed_buf, "0x{x}", .{v});
+    try testing.expect(padded.len != trimmed.len); // the leading-zero premise
+
+    try roles.upsertEACRole(database, .v2, padded, helpers.TEST_OWNER_1, "0x0110", 1000, helpers.randomHash(), 0, helpers.TEST_REGISTRY);
+
+    for ([_][]const u8{ padded, trimmed }) |form| {
+        const got = try roles.getRolesFiltered(database, .v2, .{ .resource = form });
+        defer {
+            for (got) |*r| {
+                var m = r.*;
+                m.deinit(allocator);
+            }
+            allocator.free(got);
+        }
+        try testing.expectEqual(@as(usize, 1), got.len);
+        try testing.expectEqualStrings(padded, got[0].resource);
+    }
+
+    // Exotic non-hex resource strings keep exact-match semantics.
+    const none = try roles.getRolesFiltered(database, .v2, .{ .resource = "not-hex!" });
+    defer allocator.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
