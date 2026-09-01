@@ -1135,21 +1135,35 @@ pub fn handleEACRolesChangedImpl(self: *Indexer, protocol: models.Protocol, log:
 
     // Store or delete role in database
     // If newRoleBitmap is 0, all roles were revoked - delete the entry
-    // Otherwise, upsert with the new bitmap
+    // Otherwise, upsert with the new bitmap.
+    // Buffered (deduped, flushed as one multi-row upsert) only while the
+    // reorg cursor is DISARMED: eac_roles is a capture-protected table, and a
+    // flush-time capture would tag every undo row with the batch's last block
+    // instead of each event's — see WriteBuffer.roles. Armed (near-tip)
+    // batches keep the direct per-event write with correct capture tagging.
+    const buffer_roles = self.write_buffer.active and !self.reorg_arm;
     if (new_role_bitmap == 0) {
-        try self.database.deleteEACRole(protocol, resource_hex, account, log.address);
+        if (buffer_roles) {
+            try self.write_buffer.setRole(protocol, resource_hex, account, null, log.block_number, log.transaction_hash, log.log_index, log.address);
+        } else {
+            try self.database.deleteEACRole(protocol, resource_hex, account, log.address);
+        }
         std.log.debug("  → Deleted EAC role (all roles revoked)", .{});
     } else {
-        try self.database.upsertEACRole(
-            protocol,
-            resource_hex,
-            account,
-            new_bitmap_hex,
-            log.block_number,
-            log.transaction_hash,
-            log.log_index,
-            log.address,
-        );
+        if (buffer_roles) {
+            try self.write_buffer.setRole(protocol, resource_hex, account, new_bitmap_hex, log.block_number, log.transaction_hash, log.log_index, log.address);
+        } else {
+            try self.database.upsertEACRole(
+                protocol,
+                resource_hex,
+                account,
+                new_bitmap_hex,
+                log.block_number,
+                log.transaction_hash,
+                log.log_index,
+                log.address,
+            );
+        }
         std.log.debug("  → Stored EAC role assignment", .{});
     }
 

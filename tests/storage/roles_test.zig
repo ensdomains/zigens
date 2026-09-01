@@ -412,3 +412,97 @@ test "resource filter matches padded, trimmed, and verbatim spellings" {
     defer allocator.free(none);
     try testing.expectEqual(@as(usize, 0), none.len);
 }
+
+test "upsertEACRolesBatch matches direct upsert semantics and preserves id on conflict" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const tx1 = helpers.randomHash();
+    try roles.upsertEACRole(database, .v2, "777001", helpers.TEST_OWNER_1, "0x01", 1000, tx1, 0, helpers.TEST_RESOLVER);
+
+    const before = try roles.getRolesByResource(database, .v2, "777001");
+    defer {
+        for (before) |*r| r.deinit(allocator);
+        allocator.free(before);
+    }
+    try testing.expectEqual(@as(usize, 1), before.len);
+    const original_id = before[0].id;
+
+    const tx2 = helpers.randomHash();
+    const rows = [_]roles.RoleUpsertRow{
+        // Conflicts with the pre-existing row: must UPDATE in place, not
+        // delete+reinsert (INSERT OR REPLACE would churn the id).
+        .{ .protocol = .v2, .resource = "777001", .account = helpers.TEST_OWNER_1, .role_bitmap = "0x07", .block_number = 2000, .tx_hash = tx2, .log_index = 3, .contract_address = helpers.TEST_RESOLVER },
+        .{ .protocol = .v2, .resource = "777001", .account = helpers.TEST_OWNER_2, .role_bitmap = "0x02", .block_number = 2000, .tx_hash = tx2, .log_index = 4, .contract_address = helpers.TEST_RESOLVER },
+        .{ .protocol = .v2, .resource = "777002", .account = helpers.TEST_OWNER_1, .role_bitmap = "0x04", .block_number = 2001, .tx_hash = tx2, .log_index = 5, .contract_address = helpers.TEST_RESOLVER },
+    };
+    try roles.upsertEACRolesBatch(database, &rows);
+
+    const after = try roles.getRolesByResource(database, .v2, "777001");
+    defer {
+        for (after) |*r| r.deinit(allocator);
+        allocator.free(after);
+    }
+    try testing.expectEqual(@as(usize, 2), after.len);
+    var conflicted_seen = false;
+    for (after) |r| {
+        if (r.account.eql(helpers.TEST_OWNER_1)) {
+            conflicted_seen = true;
+            try testing.expectEqual(original_id, r.id);
+            try testing.expectEqualStrings("0x07", r.role_bitmap);
+            try testing.expectEqual(@as(u64, 2000), r.block_number);
+            try testing.expectEqual(@as(u32, 3), r.log_index);
+        }
+    }
+    try testing.expect(conflicted_seen);
+
+    const other = try roles.getRolesByResource(database, .v2, "777002");
+    defer {
+        for (other) |*r| r.deinit(allocator);
+        allocator.free(other);
+    }
+    try testing.expectEqual(@as(usize, 1), other.len);
+    try testing.expectEqualStrings("0x04", other[0].role_bitmap);
+}
+
+test "upsertEACRolesBatch handles batches past the chunk boundary and tracked-string cap" {
+    // 120 rows crosses both the 90-row chunk split and the 32-tracked-string
+    // statement cap that a copying bind would hit (the 2026-08-21 dual-run
+    // regression: TooManyBoundParams looped the batch forever).
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const tx = helpers.randomHash();
+    var resources: [120][8]u8 = undefined;
+    var rows: [120]roles.RoleUpsertRow = undefined;
+    for (0..120) |i| {
+        _ = std.fmt.bufPrint(&resources[i], "88{d:0>4}", .{i}) catch unreachable;
+        rows[i] = .{
+            .protocol = .v2,
+            .resource = resources[i][0..6],
+            .account = helpers.TEST_OWNER_1,
+            .role_bitmap = "0x01",
+            .block_number = 3000 + i,
+            .tx_hash = tx,
+            .log_index = @intCast(i),
+            .contract_address = helpers.TEST_RESOLVER,
+        };
+    }
+    try roles.upsertEACRolesBatch(database, &rows);
+
+    const first = try roles.getRolesByResource(database, .v2, "880000");
+    defer {
+        for (first) |*r| r.deinit(allocator);
+        allocator.free(first);
+    }
+    try testing.expectEqual(@as(usize, 1), first.len);
+    const last = try roles.getRolesByResource(database, .v2, "880119");
+    defer {
+        for (last) |*r| r.deinit(allocator);
+        allocator.free(last);
+    }
+    try testing.expectEqual(@as(usize, 1), last.len);
+    try testing.expectEqual(@as(u64, 3119), last[0].block_number);
+}

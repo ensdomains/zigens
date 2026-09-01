@@ -44,6 +44,97 @@ pub fn upsertEACRole(db: *Database, protocol: models.Protocol, resource: []const
     try q.exec();
 }
 
+pub const RoleUpsertRow = struct {
+    protocol: models.Protocol,
+    resource: []const u8,
+    account: Address,
+    role_bitmap: []const u8,
+    block_number: u64,
+    tx_hash: Hash,
+    log_index: u32,
+    contract_address: Address,
+};
+
+/// Multi-row twin of `upsertEACRole` — same column list and the same explicit
+/// `ON CONFLICT ... DO UPDATE SET col = excluded.col` clause (NOT the dialect's
+/// `.replace`, which on SQLite becomes INSERT OR REPLACE and would churn `id`).
+/// End state per key is identical to issuing `upsertEACRole` once with the
+/// winning row. Rows MUST be unique on the conflict key
+/// (protocol, resource, account, contract_address): Postgres rejects a
+/// same-statement double-hit — the write buffer's keyed map guarantees this.
+/// Capture parity: `captureUpsert` is invoked per row exactly like the direct
+/// path; it no-ops unless the write-path capture fallback is active.
+///
+/// Row strings are BORROWED for the duration of the call (bound via
+/// bindTextStatic — the copying bindText caps tracked strings at 32 per
+/// statement, far below a full chunk). The write-buffer flush owns them until
+/// reset(), which outlives this call.
+pub fn upsertEACRolesBatch(db: *Database, rows: []const RoleUpsertRow) !void {
+    if (rows.len == 0) return;
+    // 9 params/row → 810 params, under the pre-3.32 SQLite
+    // SQLITE_MAX_VARIABLE_NUMBER floor of 999 (same convention as
+    // EVENT_BATCH_ROWS).
+    const ROLE_BATCH_ROWS: usize = 90;
+
+    const head =
+        \\INSERT INTO eac_roles
+        \\(protocol, resource, account, role_bitmap, block_number, transaction_hash, log_index, timestamp, contract_address)
+        \\VALUES
+    ;
+    const tail =
+        \\
+        \\ON CONFLICT(protocol, resource, account, contract_address) DO UPDATE SET
+        \\  role_bitmap = excluded.role_bitmap,
+        \\  block_number = excluded.block_number,
+        \\  transaction_hash = excluded.transaction_hash,
+        \\  log_index = excluded.log_index,
+        \\  timestamp = excluded.timestamp
+    ;
+
+    var start: usize = 0;
+    while (start < rows.len) {
+        const n = @min(ROLE_BATCH_ROWS, rows.len - start);
+        const chunk = rows[start .. start + n];
+
+        for (chunk) |row| {
+            try reorg_undo.captureUpsert(db, "eac_roles", .{ row.protocol, row.resource, row.account, row.contract_address });
+        }
+
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(db.allocator);
+        try sql.appendSlice(db.allocator, head);
+        for (0..n) |i| {
+            try sql.appendSlice(db.allocator, if (i == 0) "(?, ?, ?, ?, ?, ?, ?, ?, ?)" else ", (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        }
+        try sql.appendSlice(db.allocator, tail);
+
+        // Declared before the Query so its hex strings outlive exec (LIFO
+        // defers) — same pattern as insertEventsBatch.
+        var arena = std.heap.ArenaAllocator.init(db.allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+
+        var q = try Query.initCached(db, sql.items);
+        defer q.deinit();
+        for (chunk) |row| {
+            try q.bindTextStatic(row.protocol.toString());
+            try q.bindTextStatic(row.resource);
+            const acc_buf = try scratch.create([42]u8);
+            try q.bindTextStatic(row.account.toHexBuf(acc_buf));
+            try q.bindTextStatic(row.role_bitmap);
+            try q.bindInt64(@intCast(row.block_number));
+            const tx_buf = try scratch.create([66]u8);
+            try q.bindTextStatic(row.tx_hash.toHexBuf(tx_buf));
+            try q.bindInt(@intCast(row.log_index));
+            try q.bindInt64(@intCast(zsys.timestamp()));
+            const contract_buf = try scratch.create([42]u8);
+            try q.bindTextStatic(row.contract_address.toHexBuf(contract_buf));
+        }
+        try q.exec();
+        start += n;
+    }
+}
+
 /// Column list shared by all EAC role SELECTs. Column order is relied upon by
 /// `parseEACRoleRow`:
 ///   id(0), protocol(1), resource(2), account(3), role_bitmap(4),

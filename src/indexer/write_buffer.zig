@@ -15,6 +15,7 @@ const Address = @import("../types/address.zig").Address;
 const Database = @import("../storage/database.zig").Database;
 const names_storage = @import("../storage/names.zig");
 const events_storage = @import("../storage/events.zig");
+const roles_storage = @import("../storage/roles.zig");
 const ens_normalize = @import("../utils/ens_normalize.zig");
 
 /// Safely convert u64 expiry to i64 for SQLite storage.
@@ -35,8 +36,35 @@ pub const WriteBuffer = struct {
     /// Buffered events (append-only, no deduplication needed).
     events: std.ArrayList(models.Event),
 
+    /// Buffered EAC role assignments, keyed by the table's conflict key
+    /// (protocol, resource, account, contract) — last write wins, mirroring the
+    /// direct path's upsert semantics: the batch is a single transaction, so
+    /// only the final per-key state is ever observable, and the winning
+    /// event's metadata (block/tx/log_index) is preserved. A null bitmap is a
+    /// buffered delete (all roles revoked).
+    ///
+    /// INVARIANT (enforced at the handler routing site): roles are only
+    /// buffered while the reorg cursor is DISARMED. eac_roles is a
+    /// capture-protected table; a flush-time capture would tag every undo row
+    /// with the batch's LAST block and break mid-batch fork restoration.
+    roles: std.StringHashMap(BufferedRole),
+
     /// Whether the buffer is currently active (handlers should use buffer vs direct DB).
     active: bool,
+
+    pub const BufferedRole = struct {
+        protocol: models.Protocol,
+        /// Owned. Also embedded in the map key, but kept here so the flush
+        /// doesn't re-parse keys.
+        resource: []const u8,
+        account: Address,
+        contract_address: Address,
+        /// Owned. Null = delete (newRoleBitmap == 0).
+        role_bitmap: ?[]const u8,
+        block_number: u64,
+        tx_hash: Hash,
+        log_index: u32,
+    };
 
     pub const BufferedName = struct {
         /// True if this name was INSERT'd in this chunk (vs UPDATE to existing DB record).
@@ -70,6 +98,7 @@ pub const WriteBuffer = struct {
             .allocator = allocator,
             .names = std.AutoHashMap([32]u8, BufferedName).init(allocator),
             .events = .empty,
+            .roles = std.StringHashMap(BufferedRole).init(allocator),
             .active = false,
         };
     }
@@ -78,12 +107,14 @@ pub const WriteBuffer = struct {
         self.freeAll();
         self.names.deinit();
         self.events.deinit(self.allocator);
+        self.roles.deinit();
     }
 
     pub fn reset(self: *WriteBuffer) void {
         self.freeAll();
         self.names.clearRetainingCapacity();
         self.events.clearRetainingCapacity();
+        self.roles.clearRetainingCapacity();
     }
 
     fn freeAll(self: *WriteBuffer) void {
@@ -98,6 +129,13 @@ pub const WriteBuffer = struct {
         for (self.events.items) |*event| {
             if (event.name) |n| self.allocator.free(n);
             self.allocator.free(event.data);
+        }
+        // Free role keys and owned role strings
+        var rit = self.roles.iterator();
+        while (rit.next()) |entry| {
+            self.allocator.free(entry.value_ptr.resource);
+            if (entry.value_ptr.role_bitmap) |b| self.allocator.free(b);
+            self.allocator.free(entry.key_ptr.*);
         }
     }
 
@@ -314,6 +352,60 @@ pub const WriteBuffer = struct {
     }
 
     // ========================================================================
+    // EAC ROLE OPERATIONS
+    // ========================================================================
+
+    /// Buffer an EACRolesChanged outcome: `role_bitmap` = the new bitmap hex,
+    /// or null when all roles were revoked (a delete). Later writes to the
+    /// same (protocol, resource, account, contract) key replace earlier ones
+    /// — identical end state to the direct upsert/delete sequence within the
+    /// batch transaction. Dupes `resource`/`role_bitmap` so the caller keeps
+    /// ownership of its slices.
+    pub fn setRole(
+        self: *WriteBuffer,
+        protocol: models.Protocol,
+        resource: []const u8,
+        account: Address,
+        role_bitmap: ?[]const u8,
+        block_number: u64,
+        tx_hash: Hash,
+        log_index: u32,
+        contract_address: Address,
+    ) !void {
+        var account_buf: [42]u8 = undefined;
+        var contract_buf: [42]u8 = undefined;
+        const key = try std.fmt.allocPrint(self.allocator, "{s}|{s}|{s}|{s}", .{
+            protocol.toString(),
+            resource,
+            account.toHexBuf(&account_buf),
+            contract_address.toHexBuf(&contract_buf),
+        });
+        errdefer self.allocator.free(key);
+
+        const resource_dup = try self.allocator.dupe(u8, resource);
+        errdefer self.allocator.free(resource_dup);
+        const bitmap_dup: ?[]const u8 = if (role_bitmap) |b| try self.allocator.dupe(u8, b) else null;
+        errdefer if (bitmap_dup) |b| self.allocator.free(b);
+
+        const gop = try self.roles.getOrPut(key);
+        if (gop.found_existing) {
+            self.allocator.free(key);
+            self.allocator.free(gop.value_ptr.resource);
+            if (gop.value_ptr.role_bitmap) |b| self.allocator.free(b);
+        }
+        gop.value_ptr.* = .{
+            .protocol = protocol,
+            .resource = resource_dup,
+            .account = account,
+            .contract_address = contract_address,
+            .role_bitmap = bitmap_dup,
+            .block_number = block_number,
+            .tx_hash = tx_hash,
+            .log_index = log_index,
+        };
+    }
+
+    // ========================================================================
     // FLUSH — Write all buffered data to database
     // ========================================================================
 
@@ -411,6 +503,53 @@ pub const WriteBuffer = struct {
         }
         names_ms = zsys.milliTimestamp() - timer;
 
+        // 1b. Flush EAC roles — one deduped multi-row upsert (the map already
+        // guarantees unique conflict keys, which Postgres requires within a
+        // single INSERT ... ON CONFLICT statement) plus the rare buffered
+        // deletes. See the `roles` field invariant: this only runs with the
+        // reorg cursor disarmed, so no undo capture fires here — matching what
+        // the direct path would have captured (nothing).
+        var role_upserts: usize = 0;
+        var role_deletes: usize = 0;
+        if (self.roles.count() > 0) {
+            var upserts: std.ArrayList(roles_storage.RoleUpsertRow) = .empty;
+            defer upserts.deinit(self.allocator);
+            try upserts.ensureTotalCapacity(self.allocator, self.roles.count());
+            var role_it = self.roles.iterator();
+            while (role_it.next()) |entry| {
+                const r = entry.value_ptr;
+                if (r.role_bitmap) |bitmap| {
+                    upserts.appendAssumeCapacity(.{
+                        .protocol = r.protocol,
+                        .resource = r.resource,
+                        .account = r.account,
+                        .role_bitmap = bitmap,
+                        .block_number = r.block_number,
+                        .tx_hash = r.tx_hash,
+                        .log_index = r.log_index,
+                        .contract_address = r.contract_address,
+                    });
+                } else {
+                    try roles_storage.deleteEACRole(db, r.protocol, r.resource, r.account, r.contract_address);
+                    role_deletes += 1;
+                }
+            }
+            if (upserts.items.len > 0) {
+                // Chain order, not hash-map order: new rows get their serial
+                // ids in (block, log_index) sequence, matching what the direct
+                // per-event path would have assigned (the API tiebreaks equal
+                // timestamps on id).
+                std.mem.sort(roles_storage.RoleUpsertRow, upserts.items, {}, struct {
+                    fn lessThan(_: void, a: roles_storage.RoleUpsertRow, b: roles_storage.RoleUpsertRow) bool {
+                        if (a.block_number != b.block_number) return a.block_number < b.block_number;
+                        return a.log_index < b.log_index;
+                    }
+                }.lessThan);
+                try roles_storage.upsertEACRolesBatch(db, upserts.items);
+                role_upserts = upserts.items.len;
+            }
+        }
+
         // 2. Repair placeholder-named buffered events before they land: the
         // mid-batch placeholder→real patch (updatePlaceholderEventsByName)
         // only reaches rows already in the table, so buffered events would
@@ -470,7 +609,7 @@ pub const WriteBuffer = struct {
         const wal_after = db.walFileSize() orelse wal_before;
 
         const elapsed = zsys.milliTimestamp() - timer;
-        if (self.events.items.len > 0 or names_inserted > 0 or names_updated > 0) {
+        if (self.events.items.len > 0 or names_inserted > 0 or names_updated > 0 or role_upserts > 0 or role_deletes > 0) {
             if (names_ms > 5000) {
                 const op_labels = [8][]const u8{ "ins", "unwrap", "wrapstate", "owner", "expiry", "resolver", "fuses", "wrapexp" };
                 for (op_labels, 0..) |label, i| {
@@ -479,10 +618,12 @@ pub const WriteBuffer = struct {
                     }
                 }
             }
-            std.log.info("  Buffer flush: {d} events, {d} name inserts, {d} name updates in {d}ms (names={d}ms events={d}ms wal+={d}MB)", .{
+            std.log.info("  Buffer flush: {d} events, {d} name inserts, {d} name updates, {d} role upserts, {d} role deletes in {d}ms (names={d}ms events={d}ms wal+={d}MB)", .{
                 self.events.items.len,
                 names_inserted,
                 names_updated,
+                role_upserts,
+                role_deletes,
                 elapsed,
                 names_ms,
                 events_ms,

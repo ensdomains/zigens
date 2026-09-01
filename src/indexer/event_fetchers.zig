@@ -13,6 +13,43 @@ const Address = @import("../types/address.zig").Address;
 const Indexer = @import("indexer.zig").Indexer;
 const utils = @import("utils.zig");
 
+/// Bisect the first block at which `addr` has code — its deployment block.
+///
+/// A contract cannot emit logs before it has code, so anchoring a discovery
+/// backfill here is lossless by construction while cutting the sweep from the
+/// configured floor (START_BLOCK defaults to 0 → ~11.5M Sepolia blocks,
+/// ≥1,145 chunked getLogs per discovered contract — the 2026-08-20/21
+/// catch-up stalls of 10–20 min per discovery) down to the contract's actual
+/// lifetime: ~24 eth_getCode probes plus a handful of getLogs. Post-Cancun
+/// selfdestruct is a same-tx no-op, so code-presence is monotone over any
+/// range these V2-era contracts can occupy and the bisection is exact. (A
+/// pre-Cancun deploy→selfdestruct→redeploy at the same address could hide the
+/// first incarnation's events, but that incarnation's state died with it and
+/// predates the protocol — accepted.)
+///
+/// Returns null when the contract has no code anywhere ≤ `ceil` — there is
+/// provably nothing to scan. Any probe failure (e.g. a non-archive provider)
+/// falls back to `floor`, the pre-fix anchor: slower, never lossy. Probes go
+/// through the rate limiter like every other RPC in the sweep.
+fn findBackfillAnchor(self: *Indexer, client: *rpc.Client, addr: Address, floor: u64, ceil: u64) ?u64 {
+    if (ceil <= floor) return floor;
+    self.rate_limiter.acquire();
+    const code_at_ceil = client.hasCodeAt(addr, ceil) catch return floor;
+    if (!code_at_ceil) return null;
+    self.rate_limiter.acquire();
+    const code_at_floor = client.hasCodeAt(addr, floor) catch return floor;
+    if (code_at_floor) return floor;
+    var lo = floor; // no code
+    var hi = ceil; // has code
+    while (hi - lo > 1) {
+        const mid = lo + (hi - lo) / 2;
+        self.rate_limiter.acquire();
+        const has = client.hasCodeAt(addr, mid) catch return floor;
+        if (has) hi = mid else lo = mid;
+    }
+    return hi;
+}
+
 pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64, to_block: u64) !void {
     // Get the main registry address to exclude it
     const main_registry_addr = self.getEthRegistry(protocol);
@@ -35,7 +72,8 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
         });
         for (discovery.newly_discovered) |subreg_str| {
             const addr = Address.fromHex(subreg_str) catch continue;
-            // Anchor at start_block, NOT `registries.created_block`.
+            // Anchor at the contract's bisected deployment block, NOT
+            // `registries.created_block` and NOT `config.start_block`.
             //
             // `created_block` is the block of the first SubregistryUpdated — when the
             // parent→subregistry POINTER was created (see insertRegistry, which uses
@@ -44,22 +82,28 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
             // `initialize`d — granting roles, emitting EACRolesChanged — BEFORE the
             // parent is repointed at it, so its initialization events sit below
             // `created_block` and no backfill anchored there can ever reach them.
+            // (Observed on Sepolia: foxxx.eth's registry has created_block 11416800
+            // while its own earliest event is at 11416799.)
             //
-            // Observed on Sepolia: foxxx.eth's registry has created_block 11416800
-            // while its own earliest event is at 11416799. The registry was known to
-            // the indexer with ZERO indexed events, so its role holders never
-            // appeared in the app.
-            //
-            // The sweep is address-filtered and runs once per registry on first
-            // discovery, so the cost is one chunked getLogs range rather than the
-            // per-block scan the old comment implied. If that ever becomes material
-            // on a long mainnet range, the principled floor is the true deployment
-            // block from VerifiableFactory's ProxyDeployed (not currently indexed).
+            // `config.start_block` (default 0) reaches those init events but scans
+            // the entire chain per discovered contract — the 2026-08-20/21 catch-up
+            // stalls. findBackfillAnchor is the principled floor: lossless (no code
+            // → no events) and ~24 probes instead of ~1,145 getLogs.
             //
             // Outcomes land in the init-gap heal ledger (v2 is the authoritative
             // protocol for it): a failure here is retried by drainInitGapHeals
             // instead of becoming a permanent silent gap.
-            if (backfillSubregistryEvents(self, protocol, client, addr, self.config.start_block, backfill_to)) {
+            const anchor = findBackfillAnchor(self, client, addr, self.config.start_block, backfill_to) orelse {
+                // No code at or before backfill_to: deployed inside the current
+                // batch, so there is provably no pre-batch history to sweep.
+                if (protocol == .v2) {
+                    self.database.recordHealTargetSuccess(SUBREGISTRY_HEAL_TASK, protocol, subreg_str) catch |rec_err| {
+                        std.log.warn("Failed to record subregistry backfill for {s}: {}", .{ subreg_str, rec_err });
+                    };
+                }
+                continue;
+            };
+            if (backfillSubregistryEvents(self, protocol, client, addr, anchor, backfill_to)) {
                 if (protocol == .v2) {
                     self.database.recordHealTargetSuccess(SUBREGISTRY_HEAL_TASK, protocol, subreg_str) catch |rec_err| {
                         std.log.warn("Failed to record subregistry backfill for {s}: {}", .{ subreg_str, rec_err });
@@ -548,9 +592,9 @@ pub fn indexResolverEvents(self: *Indexer, protocol: models.Protocol, client: *r
     // Events within [from_block, to_block] are the pass's job (the resolver is
     // in the known set now), hence the window ends at from_block - 1.
     if (self.pending_resolver_backfills.items.len > 0) {
-        const backfill_from = self.config.start_block;
+        const backfill_floor = self.config.start_block;
         for (self.pending_resolver_backfills.items) |addr| {
-            if (from_block > backfill_from) {
+            if (from_block > backfill_floor) {
                 // Ledger recording mirrors the discovery site below. These
                 // resolvers never reach the newly-discovered path
                 // (registerResolverOnceIfNew pre-empts its IS NULL filter), so
@@ -558,6 +602,15 @@ pub fn indexResolverEvents(self: *Indexer, protocol: models.Protocol, client: *r
                 // until the next restart's seeding pass.
                 const hex = addr.toHex(self.allocator) catch continue;
                 defer self.allocator.free(hex);
+                // Deployment-block anchor — see the subregistry discovery site.
+                const backfill_from = findBackfillAnchor(self, client, addr, backfill_floor, from_block - 1) orelse {
+                    if (protocol == .v2) {
+                        self.database.recordHealTargetSuccess(RESOLVER_HEAL_TASK, protocol, hex) catch |rec_err| {
+                            std.log.warn("Failed to record first-sighting backfill for {s}: {}", .{ hex, rec_err });
+                        };
+                    }
+                    continue;
+                };
                 if (backfillResolverEvents(self, protocol, client, addr, backfill_from, from_block - 1)) {
                     if (protocol == .v2) {
                         self.database.recordHealTargetSuccess(RESOLVER_HEAL_TASK, protocol, hex) catch |rec_err| {
@@ -584,10 +637,8 @@ pub fn indexResolverEvents(self: *Indexer, protocol: models.Protocol, client: *r
     // When a resolver is first set on a domain, it may have already emitted events
     // (e.g. EACRolesChanged during initialize()) that we missed. Fetch those now.
     if (discovery.newly_discovered.len > 0 and from_block > 0) {
-        const backfill_from = self.config.start_block;
-        std.log.info("Backfilling {d} newly discovered resolver(s) from block {d} to {d}", .{
+        std.log.info("Backfilling {d} newly discovered resolver(s) up to block {d}", .{
             discovery.newly_discovered.len,
-            backfill_from,
             from_block - 1,
         });
         for (discovery.newly_discovered) |resolver_str| {
@@ -595,6 +646,15 @@ pub fn indexResolverEvents(self: *Indexer, protocol: models.Protocol, client: *r
             // Outcomes land in the init-gap heal ledger (v2 is the authoritative
             // protocol for it): a failure here is retried by drainInitGapHeals
             // instead of becoming a permanent silent gap.
+            // Deployment-block anchor — see the subregistry discovery site.
+            const backfill_from = findBackfillAnchor(self, client, addr, self.config.start_block, from_block - 1) orelse {
+                if (protocol == .v2) {
+                    self.database.recordHealTargetSuccess(RESOLVER_HEAL_TASK, protocol, resolver_str) catch |rec_err| {
+                        std.log.warn("Failed to record resolver backfill for {s}: {}", .{ resolver_str, rec_err });
+                    };
+                }
+                continue;
+            };
             if (backfillResolverEvents(self, protocol, client, addr, backfill_from, from_block - 1)) {
                 if (protocol == .v2) {
                     self.database.recordHealTargetSuccess(RESOLVER_HEAL_TASK, protocol, resolver_str) catch |rec_err| {
@@ -723,6 +783,7 @@ fn backfillResolverEvents(self: *Indexer, protocol: models.Protocol, client: *rp
     var skipped_ranges: usize = 0;
     var chunk_size: u64 = BACKFILL_MAX_CHUNK;
     var chunk_from = from_block;
+    var transient_failures: u8 = 0;
 
     while (chunk_from <= to_block) {
         var retry_chunk_size = chunk_size;
@@ -737,6 +798,21 @@ fn backfillResolverEvents(self: *Indexer, protocol: models.Protocol, client: *rp
                 .addresses = &[_]Address{resolver_addr},
                 .topic0_or = &event_topics,
             }) catch |err| {
+                // Only genuine response-size failures justify shrinking.
+                // Transport-class errors (stale pooled socket, TLS, timeout)
+                // already got the rpc client's 3 retries + pool drain;
+                // shrinking on them cannot help and permanently slows the rest
+                // of the sweep (2026-08-21 repro: HttpConnectionClosing halved
+                // 10k chunks to 2.5k for millions of remaining blocks). Retry
+                // same-size a few times, then hand the target back to the heal
+                // ledger.
+                if (err != error.RpcError and err != error.StreamTooLong) {
+                    transient_failures += 1;
+                    if (transient_failures > 3) return err;
+                    std.log.warn("    Backfill chunk {d}-{d} transport error ({any}); retrying same size (attempt {d}/3)", .{ chunk_from, chunk_to, err, transient_failures });
+                    self.rate_limiter.acquire();
+                    continue;
+                }
                 const new_size = retry_chunk_size / 2;
                 std.log.info("    Backfill chunk {d}-{d} too large ({any}), reducing to {d} blocks", .{ chunk_from, chunk_to, err, new_size });
                 retry_chunk_size = new_size;
@@ -745,6 +821,7 @@ fn backfillResolverEvents(self: *Indexer, protocol: models.Protocol, client: *rp
             };
 
             // Success - remember the working size for the next chunk
+            transient_failures = 0;
             chunk_size = retry_chunk_size;
             break result;
         } else {
@@ -882,7 +959,13 @@ pub fn seedInitGapHealTargets(self: *Indexer, protocol: models.Protocol) !void {
 fn sweepHealTarget(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, addr: Address, comptime backfillFn: anytype) !void {
     const to_block = (try self.database.getSyncState(protocol)) orelse 0;
     if (to_block < self.config.start_block) return;
-    try backfillFn(self, protocol, client, addr, self.config.start_block, to_block);
+    // Deployment-block anchor (see the subregistry discovery site): the
+    // "full-range" rationale above is preserved — replay still runs in order
+    // from before the contract's first possible event to the current head; a
+    // no-code result means the target has no events at all, which is a
+    // completed (empty) sweep, not a hole.
+    const anchor = findBackfillAnchor(self, client, addr, self.config.start_block, to_block) orelse return;
+    try backfillFn(self, protocol, client, addr, anchor, to_block);
 }
 
 /// True when any heal sweep is currently due — the cheap per-cycle gate that
@@ -967,6 +1050,7 @@ fn backfillSubregistryEvents(self: *Indexer, protocol: models.Protocol, client: 
     var skipped_ranges: usize = 0;
     var chunk_size: u64 = BACKFILL_MAX_CHUNK;
     var chunk_from = from_block;
+    var transient_failures: u8 = 0;
 
     while (chunk_from <= to_block) {
         var retry_chunk_size = chunk_size;
@@ -981,6 +1065,14 @@ fn backfillSubregistryEvents(self: *Indexer, protocol: models.Protocol, client: 
                 .addresses = &[_]Address{subreg_addr},
                 .topic0_or = &all_topics,
             }) catch |err| {
+                // Transport vs size classification — see backfillResolverEvents.
+                if (err != error.RpcError and err != error.StreamTooLong) {
+                    transient_failures += 1;
+                    if (transient_failures > 3) return err;
+                    std.log.warn("    Backfill chunk {d}-{d} transport error ({any}); retrying same size (attempt {d}/3)", .{ chunk_from, chunk_to, err, transient_failures });
+                    self.rate_limiter.acquire();
+                    continue;
+                }
                 const new_size = retry_chunk_size / 2;
                 std.log.info("    Backfill chunk {d}-{d} too large ({any}), reducing to {d} blocks", .{ chunk_from, chunk_to, err, new_size });
                 retry_chunk_size = new_size;
@@ -989,6 +1081,7 @@ fn backfillSubregistryEvents(self: *Indexer, protocol: models.Protocol, client: 
             };
 
             // Success - remember the working size for the next chunk
+            transient_failures = 0;
             chunk_size = retry_chunk_size;
             break result;
         } else {

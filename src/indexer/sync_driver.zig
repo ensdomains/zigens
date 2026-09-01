@@ -776,11 +776,20 @@ pub fn indexBlockRange(self: *Indexer, protocol: models.Protocol, client: *rpc.C
     // direct DB visibility — but events are append-only within a batch, so
     // buffering them turns thousands of per-event round trips into a few
     // multi-row inserts at flush. That per-statement RTT was the measured
-    // Neon bulk-sync bottleneck. Near the tip (reorg_arm) writes stay direct,
-    // exactly like V1. Known, accepted skew shared with V1 bulk: a
+    // Neon bulk-sync bottleneck. Known, accepted skew shared with V1 bulk: a
     // placeholder→real name patch during this batch misses same-batch
     // buffered events (denorm-only; see the events reorg-capture waiver).
-    const buffer_v2_events = should_index_v2 and !self.reorg_arm and self.config.v2_event_buffer;
+    //
+    // Buffered for the ENTIRE initial catch-up — including the near-tip
+    // (reorg_arm) batches the old `!reorg_arm` gate excluded: webhooks are
+    // suppressed until initial_sync_complete, so per-event notify isn't owed,
+    // and events are a deliberate reorg-capture waiver (rollback removes
+    // created-after rows by block number), so armed batches lose nothing by
+    // buffering. The 2026-08-20 restart catch-up paid ~1 Neon round trip per
+    // event (thousands per batch) for exactly these armed batches.
+    // Steady-state polls (initial_sync_complete true) stay direct so live
+    // webhook notifications keep firing per event.
+    const buffer_v2_events = should_index_v2 and !self.initial_sync_complete.load(.acquire) and self.config.v2_event_buffer;
     if (buffer_v2_events) self.write_buffer.active = true;
     errdefer if (buffer_v2_events) {
         self.write_buffer.active = false;
