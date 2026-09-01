@@ -767,6 +767,22 @@ pub const Client = struct {
         return block_num;
     }
 
+    /// True when `address` has contract code at `block_number` (eth_getCode
+    /// returns more than "0x"). Historical blocks need an archive-capable
+    /// provider; a non-archive provider errors, which callers must treat as
+    /// "unknown" and fall back conservatively.
+    pub fn hasCodeAt(self: *Client, address: Address, block_number: u64) !bool {
+        var addr_buf: [42]u8 = undefined;
+        const addr_hex = address.toHexBuf(&addr_buf);
+        var block_buf: [20]u8 = undefined;
+        const block_hex = try std.fmt.bufPrint(&block_buf, "0x{x}", .{block_number});
+        const parsed = try self.makeRpcCall("eth_getCode", .{ addr_hex, block_hex });
+        defer parsed.deinit();
+        const result = parsed.value.object.get("result") orelse return error.RpcError;
+        if (result != .string) return error.RpcError;
+        return result.string.len > 2;
+    }
+
     /// Execute a read-only contract call (`eth_call`) against `to` with `data`,
     /// evaluated at `block`. Returns the raw ABI return bytes, owned by this
     /// client's allocator (an empty return is a zero-length slice). An on-chain
