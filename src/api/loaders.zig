@@ -88,6 +88,11 @@ pub const LoaderContext = struct {
     /// can only mean absent-→-fallback, never a wrong empty list. Keys and
     /// values are arena-owned.
     text_key_lists: std.StringHashMap([]const []const u8),
+    /// `coinTypes` scalar-LIST field, keyed by "<resolver_hex>|<namehash_hex>".
+    /// Same contract and per-pair atomic commit discipline as text_key_lists:
+    /// key present = the pair's complete ascending coin-type list (possibly
+    /// empty); absent = fall back. Keys and list slices are arena-owned.
+    coin_type_lists: std.StringHashMap([]const u64),
     /// Per-page batch prefetch of each account's nested `domains` page
     /// (accounts lists resolve it per row otherwise — the N+1 behind the 36s
     /// Grafana max). Keyed by 0x-lowercase owner hex; value = EXACTLY the
@@ -117,6 +122,7 @@ pub const LoaderContext = struct {
             .contenthash = std.StringHashMap(?[]const u8).init(allocator),
             .texts = std.StringHashMap(?[]const u8).init(allocator),
             .text_key_lists = std.StringHashMap([]const []const u8).init(allocator),
+            .coin_type_lists = std.StringHashMap([]const u64).init(allocator),
             .domains = std.AutoHashMap(Hash, ?models.Name).init(allocator),
             .account_domains = std.StringHashMap([]models.Name).init(allocator),
         };
@@ -507,6 +513,81 @@ pub const LoaderContext = struct {
         return self.text_key_lists.get(ck);
     }
 
+    /// Batch-prefetch the `coinTypes` scalar-LIST field for a page of
+    /// (resolver, namehash) pairs: one IN-list DISTINCT sweep instead of one
+    /// point query per row. Same atomic per-pair commit as
+    /// populateTextKeyLists — a failure can only leave pairs absent (handler
+    /// falls back), never a wrong empty list. Best-effort.
+    pub fn populateCoinTypeLists(self: *LoaderContext, database: *db.Database, resolvers: []const Address, namehashes: []const Hash) void {
+        if (resolvers.len == 0) return;
+        const rows = database.getCoinTypesForPairs(resolvers, namehashes) catch return;
+        defer {
+            for (rows) |row| {
+                self.db_allocator.free(row.resolver);
+                self.db_allocator.free(row.namehash);
+            }
+            self.db_allocator.free(rows);
+        }
+        self.populateCoinTypeListsInner(resolvers, namehashes, rows) catch {};
+    }
+
+    fn populateCoinTypeListsInner(self: *LoaderContext, resolvers: []const Address, namehashes: []const Hash, rows: []const db.PairCoinTypeRow) !void {
+        // Group per pair in scan order: the batch query's global ORDER BY
+        // coin_type makes each pair's sublist arrive in the point query's
+        // exact ascending order.
+        var grouped = std.StringHashMap(std.ArrayList(u64)).init(self.allocator);
+        defer {
+            var git = grouped.iterator();
+            while (git.next()) |entry| {
+                entry.value_ptr.deinit(self.allocator);
+                self.allocator.free(entry.key_ptr.*);
+            }
+            grouped.deinit();
+        }
+        for (rows) |row| {
+            if (row.resolver.len + 1 + row.namehash.len != RECORD_KEY_LEN) continue;
+            var rk: [RECORD_KEY_LEN]u8 = undefined;
+            @memcpy(rk[0..row.resolver.len], row.resolver);
+            rk[row.resolver.len] = '|';
+            @memcpy(rk[row.resolver.len + 1 ..], row.namehash);
+            const gop = try grouped.getOrPut(rk[0..]);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .empty;
+                // Key-dupe failure must remove the entry NOW, while its key
+                // still aliases the live stack buffer — leaving it would hand
+                // the deinit sweep a dangling key.
+                gop.key_ptr.* = self.allocator.dupe(u8, rk[0..]) catch |err| {
+                    _ = grouped.remove(rk[0..]);
+                    return err;
+                };
+            }
+            try gop.value_ptr.append(self.allocator, row.coin_type);
+        }
+
+        // Atomic per-pair commit: every requested pair gets its COMPLETE list.
+        var kbuf: [RECORD_KEY_LEN]u8 = undefined;
+        for (resolvers, namehashes) |r, nh| {
+            const ck = writeRecordKey(&kbuf, r, nh);
+            if (self.coin_type_lists.contains(ck)) continue; // page duplicate or repeat priming — first list is already exact
+            const list: []const u64 = blk: {
+                if (grouped.getPtr(ck)) |gl| break :blk try gl.toOwnedSlice(self.allocator);
+                break :blk try self.allocator.alloc(u64, 0);
+            };
+            errdefer self.allocator.free(list);
+            const ck_owned = try self.allocator.dupe(u8, ck);
+            errdefer self.allocator.free(ck_owned);
+            try self.coin_type_lists.put(ck_owned, list);
+        }
+    }
+
+    /// Null = pair was not batched (caller point-queries); otherwise the
+    /// pair's complete ascending coin-type list (may be empty). Loader-owned.
+    pub fn lookupCoinTypes(self: *LoaderContext, resolver: Address, namehash: Hash) ?[]const u64 {
+        var kbuf: [RECORD_KEY_LEN]u8 = undefined;
+        const ck = writeRecordKey(&kbuf, resolver, namehash);
+        return self.coin_type_lists.get(ck);
+    }
+
     /// Returns the cached row for `address`, fetching from the DB on first miss.
     /// The returned pointer is owned by the LoaderContext (arena-scoped); callers
     /// must not free it.
@@ -558,6 +639,14 @@ pub const LoaderContext = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.text_key_lists.deinit();
+
+        // coinTypes lists: keys and list slices arena-owned (u64 items inline).
+        var ctit = self.coin_type_lists.iterator();
+        while (ctit.next()) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.coin_type_lists.deinit();
 
         // Account-domains pages: rows db-allocator-owned, keys+slices arena-owned.
         var adit = self.account_domains.iterator();
@@ -692,6 +781,61 @@ test "populateTextKeyLists: ordered lists, empty batched, unbatched null, repeat
     // Repeat priming keeps the first (equal) list and must not leak.
     ctx.populateTextKeyLists(&test_db, &pair_resolvers, &pair_namehashes);
     const again = ctx.lookupTextKeys(res_a, nh_a) orelse return error.ExpectedBatched;
+    try std.testing.expectEqual(@as(usize, 2), again.len);
+}
+
+test "populateCoinTypeLists: ordered lists, empty batched, unbatched null, repeat-safe" {
+    const allocator = std.testing.allocator;
+
+    var test_db = try db.Database.init(allocator, ":memory:");
+    defer test_db.deinit();
+
+    const res_a = Address{ .bytes = [_]u8{0xE1} ** 20 };
+    const res_b = Address{ .bytes = [_]u8{0xE2} ** 20 };
+    var nh_a = Hash{ .bytes = [_]u8{0} ** 32 };
+    nh_a.bytes[31] = 1;
+    var nh_b = Hash{ .bytes = [_]u8{0} ** 32 };
+    nh_b.bytes[31] = 2;
+    const tx = Hash{ .bytes = [_]u8{0xAB} ** 32 };
+
+    // Pair A: inserted out of ascending order (the batch must serve them
+    // ORDER BY coin_type, matching the point query), including an ENSIP-11
+    // L2 coin type past Int32. Same coin type under BOTH protocols = one
+    // DISTINCT entry, exactly like the point query.
+    try test_db.storeResolverAddress(nh_a, res_a, 2147483658, "0xaa", .v2, 100, tx, 1700000000);
+    try test_db.storeResolverAddress(nh_a, res_a, 60, "0xbb", .v2, 101, tx, 1700000001);
+    try test_db.storeResolverAddress(nh_a, res_a, 60, "0xcc", .v1, 102, tx, 1700000002);
+    // Same namehash under a DIFFERENT resolver: must not leak into pair A.
+    try test_db.storeResolverAddress(nh_a, res_b, 0, "0xdd", .v2, 103, tx, 1700000003);
+
+    const ctx = try LoaderContext.init(allocator, &test_db);
+    defer ctx.deinit();
+
+    const pair_resolvers = [_]Address{ res_a, res_a };
+    const pair_namehashes = [_]Hash{ nh_a, nh_b };
+    ctx.populateCoinTypeLists(&test_db, &pair_resolvers, &pair_namehashes);
+
+    const cts_a = ctx.lookupCoinTypes(res_a, nh_a) orelse return error.ExpectedBatched;
+    try std.testing.expectEqual(@as(usize, 2), cts_a.len);
+    try std.testing.expectEqual(@as(u64, 60), cts_a[0]);
+    try std.testing.expectEqual(@as(u64, 2147483658), cts_a[1]);
+
+    // Batched pair with zero records: complete empty list, not a fallback.
+    const cts_b = ctx.lookupCoinTypes(res_a, nh_b) orelse return error.ExpectedBatched;
+    try std.testing.expectEqual(@as(usize, 0), cts_b.len);
+
+    // Unbatched pair: null → handler point-queries (res_b was never primed).
+    try std.testing.expectEqual(@as(?[]const u64, null), ctx.lookupCoinTypes(res_b, nh_a));
+
+    // Batched answers must equal the point query.
+    const point = try test_db.getCoinTypes(res_a, nh_a);
+    defer test_db.allocator.free(point);
+    try std.testing.expectEqual(point.len, cts_a.len);
+    for (point, cts_a) |p, b| try std.testing.expectEqual(p, b);
+
+    // Repeat priming keeps the first (equal) list and must not leak.
+    ctx.populateCoinTypeLists(&test_db, &pair_resolvers, &pair_namehashes);
+    const again = ctx.lookupCoinTypes(res_a, nh_a) orelse return error.ExpectedBatched;
     try std.testing.expectEqual(@as(usize, 2), again.len);
 }
 

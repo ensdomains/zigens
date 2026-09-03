@@ -353,6 +353,18 @@ test "conformance goldens" {
         // (domains + registrations→domain): alice = ["avatar"], others empty.
         .{ .name = "domains_resolver_texts_list", .query = "{ domains(where:{name_in:[\"alice.eth\",\"bob.eth\"]}, orderBy:name, orderDirection:asc){ name resolver { texts } } }" },
         .{ .name = "registrations_domain_texts_list", .query = "{ registrations(first:10, orderBy:name, orderDirection:asc){ name domain { resolver { texts } } } }" },
+        // Locks the batched `coinTypes` scalar-LIST on the primed domains list
+        // (alice = ["60"]; bob has no resolver → null) against the point-query
+        // semantics it must reproduce exactly.
+        .{ .name = "domains_resolver_cointypes_list", .query = "{ domains(where:{name_in:[\"alice.eth\",\"bob.eth\"]}, orderBy:name, orderDirection:asc){ name resolver { coinTypes } } }" },
+        // Locks the page-batched events→domain path (one IN-list domains query
+        // + primed resolver records instead of a point query per event row).
+        // All four seeded events share alice's namehash, so real domain rows
+        // and record values flow through the batch, not just nulls.
+        .{ .name = "events_domain_batched", .query = "{ events(first:10, orderBy:blockNumber, orderDirection:asc){ type blockNumber domain { name resolver { texts coinTypes } } } }" },
+        // Locks the primed top-level resolvers list (addr/texts/coinTypes
+        // served from the page batch, not per-row point queries).
+        .{ .name = "resolvers_list_records", .query = "{ resolvers(first:10, orderBy:address, orderDirection:asc){ id address addr texts coinTypes } }" },
         // --- finality signalling (Task 09; _finality is additive, subgraph _meta unchanged) ---
         .{ .name = "finality", .query = "{ _finality { head { number } safe { number hash } finalized { number } isStale } }" },
         // --- coverage declaration (additive; lastSyncedAt is wall-clock so not selected) ---
