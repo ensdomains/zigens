@@ -28,6 +28,14 @@ pub const ETH_REGISTRY_EVENTS = [_]RegistryEventConfig{
     // LabelRegistered on the main ETH Registry happens during V1→V2 migration
     // (migration controllers call ETHRegistry directly, not through a subregistry)
     .{ .event_hash = abi.EventSignatures.label_registered_hash, .handler = Indexer.handleLabelRegistered, .name = "LabelRegistered" },
+    // ETHRegistry is itself a PermissionedRegistry: pre-migration reservations
+    // (LabelReserved via the batch registrar), releases and expiry changes land
+    // here directly, and indexSubregistryEvents deliberately skips the main
+    // registry, so this sweep must carry the full PermissionedRegistry set.
+    .{ .event_hash = abi.EventSignatures.label_reserved_hash, .handler = Indexer.handleLabelReserved, .name = "LabelReserved" },
+    .{ .event_hash = abi.EventSignatures.label_unregistered_hash, .handler = Indexer.handleLabelUnregistered, .name = "LabelUnregistered" },
+    .{ .event_hash = abi.EventSignatures.expiry_updated_hash, .handler = Indexer.handleExpiryUpdated, .name = "ExpiryUpdated" },
+    .{ .event_hash = abi.EventSignatures.parent_updated_hash, .handler = Indexer.handleParentUpdated, .name = "ParentUpdated" },
 };
 
 pub const ETH_REGISTRAR_EVENTS = [_]RegistryEventConfig{
@@ -91,6 +99,20 @@ pub const RESOLVER_EVENTS = [_]ResolverEventConfig{
     .{ .event_hash = abi.EventSignatures.named_text_resource_hash, .handler = Indexer.handleNamedTextResource, .name = "NamedTextResource" },
     .{ .event_hash = abi.EventSignatures.named_data_resource_hash, .handler = Indexer.handleNamedDataResource, .name = "NamedDataResource" },
     .{ .event_hash = abi.EventSignatures.named_addr_resource_hash, .handler = Indexer.handleNamedAddrResource, .name = "NamedAddrResource" },
+    .{ .event_hash = abi.EventSignatures.data_changed_hash, .handler = Indexer.handleDataChanged, .name = "DataChanged" },
+    // Record-model resolver events (contracts-v2 IRecordResolver). Topic-disjoint
+    // from the node-keyed family above, so both can be registered per address.
+    .{ .event_hash = abi.EventSignatures.resolver_created_hash, .handler = Indexer.handleResolverCreated, .name = "ResolverCreated" },
+    .{ .event_hash = abi.EventSignatures.linked_hash, .handler = Indexer.handleLinked, .name = "Linked" },
+    .{ .event_hash = abi.EventSignatures.cleared_hash, .handler = Indexer.handleCleared, .name = "Cleared" },
+    .{ .event_hash = abi.EventSignatures.address_updated_hash, .handler = Indexer.handleAddressUpdated, .name = "AddressUpdated" },
+    .{ .event_hash = abi.EventSignatures.text_updated_hash, .handler = Indexer.handleTextUpdated, .name = "TextUpdated" },
+    .{ .event_hash = abi.EventSignatures.data_updated_hash, .handler = Indexer.handleDataUpdated, .name = "DataUpdated" },
+    .{ .event_hash = abi.EventSignatures.contenthash_updated_hash, .handler = Indexer.handleContenthashUpdated, .name = "ContenthashUpdated" },
+    .{ .event_hash = abi.EventSignatures.abi_updated_hash, .handler = Indexer.handleABIUpdated, .name = "ABIUpdated" },
+    .{ .event_hash = abi.EventSignatures.interface_updated_hash, .handler = Indexer.handleInterfaceUpdated, .name = "InterfaceUpdated" },
+    .{ .event_hash = abi.EventSignatures.name_updated_hash, .handler = Indexer.handleNameUpdated, .name = "NameUpdated" },
+    .{ .event_hash = abi.EventSignatures.resource_argument_hash, .handler = Indexer.handleResourceArgument, .name = "ResourceArgument" },
 };
 
 // ========================================================================

@@ -1017,6 +1017,9 @@ pub fn replayV2RecordsCore(self: *Indexer) !void {
     try database.exec("DELETE FROM resolver_addresses WHERE protocol = 'v2'");
     try database.exec("DELETE FROM resolver_texts WHERE protocol = 'v2'");
     try database.exec("DELETE FROM resolver_contenthashes WHERE protocol = 'v2'");
+    try database.exec("DELETE FROM resolver_datas WHERE protocol = 'v2'");
+    try database.exec("DELETE FROM resolver_links WHERE protocol = 'v2'");
+    try database.exec("DELETE FROM resolver_kinds WHERE protocol = 'v2'");
 
     try database.beginTransaction();
     {
@@ -1025,7 +1028,7 @@ pub fn replayV2RecordsCore(self: *Indexer) !void {
         while (try q.step()) {
             const et = models.EventType.fromString(q.getTextSlice(V2_EVENT_TYPE) orelse continue) orelse continue;
             switch (et) {
-                .address_changed, .text_changed, .contenthash_changed => {
+                .address_changed, .text_changed, .contenthash_changed, .data_changed, .resolver_created, .linked, .cleared, .address_updated, .text_updated, .data_updated, .contenthash_updated, .abi_updated, .interface_updated, .name_updated => {
                     replayV2RecordEvent(self, &q, et) catch |err| {
                         std.log.warn("V2 record replay error event={s}: {}", .{ q.getTextSlice(V2_EVENT_TYPE) orelse "?", err });
                     };
@@ -1050,7 +1053,13 @@ fn jsonObjStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 /// handler froze the resolved node there). timestamp uses the block time (the live write-time
 /// wall clock is non-deterministic and not part of the projection's meaning).
 fn replayV2RecordEvent(self: *Indexer, q: *Query, et: models.EventType) !void {
-    const nh = (try v2Namehash(q)) orelse return;
+    // Node-keyed events need the frozen node; record-model events carry their record
+    // id in event_data instead (ResolverCreated has neither).
+    const nh_opt = try v2Namehash(q);
+    const nh = switch (et) {
+        .address_changed, .text_changed, .contenthash_changed, .data_changed => nh_opt orelse return,
+        else => nh_opt orelse Hash.zero,
+    };
     const data = q.getTextSlice(V2_DATA) orelse return;
     const block_number: u64 = @intCast(q.getInt64(V2_BLOCK_NUMBER));
     const timestamp = q.getInt64(V2_TIMESTAMP);
@@ -1085,6 +1094,100 @@ fn replayV2RecordEvent(self: *Indexer, q: *Query, et: models.EventType) !void {
                 self.database.deleteResolverText(.v2, nh, resolver, key) catch {};
             } else {
                 self.database.storeResolverText(nh, resolver, key, value, .v2, block_number, tx_hash, timestamp) catch {};
+            }
+        },
+        .data_changed => {
+            const key = jsonObjStr(obj, "key") orelse return;
+            const value = jsonObjStr(obj, "value") orelse "";
+            if (value.len <= 2) {
+                self.database.deleteResolverData(.v2, nh, resolver, key) catch {};
+            } else {
+                self.database.storeResolverData(nh, resolver, key, value, .v2, block_number, tx_hash, timestamp) catch {};
+            }
+        },
+        .resolver_created => {
+            const log_index: u32 = @intCast(q.getInt64(V2_LOG_INDEX));
+            self.database.upsertResolverKind(.v2, resolver, "record", block_number, tx_hash, log_index, timestamp) catch {};
+        },
+        // Record-model events: the record id is frozen in event_data; the row key is
+        // re-derived from it (never trusted from the events.namehash column).
+        .linked, .cleared, .address_updated, .text_updated, .data_updated, .contenthash_updated, .abi_updated, .interface_updated, .name_updated => {
+            const record_id: u64 = switch (obj.get("recordId") orelse return) {
+                .integer => |i| if (i < 0) return else @intCast(i),
+                else => return,
+            };
+            const rk = @import("../storage/resolver_records.zig").recordKey(record_id);
+            switch (et) {
+                .linked => {
+                    const node = Hash.fromHex(jsonObjStr(obj, "node") orelse return) catch return;
+                    const name = jsonObjStr(obj, "name") orelse "";
+                    const log_index: u32 = @intCast(q.getInt64(V2_LOG_INDEX));
+                    self.database.upsertResolverLink(.v2, resolver, node, record_id, name, block_number, tx_hash, log_index, timestamp) catch {};
+                },
+                .cleared => {
+                    self.database.deleteResolverAddresses(.v2, rk, resolver) catch {};
+                    self.database.deleteResolverTexts(.v2, rk, resolver) catch {};
+                    self.database.deleteResolverContentHash(.v2, rk, resolver) catch {};
+                    self.database.deleteResolverAbis(.v2, rk, resolver) catch {};
+                    self.database.deleteResolverNames(.v2, rk, resolver) catch {};
+                    self.database.deleteResolverInterfaces(.v2, rk, resolver) catch {};
+                    self.database.deleteResolverDatas(.v2, rk, resolver) catch {};
+                },
+                .address_updated => {
+                    const coin_type: u64 = switch (obj.get("coinType") orelse return) {
+                        .integer => |i| @intCast(i),
+                        else => return,
+                    };
+                    const address = jsonObjStr(obj, "address") orelse return;
+                    if (address.len <= 2) {
+                        self.database.deleteResolverAddress(.v2, rk, resolver, coin_type) catch {};
+                    } else {
+                        self.database.storeResolverAddress(rk, resolver, coin_type, address, .v2, block_number, tx_hash, timestamp) catch {};
+                    }
+                },
+                .text_updated => {
+                    const key = jsonObjStr(obj, "key") orelse return;
+                    const value = jsonObjStr(obj, "value") orelse "";
+                    if (value.len == 0) {
+                        self.database.deleteResolverText(.v2, rk, resolver, key) catch {};
+                    } else {
+                        self.database.storeResolverText(rk, resolver, key, value, .v2, block_number, tx_hash, timestamp) catch {};
+                    }
+                },
+                .data_updated => {
+                    const key = jsonObjStr(obj, "key") orelse return;
+                    const value = jsonObjStr(obj, "value") orelse "";
+                    if (value.len <= 2) {
+                        self.database.deleteResolverData(.v2, rk, resolver, key) catch {};
+                    } else {
+                        self.database.storeResolverData(rk, resolver, key, value, .v2, block_number, tx_hash, timestamp) catch {};
+                    }
+                },
+                .contenthash_updated => {
+                    const ch = jsonObjStr(obj, "contentHash") orelse return;
+                    if (ch.len <= 2) {
+                        self.database.deleteResolverContentHash(.v2, rk, resolver) catch {};
+                    } else {
+                        self.database.storeResolverContentHash(rk, resolver, ch, .v2, block_number, tx_hash, timestamp) catch {};
+                    }
+                },
+                .abi_updated => {
+                    const content_type: u64 = switch (obj.get("contentType") orelse return) {
+                        .integer => |i| @intCast(i),
+                        else => return,
+                    };
+                    self.database.storeResolverABI(rk, resolver, content_type, .v2, block_number, tx_hash, timestamp) catch {};
+                },
+                .interface_updated => {
+                    const iface = jsonObjStr(obj, "interfaceID") orelse return;
+                    const impl = jsonObjStr(obj, "implementer") orelse return;
+                    self.database.storeResolverInterface(rk, resolver, iface, impl, .v2, block_number, tx_hash, timestamp) catch {};
+                },
+                .name_updated => {
+                    const name = jsonObjStr(obj, "name") orelse return;
+                    self.database.storeResolverName(rk, resolver, name, .v2, block_number, tx_hash, timestamp) catch {};
+                },
+                else => {},
             }
         },
         else => {},
@@ -2173,4 +2276,117 @@ pub fn writeReplayStatus(self: *Indexer) !void {
     try q.bindInt64(zsys.timestamp());
     try q.exec();
     std.log.info("Replay status recorded: version {d}, completed through block {d}, {d} names", .{ REPLAY_VERSION, completed_block, names_count });
+}
+
+test "replayV2RecordsCore rebuilds record-model resolvers (links, values, default, cleared) from events" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cfg = @import("../config.zig").Config.fromEnv(allocator) catch return;
+    cfg.status_port = null;
+    cfg.webhooks_enabled = false;
+    defer cfg.deinit();
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+
+    const database = try allocator.create(db_module.Database);
+    database.* = try db_module.Database.init(allocator, ":memory:");
+    defer {
+        database.deinit();
+        allocator.destroy(database);
+    }
+    var idx = try Indexer.init(allocator, threaded.io(), cfg, database, null);
+    defer idx.deinit();
+
+    const carol = try hash_mod2.namehash(allocator, "carol.eth");
+    const erin = try hash_mod2.namehash(allocator, "erin.eth");
+    const dave = try hash_mod2.namehash(allocator, "dave.eth");
+    const resolver_hex = "0xdddddddddddddddddddddddddddddddddddddddd";
+    const resolver = try Address.fromHex(resolver_hex);
+    const record_model = @import("../storage/resolver_records.zig");
+
+    const ev = struct {
+        fn go(db: *db_module.Database, et: models.EventType, nh: ?Hash, data: []const u8, li: u32) !void {
+            try @import("../storage/events.zig").insertEvent(db, .{
+                .event_type = et,
+                .protocol = .v2,
+                .block_number = 300,
+                .tx_hash = Hash.zero,
+                .log_index = li,
+                .contract_address = Address.zero,
+                .name = null,
+                .namehash = nh,
+                .data = data,
+                .timestamp = 1000,
+            });
+        }
+    }.go;
+
+    const carol_hex = try carol.toHex(allocator);
+    const erin_hex = try erin.toHex(allocator);
+    const zero_hex = try Hash.zero.toHex(allocator);
+    // The exact event_data shapes the record handlers emit.
+    try ev(database, .resolver_created, null, try std.fmt.allocPrint(allocator, "{{\"resolver\":\"{s}\"}}", .{resolver_hex}), 0);
+    try ev(database, .linked, carol, try std.fmt.allocPrint(allocator, "{{\"resolver\":\"{s}\",\"recordId\":1,\"node\":\"{s}\",\"name\":\"carol.eth\"}}", .{ resolver_hex, carol_hex }), 1);
+    try ev(database, .text_updated, record_model.recordKey(1), try std.fmt.allocPrint(allocator, "{{\"resolver\":\"{s}\",\"recordId\":1,\"key\":\"avatar\",\"value\":\"he said \\\"hi\\\"\"}}", .{resolver_hex}), 2);
+    try ev(database, .address_updated, record_model.recordKey(1), try std.fmt.allocPrint(allocator, "{{\"resolver\":\"{s}\",\"recordId\":1,\"coinType\":60,\"address\":\"0x00000000000000000000000000000000000000ab\"}}", .{resolver_hex}), 3);
+    try ev(database, .contenthash_updated, record_model.recordKey(1), try std.fmt.allocPrint(allocator, "{{\"resolver\":\"{s}\",\"recordId\":1,\"contentHash\":\"0xe30101701220ab\"}}", .{resolver_hex}), 4);
+    try ev(database, .data_updated, record_model.recordKey(1), try std.fmt.allocPrint(allocator, "{{\"resolver\":\"{s}\",\"recordId\":1,\"key\":\"blob\",\"value\":\"0xdead\"}}", .{resolver_hex}), 5);
+    try ev(database, .name_updated, record_model.recordKey(1), try std.fmt.allocPrint(allocator, "{{\"resolver\":\"{s}\",\"recordId\":1,\"name\":\"carol.eth\"}}", .{resolver_hex}), 6);
+    try ev(database, .abi_updated, record_model.recordKey(1), try std.fmt.allocPrint(allocator, "{{\"resolver\":\"{s}\",\"recordId\":1,\"contentType\":1}}", .{resolver_hex}), 7);
+    try ev(database, .interface_updated, record_model.recordKey(1), try std.fmt.allocPrint(allocator, "{{\"resolver\":\"{s}\",\"recordId\":1,\"interfaceID\":\"0x01ffc9a7\",\"implementer\":\"0x2222222222222222222222222222222222222222\"}}", .{resolver_hex}), 8);
+    // erin shares record 1; the default record 2 gets a url; record 3 is cleared after a write.
+    try ev(database, .linked, erin, try std.fmt.allocPrint(allocator, "{{\"resolver\":\"{s}\",\"recordId\":1,\"node\":\"{s}\",\"name\":\"erin.eth\"}}", .{ resolver_hex, erin_hex }), 9);
+    try ev(database, .linked, Hash.zero, try std.fmt.allocPrint(allocator, "{{\"resolver\":\"{s}\",\"recordId\":2,\"node\":\"{s}\",\"name\":\"\"}}", .{ resolver_hex, zero_hex }), 10);
+    try ev(database, .text_updated, record_model.recordKey(2), try std.fmt.allocPrint(allocator, "{{\"resolver\":\"{s}\",\"recordId\":2,\"key\":\"url\",\"value\":\"https://default\"}}", .{resolver_hex}), 11);
+    try ev(database, .text_updated, record_model.recordKey(3), try std.fmt.allocPrint(allocator, "{{\"resolver\":\"{s}\",\"recordId\":3,\"key\":\"gone\",\"value\":\"x\"}}", .{resolver_hex}), 12);
+    try ev(database, .cleared, record_model.recordKey(3), try std.fmt.allocPrint(allocator, "{{\"resolver\":\"{s}\",\"recordId\":3}}", .{resolver_hex}), 13);
+    // A clearing write (empty value) must delete, not store.
+    try ev(database, .text_updated, record_model.recordKey(2), try std.fmt.allocPrint(allocator, "{{\"resolver\":\"{s}\",\"recordId\":2,\"key\":\"tmp\",\"value\":\"v\"}}", .{resolver_hex}), 14);
+    try ev(database, .text_updated, record_model.recordKey(2), try std.fmt.allocPrint(allocator, "{{\"resolver\":\"{s}\",\"recordId\":2,\"key\":\"tmp\",\"value\":\"\"}}", .{resolver_hex}), 15);
+
+    try replayV2RecordsCore(&idx);
+
+    const kind = (try database.getResolverKind(resolver)).?;
+    defer database.allocator.free(kind);
+    try std.testing.expectEqualStrings("record", kind);
+    // Shared record, unescaped value, through the link indirection.
+    const carol_avatar = (try database.getTextRecord(resolver, carol, "avatar")).?;
+    defer database.allocator.free(carol_avatar);
+    try std.testing.expectEqualStrings("he said \"hi\"", carol_avatar);
+    const erin_avatar = (try database.getTextRecord(resolver, erin, "avatar")).?;
+    defer database.allocator.free(erin_avatar);
+    try std.testing.expectEqualStrings("he said \"hi\"", erin_avatar);
+    const addr = (try database.getAddressRecord(resolver, erin, 60)).?;
+    defer database.allocator.free(addr);
+    try std.testing.expectEqualStrings("0x00000000000000000000000000000000000000ab", addr);
+    const ch = (try database.getContentHashRecord(resolver, carol)).?;
+    defer database.allocator.free(ch);
+    try std.testing.expectEqualStrings("0xe30101701220ab", ch);
+    const blob = (try database.getDataRecord(resolver, carol, "blob")).?;
+    defer database.allocator.free(blob);
+    try std.testing.expectEqualStrings("0xdead", blob);
+    const primary = (try database.getLatestNameByNamehash(carol)).?;
+    defer database.allocator.free(primary);
+    try std.testing.expectEqualStrings("carol.eth", primary);
+    const abis = try database.getAbiContentTypes(resolver, carol);
+    defer database.allocator.free(abis);
+    try std.testing.expectEqual(@as(usize, 1), abis.len);
+    const ifaces = try database.getInterfaceRecords(resolver, carol);
+    defer {
+        for (ifaces) |*i| i.deinit(database.allocator);
+        database.allocator.free(ifaces);
+    }
+    try std.testing.expectEqual(@as(usize, 1), ifaces.len);
+    // Default record serves unlinked names; cleared record 3 has nothing; tmp was deleted.
+    const dave_url = (try database.getTextRecord(resolver, dave, "url")).?;
+    defer database.allocator.free(dave_url);
+    try std.testing.expectEqualStrings("https://default", dave_url);
+    try std.testing.expectEqual(@as(?[]u8, null), try database.getTextRecord(resolver, dave, "tmp"));
+    var q = try Query.init(database, "SELECT COUNT(*) FROM resolver_texts WHERE key = 'gone'");
+    defer q.deinit();
+    try std.testing.expect(try q.step());
+    try std.testing.expectEqual(@as(i64, 0), q.getInt64(0));
+    try std.testing.expectEqual(@as(?u64, 1), try database.getEffectiveRecordId(resolver, erin));
+    try std.testing.expectEqual(@as(?u64, 2), try database.getEffectiveRecordId(resolver, dave));
 }

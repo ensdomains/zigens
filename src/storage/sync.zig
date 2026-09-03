@@ -39,6 +39,9 @@ pub const reorg_rollback_by_block_number = [_][]const u8{
     "resolver_named_resources",
     "registrations",
     "name_history",
+    "resolver_links",
+    "resolver_datas",
+    "resolver_kinds",
 };
 
 /// Deleted by `(protocol, created_block > N)`.

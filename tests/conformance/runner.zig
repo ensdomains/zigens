@@ -518,3 +518,99 @@ test "task06: indexed-miss addr resolves via Universal Resolver only when live i
     try testing.expect(std.mem.indexOf(u8, gated_on, "\"addr\":null") != null);
     try testing.expect(std.mem.indexOf(u8, gated_on, "0x3333333333333333333333333333333333333333") == null);
 }
+
+// ============================================================================
+// Record-model resolvers (contracts-v2 IRecordResolver) — own fixture so the
+// main goldens above stay byte-identical.
+// ============================================================================
+
+const RECORD_RESOLVER = Address{ .bytes = [_]u8{0xDD} ** 20 };
+
+/// carol.eth owns record 1; erin.eth shares it (linkToRecord); dave.eth has no
+/// link and falls through to the resolver-wide default record 2 (node 0x0).
+/// Record 1 carries avatar/url/ETH addr/contenthash/data; record 2 only a url.
+/// One ResourceArgument ("avatar") with a ROLE_SET_TEXT grant so the API can
+/// derive its kind.
+fn seedRecordResolverFixture(db: *Database, a: std.mem.Allocator) !void {
+    try db.setSyncState(.v1, 0);
+    try db.setSyncState(.v2, 12345);
+    const owner1 = helpers.TEST_OWNER_1;
+    const owner2 = helpers.TEST_OWNER_2;
+    const rec = RECORD_RESOLVER;
+    const tx = Hash{ .bytes = [_]u8{0xAA} ** 32 };
+    const record_model = lib.storage.resolver_records;
+
+    const carol = try seedName(db, a, "carol.eth", "carol", "eth", owner1, rec, 0xCA401, 2000000000, false, null);
+    const erin = try seedName(db, a, "erin.eth", "erin", "eth", owner1, rec, 0xE41, 2000000000, false, null);
+    const dave = try seedName(db, a, "dave.eth", "dave", "eth", owner2, rec, 0xDA5E, 2000000000, false, null);
+
+    var rec_hex: [42]u8 = undefined;
+    const rec_hexs = rec.toHexBuf(&rec_hex);
+    for ([_]struct { nh: Hash, name: []const u8 }{ .{ .nh = carol, .name = "carol.eth" }, .{ .nh = erin, .name = "erin.eth" }, .{ .nh = dave, .name = "dave.eth" } }) |n| {
+        var nh_buf: [66]u8 = undefined;
+        try resolvers.upsertResolverEntity(db, .v2, rec_hexs, n.nh.toHexBuf(&nh_buf), n.name, FIXED_BLOCK, FIXED_TS);
+    }
+
+    // ResolverCreated + the links the setters/linkToRecord emitted.
+    try db.upsertResolverKind(.v2, rec, "record", FIXED_BLOCK, tx, 0, FIXED_TS);
+    try db.upsertResolverLink(.v2, rec, carol, 1, "carol.eth", FIXED_BLOCK, tx, 1, FIXED_TS);
+    try db.upsertResolverLink(.v2, rec, erin, 1, "erin.eth", FIXED_BLOCK + 1, tx, 2, FIXED_TS);
+    try db.upsertResolverLink(.v2, rec, Hash.zero, 2, "", FIXED_BLOCK + 2, tx, 3, FIXED_TS);
+
+    const rk1 = record_model.recordKey(1);
+    const rk2 = record_model.recordKey(2);
+    try resolvers.storeResolverText(db, rk1, rec, "avatar", "https://records.example/carol.png", .v2, FIXED_BLOCK, tx, FIXED_TS);
+    try resolvers.storeResolverText(db, rk1, rec, "url", "https://carol.example", .v2, FIXED_BLOCK, tx, FIXED_TS);
+    try resolvers.storeResolverAddress(db, rk1, rec, 60, "0xcafe000000000000000000000000000000000001", .v2, FIXED_BLOCK, tx, FIXED_TS);
+    try resolvers.storeResolverAddress(db, rk1, rec, 0, "0x00010203", .v2, FIXED_BLOCK, tx, FIXED_TS);
+    try resolvers.storeResolverContentHash(db, rk1, rec, "0xe30101701220aa", .v2, FIXED_BLOCK, tx, FIXED_TS);
+    try db.storeResolverData(rk1, rec, "blob", "0xdeadbeef", .v2, FIXED_BLOCK, tx, FIXED_TS);
+    try resolvers.storeResolverText(db, rk2, rec, "url", "https://default.example", .v2, FIXED_BLOCK, tx, FIXED_TS);
+
+    // grantSetterRoles(setText(_, "avatar", _), owner1): ResourceArgument + EACRolesChanged(ROLE_SET_TEXT).
+    var resource: [32]u8 = undefined;
+    std.crypto.hash.sha3.Keccak256.hash("avatar", &resource, .{});
+    var resource_buf: [66]u8 = undefined;
+    const resource_hex = (Hash{ .bytes = resource }).toHexBuf(&resource_buf);
+    try db.upsertNamedResource(.v2, rec, resource_hex, "argument", "avatar", -1, "", FIXED_BLOCK, tx, 4);
+    try db.upsertEACRole(.v2, resource_hex, owner1, "0x10", FIXED_BLOCK, tx, 5, rec);
+}
+
+test "conformance goldens: record-model resolvers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const db = try helpers.createTestDatabase(a);
+    defer helpers.destroyTestDatabase(a, db);
+    try seedRecordResolverFixture(db, a);
+    var handler = try GraphQLHandler.init(a, 30, 100000, false);
+    defer handler.deinit();
+    const mode: Mode = if (zsys.hasEnv("CONFORMANCE_PRINT"))
+        .print
+    else if (zsys.hasEnv("CONFORMANCE_UPDATE"))
+        .update
+    else
+        .compare;
+
+    var carol_buf: [66]u8 = undefined;
+    const carol_hex = (try lib.namehash(a, "carol.eth")).toHexBuf(&carol_buf);
+    const carol_vars = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\"}}", .{carol_hex});
+    var rec_buf: [42]u8 = undefined;
+    const rec_hex = RECORD_RESOLVER.toHexBuf(&rec_buf);
+    const rec_vars = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\"}}", .{rec_hex});
+    const resolvers_query = try std.fmt.allocPrint(a, "{{ resolvers(where:{{address:\"{s}\"}}, orderBy:setBlock, orderDirection:asc){{ id address recordModel recordId texts coinTypes addr linkedNames {{ name recordId }} }} }}", .{rec_hex});
+
+    const ops = [_]Op{
+        // List path: the page-batched loaders must translate every pair through its
+        // record (own / shared / default) and serve identical values to the point path.
+        .{ .name = "record_resolver_domains", .query = "{ domains(where:{name_in:[\"carol.eth\",\"erin.eth\",\"dave.eth\"]}, orderBy:name, orderDirection:asc){ name resolver { address recordModel recordId texts coinTypes addr contentHash dataKeys data(key:\"blob\") avatar: text(key:\"avatar\") url: text(key:\"url\") linkedNames { name namehash recordId } } } }" },
+        // Point path for the record owner.
+        .{ .name = "record_resolver_domain_carol", .query = "query($id:String!){ domain(id:$id){ name resolver { recordId recordModel texts coinTypes addr contentHash data(key:\"blob\") linkedNames { name recordId } aliases { fromName } } } }", .vars = carol_vars },
+        // Top-level resolvers list (primed per page) over the same resolver.
+        .{ .name = "record_resolver_entities", .query = resolvers_query },
+        // ResourceArgument surfaces as one namedResources entry per granted setter kind.
+        .{ .name = "record_resolver_named_resources", .query = "query($id:String!){ resolver(id:$id){ namedResources { protocol resource recordKind recordKey coinType name } } }", .vars = rec_vars },
+    };
+    for (ops) |op| try checkOp(a, &handler, db, op, mode);
+    std.debug.print("conformance (record resolvers): all tests passed\n", .{});
+}

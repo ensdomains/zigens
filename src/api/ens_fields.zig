@@ -298,14 +298,27 @@ fn extractDataField(data: ?[]const u8, expected_type: []const u8, event_type: []
     return FieldValue{ .owned_optional_string = owned };
 }
 
+/// Event types whose payload carries a `key`/`value` pair: node-keyed text and
+/// data records, and their record-model (`*Updated`) counterparts.
+fn isKeyValueEvent(t: models.EventType) bool {
+    return switch (t) {
+        .text_changed, .text_updated, .data_changed, .data_updated => true,
+        else => false,
+    };
+}
+
 fn getEventTextKey(ctx: *anyopaque, allocator: std.mem.Allocator) !FieldValue {
     const event = getEventCtx(ctx);
-    return try extractDataField(event.data, "TextChanged", event.event_type.toString(), "key", allocator);
+    if (!isKeyValueEvent(event.event_type)) return FieldValue{ .optional_string = null };
+    const t = event.event_type.toString();
+    return try extractDataField(event.data, t, t, "key", allocator);
 }
 
 fn getEventTextValue(ctx: *anyopaque, allocator: std.mem.Allocator) !FieldValue {
     const event = getEventCtx(ctx);
-    return try extractDataField(event.data, "TextChanged", event.event_type.toString(), "value", allocator);
+    if (!isKeyValueEvent(event.event_type)) return FieldValue{ .optional_string = null };
+    const t = event.event_type.toString();
+    return try extractDataField(event.data, t, t, "value", allocator);
 }
 
 fn getEventData(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {

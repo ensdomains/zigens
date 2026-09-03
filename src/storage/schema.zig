@@ -142,6 +142,54 @@ pub fn migrate(self: *Database) !void {
         \\)
     );
 
+    // Record-model resolver tables (see storage/resolver_records.zig). Same
+    // rationale as init_gap_heal_targets: deployed DBs never re-run schema.sql,
+    // so this is their only creation path; no-ops where they already exist.
+    try self.exec(
+        \\CREATE TABLE IF NOT EXISTS resolver_links (
+        \\  protocol TEXT NOT NULL,
+        \\  resolver TEXT NOT NULL,
+        \\  namehash TEXT NOT NULL,
+        \\  record_id INTEGER NOT NULL,
+        \\  record_key TEXT NOT NULL,
+        \\  name TEXT NOT NULL DEFAULT '',
+        \\  block_number INTEGER NOT NULL,
+        \\  transaction_hash TEXT NOT NULL,
+        \\  log_index INTEGER NOT NULL,
+        \\  timestamp INTEGER NOT NULL,
+        \\  UNIQUE(protocol, resolver, namehash)
+        \\)
+    );
+    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_links_record ON resolver_links(resolver, record_id)");
+    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_links_namehash ON resolver_links(namehash)");
+    try self.exec(
+        \\CREATE TABLE IF NOT EXISTS resolver_datas (
+        \\  namehash TEXT NOT NULL,
+        \\  resolver TEXT NOT NULL,
+        \\  key TEXT NOT NULL,
+        \\  value TEXT NOT NULL,
+        \\  protocol TEXT NOT NULL,
+        \\  block_number INTEGER NOT NULL,
+        \\  transaction_hash TEXT NOT NULL,
+        \\  timestamp INTEGER NOT NULL,
+        \\  UNIQUE(protocol, resolver, namehash, key)
+        \\)
+    );
+    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_datas_namehash ON resolver_datas(namehash)");
+    try self.exec("CREATE INDEX IF NOT EXISTS idx_resolver_datas_resolver ON resolver_datas(resolver)");
+    try self.exec(
+        \\CREATE TABLE IF NOT EXISTS resolver_kinds (
+        \\  protocol TEXT NOT NULL,
+        \\  resolver TEXT NOT NULL,
+        \\  kind TEXT NOT NULL,
+        \\  block_number INTEGER NOT NULL,
+        \\  transaction_hash TEXT NOT NULL,
+        \\  log_index INTEGER NOT NULL,
+        \\  timestamp INTEGER NOT NULL,
+        \\  UNIQUE(protocol, resolver)
+        \\)
+    );
+
     // One-time backfill of the new entity tables. Skipped when the
     // backfill source tables (`names`, `sync_state`) don't exist yet —
     // that happens in `initWithoutSchema` test fixtures that create

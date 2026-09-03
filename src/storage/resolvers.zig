@@ -7,6 +7,7 @@ const Query = db_module.Query;
 const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
+const record_model = @import("resolver_records.zig");
 
 // ============================================================================
 // RESOLVER OPERATIONS
@@ -205,11 +206,12 @@ pub fn getAddressRecord(db: *Database, resolver: Address, namehash: Hash, coin_t
         \\LIMIT 1
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash);
+    try q.bindHash(row_key);
     try q.bindInt64(@intCast(coin_type));
 
     if (try q.step()) {
@@ -228,11 +230,12 @@ pub fn getCoinTypes(db: *Database, resolver: Address, namehash: Hash) ![]u64 {
         \\ORDER BY coin_type
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash);
+    try q.bindHash(row_key);
 
     var list: std.ArrayList(u64) = .empty;
     errdefer list.deinit(db.allocator);
@@ -251,11 +254,12 @@ pub fn getAddressRecords(db: *Database, resolver: Address, namehash: Hash) ![]Co
         \\ORDER BY coin_type
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash);
+    try q.bindHash(row_key);
     return try readCoinAddresses(db, &q);
 }
 
@@ -292,11 +296,12 @@ pub fn getContentHashRecord(db: *Database, resolver: Address, namehash: Hash) !?
         \\LIMIT 1
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash);
+    try q.bindHash(row_key);
 
     if (try q.step()) {
         return try q.getText(0);
@@ -342,6 +347,87 @@ fn bindPairsStatic(q: *Query, scratch: std.mem.Allocator, pair_resolvers: []cons
     }
 }
 
+fn dupeRowWithNamehash(comptime Row: type, a: std.mem.Allocator, row: Row, namehash: Hash) !Row {
+    var copy = row;
+    copy.resolver = try a.dupe(u8, row.resolver);
+    errdefer a.free(copy.resolver);
+    copy.namehash = try namehash.toHex(a);
+    errdefer a.free(copy.namehash);
+    if (@hasField(Row, "value")) {
+        copy.value = try a.dupe(u8, row.value);
+    }
+    errdefer if (@hasField(Row, "value")) a.free(copy.value);
+    if (@hasField(Row, "key")) {
+        copy.key = try a.dupe(u8, row.key);
+    }
+    return copy;
+}
+
+fn freeRowFields(comptime Row: type, a: std.mem.Allocator, row: *Row) void {
+    a.free(row.resolver);
+    a.free(row.namehash);
+    if (@hasField(Row, "value")) a.free(row.value);
+    if (@hasField(Row, "key")) a.free(row.key);
+}
+
+/// Re-key batch rows from the translated record keys (what the sweep queried)
+/// back to the requesting pairs' namehashes, so callers keep seeing rows under
+/// the `(resolver, namehash)` they asked for. A record shared by several names
+/// yields one row copy per requester; a legacy pair (untranslated) maps to
+/// itself. Consumes `rows`.
+fn remapRowsToRequesters(comptime Row: type, db: *Database, rows: []Row, resolvers: []const Address, namehashes: []const Hash, keys: []const Hash) ![]Row {
+    const a = db.allocator;
+    defer {
+        for (rows) |*r| freeRowFields(Row, a, r);
+        a.free(rows);
+    }
+    // "<resolver_hex>|<key_hex>" -> requester indices
+    var requesters = std.StringHashMap(std.ArrayList(usize)).init(a);
+    defer {
+        var it = requesters.iterator();
+        while (it.next()) |e| {
+            e.value_ptr.deinit(a);
+            a.free(e.key_ptr.*);
+        }
+        requesters.deinit();
+    }
+    for (resolvers, keys, 0..) |r, k, i| {
+        var kb: [42 + 1 + 66]u8 = undefined;
+        var rb: [42]u8 = undefined;
+        var hb: [66]u8 = undefined;
+        const composite = try std.fmt.bufPrint(&kb, "{s}|{s}", .{ r.toHexBuf(&rb), k.toHexBuf(&hb) });
+        const gop = try requesters.getOrPut(composite);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .empty;
+            gop.key_ptr.* = a.dupe(u8, composite) catch |err| {
+                _ = requesters.remove(composite);
+                return err;
+            };
+        }
+        try gop.value_ptr.append(a, i);
+    }
+
+    var out: std.ArrayList(Row) = .empty;
+    errdefer {
+        for (out.items) |*r| freeRowFields(Row, a, r);
+        out.deinit(a);
+    }
+    for (rows) |row| {
+        var kb: [42 + 1 + 66]u8 = undefined;
+        const composite = std.fmt.bufPrint(&kb, "{s}|{s}", .{ row.resolver, row.namehash }) catch continue;
+        const idxs = requesters.get(composite) orelse continue;
+        for (idxs.items) |i| {
+            const copy = try dupeRowWithNamehash(Row, a, row, namehashes[i]);
+            errdefer {
+                var c = copy;
+                freeRowFields(Row, a, &c);
+            }
+            try out.append(a, copy);
+        }
+    }
+    return out.toOwnedSlice(a);
+}
+
 /// Batch equivalent of `getAddressRecord` for coin_type 60: the latest address
 /// per `(resolver, namehash)` pair (`ORDER BY block_number DESC LIMIT 1`,
 /// replicated per pair via ROW_NUMBER). Only pairs that HAVE a record appear in
@@ -352,6 +438,12 @@ pub fn getAddressRecordsBatch(db: *Database, resolvers: []const Address, namehas
     var rows: std.ArrayList(ResolverRecordRow) = .empty;
     errdefer freeRecordRows(db.allocator, &rows);
     if (resolvers.len == 0) return try rows.toOwnedSlice(db.allocator);
+    const pair_resolvers = resolvers;
+    const pair_namehashes = namehashes;
+    const keys = try db.allocator.alloc(Hash, namehashes.len);
+    defer db.allocator.free(keys);
+    const translated = try record_model.resolveRecordKeys(db, resolvers, namehashes, keys);
+    const lookup: []const Hash = if (translated) keys else namehashes;
 
     var off: usize = 0;
     while (off < resolvers.len) : (off += RECORD_BATCH_CHUNK) {
@@ -375,7 +467,7 @@ pub fn getAddressRecordsBatch(db: *Database, resolvers: []const Address, namehas
         var q = try Query.init(db, sql.items);
         defer q.deinit();
         try q.bindInt64(@intCast(coin_type));
-        try bindPairsStatic(&q, arena.allocator(), resolvers[off..end], namehashes[off..end]);
+        try bindPairsStatic(&q, arena.allocator(), resolvers[off..end], lookup[off..end]);
         while (try q.step()) {
             // Loop-scoped errdefers: a later getText/append failure must free
             // the columns already duped this iteration (the outer errdefer
@@ -395,6 +487,10 @@ pub fn getAddressRecordsBatch(db: *Database, resolvers: []const Address, namehas
             try rows.append(db.allocator, .{ .resolver = r_opt.?, .namehash = nh_opt.?, .value = val_opt.? });
         }
     }
+    if (translated) {
+        const raw = try rows.toOwnedSlice(db.allocator);
+        return try remapRowsToRequesters(std.meta.Child(@TypeOf(raw)), db, raw, pair_resolvers, pair_namehashes, keys);
+    }
     return try rows.toOwnedSlice(db.allocator);
 }
 
@@ -405,6 +501,12 @@ pub fn getContentHashesBatch(db: *Database, resolvers: []const Address, namehash
     var rows: std.ArrayList(ResolverRecordRow) = .empty;
     errdefer freeRecordRows(db.allocator, &rows);
     if (resolvers.len == 0) return try rows.toOwnedSlice(db.allocator);
+    const pair_resolvers = resolvers;
+    const pair_namehashes = namehashes;
+    const keys = try db.allocator.alloc(Hash, namehashes.len);
+    defer db.allocator.free(keys);
+    const translated = try record_model.resolveRecordKeys(db, resolvers, namehashes, keys);
+    const lookup: []const Hash = if (translated) keys else namehashes;
 
     var off: usize = 0;
     while (off < resolvers.len) : (off += RECORD_BATCH_CHUNK) {
@@ -427,7 +529,7 @@ pub fn getContentHashesBatch(db: *Database, resolvers: []const Address, namehash
 
         var q = try Query.init(db, sql.items);
         defer q.deinit();
-        try bindPairsStatic(&q, arena.allocator(), resolvers[off..end], namehashes[off..end]);
+        try bindPairsStatic(&q, arena.allocator(), resolvers[off..end], lookup[off..end]);
         while (try q.step()) {
             // Loop-scoped errdefers: a later getText/append failure must free
             // the columns already duped this iteration (the outer errdefer
@@ -447,6 +549,10 @@ pub fn getContentHashesBatch(db: *Database, resolvers: []const Address, namehash
             try rows.append(db.allocator, .{ .resolver = r_opt.?, .namehash = nh_opt.?, .value = val_opt.? });
         }
     }
+    if (translated) {
+        const raw = try rows.toOwnedSlice(db.allocator);
+        return try remapRowsToRequesters(std.meta.Child(@TypeOf(raw)), db, raw, pair_resolvers, pair_namehashes, keys);
+    }
     return try rows.toOwnedSlice(db.allocator);
 }
 
@@ -459,6 +565,12 @@ pub fn getTextRecordsBatch(db: *Database, resolvers: []const Address, namehashes
     var rows: std.ArrayList(ResolverRecordRow) = .empty;
     errdefer freeRecordRows(db.allocator, &rows);
     if (resolvers.len == 0) return try rows.toOwnedSlice(db.allocator);
+    const pair_resolvers = resolvers;
+    const pair_namehashes = namehashes;
+    const keys = try db.allocator.alloc(Hash, namehashes.len);
+    defer db.allocator.free(keys);
+    const translated = try record_model.resolveRecordKeys(db, resolvers, namehashes, keys);
+    const lookup: []const Hash = if (translated) keys else namehashes;
 
     var off: usize = 0;
     while (off < resolvers.len) : (off += RECORD_BATCH_CHUNK) {
@@ -482,7 +594,7 @@ pub fn getTextRecordsBatch(db: *Database, resolvers: []const Address, namehashes
         var q = try Query.init(db, sql.items);
         defer q.deinit();
         try q.bindText(key);
-        try bindPairsStatic(&q, arena.allocator(), resolvers[off..end], namehashes[off..end]);
+        try bindPairsStatic(&q, arena.allocator(), resolvers[off..end], lookup[off..end]);
         while (try q.step()) {
             // Loop-scoped errdefers: a later getText/append failure must free
             // the columns already duped this iteration (the outer errdefer
@@ -501,6 +613,10 @@ pub fn getTextRecordsBatch(db: *Database, resolvers: []const Address, namehashes
             }
             try rows.append(db.allocator, .{ .resolver = r_opt.?, .namehash = nh_opt.?, .value = val_opt.? });
         }
+    }
+    if (translated) {
+        const raw = try rows.toOwnedSlice(db.allocator);
+        return try remapRowsToRequesters(std.meta.Child(@TypeOf(raw)), db, raw, pair_resolvers, pair_namehashes, keys);
     }
     return try rows.toOwnedSlice(db.allocator);
 }
@@ -524,6 +640,12 @@ pub fn getTextRecordKeysForPairs(db: *Database, resolvers_list: []const Address,
         rows.deinit(db.allocator);
     }
     if (resolvers_list.len == 0) return try rows.toOwnedSlice(db.allocator);
+    const pair_resolvers = resolvers_list;
+    const pair_namehashes = namehashes;
+    const keys = try db.allocator.alloc(Hash, namehashes.len);
+    defer db.allocator.free(keys);
+    const translated = try record_model.resolveRecordKeys(db, resolvers_list, namehashes, keys);
+    const lookup: []const Hash = if (translated) keys else namehashes;
 
     var off: usize = 0;
     while (off < resolvers_list.len) : (off += RECORD_BATCH_CHUNK) {
@@ -544,7 +666,7 @@ pub fn getTextRecordKeysForPairs(db: *Database, resolvers_list: []const Address,
 
         var q = try Query.init(db, sql.items);
         defer q.deinit();
-        try bindPairsStatic(&q, arena.allocator(), resolvers_list[off..end], namehashes[off..end]);
+        try bindPairsStatic(&q, arena.allocator(), resolvers_list[off..end], lookup[off..end]);
         while (try q.step()) {
             // Loop-scoped errdefers — see getTextRecordsBatch for rationale.
             const r_opt = try q.getText(0);
@@ -561,6 +683,10 @@ pub fn getTextRecordKeysForPairs(db: *Database, resolvers_list: []const Address,
             }
             try rows.append(db.allocator, .{ .resolver = r_opt.?, .namehash = nh_opt.?, .key = key_opt.? });
         }
+    }
+    if (translated) {
+        const raw = try rows.toOwnedSlice(db.allocator);
+        return try remapRowsToRequesters(std.meta.Child(@TypeOf(raw)), db, raw, pair_resolvers, pair_namehashes, keys);
     }
     return try rows.toOwnedSlice(db.allocator);
 }
@@ -582,6 +708,12 @@ pub fn getCoinTypesForPairs(db: *Database, resolvers_list: []const Address, name
         rows.deinit(db.allocator);
     }
     if (resolvers_list.len == 0) return try rows.toOwnedSlice(db.allocator);
+    const pair_resolvers = resolvers_list;
+    const pair_namehashes = namehashes;
+    const keys = try db.allocator.alloc(Hash, namehashes.len);
+    defer db.allocator.free(keys);
+    const translated = try record_model.resolveRecordKeys(db, resolvers_list, namehashes, keys);
+    const lookup: []const Hash = if (translated) keys else namehashes;
 
     var off: usize = 0;
     while (off < resolvers_list.len) : (off += RECORD_BATCH_CHUNK) {
@@ -602,7 +734,7 @@ pub fn getCoinTypesForPairs(db: *Database, resolvers_list: []const Address, name
 
         var q = try Query.init(db, sql.items);
         defer q.deinit();
-        try bindPairsStatic(&q, arena.allocator(), resolvers_list[off..end], namehashes[off..end]);
+        try bindPairsStatic(&q, arena.allocator(), resolvers_list[off..end], lookup[off..end]);
         while (try q.step()) {
             // Loop-scoped errdefers — see getTextRecordsBatch for rationale.
             const r_opt = try q.getText(0);
@@ -617,6 +749,10 @@ pub fn getCoinTypesForPairs(db: *Database, resolvers_list: []const Address, name
             try rows.append(db.allocator, .{ .resolver = r_opt.?, .namehash = nh_opt.?, .coin_type = @intCast(q.getInt64(2)) });
         }
     }
+    if (translated) {
+        const raw = try rows.toOwnedSlice(db.allocator);
+        return try remapRowsToRequesters(std.meta.Child(@TypeOf(raw)), db, raw, pair_resolvers, pair_namehashes, keys);
+    }
     return try rows.toOwnedSlice(db.allocator);
 }
 
@@ -627,11 +763,12 @@ pub fn getTextRecordKeys(db: *Database, resolver: Address, namehash: Hash) ![][]
         \\ORDER BY key
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash);
+    try q.bindHash(row_key);
 
     var keys: std.ArrayList([]u8) = .empty;
     errdefer {
@@ -659,11 +796,12 @@ pub fn getTextRecord(db: *Database, resolver: Address, namehash: Hash, key: []co
         \\LIMIT 1
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash);
+    try q.bindHash(row_key);
     try q.bindText(key);
 
     if (try q.step()) {
@@ -1006,11 +1144,12 @@ pub fn getPubkeyRecord(db: *Database, resolver: Address, namehash_val: Hash) !?P
         \\LIMIT 1
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash_val);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash_val);
+    try q.bindHash(row_key);
 
     if (try q.step()) {
         const x = try q.getText(0) orelse return null;
@@ -1034,11 +1173,12 @@ pub fn getAbiContentTypes(db: *Database, resolver: Address, namehash_val: Hash) 
         \\ORDER BY content_type
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash_val);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash_val);
+    try q.bindHash(row_key);
 
     var types: std.ArrayList(u64) = .empty;
     errdefer types.deinit(db.allocator);
@@ -1059,6 +1199,7 @@ pub fn getLatestNameByNamehash(db: *Database, namehash_val: Hash) !?[]u8 {
     const sql =
         \\SELECT name FROM resolver_names
         \\WHERE namehash = ?
+        \\   OR namehash IN (SELECT record_key FROM resolver_links WHERE namehash = ? AND record_id <> 0)
         \\ORDER BY block_number DESC, id DESC
         \\LIMIT 1
     ;
@@ -1066,6 +1207,7 @@ pub fn getLatestNameByNamehash(db: *Database, namehash_val: Hash) !?[]u8 {
     var q = try Query.init(db, sql);
     defer q.deinit();
 
+    try q.bindHash(namehash_val);
     try q.bindHash(namehash_val);
 
     if (try q.step()) {
@@ -1082,11 +1224,12 @@ pub fn getReverseNameRecord(db: *Database, resolver: Address, namehash_val: Hash
         \\LIMIT 1
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash_val);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash_val);
+    try q.bindHash(row_key);
 
     if (try q.step()) {
         return try q.getText(0);
@@ -1112,11 +1255,12 @@ pub fn getInterfaceRecords(db: *Database, resolver: Address, namehash_val: Hash)
         \\ORDER BY interface_id
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash_val);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash_val);
+    try q.bindHash(row_key);
 
     var records: std.ArrayList(InterfaceRecord) = .empty;
     errdefer {
@@ -1152,11 +1296,12 @@ pub fn getNodeRecordVersion(db: *Database, resolver: Address, namehash_val: Hash
         \\LIMIT 1
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash_val);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash_val);
+    try q.bindHash(row_key);
 
     if (try q.step()) {
         return @intCast(q.getInt64(0));
