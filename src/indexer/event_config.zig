@@ -113,6 +113,7 @@ pub const RESOLVER_EVENTS = [_]ResolverEventConfig{
     .{ .event_hash = abi.EventSignatures.interface_updated_hash, .handler = Indexer.handleInterfaceUpdated, .name = "InterfaceUpdated" },
     .{ .event_hash = abi.EventSignatures.name_updated_hash, .handler = Indexer.handleNameUpdated, .name = "NameUpdated" },
     .{ .event_hash = abi.EventSignatures.resource_argument_hash, .handler = Indexer.handleResourceArgument, .name = "ResourceArgument" },
+    .{ .event_hash = abi.EventSignatures.approval_updated_hash, .handler = Indexer.handleApprovalUpdated, .name = "ApprovalUpdated" },
 };
 
 // ========================================================================

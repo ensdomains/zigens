@@ -550,7 +550,7 @@ CREATE TABLE IF NOT EXISTS resolver_links (
   protocol TEXT NOT NULL,
   resolver TEXT NOT NULL,
   namehash TEXT NOT NULL,
-  record_id BIGINT NOT NULL,
+  record_id TEXT NOT NULL,
   record_key TEXT NOT NULL,
   name TEXT NOT NULL DEFAULT '',
   block_number BIGINT NOT NULL,

@@ -1112,17 +1112,26 @@ fn replayV2RecordEvent(self: *Indexer, q: *Query, et: models.EventType) !void {
         // Record-model events: the record id is frozen in event_data; the row key is
         // re-derived from it (never trusted from the events.namehash column).
         .linked, .cleared, .address_updated, .text_updated, .data_updated, .contenthash_updated, .abi_updated, .interface_updated, .name_updated => {
-            const record_id: u64 = switch (obj.get("recordId") orelse return) {
+            const record_model = @import("../storage/resolver_records.zig");
+            const record_id: u256 = switch (obj.get("recordId") orelse return) {
                 .integer => |i| if (i < 0) return else @intCast(i),
+                .string => |s| record_model.parseRecordId(s) orelse return,
                 else => return,
             };
-            const rk = @import("../storage/resolver_records.zig").recordKey(record_id);
+            const rk = record_model.recordKey(record_id);
             switch (et) {
                 .linked => {
                     const node = Hash.fromHex(jsonObjStr(obj, "node") orelse return) catch return;
                     const name = jsonObjStr(obj, "name") orelse "";
                     const log_index: u32 = @intCast(q.getInt64(V2_LOG_INDEX));
                     self.database.upsertResolverLink(.v2, resolver, node, record_id, name, block_number, tx_hash, log_index, timestamp) catch {};
+                    // Mirror the live handler: Linked marks the resolver as record-model
+                    // when nothing announced it (SharedResolver emits no ResolverCreated).
+                    if (self.database.getResolverKind(resolver) catch null) |existing| {
+                        self.database.allocator.free(existing);
+                    } else {
+                        self.database.upsertResolverKind(.v2, resolver, "record", block_number, tx_hash, log_index, timestamp) catch {};
+                    }
                 },
                 .cleared => {
                     self.database.deleteResolverAddresses(.v2, rk, resolver) catch {};
@@ -2387,6 +2396,6 @@ test "replayV2RecordsCore rebuilds record-model resolvers (links, values, defaul
     defer q.deinit();
     try std.testing.expect(try q.step());
     try std.testing.expectEqual(@as(i64, 0), q.getInt64(0));
-    try std.testing.expectEqual(@as(?u64, 1), try database.getEffectiveRecordId(resolver, erin));
-    try std.testing.expectEqual(@as(?u64, 2), try database.getEffectiveRecordId(resolver, dave));
+    try std.testing.expectEqual(@as(?u256, 1), try database.getEffectiveRecordId(resolver, erin));
+    try std.testing.expectEqual(@as(?u256, 2), try database.getEffectiveRecordId(resolver, dave));
 }

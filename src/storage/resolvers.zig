@@ -1199,7 +1199,7 @@ pub fn getLatestNameByNamehash(db: *Database, namehash_val: Hash) !?[]u8 {
     const sql =
         \\SELECT name FROM resolver_names
         \\WHERE namehash = ?
-        \\   OR namehash IN (SELECT record_key FROM resolver_links WHERE namehash = ? AND record_id <> 0)
+        \\   OR namehash IN (SELECT record_key FROM resolver_links WHERE namehash = ? AND record_id <> '0x0000000000000000000000000000000000000000000000000000000000000000')
         \\ORDER BY block_number DESC, id DESC
         \\LIMIT 1
     ;

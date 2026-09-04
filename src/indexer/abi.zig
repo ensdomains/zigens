@@ -298,6 +298,11 @@ pub const EventSignatures = struct {
     pub const resource_argument = "ResourceArgument(uint256,bytes)";
     pub const resource_argument_hash: Hash = eventHash(resource_argument);
 
+    /// ApprovalUpdated(uint256 indexed recordId, address indexed owner, address indexed operator, bool approved)
+    /// SharedResolver (ISharedResolver) per-record operator approval.
+    pub const approval_updated = "ApprovalUpdated(uint256,address,address,bool)";
+    pub const approval_updated_hash: Hash = eventHash(approval_updated);
+
     // ========================================================================
     // ENS Temporary Registrar events (Pre-V1 Migration, May 2017 - May 2019)
     // Address: 0x6090A6e47849629b7245Dfa1Ca21D94cd15878Ef

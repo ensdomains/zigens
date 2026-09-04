@@ -215,15 +215,15 @@ test "live Sepolia ALL_ROLES bitmap decodes to full resolver permission set" {
     const perms = try eac_roles.decodeHex(allocator, all_roles_hex, .resolver);
     defer eac_roles.freePermissions(allocator, perms);
 
-    // 11 resolver roles + 11 admin counterparts.
-    try testing.expectEqual(@as(usize, 22), perms.len);
+    // 10 resolver roles + 10 admin counterparts (record-model PermissionedResolverLib).
+    try testing.expectEqual(@as(usize, 20), perms.len);
 
     // Spot-check a couple of resolver-specific names are present.
     var has_set_addr = false;
     var has_set_name = false;
     for (perms) |p| {
-        if (std.mem.eql(u8, p, "SET_ADDR")) has_set_addr = true;
-        if (std.mem.eql(u8, p, "SET_NAME")) has_set_name = true;
+        if (std.mem.eql(u8, p, "SET_ADDRESS")) has_set_addr = true;
+        if (std.mem.eql(u8, p, "LINK")) has_set_name = true;
     }
     try testing.expect(has_set_addr);
     try testing.expect(has_set_name);
@@ -244,7 +244,7 @@ test "EAC row from a known resolver classifies as resolver and decodes resolver 
     // Sepolia shape — which previously failed the resolvers name-binding JOIN.
     const resource = "0x0000000000000000000000000000000000000000000000000000000000000000";
     const tx_hash = helpers.randomHash();
-    // 1 << 24 = nybble 6 → SET_NAME on a resolver (SET_RESOLVER on a registry).
+    // 1 << 24 = nybble 6 → SET_DATA on a resolver (SET_RESOLVER on a registry).
     const bitmap_hex = "0x0000000000000000000000000000000000000000000000000000000001000000";
     try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_1, bitmap_hex, 1000, tx_hash, 0, helpers.TEST_RESOLVER);
 
@@ -261,8 +261,8 @@ test "EAC row from a known resolver classifies as resolver and decodes resolver 
     const perms = try eac_roles.decodeHex(allocator, role_list[0].role_bitmap, role_list[0].contract_kind);
     defer eac_roles.freePermissions(allocator, perms);
     try testing.expectEqual(@as(usize, 1), perms.len);
-    // Resolver name for nybble 6 — the bug previously yielded registry's SET_RESOLVER.
-    try testing.expectEqualStrings("SET_NAME", perms[0]);
+    // Resolver name for nybble 6 — the bug previously yielded registry SET_RESOLVER.
+    try testing.expectEqualStrings("SET_DATA", perms[0]);
 }
 
 test "registerResolverIfNew reports first sighting exactly once" {

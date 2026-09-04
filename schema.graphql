@@ -584,7 +584,7 @@ type LinkedName {
   """The bound node (namehash)"""
   namehash: String!
 
-  """The record id (decimal string)"""
+  """The record id (decimal string; a full uint256 — SharedResolver keys records by the name's node itself)"""
   recordId: String!
 }
 

@@ -233,6 +233,7 @@ pub const EventType = enum {
     interface_updated,
     name_updated,
     resource_argument,
+    approval_updated,
 
     // V1 → V2 migration: emitted on the V1 row when a token transfers to a
     // MigrationController. Distinct from `name_registered`/`label_registered`
@@ -300,6 +301,7 @@ pub const EventType = enum {
             .interface_updated => "InterfaceUpdated",
             .name_updated => "NameUpdated",
             .resource_argument => "ResourceArgument",
+            .approval_updated => "ApprovalUpdated",
             .name_migrated => "NameMigrated",
             .name_wrapped => "NameWrapped",
             .name_unwrapped => "NameUnwrapped",
@@ -346,6 +348,7 @@ pub const EventType = enum {
         if (std.mem.eql(u8, s, "InterfaceUpdated")) return .interface_updated;
         if (std.mem.eql(u8, s, "NameUpdated")) return .name_updated;
         if (std.mem.eql(u8, s, "ResourceArgument")) return .resource_argument;
+        if (std.mem.eql(u8, s, "ApprovalUpdated")) return .approval_updated;
         if (std.mem.eql(u8, s, "LabelRegistered")) return .label_registered;
         if (std.mem.eql(u8, s, "LabelReserved")) return .label_reserved;
         if (std.mem.eql(u8, s, "LabelUnregistered")) return .label_unregistered;

@@ -563,6 +563,7 @@ pub const Indexer = struct {
     pub const handleInterfaceUpdated = handlers_v2_records.handleInterfaceUpdated;
     pub const handleNameUpdated = handlers_v2_records.handleNameUpdated;
     pub const handleResourceArgument = handlers_v2_records.handleResourceArgument;
+    pub const handleApprovalUpdated = handlers_v2_records.handleApprovalUpdated;
 
     // V1 event handlers (extracted to handlers_v1.zig)
     pub const handleV1NewOwner = handlers_v1.handleV1NewOwner;

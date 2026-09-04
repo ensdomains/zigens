@@ -1958,14 +1958,14 @@ test "reorg undo-log: resolver_links re-link reversed and post-N link removed (r
         const cur = (try database.getTextRecord(resolver, carol, "url")).?;
         defer allocator.free(cur);
         try testing.expectEqualStrings("two", cur);
-        try testing.expectEqual(@as(?u64, 1), try database.getEffectiveRecordId(resolver, erin));
+        try testing.expectEqual(@as(?u256, 1), try database.getEffectiveRecordId(resolver, erin));
     }
 
     // Reorg to 150: carol's link is restored to record 1, erin's link and record 2's
     // value are gone, and the read path follows the restored link.
     try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
-    try testing.expectEqual(@as(?u64, 1), try database.getEffectiveRecordId(resolver, carol));
-    try testing.expectEqual(@as(?u64, null), try database.getEffectiveRecordId(resolver, erin));
+    try testing.expectEqual(@as(?u256, 1), try database.getEffectiveRecordId(resolver, carol));
+    try testing.expectEqual(@as(?u256, null), try database.getEffectiveRecordId(resolver, erin));
     const restored = (try database.getTextRecord(resolver, carol, "url")) orelse return error.RecordVanished;
     defer allocator.free(restored);
     try testing.expectEqualStrings("one", restored);

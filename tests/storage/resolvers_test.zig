@@ -1374,9 +1374,9 @@ test "record resolver: own record, shared record, default record, unlink and leg
     try testing.expect((try resolver_records.resolveRecordKey(database, resolver, recNode(4))).eql(rk2)); // unlinked -> default
     try testing.expect((try resolver_records.resolveRecordKey(database, resolver, Hash.zero)).eql(rk2));
     try testing.expect((try resolver_records.resolveRecordKey(database, legacy, recNode(2))).eql(recNode(2))); // legacy passthrough
-    try testing.expectEqual(@as(?u64, 1), try resolver_records.getEffectiveRecordId(database, resolver, recNode(3)));
-    try testing.expectEqual(@as(?u64, 2), try resolver_records.getEffectiveRecordId(database, resolver, recNode(4)));
-    try testing.expectEqual(@as(?u64, null), try resolver_records.getEffectiveRecordId(database, legacy, recNode(2)));
+    try testing.expectEqual(@as(?u256, 1), try resolver_records.getEffectiveRecordId(database, resolver, recNode(3)));
+    try testing.expectEqual(@as(?u256, 2), try resolver_records.getEffectiveRecordId(database, resolver, recNode(4)));
+    try testing.expectEqual(@as(?u256, null), try resolver_records.getEffectiveRecordId(database, legacy, recNode(2)));
 
     // Point reads go through the indirection.
     const carol_keys = try resolvers.getTextRecordKeys(database, resolver, recNode(1));

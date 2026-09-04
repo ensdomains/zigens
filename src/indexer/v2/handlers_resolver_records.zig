@@ -27,22 +27,16 @@ const dns = @import("../../utils/dns.zig");
 const record_model = @import("../../storage/resolver_records.zig");
 
 const RecordRef = struct {
-    id: u64,
+    id: u256,
     key: Hash,
 };
 
-/// Record id from an indexed `uint256 recordId` topic. Ids are allocated
-/// sequentially from 1 on-chain; a hostile contract can emit any uint256, so
-/// anything past u64 is rejected as malformed (skipped with coordinates)
-/// instead of truncated.
-fn recordFromTopic(log: rpc.Log, event_name: []const u8) ?RecordRef {
+/// Record id from an indexed `uint256 recordId` topic, carried at full width:
+/// PermissionedResolver allocates small sequential ids, SharedResolver uses
+/// the name's 256-bit node itself.
+fn recordFromTopic(log: rpc.Log) ?RecordRef {
     if (log.topics.len < 2) return null;
-    const raw: u256 = std.mem.readInt(u256, &log.topics[1].bytes, .big);
-    const id = std.math.cast(u64, raw) orelse {
-        var tx_buf: [66]u8 = undefined;
-        std.log.warn("{s}: record id exceeds u64 at block {d} tx {s} log_index {d} — event skipped", .{ event_name, log.block_number, log.transaction_hash.toHexBuf(&tx_buf), log.log_index });
-        return null;
-    };
+    const id: u256 = std.mem.readInt(u256, &log.topics[1].bytes, .big);
     return .{ .id = id, .key = record_model.recordKey(id) };
 }
 
@@ -122,7 +116,7 @@ pub fn handleResolverCreated(self: *Indexer, protocol: models.Protocol, resolver
 /// `recordId = 0` unbinds the node; node `0x0` (root name) is the default record.
 pub fn handleLinked(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
     if (log.topics.len < 3) return error.InvalidTopicCount;
-    const rec = recordFromTopic(log, "Linked") orelse return;
+    const rec = recordFromTopic(log) orelse return;
     const node = log.topics[2];
 
     const data_values = try abi.decodeValues(log.data, &.{.bytes}, self.allocator);
@@ -131,6 +125,7 @@ pub fn handleLinked(self: *Indexer, protocol: models.Protocol, resolver: Address
     defer if (decoded) |d| self.allocator.free(d);
     // The root name (`0x00`) decodes to null: that is the default-record binding.
     const name: []const u8 = decoded orelse "";
+    const ts = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
 
     try self.database.upsertResolverLink(
         protocol,
@@ -141,8 +136,18 @@ pub fn handleLinked(self: *Indexer, protocol: models.Protocol, resolver: Address
         log.block_number,
         log.transaction_hash,
         log.log_index,
-        try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+        ts,
     );
+
+    // Any resolver that emits Linked is an IRecordResolver, whether or not it
+    // announced itself with ResolverCreated (SharedResolver does not).
+    if (try self.database.getResolverKind(resolver)) |existing| {
+        self.database.allocator.free(existing);
+    } else {
+        self.database.upsertResolverKind(protocol, resolver, record_model.ResolverKind.record, log.block_number, log.transaction_hash, log.log_index, ts) catch |err| {
+            std.log.warn("Failed to store resolver kind: {}", .{err});
+        };
+    }
 
     const resolver_hex = try resolver.toHex(self.allocator);
     defer self.allocator.free(resolver_hex);
@@ -150,15 +155,15 @@ pub fn handleLinked(self: *Indexer, protocol: models.Protocol, resolver: Address
     defer self.allocator.free(node_hex);
     const escaped_name = try json_utils.escapeString(self.allocator, name);
     defer self.allocator.free(escaped_name);
-    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":{d},\"node\":\"{s}\",\"name\":\"{s}\"}}", .{ resolver_hex, rec.id, node_hex, escaped_name });
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\",\"node\":\"{s}\",\"name\":\"{s}\"}}", .{ resolver_hex, rec.id, node_hex, escaped_name });
     const domain_name = self.getNameFromNamehash(node);
     try utils.emitEvent(self, protocol, log, .linked, domain_name, node, event_data);
 }
 
-/// Cleared(uint256 indexed recordId) — declared by IRecordResolver (no current
-/// emitter): every value of the record is dropped.
+/// Cleared(uint256 indexed recordId) — declared by IRecordResolver, emitted by
+/// SharedResolver.clear(): every value of the record is dropped.
 pub fn handleCleared(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
-    const rec = recordFromTopic(log, "Cleared") orelse return;
+    const rec = recordFromTopic(log) orelse return;
     const db = self.database;
     db.deleteResolverAddresses(protocol, rec.key, resolver) catch |err| std.log.warn("Cleared: addresses: {}", .{err});
     db.deleteResolverTexts(protocol, rec.key, resolver) catch |err| std.log.warn("Cleared: texts: {}", .{err});
@@ -170,14 +175,14 @@ pub fn handleCleared(self: *Indexer, protocol: models.Protocol, resolver: Addres
 
     const resolver_hex = try resolver.toHex(self.allocator);
     defer self.allocator.free(resolver_hex);
-    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":{d}}}", .{ resolver_hex, rec.id });
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\"}}", .{ resolver_hex, rec.id });
     try utils.emitEvent(self, protocol, log, .cleared, null, rec.key, event_data);
 }
 
 /// AddressUpdated(uint256 indexed recordId, uint256 coinType, bytes addressBytes)
 /// Empty `addressBytes` clears the coin type (`hasAddr` becomes false).
 pub fn handleAddressUpdated(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
-    const rec = recordFromTopic(log, "AddressUpdated") orelse return;
+    const rec = recordFromTopic(log) orelse return;
     const data_values = try abi.decodeValues(log.data, &.{ .uint256, .bytes }, self.allocator);
     defer abi.freeValues(data_values, self.allocator);
     const coin_type = data_values[0].uint256;
@@ -197,13 +202,13 @@ pub fn handleAddressUpdated(self: *Indexer, protocol: models.Protocol, resolver:
 
     const resolver_hex = try resolver.toHex(self.allocator);
     defer self.allocator.free(resolver_hex);
-    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":{d},\"coinType\":{d},\"address\":\"{s}\"}}", .{ resolver_hex, rec.id, coin_type, address_hex });
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\",\"coinType\":{d},\"address\":\"{s}\"}}", .{ resolver_hex, rec.id, coin_type, address_hex });
     try utils.emitEvent(self, protocol, log, .address_updated, null, rec.key, event_data);
 }
 
 /// TextUpdated(uint256 indexed recordId, string indexed keyHash, string key, string value)
 pub fn handleTextUpdated(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
-    const rec = recordFromTopic(log, "TextUpdated") orelse return;
+    const rec = recordFromTopic(log) orelse return;
     const data_values = try abi.decodeValues(log.data, &.{ .string, .string }, self.allocator);
     defer abi.freeValues(data_values, self.allocator);
     const clean = (try cleanText(self, log, "TextUpdated", data_values[0].string, data_values[1].string)) orelse return;
@@ -224,13 +229,13 @@ pub fn handleTextUpdated(self: *Indexer, protocol: models.Protocol, resolver: Ad
     defer self.allocator.free(escaped_key);
     const escaped_value = try json_utils.escapeString(self.allocator, effective_value);
     defer self.allocator.free(escaped_value);
-    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":{d},\"key\":\"{s}\",\"value\":\"{s}\"}}", .{ resolver_hex, rec.id, escaped_key, escaped_value });
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\",\"key\":\"{s}\",\"value\":\"{s}\"}}", .{ resolver_hex, rec.id, escaped_key, escaped_value });
     try utils.emitEvent(self, protocol, log, .text_updated, null, rec.key, event_data);
 }
 
 /// DataUpdated(uint256 indexed recordId, string indexed keyHash, string key, bytes value)
 pub fn handleDataUpdated(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
-    const rec = recordFromTopic(log, "DataUpdated") orelse return;
+    const rec = recordFromTopic(log) orelse return;
     const data_values = try abi.decodeValues(log.data, &.{ .string, .bytes }, self.allocator);
     defer abi.freeValues(data_values, self.allocator);
     try storeDataRecord(self, protocol, resolver, log, rec.key, data_values[0].string, data_values[1].bytes, "DataUpdated", .data_updated, rec.id);
@@ -257,7 +262,7 @@ fn storeDataRecord(
     value: []const u8,
     event_name: []const u8,
     event_type: models.EventType,
-    record_id: ?u64,
+    record_id: ?u256,
 ) !void {
     const clean_key = try stripNulls(self.allocator, key);
     defer self.allocator.free(clean_key);
@@ -284,7 +289,7 @@ fn storeDataRecord(
     const escaped_key = try json_utils.escapeString(self.allocator, clean_key);
     defer self.allocator.free(escaped_key);
     const event_data = if (record_id) |id|
-        try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":{d},\"key\":\"{s}\",\"value\":\"{s}\"}}", .{ resolver_hex, id, escaped_key, value_hex })
+        try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\",\"key\":\"{s}\",\"value\":\"{s}\"}}", .{ resolver_hex, id, escaped_key, value_hex })
     else
         try std.fmt.allocPrint(self.allocator, "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"key\":\"{s}\",\"value\":\"{s}\"}}", .{ key_hex, resolver_hex, escaped_key, value_hex });
     const domain_name = if (record_id == null) self.getNameFromNamehash(row_key) else null;
@@ -293,7 +298,7 @@ fn storeDataRecord(
 
 /// ContenthashUpdated(uint256 indexed recordId, bytes hash)
 pub fn handleContenthashUpdated(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
-    const rec = recordFromTopic(log, "ContenthashUpdated") orelse return;
+    const rec = recordFromTopic(log) orelse return;
     const data_values = try abi.decodeValues(log.data, &.{.bytes}, self.allocator);
     defer abi.freeValues(data_values, self.allocator);
     const hash_bytes = data_values[0].bytes;
@@ -310,28 +315,28 @@ pub fn handleContenthashUpdated(self: *Indexer, protocol: models.Protocol, resol
 
     const resolver_hex = try resolver.toHex(self.allocator);
     defer self.allocator.free(resolver_hex);
-    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":{d},\"contentHash\":\"{s}\"}}", .{ resolver_hex, rec.id, hash_hex });
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\",\"contentHash\":\"{s}\"}}", .{ resolver_hex, rec.id, hash_hex });
     try utils.emitEvent(self, protocol, log, .contenthash_updated, null, rec.key, event_data);
 }
 
 /// ABIUpdated(uint256 indexed recordId, uint256 indexed contentType) — no payload.
 pub fn handleABIUpdated(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
     if (log.topics.len < 3) return error.InvalidTopicCount;
-    const rec = recordFromTopic(log, "ABIUpdated") orelse return;
+    const rec = recordFromTopic(log) orelse return;
     const content_type = try abi.ABI.decodeUint256(&log.topics[2].bytes, 0);
     self.database.storeResolverABI(rec.key, resolver, @truncate(content_type), protocol, log.block_number, log.transaction_hash, try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp)) catch |err| {
         std.log.warn("Failed to store resolver ABI: {}", .{err});
     };
     const resolver_hex = try resolver.toHex(self.allocator);
     defer self.allocator.free(resolver_hex);
-    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":{d},\"contentType\":{d}}}", .{ resolver_hex, rec.id, content_type });
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\",\"contentType\":{d}}}", .{ resolver_hex, rec.id, content_type });
     try utils.emitEvent(self, protocol, log, .abi_updated, null, rec.key, event_data);
 }
 
 /// InterfaceUpdated(uint256 indexed recordId, bytes4 indexed interfaceId, address implementer)
 pub fn handleInterfaceUpdated(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
     if (log.topics.len < 3) return error.InvalidTopicCount;
-    const rec = recordFromTopic(log, "InterfaceUpdated") orelse return;
+    const rec = recordFromTopic(log) orelse return;
     const interface_id_hex = try bytesToHexAlloc(self.allocator, log.topics[2].bytes[0..4]);
     defer self.allocator.free(interface_id_hex);
     const data_values = try abi.decodeValues(log.data, &.{.address}, self.allocator);
@@ -346,14 +351,14 @@ pub fn handleInterfaceUpdated(self: *Indexer, protocol: models.Protocol, resolve
 
     const resolver_hex = try resolver.toHex(self.allocator);
     defer self.allocator.free(resolver_hex);
-    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":{d},\"interfaceID\":\"{s}\",\"implementer\":\"{s}\"}}", .{ resolver_hex, rec.id, interface_id_hex, implementer_hex });
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\",\"interfaceID\":\"{s}\",\"implementer\":\"{s}\"}}", .{ resolver_hex, rec.id, interface_id_hex, implementer_hex });
     try utils.emitEvent(self, protocol, log, .interface_updated, null, rec.key, event_data);
 }
 
 /// NameUpdated(uint256 indexed recordId, string primaryName) — the record's
 /// `name()` (reverse) value.
 pub fn handleNameUpdated(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
-    const rec = recordFromTopic(log, "NameUpdated") orelse return;
+    const rec = recordFromTopic(log) orelse return;
     const data_values = try abi.decodeValues(log.data, &.{.string}, self.allocator);
     defer abi.freeValues(data_values, self.allocator);
     const name = data_values[0].string;
@@ -369,7 +374,7 @@ pub fn handleNameUpdated(self: *Indexer, protocol: models.Protocol, resolver: Ad
     defer self.allocator.free(resolver_hex);
     const escaped_name = try json_utils.escapeString(self.allocator, name);
     defer self.allocator.free(escaped_name);
-    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":{d},\"name\":\"{s}\"}}", .{ resolver_hex, rec.id, escaped_name });
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\",\"name\":\"{s}\"}}", .{ resolver_hex, rec.id, escaped_name });
     try utils.emitEvent(self, protocol, log, .name_updated, null, rec.key, event_data);
 }
 
@@ -429,6 +434,35 @@ const AbiPart = union(enum) {
 
 /// Minimal ABI encoder for test payloads: static words inline, dynamic
 /// bytes/strings via head offsets + length-prefixed, 32-byte-padded tails.
+/// ApprovalUpdated(uint256 indexed recordId, address indexed owner, address indexed operator, bool approved)
+/// SharedResolver's per-record operator approval. Its record id IS the name's
+/// node (`uint256(node)`), so the approval is stored against that node in
+/// resolver_approvals, beside the PublicResolver `Approved` rows.
+pub fn handleApprovalUpdated(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
+    if (log.topics.len < 4) return error.InvalidTopicCount;
+    const rec = recordFromTopic(log) orelse return;
+    const node = log.topics[1];
+    var owner = Address{ .bytes = undefined };
+    @memcpy(&owner.bytes, log.topics[2].bytes[12..32]);
+    var operator = Address{ .bytes = undefined };
+    @memcpy(&operator.bytes, log.topics[3].bytes[12..32]);
+    const approved = log.data.len >= 32 and log.data[31] != 0;
+
+    self.database.upsertResolverApproval(protocol, resolver, node, "", operator, approved, log.block_number, log.transaction_hash, log.log_index) catch |err| {
+        std.log.warn("Failed to store resolver approval: {}", .{err});
+    };
+
+    const resolver_hex = try resolver.toHex(self.allocator);
+    defer self.allocator.free(resolver_hex);
+    const owner_hex = try owner.toHex(self.allocator);
+    defer self.allocator.free(owner_hex);
+    const operator_hex = try operator.toHex(self.allocator);
+    defer self.allocator.free(operator_hex);
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\",\"owner\":\"{s}\",\"operator\":\"{s}\",\"approved\":{s}}}", .{ resolver_hex, rec.id, owner_hex, operator_hex, if (approved) "true" else "false" });
+    const domain_name = self.getNameFromNamehash(node);
+    try utils.emitEvent(self, protocol, log, .approval_updated, domain_name, node, event_data);
+}
+
 fn abiEncode(allocator: std.mem.Allocator, parts: []const AbiPart) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -562,7 +596,7 @@ test "record handlers: create, link, update values, share, default, unlink, clea
 
     var link = (try db.getResolverLink(TEST_RESOLVER, carol)).?;
     defer link.deinit(db.allocator);
-    try testing.expectEqual(@as(u64, 1), link.record_id);
+    try testing.expectEqual(@as(u256, 1), link.record_id);
     try testing.expectEqualStrings("carol.eth", link.name);
 
     const avatar = (try db.getTextRecord(TEST_RESOLVER, carol, "avatar")).?;
@@ -624,15 +658,33 @@ test "record handlers: create, link, update values, share, default, unlink, clea
     try handleCleared(idx, .v2, TEST_RESOLVER, try rig.log(TEST_RESOLVER, &.{ wordHash(0), wordHash(2) }, try a.dupe(u8, "")));
     try testing.expectEqual(@as(?[]u8, null), try db.getTextRecord(TEST_RESOLVER, dave, "avatar"));
 
-    // A record id past u64 is skipped, never truncated.
-    const huge = wordHash(@as(u256, 1) << 200);
+    // A 256-bit record id (SharedResolver keys records by the node itself) is
+    // carried at full width, never truncated or skipped.
+    const huge_id: u256 = @as(u256, 1) << 200;
+    const huge = wordHash(huge_id);
     try handleTextUpdated(idx, .v2, TEST_RESOLVER, try rig.log(TEST_RESOLVER, &.{ wordHash(0), huge, wordHash(0) }, try abiEncode(a, &.{ .{ .dyn = "k" }, .{ .dyn = "v" } })));
+    // Read the row directly: name-resolution reads translate through links, and
+    // no name is linked to this record (a bare setter write on a fresh id).
+    var huge_q = try db_module.Query.init(db, "SELECT value FROM resolver_texts WHERE resolver = ? AND namehash = ? AND key = 'k'");
+    defer huge_q.deinit();
+    try huge_q.bindAddress(TEST_RESOLVER);
+    try huge_q.bindHash(record_model.recordKey(huge_id));
+    try testing.expect(try huge_q.step());
+    try testing.expectEqualStrings("v", huge_q.getTextSlice(0).?);
+
+    // SharedResolver approvals: the record id is the node, so the approval
+    // lands on the name in resolver_approvals.
+    try handleApprovalUpdated(idx, .v2, TEST_RESOLVER, try rig.log(TEST_RESOLVER, &.{ wordHash(0), carol, wordHash(0x1111111111111111111111111111111111111111), wordHash(0x2222222222222222222222222222222222222222) }, try abiEncode(a, &.{.{ .word = 1 }})));
+    var approvals_q = try db_module.Query.init(db, "SELECT COUNT(*) FROM resolver_approvals WHERE approved = 1 AND delegate = '0x2222222222222222222222222222222222222222'");
+    defer approvals_q.deinit();
+    try testing.expect(try approvals_q.step());
+    try testing.expectEqual(@as(i64, 1), approvals_q.getInt64(0));
 
     // Every handler emitted its event row.
-    var q = try db_module.Query.init(db, "SELECT COUNT(*) FROM events WHERE event_type IN ('ResolverCreated','Linked','TextUpdated','AddressUpdated','ContenthashUpdated','DataUpdated','NameUpdated','ABIUpdated','InterfaceUpdated','Cleared')");
+    var q = try db_module.Query.init(db, "SELECT COUNT(*) FROM events WHERE event_type IN ('ResolverCreated','Linked','TextUpdated','AddressUpdated','ContenthashUpdated','DataUpdated','NameUpdated','ABIUpdated','InterfaceUpdated','Cleared','ApprovalUpdated')");
     defer q.deinit();
     try testing.expect(try q.step());
-    try testing.expectEqual(@as(i64, 17), q.getInt64(0));
+    try testing.expectEqual(@as(i64, 19), q.getInt64(0));
 }
 
 test "record handlers: ResourceArgument and legacy DataChanged" {

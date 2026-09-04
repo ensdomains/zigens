@@ -35,16 +35,35 @@ pub const ResolverKind = struct {
 };
 
 /// The synthetic `namehash`-column key under which record `record_id`'s
-/// values are stored: `keccak256(RECORD_KEY_TAG || be32(record_id))`.
-pub fn recordKey(record_id: u64) Hash {
+/// values are stored: `keccak256(RECORD_KEY_TAG || be256(record_id))`. Ids are
+/// carried at full uint256 width: PermissionedResolver allocates small
+/// sequential ids, SharedResolver uses the name's node itself.
+pub fn recordKey(record_id: u256) Hash {
     var preimage: [RECORD_KEY_TAG.len + 32]u8 = undefined;
     @memcpy(preimage[0..RECORD_KEY_TAG.len], RECORD_KEY_TAG);
-    var be: [32]u8 = [_]u8{0} ** 32;
-    std.mem.writeInt(u64, be[24..32], record_id, .big);
+    var be: [32]u8 = undefined;
+    std.mem.writeInt(u256, &be, record_id, .big);
     @memcpy(preimage[RECORD_KEY_TAG.len..], &be);
     var out: [32]u8 = undefined;
     std.crypto.hash.sha3.Keccak256.hash(&preimage, &out, .{});
     return Hash{ .bytes = out };
+}
+
+pub const ZERO_RECORD_ID_HEX = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Storage spelling of a record id: fixed 66-char lowercase hex, so equality
+/// and the unlinked (`<> ZERO`) guard hold for any uint256.
+pub fn recordIdHex(record_id: u256, buf: *[66]u8) []const u8 {
+    return std.fmt.bufPrint(buf, "0x{x:0>64}", .{record_id}) catch unreachable;
+}
+
+/// Parse a stored (`0x…` hex) or replayed (decimal string) record id.
+pub fn parseRecordId(text: []const u8) ?u256 {
+    if (text.len == 0) return null;
+    if (std.mem.startsWith(u8, text, "0x") or std.mem.startsWith(u8, text, "0X")) {
+        return std.fmt.parseInt(u256, text[2..], 16) catch null;
+    }
+    return std.fmt.parseInt(u256, text, 10) catch null;
 }
 
 // ---------------------------------------------------------------------------
@@ -56,7 +75,7 @@ pub fn upsertResolverLink(
     protocol: models.Protocol,
     resolver: Address,
     namehash: Hash,
-    record_id: u64,
+    record_id: u256,
     name: []const u8,
     block_number: u64,
     tx_hash: Hash,
@@ -74,7 +93,8 @@ pub fn upsertResolverLink(
     try q.bindTextStatic(protocol.toString());
     try q.bindAddress(resolver);
     try q.bindHash(namehash);
-    try q.bindInt64(@intCast(record_id));
+    var id_buf: [66]u8 = undefined;
+    try q.bindText(recordIdHex(record_id, &id_buf));
     try q.bindHash(recordKey(record_id));
     try q.bindText(name);
     try q.bindInt64(@intCast(block_number));
@@ -86,7 +106,7 @@ pub fn upsertResolverLink(
 
 pub const ResolverLink = struct {
     /// 0 = explicitly unlinked (falls back to the default record on-chain).
-    record_id: u64,
+    record_id: u256,
     record_key: Hash,
     name: []u8,
     block_number: u64,
@@ -110,7 +130,7 @@ pub fn getResolverLink(db: *Database, resolver: Address, namehash: Hash) !?Resol
     const key = Hash.fromHex(q.getTextSlice(1) orelse return null) catch return null;
     const name = try db.allocator.dupe(u8, q.getTextSlice(2) orelse "");
     return ResolverLink{
-        .record_id = @intCast(@max(q.getInt64(0), 0)),
+        .record_id = parseRecordId(q.getTextSlice(0) orelse "") orelse 0,
         .record_key = key,
         .name = name,
         .block_number = @intCast(q.getInt64(3)),
@@ -134,7 +154,7 @@ pub fn resolveRecordKey(db: *Database, resolver: Address, namehash: Hash) !Hash 
     var zero_buf: [66]u8 = undefined;
     const zero_hex = Hash.zero.toHexBuf(&zero_buf);
     while (try q.step()) {
-        if (q.getInt64(1) == 0) continue;
+        if ((parseRecordId(q.getTextSlice(1) orelse "") orelse 0) == 0) continue;
         const row_nh = q.getTextSlice(0) orelse continue;
         const key = Hash.fromHex(q.getTextSlice(2) orelse continue) catch continue;
         if (std.mem.eql(u8, row_nh, zero_hex)) {
@@ -149,7 +169,7 @@ pub fn resolveRecordKey(db: *Database, resolver: Address, namehash: Hash) !Hash 
 
 /// The effective record id for (resolver, namehash) — own, else default — or
 /// null when the name resolves through no record (legacy or unlinked).
-pub fn getEffectiveRecordId(db: *Database, resolver: Address, namehash: Hash) !?u64 {
+pub fn getEffectiveRecordId(db: *Database, resolver: Address, namehash: Hash) !?u256 {
     var q = try Query.initCached(db,
         \\SELECT namehash, record_id FROM resolver_links
         \\WHERE resolver = ? AND namehash IN (?, ?)
@@ -158,18 +178,18 @@ pub fn getEffectiveRecordId(db: *Database, resolver: Address, namehash: Hash) !?
     try q.bindAddress(resolver);
     try q.bindHash(namehash);
     try q.bindHash(Hash.zero);
-    var own: ?u64 = null;
-    var default: ?u64 = null;
+    var own: ?u256 = null;
+    var default: ?u256 = null;
     var zero_buf: [66]u8 = undefined;
     const zero_hex = Hash.zero.toHexBuf(&zero_buf);
     while (try q.step()) {
-        const id = q.getInt64(1);
-        if (id <= 0) continue;
+        const id = parseRecordId(q.getTextSlice(1) orelse "") orelse 0;
+        if (id == 0) continue;
         const row_nh = q.getTextSlice(0) orelse continue;
         if (std.mem.eql(u8, row_nh, zero_hex)) {
-            default = @intCast(id);
+            default = id;
         } else {
-            own = @intCast(id);
+            own = id;
         }
     }
     if (namehash.isZero()) return default;
@@ -210,7 +230,7 @@ pub fn resolveRecordKeys(db: *Database, resolvers: []const Address, namehashes: 
 
         var sql: std.ArrayList(u8) = .empty;
         defer sql.deinit(db.allocator);
-        try sql.appendSlice(db.allocator, "SELECT resolver, namehash, record_id, record_key FROM resolver_links WHERE record_id <> 0 AND ((resolver, namehash) IN (");
+        try sql.appendSlice(db.allocator, "SELECT resolver, namehash, record_id, record_key FROM resolver_links WHERE record_id <> '" ++ ZERO_RECORD_ID_HEX ++ "' AND ((resolver, namehash) IN (");
         for (0..n) |i| {
             if (i > 0) try sql.appendSlice(db.allocator, ", ");
             try sql.appendSlice(db.allocator, "(?, ?)");
@@ -288,7 +308,7 @@ pub fn resolveRecordKeys(db: *Database, resolvers: []const Address, namehashes: 
 pub const LinkedName = struct {
     name: []u8,
     namehash: Hash,
-    record_id: u64,
+    record_id: u256,
     block_number: u64,
 
     pub fn deinit(self: *LinkedName, allocator: std.mem.Allocator) void {
@@ -298,7 +318,7 @@ pub const LinkedName = struct {
 
 /// Every name currently bound to `record_id` on `resolver` (the sharing view;
 /// the default-record binding to node 0x0 is included with its empty name).
-pub fn getLinkedNames(db: *Database, allocator: std.mem.Allocator, resolver: Address, record_id: u64) ![]LinkedName {
+pub fn getLinkedNames(db: *Database, allocator: std.mem.Allocator, resolver: Address, record_id: u256) ![]LinkedName {
     var q = try Query.initCached(db,
         \\SELECT name, namehash, record_id, block_number FROM resolver_links
         \\WHERE resolver = ? AND record_id = ?
@@ -306,7 +326,8 @@ pub fn getLinkedNames(db: *Database, allocator: std.mem.Allocator, resolver: Add
     );
     defer q.deinit();
     try q.bindAddress(resolver);
-    try q.bindInt64(@intCast(record_id));
+    var id_buf: [66]u8 = undefined;
+    try q.bindText(recordIdHex(record_id, &id_buf));
     var out: std.ArrayList(LinkedName) = .empty;
     errdefer {
         for (out.items) |*l| l.deinit(allocator);
@@ -319,7 +340,7 @@ pub fn getLinkedNames(db: *Database, allocator: std.mem.Allocator, resolver: Add
         try out.append(allocator, .{
             .name = name,
             .namehash = nh,
-            .record_id = @intCast(@max(q.getInt64(2), 0)),
+            .record_id = parseRecordId(q.getTextSlice(2) orelse "") orelse 0,
             .block_number = @intCast(q.getInt64(3)),
         });
     }
