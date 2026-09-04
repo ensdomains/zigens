@@ -13,6 +13,7 @@ const resolvers = @import("resolvers/resolvers.zig");
 /// GraphQL query handler for ENSv2 Indexer
 /// Provides subgraph-compatible GraphQL API
 const schema_validator_mod = @import("schema_validator.zig");
+const introspection_projection = @import("introspection_projection.zig");
 const query_validator = @import("query_validator.zig");
 
 pub const GraphQLHandler = struct {
@@ -212,10 +213,9 @@ pub const GraphQLHandler = struct {
                 break :intro; // multiple unnamed ops -> let the executor error
             };
             for (op.fields) |*f| {
-                if (std.mem.eql(u8, f.name, "__schema")) return try self.handleIntrospectionQuery();
-            }
-            for (op.fields) |*f| {
-                if (std.mem.eql(u8, f.name, "__type")) return try self.handleTypeIntrospectionQuery(f, variables);
+                if (std.mem.eql(u8, f.name, "__schema") or std.mem.eql(u8, f.name, "__type")) {
+                    return try self.handleIntrospectionRoots(op, &document, variables);
+                }
             }
         }
 
@@ -355,66 +355,71 @@ pub const GraphQLHandler = struct {
         return try self.allocator.dupe(u8, result);
     }
 
-    fn handleIntrospectionQuery(self: *GraphQLHandler) ![]u8 {
-        // Return GraphQL introspection response for autocomplete
-        // Generated from schema.graphql at build time
-        const introspection_response = @embedFile("introspection.json");
-        return try self.allocator.dupe(u8, introspection_response);
+    /// Answer every introspection root of the operation (`__schema`, `__type`,
+    /// `__typename`) under its alias, narrowed to the requested selection set —
+    /// see `introspection_projection`. Data fields mixed into the same operation
+    /// are not executed (introspection is intercepted before the executor).
+    fn handleIntrospectionRoots(self: *GraphQLHandler, op: *const parser.Operation, document: *const parser.Document, variables: ?std.json.Value) ![]u8 {
+        const schema = self.introspection_parsed.value.object.get("data").?.object.get("__schema").?;
+        const ctx = introspection_projection.Context{
+            .allocator = self.allocator,
+            .types = schema.object.get("types").?.array.items,
+            .fragments = document.fragments,
+        };
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "{\"data\":{");
+        var first = true;
+        for (op.fields) |*f| {
+            const is_schema = std.mem.eql(u8, f.name, "__schema");
+            const is_type = std.mem.eql(u8, f.name, "__type");
+            const is_typename = std.mem.eql(u8, f.name, "__typename");
+            if (!is_schema and !is_type and !is_typename) continue;
+
+            if (!first) try out.append(self.allocator, ',');
+            first = false;
+            const key = try std.json.Stringify.valueAlloc(self.allocator, f.alias orelse f.name, .{});
+            defer self.allocator.free(key);
+            try out.appendSlice(self.allocator, key);
+            try out.append(self.allocator, ':');
+
+            if (is_typename) {
+                try out.appendSlice(self.allocator, "\"Query\"");
+            } else if (is_schema) {
+                try introspection_projection.writeProjected(ctx, &out, schema, f.selections, "__Schema");
+            } else {
+                const type_name = resolveTypeNameArg(f, variables) orelse
+                    return try self.buildErrorResponseWithCode("Invalid __type query: missing name argument", ErrorCode.VALIDATION_ERROR);
+                const found = introspection_projection.findType(ctx, type_name) orelse std.json.Value.null;
+                try introspection_projection.writeProjected(ctx, &out, found, f.selections, "__Type");
+            }
+        }
+        try out.appendSlice(self.allocator, "}}");
+        return try out.toOwnedSlice(self.allocator);
     }
 
-    fn handleTypeIntrospectionQuery(self: *GraphQLHandler, field: *const parser.Field, variables: ?std.json.Value) ![]u8 {
-        // Read the requested type name from the parsed __type(name: ...) field. The literal
-        // form `__type(name: "Domain")` resolves via getStringArg; the variable form
-        // `__type(name: $name)` (used by the graphql-http conformance suite and by clients
-        // that parameterize introspection) is resolved here against the request variables.
-        const type_name = blk: {
-            if (parser.getStringArg(field, "name", null)) |literal| break :blk literal;
-            for (field.arguments) |*arg| {
-                if (!std.mem.eql(u8, arg.name, "name")) continue;
-                switch (arg.value) {
-                    .variable => |var_name| {
-                        if (variables) |vars| {
-                            if (vars == .object) {
-                                if (vars.object.get(var_name)) |jv| {
-                                    if (jv == .string) break :blk jv.string;
-                                }
+    /// The `name` argument of a `__type` field: literal form, or the variable
+    /// form resolved against the request variables (used by the graphql-http
+    /// conformance suite and by clients that parameterize introspection).
+    fn resolveTypeNameArg(field: *const parser.Field, variables: ?std.json.Value) ?[]const u8 {
+        if (parser.getStringArg(field, "name", null)) |literal| return literal;
+        for (field.arguments) |*arg| {
+            if (!std.mem.eql(u8, arg.name, "name")) continue;
+            switch (arg.value) {
+                .variable => |var_name| {
+                    if (variables) |vars| {
+                        if (vars == .object) {
+                            if (vars.object.get(var_name)) |jv| {
+                                if (jv == .string) return jv.string;
                             }
                         }
-                    },
-                    else => {},
-                }
-            }
-            return try self.buildErrorResponseWithCode("Invalid __type query: missing name argument", ErrorCode.VALIDATION_ERROR);
-        };
-
-        // Reuse the introspection parsed once at handler init (no per-request re-parse).
-        const parsed = self.introspection_parsed;
-
-        // Find the requested type
-        const types = parsed.value.object.get("data").?.object.get("__schema").?.object.get("types").?.array;
-
-        var found_type: ?std.json.Value = null;
-        for (types.items) |type_val| {
-            const name = type_val.object.get("name").?.string;
-            if (std.mem.eql(u8, name, type_name)) {
-                found_type = type_val;
-                break;
+                    }
+                },
+                else => {},
             }
         }
-
-        if (found_type == null) {
-            // Type not found - return null per GraphQL spec
-            return try self.allocator.dupe(u8, "{\"data\":{\"__type\":null}}");
-        }
-
-        // Serialize the type object to JSON
-        const type_json = std.json.Stringify.valueAlloc(self.allocator, found_type.?, .{}) catch {
-            return try self.buildErrorResponseWithCode("Failed to serialize type data", ErrorCode.INTERNAL_ERROR);
-        };
-        defer self.allocator.free(type_json);
-
-        // Build response
-        return try std.fmt.allocPrint(self.allocator, "{{\"data\":{{\"__type\":{s}}}}}", .{type_json});
+        return null;
     }
 
     const ErrorLocation = struct {
@@ -548,6 +553,51 @@ test "handleQuery: __schema inside a string argument is data, not introspection"
 
 test "handleQuery: operation named IntrospectionQuery still executes its data fields" {
     try expectQueryReturnsData("query IntrospectionQuery { domains(first:1){ id } }", "IntrospectionQuery");
+}
+
+fn introspect(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
+    var database = try db.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var handler = try GraphQLHandler.init(allocator, 10, 10000, false);
+    defer handler.deinit();
+    return try handler.handleQuery(&database, query, null, null, false);
+}
+
+test "introspection: __schema honours the selection set and expands queryType" {
+    const a = testing.allocator;
+    const result = try introspect(a, "{ __schema { queryType { fields { name } } } }");
+    defer a.free(result);
+    try testing.expect(std.mem.startsWith(u8, result, "{\"data\":{\"__schema\":{\"queryType\":{\"fields\":[{\"name\":\"domain\"}"));
+    try testing.expect(std.mem.indexOf(u8, result, "\"types\"") == null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"name\":\"roles\"") != null);
+}
+
+test "introspection: aliased __type lands under the alias and only carries requested fields" {
+    const a = testing.allocator;
+    const result = try introspect(a, "{ q: __type(name: \"EventFilter\") { name inputFields { name } } t: __typename }");
+    defer a.free(result);
+    try testing.expect(std.mem.startsWith(u8, result, "{\"data\":{\"q\":{\"name\":\"EventFilter\",\"inputFields\":[{\"name\":\"type\"}"));
+    try testing.expect(std.mem.indexOf(u8, result, "\"name\":\"resource\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"kind\"") == null);
+    try testing.expect(std.mem.endsWith(u8, result, ",\"t\":\"Query\"}}"));
+}
+
+test "introspection: GraphiQL-style fragments over __schema.types" {
+    const a = testing.allocator;
+    const result = try introspect(a, "query IntrospectionQuery { __schema { types { ...FullType } } } fragment FullType on __Type { kind name }");
+    defer a.free(result);
+    try testing.expect(std.mem.indexOf(u8, result, "{\"kind\":\"OBJECT\",\"name\":\"Query\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"fields\"") == null);
+}
+
+test "introspection: unknown __type is null and a missing name argument is a validation error" {
+    const a = testing.allocator;
+    const none = try introspect(a, "{ __type(name: \"Nope\") { name } }");
+    defer a.free(none);
+    try testing.expectEqualStrings("{\"data\":{\"__type\":null}}", none);
+    const bad = try introspect(a, "{ __type { name } }");
+    defer a.free(bad);
+    try testing.expect(std.mem.indexOf(u8, bad, "VALIDATION_ERROR") != null);
 }
 
 test "handleQuery: __type( inside a string argument is data, not introspection" {

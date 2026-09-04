@@ -396,6 +396,10 @@ test "conformance goldens" {
         .{ .name = "events_resource_root_trimmed", .query = "{ events(where: { resource: \"0x0\", contractAddress: \"0x7777777777777777777777777777777777777777\" }) { type blockNumber asEACRolesChanged { resource account newRoleBitmap } } }" },
         // Per-type list in the same family as labelRegistereds/expiryUpdateds.
         .{ .name = "events_eac_roles_changeds", .query = "{ eacRolesChangeds(first: 5, where: { contractAddress: \"0x7777777777777777777777777777777777777777\" }, orderBy: blockNumber, orderDirection: asc) { blockNumber asEACRolesChanged { resource account } } }" },
+        // --- introspection honours the selection set (was: canned whole document) ---
+        .{ .name = "introspection_query_type_fields", .query = "{ __schema { queryType { name fields { name } } mutationType { name } } }" },
+        .{ .name = "introspection_aliased_type", .query = "{ filter: __type(name: \"EventFilter\") { kind name inputFields { name type { kind name ofType { kind name } } } } __typename }" },
+        .{ .name = "introspection_fragments", .query = "query IntrospectionQuery { __schema { types { ...T } } } fragment T on __Type { kind name }" },
         // events(skip:) pages the plain list (was silently ignored).
         .{ .name = "events_skip", .query = "{ events(first: 1, skip: 1, where: { type: \"EACRolesChanged\", contractAddress: \"0x7777777777777777777777777777777777777777\" }, orderBy: blockNumber, orderDirection: asc) { blockNumber asEACRolesChanged { account } } }" },
         .{ .name = "pagination_skip", .query = "{ domains(first: 2, skip: 1, orderBy: createdAt, orderDirection: asc) { id name } }" },
