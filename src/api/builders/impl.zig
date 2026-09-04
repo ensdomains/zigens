@@ -457,8 +457,28 @@ const EventEntityConfig = json_builder.EntityConfig{
         .{ .name = "asExpiryUpdated", .handler = eventAsExpiryUpdatedHandler },
         .{ .name = "asResolverUpdated", .handler = eventAsResolverUpdatedHandler },
         .{ .name = "asLabelRegistered", .handler = eventAsLabelRegisteredHandler },
+        .{ .name = "asEACRolesChanged", .handler = eventAsEACRolesChangedHandler },
     },
 };
+
+fn eventAsEACRolesChangedHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    _ = field;
+    const event: *const models.Event = @ptrCast(@alignCast(ctx));
+    const allocator = nested_ctx.allocator;
+    if (!isEventType(event, "EACRolesChanged")) return try allocator.dupe(u8, "null");
+    const data = event.data;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '{');
+    var first = true;
+    try writeOptStringField(&out, allocator, &first, "resource", json_utils.extractStringField(data, "resource"));
+    try writeOptStringField(&out, allocator, &first, "account", json_utils.extractStringField(data, "account"));
+    try writeOptStringField(&out, allocator, &first, "oldRoleBitmap", json_utils.extractStringField(data, "oldRoleBitmap"));
+    try writeOptStringField(&out, allocator, &first, "newRoleBitmap", json_utils.extractStringField(data, "newRoleBitmap"));
+    try out.append(allocator, '}');
+    return try out.toOwnedSlice(allocator);
+}
 
 /// Build Event JSON with nested field selection support
 pub fn buildEventJson(

@@ -402,6 +402,10 @@ pub const EventFilterOptions = struct {
     data_json_owners: ?[]const []const u8 = null,
     /// Address involvement (owner OR from OR to in event data) — per-address history.
     involved: ?[]const u8 = null,
+    /// Exact match on `data.$.resource` (the EACRolesChanged payload), as the fixed
+    /// 66-char lowercase hex the indexer stores — the value exactly as emitted, EAC
+    /// version bits included. Hits idx_events_resource_extracted.
+    resource: ?[]const u8 = null,
     // Expiry filters - uses json_extract(data, '$.expiration')
     expiry_gt: ?i64 = null,
     expiry_gte: ?i64 = null,
@@ -527,6 +531,13 @@ fn appendEventScalarConditions(
         try allocated_clauses.append(db.allocator, clause);
         try conditions.append(db.allocator, clause);
     }
+    if (filter.resource != null) {
+        const resource_expr = try db.dialect().jsonExtract(db.allocator, "data", "resource", null);
+        defer db.allocator.free(resource_expr);
+        const clause = try std.fmt.allocPrint(db.allocator, "{s} = ?", .{resource_expr});
+        try allocated_clauses.append(db.allocator, clause);
+        try conditions.append(db.allocator, clause);
+    }
     // Registration-style expiry filter (V2: data.$.expiry; V1: timestamp + data.$.duration).
     if (filter.expiry_gt != null or filter.expiry_gte != null or filter.expiry_lt != null or filter.expiry_lte != null) {
         const expiry_expr = try expirySortExpr(db, false); // filter omits the $.expiration fallback
@@ -629,6 +640,7 @@ fn bindEventScalars(q: *Query, filter: EventFilterOptions) !void {
         try q.bindText(v);
         try q.bindText(v);
     }
+    if (filter.resource) |r| try q.bindText(r);
     if (filter.expiry_gt) |v| try q.bindInt64(v);
     if (filter.expiry_gte) |v| try q.bindInt64(v);
     if (filter.expiry_lt) |v| try q.bindInt64(v);

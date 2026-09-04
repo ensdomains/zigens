@@ -925,8 +925,9 @@ pub fn handleTokenRegenerated(self: *Indexer, protocol: models.Protocol, log: rp
         try self.database.updateNameTokenIdByNamehash(namehash, new_token_id);
         std.log.debug("Updated token_id in database: {d} -> {d} for {s}", .{ old_token_id, new_token_id, name_str });
 
-        // Note: eac_roles.resource stores canonical_id (version-stripped), so it remains
-        // stable across TokenRegenerated events — no update needed.
+        // Note: eac_roles.resource carries the EAC version (bumped on unregister /
+        // re-register), not the token version, so TokenRegenerated leaves it
+        // untouched — no update needed.
 
         // Update approvals.token_id from old to new (scoped by registry)
         // Approvals are tied to specific token versions, so they must be updated.
@@ -1056,8 +1057,9 @@ pub fn handleApproval(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !
 
 /// Handle EACRolesChanged event from registry contracts.
 ///
-/// Registry resources are ENS token ids (canonical_id | 32-bit version), so we
-/// strip the version bits to a stable canonical_id. See `handleEACRolesChangedImpl`.
+/// Registry resources are `canonical_id | uint32(eacVersionId)`; they are stored
+/// verbatim and only the name lookup keys on the canonical id. See
+/// `handleEACRolesChangedImpl`.
 /// EACRolesChanged(uint256 indexed resource, address indexed account, uint256 oldRoleBitmap, uint256 newRoleBitmap)
 pub fn handleEACRolesChanged(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     try handleEACRolesChangedImpl(self, protocol, log, false);
@@ -1065,15 +1067,17 @@ pub fn handleEACRolesChanged(self: *Indexer, protocol: models.Protocol, log: rpc
 
 /// Handle EACRolesChanged event, branching on the emitting contract kind.
 ///
-/// `is_resolver` controls how the indexed `resource` is interpreted:
-///   - Registry (is_resolver = false): `resource` is a token id of the form
-///     `canonical_id | uint32(version)`. The lower 32 version bits are stripped
-///     to `canonical_id` so the resource stays stable across TokenRegenerated.
+/// The indexed `resource` is stored EXACTLY as emitted for both kinds:
+///   - Registry (is_resolver = false): `resource` is `canonical_id |
+///     uint32(eacVersionId)` (PermissionedRegistry._constructResource). The low
+///     32 bits are the EAC version, bumped on unregister and on re-registering an
+///     expired label — a re-registered name therefore gets a fresh resource and
+///     the previous owner's grants stop matching, which is what makes stale
+///     grants drop out on-chain. Keeping the bits preserves that; the canonical
+///     id is used only to attribute the event to a name.
 ///   - Resolver (is_resolver = true): `resource` is either ROOT_RESOURCE (0) or
 ///     `uint256(keccak256(abi.encode(node, part)))` (see PermissionedResolverLib
-///     in contracts-v2). This is a full-entropy hash with NO version bits, so it
-///     must be stored verbatim — stripping the low 32 bits would corrupt it into
-///     a value that exists nowhere on-chain (WEB-511 Bug A).
+///     in contracts-v2), a full-entropy hash with no version bits.
 pub fn handleEACRolesChangedImpl(self: *Indexer, protocol: models.Protocol, log: rpc.Log, is_resolver: bool) !void {
     // Event: EACRolesChanged(uint256 indexed resource, address indexed account, uint256 oldRoleBitmap, uint256 newRoleBitmap)
     // topics[0] = event signature
@@ -1098,14 +1102,11 @@ pub fn handleEACRolesChangedImpl(self: *Indexer, protocol: models.Protocol, log:
     const old_role_bitmap = data_values[0].uint256;
     const new_role_bitmap = data_values[1].uint256;
 
-    // Resolve the stored resource id: resolver = verbatim keccak256(node,part)/ROOT,
-    // registry = version-stripped token id (see token_id.resolveStoredResource).
     const token_id_utils = @import("../../types/token_id.zig");
-    const stored_resource: u256 = token_id_utils.resolveStoredResource(resource_uint, is_resolver);
 
-    // Convert resource to hex string for storage
+    // Convert resource to hex string for storage (verbatim, version bits included)
     var resource_bytes: [32]u8 = undefined;
-    std.mem.writeInt(u256, &resource_bytes, stored_resource, .big);
+    std.mem.writeInt(u256, &resource_bytes, resource_uint, .big);
     const resource_hex_chars = std.fmt.bytesToHex(resource_bytes, .lower);
     const resource_hex = try std.fmt.allocPrint(self.allocator, "0x{s}", .{resource_hex_chars});
     defer self.allocator.free(resource_hex);
@@ -1183,7 +1184,7 @@ pub fn handleEACRolesChangedImpl(self: *Indexer, protocol: models.Protocol, log:
     var namehash_opt: ?Hash = null;
 
     if (!is_resolver) {
-        const maybe_name = try self.database.getNameByTokenIdAndRegistry(stored_resource, log.address);
+        const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id_utils.resourceCanonicalId(resource_uint), log.address);
         if (maybe_name) |name| {
             name_str_opt = if (name.name) |n| try self.allocator.dupe(u8, n) else null;
             namehash_opt = name.namehash;

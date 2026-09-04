@@ -37,6 +37,7 @@ pub const resolveFusesSets = event.resolveFusesSets;
 pub const resolveExpiryUpdateds = event.resolveExpiryUpdateds;
 pub const resolveResolverUpdateds = event.resolveResolverUpdateds;
 pub const resolveLabelRegistereds = event.resolveLabelRegistereds;
+pub const resolveEACRolesChangeds = event.resolveEACRolesChangeds;
 pub const resolveReverseClaimeds = event.resolveReverseClaimeds;
 pub const resolveRegistryTransfers = event.resolveRegistryTransfers;
 

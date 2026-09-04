@@ -68,6 +68,10 @@ fn parseEventWhereArgs(where_args: []const parser.Argument, allocator: std.mem.A
             opts.protocol = models.Protocol.fromString(a.value.string) catch return error.InvalidProtocol;
             continue;
         }
+        if (std.mem.eql(u8, a.name, "resource") and a.value == .string) {
+            opts.resource = (try common.normalizeResourceHex(allocator, a.value.string)) orelse return error.InvalidResource;
+            continue;
+        }
         _ = common.matchStringArg(a, "type", &opts.event_type) or
             common.matchStringArg(a, "type_not", &opts.event_type_not) or
             common.matchStringArg(a, "domain", &opts.domain) or
@@ -357,6 +361,7 @@ pub const resolveFusesSets = perTypeEventResolver("FusesSet");
 pub const resolveExpiryUpdateds = perTypeEventResolver("ExpiryUpdated");
 pub const resolveResolverUpdateds = perTypeEventResolver("ResolverUpdated");
 pub const resolveLabelRegistereds = perTypeEventResolver("LabelRegistered");
+pub const resolveEACRolesChangeds = perTypeEventResolver("EACRolesChanged");
 pub const resolveReverseClaimeds = perTypeEventResolver("ReverseClaimed");
 pub const resolveRegistryTransfers = perTypeEventResolver("RegistryTransfer");
 
@@ -380,14 +385,15 @@ fn resolveEventsWithForced(ctx: parser.ExecutionContext, field: *const parser.Fi
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
     const allocator = ctx.allocator;
 
-    const first = (try common.parsePagination(field, 100)).first;
+    const pagination_args = try common.parsePagination(field, 100);
 
     // Parse EventFilter (incl. recursive and/or boolean tree).
     var filter_opts = if (common.getObjectArg(field, "where")) |where_args|
         try parseEventWhereArgs(where_args, allocator)
     else
         db.EventFilterOptions{};
-    filter_opts.limit = first;
+    filter_opts.limit = pagination_args.first;
+    filter_opts.skip = pagination_args.skip;
 
     // Subgraph-parity per-type top-level queries (transfers, textChangeds, …)
     // inject a fixed event_type that overrides any client-set `where.type`.
