@@ -532,6 +532,7 @@ pub fn handleMetrics(self: *Server, conn: http_util.Conn) !void {
     const writer = &response.writer;
     try writer.print(
         "HTTP/1.1 200 OK\r\n" ++
+            "Connection: close\r\n" ++
             "Content-Type: text/plain; version=0.0.4\r\n" ++
             "Content-Length: {d}\r\n" ++
             "\r\n" ++
@@ -860,6 +861,7 @@ pub fn handleGraphQLPlayground(self: *Server, conn: http_util.Conn) !void {
     const writer = &response.writer;
     try writer.print(
         "HTTP/1.1 200 OK\r\n" ++
+            "Connection: close\r\n" ++
             "Content-Type: text/html\r\n" ++
             "Content-Length: {d}\r\n" ++
             "Access-Control-Allow-Origin: *\r\n" ++
