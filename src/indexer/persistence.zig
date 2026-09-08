@@ -130,6 +130,9 @@ pub fn insertName(self: *Indexer, name: models.Name) !void {
             break :blk n.is_reachable;
         };
     }
+    // A direct upsert supersedes any owner/resolver update still buffered
+    // for this row (burn + re-register within one batch).
+    self.write_buffer.discardPendingName(n.namehash);
     try self.database.insertName(n);
 }
 

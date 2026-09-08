@@ -14,6 +14,8 @@ comptime {
     _ = @import("types/token_id.zig");
     _ = @import("indexer/replay.zig");
     _ = @import("indexer/discovery_backfill.zig");
+    _ = @import("indexer/placeholders.zig");
+    _ = @import("indexer/write_buffer.zig");
     _ = @import("indexer/cdp_intake.zig");
     _ = @import("indexer/sync_watchdog.zig");
 }

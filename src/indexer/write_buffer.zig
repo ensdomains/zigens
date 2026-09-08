@@ -16,6 +16,8 @@ const Database = @import("../storage/database.zig").Database;
 const names_storage = @import("../storage/names.zig");
 const events_storage = @import("../storage/events.zig");
 const roles_storage = @import("../storage/roles.zig");
+const bulk_entities = @import("../storage/bulk_entities.zig");
+const placeholders_mod = @import("placeholders.zig");
 const ens_normalize = @import("../utils/ens_normalize.zig");
 
 /// Safely convert u64 expiry to i64 for SQLite storage.
@@ -49,8 +51,25 @@ pub const WriteBuffer = struct {
     /// with the batch's LAST block and break mid-batch fork restoration.
     roles: std.StringHashMap(BufferedRole),
 
+    /// V2 entity writes that used to cost one round trip per event, buffered
+    /// under the same DISARMED-cursor invariant as `roles` (all four tables
+    /// are capture-protected). Insertion order is kept so serial ids land in
+    /// chain order, exactly as the per-event writes assigned them.
+    registrations: std.ArrayList(BufferedRegistration),
+    registration_keys: std.StringHashMap(void),
+    /// Registrar economics per (protocol, namehash): the last write wins and
+    /// is applied by namehash at flush, which is what the per-event UPDATE
+    /// already did (older rows of a re-registered name included).
+    economics: std.StringHashMap(BufferedEconomics),
+    resolver_entities: std.ArrayList(BufferedResolverEntity),
+    resolver_entity_keys: std.StringHashMap(void),
+    accounts: std.ArrayList(BufferedAccount),
+    account_index: std.StringHashMap(usize),
     /// Whether the buffer is currently active (handlers should use buffer vs direct DB).
     active: bool,
+    /// Placeholder ledger to re-note events that land with a placeholder
+    /// name after the flush repair (set by the driver alongside `active`).
+    ledger: ?*placeholders_mod.PlaceholderLedger = null,
 
     pub const BufferedRole = struct {
         protocol: models.Protocol,
@@ -64,6 +83,53 @@ pub const WriteBuffer = struct {
         block_number: u64,
         tx_hash: Hash,
         log_index: u32,
+    };
+
+    pub const BufferedRegistration = struct {
+        protocol: models.Protocol,
+        namehash: Hash,
+        /// Owned.
+        label: []const u8,
+        /// Owned.
+        parent_name: []const u8,
+        registrant: Address,
+        registered_at: i64,
+        expiry: ?u64,
+        block_number: u64,
+        tx_hash: Hash,
+        log_index: u32,
+        event_type: models.EventType,
+    };
+
+    pub const BufferedEconomics = struct {
+        protocol: models.Protocol,
+        namehash: Hash,
+        /// Owned.
+        label_name: []const u8,
+        base_cost: u256,
+        premium: u256,
+        referrer: ?Hash,
+    };
+
+    pub const BufferedResolverEntity = struct {
+        protocol: models.Protocol,
+        /// Owned.
+        address: []const u8,
+        /// Owned.
+        name: []const u8,
+        /// Owned.
+        namehash: []const u8,
+        block_number: u64,
+        timestamp: i64,
+    };
+
+    pub const BufferedAccount = struct {
+        /// Owned; also the index key.
+        address: []const u8,
+        seen_v1: bool,
+        seen_v2: bool,
+        first_seen_block: u64,
+        first_seen_timestamp: i64,
     };
 
     pub const BufferedName = struct {
@@ -99,6 +165,13 @@ pub const WriteBuffer = struct {
             .names = std.AutoHashMap([32]u8, BufferedName).init(allocator),
             .events = .empty,
             .roles = std.StringHashMap(BufferedRole).init(allocator),
+            .registrations = .empty,
+            .registration_keys = std.StringHashMap(void).init(allocator),
+            .economics = std.StringHashMap(BufferedEconomics).init(allocator),
+            .resolver_entities = .empty,
+            .resolver_entity_keys = std.StringHashMap(void).init(allocator),
+            .accounts = .empty,
+            .account_index = std.StringHashMap(usize).init(allocator),
             .active = false,
         };
     }
@@ -108,6 +181,13 @@ pub const WriteBuffer = struct {
         self.names.deinit();
         self.events.deinit(self.allocator);
         self.roles.deinit();
+        self.registrations.deinit(self.allocator);
+        self.registration_keys.deinit();
+        self.economics.deinit();
+        self.resolver_entities.deinit(self.allocator);
+        self.resolver_entity_keys.deinit();
+        self.accounts.deinit(self.allocator);
+        self.account_index.deinit();
     }
 
     pub fn reset(self: *WriteBuffer) void {
@@ -115,6 +195,13 @@ pub const WriteBuffer = struct {
         self.names.clearRetainingCapacity();
         self.events.clearRetainingCapacity();
         self.roles.clearRetainingCapacity();
+        self.registrations.clearRetainingCapacity();
+        self.registration_keys.clearRetainingCapacity();
+        self.economics.clearRetainingCapacity();
+        self.resolver_entities.clearRetainingCapacity();
+        self.resolver_entity_keys.clearRetainingCapacity();
+        self.accounts.clearRetainingCapacity();
+        self.account_index.clearRetainingCapacity();
     }
 
     fn freeAll(self: *WriteBuffer) void {
@@ -137,6 +224,26 @@ pub const WriteBuffer = struct {
             if (entry.value_ptr.role_bitmap) |b| self.allocator.free(b);
             self.allocator.free(entry.key_ptr.*);
         }
+        for (self.registrations.items) |r| {
+            self.allocator.free(r.label);
+            self.allocator.free(r.parent_name);
+        }
+        var rk = self.registration_keys.keyIterator();
+        while (rk.next()) |k| self.allocator.free(k.*);
+        var eit = self.economics.iterator();
+        while (eit.next()) |entry| {
+            self.allocator.free(entry.value_ptr.label_name);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        for (self.resolver_entities.items) |r| {
+            self.allocator.free(r.address);
+            self.allocator.free(r.name);
+            self.allocator.free(r.namehash);
+        }
+        var rek = self.resolver_entity_keys.keyIterator();
+        while (rek.next()) |k| self.allocator.free(k.*);
+        for (self.accounts.items) |a| self.allocator.free(a.address);
+        // account_index keys alias the account address strings freed above.
     }
 
     // ========================================================================
@@ -409,6 +516,122 @@ pub const WriteBuffer = struct {
     // FLUSH — Write all buffered data to database
     // ========================================================================
 
+    /// A direct write to the names row just happened (insert/upsert/delete):
+    /// updates buffered BEFORE it are superseded by what the direct writer
+    /// wrote, so drop them — otherwise a burn + re-register in one batch
+    /// would flush a stale owner over the new row. Buffered INSERTs (V1
+    /// bulk) are untouched.
+    pub fn discardPendingName(self: *WriteBuffer, namehash: Hash) void {
+        const entry = self.names.getPtr(namehash.bytes) orelse return;
+        if (entry.is_new) return;
+        _ = self.names.remove(namehash.bytes);
+    }
+
+    // ========================================================================
+    // ENTITY OPERATIONS (V2, disarmed-cursor batches only)
+    // ========================================================================
+
+    /// Buffer a registrations row (conflict key protocol, tx, log_index;
+    /// duplicates are dropped like the conflict-ignoring insert would).
+    pub fn addRegistration(self: *WriteBuffer, row: bulk_entities.RegistrationRow) !void {
+        var tx_buf: [66]u8 = undefined;
+        const key = try std.fmt.allocPrint(self.allocator, "{s}|{s}|{d}", .{ row.protocol.toString(), row.tx_hash.toHexBuf(&tx_buf), row.log_index });
+        errdefer self.allocator.free(key);
+        const gop = try self.registration_keys.getOrPut(key);
+        if (gop.found_existing) {
+            self.allocator.free(key);
+            return;
+        }
+        const label = try self.allocator.dupe(u8, row.label);
+        errdefer self.allocator.free(label);
+        const parent = try self.allocator.dupe(u8, row.parent_name);
+        errdefer self.allocator.free(parent);
+        try self.registrations.append(self.allocator, .{
+            .protocol = row.protocol,
+            .namehash = row.namehash,
+            .label = label,
+            .parent_name = parent,
+            .registrant = row.registrant,
+            .registered_at = row.registered_at,
+            .expiry = row.expiry,
+            .block_number = row.block_number,
+            .tx_hash = row.tx_hash,
+            .log_index = row.log_index,
+            .event_type = row.event_type,
+        });
+    }
+
+    /// Buffer registrar economics for (protocol, namehash); last write wins.
+    pub fn setEconomics(self: *WriteBuffer, protocol: models.Protocol, namehash: Hash, label_name: []const u8, base_cost: u256, premium: u256, referrer: ?Hash) !void {
+        var nh_buf: [66]u8 = undefined;
+        const key = try std.fmt.allocPrint(self.allocator, "{s}|{s}", .{ protocol.toString(), namehash.toHexBuf(&nh_buf) });
+        errdefer self.allocator.free(key);
+        const label_dup = try self.allocator.dupe(u8, label_name);
+        errdefer self.allocator.free(label_dup);
+        const gop = try self.economics.getOrPut(key);
+        if (gop.found_existing) {
+            self.allocator.free(key);
+            self.allocator.free(gop.value_ptr.label_name);
+        }
+        gop.value_ptr.* = .{
+            .protocol = protocol,
+            .namehash = namehash,
+            .label_name = label_dup,
+            .base_cost = base_cost,
+            .premium = premium,
+            .referrer = referrer,
+        };
+    }
+
+    /// Buffer a Resolver entity binding; the first sighting per
+    /// (protocol, namehash, address) wins, like the conflict-ignoring insert.
+    pub fn addResolverEntity(self: *WriteBuffer, protocol: models.Protocol, address: []const u8, namehash: []const u8, name: []const u8, block_number: u64, timestamp: i64) !void {
+        const key = try std.fmt.allocPrint(self.allocator, "{s}|{s}|{s}", .{ protocol.toString(), namehash, address });
+        errdefer self.allocator.free(key);
+        const gop = try self.resolver_entity_keys.getOrPut(key);
+        if (gop.found_existing) {
+            self.allocator.free(key);
+            return;
+        }
+        const address_dup = try self.allocator.dupe(u8, address);
+        errdefer self.allocator.free(address_dup);
+        const name_dup = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_dup);
+        const namehash_dup = try self.allocator.dupe(u8, namehash);
+        errdefer self.allocator.free(namehash_dup);
+        try self.resolver_entities.append(self.allocator, .{
+            .protocol = protocol,
+            .address = address_dup,
+            .name = name_dup,
+            .namehash = namehash_dup,
+            .block_number = block_number,
+            .timestamp = timestamp,
+        });
+    }
+
+    /// Buffer an account observation, merging like the upsert does (seen
+    /// flags OR, first-seen MIN).
+    pub fn observeAccount(self: *WriteBuffer, protocol: models.Protocol, address: []const u8, block_number: u64, timestamp: i64) !void {
+        if (self.account_index.get(address)) |idx| {
+            const a = &self.accounts.items[idx];
+            if (protocol == .v1) a.seen_v1 = true else a.seen_v2 = true;
+            if (block_number < a.first_seen_block) a.first_seen_block = block_number;
+            if (timestamp < a.first_seen_timestamp) a.first_seen_timestamp = timestamp;
+            return;
+        }
+        const address_dup = try self.allocator.dupe(u8, address);
+        errdefer self.allocator.free(address_dup);
+        try self.accounts.append(self.allocator, .{
+            .address = address_dup,
+            .seen_v1 = protocol == .v1,
+            .seen_v2 = protocol == .v2,
+            .first_seen_block = block_number,
+            .first_seen_timestamp = timestamp,
+        });
+        errdefer _ = self.accounts.pop();
+        try self.account_index.put(address_dup, self.accounts.items.len - 1);
+    }
+
     pub fn flush(self: *WriteBuffer, db: *Database) !void {
         const timer = zsys.milliTimestamp();
         var names_inserted: usize = 0;
@@ -425,6 +648,13 @@ pub const WriteBuffer = struct {
         // Postgres the per-row round trips dominated the flush.
         var new_names: std.ArrayList(models.Name) = .empty;
         defer new_names.deinit(self.allocator);
+        // Owner-/resolver-only updates to existing rows (the V2 bulk shape:
+        // mint Transfer + ResolverUpdated per registration) go out as one
+        // multi-row statement per column instead of one per name.
+        var owner_rows: std.ArrayList(bulk_entities.NameAddressUpdate) = .empty;
+        defer owner_rows.deinit(self.allocator);
+        var resolver_rows: std.ArrayList(bulk_entities.NameAddressUpdate) = .empty;
+        defer resolver_rows.deinit(self.allocator);
 
         var it = self.names.iterator();
         while (it.next()) |entry| {
@@ -437,6 +667,15 @@ pub const WriteBuffer = struct {
             } else {
                 // Apply individual updates to existing DB record
                 const namehash = Hash{ .bytes = entry.key_ptr.* };
+                const address_only = bn.migrated_to == null and bn.expiry == null and bn.wrapper_state == null and
+                    !bn.unwrap and bn.fuses_update == null and bn.wrapper_expiry_update == null and
+                    (bn.owner != null or bn.resolver != null);
+                if (address_only) {
+                    if (bn.owner) |owner| try owner_rows.append(self.allocator, .{ .namehash = namehash, .value = owner });
+                    if (bn.resolver) |resolver| try resolver_rows.append(self.allocator, .{ .namehash = namehash, .value = resolver });
+                    names_updated += 1;
+                    continue;
+                }
 
                 // Unwrap must come before other wrapper updates
                 if (bn.unwrap) {
@@ -501,6 +740,18 @@ pub const WriteBuffer = struct {
             op_count[0] += new_names.items.len;
             names_inserted = new_names.items.len;
         }
+        if (owner_rows.items.len > 0) {
+            const t0 = zsys.nanoTimestamp();
+            try bulk_entities.updateNameAddressColumnBatch(db, .owner, owner_rows.items);
+            op_ns[3] += zsys.nanoTimestamp() - t0;
+            op_count[3] += owner_rows.items.len;
+        }
+        if (resolver_rows.items.len > 0) {
+            const t0 = zsys.nanoTimestamp();
+            try bulk_entities.updateNameAddressColumnBatch(db, .resolver, resolver_rows.items);
+            op_ns[5] += zsys.nanoTimestamp() - t0;
+            op_count[5] += resolver_rows.items.len;
+        }
         names_ms = zsys.milliTimestamp() - timer;
 
         // 1b. Flush EAC roles — one deduped multi-row upsert (the map already
@@ -549,6 +800,80 @@ pub const WriteBuffer = struct {
                 role_upserts = upserts.items.len;
             }
         }
+
+        // 1c. Registrations in chain order (serial ids match the per-event
+        // path), then the registrar economics by (protocol, namehash), then
+        // Resolver entity bindings and account observations — each one
+        // conflict-merging multi-row statement per chunk.
+        const entities_timer = zsys.milliTimestamp();
+        if (self.registrations.items.len > 0) {
+            std.mem.sort(BufferedRegistration, self.registrations.items, {}, struct {
+                fn lessThan(_: void, a: BufferedRegistration, b: BufferedRegistration) bool {
+                    if (a.block_number != b.block_number) return a.block_number < b.block_number;
+                    return a.log_index < b.log_index;
+                }
+            }.lessThan);
+            var rows: std.ArrayList(bulk_entities.RegistrationRow) = .empty;
+            defer rows.deinit(self.allocator);
+            try rows.ensureTotalCapacity(self.allocator, self.registrations.items.len);
+            for (self.registrations.items) |r| rows.appendAssumeCapacity(.{
+                .protocol = r.protocol,
+                .namehash = r.namehash,
+                .label = r.label,
+                .parent_name = r.parent_name,
+                .registrant = r.registrant,
+                .registered_at = r.registered_at,
+                .expiry = r.expiry,
+                .block_number = r.block_number,
+                .tx_hash = r.tx_hash,
+                .log_index = r.log_index,
+                .event_type = r.event_type,
+            });
+            try bulk_entities.insertRegistrationsBatch(db, rows.items);
+        }
+        if (self.economics.count() > 0) {
+            var rows: std.ArrayList(bulk_entities.EconomicsRow) = .empty;
+            defer rows.deinit(self.allocator);
+            try rows.ensureTotalCapacity(self.allocator, self.economics.count());
+            var eit = self.economics.valueIterator();
+            while (eit.next()) |e| rows.appendAssumeCapacity(.{
+                .protocol = e.protocol,
+                .namehash = e.namehash,
+                .label_name = e.label_name,
+                .base_cost = e.base_cost,
+                .premium = e.premium,
+                .referrer = e.referrer,
+            });
+            try bulk_entities.updateRegistrationEconomicsBatch(db, rows.items);
+        }
+        if (self.resolver_entities.items.len > 0) {
+            var rows: std.ArrayList(bulk_entities.ResolverEntityRow) = .empty;
+            defer rows.deinit(self.allocator);
+            try rows.ensureTotalCapacity(self.allocator, self.resolver_entities.items.len);
+            for (self.resolver_entities.items) |r| rows.appendAssumeCapacity(.{
+                .protocol = r.protocol,
+                .address = r.address,
+                .name = r.name,
+                .namehash = r.namehash,
+                .block_number = r.block_number,
+                .timestamp = r.timestamp,
+            });
+            try bulk_entities.upsertResolverEntitiesBatch(db, rows.items);
+        }
+        if (self.accounts.items.len > 0) {
+            var rows: std.ArrayList(bulk_entities.AccountRow) = .empty;
+            defer rows.deinit(self.allocator);
+            try rows.ensureTotalCapacity(self.allocator, self.accounts.items.len);
+            for (self.accounts.items) |a| rows.appendAssumeCapacity(.{
+                .address = a.address,
+                .seen_v1 = a.seen_v1,
+                .seen_v2 = a.seen_v2,
+                .first_seen_block = a.first_seen_block,
+                .first_seen_timestamp = a.first_seen_timestamp,
+            });
+            try bulk_entities.upsertAccountsBatch(db, rows.items);
+        }
+        const entities_ms = zsys.milliTimestamp() - entities_timer;
 
         // 2. Repair placeholder-named buffered events before they land: the
         // mid-batch placeholder→real patch (updatePlaceholderEventsByName)
@@ -602,6 +927,14 @@ pub const WriteBuffer = struct {
             }
         }
 
+        // Events still carrying a placeholder name land as such: keep the
+        // ledger a superset of what is on disk.
+        if (self.ledger) |ledger| {
+            for (self.events.items) |event| {
+                if (event.name) |n| ledger.noteName(n) catch {};
+            }
+        }
+
         // 3. Flush events — one multi-row conflict-ignoring INSERT per chunk.
         const events_timer = zsys.milliTimestamp();
         try events_storage.insertEventsBatch(db, self.events.items);
@@ -609,7 +942,8 @@ pub const WriteBuffer = struct {
         const wal_after = db.walFileSize() orelse wal_before;
 
         const elapsed = zsys.milliTimestamp() - timer;
-        if (self.events.items.len > 0 or names_inserted > 0 or names_updated > 0 or role_upserts > 0 or role_deletes > 0) {
+        const entity_rows = self.registrations.items.len + self.economics.count() + self.resolver_entities.items.len + self.accounts.items.len;
+        if (self.events.items.len > 0 or names_inserted > 0 or names_updated > 0 or role_upserts > 0 or role_deletes > 0 or entity_rows > 0) {
             if (names_ms > 5000) {
                 const op_labels = [8][]const u8{ "ins", "unwrap", "wrapstate", "owner", "expiry", "resolver", "fuses", "wrapexp" };
                 for (op_labels, 0..) |label, i| {
@@ -618,14 +952,19 @@ pub const WriteBuffer = struct {
                     }
                 }
             }
-            std.log.info("  Buffer flush: {d} events, {d} name inserts, {d} name updates, {d} role upserts, {d} role deletes in {d}ms (names={d}ms events={d}ms wal+={d}MB)", .{
+            std.log.info("  Buffer flush: {d} events, {d} name inserts, {d} name updates, {d} role upserts, {d} role deletes, {d} registrations, {d} economics, {d} resolver entities, {d} accounts in {d}ms (names={d}ms entities={d}ms events={d}ms wal+={d}MB)", .{
                 self.events.items.len,
                 names_inserted,
                 names_updated,
                 role_upserts,
                 role_deletes,
+                self.registrations.items.len,
+                self.economics.count(),
+                self.resolver_entities.items.len,
+                self.accounts.items.len,
                 elapsed,
                 names_ms,
+                entities_ms,
                 events_ms,
                 (wal_after -| wal_before) / (1024 * 1024),
             });
@@ -674,3 +1013,69 @@ pub const WriteBuffer = struct {
         name.v1_label_hash = null;
     }
 };
+
+const testing = std.testing;
+
+fn testAddr(n: u8) Address {
+    var a: Address = .{ .bytes = [_]u8{0} ** 20 };
+    a.bytes[19] = n;
+    return a;
+}
+
+test "entity buffers dedupe and merge like the per-event writers" {
+    var wb = WriteBuffer.init(testing.allocator);
+    defer wb.deinit();
+    const nh = Hash{ .bytes = [_]u8{7} ** 32 };
+    const tx = Hash{ .bytes = [_]u8{9} ** 32 };
+
+    // registrations: conflict key (protocol, tx, log_index) — a duplicate is dropped
+    const row = bulk_entities.RegistrationRow{ .protocol = .v2, .namehash = nh, .label = "a", .parent_name = "eth", .registrant = testAddr(1), .registered_at = 1, .expiry = 2, .block_number = 10, .tx_hash = tx, .log_index = 3, .event_type = .label_registered };
+    try wb.addRegistration(row);
+    try wb.addRegistration(row);
+    try testing.expectEqual(@as(usize, 1), wb.registrations.items.len);
+    try testing.expectEqualStrings("a", wb.registrations.items[0].label);
+
+    // economics: last write wins per (protocol, namehash)
+    try wb.setEconomics(.v2, nh, "a", 100, 5, null);
+    try wb.setEconomics(.v2, nh, "a", 200, 7, tx);
+    try testing.expectEqual(@as(u32, 1), wb.economics.count());
+    var eit = wb.economics.valueIterator();
+    const econ = eit.next().?;
+    try testing.expectEqual(@as(u256, 200), econ.base_cost);
+    try testing.expect(econ.referrer != null);
+
+    // resolver entities: first sighting wins
+    try wb.addResolverEntity(.v2, "0xaa", "0x07", "a.eth", 10, 100);
+    try wb.addResolverEntity(.v2, "0xaa", "0x07", "a.eth", 11, 101);
+    try testing.expectEqual(@as(usize, 1), wb.resolver_entities.items.len);
+    try testing.expectEqual(@as(u64, 10), wb.resolver_entities.items[0].block_number);
+
+    // accounts: seen flags OR, first-seen MIN
+    try wb.observeAccount(.v2, "0x01", 20, 2000);
+    try wb.observeAccount(.v1, "0x01", 10, 1000);
+    try wb.observeAccount(.v2, "0x02", 30, 3000);
+    try testing.expectEqual(@as(usize, 2), wb.accounts.items.len);
+    try testing.expect(wb.accounts.items[0].seen_v1 and wb.accounts.items[0].seen_v2);
+    try testing.expectEqual(@as(u64, 10), wb.accounts.items[0].first_seen_block);
+    try testing.expectEqual(@as(i64, 1000), wb.accounts.items[0].first_seen_timestamp);
+
+    wb.reset();
+    try testing.expectEqual(@as(usize, 0), wb.accounts.items.len);
+    try testing.expectEqual(@as(u32, 0), wb.economics.count());
+}
+
+test "a direct row write discards buffered updates but not buffered inserts" {
+    var wb = WriteBuffer.init(testing.allocator);
+    defer wb.deinit();
+    const nh = Hash{ .bytes = [_]u8{1} ** 32 };
+    try wb.updateNameOwner(nh, testAddr(1));
+    try wb.updateNameResolver(nh, testAddr(2));
+    try testing.expectEqual(@as(u32, 1), wb.names.count());
+    wb.discardPendingName(nh);
+    try testing.expectEqual(@as(u32, 0), wb.names.count());
+
+    const rec = models.Name{ .name = "x.eth", .label = "x", .parent_name = "eth", .namehash = nh, .protocol = .v1, .label_hash = Hash.zero, .parent_namehash = Hash.zero, .registry = testAddr(0), .owner = testAddr(1), .registrant = testAddr(1), .resolver = testAddr(0), .token_id = 0, .canonical_id = 0, .token_version = 0, .expiry = 0, .registry_locked = false, .migrated = false, .created_block = 0, .created_at = 0, .registered_at = 0, .updated_block = 0, .updated_at = 0, .is_wrapped = false, .wrapper_fuses = null, .wrapper_expiry = null, .is_v1_name = true, .v1_label_hash = null };
+    try wb.insertName(rec);
+    wb.discardPendingName(nh);
+    try testing.expectEqual(@as(u32, 1), wb.names.count());
+}

@@ -349,6 +349,9 @@ const SYNC_CREATE_INDEXES = [_][]const u8{
     "CREATE INDEX IF NOT EXISTS idx_names_registrant ON names(registrant)",
     "CREATE INDEX IF NOT EXISTS idx_names_v1_label_hash ON names(v1_label_hash)",
     "CREATE INDEX IF NOT EXISTS idx_names_parent_namehash ON names(parent_namehash)",
+    // Placeholder-parent child rename and the subdomains listing both filter
+    // on parent_name; without this each one scans the whole table.
+    "CREATE INDEX IF NOT EXISTS idx_names_parent_name ON names(parent_name)",
     "CREATE INDEX IF NOT EXISTS idx_names_is_wrapped ON names(is_wrapped)",
     "CREATE INDEX IF NOT EXISTS idx_names_is_v1_name ON names(is_v1_name)",
     "CREATE INDEX IF NOT EXISTS idx_names_wrapper_expiry ON names(wrapper_expiry)",
