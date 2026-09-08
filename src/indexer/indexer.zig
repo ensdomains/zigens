@@ -63,6 +63,10 @@ pub const Indexer = struct {
     // apply). Without these the fetcher re-learns from scratch every batch.
     v1_events_per_block: f64 = 0,
     v1_rpc_chunk_ceiling: u64 = 0,
+    // Largest eth_getLogs block span the provider has accepted for a discovery
+    // sweep (0 = unlimited, nothing learned yet). Lowered by the first rejection
+    // and kept for the rest of the run so every later sweep starts right-sized.
+    backfill_chunk_ceiling: u64 = 0,
     // Memoized rainbow-table lookups (hit AND miss — the empty-string sentinel).
     // A cold probe into the multi-GB rainbow DB is disk-latency-priced; the same
     // labelhash recurs on every event touching that node, so memoization collapses
