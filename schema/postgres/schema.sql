@@ -217,6 +217,7 @@ CREATE INDEX IF NOT EXISTS idx_names_v1_label_hash ON names(v1_label_hash);
 CREATE INDEX IF NOT EXISTS idx_names_wrapper_expiry ON names(wrapper_expiry);
 CREATE INDEX IF NOT EXISTS idx_names_registrant ON names(registrant);
 CREATE INDEX IF NOT EXISTS idx_names_parent_namehash ON names(parent_namehash);
+CREATE INDEX IF NOT EXISTS idx_names_parent_name ON names(parent_name);
 CREATE INDEX IF NOT EXISTS idx_names_is_reachable ON names(protocol, is_reachable);
 CREATE INDEX IF NOT EXISTS idx_names_registry_reachable ON names(protocol, registry, is_reachable);
 CREATE INDEX IF NOT EXISTS idx_names_is_normalized ON names(is_normalized);

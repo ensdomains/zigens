@@ -361,10 +361,11 @@ pub fn setRegistriesReachability(
 ) !u64 {
     if (registries.len == 0) return 0;
 
-    // Multi-row names write without per-row keys: conservatively clear the
-    // whole dispatch-scoped name prefetch (rare — one cascade per
-    // SubregistryUpdated) rather than track which rows the IN-list touched.
-    db.noteNamesBulkWrite();
+    // No name-prefetch notify: this touches is_reachable / unreachable_since /
+    // updated_* only, none of which is in the prefetch projection (protocol,
+    // registry, canonical_id, namehash, name). The former on_bulk clear here
+    // dropped the whole map mid-dispatch on every repoint cascade and turned
+    // the rest of the batch's lookups into per-event round trips.
 
     // Chunked: each registry address is a tracked text bind, and Statement caps
     // tracked binds at 32 (error.TooManyBoundParams beyond that) — large

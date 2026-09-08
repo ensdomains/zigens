@@ -324,6 +324,13 @@ pub const Client = struct {
     /// the number of requests per batch. 0 = unlimited. When set, oversized
     /// batches are split into sequential sub-batches and the responses merged.
     max_batch_requests: usize = 0,
+    /// Wall-clock of the last request through this client. A pooled
+    /// keep-alive socket that sat idle longer than IDLE_EVICT_MS (a long
+    /// database-only dispatch between fetches) is assumed closed by the
+    /// provider and evicted BEFORE the next request, instead of failing it
+    /// and — with every retry landing on the same stale pool — rolling the
+    /// whole batch back.
+    last_request_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
 
     pub fn initWithSharedHttpClient(allocator: std.mem.Allocator, rpc_url: []const u8, http_client: *std.http.Client) !*Client {
         const client = try allocator.create(Client);
@@ -409,7 +416,12 @@ pub const Client = struct {
         return .{ .status = @intFromEnum(response.head.status), .body = body };
     }
 
+    const IDLE_EVICT_MS: i64 = 30_000;
+
     fn executeHttpRequest(self: *Client, arena_allocator: std.mem.Allocator, request_body: []const u8) ![]const u8 {
+        const started_ms = zsys.milliTimestamp();
+        const last_ms = self.last_request_ms.swap(started_ms, .monotonic);
+        if (last_ms != 0 and started_ms - last_ms > IDLE_EVICT_MS) drainIdleHttpConnections(self.http_client);
         const max_retries: u32 = 3;
         const max_response_bytes: usize = 50 * 1024 * 1024;
         var attempt: u32 = 0;

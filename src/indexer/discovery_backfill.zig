@@ -52,8 +52,10 @@ pub const Kind = enum {
 
 /// Interior probes per open interval per round (8-ary search).
 const PROBES_PER_ROUND: usize = 7;
-/// eth_getCode probes per HTTP request.
+/// eth_getCode probes per HTTP request, and the size retried when a provider
+/// rejects a full batch.
 const PROBE_HTTP_BATCH: usize = 96;
+const PROBE_FALLBACK_BATCH: usize = 8;
 /// Contracts per multi-address eth_getLogs request.
 const GROUP_MAX_ADDRESSES: usize = 100;
 const SWEEP_MIN_CHUNK: u64 = 500;
@@ -181,10 +183,13 @@ const RpcProber = struct {
     client: *rpc.Client,
     calls: *usize,
 
-    fn probe(self: RpcProber, probes: []const rpc.Client.CodeProbe, out: []?bool) void {
+    /// Provider rejected a full-size batch (batch cap, size limit): retry the
+    /// same probes in small batches so one strict provider costs a few extra
+    /// round trips instead of collapsing every anchor to the floor.
+    fn probeSmall(self: RpcProber, probes: []const rpc.Client.CodeProbe, out: []?bool) void {
         var start: usize = 0;
-        while (start < probes.len) : (start += PROBE_HTTP_BATCH) {
-            const end = @min(start + PROBE_HTTP_BATCH, probes.len);
+        while (start < probes.len) : (start += PROBE_FALLBACK_BATCH) {
+            const end = @min(start + PROBE_FALLBACK_BATCH, probes.len);
             self.indexer.rate_limiter.acquire();
             self.calls.* += 1;
             const answers = self.client.getCodeBatch(probes[start..end]) catch |err| {
@@ -194,6 +199,22 @@ const RpcProber = struct {
             };
             defer self.client.allocator.free(answers);
             @memcpy(out[start..end], answers);
+        }
+    }
+
+    fn probe(self: RpcProber, probes: []const rpc.Client.CodeProbe, out: []?bool) void {
+        var start: usize = 0;
+        while (start < probes.len) : (start += PROBE_HTTP_BATCH) {
+            const end = @min(start + PROBE_HTTP_BATCH, probes.len);
+            self.indexer.rate_limiter.acquire();
+            self.calls.* += 1;
+            if (self.client.getCodeBatch(probes[start..end])) |answers| {
+                defer self.client.allocator.free(answers);
+                @memcpy(out[start..end], answers);
+            } else |err| {
+                std.log.warn("  Discovery anchor probe batch of {d} failed ({}); retrying in batches of {d}", .{ end - start, err, PROBE_FALLBACK_BATCH });
+                self.probeSmall(probes[start..end], out[start..end]);
+            }
         }
     }
 };
@@ -249,32 +270,10 @@ pub fn backfillDiscovered(self: *Indexer, protocol: models.Protocol, client: *rp
     }
     std.mem.sort(Target, targets.items, {}, targetLessThan);
 
-    var group_addrs: std.ArrayList(Address) = .empty;
-    defer group_addrs.deinit(self.allocator);
     var start: usize = 0;
     while (start < targets.items.len) {
         const end = @min(start + GROUP_MAX_ADDRESSES, targets.items.len);
-        const group = targets.items[start..end];
-        group_addrs.clearRetainingCapacity();
-        for (group) |t| group_addrs.append(self.allocator, t.addr) catch {};
-        if (group_addrs.items.len != group.len) {
-            for (group) |t| recordOutcome(self, kind, protocol, t.addr, error.OutOfMemory);
-            outcome.failed += group.len;
-            start = end;
-            continue;
-        }
-        outcome.groups += 1;
-        const sweep = sweepGroup(self, protocol, client, kind, group_addrs.items, group[0].anchor, to_block);
-        outcome.calls += sweep.calls;
-        outcome.events += sweep.events;
-        if (sweep.err) |err| {
-            std.log.warn("  {s} group sweep {d}-{d} failed for {d} contract(s) (queued for retry): {}", .{ kind.label(), group[0].anchor, to_block, group.len, err });
-            for (group) |t| recordOutcome(self, kind, protocol, t.addr, err);
-            outcome.failed += group.len;
-        } else {
-            for (group) |t| recordOutcome(self, kind, protocol, t.addr, null);
-            outcome.swept += group.len;
-        }
+        sweepTargets(self, protocol, client, kind, targets.items[start..end], to_block, &outcome);
         start = end;
     }
 
@@ -290,6 +289,43 @@ pub fn backfillDiscovered(self: *Indexer, protocol: models.Protocol, client: *rp
         zsys.milliTimestamp() - started,
     });
     return outcome;
+}
+
+/// Sweep one group and record every member's outcome. A provider that rejects
+/// the address list (or a group too dense for its response cap even at the
+/// minimum block chunk) fails with a non-transport error; the group is then
+/// split in half and each half swept on its own, down to single contracts, so
+/// a strict provider costs extra calls rather than parking targets.
+fn sweepTargets(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, kind: Kind, group: []const Target, to_block: u64, outcome: *Outcome) void {
+    if (group.len == 0) return;
+    var group_addrs: std.ArrayList(Address) = .empty;
+    defer group_addrs.deinit(self.allocator);
+    for (group) |t| group_addrs.append(self.allocator, t.addr) catch {};
+    if (group_addrs.items.len != group.len) {
+        for (group) |t| recordOutcome(self, kind, protocol, t.addr, error.OutOfMemory);
+        outcome.failed += group.len;
+        return;
+    }
+    outcome.groups += 1;
+    const sweep = sweepGroup(self, protocol, client, kind, group_addrs.items, group[0].anchor, to_block);
+    outcome.calls += sweep.calls;
+    outcome.events += sweep.events;
+    const err = sweep.err orelse {
+        for (group) |t| recordOutcome(self, kind, protocol, t.addr, null);
+        outcome.swept += group.len;
+        return;
+    };
+    const splittable = group.len > 1 and (err == error.BackfillIncomplete or err == error.RpcError or err == error.StreamTooLong);
+    if (splittable) {
+        std.log.warn("  {s} group sweep {d}-{d} rejected for {d} contract(s) ({}); splitting the group", .{ kind.label(), group[0].anchor, to_block, group.len, err });
+        const mid = group.len / 2;
+        sweepTargets(self, protocol, client, kind, group[0..mid], to_block, outcome);
+        sweepTargets(self, protocol, client, kind, group[mid..], to_block, outcome);
+        return;
+    }
+    std.log.warn("  {s} group sweep {d}-{d} failed for {d} contract(s) (queued for retry): {}", .{ kind.label(), group[0].anchor, to_block, group.len, err });
+    for (group) |t| recordOutcome(self, kind, protocol, t.addr, err);
+    outcome.failed += group.len;
 }
 
 const SweepResult = struct {
