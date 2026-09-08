@@ -113,8 +113,11 @@ pub fn resolveRolesConnection(ctx: parser.ExecutionContext, field: *const parser
         1000, // max limit
     );
 
-    // Get optional filter arguments
-    const resource_arg = parser.getStringArg(field, "resource", null);
+    // Get optional filter arguments. The resource is normalized to the stored
+    // 66-char spelling so page and count agree with `roles` (which widens the
+    // spelling in SQL); non-hex input keeps exact-match semantics.
+    const raw_resource_arg = parser.getStringArg(field, "resource", null);
+    const resource_arg: ?[]const u8 = if (raw_resource_arg) |r| ((try common.normalizeResourceHex(allocator, r)) orelse r) else null;
     const account_arg = parser.getStringArg(field, "account", null);
 
     // Parse account address if provided.

@@ -151,17 +151,35 @@ pub fn upsertEACRolesBatch(db: *Database, rows: []const RoleUpsertRow) !void {
 ///
 /// NOTE: classification must NOT key on the `resolvers` (name-binding) JOIN — those
 /// rows carry `resource = namehash`, but resolver-EAC events store `resource =`
-/// canonical_id (0 for the contract-global admin roles that make up live data), so
-/// that JOIN never matches a real resolver row. The `resolvers`/`resolver_name`
-/// JOINs below remain only for resolver-path name resolution (a no-op on current
-/// data; future-proofing for label-scoped resolver EAC).
+/// keccak256(node, part) or 0 (the contract-global admin roles that make up live
+/// data), so that JOIN never matches a real resolver row. The `resolvers`/
+/// `resolver_name` JOINs below remain only for resolver-path name resolution (a
+/// no-op on current data; future-proofing for label-scoped resolver EAC).
+///
+/// Registry resources are stored verbatim as `canonical_id | uint32(eacVersionId)`
+/// (fixed 66-char lowercase hex), so the name join keys on the canonical prefix:
+/// the first 58 chars are the label's 224-bit canonical id, the last 8 the EAC
+/// version. See `CURRENT_VERSION_ONLY` for the companion staleness rule.
+/// Excludes rows whose resource has been superseded by a higher EAC version on
+/// the same contract: the contract bumps `eacVersionId` on unregister and on
+/// re-registering an expired label, so grants keyed by an older version are
+/// unreachable through the registry from then on. Applied to listings that do
+/// NOT name a resource; an explicit `resource` filter returns exactly what was
+/// asked for, superseded or not. ROOT (0x0…0) has no version and is exempted
+/// outright. Range-scans idx_eac_roles_contract_resource.
+const CURRENT_VERSION_ONLY =
+    \\ AND (r.resource = '0x0000000000000000000000000000000000000000000000000000000000000000'
+    \\   OR NOT EXISTS (SELECT 1 FROM eac_roles n WHERE n.protocol = r.protocol AND n.contract_address = r.contract_address
+    \\     AND n.resource > r.resource AND n.resource <= (substr(r.resource, 1, 58) || 'ffffffff')))
+;
+
 const EAC_SELECT_COLUMNS =
     \\SELECT r.id, r.protocol, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp,
     \\       COALESCE(reg_name.name, resolver_name.name) AS name,
     \\       CASE WHEN kr.address IS NOT NULL THEN 1 ELSE 0 END AS is_resolver,
     \\       r.contract_address
     \\FROM eac_roles r
-    \\LEFT JOIN names reg_name ON r.resource = reg_name.canonical_id AND r.contract_address = reg_name.registry
+    \\LEFT JOIN names reg_name ON reg_name.canonical_id = (substr(r.resource, 1, 58) || '00000000') AND r.contract_address = reg_name.registry
     \\LEFT JOIN resolvers res ON r.contract_address = res.address AND r.resource = res.namehash AND res.protocol = r.protocol
     \\LEFT JOIN names resolver_name ON res.namehash = resolver_name.namehash AND resolver_name.protocol = r.protocol
     \\LEFT JOIN known_resolvers kr ON kr.address = r.contract_address AND kr.protocol = r.protocol
@@ -223,7 +241,8 @@ fn parseEACRoleRow(q: *Query, allocator: std.mem.Allocator) !models.EACRoleAssig
 /// Get all role assignments for a resource.
 /// Resolves the human-readable name via two paths:
 ///   1. Registry EAC (today's primary path): `contract_address` matches a registry row,
-///      resource = token's canonical_id — joins to `names` by (canonical_id, registry).
+///      resource = canonical_id | eacVersionId — joins to `names` by the canonical
+///      prefix and the registry (see EAC_SELECT_COLUMNS).
 ///   2. Resolver EAC: resolver contracts DO emit `EACRolesChanged` (handleResolverEACRolesChanged),
 ///      but with `resource = 0` (the EAC ROOT_RESOURCE) — contract-global admin roles, not
 ///      per-namehash. Those correctly resolve to no name (resource 0 matches no namehash), so the
@@ -311,6 +330,11 @@ pub fn getRolesFiltered(db: *Database, protocol: models.Protocol, filters: RoleF
         sql_len += clause.len;
     }
 
+    if (filters.resource == null) {
+        @memcpy(sql_buf[sql_len .. sql_len + CURRENT_VERSION_ONLY.len], CURRENT_VERSION_ONLY);
+        sql_len += CURRENT_VERSION_ONLY.len;
+    }
+
     {
         const order = " ORDER BY r.timestamp DESC, r.id DESC";
         @memcpy(sql_buf[sql_len .. sql_len + order.len], order);
@@ -391,6 +415,11 @@ pub fn getRolesWithPagination(db: *Database, protocol: models.Protocol, options:
         const clause = " AND r.contract_address = ?";
         @memcpy(sql_buf[sql_len .. sql_len + clause.len], clause);
         sql_len += clause.len;
+    }
+
+    if (options.resource == null) {
+        @memcpy(sql_buf[sql_len .. sql_len + CURRENT_VERSION_ONLY.len], CURRENT_VERSION_ONLY);
+        sql_len += CURRENT_VERSION_ONLY.len;
     }
 
     if (options.cursor_id != null) {
@@ -474,27 +503,32 @@ pub const RoleCountFilters = struct {
 
 /// Count roles matching all provided filters. Used by Registry.roleCount.
 pub fn getRoleCountFiltered(db: *Database, filters: RoleCountFilters) !usize {
-    var sql_buf: [512]u8 = undefined;
+    var sql_buf: [768]u8 = undefined;
     var sql_len: usize = 0;
 
-    const base = "SELECT COUNT(*) FROM eac_roles WHERE protocol = ?";
+    const base = "SELECT COUNT(*) FROM eac_roles r WHERE r.protocol = ?";
     @memcpy(sql_buf[sql_len .. sql_len + base.len], base);
     sql_len += base.len;
 
     if (filters.resource != null) {
-        const clause = " AND resource = ?";
+        const clause = " AND r.resource = ?";
         @memcpy(sql_buf[sql_len .. sql_len + clause.len], clause);
         sql_len += clause.len;
     }
     if (filters.account != null) {
-        const clause = " AND account = ?";
+        const clause = " AND r.account = ?";
         @memcpy(sql_buf[sql_len .. sql_len + clause.len], clause);
         sql_len += clause.len;
     }
     if (filters.contract_address != null) {
-        const clause = " AND contract_address = ?";
+        const clause = " AND r.contract_address = ?";
         @memcpy(sql_buf[sql_len .. sql_len + clause.len], clause);
         sql_len += clause.len;
+    }
+    // Same staleness rule as the listings this count paginates.
+    if (filters.resource == null) {
+        @memcpy(sql_buf[sql_len .. sql_len + CURRENT_VERSION_ONLY.len], CURRENT_VERSION_ONLY);
+        sql_len += CURRENT_VERSION_ONLY.len;
     }
 
     var q = try Query.init(db, sql_buf[0..sql_len]);
@@ -512,10 +546,12 @@ pub fn getRoleCountFiltered(db: *Database, filters: RoleCountFilters) !usize {
 /// Count distinct accounts holding any label-scoped role on a single label,
 /// keyed by the label's canonical (version-stripped) token id.
 ///
-/// A role's `resource` is the token's `canonical_id` and its `contract_address`
-/// is the registry that owns the label, so the join key is
-/// `(canonical_id, registry)` — version-independent, matching the same shape
-/// used by `getRolesByResource`. Empty role bitmaps are excluded (mirroring the
+/// A role's `resource` is `canonical_id | eacVersionId` and its
+/// `contract_address` is the registry that owns the label, so the lookup takes
+/// the canonical prefix range on `(registry, resource)` and keeps only the
+/// highest EAC version present — the generation the contract currently
+/// resolves; grants from a previous registration of the same label are not
+/// holders any more. Empty role bitmaps are excluded (mirroring the
 /// portal's `if (roleBitmap === 0n) continue`), since grant-then-revoke or
 /// backfill can leave a row with an all-zero bitmap. A label's `canonical_id` is
 /// non-zero, so the registry-wide root role (resource = 0x0…0) is naturally
@@ -533,20 +569,32 @@ pub fn getLabelRoleHolderCount(
     canonical_id_hex: []const u8,
     registry: Address,
 ) !usize {
+    const forms = ResourceForms.of(canonical_id_hex) orelse return 0;
+    var hi: [66]u8 = undefined;
+    @memcpy(hi[0..58], forms.padded[0..58]);
+    @memcpy(hi[58..66], "ffffffff");
+
     const sql =
         \\SELECT COUNT(DISTINCT account)
         \\FROM eac_roles
-        \\WHERE protocol = ? AND resource = ? AND contract_address = ?
+        \\WHERE protocol = ? AND contract_address = ? AND resource >= ? AND resource <= ?
         \\  AND role_bitmap != ?
+        \\  AND resource = (SELECT MAX(resource) FROM eac_roles
+        \\                  WHERE protocol = ? AND contract_address = ? AND resource >= ? AND resource <= ?)
     ;
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindTextStatic(protocol.toString());
-    try q.bindText(canonical_id_hex);
     try q.bindAddress(registry);
+    try q.bindText(forms.padded[0..forms.padded_len]);
+    try q.bindText(&hi);
     try q.bindTextStatic(ZERO_ROLE_BITMAP);
+    try q.bindTextStatic(protocol.toString());
+    try q.bindAddress(registry);
+    try q.bindText(forms.padded[0..forms.padded_len]);
+    try q.bindText(&hi);
 
     if (try q.step()) return @intCast(q.getInt64(0));
     return 0;

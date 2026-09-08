@@ -1213,8 +1213,9 @@ pub fn handleAliasChanged(self: *Indexer, protocol: models.Protocol, resolver: A
 
 /// Wrapper for EACRolesChanged from resolver contracts.
 /// Adapts ResolverEventConfig signature to the shared handler, flagging it as a
-/// resolver event so the indexed `resource` (keccak256(node, part), or ROOT 0) is
-/// stored verbatim rather than canonicalized like a registry token id (WEB-511).
+/// resolver event: the resource (keccak256(node, part), or ROOT 0) is stored
+/// verbatim like every EAC resource, and no name attribution by token id is
+/// attempted.
 pub fn handleResolverEACRolesChanged(self: *Indexer, protocol: models.Protocol, _resolver: Address, log: rpc.Log) !void {
     _ = _resolver;
     try Indexer.handleEACRolesChangedImpl(self, protocol, log, true);
