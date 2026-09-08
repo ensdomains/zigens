@@ -9,6 +9,7 @@ const Address = common.Address;
 const parser = common.parser;
 const pagination = common.pagination;
 const builders = @import("../builders/builders.zig");
+const domain_resolvers = @import("domain.zig");
 const loaders = common.loaders;
 const NestedContext = builders.NestedContext;
 
@@ -191,6 +192,10 @@ pub fn resolveEventConnection(ctx: parser.ExecutionContext, field: *const parser
     }
 
     const items_slice = events[0..actual_items];
+
+    // Page-batch the nested domain rows + resolver records/texts (see the
+    // registrations connection / domains list for rationale).
+    domain_resolvers.prefetchDomainsForEventPage(database, allocator, ctx.loaders, items_slice, node_selections);
 
     // Wrapper type for events
     const EventWithSelections = struct {
@@ -410,6 +415,11 @@ fn resolveEventsWithForced(ctx: parser.ExecutionContext, field: *const parser.Fi
         }
         database.allocator.free(events);
     }
+
+    // Page-batch the nested domain rows + resolver records/texts (the
+    // registrations-list treatment; without this, `domain { … }` pays one
+    // point query per row).
+    domain_resolvers.prefetchDomainsForEventPage(database, allocator, ctx.loaders, events, field.selections);
 
     // Build JSON array
     var json: std.ArrayList(u8) = .empty;

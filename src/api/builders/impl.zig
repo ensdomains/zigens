@@ -1065,6 +1065,24 @@ fn resolverCoinTypesHandler(ctx: *anyopaque, field: *const parser.Field, nested_
     const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
+    // Page-batched list first — composite (resolver, namehash) key, same
+    // contract as resolverTextsHandler. Absent = fall back to the point query.
+    if (nested_ctx.loaders) |lp| {
+        const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+        if (lc.lookupCoinTypes(rctx.resolver, rctx.namehash)) |batched| {
+            var json: std.Io.Writer.Allocating = .init(nested_ctx.allocator);
+            errdefer json.deinit();
+            var arr = try jw.arrayOn(&json.writer);
+            for (batched) |ct| {
+                const ct_str = try std.fmt.allocPrint(nested_ctx.allocator, "{d}", .{ct});
+                defer nested_ctx.allocator.free(ct_str);
+                try arr.itemStr(ct_str, nested_ctx.allocator);
+            }
+            try arr.end();
+            return try json.toOwnedSlice();
+        }
+    }
+
     const coin_types = try database.getCoinTypes(rctx.resolver, rctx.namehash);
     defer database.allocator.free(coin_types);
 
