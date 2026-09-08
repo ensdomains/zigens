@@ -1156,3 +1156,171 @@ test "named resources: upsert per (resolver,resource) updates in place; reader o
     try testing.expectEqualStrings("addr", rows[1].record_kind);
     try testing.expectEqual(@as(i64, 60), rows[1].coin_type);
 }
+
+// ============================================================================
+// PAIR BATCH READERS — CHUNK BOUNDARY
+// ============================================================================
+
+test "pair batch readers cross the chunk boundary and the tracked-bind cap" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // 210 pairs: two chunks at RECORD_BATCH_CHUNK=200, and far past the
+    // 32-tracked-string bind cap that the static-bind path must avoid — a
+    // regression to copied binds fails this test with TooManyBoundParams.
+    const total = 210;
+    const resolver = helpers.TEST_RESOLVER;
+    const tx = helpers.randomHash();
+
+    var pair_resolvers: [total]Address = undefined;
+    var pair_namehashes: [total]Hash = undefined;
+    for (0..total) |i| {
+        var nh = Hash{ .bytes = [_]u8{0} ** 32 };
+        nh.bytes[31] = @intCast(i & 0xFF);
+        nh.bytes[30] = @intCast(i >> 8);
+        nh.bytes[0] = 0xBC;
+        pair_resolvers[i] = resolver;
+        pair_namehashes[i] = nh;
+        if (i % 3 == 0) {
+            try resolvers.storeResolverAddress(database, nh, resolver, 60, "0x1111111111111111111111111111111111111111", .v2, 100, tx, 1700000000);
+            try resolvers.storeResolverAddress(database, nh, resolver, 0, "0x2222222222222222222222222222222222222222", .v2, 100, tx, 1700000000);
+            try resolvers.storeResolverText(database, nh, resolver, "avatar", "https://example.com/a.png", .v2, 100, tx, 1700000000);
+            try resolvers.storeResolverContentHash(database, nh, resolver, "0xe301", .v2, 100, tx, 1700000000);
+        }
+    }
+    const seeded = 70; // i in 0..210 with i % 3 == 0
+
+    const ct_rows = try resolvers.getCoinTypesForPairs(database, &pair_resolvers, &pair_namehashes);
+    defer {
+        for (ct_rows) |row| {
+            database.allocator.free(row.resolver);
+            database.allocator.free(row.namehash);
+        }
+        database.allocator.free(ct_rows);
+    }
+    try testing.expectEqual(@as(usize, seeded * 2), ct_rows.len);
+
+    const key_rows = try resolvers.getTextRecordKeysForPairs(database, &pair_resolvers, &pair_namehashes);
+    defer {
+        for (key_rows) |row| {
+            database.allocator.free(row.resolver);
+            database.allocator.free(row.namehash);
+            database.allocator.free(row.key);
+        }
+        database.allocator.free(key_rows);
+    }
+    try testing.expectEqual(@as(usize, seeded), key_rows.len);
+
+    const addr_rows = try resolvers.getAddressRecordsBatch(database, &pair_resolvers, &pair_namehashes, 60);
+    defer {
+        for (addr_rows) |*row| row.deinit(database.allocator);
+        database.allocator.free(addr_rows);
+    }
+    try testing.expectEqual(@as(usize, seeded), addr_rows.len);
+
+    const txt_rows = try resolvers.getTextRecordsBatch(database, &pair_resolvers, &pair_namehashes, "avatar");
+    defer {
+        for (txt_rows) |*row| row.deinit(database.allocator);
+        database.allocator.free(txt_rows);
+    }
+    try testing.expectEqual(@as(usize, seeded), txt_rows.len);
+
+    const ch_rows = try resolvers.getContentHashesBatch(database, &pair_resolvers, &pair_namehashes);
+    defer {
+        for (ch_rows) |*row| row.deinit(database.allocator);
+        database.allocator.free(ch_rows);
+    }
+    try testing.expectEqual(@as(usize, seeded), ch_rows.len);
+
+    // A seeded pair in the SECOND chunk (index 207 > 200) must reproduce the
+    // point query exactly: same coin types, same ascending order.
+    const last_nh = pair_namehashes[207];
+    const point = try resolvers.getCoinTypes(database, resolver, last_nh);
+    defer database.allocator.free(point);
+    try testing.expectEqual(@as(usize, 2), point.len);
+    try testing.expectEqual(@as(u64, 0), point[0]);
+    try testing.expectEqual(@as(u64, 60), point[1]);
+
+    const last_hex = try last_nh.toHex(allocator);
+    defer allocator.free(last_hex);
+    var batched_cts: [4]u64 = undefined;
+    var batched_n: usize = 0;
+    for (ct_rows) |row| {
+        if (std.mem.eql(u8, row.namehash, last_hex)) {
+            batched_cts[batched_n] = row.coin_type;
+            batched_n += 1;
+        }
+    }
+    try testing.expectEqual(point.len, batched_n);
+    for (point, batched_cts[0..batched_n]) |p, b| try testing.expectEqual(p, b);
+
+    // Exhaustive equivalence: for EVERY requested pair, the batched rows must
+    // reproduce the point queries exactly — same values, same order, same
+    // presence/absence — across all five readers.
+    for (pair_namehashes) |nh| {
+        const hex = try nh.toHex(allocator);
+        defer allocator.free(hex);
+
+        const p_cts = try resolvers.getCoinTypes(database, resolver, nh);
+        defer database.allocator.free(p_cts);
+        var ct_got: usize = 0;
+        for (ct_rows) |row| {
+            if (!std.mem.eql(u8, row.namehash, hex)) continue;
+            try testing.expect(ct_got < p_cts.len);
+            try testing.expectEqual(p_cts[ct_got], row.coin_type);
+            ct_got += 1;
+        }
+        try testing.expectEqual(p_cts.len, ct_got);
+
+        const p_keys = try resolvers.getTextRecordKeys(database, resolver, nh);
+        defer {
+            for (p_keys) |k| database.allocator.free(k);
+            database.allocator.free(p_keys);
+        }
+        var key_got: usize = 0;
+        for (key_rows) |row| {
+            if (!std.mem.eql(u8, row.namehash, hex)) continue;
+            try testing.expect(key_got < p_keys.len);
+            try testing.expectEqualStrings(p_keys[key_got], row.key);
+            key_got += 1;
+        }
+        try testing.expectEqual(p_keys.len, key_got);
+
+        const p_addr = try resolvers.getAddressRecord(database, resolver, nh, 60);
+        defer if (p_addr) |v| database.allocator.free(v);
+        var addr_match: ?[]const u8 = null;
+        for (addr_rows) |row| {
+            if (std.mem.eql(u8, row.namehash, hex)) addr_match = row.value;
+        }
+        if (p_addr) |v| {
+            try testing.expectEqualStrings(v, addr_match orelse return error.MissingBatchedRow);
+        } else {
+            try testing.expectEqual(@as(?[]const u8, null), addr_match);
+        }
+
+        const p_txt = try resolvers.getTextRecord(database, resolver, nh, "avatar");
+        defer if (p_txt) |v| database.allocator.free(v);
+        var txt_match: ?[]const u8 = null;
+        for (txt_rows) |row| {
+            if (std.mem.eql(u8, row.namehash, hex)) txt_match = row.value;
+        }
+        if (p_txt) |v| {
+            try testing.expectEqualStrings(v, txt_match orelse return error.MissingBatchedRow);
+        } else {
+            try testing.expectEqual(@as(?[]const u8, null), txt_match);
+        }
+
+        const p_ch = try resolvers.getContentHashRecord(database, resolver, nh);
+        defer if (p_ch) |v| database.allocator.free(v);
+        var ch_match: ?[]const u8 = null;
+        for (ch_rows) |row| {
+            if (std.mem.eql(u8, row.namehash, hex)) ch_match = row.value;
+        }
+        if (p_ch) |v| {
+            try testing.expectEqualStrings(v, ch_match orelse return error.MissingBatchedRow);
+        } else {
+            try testing.expectEqual(@as(?[]const u8, null), ch_match);
+        }
+    }
+}

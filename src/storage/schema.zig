@@ -100,6 +100,21 @@ pub fn migrate(self: *Database) !void {
         try self.exec("CREATE INDEX IF NOT EXISTS idx_names_is_normalized ON names(is_normalized)");
     }
 
+    // Indexes added after the original schema: `loadSchemaFiles` is skipped on
+    // existing DBs and `createSyncIndexes` only runs after a bulk sync dropped
+    // them, so a caught-up DB gets them here. IF NOT EXISTS is a no-op on both
+    // backends; the expression index needs the per-dialect JSON spelling.
+    if (self.hasTable("eac_roles")) {
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_contract_resource ON eac_roles(protocol, contract_address, resource)");
+    }
+    if (self.hasTable("events")) {
+        if (self.isPostgres()) {
+            try self.exec("CREATE INDEX IF NOT EXISTS idx_events_resource_extracted ON events ((data::jsonb ->> 'resource'))");
+        } else {
+            try self.exec("CREATE INDEX IF NOT EXISTS idx_events_resource_extracted ON events (json_extract(data, '$.resource'))");
+        }
+    }
+
     // `loadSchemaFiles` short-circuits when `names` exists (to avoid
     // multi-minute index rebuilds on large DBs), so any *new* tables
     // introduced after the original schema must be created here too.
@@ -228,6 +243,7 @@ const SYNC_DROP_INDEXES = [_][]const u8{
     "idx_events_owner_extracted",
     "idx_events_to_extracted",
     "idx_events_from_extracted",
+    "idx_events_resource_extracted",
     "idx_events_protocol",
     "idx_events_type",
     "idx_events_block",
@@ -300,6 +316,7 @@ const SYNC_DROP_INDEXES = [_][]const u8{
     "idx_eac_roles_account",
     "idx_eac_roles_block",
     "idx_eac_roles_contract",
+    "idx_eac_roles_contract_resource",
     "idx_temp_pre_migration_label_hash",
     "idx_temp_pre_migration_protocol",
     "idx_rainbow_source",
@@ -371,6 +388,7 @@ const SYNC_CREATE_INDEXES = [_][]const u8{
     "CREATE INDEX IF NOT EXISTS idx_eac_roles_account ON eac_roles(protocol, account)",
     "CREATE INDEX IF NOT EXISTS idx_eac_roles_block ON eac_roles(protocol, block_number)",
     "CREATE INDEX IF NOT EXISTS idx_eac_roles_contract ON eac_roles(protocol, contract_address)",
+    "CREATE INDEX IF NOT EXISTS idx_eac_roles_contract_resource ON eac_roles(protocol, contract_address, resource)",
     "CREATE INDEX IF NOT EXISTS idx_temp_pre_migration_label_hash ON temp_pre_migration_names(label_hash)",
     "CREATE INDEX IF NOT EXISTS idx_temp_pre_migration_protocol ON temp_pre_migration_names(protocol)",
     "CREATE INDEX IF NOT EXISTS idx_rainbow_source ON rainbow_labels(source)",
@@ -486,12 +504,14 @@ const SYNC_CREATE_EXPRESSION_INDEXES_SQLITE = [_][]const u8{
     "CREATE INDEX IF NOT EXISTS idx_events_owner_extracted ON events (LOWER(json_extract(data, '$.owner')))",
     "CREATE INDEX IF NOT EXISTS idx_events_to_extracted ON events (LOWER(json_extract(data, '$.to')))",
     "CREATE INDEX IF NOT EXISTS idx_events_from_extracted ON events (LOWER(json_extract(data, '$.from')))",
+    "CREATE INDEX IF NOT EXISTS idx_events_resource_extracted ON events (json_extract(data, '$.resource'))",
 };
 
 const SYNC_CREATE_EXPRESSION_INDEXES_PG = [_][]const u8{
     "CREATE INDEX IF NOT EXISTS idx_events_owner_extracted ON events (LOWER((data::jsonb ->> 'owner')))",
     "CREATE INDEX IF NOT EXISTS idx_events_to_extracted ON events (LOWER((data::jsonb ->> 'to')))",
     "CREATE INDEX IF NOT EXISTS idx_events_from_extracted ON events (LOWER((data::jsonb ->> 'from')))",
+    "CREATE INDEX IF NOT EXISTS idx_events_resource_extracted ON events ((data::jsonb ->> 'resource'))",
 };
 
 pub fn createSyncIndexes(self: *Database) !void {

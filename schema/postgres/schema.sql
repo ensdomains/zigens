@@ -576,6 +576,7 @@ CREATE INDEX IF NOT EXISTS idx_events_block_log ON events(block_number, log_inde
 CREATE INDEX IF NOT EXISTS idx_events_owner_extracted ON events (LOWER((data::jsonb ->> 'owner')));
 CREATE INDEX IF NOT EXISTS idx_events_to_extracted ON events (LOWER((data::jsonb ->> 'to')));
 CREATE INDEX IF NOT EXISTS idx_events_from_extracted ON events (LOWER((data::jsonb ->> 'from')));
+CREATE INDEX IF NOT EXISTS idx_events_resource_extracted ON events ((data::jsonb ->> 'resource'));
 
 
 -- ============================================================================
@@ -626,6 +627,7 @@ CREATE INDEX IF NOT EXISTS idx_eac_roles_resource ON eac_roles(protocol, resourc
 CREATE INDEX IF NOT EXISTS idx_eac_roles_account ON eac_roles(protocol, account);
 CREATE INDEX IF NOT EXISTS idx_eac_roles_block ON eac_roles(protocol, block_number);
 CREATE INDEX IF NOT EXISTS idx_eac_roles_contract ON eac_roles(protocol, contract_address);
+CREATE INDEX IF NOT EXISTS idx_eac_roles_contract_resource ON eac_roles(protocol, contract_address, resource);
 
 
 -- ============================================================================

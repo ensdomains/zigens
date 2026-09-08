@@ -15,6 +15,7 @@ const Hash = @import("../types/hash.zig").Hash;
 const entity = @import("resolver_entity.zig");
 pub const upsertResolverEntity = entity.upsertResolverEntity;
 pub const getResolverEntityCount = entity.getResolverEntityCount;
+pub const ResolverEntity = entity.ResolverEntity;
 pub const ResolverEntityFilters = entity.ResolverEntityFilters;
 pub const ResolverEntitySortField = entity.ResolverEntitySortField;
 pub const getFilteredResolverEntities = entity.getFilteredResolverEntities;
@@ -322,9 +323,24 @@ fn freeRecordRows(allocator: std.mem.Allocator, rows: *std.ArrayList(ResolverRec
     rows.deinit(allocator);
 }
 
-// resolver/namehash binds are tracked (dupe) strings capped at 32 per statement
-// (MAX_BOUND_STRINGS); 2 binds per pair -> 15 pairs keeps us safely under.
-const RECORD_BATCH_CHUNK: usize = 15;
+// Pair binds go through bindTextStatic with arena-scratch hex (no tracked-
+// string cap), so the chunk is sized for statement length and planner sanity,
+// not MAX_BOUND_STRINGS. 200 pairs = 400 placeholders — under even the
+// legacy SQLite 999-parameter limit; a 1000-row page batches in 5 statements.
+const RECORD_BATCH_CHUNK: usize = 200;
+
+/// Bind a chunk's (resolver, namehash) pairs as static text. The hex buffers
+/// live on `scratch`, which the caller MUST declare BEFORE the Query (LIFO
+/// defers) so they outlive statement execution — same pattern as
+/// upsertEACRolesBatch/insertEventsBatch.
+fn bindPairsStatic(q: *Query, scratch: std.mem.Allocator, pair_resolvers: []const Address, pair_namehashes: []const Hash) !void {
+    for (pair_resolvers, pair_namehashes) |r, nh| {
+        const r_buf = try scratch.create([42]u8);
+        try q.bindTextStatic(r.toHexBuf(r_buf));
+        const nh_buf = try scratch.create([66]u8);
+        try q.bindTextStatic(nh.toHexBuf(nh_buf));
+    }
+}
 
 /// Batch equivalent of `getAddressRecord` for coin_type 60: the latest address
 /// per `(resolver, namehash)` pair (`ORDER BY block_number DESC LIMIT 1`,
@@ -353,13 +369,13 @@ pub fn getAddressRecordsBatch(db: *Database, resolvers: []const Address, namehas
         }
         try sql.appendSlice(db.allocator, ")) sub WHERE rn = 1");
 
+        var arena = std.heap.ArenaAllocator.init(db.allocator);
+        defer arena.deinit();
+
         var q = try Query.init(db, sql.items);
         defer q.deinit();
         try q.bindInt64(@intCast(coin_type));
-        for (resolvers[off..end], namehashes[off..end]) |r, nh| {
-            try q.bindAddress(r);
-            try q.bindHash(nh);
-        }
+        try bindPairsStatic(&q, arena.allocator(), resolvers[off..end], namehashes[off..end]);
         while (try q.step()) {
             // Loop-scoped errdefers: a later getText/append failure must free
             // the columns already duped this iteration (the outer errdefer
@@ -406,12 +422,12 @@ pub fn getContentHashesBatch(db: *Database, resolvers: []const Address, namehash
         }
         try sql.appendSlice(db.allocator, ")) sub WHERE rn = 1");
 
+        var arena = std.heap.ArenaAllocator.init(db.allocator);
+        defer arena.deinit();
+
         var q = try Query.init(db, sql.items);
         defer q.deinit();
-        for (resolvers[off..end], namehashes[off..end]) |r, nh| {
-            try q.bindAddress(r);
-            try q.bindHash(nh);
-        }
+        try bindPairsStatic(&q, arena.allocator(), resolvers[off..end], namehashes[off..end]);
         while (try q.step()) {
             // Loop-scoped errdefers: a later getText/append failure must free
             // the columns already duped this iteration (the outer errdefer
@@ -460,13 +476,13 @@ pub fn getTextRecordsBatch(db: *Database, resolvers: []const Address, namehashes
         }
         try sql.appendSlice(db.allocator, ")) sub WHERE rn = 1");
 
+        var arena = std.heap.ArenaAllocator.init(db.allocator);
+        defer arena.deinit();
+
         var q = try Query.init(db, sql.items);
         defer q.deinit();
         try q.bindText(key);
-        for (resolvers[off..end], namehashes[off..end]) |r, nh| {
-            try q.bindAddress(r);
-            try q.bindHash(nh);
-        }
+        try bindPairsStatic(&q, arena.allocator(), resolvers[off..end], namehashes[off..end]);
         while (try q.step()) {
             // Loop-scoped errdefers: a later getText/append failure must free
             // the columns already duped this iteration (the outer errdefer
@@ -523,12 +539,12 @@ pub fn getTextRecordKeysForPairs(db: *Database, resolvers_list: []const Address,
         }
         try sql.appendSlice(db.allocator, ") ORDER BY key");
 
+        var arena = std.heap.ArenaAllocator.init(db.allocator);
+        defer arena.deinit();
+
         var q = try Query.init(db, sql.items);
         defer q.deinit();
-        for (resolvers_list[off..end], namehashes[off..end]) |r, nh| {
-            try q.bindAddress(r);
-            try q.bindHash(nh);
-        }
+        try bindPairsStatic(&q, arena.allocator(), resolvers_list[off..end], namehashes[off..end]);
         while (try q.step()) {
             // Loop-scoped errdefers — see getTextRecordsBatch for rationale.
             const r_opt = try q.getText(0);
@@ -544,6 +560,61 @@ pub fn getTextRecordKeysForPairs(db: *Database, resolvers_list: []const Address,
                 continue;
             }
             try rows.append(db.allocator, .{ .resolver = r_opt.?, .namehash = nh_opt.?, .key = key_opt.? });
+        }
+    }
+    return try rows.toOwnedSlice(db.allocator);
+}
+
+/// Distinct coin types per (resolver, namehash) across all requested pairs —
+/// the batched mirror of getCoinTypes. Global ORDER BY coin_type means each
+/// pair's list arrives in the SAME ascending order the point query produces,
+/// so grouping by pair in scan order reproduces its output exactly.
+pub const PairCoinTypeRow = struct { resolver: []u8, namehash: []u8, coin_type: u64 };
+
+pub fn getCoinTypesForPairs(db: *Database, resolvers_list: []const Address, namehashes: []const Hash) ![]PairCoinTypeRow {
+    std.debug.assert(resolvers_list.len == namehashes.len);
+    var rows: std.ArrayList(PairCoinTypeRow) = .empty;
+    errdefer {
+        for (rows.items) |row| {
+            db.allocator.free(row.resolver);
+            db.allocator.free(row.namehash);
+        }
+        rows.deinit(db.allocator);
+    }
+    if (resolvers_list.len == 0) return try rows.toOwnedSlice(db.allocator);
+
+    var off: usize = 0;
+    while (off < resolvers_list.len) : (off += RECORD_BATCH_CHUNK) {
+        const end = @min(off + RECORD_BATCH_CHUNK, resolvers_list.len);
+        const n = end - off;
+
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(db.allocator);
+        try sql.appendSlice(db.allocator, "SELECT DISTINCT resolver, namehash, coin_type FROM resolver_addresses WHERE (resolver, namehash) IN (");
+        for (0..n) |i| {
+            if (i > 0) try sql.appendSlice(db.allocator, ", ");
+            try sql.appendSlice(db.allocator, "(?, ?)");
+        }
+        try sql.appendSlice(db.allocator, ") ORDER BY coin_type");
+
+        var arena = std.heap.ArenaAllocator.init(db.allocator);
+        defer arena.deinit();
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        try bindPairsStatic(&q, arena.allocator(), resolvers_list[off..end], namehashes[off..end]);
+        while (try q.step()) {
+            // Loop-scoped errdefers — see getTextRecordsBatch for rationale.
+            const r_opt = try q.getText(0);
+            errdefer if (r_opt) |x| db.allocator.free(x);
+            const nh_opt = try q.getText(1);
+            errdefer if (nh_opt) |x| db.allocator.free(x);
+            if (r_opt == null or nh_opt == null) {
+                if (r_opt) |x| db.allocator.free(x);
+                if (nh_opt) |x| db.allocator.free(x);
+                continue;
+            }
+            try rows.append(db.allocator, .{ .resolver = r_opt.?, .namehash = nh_opt.?, .coin_type = @intCast(q.getInt64(2)) });
         }
     }
     return try rows.toOwnedSlice(db.allocator);

@@ -457,8 +457,28 @@ const EventEntityConfig = json_builder.EntityConfig{
         .{ .name = "asExpiryUpdated", .handler = eventAsExpiryUpdatedHandler },
         .{ .name = "asResolverUpdated", .handler = eventAsResolverUpdatedHandler },
         .{ .name = "asLabelRegistered", .handler = eventAsLabelRegisteredHandler },
+        .{ .name = "asEACRolesChanged", .handler = eventAsEACRolesChangedHandler },
     },
 };
+
+fn eventAsEACRolesChangedHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    _ = field;
+    const event: *const models.Event = @ptrCast(@alignCast(ctx));
+    const allocator = nested_ctx.allocator;
+    if (!isEventType(event, "EACRolesChanged")) return try allocator.dupe(u8, "null");
+    const data = event.data;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '{');
+    var first = true;
+    try writeOptStringField(&out, allocator, &first, "resource", json_utils.extractStringField(data, "resource"));
+    try writeOptStringField(&out, allocator, &first, "account", json_utils.extractStringField(data, "account"));
+    try writeOptStringField(&out, allocator, &first, "oldRoleBitmap", json_utils.extractStringField(data, "oldRoleBitmap"));
+    try writeOptStringField(&out, allocator, &first, "newRoleBitmap", json_utils.extractStringField(data, "newRoleBitmap"));
+    try out.append(allocator, '}');
+    return try out.toOwnedSlice(allocator);
+}
 
 /// Build Event JSON with nested field selection support
 pub fn buildEventJson(
@@ -1064,6 +1084,24 @@ fn resolverCoinTypesHandler(ctx: *anyopaque, field: *const parser.Field, nested_
     if (nested_ctx.at_block != null) return try nested_ctx.allocator.dupe(u8, "[]");
     const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+
+    // Page-batched list first — composite (resolver, namehash) key, same
+    // contract as resolverTextsHandler. Absent = fall back to the point query.
+    if (nested_ctx.loaders) |lp| {
+        const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+        if (lc.lookupCoinTypes(rctx.resolver, rctx.namehash)) |batched| {
+            var json: std.Io.Writer.Allocating = .init(nested_ctx.allocator);
+            errdefer json.deinit();
+            var arr = try jw.arrayOn(&json.writer);
+            for (batched) |ct| {
+                const ct_str = try std.fmt.allocPrint(nested_ctx.allocator, "{d}", .{ct});
+                defer nested_ctx.allocator.free(ct_str);
+                try arr.itemStr(ct_str, nested_ctx.allocator);
+            }
+            try arr.end();
+            return try json.toOwnedSlice();
+        }
+    }
 
     const coin_types = try database.getCoinTypes(rctx.resolver, rctx.namehash);
     defer database.allocator.free(coin_types);

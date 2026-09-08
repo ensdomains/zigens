@@ -506,3 +506,162 @@ test "upsertEACRolesBatch handles batches past the chunk boundary and tracked-st
     try testing.expectEqual(@as(usize, 1), last.len);
     try testing.expectEqual(@as(u64, 3119), last[0].block_number);
 }
+
+// ============================================================================
+// VERBATIM REGISTRY RESOURCES (EAC version bits)
+// ============================================================================
+
+/// A label's canonical id (low 32 bits zero) and its versioned resources, in the
+/// fixed 66-char hex the indexer stores.
+const VersionedLabel = struct {
+    canonical: [66]u8,
+    v0: [66]u8,
+    v1: [66]u8,
+    v2: [66]u8,
+
+    fn init(canonical_id: u256) VersionedLabel {
+        var out: VersionedLabel = undefined;
+        _ = std.fmt.bufPrint(&out.canonical, "0x{x:0>64}", .{canonical_id}) catch unreachable;
+        _ = std.fmt.bufPrint(&out.v0, "0x{x:0>64}", .{canonical_id}) catch unreachable;
+        _ = std.fmt.bufPrint(&out.v1, "0x{x:0>64}", .{canonical_id | 1}) catch unreachable;
+        _ = std.fmt.bufPrint(&out.v2, "0x{x:0>64}", .{canonical_id | 2}) catch unreachable;
+        return out;
+    }
+};
+
+const LABEL_CANONICAL: u256 = 0x53f632a801578489983227b234817273b09ffad9c79c50366f6ff4d600000000;
+
+fn seedRegistryName(allocator: std.mem.Allocator, database: *Database, name: []const u8, canonical_id: u256, registry: Address) !void {
+    const nh = try lib.namehash(allocator, name);
+    var parts = std.mem.splitScalar(u8, name, '.');
+    const label = parts.first();
+    const parent = parts.rest();
+    try database.insertName(models.Name{
+        .protocol = .v2,
+        .name = name,
+        .namehash = nh,
+        .label = label,
+        .label_hash = try lib.labelhash(allocator, label),
+        .parent_name = parent,
+        .parent_namehash = try lib.namehash(allocator, parent),
+        .registry = registry,
+        .owner = helpers.TEST_OWNER_2,
+        .registrant = helpers.TEST_OWNER_2,
+        .resolver = Address.zero,
+        .token_id = canonical_id | 2,
+        .canonical_id = canonical_id,
+        .token_version = 2,
+        .expiry = 2000000000,
+        .registry_locked = false,
+        .migrated = false,
+        .created_block = 1000,
+        .created_at = 1700000000,
+        .registered_at = 1700000000,
+        .updated_block = 1000,
+        .updated_at = 1700000000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    });
+}
+
+fn freeRoles(allocator: std.mem.Allocator, list: []models.EACRoleAssignment) void {
+    for (list) |*r| r.deinit(allocator);
+    allocator.free(list);
+}
+
+test "registry resource keeps its EAC version bits and a superseded version drops out of listings" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+    const lbl = VersionedLabel.init(LABEL_CANONICAL);
+    const registry = helpers.TEST_REGISTRY;
+    const root = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+    // First registration: owner 1 holds roles at version 0. Unregister +
+    // re-register bumps eacVersionId → the new owner's grant lands on version 1.
+    try roles.upsertEACRole(database, .v2, &lbl.v0, helpers.TEST_OWNER_1, "0x0111", 1000, helpers.randomHash(), 0, registry);
+    try roles.upsertEACRole(database, .v2, &lbl.v1, helpers.TEST_OWNER_2, "0x0111", 2000, helpers.randomHash(), 0, registry);
+    // Registry-wide ROOT roles have no version and must never be filtered out.
+    try roles.upsertEACRole(database, .v2, root, helpers.TEST_OWNER_1, "0x1111", 900, helpers.randomHash(), 0, registry);
+
+    // Stored exactly as emitted.
+    const v1_rows = try roles.getRolesFiltered(database, .v2, .{ .resource = &lbl.v1 });
+    defer freeRoles(allocator, v1_rows);
+    try testing.expectEqual(@as(usize, 1), v1_rows.len);
+    try testing.expectEqualStrings(&lbl.v1, v1_rows[0].resource);
+
+    // Contract listing: the superseded version-0 grant is gone, ROOT stays.
+    const listing = try roles.getRolesFiltered(database, .v2, .{ .contract_address = registry });
+    defer freeRoles(allocator, listing);
+    try testing.expectEqual(@as(usize, 2), listing.len);
+    for (listing) |r| try testing.expect(!std.mem.eql(u8, r.resource, &lbl.v0));
+    try testing.expectEqual(@as(usize, 2), try roles.getRoleCountFiltered(database, .{ .protocol = .v2, .contract_address = registry }));
+
+    const paged = try roles.getRolesWithPagination(database, .v2, .{ .contract_address = registry, .limit = 10 });
+    defer freeRoles(allocator, paged);
+    try testing.expectEqual(@as(usize, 2), paged.len);
+
+    // Asking for the old resource explicitly still returns its rows: history
+    // is preserved, just not presented as current.
+    const old = try roles.getRolesFiltered(database, .v2, .{ .resource = &lbl.v0 });
+    defer freeRoles(allocator, old);
+    try testing.expectEqual(@as(usize, 1), old.len);
+    try testing.expect(old[0].account.eql(helpers.TEST_OWNER_1));
+    try testing.expectEqual(@as(usize, 1), try roles.getRoleCountFiltered(database, .{ .protocol = .v2, .contract_address = registry, .resource = &lbl.v0 }));
+
+    // The account view of the old holder is likewise current-only.
+    const by_account = try roles.getRolesFiltered(database, .v2, .{ .account = helpers.TEST_OWNER_1 });
+    defer freeRoles(allocator, by_account);
+    try testing.expectEqual(@as(usize, 1), by_account.len);
+    try testing.expectEqualStrings(root, by_account[0].resource);
+}
+
+test "versioned registry resources attribute to the label by canonical prefix" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+    const lbl = VersionedLabel.init(LABEL_CANONICAL);
+    const registry = helpers.TEST_REGISTRY;
+    try seedRegistryName(allocator, database, "versioned.eth", LABEL_CANONICAL, registry);
+
+    try roles.upsertEACRole(database, .v2, &lbl.v2, helpers.TEST_OWNER_2, "0x0111", 3000, helpers.randomHash(), 0, registry);
+    // Same resource value on ANOTHER contract must not borrow the name.
+    try roles.upsertEACRole(database, .v2, &lbl.v2, helpers.TEST_OWNER_1, "0x0001", 3000, helpers.randomHash(), 1, helpers.TEST_RESOLVER);
+
+    const rows = try roles.getRolesFiltered(database, .v2, .{ .resource = &lbl.v2 });
+    defer freeRoles(allocator, rows);
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    for (rows) |r| {
+        if (r.contract_address.eql(registry)) {
+            try testing.expectEqualStrings("versioned.eth", r.name.?);
+        } else {
+            try testing.expect(r.name == null);
+        }
+    }
+}
+
+test "getLabelRoleHolderCount counts only the label's current EAC version" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+    const lbl = VersionedLabel.init(LABEL_CANONICAL);
+    const registry = helpers.TEST_REGISTRY;
+    const owner3 = Address{ .bytes = [_]u8{0x33} ** 20 };
+
+    try roles.upsertEACRole(database, .v2, &lbl.v0, helpers.TEST_OWNER_1, "0x0111", 1000, helpers.randomHash(), 0, registry);
+    try testing.expectEqual(@as(usize, 1), try roles.getLabelRoleHolderCount(database, .v2, &lbl.canonical, registry));
+
+    try roles.upsertEACRole(database, .v2, &lbl.v1, helpers.TEST_OWNER_2, "0x0111", 2000, helpers.randomHash(), 0, registry);
+    try roles.upsertEACRole(database, .v2, &lbl.v1, owner3, "0x0100", 2000, helpers.randomHash(), 1, registry);
+    // Version 1 is current: its two holders count, the version-0 holder does not.
+    try testing.expectEqual(@as(usize, 2), try roles.getLabelRoleHolderCount(database, .v2, &lbl.canonical, registry));
+    // Zero-trimmed canonical spelling resolves the same label.
+    var trimmed_buf: [66]u8 = undefined;
+    const trimmed = try std.fmt.bufPrint(&trimmed_buf, "0x{x}", .{LABEL_CANONICAL});
+    try testing.expectEqual(@as(usize, 2), try roles.getLabelRoleHolderCount(database, .v2, trimmed, registry));
+    // Another registry with the same canonical id is a different label.
+    try testing.expectEqual(@as(usize, 0), try roles.getLabelRoleHolderCount(database, .v2, &lbl.canonical, helpers.TEST_RESOLVER));
+}

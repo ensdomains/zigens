@@ -428,7 +428,7 @@ pub fn getResolverRoles(db: *Database, resolver: Address) ![]models.EACRoleAssig
     const sql =
         \\SELECT r.id, r.protocol, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp, n.name
         \\FROM eac_roles r
-        \\LEFT JOIN names n ON r.resource = n.canonical_id AND r.contract_address = n.registry
+        \\LEFT JOIN names n ON n.canonical_id = (substr(r.resource, 1, 58) || '00000000') AND r.contract_address = n.registry
         \\WHERE r.contract_address = ?
         \\ORDER BY r.timestamp DESC
     ;

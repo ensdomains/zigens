@@ -113,8 +113,11 @@ pub fn resolveRolesConnection(ctx: parser.ExecutionContext, field: *const parser
         1000, // max limit
     );
 
-    // Get optional filter arguments
-    const resource_arg = parser.getStringArg(field, "resource", null);
+    // Get optional filter arguments. The resource is normalized to the stored
+    // 66-char spelling so page and count agree with `roles` (which widens the
+    // spelling in SQL); non-hex input keeps exact-match semantics.
+    const raw_resource_arg = parser.getStringArg(field, "resource", null);
+    const resource_arg: ?[]const u8 = if (raw_resource_arg) |r| ((try common.normalizeResourceHex(allocator, r)) orelse r) else null;
     const account_arg = parser.getStringArg(field, "account", null);
 
     // Parse account address if provided.
@@ -286,6 +289,26 @@ fn mapResolverEntityOrderBy(order_by: ?[]const u8) db.ResolverEntitySortField {
     return .address;
 }
 
+/// Collect the entities page's (resolver, namehash) pairs and hand them to the
+/// shared Resolver-level record prefetch. Rows whose hex fails to parse are
+/// skipped here AND in the build loop below, so the pair arrays stay aligned
+/// with what actually renders. Best-effort: any failure just leaves the
+/// per-row handlers on their point-query fallback.
+fn prefetchResolverEntityPage(database: *db.Database, allocator: std.mem.Allocator, loaders_ptr: ?*anyopaque, entities: []const db.ResolverEntity, selections: []const parser.Field) void {
+    if (loaders_ptr == null or entities.len == 0) return;
+    var pair_resolvers: std.ArrayList(Address) = .empty;
+    defer pair_resolvers.deinit(allocator);
+    var pair_namehashes: std.ArrayList(Hash) = .empty;
+    defer pair_namehashes.deinit(allocator);
+    for (entities) |row| {
+        const r = Address.fromHex(row.address) catch continue;
+        const nh = Hash.fromHex(row.namehash) catch continue;
+        pair_resolvers.append(allocator, r) catch return;
+        pair_namehashes.append(allocator, nh) catch return;
+    }
+    domain_resolvers.prefetchRecordsForResolverPage(database, allocator, loaders_ptr, pair_resolvers.items, pair_namehashes.items, selections);
+}
+
 /// Resolver for the new subgraph-style `resolvers(first, skip, where, orderBy)`
 /// list query. Reads from the `resolvers` table (one row per (protocol, address,
 /// namehash) binding). IDs are emitted as `{protocol}-{address}-{namehash}` via
@@ -336,6 +359,11 @@ pub fn resolveResolverEntities(ctx: parser.ExecutionContext, field: *const parse
         }
         database.allocator.free(entities);
     }
+
+    // Page-batch the record fields (texts/coinTypes/addr/contentHash/text(key:))
+    // so buildResolverJson serves them from memory instead of point-querying
+    // per row (the domains-list treatment).
+    prefetchResolverEntityPage(database, allocator, ctx.loaders, entities, field.selections);
 
     var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);

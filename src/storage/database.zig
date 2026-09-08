@@ -43,7 +43,9 @@ pub const AccountFilters = accounts.AccountFilters;
 pub const AccountSortField = accounts.AccountSortField;
 pub const Account = accounts.Account;
 pub const PairTextKeyRow = resolvers.PairTextKeyRow;
+pub const PairCoinTypeRow = resolvers.PairCoinTypeRow;
 pub const NamedResource = named_resources.NamedResource;
+pub const ResolverEntity = resolvers.ResolverEntity;
 pub const ResolverEntityFilters = resolvers.ResolverEntityFilters;
 pub const ResolverEntitySortField = resolvers.ResolverEntitySortField;
 
@@ -436,6 +438,7 @@ pub const Database = struct {
     pub const getContentHashesBatch = resolvers.getContentHashesBatch;
     pub const getTextRecordsBatch = resolvers.getTextRecordsBatch;
     pub const getTextRecordKeysForPairs = resolvers.getTextRecordKeysForPairs;
+    pub const getCoinTypesForPairs = resolvers.getCoinTypesForPairs;
     pub const getTextRecordKeys = resolvers.getTextRecordKeys;
     pub const getTextRecord = resolvers.getTextRecord;
     pub const getResolversByOwner = resolvers.getResolversByOwner;

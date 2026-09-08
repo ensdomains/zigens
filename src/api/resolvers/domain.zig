@@ -318,48 +318,61 @@ fn mapFilterGroup(group: ?[]const ParsedDomainFilter, allocator: std.mem.Allocat
     return arr;
 }
 
-const ResolverRecordWants = struct { addr: bool, contenthash: bool, text_keys: bool };
+const ResolverRecordWants = struct { addr: bool = false, contenthash: bool = false, text_keys: bool = false, coin_types: bool = false };
+
+/// Which batchable records a Resolver-level selection set reads:
+/// `addr` -> addr; `contentHash` -> contenthash; `texts` -> text_keys;
+/// `coinTypes` -> coin_types.
+fn scanResolverSelections(resolver_selections: []const parser.Field, want: *ResolverRecordWants) void {
+    for (resolver_selections) |*sub| {
+        if (std.mem.eql(u8, sub.name, "addr")) want.addr = true;
+        if (std.mem.eql(u8, sub.name, "contentHash")) want.contenthash = true;
+        if (std.mem.eql(u8, sub.name, "texts")) want.text_keys = true;
+        if (std.mem.eql(u8, sub.name, "coinTypes")) want.coin_types = true;
+    }
+}
 
 /// Which batchable resolver records a `domains` selection reads: `resolvedAddress`
-/// or `resolver{ addr }` -> addr; `resolver{ contentHash }` -> contenthash;
-/// `resolver{ texts }` -> text_keys. Used to skip the page prefetch entirely
-/// when the query doesn't select them.
+/// or `resolver{ addr }` -> addr, plus everything scanResolverSelections finds
+/// under `resolver { ... }`. Used to skip the page prefetch entirely when the
+/// query doesn't select them.
 fn wantsResolverRecords(selections: []const parser.Field) ResolverRecordWants {
-    var want = ResolverRecordWants{ .addr = false, .contenthash = false, .text_keys = false };
+    var want = ResolverRecordWants{};
     for (selections) |*sel| {
         if (std.mem.eql(u8, sel.name, "resolvedAddress")) {
             want.addr = true;
         } else if (std.mem.eql(u8, sel.name, "resolver")) {
-            for (sel.selections) |*sub| {
-                if (std.mem.eql(u8, sub.name, "addr")) want.addr = true;
-                if (std.mem.eql(u8, sub.name, "contentHash")) want.contenthash = true;
-                if (std.mem.eql(u8, sub.name, "texts")) want.text_keys = true;
-            }
+            scanResolverSelections(sel.selections, &want);
         }
     }
     return want;
 }
 
-/// Collect the distinct `text(key:"...")` keys selected under `resolver { ... }`,
-/// so they can be batch-prefetched. Deduped (aliases of the same key batch once).
+/// Collect the distinct `text(key:"...")` keys in a Resolver-level selection
+/// set, so they can be batch-prefetched. Deduped (aliases of the same key
+/// batch once).
+fn collectResolverTextKeyArgs(resolver_selections: []const parser.Field, list: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !void {
+    for (resolver_selections) |*sub| {
+        if (!std.mem.eql(u8, sub.name, "text")) continue;
+        for (sub.arguments) |arg| {
+            if (!std.mem.eql(u8, arg.name, "key") or arg.value != .string) continue;
+            const k = arg.value.string;
+            var seen = false;
+            for (list.items) |ex| {
+                if (std.mem.eql(u8, ex, k)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) try list.append(allocator, k);
+        }
+    }
+}
+
 fn collectTextKeys(selections: []const parser.Field, list: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !void {
     for (selections) |*sel| {
         if (!std.mem.eql(u8, sel.name, "resolver")) continue;
-        for (sel.selections) |*sub| {
-            if (!std.mem.eql(u8, sub.name, "text")) continue;
-            for (sub.arguments) |arg| {
-                if (!std.mem.eql(u8, arg.name, "key") or arg.value != .string) continue;
-                const k = arg.value.string;
-                var seen = false;
-                for (list.items) |ex| {
-                    if (std.mem.eql(u8, ex, k)) {
-                        seen = true;
-                        break;
-                    }
-                }
-                if (!seen) try list.append(allocator, k);
-            }
-        }
+        try collectResolverTextKeyArgs(sel.selections, list, allocator);
     }
 }
 
@@ -372,7 +385,7 @@ pub fn prefetchResolverRecords(database: *db.Database, allocator: std.mem.Alloca
     var text_keys: std.ArrayList([]const u8) = .empty;
     defer text_keys.deinit(allocator);
     collectTextKeys(selections, &text_keys, allocator) catch {};
-    if (!want.addr and !want.contenthash and !want.text_keys and text_keys.items.len == 0) return;
+    if (!want.addr and !want.contenthash and !want.text_keys and !want.coin_types and text_keys.items.len == 0) return;
     const lp = loaders_ptr orelse return;
     const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
 
@@ -394,6 +407,38 @@ pub fn prefetchResolverRecords(database: *db.Database, allocator: std.mem.Alloca
     }
     if (want.text_keys) {
         lc.populateTextKeyLists(database, resolvers_buf, namehashes_buf);
+    }
+    if (want.coin_types) {
+        lc.populateCoinTypeLists(database, resolvers_buf, namehashes_buf);
+    }
+}
+
+/// Record prefetch for a page whose rows ARE (resolver, namehash) pairs — the
+/// top-level resolvers list. Same population as prefetchResolverRecords, but
+/// the selections are Resolver-level and the pair is the row itself, so no
+/// effective-resolver walk is involved: the loader keys match what each row's
+/// handlers query with exactly. Best-effort.
+pub fn prefetchRecordsForResolverPage(database: *db.Database, allocator: std.mem.Allocator, loaders_ptr: ?*anyopaque, resolvers_page: []const Address, namehashes_page: []const Hash, resolver_selections: []const parser.Field) void {
+    var want = ResolverRecordWants{};
+    scanResolverSelections(resolver_selections, &want);
+    var text_keys: std.ArrayList([]const u8) = .empty;
+    defer text_keys.deinit(allocator);
+    collectResolverTextKeyArgs(resolver_selections, &text_keys, allocator) catch {};
+    if (!want.addr and !want.contenthash and !want.text_keys and !want.coin_types and text_keys.items.len == 0) return;
+    const lp = loaders_ptr orelse return;
+    const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+
+    if (want.addr or want.contenthash) {
+        lc.populateResolverRecords(database, resolvers_page, namehashes_page, want.addr, want.contenthash);
+    }
+    if (text_keys.items.len > 0) {
+        lc.populateTextRecords(database, resolvers_page, namehashes_page, text_keys.items);
+    }
+    if (want.text_keys) {
+        lc.populateTextKeyLists(database, resolvers_page, namehashes_page);
+    }
+    if (want.coin_types) {
+        lc.populateCoinTypeLists(database, resolvers_page, namehashes_page);
     }
 }
 

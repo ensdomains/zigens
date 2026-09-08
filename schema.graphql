@@ -71,16 +71,19 @@ type Query {
   """Subgraph parity: top-level `LabelRegistered` events. Inspect via `asLabelRegistered { ... }`."""
   labelRegistereds(first: Int = 100, skip: Int = 0, where: EventFilter, orderBy: Event_orderBy, orderDirection: OrderDirection): [Event!]!
 
+  """Top-level `EACRolesChanged` events (role grant/revoke history). Filter with `where: { resource, contractAddress, blockNumber_* }`; inspect via `asEACRolesChanged { ... }`. For CURRENT holders use `roles` / `roleConnection` instead."""
+  eacRolesChangeds(first: Int = 100, skip: Int = 0, where: EventFilter, orderBy: Event_orderBy, orderDirection: OrderDirection): [Event!]!
+
   """Subgraph parity: top-level `ReverseClaimed` events. Inspect via `asReverseClaimed { ... }`."""
   reverseClaimeds(first: Int = 100, skip: Int = 0, where: EventFilter, orderBy: Event_orderBy, orderDirection: OrderDirection): [Event!]!
 
   """Subgraph parity: top-level `RegistryTransfer` events. Inspect via `asRegistryTransfer { ... }`."""
   registryTransfers(first: Int = 100, skip: Int = 0, where: EventFilter, orderBy: Event_orderBy, orderDirection: OrderDirection): [Event!]!
 
-  """Get EAC role assignments. Filters combine; `contract` scopes shared resource values (ROOT, 0x0, exists on every EAC-enabled contract) to one registry/resolver. `protocol` selects v1/v2 (default v2)."""
+  """Get EAC role assignments. Filters combine; `contract` scopes shared resource values (ROOT, 0x0, exists on every EAC-enabled contract) to one registry/resolver. `protocol` selects v1/v2 (default v2). `resource` matches the value exactly as emitted (registry: `canonical_id | eacVersionId`; any hex spelling accepted). Without `resource`, rows superseded by a higher EAC version of the same label on the same contract (a later registration of that label) are omitted; name a resource explicitly to see a superseded generation. A label that was unregistered or expired without being re-registered keeps its last generation listed — read the label's own state for that."""
   roles(resource: String, account: String, contract: String, protocol: String): [EACRoleAssignment!]!
 
-  """Get EAC role assignments with cursor-based pagination (recommended)"""
+  """Get EAC role assignments with cursor-based pagination (recommended). Same filter and superseded-version semantics as `roles`."""
   roleConnection(first: Int, after: String, last: Int, before: String, resource: String, account: String, contract: String, protocol: String): EACRoleAssignmentConnection!
 
   """
@@ -802,6 +805,18 @@ type AddressChangedData {
   address: String
 }
 
+"""Typed payload for `EACRolesChanged` events (EnhancedAccessControl on registries and resolvers)."""
+type EACRolesChangedData {
+  """EAC resource exactly as emitted (32-byte hex). Registries: `canonical_id | eacVersionId`; resolvers: keccak256(node, part) or ROOT (0x0)."""
+  resource: String!
+  """Account whose roles changed."""
+  account: String!
+  """Role bitmap before the change (32-byte hex)."""
+  oldRoleBitmap: String!
+  """Role bitmap after the change (32-byte hex); all zeros = every role revoked."""
+  newRoleBitmap: String!
+}
+
 """Typed payload for `ExpiryUpdated` events (V1 NameWrapper ExpiryExtended + V2 registry expiry updates)."""
 type ExpiryUpdatedData {
   """Namehash of the affected node (V1 NameWrapper variant)."""
@@ -907,6 +922,8 @@ type Event {
   asResolverUpdated: ResolverUpdatedData
   """Typed view of `data` when `type` is `LabelRegistered`. Null otherwise."""
   asLabelRegistered: LabelRegisteredData
+  """Typed view of `data` when `type` is `EACRolesChanged`. Null otherwise."""
+  asEACRolesChanged: EACRolesChangedData
 }
 
 """Filter criteria for querying domains"""
@@ -1126,6 +1143,9 @@ input EventFilter {
   """Filter by domain name"""
   domain: String
 
+  """Exact match on the EAC resource carried in an `EACRolesChanged` payload. Compared exactly as emitted, version bits included; any hex spelling (zero-trimmed, padded, upper-case) is accepted. Combine with `contractAddress` since ROOT (0x0) exists on every EAC-enabled contract."""
+  resource: String
+
   """Filter by contract address"""
   contractAddress: String
 
@@ -1324,13 +1344,13 @@ type RegistryInfo {
   """Total event count emitted by this registry contract."""
   eventCount: Int!
 
-  """EAC role assignments on this registry (legacy offset-based)."""
+  """EAC role assignments on this registry (legacy offset-based). Rows superseded by a higher EAC version of the same label (a later registration of that label) are omitted; an unregistered or expired label that was not re-registered keeps its last generation listed."""
   roles(first: Int, skip: Int, account: String): [EACRoleAssignment!]!
 
-  """Cursor-based EAC role assignments on this registry (recommended)."""
+  """Cursor-based EAC role assignments on this registry (recommended). Same superseded-version semantics as `roles`."""
   roleConnection(first: Int, after: String, last: Int, before: String, account: String): EACRoleAssignmentConnection!
 
-  """Total role-assignment count on this registry."""
+  """Total role-assignment count on this registry (superseded versions excluded)."""
   roleCount: Int!
 }
 
