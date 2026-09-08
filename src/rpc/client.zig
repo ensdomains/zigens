@@ -783,6 +783,64 @@ pub const Client = struct {
         return result.string.len > 2;
     }
 
+    pub const CodeProbe = struct { address: Address, block: u64 };
+
+    /// eth_getCode for many (address, block) pairs in one JSON-RPC batch, in
+    /// request order. Entry i is null when the provider's answer for probe i
+    /// was missing or malformed, so a hostile or partial reply degrades that
+    /// probe alone instead of the whole batch.
+    pub fn getCodeBatch(self: *Client, probes: []const CodeProbe) ![]?bool {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var batch_requests = try a.alloc(BatchRequest, probes.len);
+        for (probes, 0..) |probe, i| {
+            var params = std.json.Array.init(a);
+            try params.append(.{ .string = try probe.address.toHex(a) });
+            try params.append(.{ .string = try std.fmt.allocPrint(a, "0x{x}", .{probe.block}) });
+            batch_requests[i] = .{ .method = "eth_getCode", .params = .{ .array = params } };
+        }
+
+        const parsed = try self.makeBatchRpcCall(batch_requests);
+        defer parsed.deinit();
+        if (parsed.value != .array) return error.RpcError;
+        const items = parsed.value.array.items;
+        if (items.len != probes.len) return error.RpcError;
+
+        const out = try self.allocator.alloc(?bool, probes.len);
+        for (items, 0..) |item, i| out[i] = parseCodeEntry(item);
+        return out;
+    }
+
+    fn parseCodeEntry(value: std.json.Value) ?bool {
+        if (value != .object) return null;
+        const result = value.object.get("result") orelse return null;
+        if (result != .string) return null;
+        const code = result.string;
+        if (!std.mem.startsWith(u8, code, "0x")) return null;
+        return code.len > 2;
+    }
+
+    test "parseCodeEntry degrades on malformed provider responses, never panics" {
+        const a = std.testing.allocator;
+        const Case = struct { json: []const u8, want: ?bool };
+        const cases = [_]Case{
+            .{ .json = "{\"result\":\"0x6080604052\"}", .want = true },
+            .{ .json = "{\"result\":\"0x\"}", .want = false },
+            .{ .json = "{\"result\":null}", .want = null },
+            .{ .json = "{\"error\":{\"code\":-32000}}", .want = null },
+            .{ .json = "{\"result\":42}", .want = null },
+            .{ .json = "{\"result\":\"6080\"}", .want = null },
+            .{ .json = "[]", .want = null },
+        };
+        for (cases) |c| {
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, c.json, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(c.want, parseCodeEntry(parsed.value));
+        }
+    }
+
     /// Execute a read-only contract call (`eth_call`) against `to` with `data`,
     /// evaluated at `block`. Returns the raw ABI return bytes, owned by this
     /// client's allocator (an empty return is a zero-length slice). An on-chain
