@@ -90,14 +90,23 @@ fn printHelp() void {
     , .{});
 }
 
+const memstat = @import("utils/memstat.zig");
+
+/// File-scope so the per-batch memory line can read `total_requested_bytes`.
+var gpa = std.heap.DebugAllocator(.{ .thread_safe = true, .enable_memory_limit = true }){};
+
+fn gpaLiveBytes() usize {
+    return @intCast(gpa.total_requested_bytes);
+}
+
 pub fn main(init: std.process.Init) !void {
     // Configure SQLite for thread safety BEFORE any other operations
     db.configureSqliteThreadSafety();
 
     // Use thread-safe GPA configuration
-    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    memstat.live_bytes_fn = &gpaLiveBytes;
     const io = init.io;
 
     // Parse command line arguments

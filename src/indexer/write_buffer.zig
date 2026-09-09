@@ -70,6 +70,10 @@ pub const WriteBuffer = struct {
     /// Placeholder ledger to re-note events that land with a placeholder
     /// name after the flush repair (set by the driver alongside `active`).
     ledger: ?*placeholders_mod.PlaceholderLedger = null,
+    /// Re-entrancy guard: the names flush itself runs storage functions that
+    /// call the names barrier.
+    flushing_names: bool = false,
+    next_name_seq: u64 = 0,
 
     pub const BufferedRole = struct {
         protocol: models.Protocol,
@@ -135,6 +139,9 @@ pub const WriteBuffer = struct {
     pub const BufferedName = struct {
         /// True if this name was INSERT'd in this chunk (vs UPDATE to existing DB record).
         is_new: bool,
+        /// Insertion order of a buffered INSERT, so the flush assigns serial
+        /// ids in chain order like the per-event path did.
+        seq: u64 = 0,
         /// Full name record (for new inserts). All string fields are owned by the buffer.
         record: ?models.Name = null,
         /// Pending field updates (applied at flush time for existing DB names).
@@ -263,14 +270,17 @@ pub const WriteBuffer = struct {
             }
             gop.value_ptr.* = .{
                 .is_new = true,
+                .seq = self.next_name_seq,
                 .record = try dupeName(self.allocator, name),
             };
         } else {
             gop.value_ptr.* = .{
                 .is_new = true,
+                .seq = self.next_name_seq,
                 .record = try dupeName(self.allocator, name),
             };
         }
+        self.next_name_seq += 1;
         // Compute the ENSIP-15 flag here (the buffered insert chokepoint) so flushed
         // V1 names persist it just like the direct-insert path (Indexer.insertName).
         gop.value_ptr.record.?.is_normalized = ens_normalize.nameIsNormalized(self.allocator, name.name);
@@ -632,21 +642,63 @@ pub const WriteBuffer = struct {
         try self.account_index.put(address_dup, self.accounts.items.len - 1);
     }
 
+    pub fn hasPendingNames(self: *const WriteBuffer) bool {
+        return self.names.count() > 0;
+    }
+
+    /// The names tier of `flush`, also run by the names barrier: every buffered
+    /// INSERT (chain order) and pending field update lands in the database and
+    /// the map empties, so a following direct names read/write sees exactly
+    /// the direct path's state. Re-entrant calls (the storage functions used
+    /// here hit the barrier themselves) are no-ops.
+    pub fn flushNames(self: *WriteBuffer, db: *Database) !void {
+        if (self.flushing_names or self.names.count() == 0) return;
+        self.flushing_names = true;
+        defer self.flushing_names = false;
+        var stats: NamesFlushStats = .{};
+        try self.flushNamesInner(db, &stats);
+        var it = self.names.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.record) |*rec| freeNameStrings(self.allocator, rec);
+        }
+        self.names.clearRetainingCapacity();
+    }
+
+    const NamesFlushStats = struct {
+        inserted: usize = 0,
+        updated: usize = 0,
+        op_ns: [8]i128 = @splat(0),
+        op_count: [8]usize = @splat(0),
+    };
+
     pub fn flush(self: *WriteBuffer, db: *Database) !void {
         const timer = zsys.milliTimestamp();
+        var stats: NamesFlushStats = .{};
+        self.flushing_names = true;
+        self.flushNamesInner(db, &stats) catch |err| {
+            self.flushing_names = false;
+            return err;
+        };
+        self.flushing_names = false;
+        const names_inserted = stats.inserted;
+        const names_updated = stats.updated;
+        const op_ns = stats.op_ns;
+        const op_count = stats.op_count;
+        const names_ms = zsys.milliTimestamp() - timer;
+        try self.flushRest(db, timer, names_inserted, names_updated, names_ms, op_ns, op_count);
+    }
+
+    fn flushNamesInner(self: *WriteBuffer, db: *Database, stats: *NamesFlushStats) !void {
         var names_inserted: usize = 0;
         var names_updated: usize = 0;
-        var names_ms: i64 = 0;
-        // Per-statement-type forensics: [insert, unwrap, wrapper_state, migrate/owner,
-        // expiry, resolver, fuses, wrapper_expiry]. Printed when the names phase runs hot.
         var op_ns: [8]i128 = @splat(0);
         var op_count: [8]usize = @splat(0);
-        const wal_before = db.walFileSize() orelse 0;
 
         // 1. Flush names (events may reference names). New names are collected
         // and written in one multi-row upsert pass below — on a remote
         // Postgres the per-row round trips dominated the flush.
-        var new_names: std.ArrayList(models.Name) = .empty;
+        const SeqName = struct { seq: u64, name: models.Name };
+        var new_names: std.ArrayList(SeqName) = .empty;
         defer new_names.deinit(self.allocator);
         // Owner-/resolver-only updates to existing rows (the V2 bulk shape:
         // mint Transfer + ResolverUpdated per registration) go out as one
@@ -662,8 +714,8 @@ pub const WriteBuffer = struct {
 
             if (bn.is_new) {
                 // Record has all updates already applied; strings stay owned by
-                // the buffer until reset(), which outlives the batch insert.
-                try new_names.append(self.allocator, bn.record.?);
+                // the buffer until the map is cleared after the batch insert.
+                try new_names.append(self.allocator, .{ .seq = bn.seq, .name = bn.record.? });
             } else {
                 // Apply individual updates to existing DB record
                 const namehash = Hash{ .bytes = entry.key_ptr.* };
@@ -734,11 +786,20 @@ pub const WriteBuffer = struct {
             }
         }
         if (new_names.items.len > 0) {
+            std.mem.sort(SeqName, new_names.items, {}, struct {
+                fn lessThan(_: void, a: SeqName, b: SeqName) bool {
+                    return a.seq < b.seq;
+                }
+            }.lessThan);
+            var ordered: std.ArrayList(models.Name) = .empty;
+            defer ordered.deinit(self.allocator);
+            try ordered.ensureTotalCapacity(self.allocator, new_names.items.len);
+            for (new_names.items) |sn| ordered.appendAssumeCapacity(sn.name);
             const t0 = zsys.nanoTimestamp();
-            try names_storage.insertNamesBatch(db, new_names.items);
+            try names_storage.insertNamesBatch(db, ordered.items);
             op_ns[0] += zsys.nanoTimestamp() - t0;
-            op_count[0] += new_names.items.len;
-            names_inserted = new_names.items.len;
+            op_count[0] += ordered.items.len;
+            names_inserted = ordered.items.len;
         }
         if (owner_rows.items.len > 0) {
             const t0 = zsys.nanoTimestamp();
@@ -752,7 +813,16 @@ pub const WriteBuffer = struct {
             op_ns[5] += zsys.nanoTimestamp() - t0;
             op_count[5] += resolver_rows.items.len;
         }
-        names_ms = zsys.milliTimestamp() - timer;
+        stats.inserted += names_inserted;
+        stats.updated += names_updated;
+        for (0..8) |i| {
+            stats.op_ns[i] += op_ns[i];
+            stats.op_count[i] += op_count[i];
+        }
+    }
+
+    fn flushRest(self: *WriteBuffer, db: *Database, timer: i64, names_inserted: usize, names_updated: usize, names_ms: i64, op_ns: [8]i128, op_count: [8]usize) !void {
+        const wal_before = db.walFileSize() orelse 0;
 
         // 1b. Flush EAC roles — one deduped multi-row upsert (the map already
         // guarantees unique conflict keys, which Postgres requires within a

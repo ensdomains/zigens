@@ -40,6 +40,7 @@ pub fn insertRegistry(db: *Database, registry: models.Registry) !void {
 /// placeholder in their name/namehash columns (see updatePlaceholderEventsByName for event payload
 /// handling — we only patch the indexed columns, not the raw JSON data blob).
 pub fn updateRegistryPlaceholderName(db: *Database, placeholder_name: []const u8, actual_name: []const u8, namehash: Hash) !u32 {
+    try db.namesBarrier();
     try reorg_undo.captureWhere(db, "registries", "U", "name = ?", .{placeholder_name});
     var reg_q = try Query.init(db, "UPDATE registries SET name = ?, namehash = ? WHERE name = ?");
     defer reg_q.deinit();
@@ -99,6 +100,7 @@ pub fn updatePlaceholderEventsByName(db: *Database, placeholder_name: []const u8
 }
 
 pub fn getRegistriesByOwner(db: *Database, protocol: models.Protocol, owner: Address) ![]models.Registry {
+    try db.namesBarrier();
     // Join registries with names on namehash to find registries where the NAME is owned by the specified owner
     // This returns registries for names that the owner controls (not registries that the owner's names use as subregistries)
     // Only returns the LATEST (most recent) registry per name to avoid duplicates when subregistry is updated

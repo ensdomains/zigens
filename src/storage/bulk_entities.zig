@@ -11,9 +11,9 @@
 //! rows with the batch's last block. Armed (near-tip) batches keep the direct
 //! per-event writers, which capture correctly.
 //!
-//! SQLite has no round trip to save and sits below the UPDATE … FROM version
-//! floor on some hosts, so the UPDATE shapes fall back to the per-row writers
-//! there; the semantics are identical either way.
+//! Every statement here is plain SQL that both backends run unchanged: the
+//! inserts go through the dialect's multi-row upsert builder, the updates
+//! through a CTE-of-VALUES shape (see batchedUpdateSql).
 
 const std = @import("std");
 const zsys = @import("../utils/system.zig");
@@ -23,12 +23,77 @@ const Query = db_module.Query;
 const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
-const names_write = @import("names_write.zig");
-const registrations = @import("registrations.zig");
 
 /// Rows per statement. Every text bind is static (scratch-arena or
 /// buffer-owned), so the driver's copied-bind cap does not apply.
 const BATCH_ROWS: usize = 200;
+
+/// One portable statement that updates `set_cols` on every `table` row whose
+/// `key_cols` match a row of the bound VALUES list:
+///
+///   WITH v(k…, c…) AS (VALUES (?, …), …)
+///   UPDATE table SET c = (SELECT c FROM v WHERE v.k = table.k …), …[, extra]
+///   WHERE EXISTS (SELECT 1 FROM v WHERE v.k = table.k …)
+///
+/// Plain SQL on both backends (CTEs and correlated subqueries are older than
+/// every SQLite and Postgres we run), so there is no per-dialect branch.
+/// Bind order: the VALUES rows (key columns then set columns, row-major),
+/// then the binds of `extra_set`. Every VALUES cell is CAST AS TEXT so
+/// Postgres never has to infer a parameter type from the CTE.
+fn batchedUpdateSql(allocator: std.mem.Allocator, table: []const u8, key_cols: []const []const u8, set_cols: []const []const u8, extra_set: ?[]const u8, rows: usize) ![]u8 {
+    var sql: std.ArrayList(u8) = .empty;
+    errdefer sql.deinit(allocator);
+    try sql.appendSlice(allocator, "WITH v(");
+    for (key_cols, 0..) |c, i| {
+        if (i > 0) try sql.appendSlice(allocator, ", ");
+        try sql.appendSlice(allocator, c);
+    }
+    for (set_cols) |c| {
+        try sql.appendSlice(allocator, ", ");
+        try sql.appendSlice(allocator, c);
+    }
+    try sql.appendSlice(allocator, ") AS (VALUES ");
+    const cells = key_cols.len + set_cols.len;
+    for (0..rows) |r| {
+        try sql.appendSlice(allocator, if (r == 0) "(" else ", (");
+        for (0..cells) |c| {
+            try sql.appendSlice(allocator, if (c == 0) "CAST(? AS TEXT)" else ", CAST(? AS TEXT)");
+        }
+        try sql.append(allocator, ')');
+    }
+    try sql.appendSlice(allocator, ") UPDATE ");
+    try sql.appendSlice(allocator, table);
+    try sql.appendSlice(allocator, " SET ");
+    for (set_cols, 0..) |c, i| {
+        if (i > 0) try sql.appendSlice(allocator, ", ");
+        try sql.appendSlice(allocator, c);
+        try sql.appendSlice(allocator, " = (SELECT ");
+        try sql.appendSlice(allocator, c);
+        try sql.appendSlice(allocator, " FROM v WHERE ");
+        try appendKeyMatch(&sql, allocator, table, key_cols);
+        try sql.append(allocator, ')');
+    }
+    if (extra_set) |extra| {
+        try sql.appendSlice(allocator, ", ");
+        try sql.appendSlice(allocator, extra);
+    }
+    try sql.appendSlice(allocator, " WHERE EXISTS (SELECT 1 FROM v WHERE ");
+    try appendKeyMatch(&sql, allocator, table, key_cols);
+    try sql.append(allocator, ')');
+    return sql.toOwnedSlice(allocator);
+}
+
+fn appendKeyMatch(sql: *std.ArrayList(u8), allocator: std.mem.Allocator, table: []const u8, key_cols: []const []const u8) !void {
+    for (key_cols, 0..) |k, i| {
+        if (i > 0) try sql.appendSlice(allocator, " AND ");
+        try sql.appendSlice(allocator, "v.");
+        try sql.appendSlice(allocator, k);
+        try sql.appendSlice(allocator, " = ");
+        try sql.appendSlice(allocator, table);
+        try sql.append(allocator, '.');
+        try sql.appendSlice(allocator, k);
+    }
+}
 
 pub const NameAddressUpdate = struct {
     namehash: Hash,
@@ -48,40 +113,27 @@ pub const NameColumn = enum {
 };
 
 /// `UPDATE names SET <column> = ?, updated_at = ? WHERE namehash = ?` for many
-/// rows. Callers pass one entry per namehash (the buffer is keyed by it).
+/// rows in one statement per chunk. Callers pass one entry per namehash (the
+/// buffer is keyed by it).
 pub fn updateNameAddressColumnBatch(db: *Database, column: NameColumn, rows: []const NameAddressUpdate) !void {
     if (rows.len == 0) return;
-    if (!db.isPostgres()) {
-        for (rows) |r| switch (column) {
-            .owner => try names_write.updateNameOwner(db, r.namehash, r.value),
-            .resolver => try names_write.updateNameResolver(db, r.namehash, r.value),
-        };
-        return;
-    }
     const now = zsys.timestamp();
     var start: usize = 0;
     while (start < rows.len) {
         const n = @min(BATCH_ROWS, rows.len - start);
         const chunk = rows[start .. start + n];
-        var sql: std.ArrayList(u8) = .empty;
-        defer sql.deinit(db.allocator);
-        try sql.appendSlice(db.allocator, "UPDATE names SET ");
-        try sql.appendSlice(db.allocator, column.name());
-        try sql.appendSlice(db.allocator, " = v.val, updated_at = ? FROM (VALUES ");
-        for (0..n) |i| {
-            try sql.appendSlice(db.allocator, if (i == 0) "(CAST(? AS TEXT), CAST(? AS TEXT))" else ", (CAST(? AS TEXT), CAST(? AS TEXT))");
-        }
-        try sql.appendSlice(db.allocator, ") AS v(namehash, val) WHERE names.namehash = v.namehash");
+        const sql = try batchedUpdateSql(db.allocator, "names", &.{"namehash"}, &.{column.name()}, "updated_at = ?", n);
+        defer db.allocator.free(sql);
         var arena = std.heap.ArenaAllocator.init(db.allocator);
         defer arena.deinit();
         const scratch = arena.allocator();
-        var q = try Query.initCached(db, sql.items);
+        var q = try Query.initCached(db, sql);
         defer q.deinit();
-        try q.bindInt64(now);
         for (chunk) |r| {
             try q.bindTextStatic(r.namehash.toHexBuf(try scratch.create([66]u8)));
             try q.bindTextStatic(r.value.toHexBuf(try scratch.create([42]u8)));
         }
+        try q.bindInt64(now);
         try q.exec();
         start += n;
     }
@@ -159,25 +211,16 @@ pub const EconomicsRow = struct {
 /// which is what the direct path has always done.
 pub fn updateRegistrationEconomicsBatch(db: *Database, rows: []const EconomicsRow) !void {
     if (rows.len == 0) return;
-    if (!db.isPostgres()) {
-        for (rows) |r| try registrations.updateRegistrationEconomics(db, r.protocol, r.namehash, r.label_name, r.base_cost, r.premium, r.referrer);
-        return;
-    }
     var start: usize = 0;
     while (start < rows.len) {
         const n = @min(BATCH_ROWS, rows.len - start);
         const chunk = rows[start .. start + n];
-        var sql: std.ArrayList(u8) = .empty;
-        defer sql.deinit(db.allocator);
-        try sql.appendSlice(db.allocator, "UPDATE registrations SET base_cost = v.base_cost, premium = v.premium, label_name = v.label_name, referrer = v.referrer FROM (VALUES ");
-        for (0..n) |i| {
-            try sql.appendSlice(db.allocator, if (i == 0) "(CAST(? AS TEXT), CAST(? AS TEXT), CAST(? AS TEXT), CAST(? AS TEXT), CAST(? AS TEXT), CAST(? AS TEXT))" else ", (CAST(? AS TEXT), CAST(? AS TEXT), CAST(? AS TEXT), CAST(? AS TEXT), CAST(? AS TEXT), CAST(? AS TEXT))");
-        }
-        try sql.appendSlice(db.allocator, ") AS v(protocol, namehash, base_cost, premium, label_name, referrer) WHERE registrations.protocol = v.protocol AND registrations.namehash = v.namehash");
+        const sql = try batchedUpdateSql(db.allocator, "registrations", &.{ "protocol", "namehash" }, &.{ "base_cost", "premium", "label_name", "referrer" }, null, n);
+        defer db.allocator.free(sql);
         var arena = std.heap.ArenaAllocator.init(db.allocator);
         defer arena.deinit();
         const scratch = arena.allocator();
-        var q = try Query.initCached(db, sql.items);
+        var q = try Query.initCached(db, sql);
         defer q.deinit();
         for (chunk) |r| {
             try q.bindTextStatic(r.protocol.toString());

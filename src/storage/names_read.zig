@@ -222,6 +222,7 @@ fn parseNameRowShort(q: *Query, allocator: std.mem.Allocator) !models.Name {
 // ============================================================================
 
 pub fn getNameByNamehash(db: *Database, namehash: Hash) !?models.Name {
+    try db.namesBarrier();
     var q = try Query.initCached(db, SQL_SELECT_NAMES ++ " WHERE namehash = ?");
     defer q.deinit();
 
@@ -237,6 +238,7 @@ pub fn getNameByNamehash(db: *Database, namehash: Hash) !?models.Name {
 /// Avoids the cost of fetching + duping a full 21-column Name row when callers only
 /// need the human-readable name string (reverse-resolution hot path in the indexer).
 pub fn getNameStringByNamehash(db: *Database, namehash: Hash, allocator: std.mem.Allocator) !?[]u8 {
+    try db.namesBarrier();
     var q = try Query.initCached(db, "SELECT name FROM names WHERE namehash = ? LIMIT 1");
     defer q.deinit();
 
@@ -254,6 +256,7 @@ pub fn getNameStringByNamehash(db: *Database, namehash: Hash, allocator: std.mem
 /// path lookups where we need to find the V1 row by the same namehash a V2
 /// LabelRegistered event just produced.
 pub fn getNameByNamehashAndProtocol(db: *Database, namehash: Hash, protocol: models.Protocol) !?models.Name {
+    try db.namesBarrier();
     var q = try Query.initCached(db, SQL_SELECT_NAMES ++ " WHERE namehash = ? AND protocol = ?");
     defer q.deinit();
 
@@ -268,6 +271,7 @@ pub fn getNameByNamehashAndProtocol(db: *Database, namehash: Hash, protocol: mod
 
 /// Get namehash by resolver address
 pub fn getNamehashByResolver(db: *Database, resolver: Address) !?Hash {
+    try db.namesBarrier();
     var q = try Query.initCached(db, "SELECT namehash FROM names WHERE resolver = ? LIMIT 1");
     defer q.deinit();
 
@@ -284,6 +288,7 @@ pub fn getNamehashByResolver(db: *Database, resolver: Address) !?Hash {
 /// Strips to canonical_id (version-independent) for lookup, so this works with any
 /// version of the token_id and is resilient to TokenRegenerated events.
 pub fn getNameByTokenIdAndRegistry(db: *Database, token_id: u256, registry: Address) !?models.Name {
+    try db.namesBarrier();
     var q = try Query.initCached(db, SQL_SELECT_NAMES ++ " WHERE canonical_id = ? AND registry = ? LIMIT 1");
     defer q.deinit();
 
@@ -308,6 +313,7 @@ pub fn getNameByTokenIdAndRegistry(db: *Database, token_id: u256, registry: Addr
 /// this registry-less lookup (the write-buffer's placeholder-event repair)
 /// must skip rather than guess in that case.
 pub fn getUniqueNameByCanonicalId(db: *Database, protocol: models.Protocol, token_id: u256) !?models.Name {
+    try db.namesBarrier();
     var q = try Query.initCached(db, SQL_SELECT_NAMES ++ " WHERE canonical_id = ? AND protocol = ? LIMIT 2");
     defer q.deinit();
 
@@ -338,6 +344,7 @@ pub fn getUniqueNameByCanonicalId(db: *Database, protocol: models.Protocol, toke
 /// lookups above exactly, authoritative misses included. Rows and the
 /// returned slice are allocated with `allocator`.
 pub fn getNamesByCanonicalIds(db: *Database, canonical_ids: []const u256, allocator: std.mem.Allocator) ![]models.Name {
+    try db.namesBarrier();
     var out: std.ArrayList(models.Name) = .empty;
     errdefer {
         for (out.items) |*n| n.deinit(allocator);
@@ -384,6 +391,7 @@ pub fn getNamesByCanonicalIds(db: *Database, canonical_ids: []const u256, alloca
 /// unordered first-row pick only SQL can reproduce). Rows and the returned
 /// slice are allocated with `allocator`.
 pub fn getNamesByNamehashes(db: *Database, namehashes: []const Hash, allocator: std.mem.Allocator) ![]models.Name {
+    try db.namesBarrier();
     var out: std.ArrayList(models.Name) = .empty;
     errdefer {
         for (out.items) |*n| n.deinit(allocator);
@@ -438,6 +446,7 @@ pub const CanonicalNameResolution = struct {
 /// passes write events only). Names are duped with `allocator`; release via
 /// freeCanonicalNameResolutions.
 pub fn resolveUniqueNamesByCanonicalIds(db: *Database, protocol: models.Protocol, token_ids: []const u256, allocator: std.mem.Allocator) !std.AutoHashMap(u256, CanonicalNameResolution) {
+    try db.namesBarrier();
     var out = std.AutoHashMap(u256, CanonicalNameResolution).init(allocator);
     errdefer freeCanonicalNameResolutions(&out, allocator);
 
@@ -493,6 +502,7 @@ pub fn freeCanonicalNameResolutions(map: *std.AutoHashMap(u256, CanonicalNameRes
 /// Get all names owned by an address. Unreachable rows (orphaned by a
 /// subregistry repoint or LabelUnregistered) are filtered out.
 pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Name {
+    try db.namesBarrier();
     const sql = if (limit) |l|
         try std.fmt.allocPrint(db.allocator, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND owner = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' LIMIT {d}", .{l})
     else
@@ -521,6 +531,7 @@ pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Nam
 
 /// Get names by resolver address. Unreachable rows are filtered out.
 pub fn getNamesByResolver(db: *Database, resolver: Address, limit: u32) ![]models.Name {
+    try db.namesBarrier();
     var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND resolver = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY created_at DESC LIMIT ?");
     defer q.deinit();
 
@@ -558,6 +569,7 @@ pub fn getWrappedDomains(
     skip: u32,
     limit: u32,
 ) ![]models.Name {
+    try db.namesBarrier();
     var sql_buf: std.ArrayList(u8) = .empty;
     defer sql_buf.deinit(db.allocator);
     try sql_buf.appendSlice(db.allocator, SQL_SELECT_NAMES);
@@ -594,6 +606,7 @@ pub fn getWrappedDomains(
 /// null when no name currently points at this resolver. Unreachable rows
 /// are filtered out to match the rest of the API contract.
 pub fn getDomainByResolver(db: *Database, resolver: Address) !?models.Name {
+    try db.namesBarrier();
     var q = try Query.initCached(
         db,
         SQL_SELECT_NAMES ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND resolver = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY namehash ASC LIMIT 1",
@@ -626,6 +639,7 @@ const ZERO_ADDR_HEX: []const u8 = "0x0000000000000000000000000000000000000000";
 const SUBDOMAIN_GC_FILTER: []const u8 = " AND NOT (owner = '" ++ ZERO_ADDR_HEX ++ "' AND resolver = '" ++ ZERO_ADDR_HEX ++ "')";
 
 pub fn countDirectSubdomains(db: *Database, parent_name: []const u8) !u32 {
+    try db.namesBarrier();
     var q = try Query.initCached(db, "SELECT COUNT(*) FROM names WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER);
     defer q.deinit();
 
@@ -639,6 +653,7 @@ pub fn countDirectSubdomains(db: *Database, parent_name: []const u8) !u32 {
 
 /// Check if a name has any direct subdomains (reachable + non-burned).
 pub fn hasDirectSubdomains(db: *Database, parent_name: []const u8) !bool {
+    try db.namesBarrier();
     var q = try Query.initCached(db, "SELECT 1 FROM names WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER ++ " LIMIT 1");
     defer q.deinit();
 
@@ -653,6 +668,7 @@ pub fn hasDirectSubdomains(db: *Database, parent_name: []const u8) !bool {
 /// `include_unreachable` (which still applies the GC filter; resurrection
 /// requires direct namehash lookup).
 pub fn getSubdomains(db: *Database, parent_name_arg: []const u8, skip: u32, limit: u32) ![]models.Name {
+    try db.namesBarrier();
     var q = try Query.initCached(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER ++ " ORDER BY name LIMIT ? OFFSET ?");
     defer q.deinit();
 

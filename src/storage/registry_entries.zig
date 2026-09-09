@@ -359,6 +359,7 @@ pub fn setRegistriesReachability(
     block_number: u64,
     block_timestamp: i64,
 ) !u64 {
+    try db.namesBarrier();
     if (registries.len == 0) return 0;
 
     // No name-prefetch notify: this touches is_reachable / unreachable_since /
@@ -442,6 +443,7 @@ pub fn reconcileV2Reachability(
     block_number: u64,
     block_timestamp: i64,
 ) !u64 {
+    try db.namesBarrier();
     var regs: std.ArrayList(Address) = .empty;
     defer regs.deinit(allocator);
     {
@@ -475,6 +477,7 @@ pub fn markNameUnreachableByNamehash(
     block_number: u64,
     block_timestamp: i64,
 ) !void {
+    try db.namesBarrier();
     try reorg_undo.captureWhere(db, "names", "U", "protocol = ? AND namehash = ?", .{ protocol, namehash });
     var q = try Query.initCached(db,
         \\UPDATE names SET is_reachable = 0, unreachable_since = ?, updated_block = ?, updated_at = ?

@@ -328,6 +328,7 @@ pub fn countRowsBeforeNamehash(
     order_dir: OrderDir,
     filters: NameFilters,
 ) !u32 {
+    try db.namesBarrier();
     const field_outer = sort_field.toSqlQualified("names.");
     const field_cursor = sort_field.toSqlQualified("c.");
     // "before" means "would appear earlier in the result set" — depends on sort direction:
@@ -544,6 +545,7 @@ pub const NameFilters = struct {
 
 /// Get names with filters pushed down to DB query
 pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u32, order_dir: OrderDir, sort_field: NameSortField) ![]models.Name {
+    try db.namesBarrier();
     const order_str = if (order_dir == .desc) "DESC" else "ASC";
 
     // Build WHERE conditions via the shared helper so all callers (getFilteredNames,
@@ -642,6 +644,7 @@ fn bindKeysetValue(q: *Query, sort_field: NameSortField, value: []const u8) !voi
 /// parallel (read from an extra `{field} AS _sortval` column) so the caller can build
 /// per-edge cursors without materializing the sort field on models.Name.
 pub fn getFilteredNamesKeyset(db: *Database, filters: NameFilters, anchor: ?KeysetAnchor, limit: u32, order_dir: OrderDir, sort_field: NameSortField) !KeysetResult {
+    try db.namesBarrier();
     const order_str = if (order_dir == .desc) "DESC" else "ASC";
     const op = if (order_dir == .desc) "<" else ">";
 
@@ -717,6 +720,7 @@ pub fn getFilteredNamesKeyset(db: *Database, filters: NameFilters, anchor: ?Keys
 
 /// Get all names with configurable order direction
 pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u32, order_dir: OrderDir, sort_field: NameSortField) ![]models.Name {
+    try db.namesBarrier();
     const order_str = if (order_dir == .desc) "DESC" else "ASC";
     // Secondary sort on namehash (same direction) — see countRowsBeforeNamehash for why.
     // is_reachable = 1 filter is applied by default; unreachable rows are
@@ -760,6 +764,7 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
 /// same per-owner LIMIT/OFFSET, applied per partition via ROW_NUMBER. Rows
 /// come back grouped in partition order; the caller groups by owner.
 pub fn getNamesByOwnersPage(db: *Database, owners: []const Address, skip: u32, limit: u32, allocator: std.mem.Allocator) ![]models.Name {
+    try db.namesBarrier();
     if (owners.len == 0) return try allocator.alloc(models.Name, 0);
 
     var out: std.ArrayList(models.Name) = .empty;
@@ -823,6 +828,7 @@ pub fn getNamesByOwnersPage(db: *Database, owners: []const Address, skip: u32, l
 /// Get count of names with optional filters.
 /// Builds the same WHERE clause as getFilteredNames but uses SELECT COUNT(*).
 pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
+    try db.namesBarrier();
     var conditions: std.ArrayList([]const u8) = .empty;
     defer conditions.deinit(db.allocator);
 

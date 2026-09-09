@@ -157,6 +157,7 @@ pub const CoinAddress = struct {
 /// `namehash` column before this is called (which `handleLabelRegistered`
 /// does in the line just above the call site).
 pub fn applyLatestResolverFromEvents(db: *Database, protocol: models.Protocol, namehash: Hash) !void {
+    try db.namesBarrier();
     try reorg_undo.captureWhere(db, "names", "U", "protocol = ? AND namehash = ? AND (resolver IS NULL OR resolver = '0x0000000000000000000000000000000000000000') AND EXISTS (SELECT 1 FROM events WHERE event_type = 'ResolverUpdated' AND protocol = ? AND namehash = ? AND json_extract(data, '$.resolver') IS NOT NULL)", .{ protocol, namehash, protocol, namehash });
     var q = try Query.initCached(db,
         \\UPDATE names
