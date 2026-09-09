@@ -269,6 +269,9 @@ pub fn backfillDiscovered(self: *Indexer, protocol: models.Protocol, client: *rp
         }
     }
     std.mem.sort(Target, targets.items, {}, targetLessThan);
+    if (targets.items.len > 0) {
+        std.log.info("  Discovery anchors: floor {d}, ceil {d}, {d} target(s) spanning {d}..{d}", .{ floor, to_block, targets.items.len, targets.items[0].anchor, targets.items[targets.items.len - 1].anchor });
+    }
 
     var start: usize = 0;
     while (start < targets.items.len) {

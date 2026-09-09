@@ -93,7 +93,7 @@ const EVENT_COLS = [_][]const u8{ "event_type", "protocol", "block_number", "tx_
 
 /// Rows per multi-row INSERT: 10 params each → 900 params, under even the
 /// pre-3.32 SQLite SQLITE_MAX_VARIABLE_NUMBER floor of 999.
-const EVENT_BATCH_ROWS = 90;
+const EVENT_BATCH_ROWS = 400;
 
 /// Bulk-sync insert path: one multi-row conflict-ignoring INSERT per chunk of
 /// up to EVENT_BATCH_ROWS events, instead of one round trip per event — on a

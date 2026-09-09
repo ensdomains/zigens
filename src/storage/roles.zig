@@ -70,6 +70,7 @@ pub const RoleUpsertRow = struct {
 /// statement, far below a full chunk). The write-buffer flush owns them until
 /// reset(), which outlives this call.
 pub fn upsertEACRolesBatch(db: *Database, rows: []const RoleUpsertRow) !void {
+    try db.namesBarrier();
     if (rows.len == 0) return;
     // 9 params/row → 810 params, under the pre-3.32 SQLite
     // SQLITE_MAX_VARIABLE_NUMBER floor of 999 (same convention as

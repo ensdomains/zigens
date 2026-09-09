@@ -41,6 +41,13 @@ pub fn lookupPairedName(self: *Indexer, token_id: u256, registry: Address) !?Pai
     return .{ .namehash = row_mut.namehash, .name = name_copy };
 }
 
+/// Database.names_barrier target: land every buffered name before a storage
+/// names accessor runs. Armed by the driver for the buffered V2 window only.
+pub fn namesBarrierFlush(ctx: *anyopaque) anyerror!void {
+    const self: *Indexer = @ptrCast(@alignCast(ctx));
+    try self.write_buffer.flushNames(self.database);
+}
+
 /// Entity writes (name owner/resolver, registrations, resolver entities,
 /// accounts) are buffered under the same invariant as eac_roles: only while
 /// the reorg cursor is disarmed. See write_buffer.zig.

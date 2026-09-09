@@ -401,6 +401,7 @@ pub const Indexer = struct {
     pub const registerResolverOnce = caches.registerResolverOnce;
     pub const registerResolverOnceIfNew = caches.registerResolverOnceIfNew;
     pub const lookupPairedName = caches.lookupPairedName;
+    pub const namesBarrierFlush = caches.namesBarrierFlush;
     pub const bufferingEntities = caches.bufferingEntities;
     pub const setNameOwner = caches.setNameOwner;
     pub const setNameResolver = caches.setNameResolver;

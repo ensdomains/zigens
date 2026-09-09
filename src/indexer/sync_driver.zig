@@ -24,6 +24,7 @@ const NetworkHealth = @import("../utils/network_health.zig").NetworkHealth;
 const status_mod = @import("../server/status.zig");
 const IndexerStatus = status_mod.IndexerStatus;
 const reorg_undo = @import("../storage/reorg_undo.zig");
+const memstat = @import("../utils/memstat.zig");
 const ens_normalize = @import("../utils/ens_normalize.zig");
 const replay_mod = @import("replay.zig");
 const backfill_mod = @import("v1/backfill.zig");
@@ -639,6 +640,9 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
         blocks_indexed += batch_blocks;
         const progress = (@as(f64, @floatFromInt(blocks_indexed)) / @as(f64, @floatFromInt(total_blocks))) * 100.0;
         std.log.info("Progress: {d:.1}% ({d}/{d} blocks) - Batch {d}-{d} indexed", .{ progress, blocks_indexed, total_blocks, from_block, to_block });
+        if (memstat.rssBytes()) |rss| {
+            std.log.info("  Memory: rss {d} MB, allocator live {d} MB", .{ rss / (1024 * 1024), (memstat.liveBytes() orelse 0) / (1024 * 1024) });
+        }
 
         // --- Block-hash lineage (reorg detection) ---
         // Near the tip, store per-block (hash, parent_hash) so a reorg's fork point is
@@ -796,8 +800,10 @@ pub fn indexBlockRange(self: *Indexer, protocol: models.Protocol, client: *rpc.C
     if (buffer_v2_events) {
         self.write_buffer.active = true;
         self.write_buffer.ledger = &self.placeholders;
+        self.database.names_barrier = .{ .ctx = self, .flush = Indexer.namesBarrierFlush };
     }
     errdefer if (buffer_v2_events) {
+        self.database.names_barrier = null;
         self.write_buffer.active = false;
         self.write_buffer.reset();
     };
@@ -853,6 +859,7 @@ pub fn indexBlockRange(self: *Indexer, protocol: models.Protocol, client: *rpc.C
     // re-processes the batch into conflict-ignored inserts.
     if (buffer_v2_events) {
         self.write_buffer.active = false;
+        defer self.database.names_barrier = null;
         try self.write_buffer.flush(self.database);
     } else if (should_index_v2) {
         // Direct-mode twin of the flush repair: phase 1 writes datastore
