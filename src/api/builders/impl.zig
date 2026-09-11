@@ -1127,6 +1127,23 @@ fn resolverDomainHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx
     const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
+    // The resolvers list primes one domain per resolver for the page; a primed
+    // miss is authoritative (no reachable normalized name uses the resolver).
+    if (nested_ctx.loaders) |lp| {
+        const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+        if (lc.lookupDomainByResolver(rctx.resolver)) |batched| {
+            const row = batched orelse return try nested_ctx.allocator.dupe(u8, "null");
+            const row_copy = row.*;
+            return try buildDomainJson(&row_copy, field.selections, .{
+                .database = database,
+                .depth = nested_ctx.depth + 1,
+                .allocator = nested_ctx.allocator,
+                .loaders = nested_ctx.loaders,
+                .resolve = nested_ctx.resolve,
+            });
+        }
+    }
+
     const name_opt = try database.getDomainByResolver(rctx.resolver);
     if (name_opt) |name| {
         var name_mut = name;
@@ -1730,62 +1747,89 @@ fn domainSubdomainsHandler(ctx: *anyopaque, field: *const parser.Field, nested_c
 }
 
 /// Domain nested field handler: events
-fn domainEventsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
-    const domain: *const models.Name = @ptrCast(@alignCast(ctx));
-    const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+/// The `events(...)` arguments of a Domain selection as an EventFilterOptions
+/// (namehash left unset). Shared by the nested handler and the page prefetch so
+/// the loader key they compute is identical: a prefetched page only serves when
+/// the handler asks with exactly these options.
+pub const DomainEventsFilter = struct {
+    opts: db.EventFilterOptions,
+    event_types: std.ArrayList([]const u8),
+    contract_address: ?[]u8,
 
-    const first_arg = (try api_common.parsePagination(field, 100)).first;
+    pub fn deinit(self: *DomainEventsFilter, allocator: std.mem.Allocator) void {
+        self.event_types.deinit(allocator);
+        if (self.contract_address) |addr| allocator.free(addr);
+    }
+};
 
-    const namehash_hex = try domain.namehash.toHex(nested_ctx.allocator);
-    defer nested_ctx.allocator.free(namehash_hex);
-
-    var filter_opts = db.EventFilterOptions{
-        .namehash = namehash_hex,
-        .limit = first_arg,
+pub fn parseDomainEventsFilter(field: *const parser.Field, allocator: std.mem.Allocator) !DomainEventsFilter {
+    var out = DomainEventsFilter{
+        .opts = .{ .limit = (try api_common.parsePagination(field, 100)).first },
+        .event_types = .empty,
+        .contract_address = null,
     };
+    errdefer out.deinit(allocator);
 
     // Ordering is applied in SQL, BEFORE `first` truncates. Sorting the page
     // client-side cannot substitute for this: `{ first: 10, orderDirection:
     // asc }` must return the OLDEST 10 events, not the newest 10 rearranged.
-    filter_opts.sort_field = api_common.parseEventOrderBy(field, db.EventSortField, filter_opts.sort_field);
-    filter_opts.order_dir = api_common.parseOrderDirection(field, db.EventOrderDir, filter_opts.order_dir);
-
-    var event_types_list: std.ArrayList([]const u8) = .empty;
-    defer event_types_list.deinit(nested_ctx.allocator);
-
-    var normalized_contract_address: ?[]u8 = null;
-    defer if (normalized_contract_address) |addr| nested_ctx.allocator.free(addr);
+    out.opts.sort_field = api_common.parseEventOrderBy(field, db.EventSortField, out.opts.sort_field);
+    out.opts.order_dir = api_common.parseOrderDirection(field, db.EventOrderDir, out.opts.order_dir);
 
     if (api_common.getObjectArg(field, "where")) |where_args| {
         for (where_args) |a| {
             if (std.mem.eql(u8, a.name, "type_in") and a.value == .list) {
                 for (a.value.list) |item| {
-                    if (item == .string) try event_types_list.append(nested_ctx.allocator, item.string);
+                    if (item == .string) try out.event_types.append(allocator, item.string);
                 }
-                if (event_types_list.items.len > 0) filter_opts.event_types = event_types_list.items;
                 continue;
             }
             if (std.mem.eql(u8, a.name, "contractAddress") and a.value == .string) {
                 // Surface invalid input as an error — silent drop hides typos.
                 const addr = Address.fromHex(a.value.string) catch return error.InvalidContractAddress;
-                normalized_contract_address = try addr.toHex(nested_ctx.allocator);
-                filter_opts.contract_address = normalized_contract_address;
+                out.contract_address = try addr.toHex(allocator);
                 continue;
             }
 
-            _ = api_common.matchStringArg(a, "type", &filter_opts.event_type) or
-                api_common.matchIntArg(a, "blockNumber_gt", &filter_opts.block_number_gt) or
-                api_common.matchIntArg(a, "blockNumber_lt", &filter_opts.block_number_lt) or
-                api_common.matchIntArg(a, "timestamp_gt", &filter_opts.timestamp_gt) or
-                api_common.matchIntArg(a, "timestamp_lt", &filter_opts.timestamp_lt);
+            _ = api_common.matchStringArg(a, "type", &out.opts.event_type) or
+                api_common.matchIntArg(a, "blockNumber_gt", &out.opts.block_number_gt) or
+                api_common.matchIntArg(a, "blockNumber_lt", &out.opts.block_number_lt) or
+                api_common.matchIntArg(a, "timestamp_gt", &out.opts.timestamp_gt) or
+                api_common.matchIntArg(a, "timestamp_lt", &out.opts.timestamp_lt);
         }
     }
+    if (out.event_types.items.len > 0) out.opts.event_types = out.event_types.items;
+    if (out.contract_address) |addr| out.opts.contract_address = addr;
+    return out;
+}
 
-    const domain_events = try database.getEventsFiltered(filter_opts);
-    defer {
-        for (domain_events) |*e| e.deinit(database.allocator);
-        database.allocator.free(domain_events);
+fn domainEventsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    const domain: *const models.Name = @ptrCast(@alignCast(ctx));
+    const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+
+    var parsed = try parseDomainEventsFilter(field, nested_ctx.allocator);
+    defer parsed.deinit(nested_ctx.allocator);
+
+    // Served from the page loader when the enclosing list primed it with these
+    // exact arguments (one query per page instead of one per row); the point
+    // query is the fallback for single-domain lookups and unprimed pages.
+    var batched: ?[]const models.Event = null;
+    if (nested_ctx.loaders) |lp| {
+        const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+        batched = lc.lookupDomainEvents(domain.namehash, loaders.LoaderContext.eventsPageKey(parsed.opts));
     }
+
+    const namehash_hex = try domain.namehash.toHex(nested_ctx.allocator);
+    defer nested_ctx.allocator.free(namehash_hex);
+    var filter_opts = parsed.opts;
+    filter_opts.namehash = namehash_hex;
+
+    const owned_events: []models.Event = if (batched == null) try database.getEventsFiltered(filter_opts) else &.{};
+    defer {
+        for (owned_events) |*e| e.deinit(database.allocator);
+        database.allocator.free(owned_events);
+    }
+    const domain_events: []const models.Event = batched orelse owned_events;
 
     var json: std.Io.Writer.Allocating = .init(nested_ctx.allocator);
     errdefer json.deinit();

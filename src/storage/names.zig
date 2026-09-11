@@ -68,6 +68,7 @@ pub const getNamesByResolver = names_read.getNamesByResolver;
 pub const WrappedDomainFilters = names_read.WrappedDomainFilters;
 pub const getWrappedDomains = names_read.getWrappedDomains;
 pub const getDomainByResolver = names_read.getDomainByResolver;
+pub const getDomainsByResolvers = names_read.getDomainsByResolvers;
 pub const countDirectSubdomains = names_read.countDirectSubdomains;
 pub const hasDirectSubdomains = names_read.hasDirectSubdomains;
 pub const getSubdomains = names_read.getSubdomains;

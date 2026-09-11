@@ -7,6 +7,7 @@
 /// - resolveApprovals: List resolver approvals
 const std = @import("std");
 const common = @import("common.zig");
+const loader_ctx = common.loaders;
 const db = common.db;
 const models = common.models;
 const Address = common.Address;
@@ -307,6 +308,16 @@ fn prefetchResolverEntityPage(database: *db.Database, allocator: std.mem.Allocat
         pair_namehashes.append(allocator, nh) catch return;
     }
     domain_resolvers.prefetchRecordsForResolverPage(database, allocator, loaders_ptr, pair_resolvers.items, pair_namehashes.items, selections);
+
+    // `resolvers { domain { … } }`: one query for the page's canonical domains
+    // instead of one per row (the resolverDomainHandler fallback).
+    for (selections) |*sel| {
+        if (std.mem.eql(u8, sel.name, "domain")) {
+            const lc: *loader_ctx.LoaderContext = @ptrCast(@alignCast(loaders_ptr.?));
+            lc.populateDomainsByResolver(database, pair_resolvers.items);
+            break;
+        }
+    }
 }
 
 /// Resolver for the new subgraph-style `resolvers(first, skip, where, orderBy)`
