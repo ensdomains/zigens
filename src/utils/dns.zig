@@ -165,3 +165,14 @@ test "empty DNS name" {
     const name = try decodeDNSNameToString(allocator, data);
     try std.testing.expect(name == null);
 }
+
+test "decodeDNSNameToString keeps the raw label bytes: DNS labels are not required to be UTF-8" {
+    const allocator = std.testing.allocator;
+    const wire = "\x04k\xEFX\x17\x03eth\x00";
+    const name = (try decodeDNSNameToString(allocator, wire)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(name);
+    try std.testing.expectEqualSlices(u8, "k\xEFX\x17.eth", name);
+    const label = (try decodeDNSFirstLabel(allocator, wire)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(label);
+    try std.testing.expectEqualSlices(u8, "k\xEFX\x17", label);
+}

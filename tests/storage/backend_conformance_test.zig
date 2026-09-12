@@ -124,6 +124,42 @@ test "bind cursor is sequential and 1-based; bindText copies the value" {
     try testing.expectEqual(@as(i64, 42), q.getInt64(1));
 }
 
+test "text binds are stored as valid UTF-8 on every backend: invalid bytes become U+FFFD" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+    try createScratch(database);
+
+    // The staging poison (a lone 0xEF lead byte) through both bind paths; on
+    // Postgres the raw bytes would fail with 22021 and abort the transaction.
+    const poison = "k\xEF\x58\x17";
+    {
+        var q = try database.prepare("INSERT INTO conformance_t (k, t, n) VALUES (?, ?, ?)");
+        defer q.deinit();
+        try q.bindText("copied");
+        try q.bindText(poison);
+        try q.bindInt64(1);
+        try q.exec();
+    }
+    {
+        var q = try database.prepare("INSERT INTO conformance_t (k, t, n) VALUES (?, ?, ?)");
+        defer q.deinit();
+        try q.bindTextStatic("static");
+        try q.bindTextStatic(poison);
+        try q.bindInt64(2);
+        try q.exec();
+    }
+    var q = try database.prepare("SELECT k, t FROM conformance_t WHERE k IN (?, ?) ORDER BY k");
+    defer q.deinit();
+    try q.bindTextStatic("copied");
+    try q.bindTextStatic("static");
+    try testing.expect(try q.step());
+    try testing.expectEqualStrings("k\xEF\xBF\xBDX\x17", q.getTextSlice(1).?);
+    try testing.expect(try q.step());
+    try testing.expectEqualStrings("k\xEF\xBF\xBDX\x17", q.getTextSlice(1).?);
+    try testing.expect(!(try q.step()));
+}
+
 test "null binds read back as NULL through every accessor" {
     const allocator = testing.allocator;
     const database = try helpers.createTestDatabase(allocator);
