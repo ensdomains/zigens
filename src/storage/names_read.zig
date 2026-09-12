@@ -32,6 +32,18 @@ const SQL_SELECT_NAMES =
     \\FROM names
 ;
 
+/// SQL_SELECT_NAMES's column list plus a per-resolver rank (namehash ASC) as a
+/// trailing column, derived at comptime so the two lists cannot drift: a
+/// `SELECT * FROM (…) t` over it still parses with parseNameRow (indices 0..32).
+/// Backs the batched getDomainByResolver mirror.
+const SQL_SELECT_NAMES_FROM = "\nFROM names";
+const SQL_SELECT_NAMES_RANKED_BY_RESOLVER = blk: {
+    std.debug.assert(std.mem.endsWith(u8, SQL_SELECT_NAMES, SQL_SELECT_NAMES_FROM));
+    break :blk SQL_SELECT_NAMES[0 .. SQL_SELECT_NAMES.len - SQL_SELECT_NAMES_FROM.len] ++
+        ",\n       ROW_NUMBER() OVER (PARTITION BY resolver ORDER BY namehash ASC) AS rn" ++
+        SQL_SELECT_NAMES_FROM;
+};
+
 /// Shorter SELECT for queries that don't need wrapper fields (27 columns).
 /// Still includes is_reachable/unreachable_since/ttl so callers can honor
 /// reachability filtering and serialize the flag.
@@ -619,6 +631,64 @@ pub fn getDomainByResolver(db: *Database, resolver: Address) !?models.Name {
         return try parseNameRow(&q, db.allocator);
     }
     return null;
+}
+
+/// Batched mirror of getDomainByResolver over many resolvers: for each resolver
+/// address, the single row the point query would return (reachable, normalized,
+/// non-root, first by namehash ASC), replicated per resolver via ROW_NUMBER over
+/// the same WHERE. Resolvers with no such row contribute nothing. Chunks of 200
+/// with arena-static address binds (no tracked-copy cap). Rows and the returned
+/// slice are allocated with `allocator`.
+pub fn getDomainsByResolvers(db: *Database, resolvers: []const Address, allocator: std.mem.Allocator) ![]models.Name {
+    try db.namesBarrier();
+    var out: std.ArrayList(models.Name) = .empty;
+    errdefer {
+        for (out.items) |*n| n.deinit(allocator);
+        out.deinit(allocator);
+    }
+
+    // Duplicates yield one row: dedupe before chunking so a resolver repeated
+    // across chunk boundaries is not ranked (and returned) once per chunk.
+    var seen = std.AutoHashMap([20]u8, void).init(db.allocator);
+    defer seen.deinit();
+    var unique: std.ArrayList(Address) = .empty;
+    defer unique.deinit(db.allocator);
+    for (resolvers) |r| {
+        const gop = try seen.getOrPut(r.bytes);
+        if (!gop.found_existing) try unique.append(db.allocator, r);
+    }
+
+    const CHUNK = 200;
+    var start: usize = 0;
+    while (start < unique.items.len) {
+        const chunk = unique.items[start..@min(start + CHUNK, unique.items.len)];
+        start += chunk.len;
+
+        var scratch = std.heap.ArenaAllocator.init(db.allocator);
+        defer scratch.deinit();
+
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.appendSlice(scratch.allocator(), "SELECT * FROM (" ++ SQL_SELECT_NAMES_RANKED_BY_RESOLVER ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND resolver IN (");
+        for (chunk, 0..) |_, i| {
+            if (i != 0) try sql.append(scratch.allocator(), ',');
+            try sql.append(scratch.allocator(), '?');
+        }
+        try sql.appendSlice(scratch.allocator(), ") AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000') t WHERE rn = 1");
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        for (chunk) |resolver| {
+            const buf = try scratch.allocator().create([42]u8);
+            try q.bindTextStatic(resolver.toHexBuf(buf));
+        }
+        while (try q.step()) {
+            var row = try parseNameRow(&q, allocator);
+            errdefer row.deinit(allocator);
+            try out.append(allocator, row);
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
 }
 
 // ============================================================================

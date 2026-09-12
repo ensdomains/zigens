@@ -494,6 +494,7 @@ pub const Database = struct {
     // Names module - resolver query
     pub const getNamesByResolver = names.getNamesByResolver;
     pub const getDomainByResolver = names.getDomainByResolver;
+    pub const getDomainsByResolvers = names.getDomainsByResolvers;
     pub const WrappedDomainFilters = names.WrappedDomainFilters;
     pub const getWrappedDomains = names.getWrappedDomains;
 
@@ -530,6 +531,7 @@ pub const Database = struct {
     pub const insertEventIfNew = events.insertEventIfNew;
     pub const getRecentEvents = events.getRecentEvents;
     pub const getEventsFiltered = events.getEventsFiltered;
+    pub const getEventsForNamehashesPage = events.getEventsForNamehashesPage;
     pub const getEventsByNamehash = events.getEventsByNamehash;
     pub const getEventsByDomain = events.getEventsByDomain;
     pub const insertApproval = events.insertApproval;

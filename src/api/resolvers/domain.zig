@@ -381,6 +381,7 @@ fn collectTextKeys(selections: []const parser.Field, list: *std.ArrayList([]cons
 /// key instead of one point query per row). Best-effort: any failure leaves the
 /// handlers to fall back to point queries.
 pub fn prefetchResolverRecords(database: *db.Database, allocator: std.mem.Allocator, loaders_ptr: ?*anyopaque, page: []models.Name, selections: []const parser.Field) void {
+    prefetchDomainPageEvents(database, allocator, loaders_ptr, page, selections);
     const want = wantsResolverRecords(selections);
     var text_keys: std.ArrayList([]const u8) = .empty;
     defer text_keys.deinit(allocator);
@@ -411,6 +412,34 @@ pub fn prefetchResolverRecords(database: *db.Database, allocator: std.mem.Alloca
     if (want.coin_types) {
         lc.populateCoinTypeLists(database, resolvers_buf, namehashes_buf);
     }
+}
+
+/// Page-batch a Domain list's nested `events(...)` field: one per-namehash
+/// window query for the page instead of one query per row, plus one domains
+/// query for the page so `events { domain { … } }` (whose namehash is the
+/// enclosing domain's) resolves from memory. Best-effort: any failure
+/// leaves the loader unprimed and the handlers fall back to point queries.
+fn prefetchDomainPageEvents(database: *db.Database, allocator: std.mem.Allocator, loaders_ptr: ?*anyopaque, page: []models.Name, selections: []const parser.Field) void {
+    if (page.len == 0) return;
+    const lp = loaders_ptr orelse return;
+    const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+    const events_sel: *const parser.Field = blk: {
+        for (selections) |*sel| {
+            if (std.mem.eql(u8, sel.name, "events")) break :blk sel;
+        }
+        return;
+    };
+    var parsed = builders.parseDomainEventsFilter(events_sel, allocator) catch return;
+    defer parsed.deinit(allocator);
+
+    const namehashes = allocator.alloc(Hash, page.len) catch return;
+    defer allocator.free(namehashes);
+    for (page, 0..) |*n, i| namehashes[i] = n.namehash;
+    // One IN-list query rather than seeding the page's own rows: a namehash
+    // with a v1/v2 twin must resolve exactly as the point query would, which
+    // populateDomains guarantees by refusing to cache ambiguous rows.
+    lc.populateDomains(database, namehashes);
+    lc.populateDomainEvents(database, namehashes, parsed.opts);
 }
 
 /// Record prefetch for a page whose rows ARE (resolver, namehash) pairs — the

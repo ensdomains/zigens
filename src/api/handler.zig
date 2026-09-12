@@ -16,6 +16,12 @@ const schema_validator_mod = @import("schema_validator.zig");
 const introspection_projection = @import("introspection_projection.zig");
 const query_validator = @import("query_validator.zig");
 
+/// Executions at or above this take the slow-query warn path (GRAPHQL_SLOW_QUERY_MS).
+pub const DEFAULT_SLOW_QUERY_THRESHOLD_US: u64 = 2_000_000;
+
+/// Byte cap on the query text quoted in a slow-query log line.
+pub const SLOW_QUERY_EXCERPT_BYTES = 300;
+
 pub const GraphQLHandler = struct {
     allocator: std.mem.Allocator,
     executor: parser.Executor,
@@ -26,6 +32,10 @@ pub const GraphQLHandler = struct {
     complexity_max_depth: u32,
     complexity_max_cost: u32,
     metrics: metrics_mod.Metrics,
+    /// Executions (successful or failed) that take at least this long are logged
+    /// at warn level with depth, cost, outcome and a query excerpt, so a histogram
+    /// outlier can be attributed to a concrete document. Set from config after init.
+    slow_query_threshold_us: u64 = DEFAULT_SLOW_QUERY_THRESHOLD_US,
 
     pub fn init(allocator: std.mem.Allocator, max_depth: u32, max_cost: u32, metrics_enabled: bool) !GraphQLHandler {
         // Create execution context. The database is per-request: handleQuery sets it
@@ -309,7 +319,9 @@ pub const GraphQLHandler = struct {
             // warn, not err: execution failures include client-driven rejections
             // (complexity LimitExceeded, bad arguments) — not server faults.
             std.log.warn("Failed to execute GraphQL query: {}", .{err});
-            self.metrics.recordError();
+            const failed_after_us = timer.elapsedMicroseconds();
+            self.metrics.recordErrorWithDuration(failed_after_us);
+            self.logSlowQuery(failed_after_us, analysis.depth, analysis.cost, @errorName(err), query);
             if (err == error.OperationNotFound) {
                 return try self.buildErrorResponseWithCode("Operation not found", ErrorCode.VALIDATION_ERROR);
             } else if (err == error.OperationNameRequired) {
@@ -350,9 +362,20 @@ pub const GraphQLHandler = struct {
         // Record successful query with timing
         const duration_us = timer.elapsedMicroseconds();
         self.metrics.recordQuery(duration_us, analysis.depth, analysis.cost);
+        self.logSlowQuery(duration_us, analysis.depth, analysis.cost, "ok", query);
 
         // Dupe result from arena to GPA for the caller (arena is freed on return)
         return try self.allocator.dupe(u8, result);
+    }
+
+    /// Warn about an execution at or above `slow_query_threshold_us`. `outcome` is
+    /// "ok" or the execution error name. Stack-only: the excerpt lives in a local
+    /// buffer so the slow path adds no allocation to the request.
+    fn logSlowQuery(self: *const GraphQLHandler, duration_us: u64, depth: u32, cost: u32, outcome: []const u8, query: []const u8) void {
+        if (duration_us < self.slow_query_threshold_us) return;
+        var excerpt_buf: [SLOW_QUERY_EXCERPT_BYTES]u8 = undefined;
+        const excerpt = queryExcerpt(query, &excerpt_buf);
+        std.log.warn("slow graphql query: {d} ms, depth {d}, cost {d}, {s}, query: {s}", .{ duration_us / std.time.us_per_ms, depth, cost, outcome, excerpt });
     }
 
     /// Answer every introspection root of the operation (`__schema`, `__type`,
@@ -525,7 +548,92 @@ pub const GraphQLHandler = struct {
     }
 };
 
+/// Single-line excerpt of a query for log output: whitespace runs collapse to
+/// one space and the result is cut at the buffer size, backing off to a UTF-8
+/// boundary so a truncated string-literal cannot leave a split codepoint.
+pub fn queryExcerpt(query: []const u8, buf: *[SLOW_QUERY_EXCERPT_BYTES]u8) []const u8 {
+    var len: usize = 0;
+    var pending_space = false;
+    var truncated = false;
+    for (query) |c| {
+        if (std.ascii.isWhitespace(c)) {
+            pending_space = len > 0;
+            continue;
+        }
+        if (pending_space) {
+            if (len == buf.len) {
+                truncated = true;
+                break;
+            }
+            buf[len] = ' ';
+            len += 1;
+            pending_space = false;
+        }
+        if (len == buf.len) {
+            truncated = true;
+            break;
+        }
+        buf[len] = c;
+        len += 1;
+    }
+    if (truncated) {
+        while (len > 0 and (buf[len - 1] & 0xC0) == 0x80) len -= 1;
+        if (len > 0 and buf[len - 1] >= 0xC0) len -= 1;
+    }
+    return buf[0..len];
+}
+
 const testing = std.testing;
+
+test "queryExcerpt: collapses whitespace runs and trims the edges" {
+    var buf: [SLOW_QUERY_EXCERPT_BYTES]u8 = undefined;
+    const out = queryExcerpt("  query   Q {\n\tdomains(first: 1) {\n\t\tid\n\t}\n}\n", &buf);
+    try testing.expectEqualStrings("query Q { domains(first: 1) { id } }", out);
+}
+
+test "queryExcerpt: truncates to the buffer size on a UTF-8 boundary" {
+    var buf: [SLOW_QUERY_EXCERPT_BYTES]u8 = undefined;
+
+    const long = "{ domains(where:{name:\"" ++ ("a" ** 400) ++ "\"}){ id } }";
+    const cut = queryExcerpt(long, &buf);
+    try testing.expectEqual(@as(usize, SLOW_QUERY_EXCERPT_BYTES), cut.len);
+    try testing.expect(std.mem.startsWith(u8, cut, "{ domains(where:{name:\"aaaa"));
+
+    // 297 ASCII bytes then a 4-byte codepoint: the codepoint straddles the cap and is dropped whole.
+    const straddle = ("b" ** 297) ++ "\u{1F600}" ++ "tail";
+    const trimmed = queryExcerpt(straddle, &buf);
+    try testing.expectEqual(@as(usize, 297), trimmed.len);
+    try testing.expect(std.unicode.utf8ValidateSlice(trimmed));
+
+    const short = queryExcerpt("{ _meta { block { number } } }", &buf);
+    try testing.expectEqualStrings("{ _meta { block { number } } }", short);
+}
+
+test "handleQuery: slow-query threshold of zero logs but does not alter the response" {
+    const allocator = testing.allocator;
+    var database = try db.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var handler = try GraphQLHandler.init(allocator, 10, 10000, true);
+    defer handler.deinit();
+    try testing.expectEqual(DEFAULT_SLOW_QUERY_THRESHOLD_US, handler.slow_query_threshold_us);
+    handler.slow_query_threshold_us = 0;
+
+    // Success path: every execution is "slow", response is still plain data.
+    const ok = try handler.handleQuery(&database, "{ domains(first:1){ id } }", null, null, false);
+    defer allocator.free(ok);
+    try testing.expect(std.mem.indexOf(u8, ok, "\"data\"") != null);
+    try testing.expect(std.mem.indexOf(u8, ok, "\"errors\"") == null);
+
+    // Failure path: an execution error is timed into the histogram and slow-logged too.
+    const bad = try handler.handleQuery(&database, "{ account(id:\"nope\"){ id } }", null, null, false);
+    defer allocator.free(bad);
+    try testing.expect(std.mem.indexOf(u8, bad, "\"code\":\"INVALID_ARGUMENT\"") != null);
+
+    const snapshot = handler.metrics.getSnapshot();
+    try testing.expectEqual(@as(u64, 1), snapshot.successful_queries);
+    try testing.expectEqual(@as(u64, 1), snapshot.failed_queries);
+    try testing.expectEqual(@as(u64, 2), snapshot.duration_count);
+}
 
 // Build a handler over a fresh in-memory DB (full schema loaded by Database.init),
 // run a query end-to-end through handleQuery, and assert the response is a DATA

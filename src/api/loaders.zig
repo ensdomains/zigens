@@ -41,6 +41,32 @@ fn writeTextKey(buf: *[TEXT_KEY_LEN]u8, resolver: Address, namehash: Hash, key: 
     return buf[0 .. 110 + key.len];
 }
 
+// Length-prefixed, presence-tagged hashing for EventsPageKey.fingerprint, so
+// ("ab","c") ≠ ("a","bc") and null ≠ "" ≠ set. Kept as plain byte feeds (no
+// autoHash on slices) so the fingerprint is stable across both call sites.
+fn hashText(hasher: *std.hash.Wyhash, text: []const u8) void {
+    std.hash.autoHash(hasher, @as(u64, text.len));
+    hasher.update(text);
+}
+
+fn hashOptionalText(hasher: *std.hash.Wyhash, text: ?[]const u8) void {
+    if (text) |t| {
+        hasher.update(&[_]u8{1});
+        hashText(hasher, t);
+    } else {
+        hasher.update(&[_]u8{0});
+    }
+}
+
+fn hashOptionalInt(hasher: *std.hash.Wyhash, value: ?i64) void {
+    if (value) |v| {
+        hasher.update(&[_]u8{1});
+        std.hash.autoHash(hasher, v);
+    } else {
+        hasher.update(&[_]u8{0});
+    }
+}
+
 // ============================================================================
 // Per-request loader context
 // ============================================================================
@@ -112,6 +138,66 @@ pub const LoaderContext = struct {
     /// db-allocator-owned.
     domains: std.AutoHashMap(Hash, ?models.Name),
 
+    /// Per-page batch prefetch of each domain's nested `events` page (domains
+    /// lists resolving `events { … }` per row — one filtered query per row
+    /// otherwise). Keyed by namehash; value = EXACTLY the page the per-row
+    /// filtered query returns (possibly empty). Valid only for the
+    /// EventsPageKey recorded at populate time — a lookup under a different
+    /// key falls back. Rows are db-allocator-owned; slices are arena-owned.
+    domain_events: std.AutoHashMap(Hash, []models.Event),
+    domain_events_key: ?EventsPageKey = null,
+
+    /// Per-page batch prefetch of the Resolver → Domain back-reference
+    /// (`resolver { domain { … } }` — one point query per row otherwise).
+    /// Keyed by resolver bytes; key present + null = "batched, no row"; key
+    /// ABSENT = not batched (handler point-queries). Rows are
+    /// db-allocator-owned.
+    domain_by_resolver: std.AutoHashMap([20]u8, ?models.Name),
+
+    /// Identity of one nested `events` page shape: pagination, ordering and a
+    /// fingerprint over every filter field the domain-events handler can set.
+    /// The handler and the page prefetch derive it from the same
+    /// EventFilterOptions via eventsPageKey, so equal shapes compare equal.
+    pub const EventsPageKey = struct {
+        limit: u32,
+        skip: u32,
+        sort_field: db.EventSortField,
+        order_dir: db.EventOrderDir,
+        fingerprint: u64,
+
+        pub fn eql(self: EventsPageKey, other: EventsPageKey) bool {
+            return std.meta.eql(self, other);
+        }
+    };
+
+    /// Pure: depends only on the filter's pagination/ordering and the
+    /// handler-settable predicate fields (event_type, event_types,
+    /// contract_address, block_number_gt/lt, timestamp_gt/lt). The namehash
+    /// is deliberately NOT part of the key — it is the map key instead.
+    pub fn eventsPageKey(filter: db.EventFilterOptions) EventsPageKey {
+        var hasher = std.hash.Wyhash.init(0);
+        hashOptionalText(&hasher, filter.event_type);
+        if (filter.event_types) |list| {
+            hasher.update(&[_]u8{1});
+            std.hash.autoHash(&hasher, @as(u64, list.len));
+            for (list) |item| hashText(&hasher, item);
+        } else {
+            hasher.update(&[_]u8{0});
+        }
+        hashOptionalText(&hasher, filter.contract_address);
+        hashOptionalInt(&hasher, filter.block_number_gt);
+        hashOptionalInt(&hasher, filter.block_number_lt);
+        hashOptionalInt(&hasher, filter.timestamp_gt);
+        hashOptionalInt(&hasher, filter.timestamp_lt);
+        return .{
+            .limit = filter.limit,
+            .skip = filter.skip,
+            .sort_field = filter.sort_field,
+            .order_dir = filter.order_dir,
+            .fingerprint = hasher.final(),
+        };
+    }
+
     pub fn init(allocator: std.mem.Allocator, database: *db.Database) !*LoaderContext {
         const ctx = try allocator.create(LoaderContext);
         ctx.* = .{
@@ -125,6 +211,8 @@ pub const LoaderContext = struct {
             .coin_type_lists = std.StringHashMap([]const u64).init(allocator),
             .domains = std.AutoHashMap(Hash, ?models.Name).init(allocator),
             .account_domains = std.StringHashMap([]models.Name).init(allocator),
+            .domain_events = std.AutoHashMap(Hash, []models.Event).init(allocator),
+            .domain_by_resolver = std.AutoHashMap([20]u8, ?models.Name).init(allocator),
         };
         return ctx;
     }
@@ -282,6 +370,152 @@ pub const LoaderContext = struct {
     /// no row. The returned row is loader-owned — callers must NOT deinit it.
     pub fn lookupDomain(self: *LoaderContext, namehash: Hash) ?(?*const models.Name) {
         const slot = self.domains.getPtr(namehash) orelse return null;
+        if (slot.*) |*row| return @as(?*const models.Name, row);
+        return @as(?*const models.Name, null);
+    }
+
+    /// Batch-prefetch each domain's nested `events` page for one page shape:
+    /// one windowed IN query for the whole domains page instead of one
+    /// filtered query per row. `filter` is the per-row handler's options
+    /// (its namehash is ignored — every requested namehash gets its own
+    /// window). A different page shape than the one already cached clears
+    /// the map first; the same shape keeps existing entries (first page is
+    /// already exact). Namehashes with no rows get an explicit empty entry so
+    /// the handler's absent-vs-empty distinction stays exact. Best-effort.
+    pub fn populateDomainEvents(self: *LoaderContext, database: *db.Database, namehashes: []const Hash, filter: db.EventFilterOptions) void {
+        if (namehashes.len == 0) return;
+        const key = eventsPageKey(filter);
+        if (self.domain_events_key) |current| {
+            if (!current.eql(key)) self.clearDomainEvents();
+        }
+        var page_filter = filter;
+        page_filter.namehash = null;
+        const rows = database.getEventsForNamehashesPage(namehashes, page_filter, self.db_allocator) catch return;
+        defer self.db_allocator.free(rows);
+        var consumed: usize = 0;
+        self.populateDomainEventsInner(namehashes, rows, key, &consumed) catch {};
+        for (rows[consumed..]) |*row| row.deinit(self.db_allocator);
+    }
+
+    fn populateDomainEventsInner(self: *LoaderContext, namehashes: []const Hash, rows: []models.Event, key: EventsPageKey, consumed: *usize) !void {
+        self.domain_events_key = key;
+
+        // Rows arrive grouped per namehash (window partition order, then the
+        // filter's order within it); slice them into per-namehash sublists
+        // without copying the row structs twice.
+        var groups = std.AutoHashMap(Hash, std.ArrayList(models.Event)).init(self.allocator);
+        defer {
+            var git = groups.iterator();
+            while (git.next()) |entry| {
+                for (entry.value_ptr.items) |*e| e.deinit(self.db_allocator);
+                entry.value_ptr.deinit(self.allocator);
+            }
+            groups.deinit();
+        }
+        for (rows) |row| {
+            const nh = row.namehash orelse {
+                var mut = row;
+                mut.deinit(self.db_allocator);
+                consumed.* += 1;
+                continue;
+            };
+            const gop = try groups.getOrPut(nh);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(self.allocator, row);
+            // Only now does `groups` own the row — a failure above leaves it
+            // in the unconsumed tail.
+            consumed.* += 1;
+        }
+
+        // Atomic per-namehash commit; every requested namehash gets a
+        // complete page (possibly empty). Failure mid-commit leaves later
+        // namehashes absent — the handler falls back to the filtered point
+        // query, which is always correct.
+        for (namehashes) |nh| {
+            if (self.domain_events.contains(nh)) continue;
+            const list: []models.Event = blk: {
+                if (groups.getPtr(nh)) |gl| break :blk try gl.toOwnedSlice(self.allocator);
+                break :blk try self.allocator.alloc(models.Event, 0);
+            };
+            errdefer {
+                for (list) |*row| row.deinit(self.db_allocator);
+                self.allocator.free(list);
+            }
+            try self.domain_events.put(nh, list);
+        }
+    }
+
+    fn clearDomainEvents(self: *LoaderContext) void {
+        var it = self.domain_events.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.*) |*row| row.deinit(self.db_allocator);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.domain_events.clearRetainingCapacity();
+        self.domain_events_key = null;
+    }
+
+    /// Null = not batched for this page shape (caller runs its own filtered
+    /// query); otherwise the namehash's complete page (may be empty).
+    /// Loader-owned; don't free or mutate.
+    pub fn lookupDomainEvents(self: *LoaderContext, namehash: Hash, key: EventsPageKey) ?[]const models.Event {
+        const current = self.domain_events_key orelse return null;
+        if (!current.eql(key)) return null;
+        return self.domain_events.get(namehash);
+    }
+
+    /// Batch-prefetch the Resolver → Domain back-reference for a page of
+    /// resolver addresses: one IN-list query (at most one row per resolver,
+    /// the same pick the point query makes) instead of one point query per
+    /// row. Resolvers with no row cache an explicit "no row". Best-effort:
+    /// failure leaves the map un(der)populated and handlers fall back.
+    pub fn populateDomainsByResolver(self: *LoaderContext, database: *db.Database, resolvers: []const Address) void {
+        if (resolvers.len == 0) return;
+        const rows = database.getDomainsByResolvers(resolvers, self.db_allocator) catch return;
+        defer self.db_allocator.free(rows);
+        var consumed: usize = 0;
+        self.populateDomainsByResolverInner(resolvers, rows, &consumed) catch {
+            // Same stale-sentinel hazard as populateDomains: a "no row" left
+            // for a resolver whose row was never processed would serve
+            // domain:null for a row that exists. Downgrade every still-null
+            // sentinel to absent (handlers point-query, always correct).
+            for (resolvers) |r| {
+                if (self.domain_by_resolver.getPtr(r.bytes)) |slot| {
+                    if (slot.* == null) _ = self.domain_by_resolver.remove(r.bytes);
+                }
+            }
+        };
+        for (rows[consumed..]) |row| {
+            var mut = row;
+            mut.deinit(self.db_allocator);
+        }
+    }
+
+    fn populateDomainsByResolverInner(self: *LoaderContext, resolvers: []const Address, rows: []models.Name, consumed: *usize) !void {
+        for (resolvers) |r| {
+            _ = try self.domain_by_resolver.getOrPutValue(r.bytes, null);
+        }
+        for (rows) |row| {
+            consumed.* += 1;
+            if (self.domain_by_resolver.getPtr(row.resolver.bytes)) |slot| {
+                // A prior populateDomainsByResolver call may have cached this
+                // resolver already — replace, don't leak.
+                if (slot.*) |prior| {
+                    var mut = prior;
+                    mut.deinit(self.db_allocator);
+                }
+                slot.* = row;
+            } else {
+                var mut = row;
+                mut.deinit(self.db_allocator);
+            }
+        }
+    }
+
+    /// Outer null = not batched (caller point-queries); inner null = batched,
+    /// no row. The returned row is loader-owned — callers must NOT deinit it.
+    pub fn lookupDomainByResolver(self: *LoaderContext, resolver: Address) ?(?*const models.Name) {
+        const slot = self.domain_by_resolver.getPtr(resolver.bytes) orelse return null;
         if (slot.*) |*row| return @as(?*const models.Name, row);
         return @as(?*const models.Name, null);
     }
@@ -670,6 +904,20 @@ pub const LoaderContext = struct {
         }
         self.domains.deinit();
 
+        // Domain-events pages: rows db-allocator-owned, slices arena-owned.
+        self.clearDomainEvents();
+        self.domain_events.deinit();
+
+        // Resolver → Domain rows are db-allocator-owned; keys are plain bytes.
+        var rit = self.domain_by_resolver.iterator();
+        while (rit.next()) |entry| {
+            if (entry.value_ptr.*) |row| {
+                var mut = row;
+                mut.deinit(self.db_allocator);
+            }
+        }
+        self.domain_by_resolver.deinit();
+
         self.allocator.destroy(self);
     }
 };
@@ -880,6 +1128,202 @@ test "populateDomains: single-row cached, multi-row absent, zero-row sentinel, r
     ctx.populateDomains(&test_db, &page);
     const again = ctx.lookupDomain(nh(1)) orelse return error.ExpectedBatched;
     try std.testing.expectEqualStrings("solo.eth", again.?.name.?);
+}
+
+fn testEventRow(namehash: Hash, block: u64, event_type: models.EventType, contract: Address) models.Event {
+    var tx = Hash{ .bytes = [_]u8{0xEE} ** 32 };
+    tx.bytes[24] = @intCast(block >> 8);
+    tx.bytes[31] = @intCast(block & 0xFF);
+    tx.bytes[0] = namehash.bytes[31];
+    return models.Event{
+        .event_type = event_type,
+        .protocol = .v2,
+        .block_number = block,
+        .tx_hash = tx,
+        .log_index = 0,
+        .contract_address = contract,
+        .name = null,
+        .namehash = namehash,
+        .data = "{}",
+        .timestamp = @intCast(1700000000 + block),
+    };
+}
+
+fn testNamehash(n: u8) Hash {
+    var h = Hash{ .bytes = [_]u8{0} ** 32 };
+    h.bytes[31] = n;
+    h.bytes[0] = 0x0D;
+    return h;
+}
+
+test "eventsPageKey: pure, distinguishes null vs set, list contents, and pagination" {
+    const base = db.EventFilterOptions{ .limit = 10 };
+    const key = LoaderContext.eventsPageKey(base);
+    try std.testing.expect(key.eql(LoaderContext.eventsPageKey(base)));
+    try std.testing.expectEqual(@as(u32, 10), key.limit);
+
+    // The namehash is the map key, never part of the page key.
+    try std.testing.expect(key.eql(LoaderContext.eventsPageKey(.{ .limit = 10, .namehash = "0xabc" })));
+
+    try std.testing.expect(!key.eql(LoaderContext.eventsPageKey(.{ .limit = 11 })));
+    try std.testing.expect(!key.eql(LoaderContext.eventsPageKey(.{ .limit = 10, .skip = 1 })));
+    try std.testing.expect(!key.eql(LoaderContext.eventsPageKey(.{ .limit = 10, .order_dir = .asc })));
+    try std.testing.expect(!key.eql(LoaderContext.eventsPageKey(.{ .limit = 10, .sort_field = .timestamp })));
+    try std.testing.expect(!key.eql(LoaderContext.eventsPageKey(.{ .limit = 10, .event_type = "Transfer" })));
+    try std.testing.expect(!key.eql(LoaderContext.eventsPageKey(.{ .limit = 10, .event_type = "" })));
+    try std.testing.expect(!key.eql(LoaderContext.eventsPageKey(.{ .limit = 10, .contract_address = "0x00" })));
+    try std.testing.expect(!key.eql(LoaderContext.eventsPageKey(.{ .limit = 10, .block_number_gt = 0 })));
+    try std.testing.expect(!key.eql(LoaderContext.eventsPageKey(.{ .limit = 10, .block_number_lt = 0 })));
+    try std.testing.expect(!key.eql(LoaderContext.eventsPageKey(.{ .limit = 10, .timestamp_gt = 0 })));
+    try std.testing.expect(!key.eql(LoaderContext.eventsPageKey(.{ .limit = 10, .timestamp_lt = 0 })));
+
+    // Same list contents (by value) → equal; different split or order → not.
+    const ab_c = [_][]const u8{ "ab", "c" };
+    const a_bc = [_][]const u8{ "a", "bc" };
+    const ab_c_again = [_][]const u8{ "ab", "c" };
+    const c_ab = [_][]const u8{ "c", "ab" };
+    const with_list = LoaderContext.eventsPageKey(.{ .limit = 10, .event_types = &ab_c });
+    try std.testing.expect(with_list.eql(LoaderContext.eventsPageKey(.{ .limit = 10, .event_types = &ab_c_again })));
+    try std.testing.expect(!with_list.eql(LoaderContext.eventsPageKey(.{ .limit = 10, .event_types = &a_bc })));
+    try std.testing.expect(!with_list.eql(LoaderContext.eventsPageKey(.{ .limit = 10, .event_types = &c_ab })));
+    try std.testing.expect(!with_list.eql(key));
+}
+
+test "populateDomainEvents: per-namehash ordered window, limit/skip, empty sentinel, key mismatch, repeat-safe" {
+    const allocator = std.testing.allocator;
+
+    var test_db = try db.Database.init(allocator, ":memory:");
+    defer test_db.deinit();
+
+    const contract_a = Address{ .bytes = [_]u8{0xC1} ** 20 };
+    const contract_b = Address{ .bytes = [_]u8{0xC2} ** 20 };
+    // Namehash 1: four events, inserted out of block order. Namehash 2: one
+    // event, under a different contract. Namehash 3: none.
+    try test_db.insertEvent(testEventRow(testNamehash(1), 102, .transfer, contract_a));
+    try test_db.insertEvent(testEventRow(testNamehash(1), 100, .name_registered, contract_a));
+    try test_db.insertEvent(testEventRow(testNamehash(1), 103, .transfer, contract_a));
+    try test_db.insertEvent(testEventRow(testNamehash(1), 101, .transfer, contract_a));
+    try test_db.insertEvent(testEventRow(testNamehash(2), 200, .transfer, contract_b));
+
+    const ctx = try LoaderContext.init(allocator, &test_db);
+    defer ctx.deinit();
+
+    const page = [_]Hash{ testNamehash(1), testNamehash(2), testNamehash(3) };
+
+    // Default shape: newest first, limit 2 → per-namehash window.
+    const filter = db.EventFilterOptions{ .limit = 2 };
+    const key = LoaderContext.eventsPageKey(filter);
+    ctx.populateDomainEvents(&test_db, &page, filter);
+
+    const ev1 = ctx.lookupDomainEvents(testNamehash(1), key) orelse return error.ExpectedBatched;
+    try std.testing.expectEqual(@as(usize, 2), ev1.len);
+    try std.testing.expectEqual(@as(u64, 103), ev1[0].block_number);
+    try std.testing.expectEqual(@as(u64, 102), ev1[1].block_number);
+    const ev2 = ctx.lookupDomainEvents(testNamehash(2), key) orelse return error.ExpectedBatched;
+    try std.testing.expectEqual(@as(usize, 1), ev2.len);
+    try std.testing.expectEqual(@as(u64, 200), ev2[0].block_number);
+    // Zero rows: batched "empty page", not a fallback.
+    const ev3 = ctx.lookupDomainEvents(testNamehash(3), key) orelse return error.ExpectedBatched;
+    try std.testing.expectEqual(@as(usize, 0), ev3.len);
+    // Unrequested namehash: never invented.
+    try std.testing.expectEqual(@as(?[]const models.Event, null), ctx.lookupDomainEvents(testNamehash(9), key));
+
+    // Batched answers must equal the per-row filtered point query.
+    var nh_hex_buf: [66]u8 = undefined;
+    const point = try test_db.getEventsFiltered(.{ .namehash = testNamehash(1).toHexBuf(&nh_hex_buf), .limit = 2 });
+    defer {
+        for (point) |*e| e.deinit(test_db.allocator);
+        test_db.allocator.free(point);
+    }
+    try std.testing.expectEqual(point.len, ev1.len);
+    for (point, ev1) |p, b| {
+        try std.testing.expectEqual(p.block_number, b.block_number);
+        try std.testing.expect(p.tx_hash.eql(b.tx_hash));
+    }
+
+    // A different page shape is a miss, never a wrong page.
+    const other_key = LoaderContext.eventsPageKey(.{ .limit = 2, .order_dir = .asc });
+    try std.testing.expectEqual(@as(?[]const models.Event, null), ctx.lookupDomainEvents(testNamehash(1), other_key));
+
+    // Repeat priming under the SAME shape keeps the first page and must not
+    // leak (testing.allocator enforces).
+    ctx.populateDomainEvents(&test_db, &page, filter);
+    const again = ctx.lookupDomainEvents(testNamehash(1), key) orelse return error.ExpectedBatched;
+    try std.testing.expectEqual(@as(usize, 2), again.len);
+
+    // Re-priming under a NEW shape (asc + skip 1 + type filter) replaces the
+    // cached pages: the old key now misses, the new one serves the window.
+    const shifted = db.EventFilterOptions{ .limit = 2, .skip = 1, .order_dir = .asc, .event_type = "Transfer" };
+    const shifted_key = LoaderContext.eventsPageKey(shifted);
+    ctx.populateDomainEvents(&test_db, &page, shifted);
+    try std.testing.expectEqual(@as(?[]const models.Event, null), ctx.lookupDomainEvents(testNamehash(1), key));
+    const asc = ctx.lookupDomainEvents(testNamehash(1), shifted_key) orelse return error.ExpectedBatched;
+    // Transfers ascending are 101, 102, 103; skip 1 + limit 2 → 102, 103.
+    try std.testing.expectEqual(@as(usize, 2), asc.len);
+    try std.testing.expectEqual(@as(u64, 102), asc[0].block_number);
+    try std.testing.expectEqual(@as(u64, 103), asc[1].block_number);
+    const asc_empty = ctx.lookupDomainEvents(testNamehash(3), shifted_key) orelse return error.ExpectedBatched;
+    try std.testing.expectEqual(@as(usize, 0), asc_empty.len);
+
+    // Contract filter narrows per namehash exactly like the point query.
+    var contract_hex_buf: [42]u8 = undefined;
+    const by_contract = db.EventFilterOptions{ .limit = 10, .contract_address = contract_b.toHexBuf(&contract_hex_buf) };
+    const by_contract_key = LoaderContext.eventsPageKey(by_contract);
+    ctx.populateDomainEvents(&test_db, &page, by_contract);
+    const none_a = ctx.lookupDomainEvents(testNamehash(1), by_contract_key) orelse return error.ExpectedBatched;
+    try std.testing.expectEqual(@as(usize, 0), none_a.len);
+    const one_b = ctx.lookupDomainEvents(testNamehash(2), by_contract_key) orelse return error.ExpectedBatched;
+    try std.testing.expectEqual(@as(usize, 1), one_b.len);
+}
+
+test "populateDomainsByResolver: hit, authoritative null, unknown → outer null, repeat-safe" {
+    const allocator = std.testing.allocator;
+
+    var test_db = try db.Database.init(allocator, ":memory:");
+    defer test_db.deinit();
+
+    const res_a = Address{ .bytes = [_]u8{0xE1} ** 20 };
+    const res_b = Address{ .bytes = [_]u8{0xE2} ** 20 };
+    const res_c = Address{ .bytes = [_]u8{0xE3} ** 20 };
+
+    var row_a = testDomainRow(1, .v2, "alpha.eth");
+    row_a.resolver = res_a;
+    try test_db.insertName(row_a);
+    // Resolver B serves two names: the batch must make the point query's
+    // pick (lowest namehash), not an arbitrary one.
+    var row_b_hi = testDomainRow(7, .v2, "zeta.eth");
+    row_b_hi.resolver = res_b;
+    try test_db.insertName(row_b_hi);
+    var row_b_lo = testDomainRow(3, .v2, "beta.eth");
+    row_b_lo.resolver = res_b;
+    try test_db.insertName(row_b_lo);
+
+    const ctx = try LoaderContext.init(allocator, &test_db);
+    defer ctx.deinit();
+
+    const page = [_]Address{ res_a, res_b, res_c };
+    ctx.populateDomainsByResolver(&test_db, &page);
+
+    const hit_a = ctx.lookupDomainByResolver(res_a) orelse return error.ExpectedBatched;
+    try std.testing.expectEqualStrings("alpha.eth", hit_a.?.name.?);
+    const hit_b = ctx.lookupDomainByResolver(res_b) orelse return error.ExpectedBatched;
+    const point_b = (try test_db.getDomainByResolver(res_b)) orelse return error.ExpectedRow;
+    defer {
+        var mut = point_b;
+        mut.deinit(test_db.allocator);
+    }
+    try std.testing.expectEqualStrings(point_b.name.?, hit_b.?.name.?);
+    try std.testing.expect(point_b.namehash.eql(hit_b.?.namehash));
+    // No name points at C: batched "no row" sentinel.
+    const miss_c = ctx.lookupDomainByResolver(res_c) orelse return error.ExpectedBatched;
+    try std.testing.expectEqual(@as(?*const models.Name, null), miss_c);
+    // Never-requested resolver: outer null → handler point-queries.
+    try std.testing.expectEqual(@as(?(?*const models.Name), null), ctx.lookupDomainByResolver(Address{ .bytes = [_]u8{0xE9} ** 20 }));
+
+    // Repeat priming with overlap must not leak (testing.allocator enforces).
+    ctx.populateDomainsByResolver(&test_db, &page);
+    const again = ctx.lookupDomainByResolver(res_a) orelse return error.ExpectedBatched;
+    try std.testing.expectEqualStrings("alpha.eth", again.?.name.?);
 }
 
 // ============================================================================

@@ -305,6 +305,17 @@ fn sortColExpr(db: *Database, sort_field: EventSortField) ![]u8 {
     };
 }
 
+/// The ", <tiebreak>" suffix that follows the sort column: (block_number, log_index) is
+/// unique, so appending it makes every sort field a total order (no two rows tie) and
+/// pagination deterministic. Shared by getEventsFiltered and the per-namehash page
+/// loader so their row order is identical.
+fn orderTiebreakSql(filter: EventFilterOptions) []const u8 {
+    return if (filter.sort_field == .block_number)
+        (if (filter.order_dir == .desc) ", log_index DESC" else ", log_index ASC")
+    else
+        (if (filter.order_dir == .desc) ", block_number DESC, log_index DESC" else ", block_number ASC, log_index ASC");
+}
+
 pub fn getRecentEvents(db: *Database, protocol: ?models.Protocol, event_type: ?models.EventType, limit: u32) ![]models.Event {
     return getRecentEventsWithOrder(db, protocol, event_type, limit, .desc);
 }
@@ -778,12 +789,7 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     @memcpy(sql_buf[sql_len..][0..dir_str.len], dir_str);
     sql_len += dir_str.len;
 
-    // Total order: (block_number, log_index) is unique, so appending it as a final
-    // tiebreaker makes pagination deterministic for every sort field (no two rows tie).
-    const tiebreak = if (filter.sort_field == .block_number)
-        (if (filter.order_dir == .desc) ", log_index DESC" else ", log_index ASC")
-    else
-        (if (filter.order_dir == .desc) ", block_number DESC, log_index DESC" else ", block_number ASC, log_index ASC");
+    const tiebreak = orderTiebreakSql(filter);
     @memcpy(sql_buf[sql_len..][0..tiebreak.len], tiebreak);
     sql_len += tiebreak.len;
 
@@ -837,6 +843,119 @@ pub fn getEventsByDomain(db: *Database, domain_name: []const u8, limit: u32) ![]
         .domain = domain_name,
         .limit = limit,
     });
+}
+
+const EVENT_SELECT_COLS = "event_type, protocol, block_number, tx_hash, log_index, contract_address, name, namehash, data, timestamp";
+
+/// Namehashes per IN-list statement of the page loader. The hashes bind static from
+/// an arena (no tracked-copy cap), so the chunk is sized for statement length and
+/// the legacy SQLite 999-parameter floor, leaving room for the filter's own binds.
+const EVENT_PAGE_CHUNK: usize = 200;
+
+/// Batched mirror of `getEventsFiltered` over many namehashes: for EACH namehash the
+/// result holds exactly the rows `getEventsFiltered(db, filter with .namehash = that
+/// namehash)` would return — the same predicate tree (appendEventFilterConditions /
+/// bindEventFilters), the same `sortColExpr` + tiebreak order and the same
+/// `filter.limit` / `filter.skip` window — concatenated and ordered by namehash, then
+/// by the filter's ordering. `filter.namehash` is overridden per namehash exactly as
+/// that call would (the IN-list stands in for it), so callers pass null. One
+/// statement per chunk of up to EVENT_PAGE_CHUNK namehashes pages every partition at
+/// once via ROW_NUMBER() OVER (PARTITION BY namehash …), so an API page's per-domain
+/// event lists cost one round trip instead of one per domain. Namehashes with no
+/// matching rows contribute nothing. Rows and the returned slice are allocated with
+/// `allocator`; release via `freeEvents`.
+pub fn getEventsForNamehashesPage(db: *Database, namehashes: []const Hash, page_filter: EventFilterOptions, allocator: std.mem.Allocator) ![]models.Event {
+    var out: std.ArrayList(models.Event) = .empty;
+    errdefer freeEventList(allocator, &out);
+    if (namehashes.len == 0) return try out.toOwnedSlice(allocator);
+
+    var filter = page_filter;
+    filter.namehash = null;
+
+    const sort_col = try sortColExpr(db, filter.sort_field);
+    defer db.allocator.free(sort_col);
+    const dir_str: []const u8 = if (filter.order_dir == .desc) " DESC" else " ASC";
+    const tiebreak = orderTiebreakSql(filter);
+
+    var conditions: std.ArrayList([]const u8) = .empty;
+    defer conditions.deinit(db.allocator);
+    var allocated_clauses: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (allocated_clauses.items) |clause| db.allocator.free(clause);
+        allocated_clauses.deinit(db.allocator);
+    }
+    try appendEventFilterConditions(db, filter, &conditions, &allocated_clauses);
+
+    // ROW_NUMBER is 1-based: rows skip+1 ..= skip+limit are the page, exactly LIMIT/OFFSET.
+    const first_rn: u64 = filter.skip;
+    const last_rn: u64 = @as(u64, filter.skip) + filter.limit;
+
+    // A namehash listed twice (a v1/v2 twin page) must produce its window once:
+    // chunking a repeated input would emit it once per chunk it lands in.
+    var seen = std.AutoHashMap(Hash, void).init(db.allocator);
+    defer seen.deinit();
+    var unique: std.ArrayList(Hash) = .empty;
+    defer unique.deinit(db.allocator);
+    for (namehashes) |nh| {
+        const gop = try seen.getOrPut(nh);
+        if (!gop.found_existing) try unique.append(db.allocator, nh);
+    }
+
+    var start: usize = 0;
+    while (start < unique.items.len) {
+        const chunk = unique.items[start..@min(start + EVENT_PAGE_CHUNK, unique.items.len)];
+        start += chunk.len;
+
+        // Declared before the Query so its hex strings outlive step (LIFO defers).
+        var scratch = std.heap.ArenaAllocator.init(db.allocator);
+        defer scratch.deinit();
+        const scratch_alloc = scratch.allocator();
+
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.appendSlice(scratch_alloc, "SELECT " ++ EVENT_SELECT_COLS ++ " FROM (SELECT " ++ EVENT_SELECT_COLS ++
+            ", ROW_NUMBER() OVER (PARTITION BY namehash ORDER BY ");
+        try sql.appendSlice(scratch_alloc, sort_col);
+        try sql.appendSlice(scratch_alloc, dir_str);
+        try sql.appendSlice(scratch_alloc, tiebreak);
+        try sql.appendSlice(scratch_alloc, ") AS rn FROM events WHERE namehash IN (");
+        for (chunk, 0..) |_, i| {
+            if (i != 0) try sql.append(scratch_alloc, ',');
+            try sql.append(scratch_alloc, '?');
+        }
+        try sql.append(scratch_alloc, ')');
+        for (conditions.items) |cond| {
+            try sql.appendSlice(scratch_alloc, " AND ");
+            try sql.appendSlice(scratch_alloc, cond);
+        }
+        try sql.print(scratch_alloc, ") t WHERE rn > {d} AND rn <= {d} ORDER BY namehash, rn", .{ first_rn, last_rn });
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        for (chunk) |nh| {
+            const buf = try scratch_alloc.create([66]u8);
+            try q.bindTextStatic(nh.toHexBuf(buf));
+        }
+        try bindEventFilters(&q, filter);
+
+        while (try q.step()) {
+            var row = try parseEventRow(&q, allocator);
+            errdefer row.deinit(allocator);
+            try out.append(allocator, row);
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn freeEventList(allocator: std.mem.Allocator, list: *std.ArrayList(models.Event)) void {
+    for (list.items) |*event| event.deinit(allocator);
+    list.deinit(allocator);
+}
+
+/// Release a slice of events (rows + slice) allocated with `allocator`.
+pub fn freeEvents(allocator: std.mem.Allocator, events_slice: []models.Event) void {
+    for (events_slice) |*event| event.deinit(allocator);
+    allocator.free(events_slice);
 }
 
 /// Insert or update an approval

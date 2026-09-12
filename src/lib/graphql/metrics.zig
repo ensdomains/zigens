@@ -1,6 +1,22 @@
 const std = @import("std");
 const zsys = @import("../../utils/system.zig");
 
+/// Upper bounds (microseconds) of the graphql_query_duration_seconds histogram
+/// buckets; the trailing +Inf bucket is implicit.
+pub const DURATION_BUCKET_BOUNDS_US = [_]u64{
+    5_000,     10_000,    25_000,    50_000,     100_000,    250_000,    500_000,
+    1_000_000, 2_500_000, 5_000_000, 10_000_000, 30_000_000, 60_000_000,
+};
+
+/// Prometheus `le` labels (seconds) matching DURATION_BUCKET_BOUNDS_US.
+pub const DURATION_BUCKET_LABELS = [_][]const u8{
+    "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5",
+    "1",     "2.5",  "5",     "10",   "30",  "60",
+};
+
+/// Bucket slots including the +Inf bucket (last index).
+pub const DURATION_BUCKET_COUNT = DURATION_BUCKET_BOUNDS_US.len + 1;
+
 /// GraphQL Metrics Tracker
 /// Thread-safe metrics collection for GraphQL queries
 /// Zero overhead when disabled
@@ -24,6 +40,12 @@ pub const Metrics = struct {
     total_duration_us: u64,
     min_duration_us: u64,
     max_duration_us: u64,
+
+    // Duration histogram over successful AND failed executions. Bucket counts
+    // are cumulative (Prometheus `le` semantics); the last slot is +Inf.
+    duration_buckets: [DURATION_BUCKET_COUNT]u64,
+    duration_sum_us: u64,
+    duration_count: u64,
 
     // Complexity stats
     total_depth: u64,
@@ -49,6 +71,9 @@ pub const Metrics = struct {
             .total_duration_us = 0,
             .min_duration_us = std.math.maxInt(u64),
             .max_duration_us = 0,
+            .duration_buckets = [_]u64{0} ** DURATION_BUCKET_COUNT,
+            .duration_sum_us = 0,
+            .duration_count = 0,
             .total_depth = 0,
             .max_depth = 0,
             .total_cost = 0,
@@ -89,6 +114,8 @@ pub const Metrics = struct {
         if (cost > self.max_cost) {
             self.max_cost = cost;
         }
+
+        self.addDurationSample(duration_us);
     }
 
     /// Record a failed query (error during execution)
@@ -100,6 +127,40 @@ pub const Metrics = struct {
 
         self.total_queries += 1;
         self.failed_queries += 1;
+    }
+
+    /// Record a failed query that ran long enough to time (execution errors),
+    /// so the duration histogram covers failures as well as successes.
+    pub fn recordErrorWithDuration(self: *Metrics, duration_us: u64) void {
+        if (!self.enabled) return;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.total_queries += 1;
+        self.failed_queries += 1;
+        self.addDurationSample(duration_us);
+    }
+
+    /// Add one execution duration to the histogram without touching the
+    /// success/failure counters.
+    pub fn recordDuration(self: *Metrics, duration_us: u64) void {
+        if (!self.enabled) return;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.addDurationSample(duration_us);
+    }
+
+    /// Histogram update shared by the record* entry points; the caller holds the mutex.
+    fn addDurationSample(self: *Metrics, duration_us: u64) void {
+        for (DURATION_BUCKET_BOUNDS_US, 0..) |bound, i| {
+            if (duration_us <= bound) self.duration_buckets[i] += 1;
+        }
+        self.duration_buckets[DURATION_BUCKET_COUNT - 1] += 1;
+        self.duration_sum_us += duration_us;
+        self.duration_count += 1;
     }
 
     /// Record a rejected query (complexity limit exceeded)
@@ -158,6 +219,9 @@ pub const Metrics = struct {
                 .max_depth = 0,
                 .avg_cost = 0,
                 .max_cost = 0,
+                .duration_buckets = [_]u64{0} ** DURATION_BUCKET_COUNT,
+                .duration_sum_us = 0,
+                .duration_count = 0,
                 .uptime_seconds = 0,
             };
         }
@@ -199,6 +263,9 @@ pub const Metrics = struct {
             .max_depth = self.max_depth,
             .avg_cost = avg_cost,
             .max_cost = self.max_cost,
+            .duration_buckets = self.duration_buckets,
+            .duration_sum_us = self.duration_sum_us,
+            .duration_count = self.duration_count,
             .uptime_seconds = uptime,
         };
     }
@@ -256,6 +323,15 @@ pub const Metrics = struct {
         try writer.writeAll("# TYPE graphql_query_duration_microseconds_max gauge\n");
         try writer.print("graphql_query_duration_microseconds_max {d}\n", .{snapshot.max_duration_us});
 
+        try writer.writeAll("# HELP graphql_query_duration_seconds Query execution duration, successful and failed executions\n");
+        try writer.writeAll("# TYPE graphql_query_duration_seconds histogram\n");
+        for (DURATION_BUCKET_LABELS, 0..) |label, i| {
+            try writer.print("graphql_query_duration_seconds_bucket{{le=\"{s}\"}} {d}\n", .{ label, snapshot.duration_buckets[i] });
+        }
+        try writer.print("graphql_query_duration_seconds_bucket{{le=\"+Inf\"}} {d}\n", .{snapshot.duration_buckets[DURATION_BUCKET_COUNT - 1]});
+        try writer.print("graphql_query_duration_seconds_sum {d:.6}\n", .{snapshot.durationSumSeconds()});
+        try writer.print("graphql_query_duration_seconds_count {d}\n", .{snapshot.duration_count});
+
         try writer.writeAll("# HELP graphql_query_depth_avg Average query depth\n");
         try writer.writeAll("# TYPE graphql_query_depth_avg gauge\n");
         try writer.print("graphql_query_depth_avg {d}\n", .{snapshot.avg_depth});
@@ -283,8 +359,13 @@ pub const Metrics = struct {
     pub fn formatJson(self: *Metrics, allocator: std.mem.Allocator) ![]u8 {
         const snapshot = self.getSnapshot();
 
-        return std.fmt.allocPrint(allocator,
-            \\{{"enabled":{s},"total_queries":{d},"successful_queries":{d},"failed_queries":{d},"rejected_queries":{d},"primary_verified":{d},"primary_mismatch":{d},"primary_unverified":{d},"avg_duration_us":{d},"min_duration_us":{d},"max_duration_us":{d},"avg_depth":{d},"max_depth":{d},"avg_cost":{d},"max_cost":{d},"uptime_seconds":{d}}}
+        var buffer: std.Io.Writer.Allocating = .init(allocator);
+        errdefer buffer.deinit();
+
+        const writer = &buffer.writer;
+
+        try writer.print(
+            \\{{"enabled":{s},"total_queries":{d},"successful_queries":{d},"failed_queries":{d},"rejected_queries":{d},"primary_verified":{d},"primary_mismatch":{d},"primary_unverified":{d},"avg_duration_us":{d},"min_duration_us":{d},"max_duration_us":{d},"avg_depth":{d},"max_depth":{d},"avg_cost":{d},"max_cost":{d},"uptime_seconds":{d}
         , .{
             if (snapshot.enabled) "true" else "false",
             snapshot.total_queries,
@@ -303,6 +384,16 @@ pub const Metrics = struct {
             snapshot.max_cost,
             snapshot.uptime_seconds,
         });
+
+        try writer.writeAll(",\"duration_histogram\":{\"buckets\":{");
+        for (DURATION_BUCKET_LABELS, 0..) |label, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.print("\"{s}\":{d}", .{ label, snapshot.duration_buckets[i] });
+        }
+        try writer.print(",\"+Inf\":{d}}}", .{snapshot.duration_buckets[DURATION_BUCKET_COUNT - 1]});
+        try writer.print(",\"sum_seconds\":{d:.6},\"count\":{d}}}}}", .{ snapshot.durationSumSeconds(), snapshot.duration_count });
+
+        return buffer.toOwnedSlice();
     }
 };
 
@@ -323,7 +414,14 @@ pub const MetricsSnapshot = struct {
     max_depth: u32,
     avg_cost: u32,
     max_cost: u32,
+    duration_buckets: [DURATION_BUCKET_COUNT]u64,
+    duration_sum_us: u64,
+    duration_count: u64,
     uptime_seconds: u64,
+
+    pub fn durationSumSeconds(self: *const MetricsSnapshot) f64 {
+        return @as(f64, @floatFromInt(self.duration_sum_us)) / std.time.us_per_s;
+    }
 };
 
 /// Timer for measuring query execution time
@@ -593,4 +691,124 @@ test "Metrics uptime tracking" {
     // Should be at least 2 seconds, but allow for some variance
     try std.testing.expect(snapshot.uptime_seconds >= 2);
     try std.testing.expect(snapshot.uptime_seconds <= 3);
+}
+
+test "Duration histogram: a 0.3s sample lands in le=0.5 and above only" {
+    const allocator = std.testing.allocator;
+
+    var metrics = Metrics.init(allocator, true);
+    defer metrics.deinit();
+
+    metrics.recordDuration(300_000);
+
+    const snapshot = metrics.getSnapshot();
+    for (DURATION_BUCKET_BOUNDS_US, 0..) |bound, i| {
+        const expected: u64 = if (bound >= 500_000) 1 else 0;
+        try std.testing.expectEqual(expected, snapshot.duration_buckets[i]);
+    }
+    try std.testing.expectEqual(@as(u64, 0), snapshot.duration_buckets[5]); // le=0.25
+    try std.testing.expectEqual(@as(u64, 1), snapshot.duration_buckets[6]); // le=0.5
+    try std.testing.expectEqual(@as(u64, 1), snapshot.duration_buckets[DURATION_BUCKET_COUNT - 1]);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.duration_count);
+    try std.testing.expectEqual(@as(u64, 300_000), snapshot.duration_sum_us);
+}
+
+test "Duration histogram: bounds are inclusive and +Inf catches everything" {
+    const allocator = std.testing.allocator;
+
+    var metrics = Metrics.init(allocator, true);
+    defer metrics.deinit();
+
+    metrics.recordDuration(5_000); // exactly le=0.005
+    metrics.recordDuration(120_000_000); // beyond le=60
+
+    const snapshot = metrics.getSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), snapshot.duration_buckets[0]);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.duration_buckets[DURATION_BUCKET_COUNT - 2]); // le=60
+    try std.testing.expectEqual(@as(u64, 2), snapshot.duration_buckets[DURATION_BUCKET_COUNT - 1]);
+    try std.testing.expectEqual(@as(u64, 2), snapshot.duration_count);
+}
+
+test "Duration histogram: successes and failures both count, sum adds up" {
+    const allocator = std.testing.allocator;
+
+    var metrics = Metrics.init(allocator, true);
+    defer metrics.deinit();
+
+    metrics.recordQuery(1_500, 3, 15);
+    metrics.recordErrorWithDuration(2_500_000);
+    metrics.recordError(); // no timing: counters only
+
+    const snapshot = metrics.getSnapshot();
+    try std.testing.expectEqual(@as(u64, 3), snapshot.total_queries);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.successful_queries);
+    try std.testing.expectEqual(@as(u64, 2), snapshot.failed_queries);
+    try std.testing.expectEqual(@as(u64, 2), snapshot.duration_count);
+    try std.testing.expectEqual(@as(u64, 2_501_500), snapshot.duration_sum_us);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.duration_buckets[0]); // le=0.005: the 1.5ms success
+    try std.testing.expectEqual(@as(u64, 1), snapshot.duration_buckets[7]); // le=1
+    try std.testing.expectEqual(@as(u64, 2), snapshot.duration_buckets[8]); // le=2.5: both
+    // The all-time gauges stay success-only, exactly as before.
+    try std.testing.expectEqual(@as(u64, 1_500), snapshot.max_duration_us);
+    try std.testing.expectEqual(@as(u64, 1_500), snapshot.avg_duration_us);
+}
+
+test "Duration histogram: Prometheus exposition lines" {
+    const allocator = std.testing.allocator;
+
+    var metrics = Metrics.init(allocator, true);
+    defer metrics.deinit();
+
+    metrics.recordQuery(300_000, 2, 10);
+    metrics.recordErrorWithDuration(1_000_000);
+
+    const output = try metrics.formatPrometheus(allocator);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "# TYPE graphql_query_duration_seconds histogram\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "graphql_query_duration_seconds_bucket{le=\"0.005\"} 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "graphql_query_duration_seconds_bucket{le=\"0.25\"} 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "graphql_query_duration_seconds_bucket{le=\"0.5\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "graphql_query_duration_seconds_bucket{le=\"1\"} 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "graphql_query_duration_seconds_bucket{le=\"60\"} 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "graphql_query_duration_seconds_bucket{le=\"+Inf\"} 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "graphql_query_duration_seconds_sum 1.300000\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "graphql_query_duration_seconds_count 2\n") != null);
+    // Pre-existing gauges are untouched by the histogram.
+    try std.testing.expect(std.mem.indexOf(u8, output, "graphql_query_duration_microseconds_max 300000\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "graphql_queries_failed 1\n") != null);
+}
+
+test "Duration histogram: JSON carries buckets, sum and count" {
+    const allocator = std.testing.allocator;
+
+    var metrics = Metrics.init(allocator, true);
+    defer metrics.deinit();
+
+    metrics.recordQuery(300_000, 2, 10);
+
+    const output = try metrics.formatJson(allocator);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"max_duration_us\":300000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"duration_histogram\":{\"buckets\":{\"0.005\":0,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"0.25\":0,\"0.5\":1,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"+Inf\":1},\"sum_seconds\":0.300000,\"count\":1}}") != null);
+    try std.testing.expect(std.mem.endsWith(u8, output, "}}"));
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, output, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("duration_histogram").?.object.get("buckets").? == .object);
+}
+
+test "Duration histogram is disabled-safe" {
+    const allocator = std.testing.allocator;
+
+    var metrics = Metrics.init(allocator, false);
+    defer metrics.deinit();
+
+    metrics.recordDuration(300_000);
+    metrics.recordErrorWithDuration(300_000);
+    try std.testing.expectEqual(@as(u64, 0), metrics.duration_count);
+    try std.testing.expectEqual(@as(u64, 0), metrics.failed_queries);
 }
