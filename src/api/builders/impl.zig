@@ -29,6 +29,7 @@ const loaders = @import("../loaders.zig");
 const resolvers_mod = @import("../../storage/resolvers.zig");
 const registry_entries = @import("../../storage/registry_entries.zig");
 const admin = @import("../resolvers/admin.zig");
+const domain_resolvers = @import("../resolvers/domain.zig");
 const api_common = @import("../common.zig");
 const at_block_mod = @import("../../storage/at_block.zig");
 
@@ -703,6 +704,9 @@ fn accountRegistrationsHandler(ctx: *anyopaque, field: *const parser.Field, nest
     var arr = try jw.arrayOn(&json.writer);
     const start_idx: usize = @min(@as(usize, @intCast(page.skip)), registrations.len);
     const end_idx: usize = @min(start_idx + @as(usize, @intCast(page.first)), registrations.len);
+    // Same page priming as the top-level registrations list: one domains
+    // batch for the page's `domain { … }` instead of one lookup per row.
+    domain_resolvers.prefetchDomainsForEventPage(database, nested_ctx.allocator, nested_ctx.loaders, registrations[start_idx..end_idx], field.selections);
     for (registrations[start_idx..end_idx]) |*reg| {
         const reg_json = try buildRegistrationJson(reg, field.selections, .{
             .database = database,
@@ -1030,13 +1034,19 @@ fn resolverAddressesHandler(ctx: *anyopaque, field: *const parser.Field, nested_
     const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
-    const all_addresses = try database.getAddressRecords(rctx.resolver, rctx.namehash);
+    var owned: []resolvers_mod.CoinAddress = &.{};
     defer {
-        for (all_addresses) |*addr| {
-            addr.deinit(database.allocator);
-        }
-        database.allocator.free(all_addresses);
+        for (owned) |*addr| addr.deinit(database.allocator);
+        database.allocator.free(owned);
     }
+    const all_addresses: []const resolvers_mod.CoinAddress = blk: {
+        if (nested_ctx.loaders) |lp| {
+            const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+            if (lc.lookupAddressList(rctx.resolver, rctx.namehash)) |batched| break :blk batched;
+        }
+        owned = try database.getAddressRecords(rctx.resolver, rctx.namehash);
+        break :blk owned;
+    };
 
     var want_coin_type = false;
     var want_coin_type_big = false;
@@ -1306,6 +1316,17 @@ fn resolverPubkeyHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx
     const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
+    if (nested_ctx.loaders) |lp| {
+        const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+        if (lc.lookupPubkey(rctx.resolver, rctx.namehash)) |batched| {
+            const pubkey = batched orelse return try nested_ctx.allocator.dupe(u8, "null");
+            const escaped_x = try json_utils.escapeString(nested_ctx.allocator, pubkey.x);
+            defer nested_ctx.allocator.free(escaped_x);
+            const escaped_y = try json_utils.escapeString(nested_ctx.allocator, pubkey.y);
+            defer nested_ctx.allocator.free(escaped_y);
+            return try std.fmt.allocPrint(nested_ctx.allocator, "{{\"x\":\"{s}\",\"y\":\"{s}\"}}", .{ escaped_x, escaped_y });
+        }
+    }
     var pubkey_opt = try database.getPubkeyRecord(rctx.resolver, rctx.namehash);
     if (pubkey_opt) |*pubkey| {
         defer pubkey.deinit(database.allocator);
@@ -1325,8 +1346,16 @@ fn resolverAbisHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: 
     const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
-    const content_types = try database.getAbiContentTypes(rctx.resolver, rctx.namehash);
-    defer database.allocator.free(content_types);
+    var owned: []u64 = &.{};
+    defer database.allocator.free(owned);
+    const content_types: []const u64 = blk: {
+        if (nested_ctx.loaders) |lp| {
+            const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+            if (lc.lookupAbiList(rctx.resolver, rctx.namehash)) |batched| break :blk batched;
+        }
+        owned = try database.getAbiContentTypes(rctx.resolver, rctx.namehash);
+        break :blk owned;
+    };
 
     var json_buf: std.Io.Writer.Allocating = .init(nested_ctx.allocator);
     errdefer json_buf.deinit();
@@ -1343,6 +1372,15 @@ fn resolverReverseNameHandler(ctx: *anyopaque, field: *const parser.Field, neste
     const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
+    if (nested_ctx.loaders) |lp| {
+        const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+        if (lc.lookupReverseName(rctx.resolver, rctx.namehash)) |batched| {
+            const name_val = batched orelse return try nested_ctx.allocator.dupe(u8, "null");
+            const escaped = try json_utils.escapeString(nested_ctx.allocator, name_val);
+            defer nested_ctx.allocator.free(escaped);
+            return try std.fmt.allocPrint(nested_ctx.allocator, "\"{s}\"", .{escaped});
+        }
+    }
     if (try database.getReverseNameRecord(rctx.resolver, rctx.namehash)) |name_val| {
         defer database.allocator.free(name_val);
         const escaped = try json_utils.escapeString(nested_ctx.allocator, name_val);
@@ -1357,11 +1395,19 @@ fn resolverInterfacesHandler(ctx: *anyopaque, field: *const parser.Field, nested
     const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
-    const ifaces = try database.getInterfaceRecords(rctx.resolver, rctx.namehash);
+    var owned: []resolvers_mod.InterfaceRecord = &.{};
     defer {
-        for (ifaces) |*iface| iface.deinit(database.allocator);
-        database.allocator.free(ifaces);
+        for (owned) |*iface| iface.deinit(database.allocator);
+        database.allocator.free(owned);
     }
+    const ifaces: []const resolvers_mod.InterfaceRecord = blk: {
+        if (nested_ctx.loaders) |lp| {
+            const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+            if (lc.lookupInterfaceList(rctx.resolver, rctx.namehash)) |batched| break :blk batched;
+        }
+        owned = try database.getInterfaceRecords(rctx.resolver, rctx.namehash);
+        break :blk owned;
+    };
 
     var want_interface_id = false;
     var want_implementer = false;
@@ -1393,11 +1439,19 @@ fn resolverAliasesHandler(ctx: *anyopaque, field: *const parser.Field, nested_ct
     const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
-    const alias_records = try database.getResolverAliases(rctx.resolver);
+    var owned: []resolvers_mod.AliasRecord = &.{};
     defer {
-        for (alias_records) |*r| r.deinit(database.allocator);
-        database.allocator.free(alias_records);
+        for (owned) |*r| r.deinit(database.allocator);
+        database.allocator.free(owned);
     }
+    const alias_records: []const resolvers_mod.AliasRecord = blk: {
+        if (nested_ctx.loaders) |lp| {
+            const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+            if (lc.lookupAliasList(rctx.resolver)) |batched| break :blk batched;
+        }
+        owned = try database.getResolverAliases(rctx.resolver);
+        break :blk owned;
+    };
 
     var want_from = false;
     var want_to = false;
@@ -1430,6 +1484,13 @@ fn resolverVersionHandler(ctx: *anyopaque, field: *const parser.Field, nested_ct
     const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
+    if (nested_ctx.loaders) |lp| {
+        const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+        if (lc.lookupVersion(rctx.resolver, rctx.namehash)) |batched| {
+            const version = batched orelse return try nested_ctx.allocator.dupe(u8, "null");
+            return try std.fmt.allocPrint(nested_ctx.allocator, "{d}", .{version});
+        }
+    }
     if (try database.getNodeRecordVersion(rctx.resolver, rctx.namehash)) |version| {
         return try std.fmt.allocPrint(nested_ctx.allocator, "{d}", .{version});
     }
@@ -1559,7 +1620,7 @@ fn domainResolvedAddressHandler(ctx: *anyopaque, field: *const parser.Field, nes
     // At-block: inheritance skipped (would consult ancestors' CURRENT resolvers).
     var effective_resolver = domain.resolver;
     if (effective_resolver.isZero() and nested_ctx.at_block == null) {
-        effective_resolver = (try findInheritedResolver(database, domain)) orelse domain.resolver;
+        effective_resolver = (try inheritedResolverFor(database, nested_ctx.loaders, domain)) orelse domain.resolver;
     }
     if (effective_resolver.isZero()) {
         return try nested_ctx.allocator.dupe(u8, "null");
@@ -1607,8 +1668,8 @@ fn domainResolvedAddressHandler(ctx: *anyopaque, field: *const parser.Field, nes
 }
 
 /// Max ancestors to walk when resolving an inherited resolver (ENSIP-10).
-/// Bounds the parent_namehash chain traversal; real ENS names are far shallower.
-const MAX_RESOLVER_WALKUP: u8 = 64;
+/// Shared with the loader's memoized walk so both agree.
+const MAX_RESOLVER_WALKUP: u8 = loaders.MAX_RESOLVER_WALKUP;
 
 /// ENSIP-10 resolver inheritance: when a name has no resolver of its own, its
 /// effective resolver is the nearest ancestor that does (UniversalResolver
@@ -1631,13 +1692,30 @@ fn findInheritedResolver(database: *db.Database, domain: *const models.Name) any
     return null;
 }
 
+/// findInheritedResolver, served from the request loader's memo when the page
+/// prefetch walked this row already (one batched query per ancestor level for
+/// the whole page instead of one point query per hop per row); the point walk
+/// otherwise. Both return the same resolver.
+fn inheritedResolverFor(database: *db.Database, loaders_ptr: ?*anyopaque, domain: *const models.Name) anyerror!?Address {
+    if (loaders_ptr) |lp| {
+        const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+        if (lc.lookupInheritedResolver(domain)) |memoized| return memoized;
+    }
+    return findInheritedResolver(database, domain);
+}
+
 /// The resolver a domain's records are read under: its own resolver, or the
 /// nearest ancestor's (ENSIP-10 inheritance) when it has none. Public so the list
 /// resolvers can compute the batch key that matches domainResolverHandler /
 /// domainResolvedAddressHandler exactly.
 pub fn effectiveResolver(database: *db.Database, domain: *const models.Name) anyerror!Address {
+    return effectiveResolverWith(database, null, domain);
+}
+
+/// effectiveResolver with the request loader's memoized walk.
+pub fn effectiveResolverWith(database: *db.Database, loaders_ptr: ?*anyopaque, domain: *const models.Name) anyerror!Address {
     if (!domain.resolver.isZero()) return domain.resolver;
-    return (try findInheritedResolver(database, domain)) orelse domain.resolver;
+    return (try inheritedResolverFor(database, loaders_ptr, domain)) orelse domain.resolver;
 }
 
 /// Domain nested field handler: resolver
@@ -1650,7 +1728,7 @@ fn domainResolverHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx
         // (ancestor) resolver should surface that resolver and its records.
         // At-block: skipped — the walk-up would consult ancestors' CURRENT
         // resolvers, mixing history with the present.
-        effective_resolver = (try findInheritedResolver(database, domain)) orelse domain.resolver;
+        effective_resolver = (try inheritedResolverFor(database, nested_ctx.loaders, domain)) orelse domain.resolver;
     }
     if (!effective_resolver.isZero()) {
         return try buildResolverJson(effective_resolver, domain.namehash, domain.protocol, domain.name, field.selections, .{
@@ -1670,6 +1748,23 @@ fn domainParentHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: 
     const domain: *const models.Name = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
     if (!domain.parent_namehash.isZero()) {
+        // Page prefetch batches the parents (getNameByNamehash mirror: a
+        // namehash with several rows is never batched, so the point query
+        // below keeps its row-order pick).
+        if (nested_ctx.loaders) |lp| {
+            const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+            if (lc.lookupDomain(domain.parent_namehash)) |batched| {
+                const parent_row = batched orelse return try nested_ctx.allocator.dupe(u8, "null");
+                const row_copy = parent_row.*;
+                return try buildDomainJson(&row_copy, field.selections, .{
+                    .database = database,
+                    .depth = nested_ctx.depth + 1,
+                    .allocator = nested_ctx.allocator,
+                    .loaders = nested_ctx.loaders,
+                    .resolve = nested_ctx.resolve,
+                });
+            }
+        }
         const parent_opt = try database.getNameByNamehash(domain.parent_namehash);
         if (parent_opt) |parent| {
             var parent_mut = parent;
@@ -1694,9 +1789,29 @@ fn domainSubregistryHandler(ctx: *anyopaque, field: *const parser.Field, nested_
     const domain: *const models.Name = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
-    const sub = try registry_entries.getSubregistry(database, domain.protocol, domain.registry, domain.token_id);
+    var lc_opt: ?*loaders.LoaderContext = null;
+    if (nested_ctx.loaders) |lp| lc_opt = @ptrCast(@alignCast(lp));
+
+    const sub = blk: {
+        if (lc_opt) |lc| {
+            if (lc.lookupSubregistry(domain.protocol, domain.registry, domain.token_id)) |batched| break :blk batched;
+        }
+        break :blk try registry_entries.getSubregistry(database, domain.protocol, domain.registry, domain.token_id);
+    };
     if (sub.isZero()) return try nested_ctx.allocator.dupe(u8, "null");
 
+    if (lc_opt) |lc| {
+        if (lc.lookupRegistry(domain.protocol, sub)) |batched| {
+            const reg_row = batched orelse return try nested_ctx.allocator.dupe(u8, "null");
+            var reg_copy = reg_row.*;
+            return try admin.buildRegistryInfoJson(nested_ctx.allocator, database, &reg_copy, field.selections, .{
+                .allocator = nested_ctx.allocator,
+                .database = nested_ctx.database,
+                .loaders = nested_ctx.loaders,
+                .resolve = nested_ctx.resolve,
+            });
+        }
+    }
     const reg_opt = try database.getRegistry(domain.protocol, sub);
     if (reg_opt) |reg_val| {
         var reg = reg_val;
@@ -1723,11 +1838,20 @@ fn domainSubdomainsHandler(ctx: *anyopaque, field: *const parser.Field, nested_c
     var arr = try jw.arrayOn(&json.writer);
 
     if (domain.name) |parent_name| {
-        const subdomains = try database.getSubdomains(parent_name, page.skip, page.first);
+        // Page prefetch batches every parent's page for these exact args.
+        var owned: []models.Name = &.{};
         defer {
-            for (subdomains) |*n| n.deinit(database.allocator);
-            database.allocator.free(subdomains);
+            for (owned) |*n| n.deinit(database.allocator);
+            database.allocator.free(owned);
         }
+        const subdomains: []const models.Name = blk: {
+            if (nested_ctx.loaders) |lp| {
+                const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+                if (lc.lookupSubdomainPage(parent_name, page.skip, page.first)) |batched| break :blk batched;
+            }
+            owned = try database.getSubdomains(parent_name, page.skip, page.first);
+            break :blk owned;
+        };
 
         for (subdomains) |*subdomain| {
             const subdomain_json = try buildDomainJson(subdomain, field.selections, .{
@@ -2046,6 +2170,16 @@ fn domainFinalityHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx
     _ = field;
     const domain: *const models.Name = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+    // The two tiers are request-wide constants: read once per request.
+    if (nested_ctx.loaders) |lp| {
+        const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+        lc.populateFinality(database);
+        if (lc.lookupFinality()) |memo| {
+            const safe = memo.safe orelse return try nested_ctx.allocator.dupe(u8, "null");
+            const finalized = memo.finalized orelse return try nested_ctx.allocator.dupe(u8, "null");
+            return try nested_ctx.allocator.dupe(u8, finalityTier(domain.updated_block, safe.number, finalized.number));
+        }
+    }
     const safe = (try database.getFinality(database.chain_id, .safe)) orelse return try nested_ctx.allocator.dupe(u8, "null");
     const finalized = (try database.getFinality(database.chain_id, .finalized)) orelse return try nested_ctx.allocator.dupe(u8, "null");
     return try nested_ctx.allocator.dupe(u8, finalityTier(domain.updated_block, safe.number, finalized.number));
@@ -2067,6 +2201,12 @@ fn domainSubdomainsCountHandler(ctx: *anyopaque, field: *const parser.Field, nes
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
     if (domain.name) |parent_name| {
+        if (nested_ctx.loaders) |lp| {
+            const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+            if (lc.lookupSubdomainCount(parent_name)) |batched| {
+                return try std.fmt.allocPrint(nested_ctx.allocator, "{d}", .{batched});
+            }
+        }
         const count = try database.countDirectSubdomains(parent_name);
         return try std.fmt.allocPrint(nested_ctx.allocator, "{d}", .{count});
     }
@@ -2079,6 +2219,12 @@ fn domainEventsCountHandler(ctx: *anyopaque, field: *const parser.Field, nested_
     const domain: *const models.Name = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
+    if (nested_ctx.loaders) |lp| {
+        const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+        if (lc.lookupEventCount(domain.namehash)) |batched| {
+            return try std.fmt.allocPrint(nested_ctx.allocator, "{d}", .{batched});
+        }
+    }
     const count = try database.countEventsByNamehash(domain.namehash);
     return try std.fmt.allocPrint(nested_ctx.allocator, "{d}", .{count});
 }
@@ -2098,6 +2244,12 @@ fn domainRoleHolderCountHandler(ctx: *anyopaque, field: *const parser.Field, nes
     var canonical_id_buf: [66]u8 = undefined;
     const canonical_id_hex = std.fmt.bufPrint(&canonical_id_buf, "0x{x:0>64}", .{domain.canonical_id}) catch unreachable;
 
+    if (nested_ctx.loaders) |lp| {
+        const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+        if (lc.lookupRoleHolderCount(domain.protocol, canonical_id_hex, domain.registry)) |batched| {
+            return try std.fmt.allocPrint(nested_ctx.allocator, "{d}", .{batched});
+        }
+    }
     const count = try database.getLabelRoleHolderCount(domain.protocol, canonical_id_hex, domain.registry);
     return try std.fmt.allocPrint(nested_ctx.allocator, "{d}", .{count});
 }
@@ -2122,12 +2274,21 @@ fn domainSubdomainConnectionHandler(ctx: *anyopaque, field: *const parser.Field,
             }
         }
 
-        // Fetch one extra to determine hasNextPage
-        const subdomains = try database.getSubdomains(parent_name, 0, limit + 1);
+        // Fetch one extra to determine hasNextPage (page prefetch batches
+        // exactly this (0, limit + 1) page per parent).
+        var owned: []models.Name = &.{};
         defer {
-            for (subdomains) |*n| n.deinit(database.allocator);
-            database.allocator.free(subdomains);
+            for (owned) |*n| n.deinit(database.allocator);
+            database.allocator.free(owned);
         }
+        const subdomains: []const models.Name = blk: {
+            if (nested_ctx.loaders) |lp| {
+                const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+                if (lc.lookupSubdomainPage(parent_name, 0, limit + 1)) |batched| break :blk batched;
+            }
+            owned = try database.getSubdomains(parent_name, 0, limit + 1);
+            break :blk owned;
+        };
 
         const has_next = subdomains.len > limit;
         const actual_count = @min(subdomains.len, limit);
@@ -2147,7 +2308,13 @@ fn domainSubdomainConnectionHandler(ctx: *anyopaque, field: *const parser.Field,
 
         var root = try jw.objectOn(&json.writer);
         if (wants_total_count) {
-            const total_count = try database.countDirectSubdomains(parent_name);
+            const total_count: u32 = blk: {
+                if (nested_ctx.loaders) |lp| {
+                    const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+                    if (lc.lookupSubdomainCount(parent_name)) |batched| break :blk batched;
+                }
+                break :blk try database.countDirectSubdomains(parent_name);
+            };
             try root.fieldInt("totalCount", total_count);
         }
         {
@@ -2219,11 +2386,20 @@ fn domainEventsConnectionHandler(ctx: *anyopaque, field: *const parser.Field, ne
         .limit = limit + 1,
     };
 
-    const events = try database.getEventsFiltered(filter_opts);
+    // Page prefetch batches exactly this page shape per domain.
+    var owned: []models.Event = &.{};
     defer {
-        for (events) |*e| e.deinit(database.allocator);
-        database.allocator.free(events);
+        for (owned) |*e| e.deinit(database.allocator);
+        database.allocator.free(owned);
     }
+    const events: []const models.Event = blk: {
+        if (nested_ctx.loaders) |lp| {
+            const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+            if (lc.lookupDomainEvents(domain.namehash, loaders.LoaderContext.eventsPageKey(filter_opts))) |batched| break :blk batched;
+        }
+        owned = try database.getEventsFiltered(filter_opts);
+        break :blk owned;
+    };
 
     const has_next = events.len > limit;
     const actual_count = @min(events.len, limit);
@@ -2247,7 +2423,13 @@ fn domainEventsConnectionHandler(ctx: *anyopaque, field: *const parser.Field, ne
 
     var root = try jw.objectOn(&json.writer);
     if (wants_total_count) {
-        const total_count = try database.countEventsByNamehash(domain.namehash);
+        const total_count: u64 = blk: {
+            if (nested_ctx.loaders) |lp| {
+                const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+                if (lc.lookupEventCount(domain.namehash)) |batched| break :blk batched;
+            }
+            break :blk @intCast(try database.countEventsByNamehash(domain.namehash));
+        };
         try root.fieldInt("totalCount", total_count);
     }
     {

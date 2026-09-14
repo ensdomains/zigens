@@ -3,7 +3,11 @@
 //!   - events.getEventsForNamehashesPage vs getEventsFiltered(.namehash = X) — same
 //!     predicate tree, sort + tiebreak order and limit/skip window, per namehash;
 //!   - names.getDomainsByResolvers vs getDomainByResolver — the single reachable,
-//!     normalized, non-root row with the lowest namehash, per resolver.
+//!     normalized, non-root row with the lowest namehash, per resolver;
+//!   - names.countDirectSubdomainsForParents vs countDirectSubdomains — the
+//!     reachable, normalized, non-burned direct-child count, per parent;
+//!   - names.getSubdomainsForParentsPage vs getSubdomains — the same children
+//!     ordered by name, windowed by skip/first, per parent.
 //! Runs on SQLite (test-storage) and, via helpers.createTestDatabase, on Postgres
 //! (test-storage-pg) — the window-function SQL must behave identically on both.
 
@@ -384,7 +388,8 @@ test "getDomainsByResolvers: empty input, duplicates, and multi-chunk input" {
         defer allocator.free(batch);
         try testing.expectEqual(@as(usize, 0), batch.len);
     }
-    // A resolver listed twice is still one partition → one row.
+    // A single-row VALUES list, and a resolver listed twice still yields one row.
+    try expectDomainsMirrorPointQuery(allocator, db, &.{RES_MIXED});
     try expectDomainsMirrorPointQuery(allocator, db, &.{ RES_SHARED, RES_UNKNOWN, RES_SHARED });
 
     // 300 addresses → two IN-list statements with the seeded resolvers split across them.
@@ -404,4 +409,239 @@ test "getDomainsByResolvers: empty input, duplicates, and multi-chunk input" {
     // A resolver repeated across the chunk boundary still yields one row.
     many[250] = RES_SHARED;
     try expectDomainsMirrorPointQuery(allocator, db, &many);
+}
+
+// ============================================================================
+// countDirectSubdomainsForParents / getSubdomainsForParentsPage
+// ============================================================================
+
+const PARENT_ALPHA = "alpha.eth"; // four eligible children + burned/unreachable/unnormalized noise
+const PARENT_BETA = "beta.eth"; // three eligible children, one of them owner-zero with a live resolver
+const PARENT_GAMMA = "gamma.eth"; // one child
+const PARENT_EMPTY = "empty.eth"; // a name with no children
+const PARENT_UNKNOWN = "unknown.eth"; // not in names at all
+const RES_CHILD = nthAddress(0x61);
+
+fn childHash(n: u8) Hash {
+    var h = Hash{ .bytes = [_]u8{0} ** 32 };
+    h.bytes[0] = 0x0C;
+    h.bytes[31] = n;
+    return h;
+}
+
+fn fixtureChild(namehash: Hash, name_str: []const u8, parent: []const u8, owner: Address, resolver: Address, reachable: bool, normalized: bool) models.Name {
+    var n = fixtureName(namehash, name_str, resolver, reachable, normalized);
+    n.parent_name = parent;
+    n.owner = owner;
+    n.registrant = owner;
+    return n;
+}
+
+fn seedSubdomainFixtures(db: *Database) !void {
+    try db.insertName(fixtureName(childHash(0x01), PARENT_ALPHA, RES_CHILD, true, true));
+    try db.insertName(fixtureName(childHash(0x02), PARENT_BETA, RES_CHILD, true, true));
+    try db.insertName(fixtureName(childHash(0x03), PARENT_GAMMA, RES_CHILD, true, true));
+    try db.insertName(fixtureName(childHash(0x04), PARENT_EMPTY, RES_CHILD, true, true));
+
+    // Inserted out of name order so ORDER BY name is doing real work.
+    try db.insertName(fixtureChild(childHash(0x13), "c.alpha.eth", PARENT_ALPHA, OWNER, RES_CHILD, true, true));
+    try db.insertName(fixtureChild(childHash(0x11), "a.alpha.eth", PARENT_ALPHA, OWNER, RES_CHILD, true, true));
+    try db.insertName(fixtureChild(childHash(0x14), "d.alpha.eth", PARENT_ALPHA, OWNER, RES_CHILD, true, true));
+    try db.insertName(fixtureChild(childHash(0x12), "b.alpha.eth", PARENT_ALPHA, OWNER, RES_CHILD, true, true));
+    try db.insertName(fixtureChild(childHash(0x15), "burned.alpha.eth", PARENT_ALPHA, Address.zero, Address.zero, true, true));
+    try db.insertName(fixtureChild(childHash(0x16), "orphan.alpha.eth", PARENT_ALPHA, OWNER, RES_CHILD, false, true));
+    try db.insertName(fixtureChild(childHash(0x17), "unnormalized.alpha.eth", PARENT_ALPHA, OWNER, RES_CHILD, true, false));
+
+    try db.insertName(fixtureChild(childHash(0x22), "y.beta.eth", PARENT_BETA, OWNER, RES_CHILD, true, true));
+    try db.insertName(fixtureChild(childHash(0x21), "x.beta.eth", PARENT_BETA, OWNER, RES_CHILD, true, true));
+    try db.insertName(fixtureChild(childHash(0x23), "z.beta.eth", PARENT_BETA, Address.zero, RES_CHILD, true, true));
+
+    try db.insertName(fixtureChild(childHash(0x31), "only.gamma.eth", PARENT_GAMMA, OWNER, RES_CHILD, true, true));
+}
+
+fn expectCountsMirrorPointQuery(allocator: std.mem.Allocator, db: *Database, parents: []const []const u8) !void {
+    const batch = try names_storage.countDirectSubdomainsForParents(db, parents, allocator);
+    defer names_storage.freeParentCountRows(allocator, batch);
+
+    // GROUP BY parent_name per chunk + dedupe before chunking: a parent is
+    // counted in exactly one statement, so it appears at most once overall.
+    for (batch, 0..) |row, i| {
+        for (batch[0..i]) |earlier| try testing.expect(!std.mem.eql(u8, earlier.parent_name, row.parent_name));
+    }
+
+    var expected_rows: usize = 0;
+    var seen: std.ArrayList([]const u8) = .empty;
+    defer seen.deinit(allocator);
+    for (parents) |parent| {
+        var already = false;
+        for (seen.items) |p| {
+            if (std.mem.eql(u8, p, parent)) already = true;
+        }
+        if (already) continue;
+        try seen.append(allocator, parent);
+
+        const expected = try db.countDirectSubdomains(parent);
+        if (expected != 0) expected_rows += 1;
+
+        var matches: usize = 0;
+        for (batch) |row| {
+            if (!std.mem.eql(u8, row.parent_name, parent)) continue;
+            matches += 1;
+            try testing.expectEqual(expected, row.count);
+        }
+        try testing.expectEqual(@as(usize, if (expected != 0) 1 else 0), matches);
+    }
+    try testing.expectEqual(expected_rows, batch.len);
+}
+
+test "countDirectSubdomainsForParents mirrors countDirectSubdomains per parent" {
+    const allocator = testing.allocator;
+    const db = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, db);
+    try seedSubdomainFixtures(db);
+
+    const parents = [_][]const u8{ PARENT_ALPHA, PARENT_BETA, PARENT_GAMMA, PARENT_EMPTY, PARENT_UNKNOWN, PARENT_ALPHA };
+    try expectCountsMirrorPointQuery(allocator, db, &parents);
+
+    // Spot-check the GC + visibility filters directly: burned, unreachable and
+    // unnormalized children are excluded; an owner-zero child with a live
+    // resolver is not burned.
+    const batch = try names_storage.countDirectSubdomainsForParents(db, &parents, allocator);
+    defer names_storage.freeParentCountRows(allocator, batch);
+    try testing.expectEqual(@as(usize, 3), batch.len);
+    try testing.expectEqualStrings(PARENT_ALPHA, batch[0].parent_name);
+    try testing.expectEqual(@as(u32, 4), batch[0].count);
+    try testing.expectEqualStrings(PARENT_BETA, batch[1].parent_name);
+    try testing.expectEqual(@as(u32, 3), batch[1].count);
+    try testing.expectEqualStrings(PARENT_GAMMA, batch[2].parent_name);
+    try testing.expectEqual(@as(u32, 1), batch[2].count);
+
+    {
+        const empty = try names_storage.countDirectSubdomainsForParents(db, &.{}, allocator);
+        defer names_storage.freeParentCountRows(allocator, empty);
+        try testing.expectEqual(@as(usize, 0), empty.len);
+    }
+    {
+        const none = try names_storage.countDirectSubdomainsForParents(db, &.{ PARENT_EMPTY, PARENT_UNKNOWN }, allocator);
+        defer names_storage.freeParentCountRows(allocator, none);
+        try testing.expectEqual(@as(usize, 0), none.len);
+    }
+}
+
+/// Every row in `batch` whose parent_name is `parent`, in batch order.
+fn collectForParent(allocator: std.mem.Allocator, batch: []const models.Name, parent: []const u8) ![]const models.Name {
+    var out: std.ArrayList(models.Name) = .empty;
+    errdefer out.deinit(allocator);
+    for (batch) |row| {
+        if (std.mem.eql(u8, row.parent_name.?, parent)) try out.append(allocator, row);
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Each parent must occupy one contiguous run of the batch (ORDER BY parent_name, rn).
+fn expectGroupedByParent(batch: []const models.Name) !void {
+    var i: usize = 0;
+    while (i < batch.len) : (i += 1) {
+        const parent = batch[i].parent_name.?;
+        if (i > 0 and std.mem.eql(u8, batch[i - 1].parent_name.?, parent)) continue;
+        var j: usize = 0;
+        while (j < i) : (j += 1) try testing.expect(!std.mem.eql(u8, batch[j].parent_name.?, parent));
+    }
+}
+
+fn expectSubdomainPageMirrorsPointQuery(allocator: std.mem.Allocator, db: *Database, parents: []const []const u8, skip: u32, first: u32) !void {
+    const batch = try names_storage.getSubdomainsForParentsPage(db, parents, skip, first, allocator);
+    defer {
+        for (batch) |*n| n.deinit(allocator);
+        allocator.free(batch);
+    }
+    try expectGroupedByParent(batch);
+
+    var expected_total: usize = 0;
+    var seen: std.ArrayList([]const u8) = .empty;
+    defer seen.deinit(allocator);
+    for (parents) |parent| {
+        var already = false;
+        for (seen.items) |p| {
+            if (std.mem.eql(u8, p, parent)) already = true;
+        }
+        if (already) continue;
+        try seen.append(allocator, parent);
+
+        const expected = try db.getSubdomains(parent, skip, first);
+        defer {
+            for (expected) |*n| n.deinit(db.allocator);
+            db.allocator.free(expected);
+        }
+        const actual = try collectForParent(allocator, batch, parent);
+        defer allocator.free(actual);
+
+        try testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |e, a| {
+            try testing.expect(e.namehash.eql(a.namehash));
+            try testing.expectEqualStrings(e.name.?, a.name.?);
+            try testing.expectEqualStrings(e.parent_name.?, a.parent_name.?);
+            try testing.expect(e.owner.eql(a.owner));
+            try testing.expect(e.resolver.eql(a.resolver));
+            try testing.expectEqual(e.is_reachable, a.is_reachable);
+            try testing.expectEqual(e.is_normalized, a.is_normalized);
+        }
+        expected_total += expected.len;
+    }
+    try testing.expectEqual(expected_total, batch.len);
+}
+
+test "getSubdomainsForParentsPage mirrors getSubdomains per parent across windows" {
+    const allocator = testing.allocator;
+    const db = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, db);
+    try seedSubdomainFixtures(db);
+
+    // A parent with no subdomains, an unknown one and a duplicated one are all in the input.
+    const parents = [_][]const u8{ PARENT_ALPHA, PARENT_BETA, PARENT_GAMMA, PARENT_EMPTY, PARENT_UNKNOWN, PARENT_ALPHA };
+    const windows = [_][2]u32{ .{ 0, 2 }, .{ 1, 2 }, .{ 0, 10 }, .{ 3, 2 }, .{ 2, 1 }, .{ 0, 0 }, .{ 9, 5 } };
+    for (windows) |w| try expectSubdomainPageMirrorsPointQuery(allocator, db, &parents, w[0], w[1]);
+
+    // Spot-check the page shape: skip 1 / first 2 by name.
+    const batch = try names_storage.getSubdomainsForParentsPage(db, &parents, 1, 2, allocator);
+    defer {
+        for (batch) |*n| n.deinit(allocator);
+        allocator.free(batch);
+    }
+    try testing.expectEqual(@as(usize, 4), batch.len);
+    try testing.expectEqualStrings("b.alpha.eth", batch[0].name.?);
+    try testing.expectEqualStrings("c.alpha.eth", batch[1].name.?);
+    try testing.expectEqualStrings("y.beta.eth", batch[2].name.?);
+    try testing.expectEqualStrings("z.beta.eth", batch[3].name.?);
+
+    {
+        const empty = try names_storage.getSubdomainsForParentsPage(db, &.{}, 0, 10, allocator);
+        defer allocator.free(empty);
+        try testing.expectEqual(@as(usize, 0), empty.len);
+    }
+}
+
+test "subdomain parent batches: multi-chunk input with parents straddling the chunk boundary" {
+    const allocator = testing.allocator;
+    const db = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, db);
+    try seedSubdomainFixtures(db);
+
+    // 250 parents → two IN-list statements; the seeded ones sit in different
+    // chunks, one is repeated across the boundary, the rest are absent.
+    var many: [250][]const u8 = undefined;
+    var name_bufs: [250][16]u8 = undefined;
+    for (&many, 0..) |*p, i| {
+        p.* = try std.fmt.bufPrint(&name_bufs[i], "p{d}.eth", .{i});
+    }
+    many[0] = PARENT_ALPHA;
+    many[199] = PARENT_GAMMA;
+    many[200] = PARENT_BETA;
+    many[210] = PARENT_ALPHA;
+    many[249] = PARENT_EMPTY;
+
+    try expectCountsMirrorPointQuery(allocator, db, &many);
+    try expectSubdomainPageMirrorsPointQuery(allocator, db, &many, 0, 2);
+    try expectSubdomainPageMirrorsPointQuery(allocator, db, &many, 1, 2);
+    try expectSubdomainPageMirrorsPointQuery(allocator, db, &many, 0, 10);
 }

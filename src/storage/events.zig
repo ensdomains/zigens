@@ -1065,6 +1065,66 @@ pub fn countEventsByNamehash(db: *Database, namehash: Hash) !usize {
     return 0;
 }
 
+/// One `(namehash, event count)` row from `countEventsForNamehashes`.
+pub const NamehashCountRow = struct {
+    namehash: Hash,
+    count: u64,
+};
+
+/// Batched mirror of `countEventsByNamehash`: one row per namehash that has at
+/// least one event — the same bare `namehash = ?` predicate (no protocol
+/// filter), grouped, ordered by namehash. Namehashes with no events are absent
+/// (the point read answers 0). Duplicates are collapsed before chunking; one
+/// statement per chunk of EVENT_PAGE_CHUNK namehashes with arena-static hex
+/// binds. The returned slice is allocated with `allocator` (rows hold no
+/// strings); release with `allocator.free`.
+pub fn countEventsForNamehashes(db: *Database, namehashes: []const Hash, allocator: std.mem.Allocator) ![]NamehashCountRow {
+    var out: std.ArrayList(NamehashCountRow) = .empty;
+    errdefer out.deinit(allocator);
+    if (namehashes.len == 0) return try out.toOwnedSlice(allocator);
+
+    var seen = std.AutoHashMap(Hash, void).init(db.allocator);
+    defer seen.deinit();
+    var unique: std.ArrayList(Hash) = .empty;
+    defer unique.deinit(db.allocator);
+    for (namehashes) |nh| {
+        const gop = try seen.getOrPut(nh);
+        if (!gop.found_existing) try unique.append(db.allocator, nh);
+    }
+
+    var start: usize = 0;
+    while (start < unique.items.len) {
+        const chunk = unique.items[start..@min(start + EVENT_PAGE_CHUNK, unique.items.len)];
+        start += chunk.len;
+
+        // Declared before the Query so its hex strings outlive step (LIFO defers).
+        var scratch = std.heap.ArenaAllocator.init(db.allocator);
+        defer scratch.deinit();
+        const scratch_alloc = scratch.allocator();
+
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.appendSlice(scratch_alloc, "SELECT namehash, COUNT(*) FROM events WHERE namehash IN (");
+        for (chunk, 0..) |_, i| {
+            if (i != 0) try sql.append(scratch_alloc, ',');
+            try sql.append(scratch_alloc, '?');
+        }
+        try sql.appendSlice(scratch_alloc, ") GROUP BY namehash ORDER BY namehash");
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        for (chunk) |nh| {
+            const buf = try scratch_alloc.create([66]u8);
+            try q.bindTextStatic(nh.toHexBuf(buf));
+        }
+        while (try q.step()) {
+            const nh = (try q.getHash(0)) orelse continue;
+            try out.append(allocator, .{ .namehash = nh, .count = @intCast(q.getInt64(1)) });
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
 // ============================================================================
 // TESTS
 // ============================================================================

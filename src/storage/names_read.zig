@@ -11,6 +11,7 @@ const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
 const names_common = @import("names_common.zig");
+const unicode = @import("../utils/unicode.zig");
 const parseU256Hex = names_common.parseU256Hex;
 const formatU256HexBuf = names_common.formatU256HexBuf;
 
@@ -32,18 +33,6 @@ const SQL_SELECT_NAMES =
     \\FROM names
 ;
 
-/// SQL_SELECT_NAMES's column list plus a per-resolver rank (namehash ASC) as a
-/// trailing column, derived at comptime so the two lists cannot drift: a
-/// `SELECT * FROM (…) t` over it still parses with parseNameRow (indices 0..32).
-/// Backs the batched getDomainByResolver mirror.
-const SQL_SELECT_NAMES_FROM = "\nFROM names";
-const SQL_SELECT_NAMES_RANKED_BY_RESOLVER = blk: {
-    std.debug.assert(std.mem.endsWith(u8, SQL_SELECT_NAMES, SQL_SELECT_NAMES_FROM));
-    break :blk SQL_SELECT_NAMES[0 .. SQL_SELECT_NAMES.len - SQL_SELECT_NAMES_FROM.len] ++
-        ",\n       ROW_NUMBER() OVER (PARTITION BY resolver ORDER BY namehash ASC) AS rn" ++
-        SQL_SELECT_NAMES_FROM;
-};
-
 /// Shorter SELECT for queries that don't need wrapper fields (27 columns).
 /// Still includes is_reachable/unreachable_since/ttl so callers can honor
 /// reachability filtering and serialize the flag.
@@ -54,6 +43,40 @@ const SQL_SELECT_NAMES_SHORT =
     \\       is_reachable, unreachable_since, ttl, is_legacy, resolved_address, is_normalized, is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash
     \\FROM names
 ;
+
+/// SQL_SELECT_NAMES_SHORT's column list plus a per-parent rank (name ASC, the
+/// getSubdomains order) as a trailing column, derived at comptime so the two
+/// lists cannot drift: a `SELECT * FROM (…) t` over it still parses with
+/// parseNameRowShort (indices 0..32). Backs the batched getSubdomains mirror.
+const SQL_SELECT_NAMES_FROM = "\nFROM names";
+const SQL_SELECT_NAMES_SHORT_RANKED_BY_PARENT = blk: {
+    std.debug.assert(std.mem.endsWith(u8, SQL_SELECT_NAMES_SHORT, SQL_SELECT_NAMES_FROM));
+    break :blk SQL_SELECT_NAMES_SHORT[0 .. SQL_SELECT_NAMES_SHORT.len - SQL_SELECT_NAMES_FROM.len] ++
+        ",\n       ROW_NUMBER() OVER (PARTITION BY parent_name ORDER BY name, protocol) AS rn" ++
+        SQL_SELECT_NAMES_FROM;
+};
+
+const ROOT_NAMEHASH_HEX: []const u8 = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+/// IN-list / VALUES width per statement for the batched page readers.
+const BATCH_CHUNK = 200;
+
+/// Arena-owned copy of a caller string in the exact form bindText would send
+/// (UTF-8-sanitized), for a static bind: long key lists must bypass the
+/// per-statement tracked-copy cap.
+fn arenaBindCopy(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    const clean = try unicode.sanitizeUtf8(arena, s);
+    return if (clean.ptr == s.ptr) try arena.dupe(u8, s) else clean;
+}
+
+/// Append `n` comma-separated `?` placeholders wrapped as `(?),(?),…` VALUES rows
+/// (`row_values = true`) or a bare `?,?,…` IN-list (`row_values = false`).
+fn appendPlaceholders(sql: *std.ArrayList(u8), arena: std.mem.Allocator, n: usize, row_values: bool) !void {
+    for (0..n) |i| {
+        if (i != 0) try sql.append(arena, ',');
+        try sql.appendSlice(arena, if (row_values) "(?)" else "?");
+    }
+}
 
 /// Format a u256 as hex string with 0x prefix
 fn formatU256Hex(allocator: std.mem.Allocator, value: u256) ![]u8 {
@@ -635,10 +658,12 @@ pub fn getDomainByResolver(db: *Database, resolver: Address) !?models.Name {
 
 /// Batched mirror of getDomainByResolver over many resolvers: for each resolver
 /// address, the single row the point query would return (reachable, normalized,
-/// non-root, first by namehash ASC), replicated per resolver via ROW_NUMBER over
-/// the same WHERE. Resolvers with no such row contribute nothing. Chunks of 200
-/// with arena-static address binds (no tracked-copy cap). Rows and the returned
-/// slice are allocated with `allocator`.
+/// non-root, first by namehash ASC). The resolver list is a VALUES CTE and each
+/// resolver's pick is a scalar subquery over the same WHERE — on the
+/// (resolver, namehash) index that stops at its first entry — whose result
+/// keys the outer row-value IN probe. Resolvers with no such row contribute
+/// nothing. Chunks of 200 with arena-static address binds (no tracked-copy
+/// cap). Rows and the returned slice are allocated with `allocator`.
 pub fn getDomainsByResolvers(db: *Database, resolvers: []const Address, allocator: std.mem.Allocator) ![]models.Name {
     try db.namesBarrier();
     var out: std.ArrayList(models.Name) = .empty;
@@ -648,7 +673,7 @@ pub fn getDomainsByResolvers(db: *Database, resolvers: []const Address, allocato
     }
 
     // Duplicates yield one row: dedupe before chunking so a resolver repeated
-    // across chunk boundaries is not ranked (and returned) once per chunk.
+    // across chunk boundaries is not picked (and returned) once per chunk.
     var seen = std.AutoHashMap([20]u8, void).init(db.allocator);
     defer seen.deinit();
     var unique: std.ArrayList(Address) = .empty;
@@ -658,22 +683,18 @@ pub fn getDomainsByResolvers(db: *Database, resolvers: []const Address, allocato
         if (!gop.found_existing) try unique.append(db.allocator, r);
     }
 
-    const CHUNK = 200;
     var start: usize = 0;
     while (start < unique.items.len) {
-        const chunk = unique.items[start..@min(start + CHUNK, unique.items.len)];
+        const chunk = unique.items[start..@min(start + BATCH_CHUNK, unique.items.len)];
         start += chunk.len;
 
         var scratch = std.heap.ArenaAllocator.init(db.allocator);
         defer scratch.deinit();
 
         var sql: std.ArrayList(u8) = .empty;
-        try sql.appendSlice(scratch.allocator(), "SELECT * FROM (" ++ SQL_SELECT_NAMES_RANKED_BY_RESOLVER ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND resolver IN (");
-        for (chunk, 0..) |_, i| {
-            if (i != 0) try sql.append(scratch.allocator(), ',');
-            try sql.append(scratch.allocator(), '?');
-        }
-        try sql.appendSlice(scratch.allocator(), ") AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000') t WHERE rn = 1");
+        try sql.appendSlice(scratch.allocator(), "WITH v(addr) AS (VALUES ");
+        try appendPlaceholders(&sql, scratch.allocator(), chunk.len, true);
+        try sql.appendSlice(scratch.allocator(), ") " ++ SQL_SELECT_NAMES ++ " n WHERE n.is_reachable = 1 AND n.is_normalized = 1 AND (n.resolver, n.namehash) IN (SELECT v.addr, (SELECT m.namehash FROM names m WHERE m.resolver = v.addr AND m.is_reachable = 1 AND m.is_normalized = 1 AND m.namehash != '" ++ ROOT_NAMEHASH_HEX ++ "' ORDER BY m.namehash ASC LIMIT 1) FROM v)");
 
         var q = try Query.init(db, sql.items);
         defer q.deinit();
@@ -721,6 +742,68 @@ pub fn countDirectSubdomains(db: *Database, parent_name: []const u8) !u32 {
     return 0;
 }
 
+pub const ParentCountRow = struct { parent_name: []u8, count: u32 };
+
+pub fn freeParentCountRows(allocator: std.mem.Allocator, rows: []ParentCountRow) void {
+    for (rows) |row| allocator.free(row.parent_name);
+    allocator.free(rows);
+}
+
+/// Batched mirror of countDirectSubdomains over many parents: one GROUP BY
+/// statement per chunk of 200 (deduped) parent names, same WHERE as the point
+/// query, rows ordered by parent_name. Parents with no counted child are
+/// absent (the caller reads absent as 0). Names are bound statically from an
+/// arena copy so long lists escape the tracked-copy cap. Rows (and each
+/// parent_name) are allocated with `allocator`; release via freeParentCountRows.
+pub fn countDirectSubdomainsForParents(db: *Database, parent_names: []const []const u8, allocator: std.mem.Allocator) ![]ParentCountRow {
+    try db.namesBarrier();
+    var out: std.ArrayList(ParentCountRow) = .empty;
+    errdefer {
+        for (out.items) |row| allocator.free(row.parent_name);
+        out.deinit(allocator);
+    }
+
+    var unique: std.ArrayList([]const u8) = .empty;
+    defer unique.deinit(db.allocator);
+    try dedupeStrings(db.allocator, parent_names, &unique);
+
+    var start: usize = 0;
+    while (start < unique.items.len) {
+        const chunk = unique.items[start..@min(start + BATCH_CHUNK, unique.items.len)];
+        start += chunk.len;
+
+        var scratch = std.heap.ArenaAllocator.init(db.allocator);
+        defer scratch.deinit();
+
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.appendSlice(scratch.allocator(), "SELECT parent_name, COUNT(*) FROM names WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name IN (");
+        try appendPlaceholders(&sql, scratch.allocator(), chunk.len, false);
+        try sql.appendSlice(scratch.allocator(), ")" ++ SUBDOMAIN_GC_FILTER ++ " GROUP BY parent_name ORDER BY parent_name");
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        for (chunk) |parent| try q.bindTextStatic(try arenaBindCopy(scratch.allocator(), parent));
+        while (try q.step()) {
+            const parent_name = try allocator.dupe(u8, q.getTextSlice(0) orelse "");
+            errdefer allocator.free(parent_name);
+            try out.append(allocator, .{ .parent_name = parent_name, .count = @intCast(q.getInt64(1)) });
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+/// First occurrence of each distinct string in `input`, in input order (the
+/// slices are borrowed, not copied).
+fn dedupeStrings(allocator: std.mem.Allocator, input: []const []const u8, unique: *std.ArrayList([]const u8)) !void {
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+    for (input) |s| {
+        const gop = try seen.getOrPut(s);
+        if (!gop.found_existing) try unique.append(allocator, s);
+    }
+}
+
 /// Check if a name has any direct subdomains (reachable + non-burned).
 pub fn hasDirectSubdomains(db: *Database, parent_name: []const u8) !bool {
     try db.namesBarrier();
@@ -739,7 +822,7 @@ pub fn hasDirectSubdomains(db: *Database, parent_name: []const u8) !bool {
 /// requires direct namehash lookup).
 pub fn getSubdomains(db: *Database, parent_name_arg: []const u8, skip: u32, limit: u32) ![]models.Name {
     try db.namesBarrier();
-    var q = try Query.initCached(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER ++ " ORDER BY name LIMIT ? OFFSET ?");
+    var q = try Query.initCached(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER ++ " ORDER BY name, protocol LIMIT ? OFFSET ?");
     defer q.deinit();
 
     try q.bindText(parent_name_arg);
@@ -759,4 +842,75 @@ pub fn getSubdomains(db: *Database, parent_name_arg: []const u8, skip: u32, limi
     }
 
     return names.toOwnedSlice(db.allocator);
+}
+
+/// Batched mirror of getSubdomains over many parents: per parent, the window
+/// `skip < rank <= skip + first` of its direct subdomains ranked by name (the
+/// point query's ORDER BY name LIMIT first OFFSET skip), same WHERE and GC
+/// filter, one statement per chunk of 200 (deduped) parent names. Rows arrive
+/// ordered by parent_name then rank, so each parent's page is one contiguous
+/// run in page order; parents with no subdomains contribute nothing. Names
+/// are bound statically from an arena copy. Rows and the returned slice are
+/// allocated with `allocator`.
+pub fn getSubdomainsForParentsPage(db: *Database, parent_names: []const []const u8, skip: u32, first: u32, allocator: std.mem.Allocator) ![]models.Name {
+    try db.namesBarrier();
+    var out: std.ArrayList(models.Name) = .empty;
+    errdefer {
+        for (out.items) |*n| n.deinit(allocator);
+        out.deinit(allocator);
+    }
+
+    var unique: std.ArrayList([]const u8) = .empty;
+    defer unique.deinit(db.allocator);
+    try dedupeStrings(db.allocator, parent_names, &unique);
+
+    const rank_lo: i64 = skip;
+    const rank_hi: i64 = @as(i64, skip) + first;
+
+    var start: usize = 0;
+    while (start < unique.items.len) {
+        const chunk = unique.items[start..@min(start + BATCH_CHUNK, unique.items.len)];
+        start += chunk.len;
+
+        var scratch = std.heap.ArenaAllocator.init(db.allocator);
+        defer scratch.deinit();
+
+        var sql: std.ArrayList(u8) = .empty;
+        var q: Query = undefined;
+        if (db.isPostgres()) {
+            // One LATERAL page per parent: Postgres plans each exactly like
+            // the point query (name index, LIMIT pushdown), so a parent with
+            // millions of children costs what getSubdomains costs, not a
+            // sort of every child. Rows arrive grouped per parent in page
+            // order, like the windowed form below.
+            try sql.appendSlice(scratch.allocator(), "WITH v(p) AS (VALUES ");
+            for (chunk, 0..) |_, i| {
+                if (i != 0) try sql.append(scratch.allocator(), ',');
+                try sql.appendSlice(scratch.allocator(), "(?)");
+            }
+            try sql.appendSlice(scratch.allocator(), ") SELECT n.* FROM v CROSS JOIN LATERAL (" ++ SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name = v.p" ++ SUBDOMAIN_GC_FILTER ++ " ORDER BY name, protocol LIMIT ? OFFSET ?) n");
+            q = try Query.init(db, sql.items);
+            errdefer q.deinit();
+            for (chunk) |parent| try q.bindTextStatic(try arenaBindCopy(scratch.allocator(), parent));
+            try q.bindInt64(@intCast(first));
+            try q.bindInt64(@intCast(skip));
+        } else {
+            try sql.appendSlice(scratch.allocator(), "SELECT * FROM (" ++ SQL_SELECT_NAMES_SHORT_RANKED_BY_PARENT ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name IN (");
+            try appendPlaceholders(&sql, scratch.allocator(), chunk.len, false);
+            try sql.appendSlice(scratch.allocator(), ")" ++ SUBDOMAIN_GC_FILTER ++ ") t WHERE rn > ? AND rn <= ? ORDER BY parent_name, rn");
+            q = try Query.init(db, sql.items);
+            errdefer q.deinit();
+            for (chunk) |parent| try q.bindTextStatic(try arenaBindCopy(scratch.allocator(), parent));
+            try q.bindInt64(rank_lo);
+            try q.bindInt64(rank_hi);
+        }
+        defer q.deinit();
+        while (try q.step()) {
+            var row = try parseNameRowShort(&q, allocator);
+            errdefer row.deinit(allocator);
+            try out.append(allocator, row);
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
 }

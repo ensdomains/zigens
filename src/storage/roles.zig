@@ -601,6 +601,135 @@ pub fn getLabelRoleHolderCount(
     return 0;
 }
 
+/// One `(canonical_id, registry) -> distinct holder count` row from
+/// `getLabelRoleHolderCountsForLabels`. `canonical_id` is the caller's input
+/// spelling echoed back verbatim (the batch key); `registry` is the stored
+/// 0x-hex address. Both strings are owned by the allocator the read was given;
+/// free via `freeLabelRoleHolderCountRows`.
+pub const LabelRoleHolderCountRow = struct {
+    canonical_id: []u8,
+    registry: []u8,
+    count: u64,
+};
+
+pub fn freeLabelRoleHolderCountRows(allocator: std.mem.Allocator, rows: []LabelRoleHolderCountRow) void {
+    for (rows) |r| {
+        allocator.free(r.canonical_id);
+        allocator.free(r.registry);
+    }
+    allocator.free(rows);
+}
+
+/// Pairs per statement of the batch holder count. Each pair is four
+/// arena-static binds (no tracked-copy cap), so the chunk is sized for
+/// statement length: 200 pairs = 800 placeholders plus three fixed ones, under
+/// the legacy SQLite 999-parameter floor.
+const LABEL_HOLDER_BATCH_CHUNK: usize = 200;
+
+/// Batched mirror of `getLabelRoleHolderCount` over many `(canonical_id_hex,
+/// registry)` pairs: `canonical_id_hexes[i]` pairs with `registries[i]` (both
+/// the same length). Per pair it takes the point read's exact range
+/// (`lo` = padded canonical spelling, `hi` = its 58-char prefix + 'ffffffff'),
+/// keeps only rows at the MAX resource inside that range for (protocol,
+/// registry), and counts DISTINCT accounts whose bitmap is not all-zero —
+/// one statement per chunk of LABEL_HOLDER_BATCH_CHUNK pairs, via a VALUES
+/// CTE joined to eac_roles twice (range max, then holders at the max).
+/// Ordered by (canonical_id, registry). Pairs that yield zero are absent (no
+/// row in range, or every row at the max resource has a zero bitmap) — the
+/// point read answers 0 for them, as it does for a canonical id that does not
+/// parse (`ResourceForms.of` null), which is skipped here. Duplicate pairs are
+/// collapsed before chunking; two spellings of one canonical id are distinct
+/// keys that each echo their own input. Rows and the returned slice are
+/// allocated with `allocator`; free via `freeLabelRoleHolderCountRows`.
+pub fn getLabelRoleHolderCountsForLabels(
+    db: *Database,
+    protocol: models.Protocol,
+    canonical_id_hexes: []const []const u8,
+    registries: []const Address,
+    allocator: std.mem.Allocator,
+) ![]LabelRoleHolderCountRow {
+    std.debug.assert(canonical_id_hexes.len == registries.len);
+    var rows: std.ArrayList(LabelRoleHolderCountRow) = .empty;
+    errdefer {
+        for (rows.items) |r| {
+            allocator.free(r.canonical_id);
+            allocator.free(r.registry);
+        }
+        rows.deinit(allocator);
+    }
+    if (canonical_id_hexes.len == 0) return try rows.toOwnedSlice(allocator);
+
+    const Pair = struct { canonical_id_hex: []const u8, registry: Address, forms: ResourceForms };
+    // Dedupe keys (input spelling + registry hex) live here for the whole call.
+    var key_arena = std.heap.ArenaAllocator.init(db.allocator);
+    defer key_arena.deinit();
+    var seen = std.StringHashMap(void).init(db.allocator);
+    defer seen.deinit();
+    var unique: std.ArrayList(Pair) = .empty;
+    defer unique.deinit(db.allocator);
+    for (canonical_id_hexes, registries) |canonical_id_hex, registry| {
+        const forms = ResourceForms.of(canonical_id_hex) orelse continue;
+        var registry_buf: [42]u8 = undefined;
+        const key = try std.mem.concat(key_arena.allocator(), u8, &.{ canonical_id_hex, "|", registry.toHexBuf(&registry_buf) });
+        const gop = try seen.getOrPut(key);
+        if (gop.found_existing) continue;
+        try unique.append(db.allocator, .{ .canonical_id_hex = canonical_id_hex, .registry = registry, .forms = forms });
+    }
+
+    var off: usize = 0;
+    while (off < unique.items.len) : (off += LABEL_HOLDER_BATCH_CHUNK) {
+        const end = @min(off + LABEL_HOLDER_BATCH_CHUNK, unique.items.len);
+        const chunk = unique.items[off..end];
+
+        // Declared before the Query so the bound strings outlive step (LIFO defers).
+        var scratch = std.heap.ArenaAllocator.init(db.allocator);
+        defer scratch.deinit();
+        const scratch_alloc = scratch.allocator();
+
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.appendSlice(scratch_alloc, "WITH v(cid, lo, hi, registry) AS (VALUES ");
+        for (chunk, 0..) |_, i| {
+            if (i != 0) try sql.appendSlice(scratch_alloc, ", ");
+            try sql.appendSlice(scratch_alloc, "(?, ?, ?, ?)");
+        }
+        try sql.appendSlice(scratch_alloc, "), " ++
+            "m AS (SELECT v.cid, v.registry, MAX(e.resource) AS maxres FROM v JOIN eac_roles e " ++
+            "ON e.protocol = ? AND e.contract_address = v.registry AND e.resource >= v.lo AND e.resource <= v.hi " ++
+            "GROUP BY v.cid, v.registry) " ++
+            "SELECT m.cid, m.registry, COUNT(DISTINCT e.account) FROM m JOIN eac_roles e " ++
+            "ON e.protocol = ? AND e.contract_address = m.registry AND e.resource = m.maxres AND e.role_bitmap != ? " ++
+            "GROUP BY m.cid, m.registry ORDER BY m.cid, m.registry");
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        for (chunk) |pair| {
+            try q.bindTextStatic(pair.canonical_id_hex);
+            const lo = try scratch_alloc.dupe(u8, pair.forms.padded[0..pair.forms.padded_len]);
+            try q.bindTextStatic(lo);
+            const hi = try scratch_alloc.create([66]u8);
+            @memcpy(hi[0..58], pair.forms.padded[0..58]);
+            @memcpy(hi[58..66], "ffffffff");
+            try q.bindTextStatic(hi);
+            const registry_buf = try scratch_alloc.create([42]u8);
+            try q.bindTextStatic(pair.registry.toHexBuf(registry_buf));
+        }
+        try q.bindTextStatic(protocol.toString());
+        try q.bindTextStatic(protocol.toString());
+        try q.bindTextStatic(ZERO_ROLE_BITMAP);
+
+        while (try q.step()) {
+            const cid_str = q.getTextSlice(0) orelse continue;
+            const registry_str = q.getTextSlice(1) orelse continue;
+            const canonical_id = try allocator.dupe(u8, cid_str);
+            errdefer allocator.free(canonical_id);
+            const registry = try allocator.dupe(u8, registry_str);
+            errdefer allocator.free(registry);
+            try rows.append(allocator, .{ .canonical_id = canonical_id, .registry = registry, .count = @intCast(q.getInt64(2)) });
+        }
+    }
+    return try rows.toOwnedSlice(allocator);
+}
+
 /// Delete role assignment (when all roles revoked)
 pub fn deleteEACRole(db: *Database, protocol: models.Protocol, resource: []const u8, account: Address, contract_address: Address) !void {
     try reorg_undo.captureWhere(db, "eac_roles", "D", "protocol = ? AND resource = ? AND account = ? AND contract_address = ?", .{ protocol, resource, account, contract_address });

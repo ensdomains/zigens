@@ -318,34 +318,65 @@ fn mapFilterGroup(group: ?[]const ParsedDomainFilter, allocator: std.mem.Allocat
     return arr;
 }
 
-const ResolverRecordWants = struct { addr: bool = false, contenthash: bool = false, text_keys: bool = false, coin_types: bool = false };
+const ResolverRecordWants = struct {
+    addr: bool = false,
+    contenthash: bool = false,
+    text_keys: bool = false,
+    coin_types: bool = false,
+    /// `resolver { domain { … } }` — the resolver → domain back-reference.
+    domain: bool = false,
+    /// The record-list / single-value families (addresses, pubkey, abis,
+    /// reverseName, interfaces, version, aliases).
+    families: loaders.LoaderContext.ResolverFamilyWants = .{},
+    /// `resolver { … }` or `resolvedAddress` is selected at all, so the
+    /// effective (possibly inherited) resolver is needed per row.
+    resolver_selected: bool = false,
 
-/// Which batchable records a Resolver-level selection set reads:
-/// `addr` -> addr; `contentHash` -> contenthash; `texts` -> text_keys;
-/// `coinTypes` -> coin_types.
+    fn anyRecords(self: ResolverRecordWants) bool {
+        return self.addr or self.contenthash or self.text_keys or self.coin_types or self.domain or self.families.any();
+    }
+};
+
+/// Which batchable fields a Resolver-level selection set reads.
 fn scanResolverSelections(resolver_selections: []const parser.Field, want: *ResolverRecordWants) void {
     for (resolver_selections) |*sub| {
         if (std.mem.eql(u8, sub.name, "addr")) want.addr = true;
         if (std.mem.eql(u8, sub.name, "contentHash")) want.contenthash = true;
         if (std.mem.eql(u8, sub.name, "texts")) want.text_keys = true;
         if (std.mem.eql(u8, sub.name, "coinTypes")) want.coin_types = true;
+        if (std.mem.eql(u8, sub.name, "domain")) want.domain = true;
+        if (std.mem.eql(u8, sub.name, "addresses")) want.families.addresses = true;
+        if (std.mem.eql(u8, sub.name, "pubkey")) want.families.pubkey = true;
+        if (std.mem.eql(u8, sub.name, "abis")) want.families.abis = true;
+        if (std.mem.eql(u8, sub.name, "reverseName")) want.families.reverse_name = true;
+        if (std.mem.eql(u8, sub.name, "interfaces")) want.families.interfaces = true;
+        if (std.mem.eql(u8, sub.name, "version")) want.families.version = true;
+        if (std.mem.eql(u8, sub.name, "aliases")) want.families.aliases = true;
     }
 }
 
-/// Which batchable resolver records a `domains` selection reads: `resolvedAddress`
+/// Which batchable resolver fields a `domains` selection reads: `resolvedAddress`
 /// or `resolver{ addr }` -> addr, plus everything scanResolverSelections finds
-/// under `resolver { ... }`. Used to skip the page prefetch entirely when the
-/// query doesn't select them.
+/// under `resolver { ... }`.
 fn wantsResolverRecords(selections: []const parser.Field) ResolverRecordWants {
     var want = ResolverRecordWants{};
     for (selections) |*sel| {
         if (std.mem.eql(u8, sel.name, "resolvedAddress")) {
             want.addr = true;
+            want.resolver_selected = true;
         } else if (std.mem.eql(u8, sel.name, "resolver")) {
+            want.resolver_selected = true;
             scanResolverSelections(sel.selections, &want);
         }
     }
     return want;
+}
+
+fn findSelection(selections: []const parser.Field, name: []const u8) ?*const parser.Field {
+    for (selections) |*sel| {
+        if (std.mem.eql(u8, sel.name, name)) return sel;
+    }
+    return null;
 }
 
 /// Collect the distinct `text(key:"...")` keys in a Resolver-level selection
@@ -376,19 +407,30 @@ fn collectTextKeys(selections: []const parser.Field, list: *std.ArrayList([]cons
     }
 }
 
-/// Prefetch the page's resolver records into the request loader so the per-row
-/// resolver handlers read them from memory (one batch query per record type / text
-/// key instead of one point query per row). Best-effort: any failure leaves the
-/// handlers to fall back to point queries.
+/// Page-level prefetch for a list of Domain rows: every nested field the
+/// selection reads that would otherwise cost one query per row is loaded
+/// into the request loader in one batch per field, and nested Domain
+/// selections (`parent { … }`, `subdomains { … }`, `resolver { domain { … } }`)
+/// recurse so their own nested reads are batched too. Best-effort
+/// throughout: any failure leaves the handlers on their point-query paths.
 pub fn prefetchResolverRecords(database: *db.Database, allocator: std.mem.Allocator, loaders_ptr: ?*anyopaque, page: []models.Name, selections: []const parser.Field) void {
     prefetchDomainPageEvents(database, allocator, loaders_ptr, page, selections);
+    if (page.len == 0) return;
+    const lp = loaders_ptr orelse return;
+    const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+    prefetchDomainNestedFields(database, allocator, lc, page, selections);
+
     const want = wantsResolverRecords(selections);
     var text_keys: std.ArrayList([]const u8) = .empty;
     defer text_keys.deinit(allocator);
     collectTextKeys(selections, &text_keys, allocator) catch {};
-    if (!want.addr and !want.contenthash and !want.text_keys and !want.coin_types and text_keys.items.len == 0) return;
-    const lp = loaders_ptr orelse return;
-    const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
+    if (!want.resolver_selected) return;
+
+    // The ENSIP-10 walk for every row without its own resolver, memoized so
+    // the record handlers (and the resolver handler itself) read it back
+    // instead of walking per row.
+    lc.populateInheritedResolvers(database, page);
+    if (!want.anyRecords() and text_keys.items.len == 0) return;
 
     const resolvers_buf = allocator.alloc(Address, page.len) catch return;
     defer allocator.free(resolvers_buf);
@@ -397,7 +439,7 @@ pub fn prefetchResolverRecords(database: *db.Database, allocator: std.mem.Alloca
     for (page, 0..) |*n, i| {
         // Compute the SAME effective resolver the record handlers will query with,
         // so the batch keys match; the composite key makes any divergence a safe miss.
-        resolvers_buf[i] = builders.effectiveResolver(database, n) catch n.resolver;
+        resolvers_buf[i] = builders.effectiveResolverWith(database, lp, n) catch n.resolver;
         namehashes_buf[i] = n.namehash;
     }
     if (want.addr or want.contenthash) {
@@ -412,6 +454,134 @@ pub fn prefetchResolverRecords(database: *db.Database, allocator: std.mem.Alloca
     if (want.coin_types) {
         lc.populateCoinTypeLists(database, resolvers_buf, namehashes_buf);
     }
+    if (want.families.any()) {
+        lc.populateResolverFamilies(database, resolvers_buf, namehashes_buf, want.families);
+    }
+    if (want.domain) {
+        const resolver_sel = findSelection(selections, "resolver") orelse return;
+        const domain_sel = findSelection(resolver_sel.selections, "domain") orelse return;
+        prefetchResolverDomains(database, allocator, lp, lc, resolvers_buf, domain_sel.selections);
+    }
+}
+
+/// `resolver { domain { … } }`: one batch for the page's distinct effective
+/// resolvers, then the batched rows' own nested selections.
+fn prefetchResolverDomains(database: *db.Database, allocator: std.mem.Allocator, loaders_ptr: *anyopaque, lc: *loaders.LoaderContext, resolvers: []const Address, domain_selections: []const parser.Field) void {
+    var unique: std.ArrayList(Address) = .empty;
+    defer unique.deinit(allocator);
+    var seen = std.AutoHashMap([20]u8, void).init(allocator);
+    defer seen.deinit();
+    for (resolvers) |r| {
+        if (r.isZero()) continue;
+        const gop = seen.getOrPut(r.bytes) catch return;
+        if (gop.found_existing) continue;
+        unique.append(allocator, r) catch return;
+    }
+    if (unique.items.len == 0) return;
+    lc.populateDomainsByResolver(database, unique.items);
+
+    var page_rows: std.ArrayList(models.Name) = .empty;
+    defer page_rows.deinit(allocator);
+    for (unique.items) |r| {
+        const batched = lc.lookupDomainByResolver(r) orelse continue;
+        const row = batched orelse continue;
+        page_rows.append(allocator, row.*) catch return;
+    }
+    if (page_rows.items.len == 0) return;
+    prefetchResolverRecords(database, allocator, loaders_ptr, page_rows.items, domain_selections);
+}
+
+/// The Domain-level nested fields that read per row: parent, subregistry,
+/// the three counts, subdomains / subdomainConnection pages and
+/// eventsConnection. Each is batched only when selected.
+fn prefetchDomainNestedFields(database: *db.Database, allocator: std.mem.Allocator, lc: *loaders.LoaderContext, page: []models.Name, selections: []const parser.Field) void {
+    if (findSelection(selections, "parent")) |parent_sel| {
+        prefetchParents(database, allocator, lc, page, parent_sel.selections);
+    }
+    if (findSelection(selections, "subregistry") != null) {
+        lc.populateSubregistries(database, page);
+    }
+    if (findSelection(selections, "subdomainCount") != null or findSelection(selections, "subdomainsCount") != null) {
+        lc.populateSubdomainCounts(database, page);
+    }
+    if (findSelection(selections, "eventsCount") != null) {
+        lc.populateEventCounts(database, page);
+    }
+    if (findSelection(selections, "roleHolderCount") != null) {
+        lc.populateRoleHolderCounts(database, page);
+    }
+    if (findSelection(selections, "subdomains")) |sub_sel| {
+        const pg = common.parsePagination(sub_sel, 10) catch return;
+        prefetchSubdomainPages(database, allocator, lc, page, pg.skip, pg.first, sub_sel.selections);
+    } else if (findSelection(selections, "subdomainConnection")) |conn_sel| {
+        // Mirrors domainSubdomainConnectionHandler: page (0, limit + 1) plus
+        // the count when totalCount is selected.
+        const limit: u32 = @min((common.parsePagination(conn_sel, 10) catch return).first, 100);
+        if (findSelection(conn_sel.selections, "totalCount") != null) lc.populateSubdomainCounts(database, page);
+        const node_selections = connectionNodeSelections(conn_sel);
+        prefetchSubdomainPages(database, allocator, lc, page, 0, limit + 1, node_selections);
+    }
+    if (findSelection(selections, "events") == null) {
+        if (findSelection(selections, "eventsConnection")) |conn_sel| {
+            // Mirrors domainEventsConnectionHandler's filter exactly; skipped
+            // when `events` is also selected (the loader holds one page shape).
+            const limit: u32 = @min((common.parsePagination(conn_sel, 10) catch return).first, 100);
+            if (findSelection(conn_sel.selections, "totalCount") != null) lc.populateEventCounts(database, page);
+            const namehashes = allocator.alloc(Hash, page.len) catch return;
+            defer allocator.free(namehashes);
+            for (page, 0..) |*n, i| namehashes[i] = n.namehash;
+            lc.populateDomainEvents(database, namehashes, .{ .limit = limit + 1 });
+        }
+    }
+}
+
+fn connectionNodeSelections(conn_sel: *const parser.Field) []const parser.Field {
+    const edges = findSelection(conn_sel.selections, "edges") orelse return &[_]parser.Field{};
+    const node = findSelection(edges.selections, "node") orelse return &[_]parser.Field{};
+    return node.selections;
+}
+
+/// `parent { … }`: one IN-list domains query for the page's distinct parent
+/// namehashes (the handler's getNameByNamehash mirror), then the parents'
+/// own nested selections.
+fn prefetchParents(database: *db.Database, allocator: std.mem.Allocator, lc: *loaders.LoaderContext, page: []models.Name, parent_selections: []const parser.Field) void {
+    var parents: std.ArrayList(Hash) = .empty;
+    defer parents.deinit(allocator);
+    var seen = std.AutoHashMap(Hash, void).init(allocator);
+    defer seen.deinit();
+    for (page) |*n| {
+        if (n.parent_namehash.isZero()) continue;
+        const gop = seen.getOrPut(n.parent_namehash) catch return;
+        if (gop.found_existing) continue;
+        parents.append(allocator, n.parent_namehash) catch return;
+    }
+    if (parents.items.len == 0) return;
+    lc.populateDomains(database, parents.items);
+
+    var parent_rows: std.ArrayList(models.Name) = .empty;
+    defer parent_rows.deinit(allocator);
+    for (parents.items) |nh| {
+        const batched = lc.lookupDomain(nh) orelse continue;
+        const row = batched orelse continue;
+        parent_rows.append(allocator, row.*) catch return;
+    }
+    if (parent_rows.items.len == 0) return;
+    prefetchResolverRecords(database, allocator, @ptrCast(lc), parent_rows.items, parent_selections);
+}
+
+/// `subdomains(first, skip) { … }`: one windowed IN query for the page's
+/// parents, then the subdomain rows' own nested selections.
+fn prefetchSubdomainPages(database: *db.Database, allocator: std.mem.Allocator, lc: *loaders.LoaderContext, page: []models.Name, skip: u32, first: u32, sub_selections: []const parser.Field) void {
+    lc.populateSubdomainPages(database, page, skip, first);
+    var sub_rows: std.ArrayList(models.Name) = .empty;
+    defer sub_rows.deinit(allocator);
+    for (page) |*n| {
+        const parent_name = n.name orelse continue;
+        const batched = lc.lookupSubdomainPage(parent_name, skip, first) orelse continue;
+        for (batched) |row| sub_rows.append(allocator, row) catch return;
+    }
+    if (sub_rows.items.len == 0) return;
+    prefetchResolverRecords(database, allocator, @ptrCast(lc), sub_rows.items, sub_selections);
 }
 
 /// Page-batch a Domain list's nested `events(...)` field: one per-namehash
@@ -673,6 +843,9 @@ pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) 
             }
             defer name.deinit(database.allocator);
 
+            // A one-row page still owns nested lists (subdomains, events,
+            // resolver records): prime them like any list page.
+            prefetchResolverRecords(database, allocator, ctx.loaders, @as(*[1]models.Name, name), field.selections);
             const name_json = try builders.buildDomainJson(name, field.selections, .{
                 .database = database,
                 .depth = 0,
@@ -1194,6 +1367,11 @@ pub fn resolveDomain(ctx: parser.ExecutionContext, field: *const parser.Field) !
         const null_json = try allocator.dupe(u8, "null");
         return parser.FieldResult{ .json = null_json };
     }
+
+    // A single domain still owns nested lists (subdomains, events, resolver
+    // records): prime them like any list page so they batch instead of
+    // querying per row.
+    prefetchResolverRecords(database, allocator, ctx.loaders, @as(*[1]models.Name, &name), field.selections);
 
     // Build JSON object using nested builder
     const name_json = try builders.buildDomainJson(&name, field.selections, .{

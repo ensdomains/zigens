@@ -665,3 +665,151 @@ test "getLabelRoleHolderCount counts only the label's current EAC version" {
     // Another registry with the same canonical id is a different label.
     try testing.expectEqual(@as(usize, 0), try roles.getLabelRoleHolderCount(database, .v2, &lbl.canonical, helpers.TEST_RESOLVER));
 }
+
+// ============================================================================
+// BATCH HOLDER COUNTS (API page loader): regroups to exactly the point read
+// ============================================================================
+
+const ZERO_BITMAP = "0x0000000000000000000000000000000000000000000000000000000000000000";
+const ROOT_RESOURCE = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+fn holderCountFor(rows: []const roles.LabelRoleHolderCountRow, canonical_id_hex: []const u8, registry: Address) ?u64 {
+    var registry_buf: [42]u8 = undefined;
+    const registry_hex = registry.toHexBuf(&registry_buf);
+    for (rows) |r| {
+        if (std.mem.eql(u8, r.canonical_id, canonical_id_hex) and std.mem.eql(u8, r.registry, registry_hex)) return r.count;
+    }
+    return null;
+}
+
+fn expectBatchMatchesPoint(database: *Database, rows: []const roles.LabelRoleHolderCountRow, canonical_id_hexes: []const []const u8, registries: []const Address) !void {
+    for (canonical_id_hexes, registries) |cid, registry| {
+        const expected: u64 = @intCast(try roles.getLabelRoleHolderCount(database, .v2, cid, registry));
+        try testing.expectEqual(expected, holderCountFor(rows, cid, registry) orelse 0);
+    }
+}
+
+test "getLabelRoleHolderCountsForLabels regroups to exactly getLabelRoleHolderCount per label" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+    const registry = helpers.TEST_REGISTRY;
+    const owner3 = Address{ .bytes = [_]u8{0x33} ** 20 };
+
+    // Two versions: only the holders at the MAX resource (v1) count → 2.
+    const versioned = VersionedLabel.init(LABEL_CANONICAL);
+    try roles.upsertEACRole(database, .v2, &versioned.v0, helpers.TEST_OWNER_1, "0x0111", 1000, helpers.randomHash(), 0, registry);
+    try roles.upsertEACRole(database, .v2, &versioned.v1, helpers.TEST_OWNER_2, "0x0111", 2000, helpers.randomHash(), 0, registry);
+    try roles.upsertEACRole(database, .v2, &versioned.v1, owner3, "0x0100", 2000, helpers.randomHash(), 1, registry);
+    // Same resource on another contract is a different label → 1.
+    try roles.upsertEACRole(database, .v2, &versioned.v1, helpers.TEST_OWNER_1, "0x0111", 2000, helpers.randomHash(), 2, helpers.TEST_RESOLVER);
+
+    // An all-zero bitmap holder at the current version is excluded → 1.
+    const zeroed = VersionedLabel.init(0x1111111111111111111111111111111111111111111111111111111100000000);
+    try roles.upsertEACRole(database, .v2, &zeroed.v0, helpers.TEST_OWNER_1, ZERO_BITMAP, 1000, helpers.randomHash(), 0, registry);
+    try roles.upsertEACRole(database, .v2, &zeroed.v0, helpers.TEST_OWNER_2, "0x0001", 1000, helpers.randomHash(), 1, registry);
+
+    // Only zero-bitmap rows at the MAX version: the point read answers 0, the
+    // batch has no row.
+    const revoked = VersionedLabel.init(0x2222222222222222222222222222222222222222222222222222222200000000);
+    try roles.upsertEACRole(database, .v2, &revoked.v0, helpers.TEST_OWNER_1, "0x0001", 1000, helpers.randomHash(), 0, registry);
+    try roles.upsertEACRole(database, .v2, &revoked.v1, helpers.TEST_OWNER_2, ZERO_BITMAP, 2000, helpers.randomHash(), 0, registry);
+
+    // A canonical id with leading zero nibbles has two spellings; each is its
+    // own batch key and both count the same holders → 2.
+    const leading = VersionedLabel.init(0x00000000abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd00000000);
+    try roles.upsertEACRole(database, .v2, &leading.v0, helpers.TEST_OWNER_1, "0x0111", 1000, helpers.randomHash(), 0, registry);
+    try roles.upsertEACRole(database, .v2, &leading.v0, helpers.TEST_OWNER_2, "0x0011", 1000, helpers.randomHash(), 1, registry);
+    var trimmed_buf: [66]u8 = undefined;
+    const trimmed = try std.fmt.bufPrint(&trimmed_buf, "0x{x}", .{@as(u256, 0x00000000abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd00000000)});
+    try testing.expect(!std.mem.eql(u8, trimmed, &leading.canonical));
+
+    // Registry-wide ROOT role: outside every label's canonical range, so it
+    // never counts toward a label.
+    try roles.upsertEACRole(database, .v2, ROOT_RESOURCE, helpers.TEST_OWNER_1, "0x1111", 900, helpers.randomHash(), 0, registry);
+    // Other protocol never counts.
+    const bare = VersionedLabel.init(0x3333333333333333333333333333333333333333333333333333333300000000);
+    try roles.upsertEACRole(database, .v1, &bare.v0, helpers.TEST_OWNER_1, "0x0111", 1000, helpers.randomHash(), 0, registry);
+    const none = VersionedLabel.init(0x4444444444444444444444444444444444444444444444444444444400000000);
+
+    const cids = [_][]const u8{
+        &versioned.canonical, // 2
+        &zeroed.canonical, // 1
+        &revoked.canonical, // absent → 0
+        &versioned.canonical, // duplicate pair
+        &leading.canonical, // 2
+        trimmed, // second spelling, its own key → 2
+        &versioned.canonical, // other registry → 1
+        &bare.canonical, // v1-only → absent
+        &none.canonical, // no roles → absent
+        "not-hex", // unparseable → skipped
+    };
+    const regs = [_]Address{
+        registry,
+        registry,
+        registry,
+        registry,
+        registry,
+        registry,
+        helpers.TEST_RESOLVER,
+        registry,
+        registry,
+        registry,
+    };
+    const rows = try roles.getLabelRoleHolderCountsForLabels(database, .v2, &cids, &regs, allocator);
+    defer roles.freeLabelRoleHolderCountRows(allocator, rows);
+
+    try expectBatchMatchesPoint(database, rows, &cids, &regs);
+    try testing.expectEqual(@as(u64, 2), holderCountFor(rows, &versioned.canonical, registry).?);
+    try testing.expectEqual(@as(u64, 1), holderCountFor(rows, &zeroed.canonical, registry).?);
+    try testing.expectEqual(@as(u64, 2), holderCountFor(rows, &leading.canonical, registry).?);
+    try testing.expectEqual(@as(u64, 2), holderCountFor(rows, trimmed, registry).?);
+    try testing.expectEqual(@as(u64, 1), holderCountFor(rows, &versioned.canonical, helpers.TEST_RESOLVER).?);
+    try testing.expect(holderCountFor(rows, &revoked.canonical, registry) == null);
+    try testing.expect(holderCountFor(rows, &bare.canonical, registry) == null);
+    try testing.expect(holderCountFor(rows, &none.canonical, registry) == null);
+    try testing.expect(holderCountFor(rows, "not-hex", registry) == null);
+    // One row per distinct present key, ordered by (canonical_id, registry).
+    try testing.expectEqual(@as(usize, 5), rows.len);
+    try testing.expectEqualStrings(&leading.canonical, rows[0].canonical_id);
+    try testing.expectEqualStrings(&zeroed.canonical, rows[1].canonical_id);
+    try testing.expectEqualStrings(&versioned.canonical, rows[2].canonical_id);
+    try testing.expectEqualStrings(&versioned.canonical, rows[3].canonical_id);
+    try testing.expectEqualStrings(trimmed, rows[4].canonical_id);
+    var registry_buf: [42]u8 = undefined;
+    try testing.expectEqualStrings(registry.toHexBuf(&registry_buf), rows[2].registry);
+    var resolver_buf: [42]u8 = undefined;
+    try testing.expectEqualStrings(helpers.TEST_RESOLVER.toHexBuf(&resolver_buf), rows[3].registry);
+}
+
+test "getLabelRoleHolderCountsForLabels spans the 200-pair chunk boundary" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+    const registry = helpers.TEST_REGISTRY;
+
+    // 205 labels queried; every 50th has a holder at its current version,
+    // including one past the chunk boundary.
+    const total: usize = 205;
+    var canonical_bufs: [total][66]u8 = undefined;
+    var cids: [total][]const u8 = undefined;
+    var regs: [total]Address = undefined;
+    var seeded: usize = 0;
+    for (0..total) |i| {
+        const canonical_id: u256 = (@as(u256, 0x5555) << 224) | (@as(u256, i + 1) << 32);
+        cids[i] = try std.fmt.bufPrint(&canonical_bufs[i], "0x{x:0>64}", .{canonical_id});
+        regs[i] = registry;
+        if (i % 50 == 0) {
+            const lbl = VersionedLabel.init(canonical_id);
+            try roles.upsertEACRole(database, .v2, &lbl.v0, helpers.TEST_OWNER_1, "0x0001", 1000, helpers.randomHash(), 0, registry);
+            try roles.upsertEACRole(database, .v2, &lbl.v2, helpers.TEST_OWNER_2, "0x0001", 2000, helpers.randomHash(), 0, registry);
+            seeded += 1;
+        }
+    }
+
+    const rows = try roles.getLabelRoleHolderCountsForLabels(database, .v2, &cids, &regs, allocator);
+    defer roles.freeLabelRoleHolderCountRows(allocator, rows);
+    try testing.expectEqual(seeded, rows.len);
+    try expectBatchMatchesPoint(database, rows, &cids, &regs);
+    try testing.expectEqual(@as(u64, 1), holderCountFor(rows, cids[200], registry).?);
+}

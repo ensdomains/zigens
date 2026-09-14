@@ -107,6 +107,10 @@ pub fn migrate(self: *Database) !void {
     if (self.hasTable("eac_roles")) {
         try self.exec("CREATE INDEX IF NOT EXISTS idx_eac_roles_contract_resource ON eac_roles(protocol, contract_address, resource)");
     }
+    if (self.hasTable("names")) {
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_names_resolver_namehash ON names(resolver, namehash)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_names_parent_name_name ON names(parent_name, name, protocol)");
+    }
     if (self.hasTable("events")) {
         if (self.isPostgres()) {
             try self.exec("CREATE INDEX IF NOT EXISTS idx_events_resource_extracted ON events ((data::jsonb ->> 'resource'))");
@@ -258,6 +262,8 @@ const SYNC_DROP_INDEXES = [_][]const u8{
     "idx_names_expiry",
     "idx_names_registry",
     "idx_names_resolver",
+    "idx_names_resolver_namehash",
+    "idx_names_parent_name_name",
     // idx_names_created_block stays: resolver discovery runs once per batch with
     // `WHERE protocol = ? AND created_block BETWEEN ? AND ?` — without the index
     // that is a full scan of the multi-million-row names table inside the
@@ -342,6 +348,8 @@ const SYNC_CREATE_INDEXES = [_][]const u8{
     "CREATE INDEX IF NOT EXISTS idx_names_expiry ON names(expiry)",
     "CREATE INDEX IF NOT EXISTS idx_names_registry ON names(protocol, registry)",
     "CREATE INDEX IF NOT EXISTS idx_names_resolver ON names(protocol, resolver)",
+    "CREATE INDEX IF NOT EXISTS idx_names_resolver_namehash ON names(resolver, namehash)",
+    "CREATE INDEX IF NOT EXISTS idx_names_parent_name_name ON names(parent_name, name, protocol)",
     "CREATE INDEX IF NOT EXISTS idx_names_created_block ON names(protocol, created_block)",
     // domains(first:N) defaults to ORDER BY created_at, namehash — without this
     // composite the planner scan+sorts the whole table (19s -> 9ms on 3M rows).
