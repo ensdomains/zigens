@@ -621,6 +621,311 @@ pub fn getCoinTypesForPairs(db: *Database, resolvers_list: []const Address, name
     return try rows.toOwnedSlice(db.allocator);
 }
 
+// ============================================================================
+// PAIR BATCH READERS — POINT-QUERY MIRRORS
+// ============================================================================
+
+fn freeRowStrings(allocator: std.mem.Allocator, row: anytype) void {
+    inline for (std.meta.fields(@TypeOf(row))) |f| {
+        if (f.type == []u8) allocator.free(@field(row, f.name));
+    }
+}
+
+fn freeRowStringsUpTo(allocator: std.mem.Allocator, row: anytype, comptime count: usize) void {
+    inline for (std.meta.fields(@TypeOf(row)), 0..) |f, i| {
+        if (i < count and f.type == []u8) allocator.free(@field(row, f.name));
+    }
+}
+
+fn freeRows(comptime Row: type, allocator: std.mem.Allocator, rows: []Row) void {
+    for (rows) |row| freeRowStrings(allocator, row);
+    allocator.free(rows);
+}
+
+/// Read the current result row into `Row`, whose fields are declared in SELECT
+/// column order. A NULL text column skips the row (null result), mirroring the
+/// point readers' `if (try q.getText(i)) |v|` guards.
+fn readRow(comptime Row: type, q: *Query, allocator: std.mem.Allocator) !?Row {
+    var row: Row = undefined;
+    inline for (std.meta.fields(Row), 0..) |f, col| {
+        switch (f.type) {
+            []u8 => {
+                const text = q.getText(col) catch |err| {
+                    freeRowStringsUpTo(allocator, row, col);
+                    return err;
+                } orelse {
+                    freeRowStringsUpTo(allocator, row, col);
+                    return null;
+                };
+                @field(row, f.name) = text;
+            },
+            u64 => @field(row, f.name) = @intCast(q.getInt64(col)),
+            i64 => @field(row, f.name) = q.getInt64(col),
+            else => @compileError("unsupported batch row field type"),
+        }
+    }
+    return row;
+}
+
+fn buildPairInSql(allocator: std.mem.Allocator, prefix: []const u8, n: usize, suffix: []const u8) ![]u8 {
+    var sql: std.ArrayList(u8) = .empty;
+    errdefer sql.deinit(allocator);
+    try sql.appendSlice(allocator, prefix);
+    for (0..n) |i| {
+        if (i > 0) try sql.appendSlice(allocator, ", ");
+        try sql.appendSlice(allocator, "(?, ?)");
+    }
+    try sql.appendSlice(allocator, suffix);
+    return sql.toOwnedSlice(allocator);
+}
+
+const UniquePairs = struct {
+    resolvers: []Address,
+    namehashes: []Hash,
+
+    fn deinit(self: *UniquePairs, allocator: std.mem.Allocator) void {
+        allocator.free(self.resolvers);
+        allocator.free(self.namehashes);
+    }
+};
+
+/// First-seen-order dedupe of (resolver, namehash) pairs: a pair repeated
+/// across two chunks would otherwise be returned once per chunk.
+fn dedupePairs(allocator: std.mem.Allocator, resolvers_list: []const Address, namehashes: []const Hash) !UniquePairs {
+    var seen = std.AutoHashMap([52]u8, void).init(allocator);
+    defer seen.deinit();
+    var r_out: std.ArrayList(Address) = .empty;
+    errdefer r_out.deinit(allocator);
+    var nh_out: std.ArrayList(Hash) = .empty;
+    errdefer nh_out.deinit(allocator);
+    for (resolvers_list, namehashes) |r, nh| {
+        var key: [52]u8 = undefined;
+        @memcpy(key[0..20], &r.bytes);
+        @memcpy(key[20..52], &nh.bytes);
+        const gop = try seen.getOrPut(key);
+        if (gop.found_existing) continue;
+        try r_out.append(allocator, r);
+        try nh_out.append(allocator, nh);
+    }
+    const resolvers_owned = try r_out.toOwnedSlice(allocator);
+    errdefer allocator.free(resolvers_owned);
+    const namehashes_owned = try nh_out.toOwnedSlice(allocator);
+    return .{ .resolvers = resolvers_owned, .namehashes = namehashes_owned };
+}
+
+/// One statement per chunk of deduped (resolver, namehash) pairs, globally
+/// ordered by the key columns and then by the point query's own ORDER BY, so
+/// the caller regroups per pair in scan order and reproduces the point query
+/// exactly. Pairs with no rows contribute nothing. Row strings are exactly what
+/// `q.getText` returns (resolver 0x-lowercase 42 chars, namehash 0x 66 chars),
+/// owned by db.allocator — free via the row type's `free*Rows` helper.
+fn readPairRows(comptime Row: type, db: *Database, resolvers_list: []const Address, namehashes: []const Hash, prefix: []const u8, suffix: []const u8) ![]Row {
+    std.debug.assert(resolvers_list.len == namehashes.len);
+    var rows: std.ArrayList(Row) = .empty;
+    errdefer {
+        for (rows.items) |row| freeRowStrings(db.allocator, row);
+        rows.deinit(db.allocator);
+    }
+    if (resolvers_list.len == 0) return try rows.toOwnedSlice(db.allocator);
+
+    var unique = try dedupePairs(db.allocator, resolvers_list, namehashes);
+    defer unique.deinit(db.allocator);
+
+    var off: usize = 0;
+    while (off < unique.resolvers.len) : (off += RECORD_BATCH_CHUNK) {
+        const end = @min(off + RECORD_BATCH_CHUNK, unique.resolvers.len);
+
+        const sql = try buildPairInSql(db.allocator, prefix, end - off, suffix);
+        defer db.allocator.free(sql);
+
+        var arena = std.heap.ArenaAllocator.init(db.allocator);
+        defer arena.deinit();
+
+        var q = try Query.init(db, sql);
+        defer q.deinit();
+        try bindPairsStatic(&q, arena.allocator(), unique.resolvers[off..end], unique.namehashes[off..end]);
+        while (try q.step()) {
+            const row = try readRow(Row, &q, db.allocator) orelse continue;
+            errdefer freeRowStrings(db.allocator, row);
+            try rows.append(db.allocator, row);
+        }
+    }
+    return try rows.toOwnedSlice(db.allocator);
+}
+
+/// One addr record of a (resolver, namehash) pair — batched mirror of
+/// getAddressRecords (ORDER BY coin_type within the pair).
+pub const PairAddressRow = struct { resolver: []u8, namehash: []u8, coin_type: u64, address: []u8 };
+
+pub fn freePairAddressRows(allocator: std.mem.Allocator, rows: []PairAddressRow) void {
+    freeRows(PairAddressRow, allocator, rows);
+}
+
+pub fn getAddressRecordsForPairs(db: *Database, resolvers_list: []const Address, namehashes: []const Hash) ![]PairAddressRow {
+    return readPairRows(
+        PairAddressRow,
+        db,
+        resolvers_list,
+        namehashes,
+        "SELECT resolver, namehash, coin_type, address FROM resolver_addresses WHERE (resolver, namehash) IN (",
+        ") ORDER BY resolver, namehash, coin_type",
+    );
+}
+
+/// Pubkey rows of a (resolver, namehash) pair — batched mirror of
+/// getPubkeyRecord (an unordered LIMIT 1): ALL rows of the pair are returned;
+/// a pair with more than one row has no defined point-query winner.
+pub const PairPubkeyRow = struct { resolver: []u8, namehash: []u8, x: []u8, y: []u8 };
+
+pub fn freePairPubkeyRows(allocator: std.mem.Allocator, rows: []PairPubkeyRow) void {
+    freeRows(PairPubkeyRow, allocator, rows);
+}
+
+pub fn getPubkeysForPairs(db: *Database, resolvers_list: []const Address, namehashes: []const Hash) ![]PairPubkeyRow {
+    return readPairRows(
+        PairPubkeyRow,
+        db,
+        resolvers_list,
+        namehashes,
+        "SELECT resolver, namehash, x, y FROM resolver_pubkeys WHERE (resolver, namehash) IN (",
+        ") ORDER BY resolver, namehash",
+    );
+}
+
+/// One ABI content type of a (resolver, namehash) pair — batched mirror of
+/// getAbiContentTypes (ORDER BY content_type within the pair).
+pub const PairAbiRow = struct { resolver: []u8, namehash: []u8, content_type: u64 };
+
+pub fn freePairAbiRows(allocator: std.mem.Allocator, rows: []PairAbiRow) void {
+    freeRows(PairAbiRow, allocator, rows);
+}
+
+pub fn getAbiContentTypesForPairs(db: *Database, resolvers_list: []const Address, namehashes: []const Hash) ![]PairAbiRow {
+    return readPairRows(
+        PairAbiRow,
+        db,
+        resolvers_list,
+        namehashes,
+        "SELECT resolver, namehash, content_type FROM resolver_abis WHERE (resolver, namehash) IN (",
+        ") ORDER BY resolver, namehash, content_type",
+    );
+}
+
+/// Reverse-name rows of a (resolver, namehash) pair — batched mirror of
+/// getReverseNameRecord (an unordered LIMIT 1): ALL rows of the pair are
+/// returned; a pair with more than one row has no defined point-query winner.
+pub const PairReverseNameRow = struct { resolver: []u8, namehash: []u8, name: []u8 };
+
+pub fn freePairReverseNameRows(allocator: std.mem.Allocator, rows: []PairReverseNameRow) void {
+    freeRows(PairReverseNameRow, allocator, rows);
+}
+
+pub fn getReverseNamesForPairs(db: *Database, resolvers_list: []const Address, namehashes: []const Hash) ![]PairReverseNameRow {
+    return readPairRows(
+        PairReverseNameRow,
+        db,
+        resolvers_list,
+        namehashes,
+        "SELECT resolver, namehash, name FROM resolver_names WHERE (resolver, namehash) IN (",
+        ") ORDER BY resolver, namehash",
+    );
+}
+
+/// One interface record of a (resolver, namehash) pair — batched mirror of
+/// getInterfaceRecords (ORDER BY interface_id within the pair).
+pub const PairInterfaceRow = struct { resolver: []u8, namehash: []u8, interface_id: []u8, implementer: []u8 };
+
+pub fn freePairInterfaceRows(allocator: std.mem.Allocator, rows: []PairInterfaceRow) void {
+    freeRows(PairInterfaceRow, allocator, rows);
+}
+
+pub fn getInterfaceRecordsForPairs(db: *Database, resolvers_list: []const Address, namehashes: []const Hash) ![]PairInterfaceRow {
+    return readPairRows(
+        PairInterfaceRow,
+        db,
+        resolvers_list,
+        namehashes,
+        "SELECT resolver, namehash, interface_id, implementer FROM resolver_interfaces WHERE (resolver, namehash) IN (",
+        ") ORDER BY resolver, namehash, interface_id",
+    );
+}
+
+/// Node record version of a (resolver, namehash) pair — batched mirror of
+/// getNodeRecordVersion; the table's primary key is the pair, so at most one
+/// row per pair.
+pub const PairVersionRow = struct { resolver: []u8, namehash: []u8, version: i64 };
+
+pub fn freePairVersionRows(allocator: std.mem.Allocator, rows: []PairVersionRow) void {
+    freeRows(PairVersionRow, allocator, rows);
+}
+
+pub fn getNodeRecordVersionsForPairs(db: *Database, resolvers_list: []const Address, namehashes: []const Hash) ![]PairVersionRow {
+    return readPairRows(
+        PairVersionRow,
+        db,
+        resolvers_list,
+        namehashes,
+        "SELECT resolver, namehash, version FROM resolver_versions WHERE (resolver, namehash) IN (",
+        ") ORDER BY resolver, namehash",
+    );
+}
+
+/// One alias of a resolver — batched mirror of getResolverAliases (ORDER BY
+/// from_name within the resolver). Keyed by resolver alone.
+pub const ResolverAliasRow = struct { resolver: []u8, from_name: []u8, to_name: []u8 };
+
+pub fn freeResolverAliasRows(allocator: std.mem.Allocator, rows: []ResolverAliasRow) void {
+    freeRows(ResolverAliasRow, allocator, rows);
+}
+
+pub fn getResolverAliasesForResolvers(db: *Database, resolvers_list: []const Address) ![]ResolverAliasRow {
+    var rows: std.ArrayList(ResolverAliasRow) = .empty;
+    errdefer {
+        for (rows.items) |row| freeRowStrings(db.allocator, row);
+        rows.deinit(db.allocator);
+    }
+    if (resolvers_list.len == 0) return try rows.toOwnedSlice(db.allocator);
+
+    var seen = std.AutoHashMap([20]u8, void).init(db.allocator);
+    defer seen.deinit();
+    var unique: std.ArrayList(Address) = .empty;
+    defer unique.deinit(db.allocator);
+    for (resolvers_list) |r| {
+        const gop = try seen.getOrPut(r.bytes);
+        if (!gop.found_existing) try unique.append(db.allocator, r);
+    }
+
+    var off: usize = 0;
+    while (off < unique.items.len) : (off += RECORD_BATCH_CHUNK) {
+        const end = @min(off + RECORD_BATCH_CHUNK, unique.items.len);
+
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(db.allocator);
+        try sql.appendSlice(db.allocator, "SELECT resolver, from_name, to_name FROM resolver_aliases WHERE resolver IN (");
+        for (0..end - off) |i| {
+            if (i > 0) try sql.appendSlice(db.allocator, ", ");
+            try sql.append(db.allocator, '?');
+        }
+        try sql.appendSlice(db.allocator, ") ORDER BY resolver, from_name");
+
+        var arena = std.heap.ArenaAllocator.init(db.allocator);
+        defer arena.deinit();
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        for (unique.items[off..end]) |r| {
+            const buf = try arena.allocator().create([42]u8);
+            try q.bindTextStatic(r.toHexBuf(buf));
+        }
+        while (try q.step()) {
+            const row = try readRow(ResolverAliasRow, &q, db.allocator) orelse continue;
+            errdefer freeRowStrings(db.allocator, row);
+            try rows.append(db.allocator, row);
+        }
+    }
+    return try rows.toOwnedSlice(db.allocator);
+}
+
 pub fn getTextRecordKeys(db: *Database, resolver: Address, namehash: Hash) ![][]u8 {
     const sql =
         \\SELECT DISTINCT key FROM resolver_texts
