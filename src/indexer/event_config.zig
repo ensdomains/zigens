@@ -36,6 +36,7 @@ pub const ETH_REGISTRY_EVENTS = [_]RegistryEventConfig{
     .{ .event_hash = abi.EventSignatures.label_unregistered_hash, .handler = Indexer.handleLabelUnregistered, .name = "LabelUnregistered" },
     .{ .event_hash = abi.EventSignatures.expiry_updated_hash, .handler = Indexer.handleExpiryUpdated, .name = "ExpiryUpdated" },
     .{ .event_hash = abi.EventSignatures.parent_updated_hash, .handler = Indexer.handleParentUpdated, .name = "ParentUpdated" },
+    .{ .event_hash = abi.EventSignatures.registry_created_hash, .handler = Indexer.handleRegistryCreated, .name = "RegistryCreated" },
 };
 
 pub const ETH_REGISTRAR_EVENTS = [_]RegistryEventConfig{
@@ -55,6 +56,7 @@ pub const SUBREGISTRY_ENS_EVENTS = [_]RegistryEventConfig{
     .{ .event_hash = abi.EventSignatures.resolver_updated_hash, .handler = Indexer.handleResolverUpdated, .name = "ResolverUpdated" },
     .{ .event_hash = abi.EventSignatures.token_regenerated_hash, .handler = Indexer.handleTokenRegenerated, .name = "TokenRegenerated" },
     .{ .event_hash = abi.EventSignatures.eac_roles_changed_hash, .handler = Indexer.handleEACRolesChanged, .name = "EACRolesChanged" },
+    .{ .event_hash = abi.EventSignatures.registry_created_hash, .handler = Indexer.handleRegistryCreated, .name = "RegistryCreated" },
 };
 
 // TransferSingle is ERC1155 standard - uses topic-only query with two-stage filtering:

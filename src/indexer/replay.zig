@@ -1394,11 +1394,20 @@ pub fn replayV2RegistriesCore(self: *Indexer) !void {
                 .label_unregistered => replayV2SubregistryPointer(self, &q, true) catch |err| {
                     std.log.warn("V2 label_unregistered replay error: {}", .{err});
                 },
+                .registry_created => replayV2RegistryCreated(self, &q) catch |err| {
+                    std.log.warn("V2 registry_created replay error: {}", .{err});
+                },
                 else => {},
             }
         }
     }
     try database.commitTransaction();
+}
+
+fn replayV2RegistryCreated(self: *Indexer, q: *Query) !void {
+    const registry = Address.fromHex(q.getTextSlice(V2_CONTRACT) orelse return) catch return;
+    const block_number: u64 = @intCast(q.getInt64(V2_BLOCK_NUMBER));
+    try self.database.setSeededRootRegistryCreation(registry, .v2, block_number, q.getInt64(V2_TIMESTAMP));
 }
 
 fn replayV2SubregistryPointer(self: *Indexer, q: *Query, clear: bool) !void {
@@ -1456,6 +1465,7 @@ fn replayV2SubregistryPointer(self: *Indexer, q: *Query, clear: bool) !void {
             .created_block = block_number,
             .created_at = ts,
         }) catch |err| std.log.warn("insertRegistry replay: {}", .{err});
+        self.database.setSeededSubregistryCreation(new_subregistry, .v2, namehash, registry, block_number, ts) catch |err| std.log.warn("setSeededSubregistryCreation replay: {}", .{err});
     }
 }
 

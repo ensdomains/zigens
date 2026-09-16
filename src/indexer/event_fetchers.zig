@@ -1217,7 +1217,7 @@ pub fn indexPhase1V2Events(self: *Indexer, protocol: models.Protocol, client: *r
         batch[N_REG + N_REGISTRAR + 0] = .{ .from_block = from_block, .to_block = to_block, .address = eth_registry, .topics = &ds_topics[0] };
         batch[N_REG + N_REGISTRAR + 1] = .{ .from_block = from_block, .to_block = to_block, .address = eth_registry, .topics = &ds_topics[1] };
 
-        // Single HTTP call for all 11 requests
+        // Single HTTP call for all requests
         const results = try client.getLogsBatch(&batch);
         defer utils.deinitBatchResults(self.allocator, results);
 

@@ -390,6 +390,8 @@ pub const Database = struct {
 
     // Names module (15 functions)
     pub const insertRegistry = names.insertRegistry;
+    pub const setSeededRootRegistryCreation = names.setSeededRootRegistryCreation;
+    pub const setSeededSubregistryCreation = names.setSeededSubregistryCreation;
     pub const insertName = names.insertName;
     pub const insertNamesBatch = names.insertNamesBatch;
     pub const getNameByNamehash = names.getNameByNamehash;

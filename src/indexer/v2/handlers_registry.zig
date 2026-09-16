@@ -1745,6 +1745,17 @@ pub fn handleParentUpdated(self: *Indexer, protocol: models.Protocol, log: rpc.L
     try utils.emitEvent(self, protocol, log, .parent_updated, event_name, null, event_data);
 }
 
+pub fn handleRegistryCreated(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
+    const created_at = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
+    try self.database.setSeededRootRegistryCreation(log.address, protocol, log.block_number, created_at);
+
+    var registry_hex_buf: [42]u8 = undefined;
+    const registry_hex = log.address.toHexBuf(&registry_hex_buf);
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"registry\":\"{s}\"}}", .{registry_hex});
+
+    try utils.emitEvent(self, protocol, log, .registry_created, null, null, event_data);
+}
+
 /// Handle SubregistryUpdated events from PermissionedRegistry (NEW signature)
 /// Event: SubregistryUpdated(uint256 indexed tokenId, IRegistry indexed subregistry, address indexed sender)
 /// Note: Different from SubregistryUpdate - uses indexed IRegistry instead of non-indexed address
@@ -1865,6 +1876,7 @@ fn processSubregistryPointerChange(
             .created_at = block_timestamp,
         };
         try self.database.insertRegistry(registry);
+        try self.database.setSeededSubregistryCreation(new_subregistry, protocol, namehash, log.address, log.block_number, block_timestamp);
 
         // Process orphaned registrations waiting on this parent linkage.
         var subreg_hex_for_orphans_buf: [42]u8 = undefined;

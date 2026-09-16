@@ -35,6 +35,33 @@ pub fn insertRegistry(db: *Database, registry: models.Registry) !void {
     try q.exec();
 }
 
+pub fn setSeededRootRegistryCreation(db: *Database, address: Address, protocol: models.Protocol, created_block: u64, created_at: i64) !void {
+    const where = "address = ? AND protocol = ? AND parent_registry = ? AND created_at = 0";
+    try reorg_undo.captureWhere(db, "registries", "U", where, .{ address, protocol, Address.zero });
+    var q = try Query.init(db, "UPDATE registries SET created_block = ?, created_at = ? WHERE " ++ where);
+    defer q.deinit();
+    try q.bindInt64(@intCast(created_block));
+    try q.bindInt64(created_at);
+    try q.bindAddressBuf(address);
+    try q.bindTextStatic(protocol.toString());
+    try q.bindAddressBuf(Address.zero);
+    try q.exec();
+}
+
+pub fn setSeededSubregistryCreation(db: *Database, address: Address, protocol: models.Protocol, namehash: Hash, parent: Address, created_block: u64, created_at: i64) !void {
+    const where = "address = ? AND protocol = ? AND namehash = ? AND parent_registry = ? AND created_at = 0";
+    try reorg_undo.captureWhere(db, "registries", "U", where, .{ address, protocol, namehash, parent });
+    var q = try Query.init(db, "UPDATE registries SET created_block = ?, created_at = ? WHERE " ++ where);
+    defer q.deinit();
+    try q.bindInt64(@intCast(created_block));
+    try q.bindInt64(created_at);
+    try q.bindAddressBuf(address);
+    try q.bindTextStatic(protocol.toString());
+    try q.bindHashBuf(namehash);
+    try q.bindAddressBuf(parent);
+    try q.exec();
+}
+
 /// Update a registry that was created with a canonicalId placeholder name to use the actual name.
 /// Also updates names that used this placeholder as parent_name, and events stored with the
 /// placeholder in their name/namehash columns (see updatePlaceholderEventsByName for event payload
