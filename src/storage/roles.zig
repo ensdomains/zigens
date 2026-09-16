@@ -70,6 +70,7 @@ pub const RoleUpsertRow = struct {
 /// statement, far below a full chunk). The write-buffer flush owns them until
 /// reset(), which outlives this call.
 pub fn upsertEACRolesBatch(db: *Database, rows: []const RoleUpsertRow) !void {
+    try db.namesBarrier();
     if (rows.len == 0) return;
     // 9 params/row → 810 params, under the pre-3.32 SQLite
     // SQLITE_MAX_VARIABLE_NUMBER floor of 999 (same convention as
@@ -151,17 +152,35 @@ pub fn upsertEACRolesBatch(db: *Database, rows: []const RoleUpsertRow) !void {
 ///
 /// NOTE: classification must NOT key on the `resolvers` (name-binding) JOIN — those
 /// rows carry `resource = namehash`, but resolver-EAC events store `resource =`
-/// canonical_id (0 for the contract-global admin roles that make up live data), so
-/// that JOIN never matches a real resolver row. The `resolvers`/`resolver_name`
-/// JOINs below remain only for resolver-path name resolution (a no-op on current
-/// data; future-proofing for label-scoped resolver EAC).
+/// keccak256(node, part) or 0 (the contract-global admin roles that make up live
+/// data), so that JOIN never matches a real resolver row. The `resolvers`/
+/// `resolver_name` JOINs below remain only for resolver-path name resolution (a
+/// no-op on current data; future-proofing for label-scoped resolver EAC).
+///
+/// Registry resources are stored verbatim as `canonical_id | uint32(eacVersionId)`
+/// (fixed 66-char lowercase hex), so the name join keys on the canonical prefix:
+/// the first 58 chars are the label's 224-bit canonical id, the last 8 the EAC
+/// version. See `CURRENT_VERSION_ONLY` for the companion staleness rule.
+/// Excludes rows whose resource has been superseded by a higher EAC version on
+/// the same contract: the contract bumps `eacVersionId` on unregister and on
+/// re-registering an expired label, so grants keyed by an older version are
+/// unreachable through the registry from then on. Applied to listings that do
+/// NOT name a resource; an explicit `resource` filter returns exactly what was
+/// asked for, superseded or not. ROOT (0x0…0) has no version and is exempted
+/// outright. Range-scans idx_eac_roles_contract_resource.
+const CURRENT_VERSION_ONLY =
+    \\ AND (r.resource = '0x0000000000000000000000000000000000000000000000000000000000000000'
+    \\   OR NOT EXISTS (SELECT 1 FROM eac_roles n WHERE n.protocol = r.protocol AND n.contract_address = r.contract_address
+    \\     AND n.resource > r.resource AND n.resource <= (substr(r.resource, 1, 58) || 'ffffffff')))
+;
+
 const EAC_SELECT_COLUMNS =
     \\SELECT r.id, r.protocol, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp,
     \\       COALESCE(reg_name.name, resolver_name.name) AS name,
     \\       CASE WHEN kr.address IS NOT NULL THEN 1 ELSE 0 END AS is_resolver,
     \\       r.contract_address
     \\FROM eac_roles r
-    \\LEFT JOIN names reg_name ON r.resource = reg_name.canonical_id AND r.contract_address = reg_name.registry
+    \\LEFT JOIN names reg_name ON reg_name.canonical_id = (substr(r.resource, 1, 58) || '00000000') AND r.contract_address = reg_name.registry
     \\LEFT JOIN resolvers res ON r.contract_address = res.address AND r.resource = res.namehash AND res.protocol = r.protocol
     \\LEFT JOIN names resolver_name ON res.namehash = resolver_name.namehash AND resolver_name.protocol = r.protocol
     \\LEFT JOIN known_resolvers kr ON kr.address = r.contract_address AND kr.protocol = r.protocol
@@ -223,7 +242,8 @@ fn parseEACRoleRow(q: *Query, allocator: std.mem.Allocator) !models.EACRoleAssig
 /// Get all role assignments for a resource.
 /// Resolves the human-readable name via two paths:
 ///   1. Registry EAC (today's primary path): `contract_address` matches a registry row,
-///      resource = token's canonical_id — joins to `names` by (canonical_id, registry).
+///      resource = canonical_id | eacVersionId — joins to `names` by the canonical
+///      prefix and the registry (see EAC_SELECT_COLUMNS).
 ///   2. Resolver EAC: resolver contracts DO emit `EACRolesChanged` (handleResolverEACRolesChanged),
 ///      but with `resource = 0` (the EAC ROOT_RESOURCE) — contract-global admin roles, not
 ///      per-namehash. Those correctly resolve to no name (resource 0 matches no namehash), so the
@@ -311,6 +331,11 @@ pub fn getRolesFiltered(db: *Database, protocol: models.Protocol, filters: RoleF
         sql_len += clause.len;
     }
 
+    if (filters.resource == null) {
+        @memcpy(sql_buf[sql_len .. sql_len + CURRENT_VERSION_ONLY.len], CURRENT_VERSION_ONLY);
+        sql_len += CURRENT_VERSION_ONLY.len;
+    }
+
     {
         const order = " ORDER BY r.timestamp DESC, r.id DESC";
         @memcpy(sql_buf[sql_len .. sql_len + order.len], order);
@@ -391,6 +416,11 @@ pub fn getRolesWithPagination(db: *Database, protocol: models.Protocol, options:
         const clause = " AND r.contract_address = ?";
         @memcpy(sql_buf[sql_len .. sql_len + clause.len], clause);
         sql_len += clause.len;
+    }
+
+    if (options.resource == null) {
+        @memcpy(sql_buf[sql_len .. sql_len + CURRENT_VERSION_ONLY.len], CURRENT_VERSION_ONLY);
+        sql_len += CURRENT_VERSION_ONLY.len;
     }
 
     if (options.cursor_id != null) {
@@ -474,27 +504,32 @@ pub const RoleCountFilters = struct {
 
 /// Count roles matching all provided filters. Used by Registry.roleCount.
 pub fn getRoleCountFiltered(db: *Database, filters: RoleCountFilters) !usize {
-    var sql_buf: [512]u8 = undefined;
+    var sql_buf: [768]u8 = undefined;
     var sql_len: usize = 0;
 
-    const base = "SELECT COUNT(*) FROM eac_roles WHERE protocol = ?";
+    const base = "SELECT COUNT(*) FROM eac_roles r WHERE r.protocol = ?";
     @memcpy(sql_buf[sql_len .. sql_len + base.len], base);
     sql_len += base.len;
 
     if (filters.resource != null) {
-        const clause = " AND resource = ?";
+        const clause = " AND r.resource = ?";
         @memcpy(sql_buf[sql_len .. sql_len + clause.len], clause);
         sql_len += clause.len;
     }
     if (filters.account != null) {
-        const clause = " AND account = ?";
+        const clause = " AND r.account = ?";
         @memcpy(sql_buf[sql_len .. sql_len + clause.len], clause);
         sql_len += clause.len;
     }
     if (filters.contract_address != null) {
-        const clause = " AND contract_address = ?";
+        const clause = " AND r.contract_address = ?";
         @memcpy(sql_buf[sql_len .. sql_len + clause.len], clause);
         sql_len += clause.len;
+    }
+    // Same staleness rule as the listings this count paginates.
+    if (filters.resource == null) {
+        @memcpy(sql_buf[sql_len .. sql_len + CURRENT_VERSION_ONLY.len], CURRENT_VERSION_ONLY);
+        sql_len += CURRENT_VERSION_ONLY.len;
     }
 
     var q = try Query.init(db, sql_buf[0..sql_len]);
@@ -512,10 +547,12 @@ pub fn getRoleCountFiltered(db: *Database, filters: RoleCountFilters) !usize {
 /// Count distinct accounts holding any label-scoped role on a single label,
 /// keyed by the label's canonical (version-stripped) token id.
 ///
-/// A role's `resource` is the token's `canonical_id` and its `contract_address`
-/// is the registry that owns the label, so the join key is
-/// `(canonical_id, registry)` — version-independent, matching the same shape
-/// used by `getRolesByResource`. Empty role bitmaps are excluded (mirroring the
+/// A role's `resource` is `canonical_id | eacVersionId` and its
+/// `contract_address` is the registry that owns the label, so the lookup takes
+/// the canonical prefix range on `(registry, resource)` and keeps only the
+/// highest EAC version present — the generation the contract currently
+/// resolves; grants from a previous registration of the same label are not
+/// holders any more. Empty role bitmaps are excluded (mirroring the
 /// portal's `if (roleBitmap === 0n) continue`), since grant-then-revoke or
 /// backfill can leave a row with an all-zero bitmap. A label's `canonical_id` is
 /// non-zero, so the registry-wide root role (resource = 0x0…0) is naturally
@@ -533,23 +570,164 @@ pub fn getLabelRoleHolderCount(
     canonical_id_hex: []const u8,
     registry: Address,
 ) !usize {
+    const forms = ResourceForms.of(canonical_id_hex) orelse return 0;
+    var hi: [66]u8 = undefined;
+    @memcpy(hi[0..58], forms.padded[0..58]);
+    @memcpy(hi[58..66], "ffffffff");
+
     const sql =
         \\SELECT COUNT(DISTINCT account)
         \\FROM eac_roles
-        \\WHERE protocol = ? AND resource = ? AND contract_address = ?
+        \\WHERE protocol = ? AND contract_address = ? AND resource >= ? AND resource <= ?
         \\  AND role_bitmap != ?
+        \\  AND resource = (SELECT MAX(resource) FROM eac_roles
+        \\                  WHERE protocol = ? AND contract_address = ? AND resource >= ? AND resource <= ?)
     ;
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindTextStatic(protocol.toString());
-    try q.bindText(canonical_id_hex);
     try q.bindAddress(registry);
+    try q.bindText(forms.padded[0..forms.padded_len]);
+    try q.bindText(&hi);
     try q.bindTextStatic(ZERO_ROLE_BITMAP);
+    try q.bindTextStatic(protocol.toString());
+    try q.bindAddress(registry);
+    try q.bindText(forms.padded[0..forms.padded_len]);
+    try q.bindText(&hi);
 
     if (try q.step()) return @intCast(q.getInt64(0));
     return 0;
+}
+
+/// One `(canonical_id, registry) -> distinct holder count` row from
+/// `getLabelRoleHolderCountsForLabels`. `canonical_id` is the caller's input
+/// spelling echoed back verbatim (the batch key); `registry` is the stored
+/// 0x-hex address. Both strings are owned by the allocator the read was given;
+/// free via `freeLabelRoleHolderCountRows`.
+pub const LabelRoleHolderCountRow = struct {
+    canonical_id: []u8,
+    registry: []u8,
+    count: u64,
+};
+
+pub fn freeLabelRoleHolderCountRows(allocator: std.mem.Allocator, rows: []LabelRoleHolderCountRow) void {
+    for (rows) |r| {
+        allocator.free(r.canonical_id);
+        allocator.free(r.registry);
+    }
+    allocator.free(rows);
+}
+
+/// Pairs per statement of the batch holder count. Each pair is four
+/// arena-static binds (no tracked-copy cap), so the chunk is sized for
+/// statement length: 200 pairs = 800 placeholders plus three fixed ones, under
+/// the legacy SQLite 999-parameter floor.
+const LABEL_HOLDER_BATCH_CHUNK: usize = 200;
+
+/// Batched mirror of `getLabelRoleHolderCount` over many `(canonical_id_hex,
+/// registry)` pairs: `canonical_id_hexes[i]` pairs with `registries[i]` (both
+/// the same length). Per pair it takes the point read's exact range
+/// (`lo` = padded canonical spelling, `hi` = its 58-char prefix + 'ffffffff'),
+/// keeps only rows at the MAX resource inside that range for (protocol,
+/// registry), and counts DISTINCT accounts whose bitmap is not all-zero —
+/// one statement per chunk of LABEL_HOLDER_BATCH_CHUNK pairs, via a VALUES
+/// CTE joined to eac_roles twice (range max, then holders at the max).
+/// Ordered by (canonical_id, registry). Pairs that yield zero are absent (no
+/// row in range, or every row at the max resource has a zero bitmap) — the
+/// point read answers 0 for them, as it does for a canonical id that does not
+/// parse (`ResourceForms.of` null), which is skipped here. Duplicate pairs are
+/// collapsed before chunking; two spellings of one canonical id are distinct
+/// keys that each echo their own input. Rows and the returned slice are
+/// allocated with `allocator`; free via `freeLabelRoleHolderCountRows`.
+pub fn getLabelRoleHolderCountsForLabels(
+    db: *Database,
+    protocol: models.Protocol,
+    canonical_id_hexes: []const []const u8,
+    registries: []const Address,
+    allocator: std.mem.Allocator,
+) ![]LabelRoleHolderCountRow {
+    std.debug.assert(canonical_id_hexes.len == registries.len);
+    var rows: std.ArrayList(LabelRoleHolderCountRow) = .empty;
+    errdefer {
+        for (rows.items) |r| {
+            allocator.free(r.canonical_id);
+            allocator.free(r.registry);
+        }
+        rows.deinit(allocator);
+    }
+    if (canonical_id_hexes.len == 0) return try rows.toOwnedSlice(allocator);
+
+    const Pair = struct { canonical_id_hex: []const u8, registry: Address, forms: ResourceForms };
+    // Dedupe keys (input spelling + registry hex) live here for the whole call.
+    var key_arena = std.heap.ArenaAllocator.init(db.allocator);
+    defer key_arena.deinit();
+    var seen = std.StringHashMap(void).init(db.allocator);
+    defer seen.deinit();
+    var unique: std.ArrayList(Pair) = .empty;
+    defer unique.deinit(db.allocator);
+    for (canonical_id_hexes, registries) |canonical_id_hex, registry| {
+        const forms = ResourceForms.of(canonical_id_hex) orelse continue;
+        var registry_buf: [42]u8 = undefined;
+        const key = try std.mem.concat(key_arena.allocator(), u8, &.{ canonical_id_hex, "|", registry.toHexBuf(&registry_buf) });
+        const gop = try seen.getOrPut(key);
+        if (gop.found_existing) continue;
+        try unique.append(db.allocator, .{ .canonical_id_hex = canonical_id_hex, .registry = registry, .forms = forms });
+    }
+
+    var off: usize = 0;
+    while (off < unique.items.len) : (off += LABEL_HOLDER_BATCH_CHUNK) {
+        const end = @min(off + LABEL_HOLDER_BATCH_CHUNK, unique.items.len);
+        const chunk = unique.items[off..end];
+
+        // Declared before the Query so the bound strings outlive step (LIFO defers).
+        var scratch = std.heap.ArenaAllocator.init(db.allocator);
+        defer scratch.deinit();
+        const scratch_alloc = scratch.allocator();
+
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.appendSlice(scratch_alloc, "WITH v(cid, lo, hi, registry) AS (VALUES ");
+        for (chunk, 0..) |_, i| {
+            if (i != 0) try sql.appendSlice(scratch_alloc, ", ");
+            try sql.appendSlice(scratch_alloc, "(?, ?, ?, ?)");
+        }
+        try sql.appendSlice(scratch_alloc, "), " ++
+            "m AS (SELECT v.cid, v.registry, MAX(e.resource) AS maxres FROM v JOIN eac_roles e " ++
+            "ON e.protocol = ? AND e.contract_address = v.registry AND e.resource >= v.lo AND e.resource <= v.hi " ++
+            "GROUP BY v.cid, v.registry) " ++
+            "SELECT m.cid, m.registry, COUNT(DISTINCT e.account) FROM m JOIN eac_roles e " ++
+            "ON e.protocol = ? AND e.contract_address = m.registry AND e.resource = m.maxres AND e.role_bitmap != ? " ++
+            "GROUP BY m.cid, m.registry ORDER BY m.cid, m.registry");
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        for (chunk) |pair| {
+            try q.bindTextStatic(pair.canonical_id_hex);
+            const lo = try scratch_alloc.dupe(u8, pair.forms.padded[0..pair.forms.padded_len]);
+            try q.bindTextStatic(lo);
+            const hi = try scratch_alloc.create([66]u8);
+            @memcpy(hi[0..58], pair.forms.padded[0..58]);
+            @memcpy(hi[58..66], "ffffffff");
+            try q.bindTextStatic(hi);
+            const registry_buf = try scratch_alloc.create([42]u8);
+            try q.bindTextStatic(pair.registry.toHexBuf(registry_buf));
+        }
+        try q.bindTextStatic(protocol.toString());
+        try q.bindTextStatic(protocol.toString());
+        try q.bindTextStatic(ZERO_ROLE_BITMAP);
+
+        while (try q.step()) {
+            const cid_str = q.getTextSlice(0) orelse continue;
+            const registry_str = q.getTextSlice(1) orelse continue;
+            const canonical_id = try allocator.dupe(u8, cid_str);
+            errdefer allocator.free(canonical_id);
+            const registry = try allocator.dupe(u8, registry_str);
+            errdefer allocator.free(registry);
+            try rows.append(allocator, .{ .canonical_id = canonical_id, .registry = registry, .count = @intCast(q.getInt64(2)) });
+        }
+    }
+    return try rows.toOwnedSlice(allocator);
 }
 
 /// Delete role assignment (when all roles revoked)

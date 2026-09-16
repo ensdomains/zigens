@@ -7,6 +7,7 @@
 /// - resolveApprovals: List resolver approvals
 const std = @import("std");
 const common = @import("common.zig");
+const loader_ctx = common.loaders;
 const db = common.db;
 const models = common.models;
 const Address = common.Address;
@@ -113,8 +114,11 @@ pub fn resolveRolesConnection(ctx: parser.ExecutionContext, field: *const parser
         1000, // max limit
     );
 
-    // Get optional filter arguments
-    const resource_arg = parser.getStringArg(field, "resource", null);
+    // Get optional filter arguments. The resource is normalized to the stored
+    // 66-char spelling so page and count agree with `roles` (which widens the
+    // spelling in SQL); non-hex input keeps exact-match semantics.
+    const raw_resource_arg = parser.getStringArg(field, "resource", null);
+    const resource_arg: ?[]const u8 = if (raw_resource_arg) |r| ((try common.normalizeResourceHex(allocator, r)) orelse r) else null;
     const account_arg = parser.getStringArg(field, "account", null);
 
     // Parse account address if provided.
@@ -304,6 +308,16 @@ fn prefetchResolverEntityPage(database: *db.Database, allocator: std.mem.Allocat
         pair_namehashes.append(allocator, nh) catch return;
     }
     domain_resolvers.prefetchRecordsForResolverPage(database, allocator, loaders_ptr, pair_resolvers.items, pair_namehashes.items, selections);
+
+    // `resolvers { domain { … } }`: one query for the page's canonical domains
+    // instead of one per row (the resolverDomainHandler fallback).
+    for (selections) |*sel| {
+        if (std.mem.eql(u8, sel.name, "domain")) {
+            const lc: *loader_ctx.LoaderContext = @ptrCast(@alignCast(loaders_ptr.?));
+            lc.populateDomainsByResolver(database, pair_resolvers.items);
+            break;
+        }
+    }
 }
 
 /// Resolver for the new subgraph-style `resolvers(first, skip, where, orderBy)`

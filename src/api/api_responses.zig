@@ -19,6 +19,7 @@ pub fn sendJsonResponse(self: *Server, conn: http_util.Conn, status: u16, body: 
     const writer = &response.writer;
     try writer.print(
         "HTTP/1.1 {d} {s}\r\n" ++
+            "Connection: close\r\n" ++
             "Content-Type: application/json\r\n" ++
             "Content-Length: {d}\r\n" ++
             "Access-Control-Allow-Origin: *\r\n" ++
@@ -60,6 +61,7 @@ pub fn sendGraphQLResponse(self: *Server, conn: http_util.Conn, status: u16, bod
     const writer = &response.writer;
     try writer.print(
         "HTTP/1.1 {d} {s}\r\n" ++
+            "Connection: close\r\n" ++
             "Content-Type: {s}\r\n" ++
             "Content-Length: {d}\r\n" ++
             "Access-Control-Allow-Origin: *\r\n" ++
@@ -99,6 +101,7 @@ pub fn sendServiceUnavailable(self: *Server, conn: http_util.Conn) !void {
 pub fn sendCorsPreflightResponse(_: *Server, conn: http_util.Conn) !void {
     const response =
         "HTTP/1.1 204 No Content\r\n" ++
+        "Connection: close\r\n" ++
         "Access-Control-Allow-Origin: *\r\n" ++
         "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" ++
         "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
@@ -111,6 +114,7 @@ pub fn sendCorsPreflightResponse(_: *Server, conn: http_util.Conn) !void {
 pub fn sendUnauthorized(_: *Server, conn: http_util.Conn) !void {
     const body = "{\"error\":\"Authentication required\"}";
     const header = "HTTP/1.1 401 Unauthorized\r\n" ++
+        "Connection: close\r\n" ++
         "Content-Type: application/json\r\n" ++
         "WWW-Authenticate: Basic realm=\"Webhook Admin\"\r\n" ++
         "Access-Control-Allow-Origin: *\r\n" ++

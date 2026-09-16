@@ -324,6 +324,13 @@ pub const Client = struct {
     /// the number of requests per batch. 0 = unlimited. When set, oversized
     /// batches are split into sequential sub-batches and the responses merged.
     max_batch_requests: usize = 0,
+    /// Wall-clock of the last request through this client. A pooled
+    /// keep-alive socket that sat idle longer than IDLE_EVICT_MS (a long
+    /// database-only dispatch between fetches) is assumed closed by the
+    /// provider and evicted BEFORE the next request, instead of failing it
+    /// and — with every retry landing on the same stale pool — rolling the
+    /// whole batch back.
+    last_request_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
 
     pub fn initWithSharedHttpClient(allocator: std.mem.Allocator, rpc_url: []const u8, http_client: *std.http.Client) !*Client {
         const client = try allocator.create(Client);
@@ -409,7 +416,12 @@ pub const Client = struct {
         return .{ .status = @intFromEnum(response.head.status), .body = body };
     }
 
+    const IDLE_EVICT_MS: i64 = 30_000;
+
     fn executeHttpRequest(self: *Client, arena_allocator: std.mem.Allocator, request_body: []const u8) ![]const u8 {
+        const started_ms = zsys.milliTimestamp();
+        const last_ms = self.last_request_ms.swap(started_ms, .monotonic);
+        if (last_ms != 0 and started_ms - last_ms > IDLE_EVICT_MS) drainIdleHttpConnections(self.http_client);
         const max_retries: u32 = 3;
         const max_response_bytes: usize = 50 * 1024 * 1024;
         var attempt: u32 = 0;
@@ -781,6 +793,64 @@ pub const Client = struct {
         const result = parsed.value.object.get("result") orelse return error.RpcError;
         if (result != .string) return error.RpcError;
         return result.string.len > 2;
+    }
+
+    pub const CodeProbe = struct { address: Address, block: u64 };
+
+    /// eth_getCode for many (address, block) pairs in one JSON-RPC batch, in
+    /// request order. Entry i is null when the provider's answer for probe i
+    /// was missing or malformed, so a hostile or partial reply degrades that
+    /// probe alone instead of the whole batch.
+    pub fn getCodeBatch(self: *Client, probes: []const CodeProbe) ![]?bool {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var batch_requests = try a.alloc(BatchRequest, probes.len);
+        for (probes, 0..) |probe, i| {
+            var params = std.json.Array.init(a);
+            try params.append(.{ .string = try probe.address.toHex(a) });
+            try params.append(.{ .string = try std.fmt.allocPrint(a, "0x{x}", .{probe.block}) });
+            batch_requests[i] = .{ .method = "eth_getCode", .params = .{ .array = params } };
+        }
+
+        const parsed = try self.makeBatchRpcCall(batch_requests);
+        defer parsed.deinit();
+        if (parsed.value != .array) return error.RpcError;
+        const items = parsed.value.array.items;
+        if (items.len != probes.len) return error.RpcError;
+
+        const out = try self.allocator.alloc(?bool, probes.len);
+        for (items, 0..) |item, i| out[i] = parseCodeEntry(item);
+        return out;
+    }
+
+    fn parseCodeEntry(value: std.json.Value) ?bool {
+        if (value != .object) return null;
+        const result = value.object.get("result") orelse return null;
+        if (result != .string) return null;
+        const code = result.string;
+        if (!std.mem.startsWith(u8, code, "0x")) return null;
+        return code.len > 2;
+    }
+
+    test "parseCodeEntry degrades on malformed provider responses, never panics" {
+        const a = std.testing.allocator;
+        const Case = struct { json: []const u8, want: ?bool };
+        const cases = [_]Case{
+            .{ .json = "{\"result\":\"0x6080604052\"}", .want = true },
+            .{ .json = "{\"result\":\"0x\"}", .want = false },
+            .{ .json = "{\"result\":null}", .want = null },
+            .{ .json = "{\"error\":{\"code\":-32000}}", .want = null },
+            .{ .json = "{\"result\":42}", .want = null },
+            .{ .json = "{\"result\":\"6080\"}", .want = null },
+            .{ .json = "[]", .want = null },
+        };
+        for (cases) |c| {
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, c.json, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(c.want, parseCodeEntry(parsed.value));
+        }
     }
 
     /// Execute a read-only contract call (`eth_call`) against `to` with `data`,

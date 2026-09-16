@@ -80,6 +80,9 @@ pub const Config = struct {
     checkpoint_interval: u64,
     graphql_max_depth: u32,
     graphql_max_cost: u32,
+    /// Executions (successful or failed) at or above this many ms are logged at
+    /// warn level with depth, cost, outcome and a query excerpt. (GRAPHQL_SLOW_QUERY_MS)
+    graphql_slow_query_ms: u32 = 2000,
     metrics_enabled: bool,
     rainbow_path: []const u8,
     v1_contracts: contracts.ContractAddresses,
@@ -226,6 +229,7 @@ pub const Config = struct {
             .checkpoint_interval = env_mod.getEnvInt(&env_map, u64, "CHECKPOINT_INTERVAL", 100),
             .graphql_max_depth = env_mod.getEnvInt(&env_map, u32, "GRAPHQL_MAX_DEPTH", 10),
             .graphql_max_cost = env_mod.getEnvInt(&env_map, u32, "GRAPHQL_MAX_COST", 10000),
+            .graphql_slow_query_ms = env_mod.getEnvInt(&env_map, u32, "GRAPHQL_SLOW_QUERY_MS", 2000),
             .metrics_enabled = env_mod.getEnvBool(&env_map, "METRICS_ENABLED", false),
             .rainbow_path = try allocator.dupe(u8, env_mod.getEnv(&env_map, "RAINBOW_PATH", "./data/ens_rainbow.db")),
             // Falls back to RPC_URL (dupe'd independently so `deinit` can free it

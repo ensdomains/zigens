@@ -690,3 +690,310 @@ test "recompute: re-link through an ORPHANED parent must not resurrect the targe
     defer row2_mut.deinit(database.allocator);
     try testing.expect(row2.is_reachable);
 }
+
+// ============================================================================
+// BATCH READERS (API page loaders): each regroups to exactly the point read
+// ============================================================================
+
+const registry_entries = lib.storage.registry_entries;
+const names_registry = lib.storage.names_registry;
+const events = lib.storage.events;
+
+fn canonicalIdAt(i: u64) u256 {
+    return (@as(u256, i) + 1) << 32;
+}
+
+fn addressAt(i: u64) Address {
+    var out = Address{ .bytes = [_]u8{0x50} ** 20 };
+    out.bytes[18] = @intCast(i >> 8);
+    out.bytes[19] = @intCast(i & 0xFF);
+    return out;
+}
+
+fn hashAt(i: u64) Hash {
+    var out = Hash{ .bytes = [_]u8{0x60} ** 32 };
+    out.bytes[30] = @intCast(i >> 8);
+    out.bytes[31] = @intCast(i & 0xFF);
+    return out;
+}
+
+fn findSubregistryRow(rows: []const registry_entries.SubregistryRow, parent: Address, canonical_id: u256) ?Address {
+    var parent_buf: [42]u8 = undefined;
+    const parent_hex = parent.toHexBuf(&parent_buf);
+    var canonical_buf: [66]u8 = undefined;
+    const canonical_hex = std.fmt.bufPrint(&canonical_buf, "0x{x:0>64}", .{canonical_id}) catch unreachable;
+    for (rows) |r| {
+        if (std.mem.eql(u8, r.parent_registry, parent_hex) and std.mem.eql(u8, r.canonical_id, canonical_hex)) {
+            return Address.fromHex(r.subregistry) catch unreachable;
+        }
+    }
+    return null;
+}
+
+test "getSubregistriesForPairs regroups to exactly getSubregistry per pair (missing pair absent, duplicate collapsed)" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const fresh_canonical = canonicalIdAt(7);
+    const one_canonical = canonicalIdAt(8);
+    const missing_canonical = canonicalIdAt(9);
+    // Entries are written from versioned token ids; the batch takes the
+    // caller-derived canonical ids.
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, fresh_canonical | 3, SUB_A, 1000, 1700000000);
+    _ = try database.upsertRegistryEntrySubregistry(.v2, SUB_A, one_canonical | 1, SUB_A1, 1001, 1700000600);
+    // Same pair under the other protocol must not leak into a v2 read.
+    _ = try database.upsertRegistryEntrySubregistry(.v1, ETH_REGISTRY, missing_canonical, SUB_B, 1002, 1700001200);
+
+    const parents = [_]Address{ ETH_REGISTRY, SUB_A, ETH_REGISTRY, ETH_REGISTRY };
+    const ids = [_]u256{ fresh_canonical, one_canonical, missing_canonical, fresh_canonical };
+    const rows = try registry_entries.getSubregistriesForPairs(database, .v2, &parents, &ids, allocator);
+    defer registry_entries.freeSubregistryRows(allocator, rows);
+
+    // Two live pairs, ordered by (parent_registry, canonical_id): SUB_A (0xaa…)
+    // sorts before ETH_REGISTRY (0xe7…).
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    var sub_a_buf: [42]u8 = undefined;
+    try testing.expectEqualStrings(SUB_A.toHexBuf(&sub_a_buf), rows[0].parent_registry);
+    var eth_buf: [42]u8 = undefined;
+    try testing.expectEqualStrings(ETH_REGISTRY.toHexBuf(&eth_buf), rows[1].parent_registry);
+
+    for (parents, ids) |parent, canonical_id| {
+        const expected = try database.getRegistryEntrySubregistry(.v2, parent, canonical_id | 5);
+        const got = findSubregistryRow(rows, parent, canonical_id) orelse Address.zero;
+        try testing.expect(expected.eql(got));
+    }
+    try testing.expect(findSubregistryRow(rows, ETH_REGISTRY, missing_canonical) == null);
+    try testing.expect((findSubregistryRow(rows, ETH_REGISTRY, fresh_canonical) orelse Address.zero).eql(SUB_A));
+    try testing.expect((findSubregistryRow(rows, SUB_A, one_canonical) orelse Address.zero).eql(SUB_A1));
+}
+
+test "getSubregistriesForPairs spans the 200-pair chunk boundary" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const total: usize = 250;
+    var parents: [total + 2]Address = undefined;
+    var ids: [total + 2]u256 = undefined;
+    for (0..total) |i| {
+        parents[i] = ETH_REGISTRY;
+        ids[i] = canonicalIdAt(i);
+        _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, canonicalIdAt(i), addressAt(i), 1000 + i, 1700000000);
+    }
+    // One pair with no entry, one duplicate of the very first pair.
+    parents[total] = SUB_B;
+    ids[total] = canonicalIdAt(0);
+    parents[total + 1] = ETH_REGISTRY;
+    ids[total + 1] = canonicalIdAt(0);
+
+    const rows = try registry_entries.getSubregistriesForPairs(database, .v2, &parents, &ids, allocator);
+    defer registry_entries.freeSubregistryRows(allocator, rows);
+
+    try testing.expectEqual(total, rows.len);
+    // Ordered by canonical_id within the single parent: zero-padded hex order
+    // is numeric order.
+    var canonical_buf: [66]u8 = undefined;
+    for (rows, 0..) |r, i| {
+        const expected_hex = try std.fmt.bufPrint(&canonical_buf, "0x{x:0>64}", .{canonicalIdAt(i)});
+        try testing.expectEqualStrings(expected_hex, r.canonical_id);
+        const expected = try database.getRegistryEntrySubregistry(.v2, ETH_REGISTRY, canonicalIdAt(i));
+        try testing.expect(expected.eql(try Address.fromHex(r.subregistry)));
+        try testing.expect(expected.eql(addressAt(i)));
+    }
+    try testing.expect(findSubregistryRow(rows, SUB_B, canonicalIdAt(0)) == null);
+}
+
+fn insertRegistryRow(database: *Database, protocol: models.Protocol, address: Address, name: []const u8, namehash: Hash, created_block: u64) !void {
+    try database.insertRegistry(.{
+        .protocol = protocol,
+        .address = address,
+        .name = name,
+        .namehash = namehash,
+        .parent_registry = ETH_REGISTRY,
+        .created_block = created_block,
+        .created_at = @intCast(1700000000 + created_block),
+    });
+}
+
+fn expectRegistryEql(expected: models.Registry, got: models.Registry) !void {
+    try testing.expect(expected.address.eql(got.address));
+    try testing.expectEqual(expected.protocol, got.protocol);
+    try testing.expectEqualStrings(expected.name, got.name);
+    try testing.expect(expected.namehash.eql(got.namehash));
+    try testing.expect(expected.parent_registry.eql(got.parent_registry));
+    try testing.expectEqual(expected.created_block, got.created_block);
+    try testing.expectEqual(expected.created_at, got.created_at);
+}
+
+/// First row of `rows` for `address` (rows are ordered by address, then the
+/// point read's created_block DESC), or null when the address is absent.
+fn firstRegistryRow(rows: []const models.Registry, address: Address) ?models.Registry {
+    for (rows) |r| if (r.address.eql(address)) return r;
+    return null;
+}
+
+test "getRegistriesByAddresses first row per address equals getRegistry (two rows, unknown address, duplicate)" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const two_rows = SUB_A;
+    const one_row = SUB_B;
+    const unknown = SUB_A1;
+    // Inserted older-first so the point read's ORDER BY, not insert order,
+    // decides the answer.
+    try insertRegistryRow(database, .v2, two_rows, "old.eth", hashAt(1), 1000);
+    try insertRegistryRow(database, .v2, two_rows, "new.eth", hashAt(2), 2000);
+    try insertRegistryRow(database, .v2, one_row, "only.eth", hashAt(3), 1500);
+    // Other-protocol row for a queried address must not appear.
+    try insertRegistryRow(database, .v1, unknown, "v1.eth", hashAt(4), 3000);
+
+    const addresses = [_]Address{ two_rows, one_row, unknown, two_rows };
+    const rows = try names_registry.getRegistriesByAddresses(database, .v2, &addresses, allocator);
+    defer {
+        for (rows) |*r| r.deinit(allocator);
+        allocator.free(rows);
+    }
+
+    // All three v2 rows, ordered by address (SUB_A 0xaa… < SUB_B 0xbb…), then
+    // created_block DESC within SUB_A.
+    try testing.expectEqual(@as(usize, 3), rows.len);
+    try testing.expect(rows[0].address.eql(two_rows));
+    try testing.expectEqual(@as(u64, 2000), rows[0].created_block);
+    try testing.expect(rows[1].address.eql(two_rows));
+    try testing.expectEqual(@as(u64, 1000), rows[1].created_block);
+    try testing.expect(rows[2].address.eql(one_row));
+
+    for (addresses) |address| {
+        var expected = try database.getRegistry(.v2, address);
+        defer if (expected) |*e| e.deinit(allocator);
+        const got = firstRegistryRow(rows, address);
+        if (expected) |e| {
+            try expectRegistryEql(e, got.?);
+        } else {
+            try testing.expect(got == null);
+        }
+    }
+    try testing.expect(firstRegistryRow(rows, unknown) == null);
+    try testing.expectEqualStrings("new.eth", firstRegistryRow(rows, two_rows).?.name);
+}
+
+test "getRegistriesByAddresses spans the 200-address chunk boundary" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // 205 addresses queried; only every 50th has a row, including one in the
+    // second chunk.
+    const total: usize = 205;
+    var addresses: [total]Address = undefined;
+    var seeded: usize = 0;
+    for (0..total) |i| {
+        addresses[i] = addressAt(i);
+        if (i % 50 == 0) {
+            try insertRegistryRow(database, .v2, addressAt(i), "chunk.eth", hashAt(i), 1000 + i);
+            seeded += 1;
+        }
+    }
+
+    const rows = try names_registry.getRegistriesByAddresses(database, .v2, &addresses, allocator);
+    defer {
+        for (rows) |*r| r.deinit(allocator);
+        allocator.free(rows);
+    }
+    try testing.expectEqual(seeded, rows.len);
+    for (0..total) |i| {
+        var expected = try database.getRegistry(.v2, addressAt(i));
+        defer if (expected) |*e| e.deinit(allocator);
+        const got = firstRegistryRow(rows, addressAt(i));
+        if (expected) |e| try expectRegistryEql(e, got.?) else try testing.expect(got == null);
+    }
+}
+
+fn insertEventFor(database: *Database, protocol: models.Protocol, namehash: ?Hash, seq: u32) !void {
+    try database.insertEvent(.{
+        .protocol = protocol,
+        .event_type = .transfer,
+        .block_number = 1000 + seq,
+        .tx_hash = hashAt(1000 + seq),
+        .log_index = seq,
+        .contract_address = helpers.TEST_REGISTRY,
+        .name = null,
+        .namehash = namehash,
+        .data = "{}",
+        .timestamp = 1700000000,
+    });
+}
+
+fn countRowFor(rows: []const events.NamehashCountRow, namehash: Hash) ?u64 {
+    for (rows) |r| if (r.namehash.eql(namehash)) return r.count;
+    return null;
+}
+
+test "countEventsForNamehashes equals countEventsByNamehash for 0, 1 and 3 events (absent = 0, duplicate collapsed)" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const three = hashAt(1);
+    const one = hashAt(2);
+    const zero = hashAt(3);
+    const noise = hashAt(4);
+    try insertEventFor(database, .v2, three, 1);
+    try insertEventFor(database, .v2, three, 2);
+    // The point read has no protocol filter, so a v1 event counts too.
+    try insertEventFor(database, .v1, three, 3);
+    try insertEventFor(database, .v2, one, 4);
+    try insertEventFor(database, .v2, noise, 5);
+    try insertEventFor(database, .v2, null, 6);
+
+    const namehashes = [_]Hash{ three, one, zero, three };
+    const rows = try events.countEventsForNamehashes(database, &namehashes, allocator);
+    defer allocator.free(rows);
+
+    // Ordered by namehash hex: hashAt(1) < hashAt(2).
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expect(rows[0].namehash.eql(three));
+    try testing.expectEqual(@as(u64, 3), rows[0].count);
+    try testing.expect(rows[1].namehash.eql(one));
+    try testing.expectEqual(@as(u64, 1), rows[1].count);
+
+    for (namehashes) |nh| {
+        const expected: u64 = @intCast(try database.countEventsByNamehash(nh));
+        try testing.expectEqual(expected, countRowFor(rows, nh) orelse 0);
+    }
+    try testing.expect(countRowFor(rows, zero) == null);
+    try testing.expect(countRowFor(rows, noise) == null);
+}
+
+test "countEventsForNamehashes spans the 200-namehash chunk boundary" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const total: usize = 205;
+    var namehashes: [total]Hash = undefined;
+    var seq: u32 = 0;
+    var seeded: usize = 0;
+    for (0..total) |i| {
+        namehashes[i] = hashAt(i);
+        if (i % 50 == 0) {
+            // i/50 + 1 events each: 1, 2, 3, 4, 5.
+            for (0..(i / 50 + 1)) |_| {
+                seq += 1;
+                try insertEventFor(database, .v2, hashAt(i), seq);
+            }
+            seeded += 1;
+        }
+    }
+
+    const rows = try events.countEventsForNamehashes(database, &namehashes, allocator);
+    defer allocator.free(rows);
+    try testing.expectEqual(seeded, rows.len);
+    for (0..total) |i| {
+        const expected: u64 = @intCast(try database.countEventsByNamehash(hashAt(i)));
+        try testing.expectEqual(expected, countRowFor(rows, hashAt(i)) orelse 0);
+    }
+    try testing.expectEqual(@as(u64, 5), countRowFor(rows, hashAt(200)).?);
+}

@@ -182,6 +182,69 @@ fn seedFixture(db: *Database, a: std.mem.Allocator) !void {
         other_contract,
     );
 
+    // Versioned registry resources: `versioned.eth` on registry 0x7777 was
+    // registered (owner1 granted at EAC version 0), unregistered and
+    // re-registered (owner2 granted at version 1). The contract now resolves
+    // version 1 only, so the version-0 grant must drop out of every listing
+    // that does not name a resource, while the events keep both verbatim.
+    const versioned_canonical: u256 = 0x53f632a801578489983227b234817273b09ffad9c79c50366f6ff4d600000000;
+    const versioned = try lib.namehash(a, "versioned.eth");
+    try db.insertName(models.Name{
+        .protocol = .v2,
+        .name = "versioned.eth",
+        .namehash = versioned,
+        .label = "versioned",
+        .label_hash = try lib.labelhash(a, "versioned"),
+        .parent_name = "eth",
+        .parent_namehash = try lib.namehash(a, "eth"),
+        .registry = other_contract,
+        .owner = owner2,
+        .registrant = owner2,
+        .resolver = Address.zero,
+        .token_id = versioned_canonical | 1,
+        .canonical_id = versioned_canonical,
+        .token_version = 1,
+        .expiry = 2000000000,
+        .registry_locked = false,
+        .migrated = false,
+        .created_block = FIXED_BLOCK,
+        .created_at = FIXED_TS,
+        .registered_at = FIXED_TS,
+        .updated_block = FIXED_BLOCK,
+        .updated_at = FIXED_TS,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    });
+    const versioned_v0 = "0x53f632a801578489983227b234817273b09ffad9c79c50366f6ff4d600000000";
+    const versioned_v1 = "0x53f632a801578489983227b234817273b09ffad9c79c50366f6ff4d600000001";
+    const root_resource = "0x0000000000000000000000000000000000000000000000000000000000000000";
+    try db.upsertEACRole(.v2, versioned_v0, owner1, "0x0000000000000000000000000000000000000000000000000000000000000111", 300, tx, 2, other_contract);
+    try db.upsertEACRole(.v2, versioned_v1, owner2, "0x0000000000000000000000000000000000000000000000000000000000000111", 320, tx, 3, other_contract);
+    try db.upsertEACRole(.v2, root_resource, owner1, "0x0000000000000000000000000000000000000000000000000000000000010001", 290, tx, 4, other_contract);
+    const RoleEv = struct { blk: u64, li: u32, data: []const u8 };
+    const role_events = [_]RoleEv{
+        .{ .blk = 290, .li = 9100, .data = "{\"resource\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"account\":\"0x1111111111111111111111111111111111111111\",\"oldRoleBitmap\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"newRoleBitmap\":\"0x0000000000000000000000000000000000000000000000000000000000010001\"}" },
+        .{ .blk = 300, .li = 9101, .data = "{\"resource\":\"0x53f632a801578489983227b234817273b09ffad9c79c50366f6ff4d600000000\",\"account\":\"0x1111111111111111111111111111111111111111\",\"oldRoleBitmap\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"newRoleBitmap\":\"0x0000000000000000000000000000000000000000000000000000000000000111\"}" },
+        .{ .blk = 320, .li = 9102, .data = "{\"resource\":\"0x53f632a801578489983227b234817273b09ffad9c79c50366f6ff4d600000001\",\"account\":\"0x2222222222222222222222222222222222222222\",\"oldRoleBitmap\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"newRoleBitmap\":\"0x0000000000000000000000000000000000000000000000000000000000000111\"}" },
+    };
+    for (role_events) |e| {
+        try db.insertEvent(.{
+            .event_type = .eac_roles_changed,
+            .protocol = .v2,
+            .block_number = e.blk,
+            .tx_hash = Hash.zero,
+            .log_index = e.li,
+            .contract_address = other_contract,
+            .name = if (e.blk == 290) null else "versioned.eth",
+            .namehash = if (e.blk == 290) null else versioned,
+            .data = e.data,
+            .timestamp = FIXED_TS,
+        });
+    }
+
     // Registration rows: the `registrations` query reads a dedicated table that
     // insertName does not touch, so seed the .eth 2LDs (subnames are not registrations).
     try db.insertRegistration(.v2, alice, "alice", "eth", owner1, FIXED_TS, 2000000000, FIXED_BLOCK, tx, 0, .name_registered);
@@ -321,6 +384,24 @@ test "conformance goldens" {
         // get back from Domain.tokenId) must return identical rows — locks the
         // ResourceForms widening for leading-zero resources.
         .{ .name = "eac_roles_trimmed_resource", .query = "{ roles(resource: \"0x1\") { id resource account contractAddress roleBitmap permissions blockNumber } }" },
+        // --- verbatim registry resources (EAC version bits) ---
+        // Contract listing hides the superseded version-0 grant of versioned.eth
+        // and keeps ROOT; the current grant attributes to the name by canonical prefix.
+        .{ .name = "eac_roles_registry_current", .query = "{ roles(contract: \"0x7777777777777777777777777777777777777777\") { resource account name roleBitmap } roleConnection(contract: \"0x7777777777777777777777777777777777777777\", first: 10) { totalCount edges { node { resource account name } } } }" },
+        // Naming the superseded resource explicitly still returns it (history is kept).
+        .{ .name = "eac_roles_superseded_explicit", .query = "{ roles(resource: \"0x53f632a801578489983227b234817273b09ffad9c79c50366f6ff4d600000000\") { resource account name } }" },
+        // EventFilter.resource + asEACRolesChanged: exact match on the emitted resource,
+        // any hex spelling (ROOT as "0x0"), scoped to the contract.
+        .{ .name = "events_resource_versioned", .query = "{ events(where: { resource: \"0x53f632a801578489983227b234817273b09ffad9c79c50366f6ff4d600000001\", contractAddress: \"0x7777777777777777777777777777777777777777\" }) { type blockNumber domain { name } asEACRolesChanged { resource account oldRoleBitmap newRoleBitmap } asTransfer { to } } }" },
+        .{ .name = "events_resource_root_trimmed", .query = "{ events(where: { resource: \"0x0\", contractAddress: \"0x7777777777777777777777777777777777777777\" }) { type blockNumber asEACRolesChanged { resource account newRoleBitmap } } }" },
+        // Per-type list in the same family as labelRegistereds/expiryUpdateds.
+        .{ .name = "events_eac_roles_changeds", .query = "{ eacRolesChangeds(first: 5, where: { contractAddress: \"0x7777777777777777777777777777777777777777\" }, orderBy: blockNumber, orderDirection: asc) { blockNumber asEACRolesChanged { resource account } } }" },
+        // --- introspection honours the selection set (was: canned whole document) ---
+        .{ .name = "introspection_query_type_fields", .query = "{ __schema { queryType { name fields { name } } mutationType { name } } }" },
+        .{ .name = "introspection_aliased_type", .query = "{ filter: __type(name: \"EventFilter\") { kind name inputFields { name type { kind name ofType { kind name } } } } __typename }" },
+        .{ .name = "introspection_fragments", .query = "query IntrospectionQuery { __schema { types { ...T } } } fragment T on __Type { kind name }" },
+        // events(skip:) pages the plain list (was silently ignored).
+        .{ .name = "events_skip", .query = "{ events(first: 1, skip: 1, where: { type: \"EACRolesChanged\", contractAddress: \"0x7777777777777777777777777777777777777777\" }, orderBy: blockNumber, orderDirection: asc) { blockNumber asEACRolesChanged { account } } }" },
         .{ .name = "pagination_skip", .query = "{ domains(first: 2, skip: 1, orderBy: createdAt, orderDirection: asc) { id name } }" },
         .{ .name = "domain_connection", .query = "{ domainConnection(first: 2, orderBy: createdAt, orderDirection: asc) { edges { cursor node { id name } } pageInfo { hasNextPage hasPreviousPage startCursor endCursor } } }" },
         // --- where-filter matrix (deterministic order via orderBy createdAt asc, namehash tie-break) ---

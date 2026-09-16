@@ -4,6 +4,7 @@ const config = @import("../config.zig");
 const constants = @import("../constants.zig");
 const db = @import("../storage/database.zig");
 const name_prefetch_mod = @import("../storage/name_prefetch.zig");
+const placeholders_mod = @import("placeholders.zig");
 const rpc = @import("../rpc/client.zig");
 const models = @import("../types/models.zig");
 // EventSignatures consumed via the eth.zig-backed shim (re-exports them).
@@ -64,6 +65,10 @@ pub const Indexer = struct {
     // apply). Without these the fetcher re-learns from scratch every batch.
     v1_events_per_block: f64 = 0,
     v1_rpc_chunk_ceiling: u64 = 0,
+    // Largest eth_getLogs block span the provider has accepted for a discovery
+    // sweep (0 = unlimited, nothing learned yet). Lowered by the first rejection
+    // and kept for the rest of the run so every later sweep starts right-sized.
+    backfill_chunk_ceiling: u64 = 0,
     // Memoized rainbow-table lookups (hit AND miss — the empty-string sentinel).
     // A cold probe into the multi-GB rainbow DB is disk-latency-priced; the same
     // labelhash recurs on every event touching that node, so memoization collapses
@@ -116,6 +121,9 @@ pub const Indexer = struct {
     reorg_arm: bool = true,
     // Write buffer for batching DB operations during chunk processing
     write_buffer: WriteBuffer,
+    /// Which canonical/token ids have placeholder rows on disk — gates the
+    /// per-registration placeholder patches (see placeholders.zig).
+    placeholders: placeholders_mod.PlaceholderLedger,
     // Rainbow table for resolving labelhashes to labels (optional)
     rainbow: ?Rainbow = null,
     // Cached namehash("eth") — constant value used by every V2 LabelRegistered/
@@ -219,6 +227,7 @@ pub const Indexer = struct {
             .account_obs_cache = std.StringHashMap(void).init(allocator),
             .name_by_namehash_cache = std.AutoHashMap(Hash, []const u8).init(allocator),
             .write_buffer = WriteBuffer.init(allocator),
+            .placeholders = placeholders_mod.PlaceholderLedger.init(allocator),
             .rainbow = rainbow,
             .eth_namehash = try @import("../types/hash.zig").namehash(allocator, "eth"),
             .root_name = cfg.network.rootName(),
@@ -321,6 +330,7 @@ pub const Indexer = struct {
             .account_obs_cache = std.StringHashMap(void).init(allocator),
             .name_by_namehash_cache = std.AutoHashMap(Hash, []const u8).init(allocator),
             .write_buffer = WriteBuffer.init(allocator),
+            .placeholders = placeholders_mod.PlaceholderLedger.init(allocator),
             .rainbow = rainbow,
             .eth_namehash = try @import("../types/hash.zig").namehash(allocator, "eth"),
             .root_name = cfg.network.rootName(),
@@ -351,6 +361,7 @@ pub const Indexer = struct {
         }
         self.block_timestamp_cache.deinit();
         self.write_buffer.deinit();
+        self.placeholders.deinit();
         self.pending_resolver_backfills.deinit(self.allocator);
         if (self.rainbow) |*r| r.deinit();
 
@@ -390,6 +401,12 @@ pub const Indexer = struct {
     // In-memory cache / dedup accessors — implementations in caches.zig.
     pub const registerResolverOnce = caches.registerResolverOnce;
     pub const registerResolverOnceIfNew = caches.registerResolverOnceIfNew;
+    pub const lookupPairedName = caches.lookupPairedName;
+    pub const namesBarrierFlush = caches.namesBarrierFlush;
+    pub const bufferingEntities = caches.bufferingEntities;
+    pub const setNameOwner = caches.setNameOwner;
+    pub const setNameResolver = caches.setNameResolver;
+    pub const registeredNameExists = caches.registeredNameExists;
     pub const clearKnownResolverCache = caches.clearKnownResolverCache;
     pub const clearAccountObsCache = caches.clearAccountObsCache;
     pub const invalidateControllerCache = caches.invalidateControllerCache;

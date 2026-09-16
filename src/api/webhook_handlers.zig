@@ -404,6 +404,7 @@ pub fn handleWebhookUI(self: *Server, conn: http_util.Conn) !void {
     const writer = &response.writer;
     try writer.print(
         "HTTP/1.1 200 OK\r\n" ++
+            "Connection: close\r\n" ++
             "Content-Type: text/html; charset=utf-8\r\n" ++
             "Cache-Control: no-store\r\n" ++
             "Content-Length: {d}\r\n" ++

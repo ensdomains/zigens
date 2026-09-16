@@ -14,6 +14,9 @@ comptime {
     _ = @import("types/token_id.zig");
     _ = @import("indexer/replay.zig");
     _ = @import("indexer/v2/handlers_resolver_records.zig");
+    _ = @import("indexer/discovery_backfill.zig");
+    _ = @import("indexer/placeholders.zig");
+    _ = @import("indexer/write_buffer.zig");
     _ = @import("indexer/cdp_intake.zig");
     _ = @import("indexer/sync_watchdog.zig");
 }
@@ -423,4 +426,74 @@ test "seeded registries take RegistryCreated (root) or their first SubregistryUp
     try @import("indexer/replay.zig").replayV2RegistriesCore(&idx);
     try expectCreation(&database, root_registry, 400, 1_700_000_400);
     try expectCreation(&database, eth_registry, 501, 1_700_000_501);
+}
+
+test "buffered V2 name inserts are landed by the names barrier before any direct names access" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cfg = @import("config.zig").Config.fromEnv(allocator) catch return;
+    cfg.status_port = null;
+    cfg.webhooks_enabled = false;
+    defer cfg.deinit();
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const db_mod = @import("storage/database.zig");
+    var database = try db_mod.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    const indexer_mod = @import("indexer/indexer.zig");
+    var idx = try indexer_mod.Indexer.init(allocator, io, cfg, &database, null);
+    defer idx.deinit();
+
+    const models = @import("types/models.zig");
+    const Hash = @import("types/hash.zig").Hash;
+    const Address = @import("types/address.zig").Address;
+    const nh_a = Hash{ .bytes = [_]u8{0xa1} ** 32 };
+    const nh_b = Hash{ .bytes = [_]u8{0xb2} ** 32 };
+    var owner: Address = .{ .bytes = [_]u8{0} ** 20 };
+    owner.bytes[19] = 1;
+    const mk = struct {
+        fn name(nh: Hash, label: []const u8, full: []const u8, reg: Address, own: Address) models.Name {
+            return .{ .name = full, .label = label, .parent_name = "eth", .namehash = nh, .protocol = .v2, .label_hash = Hash.zero, .parent_namehash = Hash.zero, .registry = reg, .owner = own, .registrant = own, .resolver = Address.zero, .token_id = 0, .canonical_id = 0, .token_version = 0, .expiry = 1_000, .registry_locked = false, .migrated = false, .created_block = 10, .created_at = 100, .registered_at = 100, .updated_block = 10, .updated_at = 100, .is_wrapped = false, .wrapper_fuses = null, .wrapper_expiry = null, .is_v1_name = false, .v1_label_hash = null };
+        }
+    };
+    const countNames = struct {
+        fn run(db: *db_mod.Database) !i64 {
+            var q = try db_mod.Query.init(db, "SELECT COUNT(*) FROM names");
+            defer q.deinit();
+            _ = try q.step();
+            return q.getInt64(0);
+        }
+    };
+
+    // Buffered window: active buffer, disarmed cursor, barrier armed like the driver does.
+    idx.write_buffer.active = true;
+    idx.reorg_arm = false;
+    database.names_barrier = .{ .ctx = &idx, .flush = indexer_mod.Indexer.namesBarrierFlush };
+    defer database.names_barrier = null;
+
+    // Init seeds the TLD rows; measure against that baseline.
+    const base = try countNames.run(&database);
+    try idx.insertName(mk.name(nh_a, "alpha", "alpha.eth", idx.getEthRegistry(.v2), owner));
+    try std.testing.expectEqual(base, try countNames.run(&database));
+    try std.testing.expect(idx.write_buffer.hasPendingNames());
+
+    // A direct names write lands the pending row first, then applies.
+    try database.updateNameExpiry(nh_a, 2_000);
+    try std.testing.expect(!idx.write_buffer.hasPendingNames());
+    try std.testing.expectEqual(base + 1, try countNames.run(&database));
+    const row = (try database.getNameByNamehash(nh_a)).?;
+    var row_mut = row;
+    defer row_mut.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 2_000), row_mut.expiry);
+
+    // A buffered insert followed by a direct delete removes the row, never resurrects it.
+    try idx.insertName(mk.name(nh_b, "beta", "beta.eth", idx.getEthRegistry(.v2), owner));
+    try database.deleteNameByNamehash(nh_b);
+    idx.write_buffer.active = false;
+    try idx.write_buffer.flush(&database);
+    try std.testing.expectEqual(base + 1, try countNames.run(&database));
+    try std.testing.expect((try database.getNameByNamehash(nh_b)) == null);
 }

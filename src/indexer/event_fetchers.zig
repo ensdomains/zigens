@@ -12,43 +12,7 @@ const Hash = @import("../types/hash.zig").Hash;
 const Address = @import("../types/address.zig").Address;
 const Indexer = @import("indexer.zig").Indexer;
 const utils = @import("utils.zig");
-
-/// Bisect the first block at which `addr` has code — its deployment block.
-///
-/// A contract cannot emit logs before it has code, so anchoring a discovery
-/// backfill here is lossless by construction while cutting the sweep from the
-/// configured floor (START_BLOCK defaults to 0 → ~11.5M Sepolia blocks,
-/// ≥1,145 chunked getLogs per discovered contract — the 2026-08-20/21
-/// catch-up stalls of 10–20 min per discovery) down to the contract's actual
-/// lifetime: ~24 eth_getCode probes plus a handful of getLogs. Post-Cancun
-/// selfdestruct is a same-tx no-op, so code-presence is monotone over any
-/// range these V2-era contracts can occupy and the bisection is exact. (A
-/// pre-Cancun deploy→selfdestruct→redeploy at the same address could hide the
-/// first incarnation's events, but that incarnation's state died with it and
-/// predates the protocol — accepted.)
-///
-/// Returns null when the contract has no code anywhere ≤ `ceil` — there is
-/// provably nothing to scan. Any probe failure (e.g. a non-archive provider)
-/// falls back to `floor`, the pre-fix anchor: slower, never lossy. Probes go
-/// through the rate limiter like every other RPC in the sweep.
-fn findBackfillAnchor(self: *Indexer, client: *rpc.Client, addr: Address, floor: u64, ceil: u64) ?u64 {
-    if (ceil <= floor) return floor;
-    self.rate_limiter.acquire();
-    const code_at_ceil = client.hasCodeAt(addr, ceil) catch return floor;
-    if (!code_at_ceil) return null;
-    self.rate_limiter.acquire();
-    const code_at_floor = client.hasCodeAt(addr, floor) catch return floor;
-    if (code_at_floor) return floor;
-    var lo = floor; // no code
-    var hi = ceil; // has code
-    while (hi - lo > 1) {
-        const mid = lo + (hi - lo) / 2;
-        self.rate_limiter.acquire();
-        const has = client.hasCodeAt(addr, mid) catch return floor;
-        if (has) hi = mid else lo = mid;
-    }
-    return hi;
-}
+const discovery_backfill = @import("discovery_backfill.zig");
 
 pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, from_block: u64, to_block: u64) !void {
     // Get the main registry address to exclude it
@@ -60,62 +24,18 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
     var discovery = try self.database.discoverAndGetSubregistries(protocol, main_registry_hex, from_block, to_block);
     defer discovery.deinit(self.allocator);
 
-    // Backfill historical events for newly discovered subregistries.
-    // When a subregistry is first registered via SubregistryUpdate, it may have already emitted events
-    // (e.g. NameRegistered, EACRolesGranted during initialization) that we missed. Fetch those now.
+    // Newly discovered subregistries owe a sweep from their deployment block:
+    // a UserRegistry is deployed and initialize()d — granting roles — BEFORE
+    // the parent is repointed at it, so `registries.created_block` (the first
+    // SubregistryUpdated) sits above its own earliest events. Anchors and
+    // sweeps are batched across the whole set (discovery_backfill.zig).
     if (discovery.newly_discovered.len > 0 and from_block > 0) {
-        const backfill_to = from_block - 1;
         std.log.info("Backfilling {d} newly discovered subregistr{s} (up to block {d})", .{
             discovery.newly_discovered.len,
             if (discovery.newly_discovered.len == 1) "y" else "ies",
-            backfill_to,
+            from_block - 1,
         });
-        for (discovery.newly_discovered) |subreg_str| {
-            const addr = Address.fromHex(subreg_str) catch continue;
-            // Anchor at the contract's bisected deployment block, NOT
-            // `registries.created_block` and NOT `config.start_block`.
-            //
-            // `created_block` is the block of the first SubregistryUpdated — when the
-            // parent→subregistry POINTER was created (see insertRegistry, which uses
-            // INSERT OR IGNORE precisely to keep that first sighting). It is NOT the
-            // block the contract was deployed. A UserRegistry is deployed and
-            // `initialize`d — granting roles, emitting EACRolesChanged — BEFORE the
-            // parent is repointed at it, so its initialization events sit below
-            // `created_block` and no backfill anchored there can ever reach them.
-            // (Observed on Sepolia: foxxx.eth's registry has created_block 11416800
-            // while its own earliest event is at 11416799.)
-            //
-            // `config.start_block` (default 0) reaches those init events but scans
-            // the entire chain per discovered contract — the 2026-08-20/21 catch-up
-            // stalls. findBackfillAnchor is the principled floor: lossless (no code
-            // → no events) and ~24 probes instead of ~1,145 getLogs.
-            //
-            // Outcomes land in the init-gap heal ledger (v2 is the authoritative
-            // protocol for it): a failure here is retried by drainInitGapHeals
-            // instead of becoming a permanent silent gap.
-            const anchor = findBackfillAnchor(self, client, addr, self.config.start_block, backfill_to) orelse {
-                // No code at or before backfill_to: deployed inside the current
-                // batch, so there is provably no pre-batch history to sweep.
-                if (protocol == .v2) {
-                    self.database.recordHealTargetSuccess(SUBREGISTRY_HEAL_TASK, protocol, subreg_str) catch |rec_err| {
-                        std.log.warn("Failed to record subregistry backfill for {s}: {}", .{ subreg_str, rec_err });
-                    };
-                }
-                continue;
-            };
-            if (backfillSubregistryEvents(self, protocol, client, addr, anchor, backfill_to)) {
-                if (protocol == .v2) {
-                    self.database.recordHealTargetSuccess(SUBREGISTRY_HEAL_TASK, protocol, subreg_str) catch |rec_err| {
-                        std.log.warn("Failed to record subregistry backfill for {s}: {}", .{ subreg_str, rec_err });
-                    };
-                }
-            } else |err| {
-                std.log.warn("Failed to backfill subregistry {s} (queued for retry): {}", .{ subreg_str, err });
-                if (protocol == .v2) {
-                    _ = self.database.recordHealTargetFailure(SUBREGISTRY_HEAL_TASK, protocol, subreg_str, zsys.timestamp()) catch 0;
-                }
-            }
-        }
+        backfillAddressStrings(self, protocol, client, .subregistry, discovery.newly_discovered, from_block - 1);
     }
 
     const subregistries = discovery.all;
@@ -585,89 +505,34 @@ pub fn indexResolverEvents(self: *Indexer, protocol: models.Protocol, client: *r
     const resolvers_mod = @import("../storage/resolvers.zig");
     const pass_timer = zsys.milliTimestamp();
 
-    // Backfill pre-attachment history for resolvers FIRST SIGHTED this batch
-    // (queued by handleResolverUpdated's registerResolverOnceIfNew). Their
-    // initialize()-time events — EACRolesChanged role grants — fired blocks
-    // before the resolver became known, so the pass below can't see them.
-    // Events within [from_block, to_block] are the pass's job (the resolver is
-    // in the known set now), hence the window ends at from_block - 1.
-    if (self.pending_resolver_backfills.items.len > 0) {
-        const backfill_floor = self.config.start_block;
-        for (self.pending_resolver_backfills.items) |addr| {
-            if (from_block > backfill_floor) {
-                // Ledger recording mirrors the discovery site below. These
-                // resolvers never reach the newly-discovered path
-                // (registerResolverOnceIfNew pre-empts its IS NULL filter), so
-                // without this a transient failure here would stay unhealed
-                // until the next restart's seeding pass.
-                const hex = addr.toHex(self.allocator) catch continue;
-                defer self.allocator.free(hex);
-                // Deployment-block anchor — see the subregistry discovery site.
-                const backfill_from = findBackfillAnchor(self, client, addr, backfill_floor, from_block - 1) orelse {
-                    if (protocol == .v2) {
-                        self.database.recordHealTargetSuccess(RESOLVER_HEAL_TASK, protocol, hex) catch |rec_err| {
-                            std.log.warn("Failed to record first-sighting backfill for {s}: {}", .{ hex, rec_err });
-                        };
-                    }
-                    continue;
-                };
-                if (backfillResolverEvents(self, protocol, client, addr, backfill_from, from_block - 1)) {
-                    if (protocol == .v2) {
-                        self.database.recordHealTargetSuccess(RESOLVER_HEAL_TASK, protocol, hex) catch |rec_err| {
-                            std.log.warn("Failed to record first-sighting backfill for {s}: {}", .{ hex, rec_err });
-                        };
-                    }
-                } else |err| {
-                    std.log.warn("First-sighting resolver backfill failed for {s} (queued for retry): {}", .{ hex, err });
-                    if (protocol == .v2) {
-                        _ = self.database.recordHealTargetFailure(RESOLVER_HEAL_TASK, protocol, hex, zsys.timestamp()) catch 0;
-                    }
-                }
-            }
-        }
-        self.pending_resolver_backfills.clearRetainingCapacity();
+    // Resolvers first sighted this batch (queued by handleResolverUpdated's
+    // registerResolverOnceIfNew) and resolvers surfaced by discovery both owe
+    // a sweep of their pre-attachment history: initialize()-time
+    // EACRolesChanged grants fire blocks before the resolver becomes known,
+    // so the pass below can never see them. Events within [from_block,
+    // to_block] are the pass's job, hence the window ends at from_block - 1.
+    // Anchors and sweeps are batched across the whole set.
+    var owed: std.ArrayList(Address) = .empty;
+    defer owed.deinit(self.allocator);
+    if (from_block > self.config.start_block) {
+        try owed.appendSlice(self.allocator, self.pending_resolver_backfills.items);
     }
+    self.pending_resolver_backfills.clearRetainingCapacity();
 
     // Discover new resolvers and get all known resolvers
     var discovery = try resolvers_mod.discoverAndGetResolvers(self.database, protocol, from_block, to_block);
     defer discovery.deinit(self.allocator);
     const discover_ms = zsys.milliTimestamp() - pass_timer;
 
-    // Backfill historical events for newly discovered resolvers.
-    // When a resolver is first set on a domain, it may have already emitted events
-    // (e.g. EACRolesChanged during initialize()) that we missed. Fetch those now.
-    if (discovery.newly_discovered.len > 0 and from_block > 0) {
-        std.log.info("Backfilling {d} newly discovered resolver(s) up to block {d}", .{
-            discovery.newly_discovered.len,
-            from_block - 1,
-        });
+    if (from_block > 0) {
         for (discovery.newly_discovered) |resolver_str| {
             const addr = Address.fromHex(resolver_str) catch continue;
-            // Outcomes land in the init-gap heal ledger (v2 is the authoritative
-            // protocol for it): a failure here is retried by drainInitGapHeals
-            // instead of becoming a permanent silent gap.
-            // Deployment-block anchor — see the subregistry discovery site.
-            const backfill_from = findBackfillAnchor(self, client, addr, self.config.start_block, from_block - 1) orelse {
-                if (protocol == .v2) {
-                    self.database.recordHealTargetSuccess(RESOLVER_HEAL_TASK, protocol, resolver_str) catch |rec_err| {
-                        std.log.warn("Failed to record resolver backfill for {s}: {}", .{ resolver_str, rec_err });
-                    };
-                }
-                continue;
-            };
-            if (backfillResolverEvents(self, protocol, client, addr, backfill_from, from_block - 1)) {
-                if (protocol == .v2) {
-                    self.database.recordHealTargetSuccess(RESOLVER_HEAL_TASK, protocol, resolver_str) catch |rec_err| {
-                        std.log.warn("Failed to record resolver backfill for {s}: {}", .{ resolver_str, rec_err });
-                    };
-                }
-            } else |err| {
-                std.log.warn("Failed to backfill resolver {s} (queued for retry): {}", .{ resolver_str, err });
-                if (protocol == .v2) {
-                    _ = self.database.recordHealTargetFailure(RESOLVER_HEAL_TASK, protocol, resolver_str, zsys.timestamp()) catch 0;
-                }
-            }
+            try owed.append(self.allocator, addr);
         }
+    }
+    if (owed.items.len > 0) {
+        std.log.info("Backfilling {d} resolver(s) first sighted this batch (up to block {d})", .{ owed.items.len, from_block - 1 });
+        _ = discovery_backfill.backfillDiscovered(self, protocol, client, .resolver, owed.items, from_block - 1);
     }
 
     if (discovery.all.len == 0) {
@@ -754,143 +619,6 @@ pub fn indexResolverEvents(self: *Indexer, protocol: models.Protocol, client: *r
     }
 }
 
-/// Backfill historical events for a specific resolver contract.
-/// Called when a resolver is newly discovered — fetches events from its deployment
-/// to catch initialization events (e.g. EACRolesChanged) that happened before
-/// the resolver was set on any domain.
-fn backfillResolverEvents(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, resolver_addr: Address, from_block: u64, to_block: u64) !void {
-    if (to_block < from_block) return;
-
-    const resolver_hex = try resolver_addr.toHex(self.allocator);
-    defer self.allocator.free(resolver_hex);
-
-    std.log.info("  Backfilling resolver {s} events from block {d} to {d}", .{ resolver_hex, from_block, to_block });
-
-    // Build event topic array
-    var event_topics: [Indexer.RESOLVER_EVENTS.len]Hash = undefined;
-    inline for (Indexer.RESOLVER_EVENTS, 0..) |event_cfg, i| {
-        event_topics[i] = event_cfg.event_hash;
-    }
-
-    // Adaptive chunking, same shape as backfillSubregistryEvents: a provider
-    // with a hard block-range cap would fail one unchunked getLogs over the
-    // full sweep range deterministically — 8 identical failures later the
-    // ledger target would park with a permanent (if loud) gap.
-    const BACKFILL_MAX_CHUNK: u64 = 10000;
-    const BACKFILL_MIN_CHUNK: u64 = 500;
-
-    var processed: usize = 0;
-    var skipped_ranges: usize = 0;
-    var chunk_size: u64 = BACKFILL_MAX_CHUNK;
-    var chunk_from = from_block;
-    var transient_failures: u8 = 0;
-
-    while (chunk_from <= to_block) {
-        var retry_chunk_size = chunk_size;
-
-        // Retry loop with adaptive chunk size
-        const logs = while (retry_chunk_size >= BACKFILL_MIN_CHUNK) {
-            const chunk_to = @min(chunk_from + retry_chunk_size - 1, to_block);
-
-            const result = client.getLogsMultiAddress(.{
-                .from_block = chunk_from,
-                .to_block = chunk_to,
-                .addresses = &[_]Address{resolver_addr},
-                .topic0_or = &event_topics,
-            }) catch |err| {
-                // Only genuine response-size failures justify shrinking.
-                // Transport-class errors (stale pooled socket, TLS, timeout)
-                // already got the rpc client's 3 retries + pool drain;
-                // shrinking on them cannot help and permanently slows the rest
-                // of the sweep (2026-08-21 repro: HttpConnectionClosing halved
-                // 10k chunks to 2.5k for millions of remaining blocks). Retry
-                // same-size a few times, then hand the target back to the heal
-                // ledger.
-                if (err != error.RpcError and err != error.StreamTooLong) {
-                    transient_failures += 1;
-                    if (transient_failures > 3) return err;
-                    std.log.warn("    Backfill chunk {d}-{d} transport error ({any}); retrying same size (attempt {d}/3)", .{ chunk_from, chunk_to, err, transient_failures });
-                    self.rate_limiter.acquire();
-                    continue;
-                }
-                const new_size = retry_chunk_size / 2;
-                std.log.info("    Backfill chunk {d}-{d} too large ({any}), reducing to {d} blocks", .{ chunk_from, chunk_to, err, new_size });
-                retry_chunk_size = new_size;
-                self.rate_limiter.acquire();
-                continue;
-            };
-
-            // Success - remember the working size for the next chunk
-            transient_failures = 0;
-            chunk_size = retry_chunk_size;
-            break result;
-        } else {
-            // All retries failed — skip ahead so the rest of the range still
-            // gets swept, but REMEMBER the hole: the function must not report
-            // success over a gap (the ledger would record it completed).
-            std.log.warn("    Backfill for resolver {s} failed at block {d} even with min chunk, skipping ahead", .{ resolver_hex, chunk_from });
-            skipped_ranges += 1;
-            chunk_from += BACKFILL_MIN_CHUNK;
-            chunk_size = BACKFILL_MIN_CHUNK * 2;
-            continue;
-        };
-
-        defer {
-            for (logs) |*log| {
-                log.deinit(self.allocator);
-            }
-            self.allocator.free(logs);
-        }
-
-        for (logs) |log| {
-            if (log.topics.len == 0) continue;
-
-            const event_sig = log.topics[0];
-            inline for (Indexer.RESOLVER_EVENTS) |event_cfg| {
-                if (event_sig.eql(event_cfg.event_hash)) {
-                    event_cfg.handler(self, protocol, resolver_addr, log) catch |err| {
-                        std.log.warn("  Backfill handler error for resolver {s}: {}", .{ resolver_hex, err });
-                    };
-                    processed += 1;
-                    break;
-                }
-            }
-        }
-
-        // Move to next chunk
-        chunk_from += chunk_size;
-
-        // Gradually increase chunk size back toward max after success (+25%, min +500)
-        if (chunk_size < BACKFILL_MAX_CHUNK) {
-            const increase = @max(chunk_size / 4, 500);
-            const new_size = @min(chunk_size + increase, BACKFILL_MAX_CHUNK);
-            if (new_size > chunk_size) {
-                chunk_size = new_size;
-            }
-        }
-
-        // Rate limit between chunks
-        if (chunk_from <= to_block) {
-            self.rate_limiter.acquire();
-        }
-    }
-
-    // A skipped range is a hole, not a success: report failure so the caller's
-    // ledger recording retries (and eventually parks) the target honestly. The
-    // events that DID land are keepers — handlers are idempotent, so the retry
-    // only fills the holes.
-    if (skipped_ranges > 0) {
-        std.log.warn("  Resolver {s} backfill incomplete: {d} range(s) skipped", .{ resolver_hex, skipped_ranges });
-        return error.BackfillIncomplete;
-    }
-
-    if (processed == 0) {
-        std.log.info("  No historical events found for resolver {s}", .{resolver_hex});
-    } else {
-        std.log.info("  Backfilled {d} historical events for resolver {s}", .{ processed, resolver_hex });
-    }
-}
-
 // ============================================================================
 // INIT-GAP HEALS (durable per-target ledger)
 // ============================================================================
@@ -906,11 +634,11 @@ fn backfillResolverEvents(self: *Indexer, protocol: models.Protocol, client: *rp
 // silent data gap; the ledger deliberately ignores them (their word is not
 // trustworthy), at the cost of one idempotent re-sweep per pre-ledger target.
 
-const RESOLVER_HEAL_TASK = "resolver_init_gaps";
-const SUBREGISTRY_HEAL_TASK = "subregistry_init_gaps";
+const RESOLVER_HEAL_TASK = discovery_backfill.RESOLVER_HEAL_TASK;
+const SUBREGISTRY_HEAL_TASK = discovery_backfill.SUBREGISTRY_HEAL_TASK;
 /// After this many spaced failures a target parks at err level: a persistent
 /// per-target problem needs an operator, not an infinite retry loop.
-const HEAL_MAX_ATTEMPTS: u32 = 8;
+const HEAL_MAX_ATTEMPTS = discovery_backfill.HEAL_MAX_ATTEMPTS;
 /// Minimum seconds between attempts on one target, so a multi-hour RPC outage
 /// cannot burn the whole attempt budget in a few poll cycles.
 const HEAL_RETRY_SPACING_SECS: i64 = 600;
@@ -937,59 +665,24 @@ pub fn seedInitGapHealTargets(self: *Indexer, protocol: models.Protocol) !void {
     }
 }
 
-/// Sweep one target over [start_block, last-synced]. Full-range for BOTH
-/// kinds, deliberately:
-///   1. Projections (eac_roles, resolver records) are last-write-wins upserts
-///      with no block-ordering guard, so replaying only an old slice of
-///      history can regress state that advanced past it — e.g. a revoked
-///      admin's init-time grant reappearing. An in-order replay that runs to
-///      the current head always terminates on current values.
-///   2. The contract's init events predate its first sighting — for
-///      subregistries, `registries.created_block` is the first
-///      SubregistryUpdated (the parent→child POINTER), not the deployment
-///      (observed on Sepolia: foxxx.eth's registry, created_block 11416800,
-///      earliest own event 11416799) — and for pre-ledger targets it is
-///      unknowable whether earlier backfills succeeded.
-///   3. After a reorg rollback re-arms the ledger, this full re-sweep is what
-///      converges projections to the surviving chain.
-/// Handlers are idempotent, fetches are address-filtered and chunked; blocks
-/// past the sync head are the batch path's responsibility. A getSyncState
-/// failure propagates — recording success for an unswept target is the exact
-/// silent gap this ledger exists to eliminate.
-fn sweepHealTarget(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, addr: Address, comptime backfillFn: anytype) !void {
-    const to_block = (try self.database.getSyncState(protocol)) orelse 0;
-    if (to_block < self.config.start_block) return;
-    // Deployment-block anchor (see the subregistry discovery site): the
-    // "full-range" rationale above is preserved — replay still runs in order
-    // from before the contract's first possible event to the current head; a
-    // no-code result means the target has no events at all, which is a
-    // completed (empty) sweep, not a hole.
-    const anchor = findBackfillAnchor(self, client, addr, self.config.start_block, to_block) orelse return;
-    try backfillFn(self, protocol, client, addr, anchor, to_block);
-}
-
-/// True when any heal sweep is currently due — the cheap per-cycle gate that
-/// lets the sync loop skip the reorg-cursor disarm on the (typical) no-work
-/// cycle.
 pub fn hasDueInitGapHeals(self: *Indexer, protocol: models.Protocol) bool {
     if (protocol != .v2) return false;
     const retry_before = zsys.timestamp() - HEAL_RETRY_SPACING_SECS;
     return self.database.hasPendingHealTargets(protocol, HEAL_MAX_ATTEMPTS, retry_before) catch false;
 }
 
-/// Drain every due heal sweep, recording per-target outcomes in the ledger.
-/// MUST be called with the reorg cursor disarmed (both call paths guarantee
-/// it): the sweeps write historical events, and a captured write would let a
-/// later reorg rollback delete healed rows — which the ledger would then
-/// report as completed, making the loss permanent.
 pub fn drainInitGapHeals(self: *Indexer, protocol: models.Protocol, client: *rpc.Client) void {
     if (protocol != .v2) return;
     const retry_before = zsys.timestamp() - HEAL_RETRY_SPACING_SECS;
-    drainHealTask(self, RESOLVER_HEAL_TASK, protocol, client, retry_before, backfillResolverEvents);
-    drainHealTask(self, SUBREGISTRY_HEAL_TASK, protocol, client, retry_before, backfillSubregistryEvents);
+    drainHealTask(self, .resolver, protocol, client, retry_before);
+    drainHealTask(self, .subregistry, protocol, client, retry_before);
 }
 
-fn drainHealTask(self: *Indexer, task: []const u8, protocol: models.Protocol, client: *rpc.Client, retry_before: i64, comptime backfillFn: anytype) void {
+fn drainHealTask(self: *Indexer, kind: discovery_backfill.Kind, protocol: models.Protocol, client: *rpc.Client, retry_before: i64) void {
+    const task = switch (kind) {
+        .resolver => RESOLVER_HEAL_TASK,
+        .subregistry => SUBREGISTRY_HEAL_TASK,
+    };
     var targets = self.database.pendingHealTargets(self.allocator, task, protocol, HEAL_MAX_ATTEMPTS, retry_before) catch |err| {
         std.log.warn("init-gap heal: failed to list {s} targets: {}", .{ task, err });
         return;
@@ -997,168 +690,20 @@ fn drainHealTask(self: *Indexer, task: []const u8, protocol: models.Protocol, cl
     defer targets.deinit(self.allocator);
     if (targets.items.len == 0) return;
 
-    std.log.info("init-gap heal: {d} pending {s} target(s)", .{ targets.items.len, task });
-    var healed: usize = 0;
-    for (targets.items) |addr| {
-        const hex = addr.toHex(self.allocator) catch continue;
-        defer self.allocator.free(hex);
-        if (sweepHealTarget(self, protocol, client, addr, backfillFn)) {
-            self.database.recordHealTargetSuccess(task, protocol, hex) catch |err| {
-                std.log.warn("init-gap heal: {s} swept {s} but recording failed: {}", .{ task, hex, err });
-            };
-            healed += 1;
-        } else |err| {
-            const attempts = self.database.recordHealTargetFailure(task, protocol, hex, zsys.timestamp()) catch 0;
-            if (attempts >= HEAL_MAX_ATTEMPTS) {
-                std.log.err("init-gap heal: {s} target {s} PARKED after {d} failed attempts (last: {}) — its init events stay missing; delete its init_gap_heal_targets row to re-arm", .{ task, hex, attempts, err });
-            } else {
-                std.log.warn("init-gap heal: {s} sweep failed for {s} (attempt {d}/{d}): {}", .{ task, hex, attempts, HEAL_MAX_ATTEMPTS, err });
-            }
-        }
-    }
-    std.log.info("init-gap heal: {s} pass complete, {d}/{d} swept", .{ task, healed, targets.items.len });
+    const to_block = (self.database.getSyncState(protocol) catch null) orelse 0;
+    std.log.info("init-gap heal: {d} pending {s} target(s), sweeping up to block {d}", .{ targets.items.len, task, to_block });
+    const outcome = discovery_backfill.backfillDiscovered(self, protocol, client, kind, targets.items, to_block);
+    std.log.info("init-gap heal: {s} pass complete, {d}/{d} swept", .{ task, outcome.swept + outcome.no_history, targets.items.len });
 }
 
-/// Backfill historical events for a specific subregistry contract.
-/// Called when a subregistry is newly discovered — fetches events from start_block
-/// to catch initialization events (e.g. NameRegistered, EACRolesGranted) that happened
-/// before the SubregistryUpdate event was processed.
-fn backfillSubregistryEvents(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, subreg_addr: Address, from_block: u64, to_block: u64) !void {
-    if (to_block < from_block) return;
-
-    const subreg_hex = try subreg_addr.toHex(self.allocator);
-    defer self.allocator.free(subreg_hex);
-
-    std.log.info("  Backfilling subregistry {s} events from block {d} to {d}", .{ subreg_hex, from_block, to_block });
-
-    // Combined topic array (ENS events + TransferSingle) for OR matching
-    const all_topics_len = Indexer.SUBREGISTRY_ENS_EVENTS.len + 1;
-    var all_topics: [all_topics_len]Hash = undefined;
-    inline for (Indexer.SUBREGISTRY_ENS_EVENTS, 0..) |event_cfg, i| {
-        all_topics[i] = event_cfg.event_hash;
+fn backfillAddressStrings(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, kind: discovery_backfill.Kind, hexes: []const []const u8, to_block: u64) void {
+    var addrs: std.ArrayList(Address) = .empty;
+    defer addrs.deinit(self.allocator);
+    for (hexes) |hex| {
+        const addr = Address.fromHex(hex) catch continue;
+        addrs.append(self.allocator, addr) catch continue;
     }
-    all_topics[Indexer.SUBREGISTRY_ENS_EVENTS.len] = Indexer.SUBREGISTRY_TRANSFER_EVENT.event_hash;
-
-    // Adaptive chunking over the (potentially huge) historical range, mirroring the
-    // main subregistry scan in indexSubregistryEvents STEP 1: a single getLogs over
-    // millions of blocks is rejected by most RPCs (block-range cap), so chunk it and
-    // shrink-on-error. The query is address-filtered, so false positives are impossible.
-    const BACKFILL_MAX_CHUNK: u64 = 10000;
-    const BACKFILL_MIN_CHUNK: u64 = 500;
-
-    var processed: usize = 0;
-    var skipped_ranges: usize = 0;
-    var chunk_size: u64 = BACKFILL_MAX_CHUNK;
-    var chunk_from = from_block;
-    var transient_failures: u8 = 0;
-
-    while (chunk_from <= to_block) {
-        var retry_chunk_size = chunk_size;
-
-        // Retry loop with adaptive chunk size
-        const logs = while (retry_chunk_size >= BACKFILL_MIN_CHUNK) {
-            const chunk_to = @min(chunk_from + retry_chunk_size - 1, to_block);
-
-            const result = client.getLogsMultiAddress(.{
-                .from_block = chunk_from,
-                .to_block = chunk_to,
-                .addresses = &[_]Address{subreg_addr},
-                .topic0_or = &all_topics,
-            }) catch |err| {
-                // Transport vs size classification — see backfillResolverEvents.
-                if (err != error.RpcError and err != error.StreamTooLong) {
-                    transient_failures += 1;
-                    if (transient_failures > 3) return err;
-                    std.log.warn("    Backfill chunk {d}-{d} transport error ({any}); retrying same size (attempt {d}/3)", .{ chunk_from, chunk_to, err, transient_failures });
-                    self.rate_limiter.acquire();
-                    continue;
-                }
-                const new_size = retry_chunk_size / 2;
-                std.log.info("    Backfill chunk {d}-{d} too large ({any}), reducing to {d} blocks", .{ chunk_from, chunk_to, err, new_size });
-                retry_chunk_size = new_size;
-                self.rate_limiter.acquire();
-                continue;
-            };
-
-            // Success - remember the working size for the next chunk
-            transient_failures = 0;
-            chunk_size = retry_chunk_size;
-            break result;
-        } else {
-            // All retries failed — skip ahead so the rest of the range still
-            // gets swept, but REMEMBER the hole: the function must not report
-            // success over a gap (the ledger would record it completed).
-            std.log.warn("    Backfill for subregistry {s} failed at block {d} even with min chunk, skipping ahead", .{ subreg_hex, chunk_from });
-            skipped_ranges += 1;
-            chunk_from += BACKFILL_MIN_CHUNK;
-            chunk_size = BACKFILL_MIN_CHUNK * 2;
-            continue;
-        };
-
-        defer {
-            for (logs) |*log| {
-                log.deinit(self.allocator);
-            }
-            self.allocator.free(logs);
-        }
-
-        for (logs) |log| {
-            if (log.topics.len == 0) continue;
-
-            const event_sig = log.topics[0];
-
-            // Check ENS-specific events first
-            inline for (Indexer.SUBREGISTRY_ENS_EVENTS) |event_cfg| {
-                if (event_sig.eql(event_cfg.event_hash)) {
-                    event_cfg.handler(self, protocol, log) catch |err| {
-                        std.log.warn("  Backfill handler error for subregistry {s}: {}", .{ subreg_hex, err });
-                    };
-                    processed += 1;
-                    break;
-                }
-            }
-
-            // Check TransferSingle
-            if (event_sig.eql(Indexer.SUBREGISTRY_TRANSFER_EVENT.event_hash)) {
-                Indexer.SUBREGISTRY_TRANSFER_EVENT.handler(self, protocol, log) catch |err| {
-                    std.log.warn("  Backfill transfer error for subregistry {s}: {}", .{ subreg_hex, err });
-                };
-                processed += 1;
-            }
-        }
-
-        // Move to next chunk
-        chunk_from += chunk_size;
-
-        // Gradually increase chunk size back toward max after success (+25%, min +500)
-        if (chunk_size < BACKFILL_MAX_CHUNK) {
-            const increase = @max(chunk_size / 4, 500);
-            const new_size = @min(chunk_size + increase, BACKFILL_MAX_CHUNK);
-            if (new_size > chunk_size) {
-                chunk_size = new_size;
-            }
-        }
-
-        // Rate limit between chunks
-        if (chunk_from <= to_block) {
-            self.rate_limiter.acquire();
-        }
-    }
-
-    // A skipped range is a hole, not a success: report failure so the caller's
-    // ledger recording retries (and eventually parks) the target honestly. The
-    // events that DID land are keepers — handlers are idempotent, so the retry
-    // only fills the holes.
-    if (skipped_ranges > 0) {
-        std.log.warn("  Subregistry {s} backfill incomplete: {d} range(s) skipped", .{ subreg_hex, skipped_ranges });
-        return error.BackfillIncomplete;
-    }
-
-    if (processed == 0) {
-        std.log.info("  No historical events found for subregistry {s}", .{subreg_hex});
-    } else {
-        std.log.info("  Backfilled {d} historical events for subregistry {s}", .{ processed, subreg_hex });
-    }
+    _ = discovery_backfill.backfillDiscovered(self, protocol, client, kind, addrs.items, to_block);
 }
 
 /// Combined Phase 1 fetch: EthRegistry + ETHRegistrar + Datastore events in a single batch RPC call.

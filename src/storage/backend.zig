@@ -15,6 +15,7 @@ const std = @import("std");
 const Database = @import("database.zig").Database;
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
+const unicode = @import("../utils/unicode.zig");
 
 /// Max number of bound strings tracked per statement (preserves the old
 /// `Query` bound-string lifetime model: copies bound `SQLITE_STATIC` and freed
@@ -301,14 +302,36 @@ pub const Statement = struct {
 
     // ── Parameter binding ──────────────────────────────────────────────────
 
+    /// Every text bind reaches the database as valid UTF-8, whatever its source.
+    /// On-chain strings are arbitrary bytes and the contracts hash them as such,
+    /// so the indexer keeps raw bytes everywhere in memory (hash preimages,
+    /// label validation, lookups) and rewrites only here, at the storage edge:
+    /// Postgres rejects invalid UTF-8 with 22021 and, inside a batch
+    /// transaction, that one rejection aborts every later statement (25P02)
+    /// until rollback — the indexer then retries the same bytes forever.
+    /// Invalid bytes become U+FFFD so the row is stored, identically on both
+    /// backends, instead of rejected or poisoning the transaction.
+    fn sanitizedCopy(self: *Statement, value: []const u8) ![]u8 {
+        const out = try unicode.sanitizeUtf8(self.allocator, value);
+        if (out.ptr == value.ptr) return try self.allocator.dupe(u8, value);
+        std.log.warn("storage: sanitized invalid UTF-8 in a text bind ({d} bytes)", .{value.len});
+        return @constCast(out);
+    }
+
     pub fn bindText(self: *Statement, value: []const u8) !void {
-        const copy = try self.allocator.dupe(u8, value);
+        const copy = try self.sanitizedCopy(value);
         try self.trackBoundString(copy);
         try self.bindTrackedText(copy);
     }
 
-    /// Bind text with caller-guaranteed static lifetime (no copy).
+    /// Bind text with caller-guaranteed static lifetime (no copy). Invalid
+    /// UTF-8 falls back to a tracked sanitized copy.
     pub fn bindTextStatic(self: *Statement, value: []const u8) !void {
+        if (!std.unicode.utf8ValidateSlice(value)) {
+            const fixed = try self.sanitizedCopy(value);
+            try self.trackBoundString(fixed);
+            return self.bindTrackedText(fixed);
+        }
         if (!self.vtable.bindText(self.ctx, self.param_idx, value.ptr, value.len)) {
             std.log.err("Failed to bind static text parameter: {s}", .{self.vtable.lastError(self.ctx)});
             return error.BindFailed;

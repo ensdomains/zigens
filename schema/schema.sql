@@ -202,6 +202,16 @@ CREATE INDEX IF NOT EXISTS idx_names_expiry ON names(expiry);
 CREATE INDEX IF NOT EXISTS idx_names_expiry_effective ON names(expiry_effective);
 CREATE INDEX IF NOT EXISTS idx_names_registry ON names(protocol, registry);
 CREATE INDEX IF NOT EXISTS idx_names_resolver ON names(protocol, resolver);
+-- Resolver.domain picks the lowest namehash pointing at a resolver (ORDER BY
+-- namehash ASC LIMIT 1); this composite lets that pick (and its per-page batched
+-- form, one scalar subquery per resolver) stop at the first index entry instead
+-- of sorting every name on the resolver.
+CREATE INDEX IF NOT EXISTS idx_names_resolver_namehash ON names(resolver, namehash);
+-- Domain.subdomains pages read `parent_name = ? ORDER BY name, protocol LIMIT ? OFFSET ?`,
+-- per row and per page (one LATERAL page per parent on Postgres); this composite
+-- serves that order directly so a parent with millions of children costs one
+-- index range scan of the page, never a sort of every child.
+CREATE INDEX IF NOT EXISTS idx_names_parent_name_name ON names(parent_name, name, protocol);
 CREATE INDEX IF NOT EXISTS idx_names_created_block ON names(protocol, created_block);
 -- domains(first:N) defaults to ORDER BY created_at, namehash (keyset pagination
 -- tiebreak). The composite lets the planner stream the newest/oldest N rows
@@ -214,6 +224,7 @@ CREATE INDEX IF NOT EXISTS idx_names_v1_label_hash ON names(v1_label_hash);
 CREATE INDEX IF NOT EXISTS idx_names_wrapper_expiry ON names(wrapper_expiry);
 CREATE INDEX IF NOT EXISTS idx_names_registrant ON names(registrant);
 CREATE INDEX IF NOT EXISTS idx_names_parent_namehash ON names(parent_namehash);
+CREATE INDEX IF NOT EXISTS idx_names_parent_name ON names(parent_name);
 CREATE INDEX IF NOT EXISTS idx_names_is_reachable ON names(protocol, is_reachable);
 CREATE INDEX IF NOT EXISTS idx_names_registry_reachable ON names(protocol, registry, is_reachable);
 CREATE INDEX IF NOT EXISTS idx_names_is_normalized ON names(is_normalized);
@@ -621,6 +632,7 @@ CREATE INDEX IF NOT EXISTS idx_events_block_log ON events(block_number, log_inde
 CREATE INDEX IF NOT EXISTS idx_events_owner_extracted ON events (LOWER(json_extract(data, '$.owner')));
 CREATE INDEX IF NOT EXISTS idx_events_to_extracted ON events (LOWER(json_extract(data, '$.to')));
 CREATE INDEX IF NOT EXISTS idx_events_from_extracted ON events (LOWER(json_extract(data, '$.from')));
+CREATE INDEX IF NOT EXISTS idx_events_resource_extracted ON events (json_extract(data, '$.resource'));
 
 
 -- ============================================================================
@@ -671,6 +683,7 @@ CREATE INDEX IF NOT EXISTS idx_eac_roles_resource ON eac_roles(protocol, resourc
 CREATE INDEX IF NOT EXISTS idx_eac_roles_account ON eac_roles(protocol, account);
 CREATE INDEX IF NOT EXISTS idx_eac_roles_block ON eac_roles(protocol, block_number);
 CREATE INDEX IF NOT EXISTS idx_eac_roles_contract ON eac_roles(protocol, contract_address);
+CREATE INDEX IF NOT EXISTS idx_eac_roles_contract_resource ON eac_roles(protocol, contract_address, resource);
 
 
 -- ============================================================================

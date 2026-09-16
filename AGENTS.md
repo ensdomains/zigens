@@ -115,6 +115,11 @@ const arena_alloc = arena.allocator();
 
 Use the `Query` abstraction for parameterized queries, check `sql_err` after C calls, and use transactions.
 
+Any storage function whose SQL reads or writes the `names` table must start with
+`try db.namesBarrier();` — the indexer buffers V2 name inserts during bulk sync and the
+barrier lands them before the statement runs. Only the flush writers themselves
+(`names_write.insertNamesBatch`, `bulk_entities.*`) and DDL are exempt.
+
 ```zig
 const stmt = try db.prepare("SELECT * FROM names WHERE namehash = ?");
 defer stmt.finalize();

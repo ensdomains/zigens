@@ -29,10 +29,17 @@ pub fn recordAccountObservation(self: *Indexer, protocol: models.Protocol, addr:
         std.log.debug("observeAccount timestamp fetch failed: {}", .{err});
         return; // best-effort — retried on the next observation of this address
     };
-    self.database.upsertAccount(protocol, addr_hex, log.block_number, ts) catch |err| {
-        std.log.debug("upsertAccount failed: {}", .{err});
-        return; // don't cache on failure — retry on the next observation
-    };
+    if (self.bufferingEntities()) {
+        self.write_buffer.observeAccount(protocol, addr_hex, log.block_number, ts) catch |err| {
+            std.log.debug("buffering account observation failed: {}", .{err});
+            return;
+        };
+    } else {
+        self.database.upsertAccount(protocol, addr_hex, log.block_number, ts) catch |err| {
+            std.log.debug("upsertAccount failed: {}", .{err});
+            return; // don't cache on failure — retry on the next observation
+        };
+    }
     const key_copy = self.allocator.dupe(u8, key) catch return;
     self.account_obs_cache.put(key_copy, {}) catch self.allocator.free(key_copy);
 }
@@ -63,6 +70,7 @@ pub fn emitEvent(
         .data = data,
         .timestamp = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     };
+    if (name) |n| self.placeholders.noteName(n) catch {};
     try Indexer.insertEventAndNotify(self, event);
 }
 
@@ -170,16 +178,23 @@ pub fn dispatchOrdered(
     }
 }
 
-/// Collect the tokenIds of every ResolverUpdated entry and load their names
-/// rows. Best-effort: any failure (or an undecodable topic) just leaves the
-/// map unbuilt/incomplete and lookups fall back to the DB — the prefetch is
-/// never allowed to abort dispatch.
+/// Collect the token id of every entry — topics[1] for the registry and
+/// registrar events, the data-encoded id for TransferSingle — and load their
+/// names rows, so every handler's (token id, registry) lookup and every
+/// same-dispatch write-through has an entry to land in. Non-token topics
+/// only add empty entries. Best-effort: any failure (or an undecodable
+/// topic) just leaves the map unbuilt/incomplete and lookups fall back to
+/// the DB — the prefetch is never allowed to abort dispatch.
 fn buildNamePrefetch(self: *Indexer, entries: []const DispatchEntry, out: *?name_prefetch_mod.NamePrefetch) void {
     var tokens: std.ArrayList(u256) = .empty;
     defer tokens.deinit(self.allocator);
     for (entries) |entry| {
-        if (entry.handler != @as(@TypeOf(entry.handler), Indexer.handleResolverUpdated)) continue;
-        if (entry.log.topics.len < 4) continue;
+        if (entry.handler == @as(@TypeOf(entry.handler), Indexer.handleTransfer)) {
+            if (entry.log.data.len < 32) continue;
+            tokens.append(self.allocator, std.mem.readInt(u256, entry.log.data[0..32], .big)) catch return;
+            continue;
+        }
+        if (entry.log.topics.len < 2) continue;
         const tok = std.mem.readInt(u256, &entry.log.topics[1].bytes, .big);
         tokens.append(self.allocator, tok) catch return;
     }

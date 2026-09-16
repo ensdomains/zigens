@@ -205,6 +205,119 @@ pub fn getSubregistry(
     return Address.zero;
 }
 
+/// One live `(parent_registry, canonical_id) -> subregistry` row from a batch
+/// read. All fields are 0x-hex text owned by the allocator the read was given;
+/// free via `freeSubregistryRows`.
+pub const SubregistryRow = struct {
+    parent_registry: []u8,
+    canonical_id: []u8,
+    subregistry: []u8,
+};
+
+pub fn freeSubregistryRows(allocator: std.mem.Allocator, rows: []SubregistryRow) void {
+    for (rows) |r| {
+        allocator.free(r.parent_registry);
+        allocator.free(r.canonical_id);
+        allocator.free(r.subregistry);
+    }
+    allocator.free(rows);
+}
+
+/// Pairs per IN-list statement of the batch read. The pair binds are
+/// arena-static (no tracked-copy cap), so the chunk is sized for statement
+/// length: 200 pairs = 400 placeholders, under the legacy SQLite
+/// 999-parameter floor.
+const ENTRY_BATCH_CHUNK: usize = 200;
+
+/// Batched mirror of `getSubregistry` over many `(parent_registry,
+/// canonical_id)` pairs: `parent_registries[i]` pairs with `canonical_ids[i]`
+/// (both the same length). Unlike the point read, which derives the canonical
+/// id from a token id via `token_id_utils.getCanonicalId`, this takes
+/// canonical ids the caller has ALREADY derived; each is formatted to the
+/// stored `0x` + 64-hex form. Same predicate as the point read over the pair
+/// list, one statement per chunk of ENTRY_BATCH_CHUNK pairs, ordered by
+/// (parent_registry, canonical_id). The table is UNIQUE on (protocol,
+/// parent_registry, canonical_id), so a pair yields at most one row; pairs
+/// without an entry are absent (the point read answers Address.zero for
+/// them). Duplicate pairs are collapsed before chunking. Rows and the returned
+/// slice are allocated with `allocator`; free via `freeSubregistryRows`.
+pub fn getSubregistriesForPairs(
+    db: *Database,
+    protocol: models.Protocol,
+    parent_registries: []const Address,
+    canonical_ids: []const u256,
+    allocator: std.mem.Allocator,
+) ![]SubregistryRow {
+    std.debug.assert(parent_registries.len == canonical_ids.len);
+    var rows: std.ArrayList(SubregistryRow) = .empty;
+    errdefer {
+        for (rows.items) |r| {
+            allocator.free(r.parent_registry);
+            allocator.free(r.canonical_id);
+            allocator.free(r.subregistry);
+        }
+        rows.deinit(allocator);
+    }
+    if (parent_registries.len == 0) return try rows.toOwnedSlice(allocator);
+
+    const PairKey = struct { parent: [20]u8, canonical_id: u256 };
+    var seen = std.AutoHashMap(PairKey, void).init(db.allocator);
+    defer seen.deinit();
+    var unique_parents: std.ArrayList(Address) = .empty;
+    defer unique_parents.deinit(db.allocator);
+    var unique_ids: std.ArrayList(u256) = .empty;
+    defer unique_ids.deinit(db.allocator);
+    for (parent_registries, canonical_ids) |parent, canonical_id| {
+        const gop = try seen.getOrPut(.{ .parent = parent.bytes, .canonical_id = canonical_id });
+        if (gop.found_existing) continue;
+        try unique_parents.append(db.allocator, parent);
+        try unique_ids.append(db.allocator, canonical_id);
+    }
+
+    var off: usize = 0;
+    while (off < unique_parents.items.len) : (off += ENTRY_BATCH_CHUNK) {
+        const end = @min(off + ENTRY_BATCH_CHUNK, unique_parents.items.len);
+        const n = end - off;
+
+        // Declared before the Query so the hex binds outlive step (LIFO defers).
+        var scratch = std.heap.ArenaAllocator.init(db.allocator);
+        defer scratch.deinit();
+        const scratch_alloc = scratch.allocator();
+
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.appendSlice(scratch_alloc, "SELECT parent_registry, canonical_id, subregistry FROM registry_entries " ++
+            "WHERE protocol = ? AND (parent_registry, canonical_id) IN (");
+        for (0..n) |i| {
+            if (i > 0) try sql.appendSlice(scratch_alloc, ", ");
+            try sql.appendSlice(scratch_alloc, "(?, ?)");
+        }
+        try sql.appendSlice(scratch_alloc, ") ORDER BY parent_registry, canonical_id");
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        try q.bindTextStatic(protocol.toString());
+        for (unique_parents.items[off..end], unique_ids.items[off..end]) |parent, canonical_id| {
+            const parent_buf = try scratch_alloc.create([42]u8);
+            try q.bindTextStatic(parent.toHexBuf(parent_buf));
+            const canonical_buf = try scratch_alloc.create([66]u8);
+            try q.bindTextStatic(formatU256HexBuf(canonical_buf, canonical_id));
+        }
+        while (try q.step()) {
+            const parent_str = q.getTextSlice(0) orelse continue;
+            const canonical_str = q.getTextSlice(1) orelse continue;
+            const subregistry_str = q.getTextSlice(2) orelse continue;
+            const parent = try allocator.dupe(u8, parent_str);
+            errdefer allocator.free(parent);
+            const canonical = try allocator.dupe(u8, canonical_str);
+            errdefer allocator.free(canonical);
+            const subregistry = try allocator.dupe(u8, subregistry_str);
+            errdefer allocator.free(subregistry);
+            try rows.append(allocator, .{ .parent_registry = parent, .canonical_id = canonical, .subregistry = subregistry });
+        }
+    }
+    return try rows.toOwnedSlice(allocator);
+}
+
 /// BFS the descendant tree under `root` to produce the complete set of
 /// subregistry contract addresses transitively reachable from `root` via
 /// `registry_entries.subregistry` edges, including `root` itself.
@@ -359,12 +472,14 @@ pub fn setRegistriesReachability(
     block_number: u64,
     block_timestamp: i64,
 ) !u64 {
+    try db.namesBarrier();
     if (registries.len == 0) return 0;
 
-    // Multi-row names write without per-row keys: conservatively clear the
-    // whole dispatch-scoped name prefetch (rare — one cascade per
-    // SubregistryUpdated) rather than track which rows the IN-list touched.
-    db.noteNamesBulkWrite();
+    // No name-prefetch notify: this touches is_reachable / unreachable_since /
+    // updated_* only, none of which is in the prefetch projection (protocol,
+    // registry, canonical_id, namehash, name). The former on_bulk clear here
+    // dropped the whole map mid-dispatch on every repoint cascade and turned
+    // the rest of the batch's lookups into per-event round trips.
 
     // Chunked: each registry address is a tracked text bind, and Statement caps
     // tracked binds at 32 (error.TooManyBoundParams beyond that) — large
@@ -441,6 +556,7 @@ pub fn reconcileV2Reachability(
     block_number: u64,
     block_timestamp: i64,
 ) !u64 {
+    try db.namesBarrier();
     var regs: std.ArrayList(Address) = .empty;
     defer regs.deinit(allocator);
     {
@@ -474,6 +590,7 @@ pub fn markNameUnreachableByNamehash(
     block_number: u64,
     block_timestamp: i64,
 ) !void {
+    try db.namesBarrier();
     try reorg_undo.captureWhere(db, "names", "U", "protocol = ? AND namehash = ?", .{ protocol, namehash });
     var q = try Query.initCached(db,
         \\UPDATE names SET is_reachable = 0, unreachable_since = ?, updated_block = ?, updated_at = ?
