@@ -194,6 +194,7 @@ pub const EventType = enum {
 
     // Parent events
     parent_updated,
+    registry_created,
 
     // Token events
     token_regenerated,
@@ -275,6 +276,7 @@ pub const EventType = enum {
             .expiry_updated => "ExpiryUpdated",
             .commitment_made => "CommitmentMade",
             .parent_updated => "ParentUpdated",
+            .registry_created => "RegistryCreated",
             .token_regenerated => "TokenRegenerated",
             .approval => "Approval",
             .metadata_changed => "MetadataChanged",
@@ -354,6 +356,7 @@ pub const EventType = enum {
         if (std.mem.eql(u8, s, "LabelUnregistered")) return .label_unregistered;
         if (std.mem.eql(u8, s, "ExpiryUpdated")) return .expiry_updated;
         if (std.mem.eql(u8, s, "ParentUpdated")) return .parent_updated;
+        if (std.mem.eql(u8, s, "RegistryCreated")) return .registry_created;
         if (std.mem.eql(u8, s, "NameMigrated")) return .name_migrated;
         if (std.mem.eql(u8, s, "NameWrapped")) return .name_wrapped;
         if (std.mem.eql(u8, s, "NameUnwrapped")) return .name_unwrapped;

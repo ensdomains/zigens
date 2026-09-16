@@ -10,6 +10,8 @@ const names_read = @import("names_read.zig");
 
 // Registry operations
 pub const insertRegistry = names_registry.insertRegistry;
+pub const setSeededRootRegistryCreation = names_registry.setSeededRootRegistryCreation;
+pub const setSeededSubregistryCreation = names_registry.setSeededSubregistryCreation;
 pub const updateRegistryPlaceholderName = names_registry.updateRegistryPlaceholderName;
 pub const updatePlaceholderEventsByName = names_registry.updatePlaceholderEventsByName;
 pub const getRegistriesByOwner = names_registry.getRegistriesByOwner;

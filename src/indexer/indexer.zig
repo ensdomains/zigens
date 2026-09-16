@@ -540,6 +540,7 @@ pub const Indexer = struct {
     pub const handleLabelUnregistered = handlers_v2_registry.handleLabelUnregistered;
     pub const handleExpiryUpdated = handlers_v2_registry.handleExpiryUpdated;
     pub const handleParentUpdated = handlers_v2_registry.handleParentUpdated;
+    pub const handleRegistryCreated = handlers_v2_registry.handleRegistryCreated;
     pub const handleSubregistryUpdated = handlers_v2_registry.handleSubregistryUpdated;
     pub const handleResolverUpdated = handlers_v2_registry.handleResolverUpdated;
 
