@@ -70,6 +70,11 @@ pub const Tx = backend_mod.Tx;
 /// rows can never go stale: every writer in names_write.zig (plus the
 /// reachability cascades in registry_entries.zig) notifies through this hook.
 /// Callbacks must be infallible and cheap — they run inline on the write path.
+pub const NamesBarrier = struct {
+    ctx: *anyopaque,
+    flush: *const fn (ctx: *anyopaque) anyerror!void,
+};
+
 pub const NameWriteListener = struct {
     ctx: *anyopaque,
     /// insertName/insertNamesBatch: the post-upsert values of the prefetch
@@ -100,6 +105,12 @@ pub const Database = struct {
     /// Names-write observer (see NameWriteListener). Null outside the
     /// indexer's dispatch-scoped prefetch window.
     name_write_listener: ?NameWriteListener = null,
+    /// Flush barrier for buffered `names` rows (indexer/write_buffer.zig).
+    /// Armed by the indexer while V2 name inserts are buffered; every storage
+    /// function that reads or writes the names table calls `namesBarrier()`
+    /// first, so its SQL always sees exactly the rows the direct per-event path
+    /// would have written by then. Unarmed (API, replay, tests): a no-op.
+    names_barrier: ?NamesBarrier = null,
     /// SQLite page-cache size (MB) applied by dropSyncIndexes for bulk sync.
     /// Set by the indexer from Config (SYNC_CACHE_MB, .env-aware); process env
     /// still overrides inside dropSyncIndexes. Paths that never bulk-sync
@@ -235,6 +246,11 @@ pub const Database = struct {
     /// ROWID of the most recent successful INSERT on this connection.
     pub fn lastInsertId(self: *Database) i64 {
         return self.backend.vtable.lastInsertId(self.backend.ptr);
+    }
+
+    /// See `names_barrier`. Called at the top of every names-table accessor.
+    pub fn namesBarrier(self: *Database) !void {
+        if (self.names_barrier) |b| try b.flush(b.ctx);
     }
 
     pub fn noteNameUpsert(self: *Database, protocol: models.Protocol, registry: Address, canonical_id: u256, namehash: Hash, name: ?[]const u8) void {
@@ -497,6 +513,7 @@ pub const Database = struct {
     // Names module - resolver query
     pub const getNamesByResolver = names.getNamesByResolver;
     pub const getDomainByResolver = names.getDomainByResolver;
+    pub const getDomainsByResolvers = names.getDomainsByResolvers;
     pub const WrappedDomainFilters = names.WrappedDomainFilters;
     pub const getWrappedDomains = names.getWrappedDomains;
 
@@ -533,6 +550,7 @@ pub const Database = struct {
     pub const insertEventIfNew = events.insertEventIfNew;
     pub const getRecentEvents = events.getRecentEvents;
     pub const getEventsFiltered = events.getEventsFiltered;
+    pub const getEventsForNamehashesPage = events.getEventsForNamehashesPage;
     pub const getEventsByNamehash = events.getEventsByNamehash;
     pub const getEventsByDomain = events.getEventsByDomain;
     pub const insertApproval = events.insertApproval;

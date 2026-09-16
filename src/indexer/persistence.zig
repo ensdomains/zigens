@@ -130,6 +130,20 @@ pub fn insertName(self: *Indexer, name: models.Name) !void {
             break :blk n.is_reachable;
         };
     }
+    if (n.protocol == .v2 and self.bufferingEntities()) {
+        // Buffered like every other V2 entity write: the row lands in one
+        // multi-row upsert at flush (chain order), or earlier if any storage
+        // names accessor runs first (Database.names_barrier). A buffered
+        // insert supersedes pending field updates exactly as the upsert did.
+        // The prefetch learns the row now, as the direct insert's listener
+        // notify would have told it.
+        try self.write_buffer.insertName(n);
+        self.database.noteNameUpsert(n.protocol, n.registry, n.canonical_id, n.namehash, n.name);
+        return;
+    }
+    // A direct upsert supersedes any owner/resolver update still buffered
+    // for this row (burn + re-register within one batch).
+    self.write_buffer.discardPendingName(n.namehash);
     try self.database.insertName(n);
 }
 

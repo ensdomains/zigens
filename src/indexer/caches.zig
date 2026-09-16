@@ -15,6 +15,64 @@ const Hash = @import("../types/hash.zig").Hash;
 const Address = @import("../types/address.zig").Address;
 const Indexer = @import("indexer.zig").Indexer;
 
+pub const PairedName = struct {
+    namehash: Hash,
+    /// Owned by the caller (free with the indexer allocator).
+    name: ?[]u8,
+};
+
+/// names_read.getNameByTokenIdAndRegistry's (namehash, name) projection —
+/// answered from the dispatch-scoped prefetch when it is authoritative, by
+/// the DB point lookup otherwise. Every handler that keys on (token id,
+/// emitting registry) goes through here so a dispatch costs one IN-list load
+/// instead of one round trip per event.
+pub fn lookupPairedName(self: *Indexer, token_id: u256, registry: Address) !?PairedName {
+    if (self.name_prefetch) |np| {
+        switch (try np.pairedLookup(token_id, registry, self.allocator)) {
+            .unknown => {},
+            .miss => return null,
+            .hit => |hit| return .{ .namehash = hit.namehash, .name = hit.name },
+        }
+    }
+    const row = (try self.database.getNameByTokenIdAndRegistry(token_id, registry)) orelse return null;
+    var row_mut = row;
+    defer row_mut.deinit(self.allocator);
+    const name_copy: ?[]u8 = if (row_mut.name) |n| try self.allocator.dupe(u8, n) else null;
+    return .{ .namehash = row_mut.namehash, .name = name_copy };
+}
+
+/// Database.names_barrier target: land every buffered name before a storage
+/// names accessor runs. Armed by the driver for the buffered V2 window only.
+pub fn namesBarrierFlush(ctx: *anyopaque) anyerror!void {
+    const self: *Indexer = @ptrCast(@alignCast(ctx));
+    try self.write_buffer.flushNames(self.database);
+}
+
+/// Entity writes (name owner/resolver, registrations, resolver entities,
+/// accounts) are buffered under the same invariant as eac_roles: only while
+/// the reorg cursor is disarmed. See write_buffer.zig.
+pub fn bufferingEntities(self: *Indexer) bool {
+    return self.write_buffer.active and !self.reorg_arm;
+}
+
+pub fn setNameOwner(self: *Indexer, namehash: Hash, owner: Address) !void {
+    if (self.bufferingEntities()) return self.write_buffer.updateNameOwner(namehash, owner);
+    try self.database.updateNameOwner(namehash, owner);
+}
+
+pub fn setNameResolver(self: *Indexer, namehash: Hash, resolver: Address) !void {
+    if (self.bufferingEntities()) return self.write_buffer.updateNameResolver(namehash, resolver);
+    try self.database.updateNameResolver(namehash, resolver);
+}
+
+/// True when the row (protocol scope of `registry`, `namehash`) already
+/// exists for `token_id` — i.e. the registry's LabelRegistered was processed.
+pub fn registeredNameExists(self: *Indexer, token_id: u256, registry: Address, namehash: Hash) !bool {
+    const hit = (try self.lookupPairedName(token_id, registry)) orelse return false;
+    defer if (hit.name) |n| self.allocator.free(n);
+    return hit.namehash.eql(namehash);
+}
+
 /// Register a resolver as known, deduplicated in-memory: the first observation per
 /// (protocol, address) this run does the DB upsert; later observations are skipped.
 /// `known_resolvers` is membership-only (its `last_indexed_block` is never read), so

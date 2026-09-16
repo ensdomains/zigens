@@ -24,6 +24,7 @@ const NetworkHealth = @import("../utils/network_health.zig").NetworkHealth;
 const status_mod = @import("../server/status.zig");
 const IndexerStatus = status_mod.IndexerStatus;
 const reorg_undo = @import("../storage/reorg_undo.zig");
+const memstat = @import("../utils/memstat.zig");
 const ens_normalize = @import("../utils/ens_normalize.zig");
 const replay_mod = @import("replay.zig");
 const backfill_mod = @import("v1/backfill.zig");
@@ -476,6 +477,8 @@ pub fn rollbackToLastValidBlock(self: *Indexer, protocol: models.Protocol, clien
 
     std.log.warn("Rolling back {s} to block {d}", .{ protocol.toString(), rollback_to });
     try self.database.rollbackToBlock(protocol, rollback_to);
+    // Undo rows can resurrect placeholder rows the ledger already forgot.
+    self.placeholders.seed(self.database);
     // rollbackToBlock cleared the reorg_cursor row; drop the in-memory mirror so the
     // next event re-arms it (otherwise capture stays silently disabled for that block).
     self.invalidateReorgCursor();
@@ -548,6 +551,7 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
     // for the rest of the bulk sync. Armed batches re-set the cursor per block.
     reorg_undo.clearCursor(self.database, protocol) catch |err|
         std.log.warn("reorg undo-log: failed to clear cursor at sync start: {}", .{err});
+    self.placeholders.seed(self.database);
     self.invalidateReorgCursor();
 
     // Index in batches with adaptive batch sizing
@@ -636,6 +640,9 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
         blocks_indexed += batch_blocks;
         const progress = (@as(f64, @floatFromInt(blocks_indexed)) / @as(f64, @floatFromInt(total_blocks))) * 100.0;
         std.log.info("Progress: {d:.1}% ({d}/{d} blocks) - Batch {d}-{d} indexed", .{ progress, blocks_indexed, total_blocks, from_block, to_block });
+        if (memstat.rssBytes()) |rss| {
+            std.log.info("  Memory: rss {d} MB, allocator live {d} MB", .{ rss / (1024 * 1024), (memstat.liveBytes() orelse 0) / (1024 * 1024) });
+        }
 
         // --- Block-hash lineage (reorg detection) ---
         // Near the tip, store per-block (hash, parent_hash) so a reorg's fork point is
@@ -790,8 +797,13 @@ pub fn indexBlockRange(self: *Indexer, protocol: models.Protocol, client: *rpc.C
     // Steady-state polls (initial_sync_complete true) stay direct so live
     // webhook notifications keep firing per event.
     const buffer_v2_events = should_index_v2 and !self.initial_sync_complete.load(.acquire) and self.config.v2_event_buffer;
-    if (buffer_v2_events) self.write_buffer.active = true;
+    if (buffer_v2_events) {
+        self.write_buffer.active = true;
+        self.write_buffer.ledger = &self.placeholders;
+        self.database.names_barrier = .{ .ctx = self, .flush = Indexer.namesBarrierFlush };
+    }
     errdefer if (buffer_v2_events) {
+        self.database.names_barrier = null;
         self.write_buffer.active = false;
         self.write_buffer.reset();
     };
@@ -847,6 +859,7 @@ pub fn indexBlockRange(self: *Indexer, protocol: models.Protocol, client: *rpc.C
     // re-processes the batch into conflict-ignored inserts.
     if (buffer_v2_events) {
         self.write_buffer.active = false;
+        defer self.database.names_barrier = null;
         try self.write_buffer.flush(self.database);
     } else if (should_index_v2) {
         // Direct-mode twin of the flush repair: phase 1 writes datastore

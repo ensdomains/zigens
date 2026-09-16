@@ -60,6 +60,7 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("Port: {d}", .{cfg.api_port});
     std.log.info("GraphQL Max Depth: {d}", .{cfg.graphql_max_depth});
     std.log.info("GraphQL Max Cost: {d}", .{cfg.graphql_max_cost});
+    std.log.info("GraphQL Slow Query Threshold: {d} ms", .{cfg.graphql_slow_query_ms});
 
     // Read-only session pool (skip schema loading — the indexer owns writes):
     // DATABASE_POOL_SIZE independent sessions acquired per request. Sessions are
@@ -106,6 +107,7 @@ pub fn main(init: std.process.Init) !void {
     const webhook_path: ?[]const u8 = if (cfg.webhooks_enabled) cfg.webhook_db_path else null;
     var server = try api.Server.init(allocator, io, &db_pool, webhook_path, cfg.api_port, cfg.graphql_max_depth, cfg.graphql_max_cost, cfg.metrics_enabled, cfg.rate_limit_per_second, cfg.webhook_admin_username, cfg.webhook_admin_password, cfg.trusted_proxy_hops, cfg.request_timeout_ms, cfg.max_concurrent_connections, cfg.internal_admin_token, cfg.internal_rate_limit_per_second, cfg.webhooks_allow_unauthenticated);
     defer server.deinit();
+    server.graphql_handler.slow_query_threshold_us = @as(u64, cfg.graphql_slow_query_ms) * std.time.us_per_ms;
 
     // Opt-in on-chain resolution (default off). Covers primary-name verification (05)
     // and/or live Universal Resolver record fallback (06); either flag creates the shared

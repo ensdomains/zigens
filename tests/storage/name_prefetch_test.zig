@@ -196,7 +196,7 @@ test "write-through: same-dispatch registrations become map hits" {
     try testing.expectEqual(Tag.unknown, std.meta.activeTag(try np.pairedLookup(CID_UNPREFETCHED, REG_1, allocator)));
 }
 
-test "non-projection writes invalidate conservatively; bulk writes clear" {
+test "non-projection writes invalidate conservatively; keyless projection writes clear" {
     const allocator = testing.allocator;
     const database = try helpers.createTestDatabase(allocator);
     defer helpers.destroyTestDatabase(allocator, database);
@@ -219,15 +219,26 @@ test "non-projection writes invalidate conservatively; bulk writes clear" {
     try database.deleteNameByNamehash(nthHash(4));
     try testing.expectEqual(Tag.unknown, std.meta.activeTag(try np.uniqueLookup(.v1, CID_SPLIT, allocator)));
 
-    // Bulk write (reachability cascade) clears everything.
+    // The reachability cascade is a keyless multi-row write, but it touches
+    // only is_reachable / unreachable_since / updated_* — nothing in the
+    // projection — so the map stays intact and keeps answering exactly. (It
+    // used to clear everything, which turned the rest of a registration-heavy
+    // dispatch into per-event round trips after every repoint.)
     var np2 = NamePrefetch.init(allocator);
     defer np2.deinit();
     try np2.populate(database, &PREFETCH_TOKENS);
     database.name_write_listener = np2.listener();
     defer database.name_write_listener = null;
+    const entries_before = np2.by_cid.count();
     _ = try lib.storage.registry_entries.setRegistriesReachability(database, .v2, &[_]Address{REG_2}, false, 200, 1700000100);
-    try testing.expectEqual(Tag.unknown, std.meta.activeTag(try np2.pairedLookup(CID_AMBIG, REG_2, allocator)));
-    try testing.expectEqual(Tag.unknown, std.meta.activeTag(try np2.uniqueLookup(.v2, CID_SPLIT, allocator)));
+    try testing.expectEqual(entries_before, np2.by_cid.count());
+    try expectHitName(try np2.pairedLookup(CID_AMBIG, REG_2, allocator), "ambig-r2.eth", allocator);
+    const split = try np2.uniqueLookup(.v2, CID_SPLIT, allocator);
+    switch (split) {
+        .hit => |h| if (h.name) |nm| allocator.free(nm),
+        else => {},
+    }
+    try testing.expect(std.meta.activeTag(split) != Tag.unknown);
 
     // Placeholder-parent patch (names_registry) is keyless too — must clear,
     // but ONLY when it matched rows: it runs once per registration and almost
