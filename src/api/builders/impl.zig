@@ -1497,6 +1497,117 @@ fn resolverVersionHandler(ctx: *anyopaque, field: *const parser.Field, nested_ct
     return try nested_ctx.allocator.dupe(u8, "null");
 }
 
+/// Resolver nested field handler: recordId — the record this name resolves
+/// through on a record-model resolver (own, else default); null otherwise.
+fn resolverRecordIdHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    _ = field;
+    const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
+    const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+    if (try database.getEffectiveRecordId(rctx.resolver, rctx.namehash)) |id| {
+        return try std.fmt.allocPrint(nested_ctx.allocator, "\"{d}\"", .{id});
+    }
+    return try nested_ctx.allocator.dupe(u8, "null");
+}
+
+/// Resolver nested field handler: recordModel — announced by ResolverCreated.
+fn resolverRecordModelHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    _ = field;
+    const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
+    const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+    if (try database.getResolverKind(rctx.resolver)) |kind| {
+        defer database.allocator.free(kind);
+        return try nested_ctx.allocator.dupe(u8, if (std.mem.eql(u8, kind, "record")) "true" else "false");
+    }
+    return try nested_ctx.allocator.dupe(u8, "false");
+}
+
+/// Resolver nested field handler: linkedNames — every name bound to the record
+/// this name resolves through (the sharing view of a record resolver).
+fn resolverLinkedNamesHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
+    const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+    const record_id = (try database.getEffectiveRecordId(rctx.resolver, rctx.namehash)) orelse return try nested_ctx.allocator.dupe(u8, "[]");
+    const linked = try database.getLinkedNames(nested_ctx.allocator, rctx.resolver, record_id);
+    defer {
+        for (linked) |*l| l.deinit(nested_ctx.allocator);
+        nested_ctx.allocator.free(linked);
+    }
+
+    var want_name = false;
+    var want_namehash = false;
+    var want_record_id = false;
+    for (field.selections) |subfield| {
+        if (std.mem.eql(u8, subfield.name, "name")) want_name = true;
+        if (std.mem.eql(u8, subfield.name, "namehash")) want_namehash = true;
+        if (std.mem.eql(u8, subfield.name, "recordId")) want_record_id = true;
+    }
+    if (!want_name and !want_namehash and !want_record_id) {
+        want_name = true;
+        want_namehash = true;
+        want_record_id = true;
+    }
+
+    var json_buf: std.Io.Writer.Allocating = .init(nested_ctx.allocator);
+    errdefer json_buf.deinit();
+    var arr = try jw.arrayOn(&json_buf.writer);
+    for (linked) |l| {
+        var obj = try arr.beginObject();
+        if (want_name) try obj.fieldStr("name", l.name, nested_ctx.allocator);
+        if (want_namehash) {
+            const nh_hex = try l.namehash.toHex(nested_ctx.allocator);
+            defer nested_ctx.allocator.free(nh_hex);
+            try obj.fieldStr("namehash", nh_hex, nested_ctx.allocator);
+        }
+        if (want_record_id) {
+            const id_str = try std.fmt.allocPrint(nested_ctx.allocator, "{d}", .{l.record_id});
+            defer nested_ctx.allocator.free(id_str);
+            try obj.fieldStr("recordId", id_str, nested_ctx.allocator);
+        }
+        try obj.end();
+    }
+    try arr.end();
+    return try nested_ctx.allocator.dupe(u8, json_buf.written());
+}
+
+/// Resolver nested field handler: data(key) — ENSIP-24 data record as 0x-hex.
+fn resolverDataHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
+    const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+    // At-block: state-only, no fall-through (see resolverAddrHandler).
+    if (nested_ctx.at_block != null) return try nested_ctx.allocator.dupe(u8, "null");
+    var key_arg: ?[]const u8 = null;
+    for (field.arguments) |arg| {
+        if (std.mem.eql(u8, arg.name, "key") and arg.value == .string) key_arg = arg.value.string;
+    }
+    const key = key_arg orelse return try nested_ctx.allocator.dupe(u8, "null");
+    if (try database.getDataRecord(rctx.resolver, rctx.namehash, key)) |value| {
+        defer database.allocator.free(value);
+        const escaped = try json_utils.escapeString(nested_ctx.allocator, value);
+        defer nested_ctx.allocator.free(escaped);
+        return try std.fmt.allocPrint(nested_ctx.allocator, "\"{s}\"", .{escaped});
+    }
+    return try nested_ctx.allocator.dupe(u8, "null");
+}
+
+/// Resolver nested field handler: dataKeys — scalar list of data(key) keys.
+fn resolverDataKeysHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
+    if (field.selections.len > 0) return error.SubSelectionOnScalar;
+    if (nested_ctx.at_block != null) return try nested_ctx.allocator.dupe(u8, "[]");
+    const rctx: *const fields.ResolverBuildContext = @ptrCast(@alignCast(ctx));
+    const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+    const keys = try database.getDataKeys(rctx.resolver, rctx.namehash);
+    defer {
+        for (keys) |k| database.allocator.free(k);
+        database.allocator.free(keys);
+    }
+    var json: std.Io.Writer.Allocating = .init(nested_ctx.allocator);
+    errdefer json.deinit();
+    var arr = try jw.arrayOn(&json.writer);
+    for (keys) |k| try arr.itemStr(k, nested_ctx.allocator);
+    try arr.end();
+    return try json.toOwnedSlice();
+}
+
 /// Resolver entity configuration
 const ResolverBuildEntityConfig = json_builder.EntityConfig{
     .type_name = "Resolver",
@@ -1515,6 +1626,11 @@ const ResolverBuildEntityConfig = json_builder.EntityConfig{
         .{ .name = "interfaces", .handler = resolverInterfacesHandler },
         .{ .name = "aliases", .handler = resolverAliasesHandler },
         .{ .name = "version", .handler = resolverVersionHandler },
+        .{ .name = "recordId", .handler = resolverRecordIdHandler },
+        .{ .name = "recordModel", .handler = resolverRecordModelHandler },
+        .{ .name = "linkedNames", .handler = resolverLinkedNamesHandler },
+        .{ .name = "data", .handler = resolverDataHandler },
+        .{ .name = "dataKeys", .handler = resolverDataKeysHandler },
     },
 };
 

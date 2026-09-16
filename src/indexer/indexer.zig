@@ -20,6 +20,7 @@ const status_mod = @import("../server/status.zig");
 const IndexerStatus = status_mod.IndexerStatus;
 const handlers_v2_registry = @import("v2/handlers_registry.zig");
 const handlers_v2_resolver = @import("v2/handlers_resolver.zig");
+const handlers_v2_records = @import("v2/handlers_resolver_records.zig");
 const event_fetchers = @import("event_fetchers.zig");
 const v1_indexing = @import("v1/indexing.zig");
 const handlers_v1 = @import("v1/handlers.zig");
@@ -565,6 +566,21 @@ pub const Indexer = struct {
     pub const handleVersionChanged = handlers_v2_resolver.handleVersionChanged;
     pub const handleAliasChanged = handlers_v2_resolver.handleAliasChanged;
     pub const handleResolverEACRolesChanged = handlers_v2_resolver.handleResolverEACRolesChanged;
+
+    // V2 record-model resolver handlers (handlers_resolver_records.zig)
+    pub const handleDataChanged = handlers_v2_records.handleDataChanged;
+    pub const handleResolverCreated = handlers_v2_records.handleResolverCreated;
+    pub const handleLinked = handlers_v2_records.handleLinked;
+    pub const handleCleared = handlers_v2_records.handleCleared;
+    pub const handleAddressUpdated = handlers_v2_records.handleAddressUpdated;
+    pub const handleTextUpdated = handlers_v2_records.handleTextUpdated;
+    pub const handleDataUpdated = handlers_v2_records.handleDataUpdated;
+    pub const handleContenthashUpdated = handlers_v2_records.handleContenthashUpdated;
+    pub const handleABIUpdated = handlers_v2_records.handleABIUpdated;
+    pub const handleInterfaceUpdated = handlers_v2_records.handleInterfaceUpdated;
+    pub const handleNameUpdated = handlers_v2_records.handleNameUpdated;
+    pub const handleResourceArgument = handlers_v2_records.handleResourceArgument;
+    pub const handleApprovalUpdated = handlers_v2_records.handleApprovalUpdated;
 
     // V1 event handlers (extracted to handlers_v1.zig)
     pub const handleV1NewOwner = handlers_v1.handleV1NewOwner;

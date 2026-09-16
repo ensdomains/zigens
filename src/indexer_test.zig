@@ -13,6 +13,7 @@ comptime {
     _ = @import("utils/v1_names.zig");
     _ = @import("types/token_id.zig");
     _ = @import("indexer/replay.zig");
+    _ = @import("indexer/v2/handlers_resolver_records.zig");
     _ = @import("indexer/discovery_backfill.zig");
     _ = @import("indexer/placeholders.zig");
     _ = @import("indexer/write_buffer.zig");

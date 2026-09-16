@@ -13,6 +13,7 @@ pub const storage = struct {
     pub const names = @import("storage/names.zig");
     pub const events = @import("storage/events.zig");
     pub const resolvers = @import("storage/resolvers.zig");
+    pub const resolver_records = @import("storage/resolver_records.zig");
     pub const roles = @import("storage/roles.zig");
     pub const webhooks = @import("storage/webhooks.zig");
     pub const registrations = @import("storage/registrations.zig");

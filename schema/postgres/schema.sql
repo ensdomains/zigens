@@ -553,6 +553,55 @@ CREATE TABLE IF NOT EXISTS resolver_named_resources (
 
 CREATE INDEX IF NOT EXISTS idx_named_resources_resolver ON resolver_named_resources(protocol, resolver);
 
+-- Record-model resolvers (contracts-v2 IRecordResolver): Linked(recordId, node, name)
+-- binds a name's node to a record id (0 = unlinked); node 0x0 holds the resolver-wide
+-- default record. record_key is the synthetic namehash-column key the record's values
+-- are stored under in the resolver_* tables (see storage/resolver_records.zig).
+CREATE TABLE IF NOT EXISTS resolver_links (
+  protocol TEXT NOT NULL,
+  resolver TEXT NOT NULL,
+  namehash TEXT NOT NULL,
+  record_id TEXT NOT NULL,
+  record_key TEXT NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  block_number BIGINT NOT NULL,
+  transaction_hash TEXT NOT NULL,
+  log_index BIGINT NOT NULL,
+  timestamp BIGINT NOT NULL,
+  UNIQUE(protocol, resolver, namehash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_resolver_links_record ON resolver_links(resolver, record_id);
+CREATE INDEX IF NOT EXISTS idx_resolver_links_namehash ON resolver_links(namehash);
+
+-- ENSIP-24 data(key) records (DataUpdated on record resolvers, DataChanged on legacy).
+CREATE TABLE IF NOT EXISTS resolver_datas (
+  namehash TEXT NOT NULL,
+  resolver TEXT NOT NULL,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL,
+  protocol TEXT NOT NULL,
+  block_number BIGINT NOT NULL,
+  transaction_hash TEXT NOT NULL,
+  timestamp BIGINT NOT NULL,
+  UNIQUE(protocol, resolver, namehash, key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_resolver_datas_namehash ON resolver_datas(namehash);
+CREATE INDEX IF NOT EXISTS idx_resolver_datas_resolver ON resolver_datas(resolver);
+
+-- ResolverCreated(): marks a resolver as record-model ('record').
+CREATE TABLE IF NOT EXISTS resolver_kinds (
+  protocol TEXT NOT NULL,
+  resolver TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  block_number BIGINT NOT NULL,
+  transaction_hash TEXT NOT NULL,
+  log_index BIGINT NOT NULL,
+  timestamp BIGINT NOT NULL,
+  UNIQUE(protocol, resolver)
+);
+
 
 -- ============================================================================
 -- EVENTS

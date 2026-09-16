@@ -761,16 +761,46 @@ fn buildResolverJson(
                     allocator.free(rows);
                 }
                 for (rows) |*row| {
-                    if (emitted > 0) try json.appendSlice(allocator, ",");
-                    emitted += 1;
-                    var fctx = NamedResourceFieldCtx{ .protocol = proto.toString(), .row = row };
-                    const handler = FieldHandler{
-                        .handleFn = handleNamedResourceField,
-                        .context = @ptrCast(&fctx),
-                    };
-                    const row_json = try buildJsonWithFields(allocator, sel.selections, handler);
-                    defer allocator.free(row_json);
-                    try json.appendSlice(allocator, row_json);
+                    // Record-model resolvers name resources per setter ARGUMENT
+                    // (ResourceArgument); which setter(s) the resource guards is
+                    // carried by the role bits granted on it, so emit one entry
+                    // per granted kind (or the raw "argument" before any grant).
+                    var kinds_buf: [5][]const u8 = undefined;
+                    var kinds_len: usize = 0;
+                    if (std.mem.eql(u8, row.record_kind, "argument")) {
+                        const bits = database.getResourceRoleUnion(proto, resolver_addr, row.resource) catch 0;
+                        const table = [_]struct { bit: u256, kind: []const u8 }{
+                            .{ .bit = 1 << 0, .kind = "addr" },
+                            .{ .bit = 1 << 4, .kind = "text" },
+                            .{ .bit = 1 << 12, .kind = "abi" },
+                            .{ .bit = 1 << 16, .kind = "interface" },
+                            .{ .bit = 1 << 24, .kind = "data" },
+                        };
+                        for (table) |entry| {
+                            if (bits & (entry.bit | (entry.bit << 128)) != 0) {
+                                kinds_buf[kinds_len] = entry.kind;
+                                kinds_len += 1;
+                            }
+                        }
+                    }
+                    if (kinds_len == 0) {
+                        kinds_buf[0] = row.record_kind;
+                        kinds_len = 1;
+                    }
+                    for (kinds_buf[0..kinds_len]) |kind| {
+                        if (emitted > 0) try json.appendSlice(allocator, ",");
+                        emitted += 1;
+                        var derived = row.*;
+                        derived.record_kind = @constCast(kind);
+                        var fctx = NamedResourceFieldCtx{ .protocol = proto.toString(), .row = &derived };
+                        const handler = FieldHandler{
+                            .handleFn = handleNamedResourceField,
+                            .context = @ptrCast(&fctx),
+                        };
+                        const row_json = try buildJsonWithFields(allocator, sel.selections, handler);
+                        defer allocator.free(row_json);
+                        try json.appendSlice(allocator, row_json);
+                    }
                 }
             }
             try json.appendSlice(allocator, "]");

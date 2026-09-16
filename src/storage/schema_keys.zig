@@ -54,6 +54,9 @@ const conflict_keys = std.StaticStringMap([]const []const u8).initComptime(.{
     .{ "resolver_metadata", &[_][]const u8{ "protocol", "resolver" } },
     .{ "resolver_approvals", &[_][]const u8{ "protocol", "resolver", "namehash", "context", "delegate" } },
     .{ "resolver_named_resources", &[_][]const u8{ "protocol", "resolver", "resource" } },
+    .{ "resolver_links", &[_][]const u8{ "protocol", "resolver", "namehash" } },
+    .{ "resolver_datas", &[_][]const u8{ "protocol", "resolver", "namehash", "key" } },
+    .{ "resolver_kinds", &[_][]const u8{ "protocol", "resolver" } },
     .{ "reverse_records", &[_][]const u8{ "protocol", "address" } },
     .{ "unknown_labels", &[_][]const u8{ "labelhash", "parent_node" } },
     // Resolution cache — created via resolve/cache.zig `ensureSchema` (not the
@@ -72,7 +75,7 @@ pub fn conflictColsFor(table: []const u8) ?[]const []const u8 {
 }
 
 test "conflictColsFor matches every schema-derived key" {
-    // Pins all 26 entries against schema/schema.sql — the sole guard on these
+    // Pins all 29 entries against schema/schema.sql — the sole guard on these
     // keys, since SQLite ignores them and only Postgres (Phase 4) exercises them.
     const expected = .{
         .{ "sync_state", &[_][]const u8{"protocol"} },
@@ -106,6 +109,9 @@ test "conflictColsFor matches every schema-derived key" {
         .{ "resolver_metadata", &[_][]const u8{ "protocol", "resolver" } },
         .{ "resolver_approvals", &[_][]const u8{ "protocol", "resolver", "namehash", "context", "delegate" } },
         .{ "resolver_named_resources", &[_][]const u8{ "protocol", "resolver", "resource" } },
+        .{ "resolver_links", &[_][]const u8{ "protocol", "resolver", "namehash" } },
+        .{ "resolver_datas", &[_][]const u8{ "protocol", "resolver", "namehash", "key" } },
+        .{ "resolver_kinds", &[_][]const u8{ "protocol", "resolver" } },
         .{ "reverse_records", &[_][]const u8{ "protocol", "address" } },
         .{ "unknown_labels", &[_][]const u8{ "labelhash", "parent_node" } },
         .{ "resolution_cache", &[_][]const u8{ "chain_id", "target", "selector_key", "arg_hash", "block_dep_hash" } },

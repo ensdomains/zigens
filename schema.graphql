@@ -579,6 +579,18 @@ type InterfaceRecord {
   implementer: String!
 }
 
+"""A name bound to a record on a record-model resolver (contracts-v2 IRecordResolver). Record sharing replaces aliasing: every name linked to the same record serves the same values."""
+type LinkedName {
+  """The bound name (empty for the resolver-wide default record bound to node 0x0)"""
+  name: String!
+
+  """The bound node (namehash)"""
+  namehash: String!
+
+  """The record id (decimal string; a full uint256 — SharedResolver keys records by the name's node itself)"""
+  recordId: String!
+}
+
 """A resolver alias mapping (from OwnedResolver)"""
 type Alias {
   """Source DNS name"""
@@ -644,6 +656,21 @@ type Resolver {
 
   """Current version counter (from VersionChanged events)"""
   version: Int
+
+  """Record-model resolvers (contracts-v2 IRecordResolver) key values by record, not node: the record this name resolves through — its own record, else the resolver's default record (node 0x0). Decimal string; null on legacy node-keyed resolvers or when the name is unlinked and there is no default."""
+  recordId: String
+
+  """True when the resolver announced itself as record-model (ResolverCreated)."""
+  recordModel: Boolean!
+
+  """Every name bound to the same record as this name (record sharing replaces aliasing). Empty on legacy resolvers."""
+  linkedNames: [LinkedName!]
+
+  """ENSIP-24 data(key) record as 0x-hex bytes (null if unset). From DataUpdated (record resolvers) and DataChanged (legacy)."""
+  data(key: String!): String
+
+  """All data(key) keys set on this resolver/name — a scalar list of keys, like `texts`; read values with `data(key:)`."""
+  dataKeys: [String!]
 }
 
 """A domain registration record"""
@@ -1265,7 +1292,7 @@ type ResolverDetail {
   namedResources: [NamedResourceEntry!]!
 }
 
-"""An EAC resource id and the name/record it guards on a resolver (from the Named*Resource discovery events)"""
+"""An EAC resource id and the name/record it guards on a resolver. Legacy resolvers announce it per name (Named*Resource); record-model resolvers announce it per setter ARGUMENT (ResourceArgument): `name` is then empty, `recordKey` carries the argument (text/data key, or 0x-hex for interface ids), `coinType` its integer value (coin type or ABI content type), and `recordKind` is derived from the setter roles granted on the resource — one entry per kind, or `argument` before any grant is indexed."""
 type NamedResourceEntry {
   """Protocol the association was indexed under"""
   protocol: String!

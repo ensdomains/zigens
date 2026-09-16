@@ -249,6 +249,61 @@ pub const EventSignatures = struct {
     pub const data_changed_hash: Hash = eventHash(data_changed);
 
     // ========================================================================
+    // Record-model resolver events (contracts-v2 IRecordResolver — the
+    // PermissionedResolver rewrite). Values are keyed by recordId, not node;
+    // `Linked` binds a node to a record. See storage/resolver_records.zig.
+    // ========================================================================
+
+    /// ResolverCreated()
+    pub const resolver_created = "ResolverCreated()";
+    pub const resolver_created_hash: Hash = eventHash(resolver_created);
+
+    /// Linked(uint256 indexed recordId, bytes32 indexed node, bytes name)
+    pub const linked = "Linked(uint256,bytes32,bytes)";
+    pub const linked_hash: Hash = eventHash(linked);
+
+    /// Cleared(uint256 indexed recordId)
+    pub const cleared = "Cleared(uint256)";
+    pub const cleared_hash: Hash = eventHash(cleared);
+
+    /// AddressUpdated(uint256 indexed recordId, uint256 coinType, bytes addressBytes)
+    pub const address_updated = "AddressUpdated(uint256,uint256,bytes)";
+    pub const address_updated_hash: Hash = eventHash(address_updated);
+
+    /// TextUpdated(uint256 indexed recordId, string indexed keyHash, string key, string value)
+    pub const text_updated = "TextUpdated(uint256,string,string,string)";
+    pub const text_updated_hash: Hash = eventHash(text_updated);
+
+    /// DataUpdated(uint256 indexed recordId, string indexed keyHash, string key, bytes value)
+    pub const data_updated = "DataUpdated(uint256,string,string,bytes)";
+    pub const data_updated_hash: Hash = eventHash(data_updated);
+
+    /// ContenthashUpdated(uint256 indexed recordId, bytes hash)
+    pub const contenthash_updated = "ContenthashUpdated(uint256,bytes)";
+    pub const contenthash_updated_hash: Hash = eventHash(contenthash_updated);
+
+    /// ABIUpdated(uint256 indexed recordId, uint256 indexed contentType)
+    pub const abi_updated = "ABIUpdated(uint256,uint256)";
+    pub const abi_updated_hash: Hash = eventHash(abi_updated);
+
+    /// InterfaceUpdated(uint256 indexed recordId, bytes4 indexed interfaceId, address implementer)
+    pub const interface_updated = "InterfaceUpdated(uint256,bytes4,address)";
+    pub const interface_updated_hash: Hash = eventHash(interface_updated);
+
+    /// NameUpdated(uint256 indexed recordId, string primaryName)
+    pub const name_updated = "NameUpdated(uint256,string)";
+    pub const name_updated_hash: Hash = eventHash(name_updated);
+
+    /// ResourceArgument(uint256 indexed resource, bytes arg)
+    pub const resource_argument = "ResourceArgument(uint256,bytes)";
+    pub const resource_argument_hash: Hash = eventHash(resource_argument);
+
+    /// ApprovalUpdated(uint256 indexed recordId, address indexed owner, address indexed operator, bool approved)
+    /// SharedResolver (ISharedResolver) per-record operator approval.
+    pub const approval_updated = "ApprovalUpdated(uint256,address,address,bool)";
+    pub const approval_updated_hash: Hash = eventHash(approval_updated);
+
+    // ========================================================================
     // ENS Temporary Registrar events (Pre-V1 Migration, May 2017 - May 2019)
     // Address: 0x6090A6e47849629b7245Dfa1Ca21D94cd15878Ef
     // Deployed: Block 3327417 (May 2017)

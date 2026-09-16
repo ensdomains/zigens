@@ -218,6 +218,22 @@ pub const EventType = enum {
     // OwnedResolver events
     version_changed,
     alias_changed,
+    // Legacy node-keyed `data(key)` record (IDataResolver.DataChanged)
+    data_changed,
+    // Record-model resolver events (contracts-v2 IRecordResolver): values are
+    // keyed by recordId; `linked` binds a node to a record, `cleared` drops one.
+    resolver_created,
+    linked,
+    cleared,
+    address_updated,
+    text_updated,
+    data_updated,
+    contenthash_updated,
+    abi_updated,
+    interface_updated,
+    name_updated,
+    resource_argument,
+    approval_updated,
 
     // V1 → V2 migration: emitted on the V1 row when a token transfers to a
     // MigrationController. Distinct from `name_registered`/`label_registered`
@@ -273,6 +289,19 @@ pub const EventType = enum {
             .eac_roles_changed => "EACRolesChanged",
             .version_changed => "VersionChanged",
             .alias_changed => "AliasChanged",
+            .data_changed => "DataChanged",
+            .resolver_created => "ResolverCreated",
+            .linked => "Linked",
+            .cleared => "Cleared",
+            .address_updated => "AddressUpdated",
+            .text_updated => "TextUpdated",
+            .data_updated => "DataUpdated",
+            .contenthash_updated => "ContenthashUpdated",
+            .abi_updated => "ABIUpdated",
+            .interface_updated => "InterfaceUpdated",
+            .name_updated => "NameUpdated",
+            .resource_argument => "ResourceArgument",
+            .approval_updated => "ApprovalUpdated",
             .name_migrated => "NameMigrated",
             .name_wrapped => "NameWrapped",
             .name_unwrapped => "NameUnwrapped",
@@ -307,6 +336,19 @@ pub const EventType = enum {
         if (std.mem.eql(u8, s, "EACRolesChanged")) return .eac_roles_changed;
         if (std.mem.eql(u8, s, "VersionChanged")) return .version_changed;
         if (std.mem.eql(u8, s, "AliasChanged")) return .alias_changed;
+        if (std.mem.eql(u8, s, "DataChanged")) return .data_changed;
+        if (std.mem.eql(u8, s, "ResolverCreated")) return .resolver_created;
+        if (std.mem.eql(u8, s, "Linked")) return .linked;
+        if (std.mem.eql(u8, s, "Cleared")) return .cleared;
+        if (std.mem.eql(u8, s, "AddressUpdated")) return .address_updated;
+        if (std.mem.eql(u8, s, "TextUpdated")) return .text_updated;
+        if (std.mem.eql(u8, s, "DataUpdated")) return .data_updated;
+        if (std.mem.eql(u8, s, "ContenthashUpdated")) return .contenthash_updated;
+        if (std.mem.eql(u8, s, "ABIUpdated")) return .abi_updated;
+        if (std.mem.eql(u8, s, "InterfaceUpdated")) return .interface_updated;
+        if (std.mem.eql(u8, s, "NameUpdated")) return .name_updated;
+        if (std.mem.eql(u8, s, "ResourceArgument")) return .resource_argument;
+        if (std.mem.eql(u8, s, "ApprovalUpdated")) return .approval_updated;
         if (std.mem.eql(u8, s, "LabelRegistered")) return .label_registered;
         if (std.mem.eql(u8, s, "LabelReserved")) return .label_reserved;
         if (std.mem.eql(u8, s, "LabelUnregistered")) return .label_unregistered;

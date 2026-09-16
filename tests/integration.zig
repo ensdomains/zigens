@@ -1928,3 +1928,46 @@ test "reorg undo-log: key-scoped resolver text delete and created_block lowering
     // created-after delete removed it — rollback ≡ clean-sync-at-150.
     try testing.expect((try database.getNameByNamehash(n.namehash)) == null);
 }
+
+test "reorg undo-log: resolver_links re-link reversed and post-N link removed (record resolvers)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try testDb(allocator);
+    defer database.deinit();
+
+    const carol = try namehash(allocator, "carol.eth");
+    const erin = try namehash(allocator, "erin.eth");
+    const resolver = try Address.fromHex("0x00000000000000000000000000000000000000dd");
+    const tx = try Hash.fromHex("0x0000000000000000000000000000000000000000000000000000000000000abc");
+    const record_model = lib.storage.resolver_records;
+
+    // Block 100: carol -> record 1 with url "one".
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 100);
+    try database.upsertResolverLink(.v2, resolver, carol, 1, "carol.eth", 100, tx, 0, 1700000100);
+    try database.storeResolverText(record_model.recordKey(1), resolver, "url", "one", .v2, 100, tx, 1700000100);
+
+    // Block 200: carol re-linked to record 2 (overwrite of a pre-N row), erin newly
+    // linked (post-N insert), record 2 gets url "two".
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
+    try database.upsertResolverLink(.v2, resolver, carol, 2, "carol.eth", 200, tx, 1, 1700000200);
+    try database.upsertResolverLink(.v2, resolver, erin, 1, "erin.eth", 200, tx, 2, 1700000200);
+    try database.storeResolverText(record_model.recordKey(2), resolver, "url", "two", .v2, 200, tx, 1700000200);
+    {
+        const cur = (try database.getTextRecord(resolver, carol, "url")).?;
+        defer allocator.free(cur);
+        try testing.expectEqualStrings("two", cur);
+        try testing.expectEqual(@as(?u256, 1), try database.getEffectiveRecordId(resolver, erin));
+    }
+
+    // Reorg to 150: carol's link is restored to record 1, erin's link and record 2's
+    // value are gone, and the read path follows the restored link.
+    try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
+    try testing.expectEqual(@as(?u256, 1), try database.getEffectiveRecordId(resolver, carol));
+    try testing.expectEqual(@as(?u256, null), try database.getEffectiveRecordId(resolver, erin));
+    const restored = (try database.getTextRecord(resolver, carol, "url")) orelse return error.RecordVanished;
+    defer allocator.free(restored);
+    try testing.expectEqualStrings("one", restored);
+    std.debug.print("✓ resolver_links re-link reversed and post-N link removed on reorg\n", .{});
+}
