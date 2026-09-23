@@ -1,4 +1,6 @@
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
+const shutdown = @import("shutdown.zig");
 
 /// Network health checker - waits for network connectivity before continuing
 pub const NetworkHealth = struct {
@@ -16,18 +18,19 @@ pub const NetworkHealth = struct {
         };
     }
 
-    /// Wait until network is healthy, logging status periodically
-    /// This never returns an error - it waits indefinitely until connection is restored
+    /// Wait until network is healthy, logging status periodically.
+    /// Waits indefinitely for connectivity, but returns early on graceful
+    /// shutdown — callers re-check their stop condition immediately after.
     pub fn waitForHealthy(self: *NetworkHealth) void {
         var consecutive_failures: u32 = 0;
         var logged_waiting = false;
 
-        while (true) {
+        while (!shutdown.isRequested()) {
             if (self.checkConnection()) {
                 if (logged_waiting) {
                     std.log.info("✓ Network connection restored, resuming operations", .{});
                 }
-                self.last_check = std.time.timestamp();
+                self.last_check = zsys.timestamp();
                 return;
             } else {
                 consecutive_failures += 1;
@@ -43,7 +46,7 @@ pub const NetworkHealth = struct {
                 // Wait before next check (exponential backoff up to 10 seconds)
                 const wait_ms = @min(self.check_interval_ms * @as(u64, @intCast(@min(consecutive_failures, 10))), 10000);
                 const wait_ns = wait_ms * @as(u64, std.time.ns_per_ms);
-                std.Thread.sleep(wait_ns);
+                if (shutdown.sleepInterruptible(wait_ns)) return;
             }
         }
     }
@@ -56,25 +59,16 @@ pub const NetworkHealth = struct {
     /// is broken. That false-positive caused the indexer to flap between
     /// "network restored, continuing..." and "network error detected, waiting..."
     /// because the TCP check passed but the next real RPC call still failed
-    /// (`error.WriteFailed`).
+    /// (`error.WriteFailed`). (The 0.15-era DNS/TCP preflight is gone with std.net;
+    /// the fetch below is the one real check.)
     fn checkConnection(self: *NetworkHealth) bool {
-        // 1) Cheap pre-flight: TCP-resolve the host. Bails fast on hard outages
-        //    (no DNS / no route to host) without paying for a full HTTPS handshake.
-        const uri = std.Uri.parse(self.rpc_url) catch return false;
-        const port: u16 = uri.port orelse if (std.mem.startsWith(u8, self.rpc_url, "https")) 443 else 80;
-        const host = uri.host orelse return false;
+        // Per-call event loop: checkConnection is a cold path (only runs while the
+        // network is already down), so a throwaway Threaded per check is fine and
+        // keeps io out of the public API.
+        var threaded = std.Io.Threaded.init(self.allocator, .{});
+        defer threaded.deinit();
 
-        const address_list = std.net.getAddressList(self.allocator, host.percent_encoded, port) catch return false;
-        defer address_list.deinit();
-        if (address_list.addrs.len == 0) return false;
-
-        const stream = std.net.tcpConnectToAddress(address_list.addrs[0]) catch return false;
-        stream.close();
-
-        // 2) Real check: post a tiny JSON-RPC request and require a 2xx response with
-        //    a non-empty body. This exercises the same path the indexer's `eth_getLogs`
-        //    calls take, so a passing check actually predicts the next call will work.
-        var client = std.http.Client{ .allocator = self.allocator };
+        var client = std.http.Client{ .allocator = self.allocator, .io = threaded.io() };
         defer client.deinit();
 
         const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_blockNumber\",\"params\":[]}";
@@ -89,6 +83,9 @@ pub const NetworkHealth = struct {
             .extra_headers = &[_]std.http.Header{
                 .{ .name = "Content-Type", .value = "application/json" },
             },
+            // Identity-only, like rpc/client.zig: keep the health probe off the flate
+            // decompressor path entirely (see executeHttpRequest there).
+            .headers = .{ .accept_encoding = .{ .override = "identity" } },
             .response_writer = &response_buf.writer,
             .keep_alive = false,
         }) catch return false;

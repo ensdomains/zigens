@@ -6,7 +6,7 @@ This file provides guidelines for agentic coding agents working on this codebase
 
 ENSv2 Indexer is a high-performance Ethereum Name Service indexer written in Zig. It indexes both ENS V1 (legacy) and ENS V2 (new) contract events on Ethereum, provides a GraphQL API, and supports webhooks.
 
-- **Language**: Zig 0.15.1+
+- **Language**: Zig 0.16.0+
 - **Database**: SQLite
 - **Build System**: Zig build
 
@@ -114,6 +114,11 @@ const arena_alloc = arena.allocator();
 ### SQLite Patterns
 
 Use the `Query` abstraction for parameterized queries, check `sql_err` after C calls, and use transactions.
+
+Any storage function whose SQL reads or writes the `names` table must start with
+`try db.namesBarrier();` — the indexer buffers V2 name inserts during bulk sync and the
+barrier lands them before the statement runs. Only the flush writers themselves
+(`names_write.insertNamesBatch`, `bulk_entities.*`) and DDL are exempt.
 
 ```zig
 const stmt = try db.prepare("SELECT * FROM names WHERE namehash = ?");

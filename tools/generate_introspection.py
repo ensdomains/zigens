@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import unittest
 from dataclasses import dataclass, field
@@ -542,10 +543,32 @@ def main() -> None:
 
     introspection = parse_graphql_schema(schema_text)
 
-    with open(sys.argv[2], "w") as f:
-        json.dump(introspection, f, indent=2)
+    # Defensive write: some filesystems (e.g. virtiofs mounts) can intermittently corrupt large
+    # writes (a NUL byte at a 32 KiB block boundary), which would make Zig's strict
+    # `@embedFile` JSON parser reject the introspection at startup. Write, read back, and
+    # verify it round-trips as valid NUL-free JSON; retry a few times before failing loud.
+    payload = json.dumps(introspection, indent=2)
+    out_path = sys.argv[2]
+    verified = False
+    for _ in range(5):
+        with open(out_path, "w") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        with open(out_path, "rb") as f:
+            written = f.read()
+        if b"\x00" not in written:
+            try:
+                json.loads(written.decode("utf-8"))
+                verified = True
+                break
+            except ValueError:
+                pass
+    if not verified:
+        sys.stderr.write("generate_introspection: output failed NUL/JSON verification after retries\n")
+        sys.exit(1)
 
-    print(f"\u2705 Generated introspection: {sys.argv[2]}")
+    print(f"\u2705 Generated introspection: {out_path}")
 
 
 if __name__ == "__main__":

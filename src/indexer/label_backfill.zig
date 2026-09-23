@@ -1,8 +1,8 @@
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const ens_name = @import("../utils/ens_name.zig");
 const rpc = @import("../rpc/client.zig");
 const db_module = @import("../storage/database.zig");
-const c = db_module.c;
 const unknown_labels_storage = @import("../storage/unknown_labels.zig");
 const v1_names = @import("../utils/v1_names.zig");
 const CalldataDecoder = @import("../utils/calldata_decoder.zig").CalldataDecoder;
@@ -10,14 +10,10 @@ const Hash = @import("../types/hash.zig").Hash;
 const Address = @import("../types/address.zig").Address;
 const models = @import("../types/models.zig");
 const names_storage = @import("../storage/names.zig");
+const ens_normalize = @import("../utils/ens_normalize.zig");
 const Rainbow = @import("../rainbow/rainbow.zig").Rainbow;
 const constants = @import("../constants.zig");
 const Keccak256 = std.crypto.hash.sha3.Keccak256;
-
-// SQLITE_TRANSIENT constant
-inline fn SQLITE_TRANSIENT() c.sqlite3_destructor_type {
-    return null;
-}
 
 /// Backfill unknown subdomain labels by fetching transaction calldata
 /// and extracting label text from setSubnode* function calls
@@ -63,7 +59,7 @@ pub const LabelBackfill = struct {
             // Get batch of unknown labels (query already excludes attempts >= 3)
             const unknown_labels = try unknown_labels_storage.getUnknownLabelsForBackfill(
                 self.allocator,
-                self.database.db.?,
+                self.database,
                 BATCH_SIZE,
             );
             defer {
@@ -88,12 +84,12 @@ pub const LabelBackfill = struct {
             // Inter-batch sleep to be kind to the RPC provider. Skip on the
             // last iteration (loop is about to exit anyway).
             if (iteration + 1 < MAX_ITERATIONS) {
-                std.Thread.sleep(INTER_BATCH_DELAY_MS * std.time.ns_per_ms);
+                zsys.sleep(INTER_BATCH_DELAY_MS * std.time.ns_per_ms);
             }
         }
 
         if (iteration >= MAX_ITERATIONS) {
-            const remaining = unknown_labels_storage.getUnknownLabelCount(self.database.db.?) catch 0;
+            const remaining = unknown_labels_storage.getUnknownLabelCount(self.database) catch 0;
             std.log.info(
                 "Reached MAX_ITERATIONS ({d}) for unknown-label backfill; {d} labels still pending (attempts<3). Will resume on next sync cycle.",
                 .{ MAX_ITERATIONS, remaining },
@@ -136,13 +132,13 @@ pub const LabelBackfill = struct {
                     std.log.warn("Failed to create addr.reverse name for labelhash={s}: {}", .{ label.labelhash, err });
                 };
 
-                try unknown_labels_storage.deleteUnknownLabel(self.database.db.?, label.id);
+                try unknown_labels_storage.deleteUnknownLabel(self.database, label.id);
                 resolved_count += 1;
             } else {
                 // Owner address didn't match — mark as failed (no point retrying via RPC)
-                unknown_labels_storage.incrementBackfillAttempt(self.database.db.?, label.id) catch {};
-                unknown_labels_storage.incrementBackfillAttempt(self.database.db.?, label.id) catch {};
-                unknown_labels_storage.incrementBackfillAttempt(self.database.db.?, label.id) catch {};
+                unknown_labels_storage.incrementBackfillAttempt(self.database, label.id) catch {};
+                unknown_labels_storage.incrementBackfillAttempt(self.database, label.id) catch {};
+                unknown_labels_storage.incrementBackfillAttempt(self.database, label.id) catch {};
             }
         }
 
@@ -178,7 +174,7 @@ pub const LabelBackfill = struct {
                     };
 
                     // Delete from unknown_labels (successfully resolved)
-                    try unknown_labels_storage.deleteUnknownLabel(self.database.db.?, label.id);
+                    try unknown_labels_storage.deleteUnknownLabel(self.database, label.id);
 
                     resolved_count += 1;
                 }
@@ -187,26 +183,21 @@ pub const LabelBackfill = struct {
 
         // STEP 2: For remaining unknown labels, try calldata decoding
         // Collect labels still needing resolution (skip addr.reverse — already handled)
-        var remaining_labels: std.ArrayList(unknown_labels_storage.UnknownLabel) = .{};
+        var remaining_labels: std.ArrayList(unknown_labels_storage.UnknownLabel) = .empty;
         defer remaining_labels.deinit(self.allocator);
 
         for (unknown_labels) |label| {
             // Skip addr.reverse entries (already resolved or marked failed in step 0)
             if (std.mem.eql(u8, label.parent_node, addr_reverse_hex)) continue;
 
-            // Check if this label was already resolved by rainbow
-            const exists_query = "SELECT COUNT(*) FROM unknown_labels WHERE id = ?";
-            var stmt: ?*c.sqlite3_stmt = null;
-            const rc = c.sqlite3_prepare_v2(self.database.db.?, exists_query.ptr, @intCast(exists_query.len), &stmt, null);
-            if (rc == c.SQLITE_OK) {
-                _ = c.sqlite3_bind_int64(stmt.?, 1, label.id);
-                if (c.sqlite3_step(stmt.?) == c.SQLITE_ROW) {
-                    const count = c.sqlite3_column_int64(stmt.?, 0);
-                    if (count > 0) {
-                        try remaining_labels.append(self.allocator, label);
-                    }
+            // Check if this label was already resolved by rainbow (best-effort).
+            var q = db_module.Query.init(self.database, "SELECT COUNT(*) FROM unknown_labels WHERE id = ?") catch continue;
+            defer q.deinit();
+            q.bindInt64(label.id) catch continue;
+            if (q.step() catch false) {
+                if (q.getInt64(0) > 0) {
+                    try remaining_labels.append(self.allocator, label);
                 }
-                _ = c.sqlite3_finalize(stmt);
             }
         }
 
@@ -229,7 +220,7 @@ pub const LabelBackfill = struct {
             std.log.err("Failed to fetch transactions batch: {}", .{err});
             // Increment attempt counters for remaining labels
             for (remaining_labels.items) |label| {
-                unknown_labels_storage.incrementBackfillAttempt(self.database.db.?, label.id) catch {};
+                unknown_labels_storage.incrementBackfillAttempt(self.database, label.id) catch {};
             }
             return resolved_count;
         };
@@ -248,7 +239,7 @@ pub const LabelBackfill = struct {
             // This tries both direct setSubnode calls and multicall patterns
             const maybe_label_text = CalldataDecoder.decodeLabelFromCalldata(self.allocator, tx.input) catch |err| {
                 std.log.warn("Failed to decode calldata for tx {s}: {}", .{ label.transaction_hash, err });
-                try unknown_labels_storage.incrementBackfillAttempt(self.database.db.?, label.id);
+                try unknown_labels_storage.incrementBackfillAttempt(self.database, label.id);
                 continue;
             };
 
@@ -276,7 +267,7 @@ pub const LabelBackfill = struct {
                 };
 
                 // Delete from unknown_labels (successfully resolved)
-                try unknown_labels_storage.deleteUnknownLabel(self.database.db.?, label.id);
+                try unknown_labels_storage.deleteUnknownLabel(self.database, label.id);
 
                 resolved_count += 1;
             } else {
@@ -285,7 +276,7 @@ pub const LabelBackfill = struct {
                     label.transaction_hash,
                     label.labelhash,
                 });
-                try unknown_labels_storage.incrementBackfillAttempt(self.database.db.?, label.id);
+                try unknown_labels_storage.incrementBackfillAttempt(self.database, label.id);
             }
         }
 
@@ -330,51 +321,12 @@ pub const LabelBackfill = struct {
         label_text: []const u8,
         unknown_label: unknown_labels_storage.UnknownLabel,
     ) !void {
-        const namehash = try Hash.fromHex(unknown_label.namehash);
-
-        // Check if name exists — it should, since handleV1NewOwner now creates records inline
-        if (try names_storage.getNameByNamehash(self.database, namehash)) |existing| {
-            var existing_mut = existing;
-            defer existing_mut.deinit(self.allocator);
-
-            // Only heal if the label is still in [labelhash] notation
-            const needs_heal = existing.label != null and existing.label.?[0] == '[';
-            if (!needs_heal) return; // Already has a real label
-
-            // Look up parent name to reconstruct full name
-            const parent_namehash = try Hash.fromHex(unknown_label.parent_node);
-            var parent_name_str: ?[]const u8 = null;
-            var parent_record_to_free: ?models.Name = null;
-            defer if (parent_record_to_free) |*pr| pr.deinit(self.allocator);
-
-            if (parent_namehash.eql(constants.WellKnown.root_namehash)) {
-                // Genuine root child (a TLD): bare label, no suffix.
-                parent_name_str = ens_name.ROOT_PARENT;
-            } else if (try names_storage.getNameByNamehash(self.database, parent_namehash)) |parent_record| {
-                parent_record_to_free = parent_record;
-                parent_name_str = parent_record.name;
-            } else {
-                // Parent absent and not root: joining against an empty parent
-                // would mint a root-level name ('foo') inconsistent with this
-                // row's namehash (= namehash('foo.<parent>')). Leave the
-                // [labelhash] placeholder for a later heal once the parent is
-                // indexed, rather than write a wrong name.
-                std.log.debug("Skipping label heal for '{s}': parent {s} not yet indexed", .{ label_text, unknown_label.parent_node });
-                return;
-            }
-
-            const full_name = try ens_name.join(self.allocator, label_text, parent_name_str);
-            defer self.allocator.free(full_name);
-
-            try names_storage.updateNameLabel(self.database, .v1, namehash, label_text, full_name);
-            std.log.debug("Healed subdomain label: {s}", .{full_name});
-        }
-        // If name doesn't exist (shouldn't happen with new indexing), skip silently
+        return healSubdomainLabel(self.allocator, self.database, label_text, unknown_label);
     }
 
     /// Get statistics about unknown labels
     pub fn getStats(self: *LabelBackfill) !BackfillStats {
-        const total = try unknown_labels_storage.getUnknownLabelCount(self.database.db.?);
+        const total = try unknown_labels_storage.getUnknownLabelCount(self.database);
 
         // Get count by attempt ranges
         const query =
@@ -385,23 +337,15 @@ pub const LabelBackfill = struct {
             \\FROM unknown_labels
         ;
 
-        var stmt: ?*c.sqlite3_stmt = null;
-        const rc = c.sqlite3_prepare_v2(self.database.db.?, query.ptr, @intCast(query.len), &stmt, null);
-        if (rc != c.SQLITE_OK) {
-            return error.DatabaseError;
-        }
-        defer _ = c.sqlite3_finalize(stmt);
-
-        const step_rc = c.sqlite3_step(stmt);
-        if (step_rc != c.SQLITE_ROW) {
-            return error.DatabaseError;
-        }
+        var q = db_module.Query.init(self.database, query) catch return error.DatabaseError;
+        defer q.deinit();
+        if (!(q.step() catch return error.DatabaseError)) return error.DatabaseError;
 
         return BackfillStats{
             .total = total,
-            .pending = @intCast(c.sqlite3_column_int64(stmt, 0)),
-            .retrying = @intCast(c.sqlite3_column_int64(stmt, 1)),
-            .failed = @intCast(c.sqlite3_column_int64(stmt, 2)),
+            .pending = @intCast(q.getInt64(0)),
+            .retrying = @intCast(q.getInt64(1)),
+            .failed = @intCast(q.getInt64(2)),
         };
     }
 };
@@ -412,3 +356,47 @@ pub const BackfillStats = struct {
     retrying: u64,
     failed: u64,
 };
+
+/// Materialize a previously-unknown subdomain label onto its name record once the
+/// plaintext label becomes known — from the rainbow table or an on-chain LabelStore
+/// `Label` event. The protocol is taken from the existing name row, so both V1 and V2
+/// names heal. No-op if the name is absent, already has a real label, or its parent
+/// is not indexed yet (leaves the `[labelhash]` placeholder for a later heal).
+pub fn healSubdomainLabel(
+    allocator: std.mem.Allocator,
+    database: *db_module.Database,
+    label_text: []const u8,
+    unknown_label: unknown_labels_storage.UnknownLabel,
+) !void {
+    const namehash = try Hash.fromHex(unknown_label.namehash);
+
+    if (try names_storage.getNameByNamehash(database, namehash)) |existing| {
+        var existing_mut = existing;
+        defer existing_mut.deinit(allocator);
+
+        const needs_heal = existing.label != null and existing.label.?[0] == '[';
+        if (!needs_heal) return;
+
+        const parent_namehash = try Hash.fromHex(unknown_label.parent_node);
+        var parent_name_str: ?[]const u8 = null;
+        var parent_record_to_free: ?models.Name = null;
+        defer if (parent_record_to_free) |*pr| pr.deinit(allocator);
+
+        if (parent_namehash.eql(constants.WellKnown.root_namehash)) {
+            parent_name_str = ens_name.ROOT_PARENT;
+        } else if (try names_storage.getNameByNamehash(database, parent_namehash)) |parent_record| {
+            parent_record_to_free = parent_record;
+            parent_name_str = parent_record.name;
+        } else {
+            std.log.debug("Skipping label heal for '{s}': parent {s} not yet indexed", .{ label_text, unknown_label.parent_node });
+            return;
+        }
+
+        const full_name = try ens_name.join(allocator, label_text, parent_name_str);
+        defer allocator.free(full_name);
+
+        const is_norm = ens_normalize.nameIsNormalized(allocator, full_name);
+        try names_storage.updateNameLabel(database, existing.protocol, namehash, label_text, full_name, is_norm);
+        std.log.debug("Healed subdomain label: {s}", .{full_name});
+    }
+}

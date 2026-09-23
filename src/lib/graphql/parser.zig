@@ -178,19 +178,28 @@ pub const Lexer = struct {
         const start = self.pos;
         self.pos += 1; // Skip opening "
 
-        while (self.pos < self.source.len and self.source[self.pos] != '"') {
-            if (self.source[self.pos] == '\\') {
-                self.pos += 1; // Skip escape char
+        var closed = false;
+        while (self.pos < self.source.len) {
+            const c = self.source[self.pos];
+            if (c == '"') {
+                self.pos += 1; // consume closing "
+                closed = true;
+                break;
+            }
+            if (c == '\\') {
+                // Escape: skip the backslash AND the escaped byte, but never past
+                // end — a trailing lone backslash must not advance out of bounds.
+                self.pos += 1;
+                if (self.pos >= self.source.len) break;
             }
             self.pos += 1;
         }
 
-        if (self.pos < self.source.len) {
-            self.pos += 1; // Skip closing "
-        }
-
+        // An unterminated string (no closing quote before EOF) is invalid input;
+        // returning .invalid makes parseValue reject it via UnexpectedToken instead
+        // of yielding a bogus .string token (and previously an out-of-bounds slice).
         return Token{
-            .type = .string,
+            .type = if (closed) .string else .invalid,
             .value = self.source[start..self.pos],
             .start = start,
             .end = self.pos,
@@ -262,6 +271,37 @@ pub const Lexer = struct {
 // AST (Abstract Syntax Tree)
 // ============================================================================
 
+pub const SourceLocation = struct {
+    line: u32,
+    column: u32,
+};
+
+/// Convert a byte offset into the 1-based line/column of GraphQL error
+/// `locations`. Treats \n, \r, and \r\n as single line terminators (GraphQL
+/// LineTerminator). Columns count Unicode code points (UTF-8 continuation
+/// bytes don't advance), matching graphql-js for all non-astral text.
+/// Offsets past the end clamp to the end of the source.
+pub fn sourceLocation(source: []const u8, offset: usize) SourceLocation {
+    const end = @min(offset, source.len);
+    var line: u32 = 1;
+    var column: u32 = 1;
+    var i: usize = 0;
+    while (i < end) : (i += 1) {
+        const byte = source[i];
+        if (byte == '\n') {
+            line += 1;
+            column = 1;
+        } else if (byte == '\r') {
+            line += 1;
+            column = 1;
+            if (i + 1 < end and source[i + 1] == '\n') i += 1;
+        } else if (byte & 0xC0 != 0x80) {
+            column += 1;
+        }
+    }
+    return .{ .line = line, .column = column };
+}
+
 pub const Value = union(enum) {
     int: i64,
     float: f64,
@@ -286,6 +326,9 @@ pub const Value = union(enum) {
                 }
                 allocator.free(obj);
             },
+            // .string is allocator-owned (parseValue decodes/dupes it). `.variable`
+            // stays a borrowed token slice, so it is NOT freed here.
+            .string => |str| allocator.free(str),
             else => {},
         }
     }
@@ -294,6 +337,7 @@ pub const Value = union(enum) {
 pub const Argument = struct {
     name: []const u8,
     value: Value,
+    pos: usize = 0, // Byte offset of the name token in the source (0 when synthesized from variables)
 
     pub fn deinit(self: *Argument, allocator: std.mem.Allocator) void {
         self.value.deinit(allocator);
@@ -320,6 +364,7 @@ pub const Field = struct {
     selections: []Field,
     fragment_spread: ?[]const u8, // If this is a fragment spread (...FragmentName), this is the fragment name
     directives: []Directive, // Field directives (e.g., @skip, @include)
+    pos: usize = 0, // Byte offset of the field's first token in the source (alias when aliased)
 
     pub fn deinit(self: *Field, allocator: std.mem.Allocator) void {
         for (self.arguments) |*arg| {
@@ -471,10 +516,124 @@ pub const Document = struct {
 // PARSER
 // ============================================================================
 
+/// Decode a GraphQL string token's escape sequences into a freshly-allocated, owned
+/// buffer. `raw` is the lexer token INCLUDING the surrounding quotes. Handles
+/// \" \\ \/ \b \f \n \r \t and \uXXXX (with UTF-16 surrogate pairs). Malformed
+/// escapes are emitted literally rather than erroring: the lexer (readString) already
+/// guaranteed a closed, in-bounds token, so this only shapes the decoded content and
+/// never reads out of bounds. The result is owned by `allocator` (freed via Value.deinit).
+fn decodeStringValue(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const inner = if (raw.len >= 2 and raw[0] == '"' and raw[raw.len - 1] == '"')
+        raw[1 .. raw.len - 1]
+    else
+        raw;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < inner.len) {
+        const c = inner[i];
+        if (c != '\\') {
+            try out.append(allocator, c);
+            i += 1;
+            continue;
+        }
+        if (i + 1 >= inner.len) { // dangling backslash
+            try out.append(allocator, '\\');
+            i += 1;
+            continue;
+        }
+        switch (inner[i + 1]) {
+            '"' => {
+                try out.append(allocator, '"');
+                i += 2;
+            },
+            '\\' => {
+                try out.append(allocator, '\\');
+                i += 2;
+            },
+            '/' => {
+                try out.append(allocator, '/');
+                i += 2;
+            },
+            'b' => {
+                try out.append(allocator, 0x08);
+                i += 2;
+            },
+            'f' => {
+                try out.append(allocator, 0x0c);
+                i += 2;
+            },
+            'n' => {
+                try out.append(allocator, '\n');
+                i += 2;
+            },
+            'r' => {
+                try out.append(allocator, '\r');
+                i += 2;
+            },
+            't' => {
+                try out.append(allocator, '\t');
+                i += 2;
+            },
+            'u' => {
+                if (i + 6 > inner.len) { // not enough hex digits
+                    try out.append(allocator, '\\');
+                    i += 1;
+                    continue;
+                }
+                const cp0 = std.fmt.parseInt(u21, inner[i + 2 .. i + 6], 16) catch {
+                    try out.append(allocator, '\\');
+                    i += 1;
+                    continue;
+                };
+                var cp: u21 = cp0;
+                var consumed: usize = 6;
+                // UTF-16 surrogate pair: high (D800-DBFF) then low (DC00-DFFF).
+                if (cp0 >= 0xD800 and cp0 <= 0xDBFF and i + 12 <= inner.len and
+                    inner[i + 6] == '\\' and inner[i + 7] == 'u')
+                {
+                    if (std.fmt.parseInt(u21, inner[i + 8 .. i + 12], 16)) |cp1| {
+                        if (cp1 >= 0xDC00 and cp1 <= 0xDFFF) {
+                            cp = 0x10000 + ((cp0 - 0xD800) << 10) + (cp1 - 0xDC00);
+                            consumed = 12;
+                        }
+                    } else |_| {}
+                }
+                var buf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(cp, &buf) catch blk: {
+                    // Lone surrogate / invalid scalar -> U+FFFD replacement char.
+                    break :blk std.unicode.utf8Encode(0xFFFD, &buf) catch unreachable;
+                };
+                try out.appendSlice(allocator, buf[0..n]);
+                i += consumed;
+            },
+            else => |e| { // unknown escape: emit the escaped char literally
+                try out.append(allocator, e);
+                i += 2;
+            },
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 pub const Parser = struct {
     lexer: Lexer,
     current_token: Token,
     allocator: std.mem.Allocator,
+    /// Current nesting depth of the recursive-descent parse. Bounded by
+    /// MAX_PARSE_DEPTH at every re-entry point of the two mutual-recursion cycles
+    /// (selection sets and input values), so a pathological deeply-nested query
+    /// cannot overflow the native thread stack before the complexity analyzer —
+    /// which only runs on the *finished* AST — ever sees it.
+    depth: u32 = 0,
+
+    /// Hard cap on parse nesting. A pure safety net far above any realistic query
+    /// and far below stack exhaustion; independent of (and larger than) the
+    /// configurable complexity max_depth, so a misconfigured high complexity limit
+    /// can never re-expose the stack-overflow crash.
+    pub const MAX_PARSE_DEPTH: u32 = 64;
 
     pub fn init(allocator: std.mem.Allocator, source: []const u8) !Parser {
         var lexer = Lexer.init(source);
@@ -487,9 +646,14 @@ pub const Parser = struct {
         };
     }
 
+    inline fn enter(self: *Parser) !void {
+        self.depth += 1;
+        if (self.depth > MAX_PARSE_DEPTH) return error.MaxParseDepthExceeded;
+    }
+
     pub fn parseDocument(self: *Parser) !Document {
-        var operations: std.ArrayList(Operation) = .{};
-        var fragments: std.ArrayList(Fragment) = .{};
+        var operations: std.ArrayList(Operation) = .empty;
+        var fragments: std.ArrayList(Fragment) = .empty;
         errdefer {
             for (operations.items) |*op| {
                 op.deinit(self.allocator);
@@ -604,7 +768,7 @@ pub const Parser = struct {
         }
         self.advance();
 
-        var definitions: std.ArrayList(VariableDefinition) = .{};
+        var definitions: std.ArrayList(VariableDefinition) = .empty;
         errdefer {
             for (definitions.items) |*def| {
                 def.deinit(self.allocator);
@@ -706,12 +870,14 @@ pub const Parser = struct {
     }
 
     fn parseSelectionSet(self: *Parser) anyerror![]Field {
+        try self.enter();
+        defer self.depth -= 1;
         if (self.current_token.type != .left_brace) {
             return error.ExpectedLeftBrace;
         }
         self.advance(); // Skip {
 
-        var fields: std.ArrayList(Field) = .{};
+        var fields: std.ArrayList(Field) = .empty;
         errdefer {
             for (fields.items) |*field| {
                 field.deinit(self.allocator);
@@ -743,6 +909,7 @@ pub const Parser = struct {
         if (self.current_token.type != .spread) {
             return error.ExpectedSpread;
         }
+        const start_pos = self.current_token.start;
         self.advance();
 
         // Check for inline fragment (... on Type { ... })
@@ -769,6 +936,7 @@ pub const Parser = struct {
                 .selections = selections,
                 .fragment_spread = null, // Not a named fragment spread
                 .directives = directives,
+                .pos = start_pos,
             };
         }
 
@@ -790,6 +958,7 @@ pub const Parser = struct {
             .selections = &.{},
             .fragment_spread = frag_name,
             .directives = directives,
+            .pos = start_pos,
         };
     }
 
@@ -798,6 +967,7 @@ pub const Parser = struct {
             return error.ExpectedFieldName;
         }
 
+        const start_pos = self.current_token.start;
         const name = self.current_token.value;
         var alias: ?[]const u8 = null;
         self.advance();
@@ -836,12 +1006,13 @@ pub const Parser = struct {
             .selections = selections,
             .fragment_spread = null,
             .directives = directives,
+            .pos = start_pos,
         };
     }
 
     /// Parse directives like @skip(if: true) or @include(if: $showDetails)
     fn parseDirectives(self: *Parser) ![]Directive {
-        var directives: std.ArrayList(Directive) = .{};
+        var directives: std.ArrayList(Directive) = .empty;
         errdefer {
             for (directives.items) |*dir| {
                 dir.deinit(self.allocator);
@@ -881,7 +1052,7 @@ pub const Parser = struct {
         }
         self.advance(); // Skip (
 
-        var arguments: std.ArrayList(Argument) = .{};
+        var arguments: std.ArrayList(Argument) = .empty;
         errdefer {
             for (arguments.items) |*arg| {
                 arg.deinit(self.allocator);
@@ -907,6 +1078,7 @@ pub const Parser = struct {
             return error.ExpectedArgumentName;
         }
 
+        const arg_pos = self.current_token.start;
         const arg_name = self.current_token.value;
         self.advance();
 
@@ -920,6 +1092,7 @@ pub const Parser = struct {
         return Argument{
             .name = arg_name,
             .value = value,
+            .pos = arg_pos,
         };
     }
 
@@ -946,14 +1119,11 @@ pub const Parser = struct {
                 return Value{ .float = val };
             },
             .string => {
-                // Remove quotes from string
-                const str = self.current_token.value;
-                const unquoted = if (str.len >= 2 and str[0] == '"' and str[str.len - 1] == '"')
-                    str[1 .. str.len - 1]
-                else
-                    str;
+                // Decode escape sequences into an owned buffer (GraphQL string values
+                // are escaped; the raw token would otherwise leak `\n` / `\uXXXX` literally).
+                const decoded = try decodeStringValue(self.allocator, self.current_token.value);
                 self.advance();
-                return Value{ .string = unquoted };
+                return Value{ .string = decoded };
             },
             .name => {
                 const val = self.current_token.value;
@@ -968,8 +1138,9 @@ pub const Parser = struct {
                     return Value{ .null_value = {} };
                 }
 
-                // Otherwise treat as enum/string
-                return Value{ .string = val };
+                // Otherwise treat as enum/string. Dupe so every Value.string is
+                // allocator-owned (uniform ownership for Value.deinit).
+                return Value{ .string = try self.allocator.dupe(u8, val) };
             },
             .left_bracket => {
                 return try self.parseListValue();
@@ -984,12 +1155,14 @@ pub const Parser = struct {
     }
 
     fn parseListValue(self: *Parser) anyerror!Value {
+        try self.enter();
+        defer self.depth -= 1;
         if (self.current_token.type != .left_bracket) {
             return error.ExpectedLeftBracket;
         }
         self.advance(); // Skip [
 
-        var items: std.ArrayList(Value) = .{};
+        var items: std.ArrayList(Value) = .empty;
         errdefer {
             for (items.items) |*item| {
                 item.deinit(self.allocator);
@@ -1011,12 +1184,14 @@ pub const Parser = struct {
     }
 
     fn parseObjectValue(self: *Parser) anyerror!Value {
+        try self.enter();
+        defer self.depth -= 1;
         if (self.current_token.type != .left_brace) {
             return error.ExpectedLeftBrace;
         }
         self.advance(); // Skip {
 
-        var fields: std.ArrayList(Argument) = .{};
+        var fields: std.ArrayList(Argument) = .empty;
         errdefer {
             for (fields.items) |*field| {
                 field.value.deinit(self.allocator);
@@ -1029,6 +1204,7 @@ pub const Parser = struct {
             if (self.current_token.type != .name) {
                 return error.ExpectedFieldName;
             }
+            const field_pos = self.current_token.start;
             const field_name = self.current_token.value;
             self.advance();
 
@@ -1044,6 +1220,7 @@ pub const Parser = struct {
             try fields.append(self.allocator, Argument{
                 .name = field_name,
                 .value = field_value,
+                .pos = field_pos,
             });
 
             // Skip optional comma
@@ -1074,6 +1251,10 @@ pub const ExecutionContext = struct {
     allocator: std.mem.Allocator,
     database: *anyopaque, // Will be cast to *Database by resolvers
     loaders: ?*anyopaque, // Will be cast to *LoaderContext by resolvers (optional for backward compatibility)
+    /// Optional live-resolution context (cast to resolve.universal.LiveContext by the
+    /// record-read handlers). Null unless RESOLVE_LIVE_ENABLED wired a resolver for this
+    /// request; when null the handlers behave exactly as before (indexed-only).
+    resolve: ?*anyopaque = null,
 };
 
 /// Result of executing a field
@@ -1187,6 +1368,7 @@ pub const Executor = struct {
                     resolved_args[i] = Argument{
                         .name = arg.name,
                         .value = try self.resolveValue(&arg.value),
+                        .pos = arg.pos,
                     };
                     resolved_count += 1;
                 }
@@ -1323,7 +1505,7 @@ pub const Executor = struct {
         self.variables = &variables_map;
         defer self.variables = null;
 
-        var response: std.ArrayList(u8) = .{};
+        var response: std.ArrayList(u8) = .empty;
         defer response.deinit(self.allocator);
 
         try response.appendSlice(self.allocator, "{\"data\":{");
@@ -1374,7 +1556,7 @@ pub const Executor = struct {
     /// Expand selections, replacing fragment spreads with actual fragment fields
     /// Also filters out fields that should be skipped due to directives (@skip, @include)
     pub fn expandSelections(self: *Executor, selections: []const Field) ![]Field {
-        var expanded: std.ArrayList(Field) = .{};
+        var expanded: std.ArrayList(Field) = .empty;
         errdefer expanded.deinit(self.allocator);
 
         for (selections) |*field| {
@@ -1414,7 +1596,7 @@ pub const Executor = struct {
     }
 
     fn executeOperation(self: *Executor, operation: *const Operation) ![]u8 {
-        var response: std.ArrayList(u8) = .{};
+        var response: std.ArrayList(u8) = .empty;
         defer response.deinit(self.allocator);
 
         // Expand fragments and filter by directives (@skip, @include)
@@ -1452,6 +1634,7 @@ pub const Executor = struct {
             resolved_args[i] = Argument{
                 .name = arg.name,
                 .value = try self.resolveValue(&arg.value),
+                .pos = arg.pos,
             };
             resolved_count += 1;
         }
@@ -1671,7 +1854,130 @@ pub fn getValueTypeName(value: Value) []const u8 {
 // UTILITY FUNCTIONS
 // ============================================================================
 
+/// Byte offset where the last `parseQuery` on this thread failed (the token
+/// the parser was looking at), or null if it succeeded. Feeds syntax-error
+/// `locations`; reset at the start of every `parseQuery`.
+threadlocal var last_syntax_error_pos: ?usize = null;
+
+pub fn lastSyntaxErrorPos() ?usize {
+    return last_syntax_error_pos;
+}
+
 pub fn parseQuery(allocator: std.mem.Allocator, query: []const u8) !Document {
+    last_syntax_error_pos = null;
     var parser = try Parser.init(allocator, query);
-    return try parser.parseDocument();
+    return parser.parseDocument() catch |err| {
+        last_syntax_error_pos = parser.current_token.start;
+        return err;
+    };
+}
+
+test "decodeStringValue decodes GraphQL escapes into owned buffer (leak-checked)" {
+    const a = std.testing.allocator;
+    const Case = struct { raw: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .raw = "\"plain\"", .want = "plain" },
+        // "a\"b"  ->  a"b   (escaped quote)
+        .{ .raw = &[_]u8{ '"', 'a', '\\', '"', 'b', '"' }, .want = &[_]u8{ 'a', '"', 'b' } },
+        // "x\\y"  ->  x\y   (escaped backslash)
+        .{ .raw = &[_]u8{ '"', 'x', '\\', '\\', 'y', '"' }, .want = &[_]u8{ 'x', '\\', 'y' } },
+        // "l\nm"  ->  l<LF>m
+        .{ .raw = &[_]u8{ '"', 'l', '\\', 'n', 'm', '"' }, .want = &[_]u8{ 'l', '\n', 'm' } },
+        // "a" -> a
+        .{ .raw = "\"\\u0061\"", .want = "a" },
+        // "🚀" -> U+1F680 rocket (surrogate pair)
+        .{ .raw = "\"\\uD83D\\uDE80\"", .want = "\u{1F680}" },
+    };
+    for (cases) |c| {
+        const got = try decodeStringValue(a, c.raw);
+        defer a.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
+}
+
+test "decodeStringValue is robust to malformed escapes (no crash, no OOB)" {
+    const a = std.testing.allocator;
+    // Invalid \u hex -> backslash emitted literally, then the rest verbatim.
+    const g1 = try decodeStringValue(a, "\"\\uZZZZ\"");
+    defer a.free(g1);
+    try std.testing.expectEqualStrings("\\uZZZZ", g1);
+    // Lone high surrogate (no low pair) -> U+FFFD replacement char.
+    const g2 = try decodeStringValue(a, "\"\\uD83D\"");
+    defer a.free(g2);
+    try std.testing.expectEqualStrings("\u{FFFD}", g2);
+    // Unknown escape -> escaped char emitted literally.
+    const g3 = try decodeStringValue(a, &[_]u8{ '"', '\\', 'q', '"' });
+    defer a.free(g3);
+    try std.testing.expectEqualStrings("q", g3);
+}
+
+test "parseValue produces an owned, unescaped string argument (full-parse leak check)" {
+    const a = std.testing.allocator;
+    // where:{ name: "a\"b" }  — the decoded name arg must be a"b, and the whole
+    // document must deinit cleanly under the testing allocator (no leak/double-free).
+    var doc = try parseQuery(a, "{ domains(where: { name: \"a\\\"b\" }) { name } }");
+    defer doc.deinit(a);
+    const op = doc.operations[0];
+    const domains_field = op.fields[0];
+    // where arg -> object -> name field value
+    for (domains_field.arguments) |arg| {
+        if (std.mem.eql(u8, arg.name, "where")) {
+            switch (arg.value) {
+                .object => |obj| for (obj) |o| {
+                    if (std.mem.eql(u8, o.name, "name")) {
+                        try std.testing.expectEqualStrings(&[_]u8{ 'a', '"', 'b' }, o.value.string);
+                    }
+                },
+                else => try std.testing.expect(false),
+            }
+        }
+    }
+}
+
+test "sourceLocation maps byte offsets to 1-based line/column" {
+    const src = "{ a }\n{ b\xc3\xa9, c }\r\nx";
+    try std.testing.expectEqual(SourceLocation{ .line = 1, .column = 1 }, sourceLocation(src, 0));
+    try std.testing.expectEqual(SourceLocation{ .line = 1, .column = 3 }, sourceLocation(src, 2));
+    try std.testing.expectEqual(SourceLocation{ .line = 2, .column = 3 }, sourceLocation(src, std.mem.indexOfScalar(u8, src, 'b').?));
+    // 'c' sits after the 2-byte e-acute: columns count code points, not bytes
+    try std.testing.expectEqual(SourceLocation{ .line = 2, .column = 7 }, sourceLocation(src, std.mem.indexOfScalar(u8, src, 'c').?));
+    // \r\n is a single line terminator
+    try std.testing.expectEqual(SourceLocation{ .line = 3, .column = 1 }, sourceLocation(src, std.mem.indexOfScalar(u8, src, 'x').?));
+    try std.testing.expectEqual(sourceLocation(src, src.len), sourceLocation(src, 9999));
+}
+
+test "parseQuery records the failure position for syntax errors" {
+    const a = std.testing.allocator;
+
+    const bad = "{ domains( } }";
+    try std.testing.expectError(error.ExpectedArgumentName, parseQuery(a, bad));
+    try std.testing.expectEqual(std.mem.indexOfScalar(u8, bad, '}').?, lastSyntaxErrorPos().?);
+
+    // Unterminated document fails at EOF; sourceLocation clamps to the end.
+    const eof = "{ domains { id }";
+    if (parseQuery(a, eof)) |doc| {
+        var d = doc;
+        d.deinit(a);
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try std.testing.expectEqual(eof.len, lastSyntaxErrorPos().?);
+
+    // A successful parse resets the thread's failure position.
+    var doc = try parseQuery(a, "{ domains { id } }");
+    doc.deinit(a);
+    try std.testing.expectEqual(@as(?usize, null), lastSyntaxErrorPos());
+}
+
+test "parser records source positions for fields, arguments, and object fields" {
+    const a = std.testing.allocator;
+    const query = "{\n  domains(first: 1, where: {name_contains: \"x\"}) {\n    id\n  }\n}";
+    var doc = try parseQuery(a, query);
+    defer doc.deinit(a);
+    const field = doc.operations[0].fields[0];
+    try std.testing.expectEqual(std.mem.indexOf(u8, query, "domains").?, field.pos);
+    try std.testing.expectEqual(std.mem.indexOf(u8, query, "first").?, field.arguments[0].pos);
+    const where_arg = field.arguments[1];
+    try std.testing.expectEqual(std.mem.indexOf(u8, query, "where").?, where_arg.pos);
+    try std.testing.expectEqual(std.mem.indexOf(u8, query, "name_contains").?, where_arg.value.object[0].pos);
+    try std.testing.expectEqual(std.mem.indexOf(u8, query, "id").?, field.selections[0].pos);
 }

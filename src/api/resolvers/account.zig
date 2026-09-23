@@ -8,6 +8,7 @@ const models = common.models;
 const Address = common.Address;
 const parser = common.parser;
 const builders = @import("../builders/builders.zig");
+const domain_resolvers = @import("domain.zig");
 
 /// Resolver for account query
 pub fn resolveAccount(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
@@ -30,6 +31,7 @@ pub fn resolveAccount(ctx: parser.ExecutionContext, field: *const parser.Field) 
         .depth = 1,
         .allocator = allocator,
         .loaders = ctx.loaders,
+        .resolve = ctx.resolve,
     });
     return parser.FieldResult{ .json = account_json };
 }
@@ -86,12 +88,17 @@ pub fn resolveAccounts(ctx: parser.ExecutionContext, field: *const parser.Field)
     defer {
         for (accounts) |*a| {
             var m = a.*;
-            m.deinit(allocator);
+            m.deinit(database.allocator);
         }
-        allocator.free(accounts);
+        database.allocator.free(accounts);
     }
 
-    var json: std.ArrayList(u8) = .{};
+    // Page-batch the nested `domains` pages + their resolver records/texts:
+    // one windowed query for the whole accounts page instead of one point
+    // query per account (the N+1 behind multi-second accounts lists).
+    domain_resolvers.prefetchDomainsForAccountsPage(database, allocator, ctx.loaders, accounts, field.selections);
+
+    var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);
     try json.appendSlice(allocator, "[");
     for (accounts, 0..) |row, i| {
@@ -102,6 +109,7 @@ pub fn resolveAccounts(ctx: parser.ExecutionContext, field: *const parser.Field)
             .depth = 0,
             .allocator = allocator,
             .loaders = ctx.loaders,
+            .resolve = null, // list context: live resolution is single-name only, never per-row
         });
         defer allocator.free(acct_json);
         try json.appendSlice(allocator, acct_json);

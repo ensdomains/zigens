@@ -255,3 +255,18 @@ test "decodeUint256Array handles two-array TransferBatch payload" {
     try std.testing.expectEqual(@as(u256, 1), values[0]);
     try std.testing.expectEqual(@as(u256, 2), values[1]);
 }
+
+test "decodeValues keeps the raw bytes of a non-UTF-8 string: the contracts hash labels as bytes" {
+    const allocator = std.testing.allocator;
+    var data: [96]u8 = [_]u8{0} ** 96;
+    data[31] = 0x20;
+    data[63] = 4;
+    @memcpy(data[64..68], "k\xEF\x58\x17");
+    const values = try decodeValues(&data, &.{.string}, allocator);
+    defer freeValues(values, allocator);
+    try std.testing.expectEqualSlices(u8, "k\xEF\x58\x17", values[0].string);
+    const hash_mod = @import("../types/hash.zig");
+    const from_decoded = try hash_mod.keccak256(allocator, values[0].string);
+    const from_chain_bytes = try hash_mod.keccak256(allocator, "k\xEF\x58\x17");
+    try std.testing.expect(from_decoded.eql(from_chain_bytes));
+}

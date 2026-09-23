@@ -2,28 +2,38 @@ const std = @import("std");
 const config = @import("config.zig");
 const api = @import("api/server.zig");
 const db = @import("storage/database.zig");
+const pool_mod = @import("storage/pool.zig");
+const shutdown = @import("utils/shutdown.zig");
 const ens_normalize = @import("ens_normalize");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     // Configure SQLite for thread safety BEFORE any other operations
-    const sqlite_result = db.c.sqlite3_config(db.c.SQLITE_CONFIG_SERIALIZED);
-    if (sqlite_result == db.c.SQLITE_OK) {
-        std.log.info("SQLite configured for serialized (thread-safe) mode", .{});
-    } else {
-        std.log.warn("Failed to configure SQLite thread safety: {d}", .{sqlite_result});
-    }
+    db.configureSqliteThreadSafety();
 
     // Use thread-safe allocator for concurrent request handling
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    const io = init.io;
 
     // Load configuration from .env
     var cfg = try config.Config.fromEnv(allocator);
     defer cfg.deinit();
 
+    // Fail-closed: refuse to boot with an ambiguous partial webhook-admin credential
+    // (exactly one of username/password set).
+    cfg.validateAuth() catch |err| {
+        std.log.err("Invalid admin auth config: {} (set BOTH WEBHOOK_ADMIN_USERNAME and WEBHOOK_ADMIN_PASSWORD, or neither)", .{err});
+        return err;
+    };
+    // CCIP-Read only works via live resolution; refuse to boot with CCIP on but live off.
+    cfg.validateResolution() catch |err| {
+        std.log.err("Invalid resolution config: {} (RESOLVE_CCIP_ENABLED requires RESOLVE_LIVE_ENABLED)", .{err});
+        return err;
+    };
+
     // Parse command line arguments (override env vars)
-    var args = std.process.args();
+    var args = init.minimal.args.iterate();
     _ = args.skip(); // Skip program name
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--port")) {
@@ -43,24 +53,49 @@ pub fn main() !void {
     }
 
     std.log.info("ENSv2 API Server starting...", .{});
-    std.log.info("Database: {s}", .{cfg.database_path});
+    switch (cfg.backend_kind) {
+        .sqlite => std.log.info("Database: sqlite {s}", .{cfg.database_path}),
+        .postgres => std.log.info("Database: postgres (via DATABASE_URL)", .{}),
+    }
     std.log.info("Port: {d}", .{cfg.api_port});
     std.log.info("GraphQL Max Depth: {d}", .{cfg.graphql_max_depth});
     std.log.info("GraphQL Max Cost: {d}", .{cfg.graphql_max_cost});
+    std.log.info("GraphQL Slow Query Threshold: {d} ms", .{cfg.graphql_slow_query_ms});
 
-    // Initialize database (read-only for API - skip schema loading)
-    var database = try db.Database.initWithoutSchema(allocator, cfg.database_path);
-    defer database.deinit();
-    database.setChainId(cfg.network.chainId());
+    // Read-only session pool (skip schema loading — the indexer owns writes):
+    // DATABASE_POOL_SIZE independent sessions acquired per request. Sessions are
+    // never shared across threads — SQLite gets N read connections to the file
+    // (:memory: pins to 1), and a single pinned pg connection is not
+    // concurrent-safe under the API's thread-per-request model.
+    var db_pool = try pool_mod.Pool.open(allocator, .{
+        .kind = cfg.backend_kind,
+        .sqlite_path = cfg.database_path,
+        .database_url = cfg.database_url,
+        .size = cfg.database_pool_size,
+        .chain_id = cfg.network.chainId(),
+    });
+    defer db_pool.deinit();
 
-    // Check database integrity
-    const integrity_ok = try database.checkIntegrity();
-    if (!integrity_ok) {
-        std.log.err("Database integrity check failed!", .{});
-        return error.DatabaseCorrupted;
+    // Liveness probe by default; API_INTEGRITY_CHECK=true restores the deep
+    // quick_check scan (minutes of full-file I/O on a mainnet-scale DB while
+    // the indexer writes — the read-only API can't act on the result anyway).
+    {
+        const session = try db_pool.acquire();
+        defer db_pool.release(session);
+        if (cfg.api_integrity_check) {
+            std.log.info("Running deep integrity check (API_INTEGRITY_CHECK=true)...", .{});
+            const integrity_ok = try session.checkIntegrity();
+            if (!integrity_ok) {
+                std.log.err("Database integrity check failed!", .{});
+                return error.DatabaseCorrupted;
+            }
+        } else if (!try session.probeLiveness()) {
+            std.log.err("Database liveness probe failed!", .{});
+            return error.DatabaseUnavailable;
+        }
     }
 
-    std.log.info("Database connected", .{});
+    std.log.info("Database connected ({d} session{s})", .{ db_pool.sessions.len, if (db_pool.sessions.len == 1) "" else "s" });
 
     // Eagerly initialize ENS normalizer to avoid cold-start latency on first query
     std.log.info("Initializing ENS name normalizer...", .{});
@@ -70,8 +105,18 @@ pub fn main() !void {
     // Start API server with complexity limits and metrics from config
     // Only pass webhook_db_path if webhooks are enabled
     const webhook_path: ?[]const u8 = if (cfg.webhooks_enabled) cfg.webhook_db_path else null;
-    var server = try api.Server.init(allocator, &database, webhook_path, cfg.api_port, cfg.graphql_max_depth, cfg.graphql_max_cost, cfg.metrics_enabled, cfg.rate_limit_per_second, cfg.webhook_admin_username, cfg.webhook_admin_password);
+    var server = try api.Server.init(allocator, io, &db_pool, webhook_path, cfg.api_port, cfg.graphql_max_depth, cfg.graphql_max_cost, cfg.metrics_enabled, cfg.rate_limit_per_second, cfg.webhook_admin_username, cfg.webhook_admin_password, cfg.trusted_proxy_hops, cfg.request_timeout_ms, cfg.max_concurrent_connections, cfg.internal_admin_token, cfg.internal_rate_limit_per_second, cfg.webhooks_allow_unauthenticated);
     defer server.deinit();
+    server.graphql_handler.slow_query_threshold_us = @as(u64, cfg.graphql_slow_query_ms) * std.time.us_per_ms;
+
+    // Opt-in on-chain resolution (default off). Covers primary-name verification (05)
+    // and/or live Universal Resolver record fallback (06); either flag creates the shared
+    // RPC client. Leaving both unset creates no RPC client and changes no served value.
+    if (cfg.primary_verify_enabled or cfg.resolve_live_enabled) {
+        try server.enableResolution(cfg.resolve_rpc_url, cfg.resolve_cache_ttl_s, cfg.network.chainId(), cfg.v1_contracts.ens_registry, cfg.resolve_universal_resolver, cfg.resolve_live_enabled, cfg.primary_verify_enabled, cfg.resolve_ccip_enabled, cfg.ccip_max_redirects, cfg.ccip_gateway_timeout_ms);
+        // The resolve RPC URL embeds the provider API key — never log it.
+        std.log.info("On-chain resolution enabled (primary_verify={}, live={}, rpc=[CONFIGURED])", .{ cfg.primary_verify_enabled, cfg.resolve_live_enabled });
+    }
 
     if (cfg.webhook_admin_username != null and cfg.webhook_admin_password != null) {
         std.log.info("Webhook auth enabled (username: {s})", .{cfg.webhook_admin_username.?});
@@ -81,7 +126,9 @@ pub fn main() !void {
 
     std.log.info("Ready to serve requests", .{});
 
+    shutdown.install();
     try server.start();
+    std.log.info("Shutdown complete.", .{});
 }
 
 test {

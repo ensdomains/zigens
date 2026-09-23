@@ -9,13 +9,13 @@ const std = @import("std");
 const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
+const keccak256 = @import("../types/hash.zig").keccak256;
 
 // Import generic field utilities
 const generic_fields = @import("../lib/graphql/fields.zig");
 pub const escapeJsonString = generic_fields.escapeJsonString;
 
 // EAC roleBitmap → named permission decoding
-const eac_roles = @import("eac_roles.zig");
 
 // ============================================================================
 // ENS-SPECIFIC FIELD TYPES (extends generic with Address/Hash)
@@ -29,25 +29,16 @@ pub const FieldType = enum {
     optional_string,
     /// Integer field
     int,
-    /// Optional integer field
-    optional_int,
     /// Boolean field
     bool_field,
-    /// Optional boolean field
-    optional_bool,
     /// Address field (rendered as hex string)
     address,
-    /// Optional address field
-    optional_address,
     /// Hash field (rendered as hex string)
     hash,
     /// Optional hash field
     optional_hash,
     /// Custom writer that produces a scalar value (sub-selections invalid).
     custom_scalar,
-    /// Custom writer that produces an object/list (sub-selections may be valid; the
-    /// writer is responsible for honoring them).
-    custom,
 };
 
 /// Result of getting a field value (ENS-extended)
@@ -61,15 +52,10 @@ pub const FieldValue = union(enum) {
     /// Allocator-owned optional string — freed after writing when present.
     owned_optional_string: ?[]const u8,
     int: i64,
-    optional_int: ?i64,
     bool_val: bool,
-    optional_bool: ?bool,
     address: Address,
-    optional_address: ?Address,
     hash: Hash,
     optional_hash: ?Hash,
-    /// Custom handlers write directly to the writer and return true if handled
-    custom: bool,
     /// Field not found or error
     none: void,
 };
@@ -78,7 +64,7 @@ pub const FieldValue = union(enum) {
 pub const FieldGetter = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!FieldValue;
 
 /// Custom writer function type - writes directly to JSON output
-pub const CustomWriter = *const fn (ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) anyerror!bool;
+pub const CustomWriter = *const fn (ctx: *anyopaque, output_key: []const u8, writer: *std.Io.Writer, allocator: std.mem.Allocator) anyerror!bool;
 
 /// Field definition (ENS-extended)
 pub const FieldDef = struct {
@@ -106,19 +92,9 @@ pub const FieldDef = struct {
         return .{ .name = name, .field_type = .int, .getter = getter, .custom_writer = null };
     }
 
-    /// Create an optional integer field
-    pub fn optionalInt(name: []const u8, getter: FieldGetter) FieldDef {
-        return .{ .name = name, .field_type = .optional_int, .getter = getter, .custom_writer = null };
-    }
-
     /// Create a boolean field
     pub fn boolean(name: []const u8, getter: FieldGetter) FieldDef {
         return .{ .name = name, .field_type = .bool_field, .getter = getter, .custom_writer = null };
-    }
-
-    /// Create an optional boolean field
-    pub fn optionalBoolean(name: []const u8, getter: FieldGetter) FieldDef {
-        return .{ .name = name, .field_type = .optional_bool, .getter = getter, .custom_writer = null };
     }
 
     /// Create an address field
@@ -136,12 +112,6 @@ pub const FieldDef = struct {
         return .{ .name = name, .field_type = .optional_hash, .getter = getter, .custom_writer = null };
     }
 
-    /// Create a custom field with direct writer access. Use this for fields whose JSON
-    /// shape is an object or list — the writer is expected to honor sub-selections itself.
-    pub fn custom(name: []const u8, writer_fn: CustomWriter) FieldDef {
-        return .{ .name = name, .field_type = .custom, .getter = null, .custom_writer = writer_fn };
-    }
-
     /// Create a custom field whose value is scalar (e.g. a formatted string or number).
     /// Sub-selections will be rejected at the entity-builder level.
     pub fn customScalar(name: []const u8, writer_fn: CustomWriter) FieldDef {
@@ -155,7 +125,7 @@ pub fn handleFieldFromTable(
     ctx: *anyopaque,
     output_key: []const u8,
     field_name: []const u8,
-    writer: std.ArrayList(u8).Writer,
+    writer: *std.Io.Writer,
     allocator: std.mem.Allocator,
     field_defs: []const FieldDef,
 ) !bool {
@@ -172,12 +142,12 @@ pub fn handleFieldFromTable(
 fn writeFieldValue(
     ctx: *anyopaque,
     output_key: []const u8,
-    writer: std.ArrayList(u8).Writer,
+    writer: *std.Io.Writer,
     allocator: std.mem.Allocator,
     def: FieldDef,
 ) !bool {
-    // Handle custom fields (both scalar and object kinds dispatch through the writer)
-    if (def.field_type == .custom or def.field_type == .custom_scalar) {
+    // Custom-scalar fields dispatch through the writer directly
+    if (def.field_type == .custom_scalar) {
         if (def.custom_writer) |custom_fn| {
             return try custom_fn(ctx, output_key, writer, allocator);
         }
@@ -227,40 +197,14 @@ fn writeFieldValue(
             try writer.print("\"{s}\":{d}", .{ output_key, i });
             return true;
         },
-        .optional_int => |maybe_i| {
-            if (maybe_i) |i| {
-                try writer.print("\"{s}\":{d}", .{ output_key, i });
-            } else {
-                try writer.print("\"{s}\":null", .{output_key});
-            }
-            return true;
-        },
         .bool_val => |b| {
             try writer.print("\"{s}\":{s}", .{ output_key, if (b) "true" else "false" });
-            return true;
-        },
-        .optional_bool => |maybe_b| {
-            if (maybe_b) |b| {
-                try writer.print("\"{s}\":{s}", .{ output_key, if (b) "true" else "false" });
-            } else {
-                try writer.print("\"{s}\":null", .{output_key});
-            }
             return true;
         },
         .address => |addr| {
             const hex = try addr.toHex(allocator);
             defer allocator.free(hex);
             try writer.print("\"{s}\":\"{s}\"", .{ output_key, hex });
-            return true;
-        },
-        .optional_address => |maybe_addr| {
-            if (maybe_addr) |addr| {
-                const hex = try addr.toHex(allocator);
-                defer allocator.free(hex);
-                try writer.print("\"{s}\":\"{s}\"", .{ output_key, hex });
-            } else {
-                try writer.print("\"{s}\":null", .{output_key});
-            }
             return true;
         },
         .hash => |h| {
@@ -279,9 +223,6 @@ fn writeFieldValue(
             }
             return true;
         },
-        .custom => |handled| {
-            return handled;
-        },
         .none => {
             return false;
         },
@@ -295,14 +236,6 @@ fn writeFieldValue(
 /// Get event from context
 fn getEventCtx(ctx: *anyopaque) *const models.Event {
     return @ptrCast(@alignCast(ctx));
-}
-
-fn getEventId(ctx: *anyopaque, allocator: std.mem.Allocator) !FieldValue {
-    const event = getEventCtx(ctx);
-    const tx_hash = try event.tx_hash.toHex(allocator);
-    defer allocator.free(tx_hash);
-    const id = try std.fmt.allocPrint(allocator, "{s}-{d}", .{ tx_hash, event.log_index });
-    return FieldValue{ .owned_string = id };
 }
 
 fn getEventType(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
@@ -365,14 +298,27 @@ fn extractDataField(data: ?[]const u8, expected_type: []const u8, event_type: []
     return FieldValue{ .owned_optional_string = owned };
 }
 
+/// Event types whose payload carries a `key`/`value` pair: node-keyed text and
+/// data records, and their record-model (`*Updated`) counterparts.
+fn isKeyValueEvent(t: models.EventType) bool {
+    return switch (t) {
+        .text_changed, .text_updated, .data_changed, .data_updated => true,
+        else => false,
+    };
+}
+
 fn getEventTextKey(ctx: *anyopaque, allocator: std.mem.Allocator) !FieldValue {
     const event = getEventCtx(ctx);
-    return try extractDataField(event.data, "TextChanged", event.event_type.toString(), "key", allocator);
+    if (!isKeyValueEvent(event.event_type)) return FieldValue{ .optional_string = null };
+    const t = event.event_type.toString();
+    return try extractDataField(event.data, t, t, "key", allocator);
 }
 
 fn getEventTextValue(ctx: *anyopaque, allocator: std.mem.Allocator) !FieldValue {
     const event = getEventCtx(ctx);
-    return try extractDataField(event.data, "TextChanged", event.event_type.toString(), "value", allocator);
+    if (!isKeyValueEvent(event.event_type)) return FieldValue{ .optional_string = null };
+    const t = event.event_type.toString();
+    return try extractDataField(event.data, t, t, "value", allocator);
 }
 
 fn getEventData(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
@@ -401,7 +347,7 @@ pub const EventFields = [_]FieldDef{
 };
 
 /// Custom writer for event ID (composite field)
-fn writeEventId(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn writeEventId(ctx: *anyopaque, output_key: []const u8, writer: *std.Io.Writer, allocator: std.mem.Allocator) !bool {
     const event = getEventCtx(ctx);
     const tx_hash = try event.tx_hash.toHex(allocator);
     defer allocator.free(tx_hash);
@@ -410,196 +356,24 @@ fn writeEventId(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u
 }
 
 // ============================================================================
-// EAC ROLE FIELD DEFINITIONS
-// ============================================================================
-
-fn getEACRoleCtx(ctx: *anyopaque) *const models.EACRoleAssignment {
-    return @ptrCast(@alignCast(ctx));
-}
-
-fn getEACRoleId(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const role = getEACRoleCtx(ctx);
-    return FieldValue{ .int = @intCast(role.id) };
-}
-
-fn getEACRoleResource(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const role = getEACRoleCtx(ctx);
-    return FieldValue{ .string = role.resource };
-}
-
-fn getEACRoleAccount(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const role = getEACRoleCtx(ctx);
-    return FieldValue{ .address = role.account };
-}
-
-fn getEACRoleBitmap(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const role = getEACRoleCtx(ctx);
-    return FieldValue{ .string = role.role_bitmap };
-}
-
-fn getEACRoleBlockNumber(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const role = getEACRoleCtx(ctx);
-    return FieldValue{ .int = @intCast(role.block_number) };
-}
-
-fn getEACRoleTransactionHash(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const role = getEACRoleCtx(ctx);
-    return FieldValue{ .hash = role.tx_hash };
-}
-
-fn getEACRoleTimestamp(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const role = getEACRoleCtx(ctx);
-    return FieldValue{ .int = role.timestamp };
-}
-
-fn getEACRoleName(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const role = getEACRoleCtx(ctx);
-    return FieldValue{ .optional_string = role.name };
-}
-
-/// EAC Role field definitions table
-pub const EACRoleFields = [_]FieldDef{
-    FieldDef.customScalar("id", writeEACRoleId),
-    FieldDef.string("resource", getEACRoleResource),
-    FieldDef.customScalar("account", writeEACRoleAccount),
-    FieldDef.string("roleBitmap", getEACRoleBitmap),
-    FieldDef.custom("permissions", writeEACRolePermissions),
-    FieldDef.int("blockNumber", getEACRoleBlockNumber),
-    FieldDef.hashField("transactionHash", getEACRoleTransactionHash),
-    FieldDef.int("timestamp", getEACRoleTimestamp),
-    FieldDef.optionalString("name", getEACRoleName),
-};
-
-/// Custom writer for EAC role ID
-fn writeEACRoleId(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, _: std.mem.Allocator) !bool {
-    const role = getEACRoleCtx(ctx);
-    try writer.print("\"{s}\":\"{d}\"", .{ output_key, role.id });
-    return true;
-}
-
-/// Custom writer for EAC role account (as hex string)
-fn writeEACRoleAccount(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
-    const role = getEACRoleCtx(ctx);
-    const hex = try role.account.toHex(allocator);
-    defer allocator.free(hex);
-    try writer.print("\"{s}\":\"{s}\"", .{ output_key, hex });
-    return true;
-}
-
-/// Custom writer for the decoded `permissions` list — the human-readable names
-/// of the roles encoded in `roleBitmap`, decoded against the emitting contract's
-/// role table (resolver vs registry). Renders a JSON array of strings.
-pub fn writeEACRolePermissions(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
-    const role = getEACRoleCtx(ctx);
-    const perms = try eac_roles.decodeHex(allocator, role.role_bitmap, role.contract_kind);
-    defer eac_roles.freePermissions(allocator, perms);
-
-    try writer.print("\"{s}\":[", .{output_key});
-    for (perms, 0..) |perm, i| {
-        if (i != 0) try writer.writeByte(',');
-        const escaped = try escapeJsonString(allocator, perm);
-        defer allocator.free(escaped);
-        try writer.print("\"{s}\"", .{escaped});
-    }
-    try writer.writeByte(']');
-    return true;
-}
-
-// ============================================================================
-// RESOLVER FIELD DEFINITIONS
-// ============================================================================
-
-fn getResolverCtx(ctx: *anyopaque) *const models.Resolver {
-    return @ptrCast(@alignCast(ctx));
-}
-
-fn getResolverAddress(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const resolver = getResolverCtx(ctx);
-    return FieldValue{ .address = resolver.address };
-}
-
-fn getResolverName(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const resolver = getResolverCtx(ctx);
-    return FieldValue{ .string = resolver.name };
-}
-
-fn getResolverNamehash(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const resolver = getResolverCtx(ctx);
-    return FieldValue{ .hash = resolver.namehash };
-}
-
-fn getResolverSetBlock(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const resolver = getResolverCtx(ctx);
-    return FieldValue{ .int = @intCast(resolver.set_block) };
-}
-
-fn getResolverSetAt(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const resolver = getResolverCtx(ctx);
-    return FieldValue{ .int = resolver.set_at };
-}
-
-/// Resolver field definitions table
-pub const ResolverFields = [_]FieldDef{
-    FieldDef.address("address", getResolverAddress),
-    FieldDef.string("name", getResolverName),
-    FieldDef.hashField("namehash", getResolverNamehash),
-    FieldDef.int("setBlock", getResolverSetBlock),
-    FieldDef.int("setAt", getResolverSetAt),
-};
-
-// ============================================================================
-// REGISTRY FIELD DEFINITIONS
-// ============================================================================
-
-fn getRegistryCtx(ctx: *anyopaque) *const models.Registry {
-    return @ptrCast(@alignCast(ctx));
-}
-
-fn getRegistryAddress(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const registry = getRegistryCtx(ctx);
-    return FieldValue{ .address = registry.address };
-}
-
-fn getRegistryName(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const registry = getRegistryCtx(ctx);
-    return FieldValue{ .string = registry.name };
-}
-
-fn getRegistryNamehash(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const registry = getRegistryCtx(ctx);
-    return FieldValue{ .hash = registry.namehash };
-}
-
-fn getRegistryParentRegistry(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const registry = getRegistryCtx(ctx);
-    return FieldValue{ .address = registry.parent_registry };
-}
-
-fn getRegistryCreatedBlock(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const registry = getRegistryCtx(ctx);
-    return FieldValue{ .int = @intCast(registry.created_block) };
-}
-
-fn getRegistryCreatedAt(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const registry = getRegistryCtx(ctx);
-    return FieldValue{ .int = registry.created_at };
-}
-
-/// Registry field definitions table
-pub const RegistryFields = [_]FieldDef{
-    FieldDef.address("address", getRegistryAddress),
-    FieldDef.string("name", getRegistryName),
-    FieldDef.hashField("namehash", getRegistryNamehash),
-    FieldDef.address("parentRegistry", getRegistryParentRegistry),
-    FieldDef.int("createdBlock", getRegistryCreatedBlock),
-    FieldDef.int("createdAt", getRegistryCreatedAt),
-};
-
-// ============================================================================
 // REGISTRATION FIELD DEFINITIONS (uses Event model)
 // ============================================================================
 
 /// Registration uses Event as underlying model
+/// Registration.id is the labelhash (keccak256 of the label), matching the ENS
+/// subgraph — NOT the human name. `label_name` carries the label (the storage
+/// SELECT aliases COALESCE(label_name, label), NOT NULL for registration rows);
+/// fall back to the namehash if it is somehow absent. The `name` field still
+/// returns the human name via getRegistrationName.
+fn getRegistrationId(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!FieldValue {
+    const event = getEventCtx(ctx);
+    if (event.label_name) |label| {
+        return FieldValue{ .hash = try keccak256(allocator, label) };
+    }
+    if (event.namehash) |nh| return FieldValue{ .hash = nh };
+    return FieldValue{ .hash = Hash.zero };
+}
+
 fn getRegistrationName(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
     const event = getEventCtx(ctx);
     return FieldValue{ .optional_string = event.name };
@@ -650,7 +424,7 @@ fn getRegistrationReferrer(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
 /// clean lifetime (returning an allocated string via FieldValue.optional_string
 /// would leak — the dispatcher in lib/graphql/fields.zig doesn't free getter
 /// return values, and we can't safely escape/free in-line).
-fn writeRegistrationCost(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn writeRegistrationCost(ctx: *anyopaque, output_key: []const u8, writer: *std.Io.Writer, allocator: std.mem.Allocator) !bool {
     const event = getEventCtx(ctx);
     const base = event.base_cost orelse {
         try writer.print("\"{s}\":null", .{output_key});
@@ -680,7 +454,7 @@ fn writeRegistrationCost(ctx: *anyopaque, output_key: []const u8, writer: std.Ar
 /// Note: expiryDate, registrant, and domain are handled as nested fields
 /// because they require database access and JSON parsing
 pub const RegistrationFields = [_]FieldDef{
-    FieldDef.optionalString("id", getRegistrationName),
+    FieldDef.hashField("id", getRegistrationId),
     FieldDef.optionalString("name", getRegistrationName),
     FieldDef.int("block", getRegistrationBlock),
     FieldDef.int("blockNumber", getRegistrationBlock),
@@ -695,140 +469,6 @@ pub const RegistrationFields = [_]FieldDef{
 };
 
 // ============================================================================
-// RESOLVER METADATA FIELD DEFINITIONS
-// ============================================================================
-
-fn getResolverMetadataCtx(ctx: *anyopaque) *const models.ResolverMetadata {
-    return @ptrCast(@alignCast(ctx));
-}
-
-fn getResolverMetadataId(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const metadata = getResolverMetadataCtx(ctx);
-    return FieldValue{ .int = @intCast(metadata.id) };
-}
-
-fn getResolverMetadataResolver(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const metadata = getResolverMetadataCtx(ctx);
-    return FieldValue{ .address = metadata.resolver };
-}
-
-fn getResolverMetadataGraphqlUrl(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const metadata = getResolverMetadataCtx(ctx);
-    return FieldValue{ .string = metadata.graphql_url };
-}
-
-fn getResolverMetadataBlockNumber(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const metadata = getResolverMetadataCtx(ctx);
-    return FieldValue{ .int = @intCast(metadata.block_number) };
-}
-
-fn getResolverMetadataTransactionHash(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const metadata = getResolverMetadataCtx(ctx);
-    return FieldValue{ .hash = metadata.tx_hash };
-}
-
-fn getResolverMetadataTimestamp(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const metadata = getResolverMetadataCtx(ctx);
-    return FieldValue{ .int = metadata.timestamp };
-}
-
-/// Custom writer for resolver metadata ID (as string)
-fn writeResolverMetadataId(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, _: std.mem.Allocator) !bool {
-    const metadata = getResolverMetadataCtx(ctx);
-    try writer.print("\"{s}\":\"{d}\"", .{ output_key, metadata.id });
-    return true;
-}
-
-/// Resolver metadata field definitions table
-pub const ResolverMetadataFields = [_]FieldDef{
-    FieldDef.customScalar("id", writeResolverMetadataId),
-    FieldDef.address("resolver", getResolverMetadataResolver),
-    FieldDef.string("graphqlUrl", getResolverMetadataGraphqlUrl),
-    FieldDef.int("blockNumber", getResolverMetadataBlockNumber),
-    FieldDef.hashField("transactionHash", getResolverMetadataTransactionHash),
-    FieldDef.int("timestamp", getResolverMetadataTimestamp),
-};
-
-// ============================================================================
-// RESOLVER APPROVAL FIELD DEFINITIONS
-// ============================================================================
-
-fn getResolverApprovalCtx(ctx: *anyopaque) *const models.ResolverApproval {
-    return @ptrCast(@alignCast(ctx));
-}
-
-fn getResolverApprovalId(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const approval = getResolverApprovalCtx(ctx);
-    return FieldValue{ .int = @intCast(approval.id) };
-}
-
-fn getResolverApprovalResolver(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const approval = getResolverApprovalCtx(ctx);
-    return FieldValue{ .address = approval.resolver };
-}
-
-fn getResolverApprovalNamehash(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const approval = getResolverApprovalCtx(ctx);
-    return FieldValue{ .hash = approval.namehash };
-}
-
-fn getResolverApprovalContext(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const approval = getResolverApprovalCtx(ctx);
-    return FieldValue{ .optional_string = approval.context };
-}
-
-fn getResolverApprovalDelegate(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const approval = getResolverApprovalCtx(ctx);
-    return FieldValue{ .address = approval.delegate };
-}
-
-fn getResolverApprovalApproved(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const approval = getResolverApprovalCtx(ctx);
-    return FieldValue{ .bool_val = approval.approved };
-}
-
-fn getResolverApprovalBlockNumber(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const approval = getResolverApprovalCtx(ctx);
-    return FieldValue{ .int = @intCast(approval.block_number) };
-}
-
-fn getResolverApprovalTransactionHash(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const approval = getResolverApprovalCtx(ctx);
-    return FieldValue{ .hash = approval.tx_hash };
-}
-
-fn getResolverApprovalLogIndex(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const approval = getResolverApprovalCtx(ctx);
-    return FieldValue{ .int = @intCast(approval.log_index) };
-}
-
-fn getResolverApprovalTimestamp(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const approval = getResolverApprovalCtx(ctx);
-    return FieldValue{ .int = approval.timestamp };
-}
-
-/// Custom writer for resolver approval ID (as string)
-fn writeResolverApprovalId(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, _: std.mem.Allocator) !bool {
-    const approval = getResolverApprovalCtx(ctx);
-    try writer.print("\"{s}\":\"{d}\"", .{ output_key, approval.id });
-    return true;
-}
-
-/// Resolver approval field definitions table
-pub const ResolverApprovalFields = [_]FieldDef{
-    FieldDef.customScalar("id", writeResolverApprovalId),
-    FieldDef.address("resolver", getResolverApprovalResolver),
-    FieldDef.hashField("namehash", getResolverApprovalNamehash),
-    FieldDef.optionalString("context", getResolverApprovalContext),
-    FieldDef.address("delegate", getResolverApprovalDelegate),
-    FieldDef.boolean("approved", getResolverApprovalApproved),
-    FieldDef.int("blockNumber", getResolverApprovalBlockNumber),
-    FieldDef.hashField("transactionHash", getResolverApprovalTransactionHash),
-    FieldDef.int("logIndex", getResolverApprovalLogIndex),
-    FieldDef.int("timestamp", getResolverApprovalTimestamp),
-};
-
-// ============================================================================
 // NAME/DOMAIN FIELD DEFINITIONS
 // ============================================================================
 
@@ -836,61 +476,12 @@ fn getNameCtx(ctx: *anyopaque) *const models.Name {
     return @ptrCast(@alignCast(ctx));
 }
 
-fn getNameName(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const name = getNameCtx(ctx);
-    return FieldValue{ .string = name.name };
-}
-
-fn getNameLabel(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const name = getNameCtx(ctx);
-    return FieldValue{ .string = name.label };
-}
-
-fn getNameLabelhash(ctx: *anyopaque, _: std.mem.Allocator) !FieldValue {
-    const name = getNameCtx(ctx);
-    return FieldValue{ .hash = name.label_hash };
-}
-
 /// Custom writer for name ID/name field
-fn writeNameId(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn writeNameId(ctx: *anyopaque, output_key: []const u8, writer: *std.Io.Writer, allocator: std.mem.Allocator) !bool {
     const name = getNameCtx(ctx);
     const escaped = try escapeJsonString(allocator, name.name orelse "[unknown]");
     defer allocator.free(escaped);
     try writer.print("\"{s}\":\"{s}\"", .{ output_key, escaped });
-    return true;
-}
-
-/// Custom writer for owner field (nested object)
-fn writeNameOwner(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
-    const name = getNameCtx(ctx);
-    const owner_hex = try name.owner.toHex(allocator);
-    defer allocator.free(owner_hex);
-    try writer.print("\"{s}\":{{\"id\":\"{s}\"}}", .{ output_key, owner_hex });
-    return true;
-}
-
-/// Custom writer for resolver field (nested object or null)
-fn writeNameResolver(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
-    const name = getNameCtx(ctx);
-    if (!name.resolver.isZero()) {
-        const resolver_hex = try name.resolver.toHex(allocator);
-        defer allocator.free(resolver_hex);
-        try writer.print("\"{s}\":{{\"address\":\"{s}\"}}", .{ output_key, resolver_hex });
-    } else {
-        try writer.print("\"{s}\":null", .{output_key});
-    }
-    return true;
-}
-
-/// Custom writer for expiryDate field. For V1 .eth 2LDs, includes the 90-day
-/// grace period (subgraph parity). Null when no expiry is set.
-fn writeNameExpiryDate(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, _: std.mem.Allocator) !bool {
-    const name = getNameCtx(ctx);
-    if (hasValidExpiry(name.expiry)) {
-        try writer.print("\"{s}\":{d}", .{ output_key, effectiveDomainExpiry(name) });
-    } else {
-        try writer.print("\"{s}\":null", .{output_key});
-    }
     return true;
 }
 
@@ -909,21 +500,31 @@ pub fn effectiveDomainExpiry(name: anytype) i64 {
     const base: i64 = @intCast(name.expiry);
     if (name.protocol != .v1) return base;
     if (name.expiry == 0) return base;
+    // Wrapped names already store a grace-inclusive value: the PCC mirror
+    // copies wrapper_expiry (= BaseRegistrar.expires + 90d per the NameWrapper
+    // contract) into names.expiry — adding grace again double-counted it.
+    if (name.is_wrapped) return base;
     const parent = name.parent_name orelse return base;
     if (!std.mem.eql(u8, parent, "eth")) return base;
-    return base + V1_GRACE_PERIOD_SECONDS;
+    // Saturating: a poisoned near-max stored expiry must not panic the builder.
+    return base +| V1_GRACE_PERIOD_SECONDS;
 }
 
-/// Name/Domain field definitions table (for simple queries)
-pub const NameFields = [_]FieldDef{
-    FieldDef.custom("id", writeNameId),
-    FieldDef.custom("name", writeNameId),
-    FieldDef.custom("owner", writeNameOwner),
-    FieldDef.custom("resolver", writeNameResolver),
-    FieldDef.custom("labelName", writeNameLabelName),
-    FieldDef.custom("labelhash", writeNameLabelhash),
-    FieldDef.custom("expiryDate", writeNameExpiryDate),
-};
+test "effectiveDomainExpiry: grace only for unwrapped V1 .eth 2LDs" {
+    const Probe = struct {
+        expiry: u64,
+        protocol: models.Protocol,
+        parent_name: ?[]const u8,
+        is_wrapped: bool,
+    };
+    const grace = V1_GRACE_PERIOD_SECONDS;
+    try std.testing.expectEqual(@as(i64, 1000 + grace), effectiveDomainExpiry(Probe{ .expiry = 1000, .protocol = .v1, .parent_name = "eth", .is_wrapped = false }));
+    // Wrapped: stored value is already grace-inclusive — no second helping.
+    try std.testing.expectEqual(@as(i64, 1000), effectiveDomainExpiry(Probe{ .expiry = 1000, .protocol = .v1, .parent_name = "eth", .is_wrapped = true }));
+    try std.testing.expectEqual(@as(i64, 1000), effectiveDomainExpiry(Probe{ .expiry = 1000, .protocol = .v2, .parent_name = "eth", .is_wrapped = false }));
+    try std.testing.expectEqual(@as(i64, 1000), effectiveDomainExpiry(Probe{ .expiry = 1000, .protocol = .v1, .parent_name = "xyz", .is_wrapped = false }));
+    try std.testing.expectEqual(@as(i64, 0), effectiveDomainExpiry(Probe{ .expiry = 0, .protocol = .v1, .parent_name = "eth", .is_wrapped = false }));
+}
 
 // ============================================================================
 // DOMAIN BUILD FIELD DEFINITIONS (for json_builder)
@@ -971,17 +572,6 @@ fn getDomainCreatedAt(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue
 fn getDomainRegistrationDate(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue {
     const name = getNameCtx(ctx);
     return FieldValue{ .int = name.registered_at };
-}
-
-/// Get domain expiry. For V1 .eth 2LDs, includes the 90-day grace period
-/// (subgraph parity: `Domain.expiryDate = expires + 90d`). The bare on-chain
-/// `expires` is still available via the parallel `Registration.expiryDate`.
-fn getDomainExpiry(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue {
-    const name = getNameCtx(ctx);
-    if (hasValidExpiry(name.expiry)) {
-        return FieldValue{ .int = effectiveDomainExpiry(name) };
-    }
-    return FieldValue{ .none = {} };
 }
 
 /// Get domain isReachable
@@ -1058,7 +648,9 @@ fn getDomainGracePeriodEnd(ctx: *anyopaque, _: std.mem.Allocator) anyerror!Field
 /// Domain build field definitions - scalar fields only
 /// Nested fields (owner, registrant, resolver, etc.) are handled via NestedFieldDef
 pub const DomainBuildFields = [_]FieldDef{
-    FieldDef.customScalar("id", writeNameId),
+    // Domain.id is the namehash (ERC-137 node), matching the ENS subgraph. The
+    // singular domain(id:) lookup still accepts a name OR a namehash (resolveDomainId).
+    FieldDef.hashField("id", getDomainNamehash),
     FieldDef.customScalar("name", writeNameId),
     FieldDef.hashField("namehash", getDomainNamehash),
     FieldDef.customScalar("labelName", writeNameLabelName),
@@ -1081,7 +673,7 @@ pub const DomainBuildFields = [_]FieldDef{
 };
 
 /// Custom writer for labelName
-fn writeNameLabelName(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn writeNameLabelName(ctx: *anyopaque, output_key: []const u8, writer: *std.Io.Writer, allocator: std.mem.Allocator) !bool {
     const name = getNameCtx(ctx);
     const escaped = try escapeJsonString(allocator, name.label orelse "[unknown]");
     defer allocator.free(escaped);
@@ -1090,7 +682,7 @@ fn writeNameLabelName(ctx: *anyopaque, output_key: []const u8, writer: std.Array
 }
 
 /// Custom writer for labelhash
-fn writeNameLabelhash(ctx: *anyopaque, output_key: []const u8, writer: std.ArrayList(u8).Writer, allocator: std.mem.Allocator) !bool {
+fn writeNameLabelhash(ctx: *anyopaque, output_key: []const u8, writer: *std.Io.Writer, allocator: std.mem.Allocator) !bool {
     const name = getNameCtx(ctx);
     const hash_hex = try name.label_hash.toHex(allocator);
     defer allocator.free(hash_hex);
@@ -1137,6 +729,10 @@ pub const ResolverBuildContext = struct {
     namehash: Hash,
     protocol: models.Protocol,
     chain_id: u64,
+    /// The human (ENSIP-15-normalized) name for this node, when known. Needed to
+    /// DNS-encode the Universal Resolver `resolve(bytes name, ...)` call on an indexed
+    /// MISS. Null when the caller couldn't supply it → live fallback is skipped.
+    name: ?[]const u8 = null,
 };
 
 /// Helper to get ResolverBuildContext from opaque pointer

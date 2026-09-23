@@ -17,6 +17,13 @@ pub const MAX_FIRST: i64 = 1000;
 /// Default skip (offset) when pagination args are omitted.
 pub const DEFAULT_SKIP: i64 = 0;
 
+/// Maximum offset for flat `skip`-paginated queries. Bounds the value so the
+/// `@intCast` to the u32 `Pagination.skip` cannot panic on a hostile
+/// `skip: 9999999999` (which would otherwise crash the process), and keeps
+/// deep-offset scans from becoming an amplification vector. Clients needing to
+/// page deeper than this should use cursor (connection) pagination.
+pub const MAX_SKIP: i64 = 1_000_000;
+
 // ============================================================================
 // PAGINATION
 // ============================================================================
@@ -30,7 +37,9 @@ pub const Pagination = struct {
 /// - `first`: explicitly-passed values exceeding MAX_FIRST return `error.LimitExceeded`
 ///   so callers don't get deceptively-truncated pages. The default (when omitted)
 ///   never errors. Negative values return `error.NegativeLimit`.
-/// - `skip`: clamped to `[0, ∞)` (negative values silently snap to 0).
+/// - `skip`: negative values return `error.NegativeLimit`; values exceeding
+///   `MAX_SKIP` return `error.LimitExceeded` (an unbounded `skip` would overflow
+///   the u32 cast and crash the process).
 ///
 /// For Relay-style connection queries, use `lib/graphql/pagination.PaginationParams.parse`
 /// instead — this helper is for flat list queries that take `first`/`skip` directly.
@@ -40,15 +49,15 @@ pub fn parsePagination(field: *const parser.Field, default_first: i64) !Paginati
     const first_explicit = parser.getIntArg(field, "first", null);
     const first_raw = first_explicit orelse default_first;
     const skip_raw = parser.getIntArg(field, "skip", DEFAULT_SKIP) orelse DEFAULT_SKIP;
-    if (first_raw < 0) return error.NegativeLimit;
+    if (first_raw < 0 or skip_raw < 0) return error.NegativeLimit;
     if (first_explicit) |e| {
         if (e > MAX_FIRST) return error.LimitExceeded;
     }
+    if (skip_raw > MAX_SKIP) return error.LimitExceeded;
     const first_clamped = @min(first_raw, MAX_FIRST);
-    const skip_clamped = @max(skip_raw, 0);
     return .{
         .first = @intCast(first_clamped),
-        .skip = @intCast(skip_clamped),
+        .skip = @intCast(skip_raw),
     };
 }
 
@@ -65,6 +74,23 @@ pub fn parseOrderDirection(field: *const parser.Field, comptime T: type, default
     const str = parser.getStringArg(field, "orderDirection", null) orelse return default;
     if (std.mem.eql(u8, str, "desc")) return @as(T, .desc);
     if (std.mem.eql(u8, str, "asc")) return @as(T, .asc);
+    return default;
+}
+
+/// Parse the `orderBy` arg of an `Event_orderBy` field onto a storage sort
+/// enum. Falls back to `default` when the arg is missing or unrecognized.
+///
+/// Comptime type parameter for the same reason as `parseOrderDirection`: it
+/// keeps this module free of a storage dependency. Callers pass
+/// `db.EventSortField`.
+///
+/// Keep the accepted names in sync with the `Event_orderBy` enum in
+/// `schema.graphql`.
+pub fn parseEventOrderBy(field: *const parser.Field, comptime T: type, default: T) T {
+    const order_by = parser.getStringArg(field, "orderBy", null) orelse return default;
+    if (std.mem.eql(u8, order_by, "blockNumber")) return @as(T, .block_number);
+    if (std.mem.eql(u8, order_by, "timestamp")) return @as(T, .timestamp);
+    if (std.mem.eql(u8, order_by, "name")) return @as(T, .name);
     return default;
 }
 
@@ -138,7 +164,7 @@ pub fn parseStringListArg(arg: parser.Argument, allocator: std.mem.Allocator) !?
     const constants_mod = @import("../constants.zig");
     if (arg.value != .list) return null;
     if (arg.value.list.len > constants_mod.Pagination.max_limit) return error.TooManyNames;
-    var list: std.ArrayList([]const u8) = .{};
+    var list: std.ArrayList([]const u8) = .empty;
     defer list.deinit(allocator);
     for (arg.value.list) |item| {
         if (item == .string) try list.append(allocator, item.string);
@@ -152,7 +178,7 @@ pub fn parseStringListArg(arg: parser.Argument, allocator: std.mem.Allocator) !?
 /// fails hex parsing (matches `matchAddressArg`'s fail-loud semantics).
 pub fn parseAddressListArg(arg: parser.Argument, allocator: std.mem.Allocator) !?[]Address {
     if (arg.value != .list) return null;
-    var list: std.ArrayList(Address) = .{};
+    var list: std.ArrayList(Address) = .empty;
     defer list.deinit(allocator);
     for (arg.value.list) |item| {
         if (item == .string) {
@@ -280,4 +306,85 @@ test "getObjectArg returns inner object or null" {
     try testing.expectEqualStrings("name", obj.?[0].name);
 
     try testing.expect(getObjectArg(&field, "missing") == null);
+}
+
+// `parseEventOrderBy` is generic so this module stays free of a storage
+// dependency, so exercise it against the real `EventSortField` — a local stub
+// would not catch a variant renamed on the storage side.
+const EventSortField = @import("../storage/events.zig").EventSortField;
+const EventOrderDir = @import("../storage/events.zig").OrderDir;
+
+test "parseEventOrderBy maps every Event_orderBy value" {
+    // Keep in sync with the `Event_orderBy` enum in schema.graphql.
+    const cases = [_]struct { arg: []const u8, want: EventSortField }{
+        .{ .arg = "blockNumber", .want = .block_number },
+        .{ .arg = "timestamp", .want = .timestamp },
+        .{ .arg = "name", .want = .name },
+    };
+    for (cases) |c| {
+        var args = [_]parser.Argument{
+            .{ .name = "orderBy", .value = .{ .string = c.arg } },
+        };
+        try testing.expectEqual(
+            c.want,
+            parseEventOrderBy(&makeField(&args), EventSortField, .block_number),
+        );
+    }
+}
+
+test "parseEventOrderBy falls back to default when missing or unrecognized" {
+    // Missing arg: Domain.events omits orderBy on most queries, and must then
+    // keep whatever the caller already resolved rather than silently resetting.
+    var none = [_]parser.Argument{};
+    try testing.expectEqual(
+        EventSortField.timestamp,
+        parseEventOrderBy(&makeField(&none), EventSortField, .timestamp),
+    );
+
+    // Unrecognized value: reject rather than guess. `expiry` is a real
+    // EventSortField variant but is NOT exposed by Event_orderBy, so it must
+    // not be reachable from client input.
+    var bogus = [_]parser.Argument{
+        .{ .name = "orderBy", .value = .{ .string = "expiry" } },
+    };
+    try testing.expectEqual(
+        EventSortField.timestamp,
+        parseEventOrderBy(&makeField(&bogus), EventSortField, .timestamp),
+    );
+
+    // Wrong type: an int where a string is expected must not be coerced.
+    var wrong_type = [_]parser.Argument{
+        .{ .name = "orderBy", .value = .{ .int = 1 } },
+    };
+    try testing.expectEqual(
+        EventSortField.name,
+        parseEventOrderBy(&makeField(&wrong_type), EventSortField, .name),
+    );
+}
+
+test "parseOrderDirection round-trips both directions for events" {
+    // Domain.events pairs orderBy with orderDirection; the pair is what makes
+    // `{ first: n, orderDirection: asc }` return the OLDEST n rather than the
+    // newest n rearranged, so cover the event enum explicitly.
+    var asc = [_]parser.Argument{
+        .{ .name = "orderDirection", .value = .{ .string = "asc" } },
+    };
+    try testing.expectEqual(
+        EventOrderDir.asc,
+        parseOrderDirection(&makeField(&asc), EventOrderDir, .desc),
+    );
+
+    var desc = [_]parser.Argument{
+        .{ .name = "orderDirection", .value = .{ .string = "desc" } },
+    };
+    try testing.expectEqual(
+        EventOrderDir.desc,
+        parseOrderDirection(&makeField(&desc), EventOrderDir, .asc),
+    );
+
+    var none = [_]parser.Argument{};
+    try testing.expectEqual(
+        EventOrderDir.desc,
+        parseOrderDirection(&makeField(&none), EventOrderDir, .desc),
+    );
 }

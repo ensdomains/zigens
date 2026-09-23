@@ -62,7 +62,7 @@ pub const EventSignatures = struct {
     pub const token_regenerated_hash: Hash = eventHash(token_regenerated);
 
     /// ExpiryUpdated(uint256 indexed tokenId, uint64 newExpiry, address changedBy)
-    /// New event signature that replaces NameRenewed in current namechain deployment
+    /// New event signature that replaces NameRenewed in the current V2 deployment
     pub const expiry_updated = "ExpiryUpdated(uint256,uint64,address)";
     pub const expiry_updated_hash: Hash = eventHash(expiry_updated);
 
@@ -85,6 +85,12 @@ pub const EventSignatures = struct {
     /// Emitted when the parent of a registry is changed
     pub const parent_updated = "ParentUpdated(address,string,address)";
     pub const parent_updated_hash: Hash = eventHash(parent_updated);
+
+    /// Label(bytes32 indexed labelHash, string label)
+    /// Emitted by the LabelStore contract: an on-chain labelhash->preimage dictionary
+    /// used to heal unknown labels.
+    pub const label_store_label = "Label(bytes32,string)";
+    pub const label_store_label_hash: Hash = eventHash(label_store_label);
 
     // ========================================================================
     // Enhanced Access Control events (from common/access-control/interfaces/IEnhancedAccessControl.sol)
@@ -168,6 +174,12 @@ pub const EventSignatures = struct {
     pub const authorisation_changed = "AuthorisationChanged(bytes32,address,address,bool)";
     pub const authorisation_changed_hash: Hash = eventHash(authorisation_changed);
 
+    /// Approved(address owner, bytes32 indexed node, address indexed delegate, bool indexed approved)
+    /// Per-name delegate approval (PublicResolver 2023+); the modern successor
+    /// to AuthorisationChanged. Feeds resolver_approvals (context = NULL).
+    pub const approved = "Approved(address,bytes32,address,bool)";
+    pub const approved_hash: Hash = eventHash(approved);
+
     /// DNSRecordChanged(bytes32 indexed node, bytes name, uint16 resource, bytes record)
     /// ENSIP-17 DNS resolver event — V1 PublicResolver + V2 PublicResolverV2.
     pub const dns_record_changed = "DNSRecordChanged(bytes32,bytes,uint16,bytes)";
@@ -235,6 +247,61 @@ pub const EventSignatures = struct {
     /// Mirrors `TextChanged` but the value is `bytes` instead of `string`.
     pub const data_changed = "DataChanged(bytes32,string,string,bytes)";
     pub const data_changed_hash: Hash = eventHash(data_changed);
+
+    // ========================================================================
+    // Record-model resolver events (contracts-v2 IRecordResolver — the
+    // PermissionedResolver rewrite). Values are keyed by recordId, not node;
+    // `Linked` binds a node to a record. See storage/resolver_records.zig.
+    // ========================================================================
+
+    /// ResolverCreated()
+    pub const resolver_created = "ResolverCreated()";
+    pub const resolver_created_hash: Hash = eventHash(resolver_created);
+
+    /// Linked(uint256 indexed recordId, bytes32 indexed node, bytes name)
+    pub const linked = "Linked(uint256,bytes32,bytes)";
+    pub const linked_hash: Hash = eventHash(linked);
+
+    /// Cleared(uint256 indexed recordId)
+    pub const cleared = "Cleared(uint256)";
+    pub const cleared_hash: Hash = eventHash(cleared);
+
+    /// AddressUpdated(uint256 indexed recordId, uint256 coinType, bytes addressBytes)
+    pub const address_updated = "AddressUpdated(uint256,uint256,bytes)";
+    pub const address_updated_hash: Hash = eventHash(address_updated);
+
+    /// TextUpdated(uint256 indexed recordId, string indexed keyHash, string key, string value)
+    pub const text_updated = "TextUpdated(uint256,string,string,string)";
+    pub const text_updated_hash: Hash = eventHash(text_updated);
+
+    /// DataUpdated(uint256 indexed recordId, string indexed keyHash, string key, bytes value)
+    pub const data_updated = "DataUpdated(uint256,string,string,bytes)";
+    pub const data_updated_hash: Hash = eventHash(data_updated);
+
+    /// ContenthashUpdated(uint256 indexed recordId, bytes hash)
+    pub const contenthash_updated = "ContenthashUpdated(uint256,bytes)";
+    pub const contenthash_updated_hash: Hash = eventHash(contenthash_updated);
+
+    /// ABIUpdated(uint256 indexed recordId, uint256 indexed contentType)
+    pub const abi_updated = "ABIUpdated(uint256,uint256)";
+    pub const abi_updated_hash: Hash = eventHash(abi_updated);
+
+    /// InterfaceUpdated(uint256 indexed recordId, bytes4 indexed interfaceId, address implementer)
+    pub const interface_updated = "InterfaceUpdated(uint256,bytes4,address)";
+    pub const interface_updated_hash: Hash = eventHash(interface_updated);
+
+    /// NameUpdated(uint256 indexed recordId, string primaryName)
+    pub const name_updated = "NameUpdated(uint256,string)";
+    pub const name_updated_hash: Hash = eventHash(name_updated);
+
+    /// ResourceArgument(uint256 indexed resource, bytes arg)
+    pub const resource_argument = "ResourceArgument(uint256,bytes)";
+    pub const resource_argument_hash: Hash = eventHash(resource_argument);
+
+    /// ApprovalUpdated(uint256 indexed recordId, address indexed owner, address indexed operator, bool approved)
+    /// SharedResolver (ISharedResolver) per-record operator approval.
+    pub const approval_updated = "ApprovalUpdated(uint256,address,address,bool)";
+    pub const approval_updated_hash: Hash = eventHash(approval_updated);
 
     // ========================================================================
     // ENS Temporary Registrar events (Pre-V1 Migration, May 2017 - May 2019)
@@ -387,6 +454,24 @@ pub const EventSignatures = struct {
     pub const unwrapped_controller_name_renewed = "NameRenewed(string,bytes32,uint256,uint256,bytes32)";
     pub const unwrapped_controller_name_renewed_hash: Hash = eventHash(unwrapped_controller_name_renewed);
 
+    /// NameRegistered(string name, bytes32 indexed label, address indexed owner, uint256 expires)
+    /// 4-arg Basenames RegistrarController (Base mainnet, legacy + upgradeable
+    /// proxy): no cost fields — a subset of the 5-arg legacy ENS controller shape.
+    pub const basenames_controller_name_registered = "NameRegistered(string,bytes32,address,uint256)";
+    pub const basenames_controller_name_registered_hash: Hash = eventHash(basenames_controller_name_registered);
+
+    /// NameRenewed(string name, bytes32 indexed label, uint256 expires)
+    /// 3-arg Basenames RegistrarController: no cost field.
+    pub const basenames_controller_name_renewed = "NameRenewed(string,bytes32,uint256)";
+    pub const basenames_controller_name_renewed_hash: Hash = eventHash(basenames_controller_name_renewed);
+
+    /// NameRegisteredWithRecord(uint256 indexed id, address indexed owner, uint256 expires, address resolver, uint64 ttl)
+    /// Basenames BaseRegistrar: the CANONICAL registration event on Base — both
+    /// Basenames controllers register via registerWithRecord, which emits ONLY
+    /// this (the plain NameRegistered fires only for direct register/registerOnly).
+    pub const basenames_registrar_name_registered_with_record = "NameRegisteredWithRecord(uint256,address,uint256,address,uint64)";
+    pub const basenames_registrar_name_registered_with_record_hash: Hash = eventHash(basenames_registrar_name_registered_with_record);
+
     // ========================================================================
     // ENS V1 Reverse Registrar events (ReverseRegistrar.sol)
     // Address: 0xa58E81fe9b61B5c3fE2AFD33CF304c454AbFc7Cb
@@ -428,5 +513,3 @@ pub const EventSignatures = struct {
     pub const registry_created = "RegistryCreated()";
     pub const registry_created_hash: Hash = eventHash(registry_created);
 };
-
-

@@ -36,6 +36,18 @@ CREATE TABLE IF NOT EXISTS sync_state (
   last_synced_at INTEGER NOT NULL
 );
 
+-- Durable marker for a COMPLETED --backfill projection rebuild. Cleared at
+-- replay start, written only after every core finishes — a crashed rebuild is
+-- therefore distinguishable from a finished one. replay_version is the code
+-- version of the replay logic; a version bump invalidates older rebuilds.
+CREATE TABLE IF NOT EXISTS replay_status (
+  id INTEGER PRIMARY KEY,
+  replay_version INTEGER NOT NULL,
+  completed_block INTEGER NOT NULL,
+  names_count INTEGER NOT NULL,
+  completed_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS block_hashes (
   protocol TEXT NOT NULL,
   block_number INTEGER NOT NULL,
@@ -154,6 +166,24 @@ CREATE TABLE IF NOT EXISTS names (
   -- not write this column — V2 readers fall back to the query-time resolver
   -- lookup (see api/builders/impl.zig:domainResolvedAddressHandler).
   resolved_address TEXT DEFAULT NULL,
+  -- ENSIP-15 normalization status of `name`, computed at ingest. 1 = normalized,
+  -- 0 = non-normalized or unknown label. Default-filtered out of GraphQL listings
+  -- unless includeUnnormalized is passed (mirrors is_reachable).
+  is_normalized INTEGER NOT NULL DEFAULT 1,
+  -- Grace-inclusive expiry (subgraph `Domain.expiryDate`): bare stored expiry
+  -- plus the 90d (7776000s) registrar grace for UNWRAPPED V1 .eth 2LDs only
+  -- (wrapped rows already store the grace-inclusive wrapper value). This is the
+  -- single SQL source of the rule that backs the `expiryDate`/`expiryDate_*`
+  -- filters and ordering; a STORED generated column keeps it sargable via
+  -- idx_names_expiry_effective (the old inline CASE defeated idx_names_expiry).
+  -- Mirrors ens_fields.effectiveDomainExpiry on the read/serialization side.
+  -- The maxInt(i64)-7776000 upper bound stops a near-max expiry from overflowing
+  -- the addition (PG BIGINT errors; SQLite would silently widen to REAL).
+  expiry_effective INTEGER GENERATED ALWAYS AS (
+    CASE WHEN protocol = 'v1' AND parent_name = 'eth' AND is_wrapped = 0
+           AND expiry > 0 AND expiry <= 9223372036846999807
+         THEN expiry + 7776000 ELSE expiry END
+  ) STORED,
   UNIQUE(protocol, namehash)
 );
 
@@ -163,10 +193,30 @@ CREATE INDEX IF NOT EXISTS idx_names_label ON names(label);
 CREATE INDEX IF NOT EXISTS idx_names_owner ON names(owner);
 CREATE INDEX IF NOT EXISTS idx_names_token_id ON names(token_id);
 CREATE INDEX IF NOT EXISTS idx_names_canonical_id ON names(canonical_id);
+-- getNameByTokenIdAndRegistry filters (canonical_id, registry); a popular label's
+-- canonical_id appears in many registries, so the single-column index leaves a per-row
+-- `registry` Filter (EXPLAIN confirmed). This compound index makes registry an Index
+-- Cond. Kept through bulk sync (handler lookup), like idx_names_canonical_id.
+CREATE INDEX IF NOT EXISTS idx_names_canonical_id_registry ON names(canonical_id, registry);
 CREATE INDEX IF NOT EXISTS idx_names_expiry ON names(expiry);
+CREATE INDEX IF NOT EXISTS idx_names_expiry_effective ON names(expiry_effective);
 CREATE INDEX IF NOT EXISTS idx_names_registry ON names(protocol, registry);
 CREATE INDEX IF NOT EXISTS idx_names_resolver ON names(protocol, resolver);
+-- Resolver.domain picks the lowest namehash pointing at a resolver (ORDER BY
+-- namehash ASC LIMIT 1); this composite lets that pick (and its per-page batched
+-- form, one scalar subquery per resolver) stop at the first index entry instead
+-- of sorting every name on the resolver.
+CREATE INDEX IF NOT EXISTS idx_names_resolver_namehash ON names(resolver, namehash);
+-- Domain.subdomains pages read `parent_name = ? ORDER BY name, protocol LIMIT ? OFFSET ?`,
+-- per row and per page (one LATERAL page per parent on Postgres); this composite
+-- serves that order directly so a parent with millions of children costs one
+-- index range scan of the page, never a sort of every child.
+CREATE INDEX IF NOT EXISTS idx_names_parent_name_name ON names(parent_name, name, protocol);
 CREATE INDEX IF NOT EXISTS idx_names_created_block ON names(protocol, created_block);
+-- domains(first:N) defaults to ORDER BY created_at, namehash (keyset pagination
+-- tiebreak). The composite lets the planner stream the newest/oldest N rows
+-- instead of scan+sorting the whole table (measured 19s -> 9ms on 3M rows).
+CREATE INDEX IF NOT EXISTS idx_names_created_at ON names(created_at, namehash);
 CREATE INDEX IF NOT EXISTS idx_names_namehash ON names(namehash);
 CREATE INDEX IF NOT EXISTS idx_names_is_wrapped ON names(is_wrapped);
 CREATE INDEX IF NOT EXISTS idx_names_is_v1_name ON names(is_v1_name);
@@ -174,8 +224,10 @@ CREATE INDEX IF NOT EXISTS idx_names_v1_label_hash ON names(v1_label_hash);
 CREATE INDEX IF NOT EXISTS idx_names_wrapper_expiry ON names(wrapper_expiry);
 CREATE INDEX IF NOT EXISTS idx_names_registrant ON names(registrant);
 CREATE INDEX IF NOT EXISTS idx_names_parent_namehash ON names(parent_namehash);
+CREATE INDEX IF NOT EXISTS idx_names_parent_name ON names(parent_name);
 CREATE INDEX IF NOT EXISTS idx_names_is_reachable ON names(protocol, is_reachable);
 CREATE INDEX IF NOT EXISTS idx_names_registry_reachable ON names(protocol, registry, is_reachable);
+CREATE INDEX IF NOT EXISTS idx_names_is_normalized ON names(is_normalized);
 
 -- Partial index targeting Domain.subdomainsCount / subdomainCount / hasDirectSubdomains
 -- / getSubdomains queries (see src/storage/names.zig:SUBDOMAIN_GC_FILTER for the matching
@@ -251,7 +303,6 @@ CREATE TABLE IF NOT EXISTS resolver_addresses (
   resolver TEXT NOT NULL,
   coin_type INTEGER NOT NULL,
   address TEXT NOT NULL,
-  context TEXT,
   protocol TEXT NOT NULL,
   block_number INTEGER NOT NULL,
   transaction_hash TEXT NOT NULL,
@@ -261,14 +312,12 @@ CREATE TABLE IF NOT EXISTS resolver_addresses (
 
 CREATE INDEX IF NOT EXISTS idx_resolver_addresses_namehash ON resolver_addresses(namehash);
 CREATE INDEX IF NOT EXISTS idx_resolver_addresses_resolver ON resolver_addresses(resolver);
-CREATE INDEX IF NOT EXISTS idx_resolver_addresses_context ON resolver_addresses(protocol, namehash, context);
 
 CREATE TABLE IF NOT EXISTS resolver_contenthashes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   namehash TEXT NOT NULL,
   resolver TEXT NOT NULL,
   contenthash TEXT NOT NULL,
-  context TEXT,
   protocol TEXT NOT NULL,
   block_number INTEGER NOT NULL,
   transaction_hash TEXT NOT NULL,
@@ -278,7 +327,6 @@ CREATE TABLE IF NOT EXISTS resolver_contenthashes (
 
 CREATE INDEX IF NOT EXISTS idx_resolver_contenthashes_namehash ON resolver_contenthashes(namehash);
 CREATE INDEX IF NOT EXISTS idx_resolver_contenthashes_resolver ON resolver_contenthashes(resolver);
-CREATE INDEX IF NOT EXISTS idx_resolver_contenthashes_context ON resolver_contenthashes(protocol, namehash, context);
 
 CREATE TABLE IF NOT EXISTS resolver_texts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -286,7 +334,6 @@ CREATE TABLE IF NOT EXISTS resolver_texts (
   resolver TEXT NOT NULL,
   key TEXT NOT NULL,
   value TEXT NOT NULL,
-  context TEXT,
   protocol TEXT NOT NULL,
   block_number INTEGER NOT NULL,
   transaction_hash TEXT NOT NULL,
@@ -297,7 +344,6 @@ CREATE TABLE IF NOT EXISTS resolver_texts (
 CREATE INDEX IF NOT EXISTS idx_resolver_texts_namehash ON resolver_texts(namehash);
 CREATE INDEX IF NOT EXISTS idx_resolver_texts_resolver ON resolver_texts(resolver);
 CREATE INDEX IF NOT EXISTS idx_resolver_texts_key ON resolver_texts(key);
-CREATE INDEX IF NOT EXISTS idx_resolver_texts_context ON resolver_texts(protocol, namehash, context);
 
 
 -- ============================================================================
@@ -481,6 +527,78 @@ CREATE INDEX IF NOT EXISTS idx_resolver_approvals_namehash ON resolver_approvals
 CREATE INDEX IF NOT EXISTS idx_resolver_approvals_delegate ON resolver_approvals(protocol, delegate);
 CREATE INDEX IF NOT EXISTS idx_resolver_approvals_context ON resolver_approvals(protocol, context);
 
+-- Resource-naming discovery (PermissionedResolver Named*Resource events): maps
+-- an EAC resource id to the name/record it guards on a resolver. Emitted once,
+-- on the first role grant for a resource. One row per (resolver, resource);
+-- record_key/coin_type are attributes ('' / -1 when not applicable), so the
+-- UNIQUE key has no nullable columns (SQL NULLs never conflict).
+CREATE TABLE IF NOT EXISTS resolver_named_resources (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  protocol TEXT NOT NULL,
+  resolver TEXT NOT NULL,
+  resource TEXT NOT NULL,
+  record_kind TEXT NOT NULL,
+  record_key TEXT NOT NULL DEFAULT '',
+  coin_type INTEGER NOT NULL DEFAULT -1,
+  name TEXT NOT NULL,
+  block_number INTEGER NOT NULL,
+  transaction_hash TEXT NOT NULL,
+  log_index INTEGER NOT NULL,
+  timestamp INTEGER NOT NULL,
+  UNIQUE(protocol, resolver, resource)
+);
+
+CREATE INDEX IF NOT EXISTS idx_named_resources_resolver ON resolver_named_resources(protocol, resolver);
+
+-- Record-model resolvers (contracts-v2 IRecordResolver): Linked(recordId, node, name)
+-- binds a name's node to a record id (0 = unlinked); node 0x0 holds the resolver-wide
+-- default record. record_key is the synthetic namehash-column key the record's values
+-- are stored under in the resolver_* tables (see storage/resolver_records.zig).
+CREATE TABLE IF NOT EXISTS resolver_links (
+  protocol TEXT NOT NULL,
+  resolver TEXT NOT NULL,
+  namehash TEXT NOT NULL,
+  record_id TEXT NOT NULL,
+  record_key TEXT NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  block_number INTEGER NOT NULL,
+  transaction_hash TEXT NOT NULL,
+  log_index INTEGER NOT NULL,
+  timestamp INTEGER NOT NULL,
+  UNIQUE(protocol, resolver, namehash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_resolver_links_record ON resolver_links(resolver, record_id);
+CREATE INDEX IF NOT EXISTS idx_resolver_links_namehash ON resolver_links(namehash);
+
+-- ENSIP-24 data(key) records (DataUpdated on record resolvers, DataChanged on legacy).
+CREATE TABLE IF NOT EXISTS resolver_datas (
+  namehash TEXT NOT NULL,
+  resolver TEXT NOT NULL,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL,
+  protocol TEXT NOT NULL,
+  block_number INTEGER NOT NULL,
+  transaction_hash TEXT NOT NULL,
+  timestamp INTEGER NOT NULL,
+  UNIQUE(protocol, resolver, namehash, key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_resolver_datas_namehash ON resolver_datas(namehash);
+CREATE INDEX IF NOT EXISTS idx_resolver_datas_resolver ON resolver_datas(resolver);
+
+-- ResolverCreated(): marks a resolver as record-model ('record').
+CREATE TABLE IF NOT EXISTS resolver_kinds (
+  protocol TEXT NOT NULL,
+  resolver TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  block_number INTEGER NOT NULL,
+  transaction_hash TEXT NOT NULL,
+  log_index INTEGER NOT NULL,
+  timestamp INTEGER NOT NULL,
+  UNIQUE(protocol, resolver)
+);
+
 
 -- ============================================================================
 -- EVENTS
@@ -512,6 +630,9 @@ CREATE INDEX IF NOT EXISTS idx_events_contract_address ON events(contract_addres
 CREATE INDEX IF NOT EXISTS idx_events_protocol_type_block ON events(protocol, event_type, block_number);
 CREATE INDEX IF NOT EXISTS idx_events_block_log ON events(block_number, log_index);
 CREATE INDEX IF NOT EXISTS idx_events_owner_extracted ON events (LOWER(json_extract(data, '$.owner')));
+CREATE INDEX IF NOT EXISTS idx_events_to_extracted ON events (LOWER(json_extract(data, '$.to')));
+CREATE INDEX IF NOT EXISTS idx_events_from_extracted ON events (LOWER(json_extract(data, '$.from')));
+CREATE INDEX IF NOT EXISTS idx_events_resource_extracted ON events (json_extract(data, '$.resource'));
 
 
 -- ============================================================================
@@ -562,6 +683,7 @@ CREATE INDEX IF NOT EXISTS idx_eac_roles_resource ON eac_roles(protocol, resourc
 CREATE INDEX IF NOT EXISTS idx_eac_roles_account ON eac_roles(protocol, account);
 CREATE INDEX IF NOT EXISTS idx_eac_roles_block ON eac_roles(protocol, block_number);
 CREATE INDEX IF NOT EXISTS idx_eac_roles_contract ON eac_roles(protocol, contract_address);
+CREATE INDEX IF NOT EXISTS idx_eac_roles_contract_resource ON eac_roles(protocol, contract_address, resource);
 
 
 -- ============================================================================
@@ -696,6 +818,20 @@ CREATE TABLE IF NOT EXISTS backfill_status (
   records_processed INTEGER DEFAULT 0
 );
 
+-- Durable per-target ledger for init-gap heal sweeps (resolver/subregistry
+-- contracts whose initialization events predate their first sighting). One row
+-- per owed sweep; failures retry with attempt caps instead of being silently
+-- absorbed by a task-level completion marker.
+CREATE TABLE IF NOT EXISTS init_gap_heal_targets (
+  task TEXT NOT NULL,
+  protocol TEXT NOT NULL,
+  address TEXT NOT NULL,
+  completed INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (task, protocol, address)
+);
+
 
 -- ============================================================================
 -- UNKNOWN LABELS (labelhash → label backfill queue; migration 010)
@@ -721,6 +857,10 @@ CREATE INDEX IF NOT EXISTS idx_unknown_labels_backfill
     WHERE backfill_attempts < 3;
 CREATE INDEX IF NOT EXISTS idx_unknown_labels_tx_hash ON unknown_labels(transaction_hash);
 CREATE INDEX IF NOT EXISTS idx_unknown_labels_labelhash ON unknown_labels(labelhash);
+-- The NameWrapped DNS-heal path deletes by namehash for every label level of
+-- every wrap event; without this index each delete (and its reorg-capture
+-- SELECT) full-scans the table.
+CREATE INDEX IF NOT EXISTS idx_unknown_labels_namehash ON unknown_labels(namehash);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_unknown_labels_unique ON unknown_labels(labelhash, parent_node);
 
 

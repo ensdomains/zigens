@@ -34,6 +34,17 @@ pub const NestedContext = struct {
     depth: u32,
     allocator: std.mem.Allocator,
     loaders: ?*anyopaque,
+    /// Optional live-resolution context (cast to resolve.universal.LiveContext by the
+    /// record-read handlers). Default null; propagated from the parent context at every
+    /// nested-context construction, so a missed propagation just disables the fallback
+    /// on that branch (fail-safe = pre-existing indexed-only behavior).
+    resolve: ?*anyopaque = null,
+    /// Optional at-block reconstruction state (cast to storage.at_block.AtBlockState).
+    /// Set ONLY on the single at-block entity's serve path (resolveDomain -> its own
+    /// resolver/record fields); deliberately NOT propagated into nested domain entities
+    /// (parent/subdomains), which serve current state — a missed site fails safe to
+    /// current-state reads, never to mixed history.
+    at_block: ?*const anyopaque = null,
 };
 
 /// Nested field handler function type
@@ -73,9 +84,9 @@ pub fn buildEntityJson(
         return error.MaxDepthExceeded;
     }
 
-    var json: std.ArrayList(u8) = .{};
-    errdefer json.deinit(allocator);
-    const writer = json.writer(allocator);
+    var json: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json.deinit();
+    const writer = &json.writer;
 
     try writer.writeAll("{");
     var first = true;
@@ -141,30 +152,30 @@ pub fn buildEntityJson(
         // or `name { foo }` on a String field).
         if (field.selections.len > 0) {
             for (config.field_defs) |def| {
-                if (std.mem.eql(u8, def.name, field.name) and def.field_type != .custom) {
-                    // FieldDef.custom = object/list writer (sub-selections honored by writer).
-                    // All other types (including custom_scalar) are scalars and must reject sub-selections.
+                if (std.mem.eql(u8, def.name, field.name)) {
+                    // All FieldDef types (including custom_scalar) are scalars and must
+                    // reject sub-selections; object/list fields go through NestedFieldDef.
                     return error.SubSelectionOnScalar;
                 }
             }
         }
 
         // Try scalar field from field definitions
-        var field_buffer: std.ArrayList(u8) = .{};
-        defer field_buffer.deinit(allocator);
+        var field_buffer: std.Io.Writer.Allocating = .init(allocator);
+        defer field_buffer.deinit();
 
         const handled = try fields.handleFieldFromTable(
             ctx,
             output_key,
             field.name,
-            field_buffer.writer(allocator),
+            &field_buffer.writer,
             allocator,
             config.field_defs,
         );
 
         if (handled) {
             if (!first) try writer.writeAll(",");
-            try writer.writeAll(field_buffer.items);
+            try writer.writeAll(field_buffer.written());
             first = false;
         } else {
             // Unknown field - return null per GraphQL spec
@@ -176,99 +187,6 @@ pub fn buildEntityJson(
 
     try writer.writeAll("}");
     // toOwnedSlice transfers the backing buffer directly to the caller — saves the
-    // dupe-then-free round trip vs `allocator.dupe(u8, json.items)`.
-    return try json.toOwnedSlice(allocator);
-}
-
-/// Build JSON array for a list of entities
-pub fn buildEntityArrayJson(
-    comptime T: type,
-    allocator: std.mem.Allocator,
-    items: []T,
-    selections: []const parser.Field,
-    config: *const EntityConfig,
-    nested_ctx: NestedContext,
-) anyerror![]u8 {
-    var json: std.ArrayList(u8) = .{};
-    errdefer json.deinit(allocator);
-    const writer = json.writer(allocator);
-
-    try writer.writeAll("[");
-
-    for (items, 0..) |*item, i| {
-        if (i > 0) try writer.writeAll(",");
-        const item_json = try buildEntityJson(
-            allocator,
-            @ptrCast(item),
-            selections,
-            config,
-            nested_ctx,
-        );
-        defer allocator.free(item_json);
-        try writer.writeAll(item_json);
-    }
-
-    try writer.writeAll("]");
-    return try json.toOwnedSlice(allocator);
-}
-
-// ============================================================================
-// SIMPLE ENTITY CONFIGURATIONS (no nested fields)
-// ============================================================================
-
-/// Registration entity configuration
-pub const RegistrationConfig = EntityConfig{
-    .type_name = "Registration",
-    .field_defs = &fields.RegistrationFields,
-    .nested_fields = &[_]NestedFieldDef{},
-};
-
-/// EAC Role entity configuration
-pub const EACRoleConfig = EntityConfig{
-    .type_name = "EACRoleAssignment",
-    .field_defs = &fields.EACRoleFields,
-    .nested_fields = &[_]NestedFieldDef{},
-};
-
-/// Resolver entity configuration
-pub const ResolverConfig = EntityConfig{
-    .type_name = "Resolver",
-    .field_defs = &fields.ResolverFields,
-    .nested_fields = &[_]NestedFieldDef{},
-};
-
-/// Registry entity configuration
-pub const RegistryConfig = EntityConfig{
-    .type_name = "Registry",
-    .field_defs = &fields.RegistryFields,
-    .nested_fields = &[_]NestedFieldDef{},
-};
-
-/// ResolverMetadata entity configuration
-pub const ResolverMetadataConfig = EntityConfig{
-    .type_name = "ResolverMetadata",
-    .field_defs = &fields.ResolverMetadataFields,
-    .nested_fields = &[_]NestedFieldDef{},
-};
-
-/// ResolverApproval entity configuration
-pub const ResolverApprovalConfig = EntityConfig{
-    .type_name = "ResolverApproval",
-    .field_defs = &fields.ResolverApprovalFields,
-    .nested_fields = &[_]NestedFieldDef{},
-};
-
-// ============================================================================
-// TESTS
-// ============================================================================
-
-test "EntityConfig structure" {
-    // Test that EntityConfig structures are valid
-    try std.testing.expectEqualStrings("Registration", RegistrationConfig.type_name);
-    try std.testing.expect(RegistrationConfig.field_defs.len > 0);
-    try std.testing.expect(RegistrationConfig.nested_fields.len == 0);
-
-    try std.testing.expectEqualStrings("EACRoleAssignment", EACRoleConfig.type_name);
-    try std.testing.expectEqualStrings("Resolver", ResolverConfig.type_name);
-    try std.testing.expectEqualStrings("Registry", RegistryConfig.type_name);
+    // dupe-then-free round trip vs `allocator.dupe(u8, json.written())`.
+    return try json.toOwnedSlice();
 }

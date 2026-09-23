@@ -1,4 +1,6 @@
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
+const Conn = @import("../api/http_util.zig").Conn;
 
 pub const IndexerStatus = struct {
     current_block: u64,
@@ -23,7 +25,7 @@ pub const IndexerStatus = struct {
         if (self.indexing_complete) return null;
         if (self.current_block <= self.start_block) return null;
 
-        const elapsed = std.time.timestamp() - self.start_time;
+        const elapsed = zsys.timestamp() - self.start_time;
         if (elapsed <= 0) return null;
 
         const blocks_done = self.current_block - self.start_block;
@@ -40,19 +42,32 @@ pub const IndexerStatus = struct {
 pub const StatusServer = struct {
     allocator: std.mem.Allocator,
     status: *IndexerStatus,
-    listener: std.net.Server,
+    // Privately owned event loop: StatusServer.init keeps its (allocator, status,
+    // port) signature, so callers never thread an io handle through.
+    threaded: *std.Io.Threaded,
+    io: std.Io,
+    listener: std.Io.net.Server,
     thread: ?std.Thread,
     port: u16,
     running: std.atomic.Value(bool),
 
     pub fn init(allocator: std.mem.Allocator, status: *IndexerStatus, port: u16) !*StatusServer {
+        const threaded = try allocator.create(std.Io.Threaded);
+        errdefer allocator.destroy(threaded);
+        threaded.* = std.Io.Threaded.init(allocator, .{});
+        errdefer threaded.deinit();
+        const io = threaded.io();
+
         const self = try allocator.create(StatusServer);
-        const address = try std.net.Address.parseIp("0.0.0.0", port);
+        errdefer allocator.destroy(self);
+        const address = try std.Io.net.IpAddress.parse("0.0.0.0", port);
 
         self.* = StatusServer{
             .allocator = allocator,
             .status = status,
-            .listener = try address.listen(.{ .reuse_address = true }),
+            .threaded = threaded,
+            .io = io,
+            .listener = try address.listen(io, .{ .reuse_address = true }),
             .thread = null,
             .port = port,
             .running = std.atomic.Value(bool).init(false),
@@ -68,36 +83,42 @@ pub const StatusServer = struct {
 
     pub fn stop(self: *StatusServer) void {
         self.running.store(false, .seq_cst);
+        // Wake the blocked accept: shutdown(2) makes it fail with
+        // error.SocketNotListening (which run() treats as stop) — without this,
+        // join blocks until one more connection happens to arrive.
+        _ = std.c.shutdown(self.listener.socket.handle, std.c.SHUT.RDWR);
         if (self.thread) |thread| {
             thread.join();
         }
-        self.listener.deinit();
+        self.listener.deinit(self.io);
     }
 
     pub fn deinit(self: *StatusServer) void {
         self.stop();
+        self.threaded.deinit();
+        self.allocator.destroy(self.threaded);
         self.allocator.destroy(self);
     }
 
     fn run(self: *StatusServer) !void {
         while (self.running.load(.seq_cst)) {
-            const connection = self.listener.accept() catch |err| {
+            const stream = self.listener.accept(self.io) catch |err| {
                 if (err == error.SocketNotListening) break;
                 std.log.err("Failed to accept connection: {}", .{err});
                 continue;
             };
 
-            self.handleConnection(connection) catch |err| {
+            self.handleConnection(.{ .io = self.io, .stream = stream }) catch |err| {
                 std.log.err("Failed to handle connection: {}", .{err});
             };
         }
     }
 
-    fn handleConnection(self: *StatusServer, conn: std.net.Server.Connection) !void {
-        defer conn.stream.close();
+    fn handleConnection(self: *StatusServer, conn: Conn) !void {
+        defer conn.close();
 
         var buf: [4096]u8 = undefined;
-        const bytes_read = try conn.stream.read(&buf);
+        const bytes_read = try conn.read(&buf);
         if (bytes_read == 0) return;
 
         const request = buf[0..bytes_read];
@@ -111,15 +132,15 @@ pub const StatusServer = struct {
         const path = std.mem.trim(u8, parts.next() orelse "/", &std.ascii.whitespace);
 
         if (std.mem.eql(u8, path, "/status")) {
-            try self.serveStatusPage(conn.stream);
+            try self.serveStatusPage(conn);
         } else if (std.mem.eql(u8, path, "/status/api")) {
-            try self.serveStatusAPI(conn.stream);
+            try self.serveStatusAPI(conn);
         } else {
-            try self.serve404(conn.stream);
+            try self.serve404(conn);
         }
     }
 
-    fn serveStatusPage(self: *StatusServer, stream: std.net.Stream) !void {
+    fn serveStatusPage(self: *StatusServer, conn: Conn) !void {
         const html = try generateHTML(self.allocator, self.status);
         defer self.allocator.free(html);
 
@@ -130,10 +151,10 @@ pub const StatusServer = struct {
         );
         defer self.allocator.free(response);
 
-        _ = try stream.writeAll(response);
+        try conn.writeAll(response);
     }
 
-    fn serveStatusAPI(self: *StatusServer, stream: std.net.Stream) !void {
+    fn serveStatusAPI(self: *StatusServer, conn: Conn) !void {
         const json = try generateJSON(self.allocator, self.status);
         defer self.allocator.free(json);
 
@@ -144,10 +165,10 @@ pub const StatusServer = struct {
         );
         defer self.allocator.free(response);
 
-        _ = try stream.writeAll(response);
+        try conn.writeAll(response);
     }
 
-    fn serve404(self: *StatusServer, stream: std.net.Stream) !void {
+    fn serve404(self: *StatusServer, conn: Conn) !void {
         const body = "404 Not Found\n";
         const response = try std.fmt.allocPrint(
             self.allocator,
@@ -156,7 +177,7 @@ pub const StatusServer = struct {
         );
         defer self.allocator.free(response);
 
-        _ = try stream.writeAll(response);
+        try conn.writeAll(response);
     }
 };
 

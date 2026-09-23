@@ -1,5 +1,6 @@
 const std = @import("std");
 const db_module = @import("database.zig");
+const reorg_undo = @import("reorg_undo.zig");
 const Database = db_module.Database;
 const Query = db_module.Query;
 const Address = @import("../types/address.zig").Address;
@@ -11,6 +12,8 @@ pub fn addController(
     block_number: u64,
     tx_hash: []const u8,
 ) !void {
+    const existed = try reorg_undo.activeRowExists(database, "v1_controllers", "controller_address = ?", .{controller_address});
+    if (existed) try reorg_undo.captureActiveWhere(database, "v1_controllers", "U", "controller_address = ?", .{controller_address});
     const sql =
         \\INSERT INTO v1_controllers (controller_address, added_block_number, is_active, added_tx_hash)
         \\VALUES (?, ?, 1, ?)
@@ -28,6 +31,7 @@ pub fn addController(
     try q.bindText(tx_hash);
 
     try q.exec();
+    if (!existed) try reorg_undo.captureActiveWhere(database, "v1_controllers", "I", "controller_address = ?", .{controller_address});
 }
 
 /// Remove a controller from the v1_controllers table (mark as inactive)
@@ -37,6 +41,7 @@ pub fn removeController(
     block_number: u64,
     tx_hash: []const u8,
 ) !void {
+    try reorg_undo.captureActiveWhere(database, "v1_controllers", "U", "controller_address = ?", .{controller_address});
     const sql =
         \\UPDATE v1_controllers
         \\SET is_active = 0,
@@ -69,7 +74,7 @@ pub fn getActiveControllers(
     var q = try Query.initCached(database, sql);
     defer q.deinit();
 
-    var controllers: std.ArrayList(Address) = .{};
+    var controllers: std.ArrayList(Address) = .empty;
     errdefer controllers.deinit(allocator);
 
     while (try q.step()) {

@@ -2,6 +2,7 @@ const std = @import("std");
 const ens_name = @import("../utils/ens_name.zig");
 const constants = @import("../constants.zig");
 const db_module = @import("database.zig");
+const reorg_undo = @import("reorg_undo.zig");
 const Database = db_module.Database;
 const Hash = @import("../types/hash.zig").Hash;
 const Address = @import("../types/address.zig").Address;
@@ -30,11 +31,14 @@ pub fn insertRegistration(
     log_index: u32,
     event_type: models.EventType,
 ) !void {
-    const sql =
-        \\INSERT OR IGNORE INTO registrations
-        \\(protocol, namehash, label, parent_name, registrant, registered_at, expiry, block_number, transaction_hash, log_index, event_type)
-        \\VALUES (?, ?, ?, ?, LOWER(?), ?, ?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertExprSql(
+        db.allocator,
+        "registrations",
+        &.{ "protocol", "namehash", "label", "parent_name", "registrant", "registered_at", "expiry", "block_number", "transaction_hash", "log_index", "event_type" },
+        &.{ "?", "?", "?", "?", "LOWER(?)", "?", "?", "?", "?", "?", "?" },
+        .ignore,
+    );
+    defer db.allocator.free(sql);
 
     var q = try db_module.Query.initCached(db, sql);
     defer q.deinit();
@@ -78,6 +82,7 @@ pub fn updateRegistrationExpiry(
     namehash: Hash,
     new_expiry: i64,
 ) !void {
+    try reorg_undo.captureWhere(db, "registrations", "U", "protocol = ? AND namehash = ?", .{ protocol, namehash });
     var q = try db_module.Query.initCached(db,
         \\UPDATE registrations SET expiry = ? WHERE protocol = ? AND namehash = ?
     );
@@ -102,6 +107,7 @@ pub fn updateRegistrationRegistrant(
     namehash: Hash,
     new_registrant: Address,
 ) !void {
+    try reorg_undo.captureWhere(db, "registrations", "U", "protocol = ? AND namehash = ?", .{ protocol, namehash });
     var q = try db_module.Query.initCached(db,
         \\UPDATE registrations SET registrant = LOWER(?) WHERE protocol = ? AND namehash = ?
     );
@@ -133,6 +139,7 @@ pub fn updateRegistrationEconomics(
     premium: u256,
     referrer: ?Hash,
 ) !void {
+    try reorg_undo.captureWhere(db, "registrations", "U", "protocol = ? AND namehash = ?", .{ protocol, namehash });
     const sql =
         \\UPDATE registrations
         \\SET base_cost = ?, premium = ?, label_name = ?, referrer = ?
@@ -203,6 +210,9 @@ pub const RegistrationFilterOptions = struct {
     expiry_gte: ?i64 = null,
     expiry_lt: ?i64 = null,
     expiry_lte: ?i64 = null,
+    /// Subgraph-style boolean composition (GraphQL `and` / `or`), nesting recursively.
+    and_group: ?[]const RegistrationFilterOptions = null,
+    or_group: ?[]const RegistrationFilterOptions = null,
 };
 
 /// Map an EventSortField to a registrations-table column name. The events-table
@@ -217,9 +227,36 @@ fn sortColumn(sort_field: events.EventSortField) []const u8 {
     };
 }
 
+/// Sort-column expression shared by getRegistrations and countRegistrationsBeforeCursor so
+/// the fetch order and the cursor-position count agree exactly. Nullable columns are
+/// COALESCE'd so NULLs order deterministically and the count comparison stays NULL-free.
+fn sortColExprReg(sort_field: events.EventSortField) []const u8 {
+    return switch (sort_field) {
+        .block_number => "block_number",
+        .timestamp => "COALESCE(registered_at, 0)",
+        .name => "COALESCE(label, '')",
+        .expiry => "COALESCE(expiry, 0)",
+    };
+}
+
 /// Append WHERE conditions for a registrations-table query. `allocated_clauses`
 /// owns dynamically-built IN clauses so the caller can free them.
 fn appendFilterConditions(
+    db: *Database,
+    filter: RegistrationFilterOptions,
+    conditions: *std.ArrayList([]const u8),
+    allocated_clauses: *std.ArrayList([]const u8),
+) !void {
+    // PROTOCOL DEDUP: mirror the domains-list rule — a registration indexed under both
+    // protocols for the same node is served once, as its v2 row.
+    try conditions.append(db.allocator, "NOT (registrations.protocol = 'v1' AND EXISTS (SELECT 1 FROM registrations v2twin WHERE v2twin.namehash = registrations.namehash AND v2twin.protocol = 'v2'))");
+    if (try buildRegNodeExpr(db, filter, allocated_clauses)) |expr| {
+        try conditions.append(db.allocator, expr);
+    }
+}
+
+/// One registration-filter node's scalar predicates (no and/or).
+fn appendRegScalarConditions(
     db: *Database,
     filter: RegistrationFilterOptions,
     conditions: *std.ArrayList([]const u8),
@@ -229,7 +266,7 @@ fn appendFilterConditions(
     if (filter.registrant != null) try conditions.append(db.allocator, "registrant = LOWER(?)");
     if (filter.registrant_in) |list| {
         if (list.len > 0) {
-            var in_parts: std.ArrayList(u8) = .{};
+            var in_parts: std.ArrayList(u8) = .empty;
             defer in_parts.deinit(db.allocator);
             try in_parts.appendSlice(db.allocator, "registrant IN (");
             for (list, 0..) |_, i| {
@@ -248,9 +285,52 @@ fn appendFilterConditions(
     if (filter.expiry_lte != null) try conditions.append(db.allocator, "expiry <= ?");
 }
 
-/// Bind values for the conditions appended by `appendFilterConditions`. Order
-/// must match exactly.
-fn bindFilters(q: *db_module.Query, filter: RegistrationFilterOptions) !void {
+/// Recursively build one registration-filter node's boolean SQL (scalars + and/or).
+fn buildRegNodeExpr(
+    db: *Database,
+    filter: RegistrationFilterOptions,
+    allocated_clauses: *std.ArrayList([]const u8),
+) anyerror!?[]const u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(db.allocator);
+    try appendRegScalarConditions(db, filter, &parts, allocated_clauses);
+    if (filter.and_group) |children| {
+        for (children) |child| {
+            if (try buildRegNodeExpr(db, child, allocated_clauses)) |sub| try parts.append(db.allocator, sub);
+        }
+    }
+    if (filter.or_group) |children| {
+        var or_parts: std.ArrayList([]const u8) = .empty;
+        defer or_parts.deinit(db.allocator);
+        for (children) |child| {
+            if (try buildRegNodeExpr(db, child, allocated_clauses)) |sub| try or_parts.append(db.allocator, sub);
+        }
+        if (or_parts.items.len > 0) {
+            const joined = try db_module.query.joinWrapped(db.allocator, or_parts.items, " OR ");
+            try allocated_clauses.append(db.allocator, joined);
+            try parts.append(db.allocator, joined);
+        }
+    }
+    if (parts.items.len == 0) return null;
+    if (parts.items.len == 1) return parts.items[0];
+    const joined = try db_module.query.joinWrapped(db.allocator, parts.items, " AND ");
+    try allocated_clauses.append(db.allocator, joined);
+    return joined;
+}
+
+/// Bind values for `filter`: scalars, then and, then or (matches the SQL build order).
+fn bindFilters(q: *db_module.Query, filter: RegistrationFilterOptions) anyerror!void {
+    try bindRegScalars(q, filter);
+    if (filter.and_group) |children| {
+        for (children) |child| try bindFilters(q, child);
+    }
+    if (filter.or_group) |children| {
+        for (children) |child| try bindFilters(q, child);
+    }
+}
+
+/// Bind one node's scalars in the same order `appendRegScalarConditions` appends them.
+fn bindRegScalars(q: *db_module.Query, filter: RegistrationFilterOptions) !void {
     if (filter.protocol) |p| try q.bindTextStatic(p.toString());
     if (filter.registrant) |r| try q.bindText(r);
     if (filter.registrant_in) |list| {
@@ -347,13 +427,13 @@ pub fn getRegistrations(database: *Database, filter: RegistrationFilterOptions) 
         "expiry, block_number, transaction_hash, log_index, event_type, " ++
         "base_cost, premium, COALESCE(label_name, label) AS label_name, referrer FROM registrations";
 
-    var sql_buf: std.ArrayList(u8) = .{};
+    var sql_buf: std.ArrayList(u8) = .empty;
     defer sql_buf.deinit(database.allocator);
     try sql_buf.appendSlice(database.allocator, base_sql);
 
-    var conditions: std.ArrayList([]const u8) = .{};
+    var conditions: std.ArrayList([]const u8) = .empty;
     defer conditions.deinit(database.allocator);
-    var allocated_clauses: std.ArrayList([]const u8) = .{};
+    var allocated_clauses: std.ArrayList([]const u8) = .empty;
     defer {
         for (allocated_clauses.items) |s| database.allocator.free(s);
         allocated_clauses.deinit(database.allocator);
@@ -368,8 +448,9 @@ pub fn getRegistrations(database: *Database, filter: RegistrationFilterOptions) 
         }
     }
 
+    // Total order: sort expression then the unique `id`, shared with the cursor count.
     try sql_buf.appendSlice(database.allocator, " ORDER BY ");
-    try sql_buf.appendSlice(database.allocator, sortColumn(filter.sort_field));
+    try sql_buf.appendSlice(database.allocator, sortColExprReg(filter.sort_field));
     try sql_buf.appendSlice(database.allocator, if (filter.order_dir == .desc) " DESC" else " ASC");
     try sql_buf.appendSlice(database.allocator, ", id ");
     try sql_buf.appendSlice(database.allocator, if (filter.order_dir == .desc) "DESC" else "ASC");
@@ -382,7 +463,7 @@ pub fn getRegistrations(database: *Database, filter: RegistrationFilterOptions) 
     try q.bindInt(@intCast(filter.limit));
     try q.bindInt(@intCast(filter.skip));
 
-    var results: std.ArrayList(models.Event) = .{};
+    var results: std.ArrayList(models.Event) = .empty;
     errdefer {
         for (results.items) |*ev| ev.deinit(database.allocator);
         results.deinit(database.allocator);
@@ -399,13 +480,13 @@ pub fn getRegistrations(database: *Database, filter: RegistrationFilterOptions) 
 /// Count registrations matching the filter. Matches `getRegistrations`'s
 /// WHERE clause exactly so paginated cursor offsets are consistent.
 pub fn getRegistrationCount(database: *Database, filter: RegistrationFilterOptions) !usize {
-    var sql_buf: std.ArrayList(u8) = .{};
+    var sql_buf: std.ArrayList(u8) = .empty;
     defer sql_buf.deinit(database.allocator);
     try sql_buf.appendSlice(database.allocator, "SELECT COUNT(*) FROM registrations");
 
-    var conditions: std.ArrayList([]const u8) = .{};
+    var conditions: std.ArrayList([]const u8) = .empty;
     defer conditions.deinit(database.allocator);
-    var allocated_clauses: std.ArrayList([]const u8) = .{};
+    var allocated_clauses: std.ArrayList([]const u8) = .empty;
     defer {
         for (allocated_clauses.items) |s| database.allocator.free(s);
         allocated_clauses.deinit(database.allocator);
@@ -437,29 +518,35 @@ pub fn countRegistrationsBeforeCursor(
     order_dir: events.OrderDir,
     filter: RegistrationFilterOptions,
 ) !u32 {
-    // Resolve the cursor row's block_number first.
-    var lookup = try db_module.Query.init(
-        database,
-        "SELECT block_number FROM registrations WHERE transaction_hash = ? AND log_index = ? LIMIT 1",
-    );
+    // Count in the SAME total order the fetch uses: (sort_expr, id). A cursor identifies a
+    // unique row; count rows strictly before it so OFFSET = count + 1 lands on the next page
+    // with no dropped/duplicated rows.
+    const sort_expr = sortColExprReg(filter.sort_field);
+    const is_text_sort = filter.sort_field == .name;
+
+    // Resolve the cursor row's (sort_value, id).
+    const lookup_sql = try std.fmt.allocPrint(database.allocator, "SELECT {s}, id FROM registrations WHERE transaction_hash = ? AND log_index = ? LIMIT 1", .{sort_expr});
+    defer database.allocator.free(lookup_sql);
+    var lookup = try db_module.Query.init(database, lookup_sql);
     defer lookup.deinit();
     try lookup.bindText(tx_hash_hex);
     try lookup.bindInt(@intCast(log_index));
     if (!try lookup.step()) return 0;
-    const cursor_block = lookup.getInt64(0);
+    const cursor_sort_int: i64 = if (is_text_sort) 0 else lookup.getInt64(0);
+    const cursor_sort_text: []const u8 = try database.allocator.dupe(u8, if (is_text_sort) (lookup.getTextSlice(0) orelse "") else "");
+    defer database.allocator.free(cursor_sort_text);
+    const cursor_id = lookup.getInt64(1);
 
-    var sql_buf: std.ArrayList(u8) = .{};
+    const op: []const u8 = if (order_dir == .desc) ">" else "<";
+    var sql_buf: std.ArrayList(u8) = .empty;
     defer sql_buf.deinit(database.allocator);
+    const pred = try std.fmt.allocPrint(database.allocator, "SELECT COUNT(*) FROM registrations WHERE ({s} {s} ? OR ({s} = ? AND id {s} ?))", .{ sort_expr, op, sort_expr, op });
+    defer database.allocator.free(pred);
+    try sql_buf.appendSlice(database.allocator, pred);
 
-    const base = if (order_dir == .desc)
-        "SELECT COUNT(*) FROM registrations WHERE (block_number > ? OR (block_number = ? AND log_index > ?))"
-    else
-        "SELECT COUNT(*) FROM registrations WHERE (block_number < ? OR (block_number = ? AND log_index < ?))";
-    try sql_buf.appendSlice(database.allocator, base);
-
-    var conditions: std.ArrayList([]const u8) = .{};
+    var conditions: std.ArrayList([]const u8) = .empty;
     defer conditions.deinit(database.allocator);
-    var allocated_clauses: std.ArrayList([]const u8) = .{};
+    var allocated_clauses: std.ArrayList([]const u8) = .empty;
     defer {
         for (allocated_clauses.items) |s| database.allocator.free(s);
         allocated_clauses.deinit(database.allocator);
@@ -472,9 +559,14 @@ pub fn countRegistrationsBeforeCursor(
 
     var q = try db_module.Query.initCached(database, sql_buf.items);
     defer q.deinit();
-    try q.bindInt64(cursor_block);
-    try q.bindInt64(cursor_block);
-    try q.bindInt(@intCast(log_index));
+    if (is_text_sort) {
+        try q.bindText(cursor_sort_text);
+        try q.bindText(cursor_sort_text);
+    } else {
+        try q.bindInt64(cursor_sort_int);
+        try q.bindInt64(cursor_sort_int);
+    }
+    try q.bindInt64(cursor_id);
     try bindFilters(&q, filter);
     if (!try q.step()) return 0;
     return @intCast(q.getInt64(0));
@@ -487,4 +579,63 @@ pub fn countRegistrationsBeforeCursor(
 test "getRegistrations reads from registrations table" {
     // Smoke: module compiles. Real coverage lives in tests/storage tests with
     // a populated DB fixture (out of scope here).
+}
+
+test "registration connection pagination reproduces the full ordered result (all sort fields)" {
+    const allocator = std.testing.allocator;
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const Row = struct { blk: u64, log: u32, ts: i64, label: []const u8 };
+    const rows = [_]Row{
+        .{ .blk = 100, .log = 0, .ts = 1000, .label = "bbb" },
+        .{ .blk = 100, .log = 1, .ts = 1000, .label = "aaa" },
+        .{ .blk = 101, .log = 0, .ts = 1000, .label = "aaa" },
+        .{ .blk = 101, .log = 1, .ts = 1001, .label = "ccc" },
+        .{ .blk = 102, .log = 0, .ts = 1001, .label = "bbb" },
+        .{ .blk = 102, .log = 1, .ts = 1002, .label = "aaa" },
+        .{ .blk = 103, .log = 0, .ts = 1002, .label = "ddd" },
+    };
+    for (rows, 0..) |r, i| {
+        var tx = [_]u8{0} ** 32;
+        std.mem.writeInt(u32, tx[0..4], @intCast(i + 1), .big);
+        try insertRegistration(&database, .v2, Hash.zero, r.label, "eth", Address.zero, r.ts, null, r.blk, Hash{ .bytes = tx }, r.log, .name_registered);
+    }
+
+    const sorts = [_]events.EventSortField{ .block_number, .timestamp, .name };
+    const dirs = [_]events.OrderDir{ .desc, .asc };
+    for (sorts) |sf| {
+        for (dirs) |dir| {
+            const full = try getRegistrations(&database, .{ .sort_field = sf, .order_dir = dir, .limit = 1000 });
+            defer {
+                for (full) |*e| e.deinit(database.allocator);
+                database.allocator.free(full);
+            }
+
+            var collected: std.ArrayList(struct { blk: u64, log: u32 }) = .empty;
+            defer collected.deinit(allocator);
+            var skip: u32 = 0;
+            while (true) {
+                const page = try getRegistrations(&database, .{ .sort_field = sf, .order_dir = dir, .limit = 3, .skip = skip });
+                defer {
+                    for (page) |*e| e.deinit(database.allocator);
+                    database.allocator.free(page);
+                }
+                if (page.len == 0) break;
+                for (page) |e| try collected.append(allocator, .{ .blk = e.block_number, .log = e.log_index });
+                const last = page[page.len - 1];
+                const tx_hex = try last.tx_hash.toHex(allocator);
+                defer allocator.free(tx_hex);
+                const before = try countRegistrationsBeforeCursor(&database, tx_hex, last.log_index, dir, .{ .sort_field = sf, .order_dir = dir });
+                skip = before + 1;
+                if (page.len < 3) break;
+            }
+
+            try std.testing.expectEqual(full.len, collected.items.len);
+            for (full, collected.items) |f, c| {
+                try std.testing.expectEqual(f.block_number, c.blk);
+                try std.testing.expectEqual(f.log_index, c.log);
+            }
+        }
+    }
 }

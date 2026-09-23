@@ -2,6 +2,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const indexer = @import("indexer/indexer.zig");
 const db = @import("storage/database.zig");
+const db_open = @import("storage/db_open.zig");
 
 // Configure logging: filter debug logs, use file redirection in production
 // Run with: ./ensv2-indexer-v1 > logs/indexer.log 2>&1 &
@@ -28,11 +29,13 @@ fn printHelp() void {
     , .{});
 }
 
-fn parseArgs(allocator: std.mem.Allocator, cfg: *config.Config) !CliMode {
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
+const CliArgs = struct { mode: CliMode, from_block: ?u64 };
+
+fn parseArgs(process_args: std.process.Args, cfg: *config.Config) !CliArgs {
+    var args = process_args.iterate();
 
     var mode: CliMode = .index;
+    var from_block: ?u64 = null;
 
     // Skip program name
     _ = args.skip();
@@ -45,7 +48,8 @@ fn parseArgs(allocator: std.mem.Allocator, cfg: *config.Config) !CliMode {
             mode = .backfill;
         } else if (std.mem.eql(u8, arg, "--from-block")) {
             if (args.next()) |block_str| {
-                cfg.start_block = try std.fmt.parseInt(u64, block_str, 10);
+                from_block = try std.fmt.parseInt(u64, block_str, 10);
+                cfg.start_block = from_block.?;
             } else {
                 std.log.err("--from-block requires a block number", .{});
                 return error.InvalidArgument;
@@ -62,40 +66,56 @@ fn parseArgs(allocator: std.mem.Allocator, cfg: *config.Config) !CliMode {
         }
     }
 
-    return mode;
+    return .{ .mode = mode, .from_block = from_block };
 }
 
-pub fn main() !void {
+const memstat = @import("utils/memstat.zig");
+
+/// File-scope so the per-batch memory line can read `total_requested_bytes`.
+var gpa = std.heap.DebugAllocator(.{ .thread_safe = true, .enable_memory_limit = true }){};
+
+fn gpaLiveBytes() usize {
+    return @intCast(gpa.total_requested_bytes);
+}
+
+pub fn main(init: std.process.Init) !void {
     // Configure SQLite for thread safety BEFORE any other operations
-    const sqlite_result = db.c.sqlite3_config(db.c.SQLITE_CONFIG_SERIALIZED);
-    if (sqlite_result == db.c.SQLITE_OK) {
-        std.log.info("SQLite configured for serialized (thread-safe) mode", .{});
-    } else {
-        std.log.warn("Failed to configure SQLite thread safety: {d}", .{sqlite_result});
-    }
+    db.configureSqliteThreadSafety();
 
     // Use thread-safe GPA configuration
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    memstat.live_bytes_fn = &gpaLiveBytes;
+    const io = init.io;
 
     // Load configuration from .env
     var cfg = try config.Config.fromEnv(allocator);
     defer cfg.deinit();
 
     // Parse command-line arguments (override .env values)
-    const mode = try parseArgs(allocator, &cfg);
+    const cli = try parseArgs(init.minimal.args, &cfg);
+    const mode = cli.mode;
 
     std.log.info("ENSv2 V1 Indexer starting...", .{});
     std.log.info("Network: {s}", .{cfg.network.toString()});
     std.log.info("Database: {s}", .{cfg.database_path});
 
-    // Initialize database
-    var database = try db.Database.init(allocator, cfg.database_path);
+    // Initialize database (backend selected by config: SQLite path or DATABASE_URL).
+    var database = try db_open.openFromConfig(allocator, cfg);
     defer database.deinit();
     database.setChainId(cfg.network.chainId());
 
-    std.log.info("Database initialized at: {s}", .{cfg.database_path});
+    switch (cfg.backend_kind) {
+        .sqlite => std.log.info("Database initialized: sqlite {s}", .{cfg.database_path}),
+        .postgres => std.log.info("Database initialized: postgres (via DATABASE_URL)", .{}),
+    }
+
+    // --from-block resets this protocol's cursor, mirroring the combined binary,
+    // so all three binaries interpret the flag identically.
+    if (cli.from_block) |fb| {
+        std.log.info("Resetting sync state to block {d}...", .{fb});
+        try database.setSyncState(.v1, fb);
+    }
 
     // In backfill mode, disable status server and webhooks to avoid DB lock contention
     if (mode == .backfill) {
@@ -104,13 +124,15 @@ pub fn main() !void {
     }
 
     // Initialize indexer with only V1 client
-    var idx = try indexer.Indexer.initSingleProtocol(allocator, cfg, &database, .v1, cfg.end_block);
+    var idx = try indexer.Indexer.initSingleProtocol(allocator, io, cfg, &database, .v1, cfg.end_block);
     defer idx.deinit();
 
     switch (mode) {
         .backfill => {
             std.log.info("Running in --backfill mode: rebuilding names from stored events", .{});
+            try idx.clearReplayStatus();
             try idx.replayEventsToRebuildNames();
+            try idx.writeReplayStatus();
             std.log.info("Backfill complete. Exiting.", .{});
         },
         .index => {

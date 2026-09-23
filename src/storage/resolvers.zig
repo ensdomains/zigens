@@ -1,192 +1,34 @@
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const db_module = @import("database.zig");
+const reorg_undo = @import("reorg_undo.zig");
 const Database = db_module.Database;
 const Query = db_module.Query;
 const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
+const record_model = @import("resolver_records.zig");
 
 // ============================================================================
 // RESOLVER OPERATIONS
 // ============================================================================
 
-// ----------------------------------------------------------------------------
-// Resolver entity table (subgraph parity)
-// ----------------------------------------------------------------------------
-// One row per (protocol, namehash, resolver_address) binding ever observed on
-// a NewResolver-style event. The same name can produce multiple Resolver rows
-// over time if its resolver contract changes — each row records when that
-// specific binding was first set.
-//
-// The subgraph encodes IDs as `{chainId}-{address}-{node}`. Our (protocol,
-// address, namehash) triple is the same shape; the encoding lives in the
-// query layer, not the storage layer.
-
-pub fn upsertResolverEntity(
-    db: *Database,
-    protocol: models.Protocol,
-    resolver_address: []const u8,
-    namehash: []const u8,
-    name: []const u8,
-    block_number: u64,
-    timestamp: i64,
-) !void {
-    if (resolver_address.len == 0 or namehash.len == 0) return;
-    const sql =
-        \\INSERT OR IGNORE INTO resolvers
-        \\  (protocol, address, name, namehash, set_block, set_at)
-        \\VALUES (?, ?, ?, ?, ?, ?)
-    ;
-    var q = try Query.initCached(db, sql);
-    defer q.deinit();
-    try q.bindTextStatic(protocol.toString());
-    try q.bindText(resolver_address);
-    try q.bindText(name);
-    try q.bindText(namehash);
-    try q.bindInt64(@intCast(block_number));
-    try q.bindInt64(timestamp);
-    try q.exec();
-}
-
-pub fn getResolverEntityCount(db: *Database) !u64 {
-    var q = try Query.init(db, "SELECT COUNT(*) FROM resolvers");
-    defer q.deinit();
-    if (!(try q.step())) return 0;
-    return @intCast(q.getInt64(0));
-}
-
-pub const ResolverEntity = struct {
-    protocol: []const u8,
-    address: []const u8,
-    name: []const u8,
-    namehash: []const u8,
-    set_block: u64,
-    set_at: i64,
-
-    pub fn deinit(self: *ResolverEntity, allocator: std.mem.Allocator) void {
-        allocator.free(self.protocol);
-        allocator.free(self.address);
-        allocator.free(self.name);
-        allocator.free(self.namehash);
-    }
-};
-
-pub const ResolverEntityFilters = struct {
-    /// Exact match on the resolver contract address (lowercase 0x-hex).
-    address: ?[]const u8 = null,
-    address_in: ?[]const []const u8 = null,
-    /// Exact match on the bound namehash.
-    namehash: ?[]const u8 = null,
-    /// Restrict to one protocol; null = both.
-    protocol: ?[]const u8 = null,
-};
-
-pub const ResolverEntitySortField = enum {
-    set_block,
-    address,
-
-    pub fn toSql(self: ResolverEntitySortField) []const u8 {
-        return switch (self) {
-            .set_block => "set_block",
-            .address => "address",
-        };
-    }
-};
-
-pub fn getFilteredResolverEntities(
-    db: *Database,
-    filters: ResolverEntityFilters,
-    skip: u32,
-    limit: u32,
-    order_dir: db_module.OrderDir,
-    sort_field: ResolverEntitySortField,
-) ![]ResolverEntity {
-    var conditions: std.ArrayList([]const u8) = .{};
-    defer conditions.deinit(db.allocator);
-    var allocated: std.ArrayList([]const u8) = .{};
-    defer {
-        for (allocated.items) |s| db.allocator.free(s);
-        allocated.deinit(db.allocator);
-    }
-
-    if (filters.address != null) try conditions.append(db.allocator, "address = ?");
-    if (filters.namehash != null) try conditions.append(db.allocator, "namehash = ?");
-    if (filters.protocol != null) try conditions.append(db.allocator, "protocol = ?");
-    if (filters.address_in) |addrs| {
-        if (addrs.len == 0) {
-            try conditions.append(db.allocator, "1=0");
-        } else {
-            const clause = try db_module.query.buildInClause(db.allocator, "address", "IN", addrs.len);
-            try allocated.append(db.allocator, clause);
-            try conditions.append(db.allocator, clause);
-        }
-    }
-
-    var sql_buf: std.ArrayList(u8) = .{};
-    defer sql_buf.deinit(db.allocator);
-    try sql_buf.appendSlice(db.allocator, "SELECT protocol, address, name, namehash, set_block, set_at FROM resolvers");
-    if (conditions.items.len > 0) {
-        try sql_buf.appendSlice(db.allocator, " WHERE ");
-        for (conditions.items, 0..) |c, i| {
-            if (i > 0) try sql_buf.appendSlice(db.allocator, " AND ");
-            try sql_buf.appendSlice(db.allocator, c);
-        }
-    }
-    try sql_buf.appendSlice(db.allocator, " ORDER BY ");
-    try sql_buf.appendSlice(db.allocator, sort_field.toSql());
-    try sql_buf.appendSlice(db.allocator, if (order_dir == .desc) " DESC" else " ASC");
-    try sql_buf.appendSlice(db.allocator, ", namehash ASC LIMIT ? OFFSET ?");
-
-    var q = try Query.init(db, sql_buf.items);
-    defer q.deinit();
-    if (filters.address) |a| try q.bindText(a);
-    if (filters.namehash) |n| try q.bindText(n);
-    if (filters.protocol) |p| try q.bindText(p);
-    if (filters.address_in) |addrs| {
-        for (addrs) |a| try q.bindText(a);
-    }
-    try q.bindInt64(@intCast(limit));
-    try q.bindInt64(@intCast(skip));
-
-    var results: std.ArrayList(ResolverEntity) = .{};
-    defer results.deinit(db.allocator);
-    while (try q.step()) {
-        try results.append(db.allocator, .{
-            .protocol = try db.allocator.dupe(u8, q.getTextSlice(0) orelse ""),
-            .address = try db.allocator.dupe(u8, q.getTextSlice(1) orelse ""),
-            .name = try db.allocator.dupe(u8, q.getTextSlice(2) orelse ""),
-            .namehash = try db.allocator.dupe(u8, q.getTextSlice(3) orelse ""),
-            .set_block = @intCast(q.getInt64(4)),
-            .set_at = q.getInt64(5),
-        });
-    }
-    return try results.toOwnedSlice(db.allocator);
-}
-
-// Backfill `resolvers` rows from existing `names.resolver` bindings. Idempotent
-// (INSERT OR IGNORE preserves any previously inserted rows). Used once after
-// the writer is added to event handlers, so historical data isn't lost.
-pub fn backfillResolverEntitiesFromNames(db: *Database) !u64 {
-    const seed_block_sql = "SELECT COALESCE(MIN(last_synced_block), 0) FROM sync_state";
-    var seed_q = try Query.init(db, seed_block_sql);
-    defer seed_q.deinit();
-    const seed_block: i64 = if (try seed_q.step()) seed_q.getInt64(0) else 0;
-
-    const sql =
-        \\INSERT OR IGNORE INTO resolvers (protocol, address, name, namehash, set_block, set_at)
-        \\SELECT n.protocol, n.resolver, n.name, n.namehash, ?, COALESCE(n.created_at, 0)
-        \\FROM names n
-        \\WHERE n.resolver IS NOT NULL
-        \\  AND n.resolver != ''
-        \\  AND n.resolver != '0x0000000000000000000000000000000000000000'
-    ;
-    var q = try Query.init(db, sql);
-    defer q.deinit();
-    try q.bindInt64(seed_block);
-    try q.exec();
-    return try getResolverEntityCount(db);
-}
-
+const entity = @import("resolver_entity.zig");
+pub const upsertResolverEntity = entity.upsertResolverEntity;
+pub const getResolverEntityCount = entity.getResolverEntityCount;
+pub const ResolverEntity = entity.ResolverEntity;
+pub const ResolverEntityFilters = entity.ResolverEntityFilters;
+pub const ResolverEntitySortField = entity.ResolverEntitySortField;
+pub const getFilteredResolverEntities = entity.getFilteredResolverEntities;
+pub const backfillResolverEntitiesFromNames = entity.backfillResolverEntitiesFromNames;
+pub const getResolversToIndex = entity.getResolversToIndex;
+pub const ResolverDiscoveryResult = entity.ResolverDiscoveryResult;
+pub const discoverAndGetResolvers = entity.discoverAndGetResolvers;
+pub const getResolversByOwner = entity.getResolversByOwner;
+pub const getResolverNodeCount = entity.getResolverNodeCount;
+pub const getResolverAliasCount = entity.getResolverAliasCount;
+pub const getResolverRoleHolderCount = entity.getResolverRoleHolderCount;
+pub const getResolverRoles = entity.getResolverRoles;
 
 pub fn storeResolverAddress(
     db: *Database,
@@ -199,11 +41,9 @@ pub fn storeResolverAddress(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_addresses
-        \\  (namehash, resolver, coin_type, address, protocol, block_number, transaction_hash, timestamp, context)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
-    ;
+    try reorg_undo.captureUpsert(db, "resolver_addresses", .{ protocol, resolver, namehash, coin_type });
+    const sql = try db.upsertSql(db.allocator, "resolver_addresses", &.{ "namehash", "resolver", "coin_type", "address", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -231,11 +71,9 @@ pub fn storeResolverContentHash(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_contenthashes
-        \\  (namehash, resolver, contenthash, protocol, block_number, transaction_hash, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?)
-    ;
+    try reorg_undo.captureUpsert(db, "resolver_contenthashes", .{ protocol, resolver, namehash });
+    const sql = try db.upsertSql(db.allocator, "resolver_contenthashes", &.{ "namehash", "resolver", "contenthash", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -263,11 +101,9 @@ pub fn storeResolverText(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_texts
-        \\  (namehash, resolver, key, value, protocol, block_number, transaction_hash, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ;
+    try reorg_undo.captureUpsert(db, "resolver_texts", .{ protocol, resolver, namehash, key });
+    const sql = try db.upsertSql(db.allocator, "resolver_texts", &.{ "namehash", "resolver", "key", "value", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -322,6 +158,8 @@ pub const CoinAddress = struct {
 /// `namehash` column before this is called (which `handleLabelRegistered`
 /// does in the line just above the call site).
 pub fn applyLatestResolverFromEvents(db: *Database, protocol: models.Protocol, namehash: Hash) !void {
+    try db.namesBarrier();
+    try reorg_undo.captureWhere(db, "names", "U", "protocol = ? AND namehash = ? AND (resolver IS NULL OR resolver = '0x0000000000000000000000000000000000000000') AND EXISTS (SELECT 1 FROM events WHERE event_type = 'ResolverUpdated' AND protocol = ? AND namehash = ? AND json_extract(data, '$.resolver') IS NOT NULL)", .{ protocol, namehash, protocol, namehash });
     var q = try Query.initCached(db,
         \\UPDATE names
         \\SET resolver = (
@@ -349,12 +187,13 @@ pub fn applyLatestResolverFromEvents(db: *Database, protocol: models.Protocol, n
     defer q.deinit();
     try q.bindTextStatic(protocol.toString());
     try q.bindHashBuf(namehash);
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.bindTextStatic(protocol.toString());
     try q.bindHashBuf(namehash);
     try q.bindTextStatic(protocol.toString());
     try q.bindHashBuf(namehash);
     try q.exec();
+    db.noteNameWriteByNamehash(namehash);
 }
 
 /// Latest addr record for a given (resolver, namehash, coin_type).
@@ -368,11 +207,12 @@ pub fn getAddressRecord(db: *Database, resolver: Address, namehash: Hash, coin_t
         \\LIMIT 1
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash);
+    try q.bindHash(row_key);
     try q.bindInt64(@intCast(coin_type));
 
     if (try q.step()) {
@@ -391,13 +231,14 @@ pub fn getCoinTypes(db: *Database, resolver: Address, namehash: Hash) ![]u64 {
         \\ORDER BY coin_type
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash);
+    try q.bindHash(row_key);
 
-    var list: std.ArrayList(u64) = .{};
+    var list: std.ArrayList(u64) = .empty;
     errdefer list.deinit(db.allocator);
     while (try q.step()) {
         try list.append(db.allocator, @intCast(q.getInt64(0)));
@@ -414,16 +255,17 @@ pub fn getAddressRecords(db: *Database, resolver: Address, namehash: Hash) ![]Co
         \\ORDER BY coin_type
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash);
+    try q.bindHash(row_key);
     return try readCoinAddresses(db, &q);
 }
 
 fn readCoinAddresses(db: *Database, q: *Query) ![]CoinAddress {
-    var addresses: std.ArrayList(CoinAddress) = .{};
+    var addresses: std.ArrayList(CoinAddress) = .empty;
     errdefer {
         for (addresses.items) |*addr| {
             addr.deinit(db.allocator);
@@ -455,11 +297,12 @@ pub fn getContentHashRecord(db: *Database, resolver: Address, namehash: Hash) !?
         \\LIMIT 1
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash);
+    try q.bindHash(row_key);
 
     if (try q.step()) {
         return try q.getText(0);
@@ -467,7 +310,839 @@ pub fn getContentHashRecord(db: *Database, resolver: Address, namehash: Hash) !?
     return null;
 }
 
+/// One `(resolver, namehash) -> value` row from a batch record read. All fields
+/// are 0x-hex text owned by the db allocator; free via `deinit`.
+pub const ResolverRecordRow = struct {
+    resolver: []u8,
+    namehash: []u8,
+    value: []u8,
+
+    pub fn deinit(self: *ResolverRecordRow, allocator: std.mem.Allocator) void {
+        allocator.free(self.resolver);
+        allocator.free(self.namehash);
+        allocator.free(self.value);
+    }
+};
+
+fn freeRecordRows(allocator: std.mem.Allocator, rows: *std.ArrayList(ResolverRecordRow)) void {
+    for (rows.items) |*r| r.deinit(allocator);
+    rows.deinit(allocator);
+}
+
+// Pair binds go through bindTextStatic with arena-scratch hex (no tracked-
+// string cap), so the chunk is sized for statement length and planner sanity,
+// not MAX_BOUND_STRINGS. 200 pairs = 400 placeholders — under even the
+// legacy SQLite 999-parameter limit; a 1000-row page batches in 5 statements.
+const RECORD_BATCH_CHUNK: usize = 200;
+
+/// Bind a chunk's (resolver, namehash) pairs as static text. The hex buffers
+/// live on `scratch`, which the caller MUST declare BEFORE the Query (LIFO
+/// defers) so they outlive statement execution — same pattern as
+/// upsertEACRolesBatch/insertEventsBatch.
+fn bindPairsStatic(q: *Query, scratch: std.mem.Allocator, pair_resolvers: []const Address, pair_namehashes: []const Hash) !void {
+    for (pair_resolvers, pair_namehashes) |r, nh| {
+        const r_buf = try scratch.create([42]u8);
+        try q.bindTextStatic(r.toHexBuf(r_buf));
+        const nh_buf = try scratch.create([66]u8);
+        try q.bindTextStatic(nh.toHexBuf(nh_buf));
+    }
+}
+
+fn dupeRowWithNamehash(comptime Row: type, a: std.mem.Allocator, row: Row, namehash: Hash) !Row {
+    var copy = row;
+    copy.resolver = try a.dupe(u8, row.resolver);
+    errdefer a.free(copy.resolver);
+    copy.namehash = try namehash.toHex(a);
+    errdefer a.free(copy.namehash);
+    if (@hasField(Row, "value")) {
+        copy.value = try a.dupe(u8, row.value);
+    }
+    errdefer if (@hasField(Row, "value")) a.free(copy.value);
+    if (@hasField(Row, "key")) {
+        copy.key = try a.dupe(u8, row.key);
+    }
+    return copy;
+}
+
+fn freeRowFields(comptime Row: type, a: std.mem.Allocator, row: *Row) void {
+    a.free(row.resolver);
+    a.free(row.namehash);
+    if (@hasField(Row, "value")) a.free(row.value);
+    if (@hasField(Row, "key")) a.free(row.key);
+}
+
+/// Re-key batch rows from the translated record keys (what the sweep queried)
+/// back to the requesting pairs' namehashes, so callers keep seeing rows under
+/// the `(resolver, namehash)` they asked for. A record shared by several names
+/// yields one row copy per requester; a legacy pair (untranslated) maps to
+/// itself. Consumes `rows`.
+fn remapRowsToRequesters(comptime Row: type, db: *Database, rows: []Row, resolvers: []const Address, namehashes: []const Hash, keys: []const Hash) ![]Row {
+    const a = db.allocator;
+    defer {
+        for (rows) |*r| freeRowFields(Row, a, r);
+        a.free(rows);
+    }
+    // "<resolver_hex>|<key_hex>" -> requester indices
+    var requesters = std.StringHashMap(std.ArrayList(usize)).init(a);
+    defer {
+        var it = requesters.iterator();
+        while (it.next()) |e| {
+            e.value_ptr.deinit(a);
+            a.free(e.key_ptr.*);
+        }
+        requesters.deinit();
+    }
+    for (resolvers, keys, 0..) |r, k, i| {
+        var kb: [42 + 1 + 66]u8 = undefined;
+        var rb: [42]u8 = undefined;
+        var hb: [66]u8 = undefined;
+        const composite = try std.fmt.bufPrint(&kb, "{s}|{s}", .{ r.toHexBuf(&rb), k.toHexBuf(&hb) });
+        const gop = try requesters.getOrPut(composite);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .empty;
+            gop.key_ptr.* = a.dupe(u8, composite) catch |err| {
+                _ = requesters.remove(composite);
+                return err;
+            };
+        }
+        try gop.value_ptr.append(a, i);
+    }
+
+    var out: std.ArrayList(Row) = .empty;
+    errdefer {
+        for (out.items) |*r| freeRowFields(Row, a, r);
+        out.deinit(a);
+    }
+    for (rows) |row| {
+        var kb: [42 + 1 + 66]u8 = undefined;
+        const composite = std.fmt.bufPrint(&kb, "{s}|{s}", .{ row.resolver, row.namehash }) catch continue;
+        const idxs = requesters.get(composite) orelse continue;
+        for (idxs.items) |i| {
+            const copy = try dupeRowWithNamehash(Row, a, row, namehashes[i]);
+            errdefer {
+                var c = copy;
+                freeRowFields(Row, a, &c);
+            }
+            try out.append(a, copy);
+        }
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// Batch equivalent of `getAddressRecord` for coin_type 60: the latest address
+/// per `(resolver, namehash)` pair (`ORDER BY block_number DESC LIMIT 1`,
+/// replicated per pair via ROW_NUMBER). Only pairs that HAVE a record appear in
+/// the result. `resolvers[i]` pairs with `namehashes[i]`; both must be the same
+/// length. Caller owns the returned slice and each row.
+pub fn getAddressRecordsBatch(db: *Database, resolvers: []const Address, namehashes: []const Hash, coin_type: u64) ![]ResolverRecordRow {
+    std.debug.assert(resolvers.len == namehashes.len);
+    var rows: std.ArrayList(ResolverRecordRow) = .empty;
+    errdefer freeRecordRows(db.allocator, &rows);
+    if (resolvers.len == 0) return try rows.toOwnedSlice(db.allocator);
+    const pair_resolvers = resolvers;
+    const pair_namehashes = namehashes;
+    const keys = try db.allocator.alloc(Hash, namehashes.len);
+    defer db.allocator.free(keys);
+    const translated = try record_model.resolveRecordKeys(db, resolvers, namehashes, keys);
+    const lookup: []const Hash = if (translated) keys else namehashes;
+
+    var off: usize = 0;
+    while (off < resolvers.len) : (off += RECORD_BATCH_CHUNK) {
+        const end = @min(off + RECORD_BATCH_CHUNK, resolvers.len);
+        const n = end - off;
+
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(db.allocator);
+        try sql.appendSlice(db.allocator, "SELECT resolver, namehash, address FROM (" ++
+            "SELECT resolver, namehash, address, ROW_NUMBER() OVER (PARTITION BY resolver, namehash ORDER BY block_number DESC) AS rn " ++
+            "FROM resolver_addresses WHERE coin_type = ? AND (resolver, namehash) IN (");
+        for (0..n) |i| {
+            if (i > 0) try sql.appendSlice(db.allocator, ", ");
+            try sql.appendSlice(db.allocator, "(?, ?)");
+        }
+        try sql.appendSlice(db.allocator, ")) sub WHERE rn = 1");
+
+        var arena = std.heap.ArenaAllocator.init(db.allocator);
+        defer arena.deinit();
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        try q.bindInt64(@intCast(coin_type));
+        try bindPairsStatic(&q, arena.allocator(), resolvers[off..end], lookup[off..end]);
+        while (try q.step()) {
+            // Loop-scoped errdefers: a later getText/append failure must free
+            // the columns already duped this iteration (the outer errdefer
+            // only sweeps rows already committed to the list).
+            const r_opt = try q.getText(0);
+            errdefer if (r_opt) |x| db.allocator.free(x);
+            const nh_opt = try q.getText(1);
+            errdefer if (nh_opt) |x| db.allocator.free(x);
+            const val_opt = try q.getText(2);
+            errdefer if (val_opt) |x| db.allocator.free(x);
+            if (r_opt == null or nh_opt == null or val_opt == null) {
+                if (r_opt) |x| db.allocator.free(x);
+                if (nh_opt) |x| db.allocator.free(x);
+                if (val_opt) |x| db.allocator.free(x);
+                continue;
+            }
+            try rows.append(db.allocator, .{ .resolver = r_opt.?, .namehash = nh_opt.?, .value = val_opt.? });
+        }
+    }
+    if (translated) {
+        const raw = try rows.toOwnedSlice(db.allocator);
+        return try remapRowsToRequesters(std.meta.Child(@TypeOf(raw)), db, raw, pair_resolvers, pair_namehashes, keys);
+    }
+    return try rows.toOwnedSlice(db.allocator);
+}
+
+/// Batch equivalent of `getContentHashRecord`: the latest contenthash per
+/// `(resolver, namehash)` pair. Same contract as `getAddressRecordsBatch`.
+pub fn getContentHashesBatch(db: *Database, resolvers: []const Address, namehashes: []const Hash) ![]ResolverRecordRow {
+    std.debug.assert(resolvers.len == namehashes.len);
+    var rows: std.ArrayList(ResolverRecordRow) = .empty;
+    errdefer freeRecordRows(db.allocator, &rows);
+    if (resolvers.len == 0) return try rows.toOwnedSlice(db.allocator);
+    const pair_resolvers = resolvers;
+    const pair_namehashes = namehashes;
+    const keys = try db.allocator.alloc(Hash, namehashes.len);
+    defer db.allocator.free(keys);
+    const translated = try record_model.resolveRecordKeys(db, resolvers, namehashes, keys);
+    const lookup: []const Hash = if (translated) keys else namehashes;
+
+    var off: usize = 0;
+    while (off < resolvers.len) : (off += RECORD_BATCH_CHUNK) {
+        const end = @min(off + RECORD_BATCH_CHUNK, resolvers.len);
+        const n = end - off;
+
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(db.allocator);
+        try sql.appendSlice(db.allocator, "SELECT resolver, namehash, contenthash FROM (" ++
+            "SELECT resolver, namehash, contenthash, ROW_NUMBER() OVER (PARTITION BY resolver, namehash ORDER BY block_number DESC) AS rn " ++
+            "FROM resolver_contenthashes WHERE (resolver, namehash) IN (");
+        for (0..n) |i| {
+            if (i > 0) try sql.appendSlice(db.allocator, ", ");
+            try sql.appendSlice(db.allocator, "(?, ?)");
+        }
+        try sql.appendSlice(db.allocator, ")) sub WHERE rn = 1");
+
+        var arena = std.heap.ArenaAllocator.init(db.allocator);
+        defer arena.deinit();
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        try bindPairsStatic(&q, arena.allocator(), resolvers[off..end], lookup[off..end]);
+        while (try q.step()) {
+            // Loop-scoped errdefers: a later getText/append failure must free
+            // the columns already duped this iteration (the outer errdefer
+            // only sweeps rows already committed to the list).
+            const r_opt = try q.getText(0);
+            errdefer if (r_opt) |x| db.allocator.free(x);
+            const nh_opt = try q.getText(1);
+            errdefer if (nh_opt) |x| db.allocator.free(x);
+            const val_opt = try q.getText(2);
+            errdefer if (val_opt) |x| db.allocator.free(x);
+            if (r_opt == null or nh_opt == null or val_opt == null) {
+                if (r_opt) |x| db.allocator.free(x);
+                if (nh_opt) |x| db.allocator.free(x);
+                if (val_opt) |x| db.allocator.free(x);
+                continue;
+            }
+            try rows.append(db.allocator, .{ .resolver = r_opt.?, .namehash = nh_opt.?, .value = val_opt.? });
+        }
+    }
+    if (translated) {
+        const raw = try rows.toOwnedSlice(db.allocator);
+        return try remapRowsToRequesters(std.meta.Child(@TypeOf(raw)), db, raw, pair_resolvers, pair_namehashes, keys);
+    }
+    return try rows.toOwnedSlice(db.allocator);
+}
+
+/// Batch equivalent of `getTextRecord` for a single `key`: the latest value per
+/// `(resolver, namehash)` pair for that key. Same contract as
+/// `getAddressRecordsBatch`. Rows carry (resolver, namehash, value); the key is
+/// fixed per call, so the caller supplies it when keying the result.
+pub fn getTextRecordsBatch(db: *Database, resolvers: []const Address, namehashes: []const Hash, key: []const u8) ![]ResolverRecordRow {
+    std.debug.assert(resolvers.len == namehashes.len);
+    var rows: std.ArrayList(ResolverRecordRow) = .empty;
+    errdefer freeRecordRows(db.allocator, &rows);
+    if (resolvers.len == 0) return try rows.toOwnedSlice(db.allocator);
+    const pair_resolvers = resolvers;
+    const pair_namehashes = namehashes;
+    const keys = try db.allocator.alloc(Hash, namehashes.len);
+    defer db.allocator.free(keys);
+    const translated = try record_model.resolveRecordKeys(db, resolvers, namehashes, keys);
+    const lookup: []const Hash = if (translated) keys else namehashes;
+
+    var off: usize = 0;
+    while (off < resolvers.len) : (off += RECORD_BATCH_CHUNK) {
+        const end = @min(off + RECORD_BATCH_CHUNK, resolvers.len);
+        const n = end - off;
+
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(db.allocator);
+        try sql.appendSlice(db.allocator, "SELECT resolver, namehash, value FROM (" ++
+            "SELECT resolver, namehash, value, ROW_NUMBER() OVER (PARTITION BY resolver, namehash ORDER BY block_number DESC) AS rn " ++
+            "FROM resolver_texts WHERE key = ? AND (resolver, namehash) IN (");
+        for (0..n) |i| {
+            if (i > 0) try sql.appendSlice(db.allocator, ", ");
+            try sql.appendSlice(db.allocator, "(?, ?)");
+        }
+        try sql.appendSlice(db.allocator, ")) sub WHERE rn = 1");
+
+        var arena = std.heap.ArenaAllocator.init(db.allocator);
+        defer arena.deinit();
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        try q.bindText(key);
+        try bindPairsStatic(&q, arena.allocator(), resolvers[off..end], lookup[off..end]);
+        while (try q.step()) {
+            // Loop-scoped errdefers: a later getText/append failure must free
+            // the columns already duped this iteration (the outer errdefer
+            // only sweeps rows already committed to the list).
+            const r_opt = try q.getText(0);
+            errdefer if (r_opt) |x| db.allocator.free(x);
+            const nh_opt = try q.getText(1);
+            errdefer if (nh_opt) |x| db.allocator.free(x);
+            const val_opt = try q.getText(2);
+            errdefer if (val_opt) |x| db.allocator.free(x);
+            if (r_opt == null or nh_opt == null or val_opt == null) {
+                if (r_opt) |x| db.allocator.free(x);
+                if (nh_opt) |x| db.allocator.free(x);
+                if (val_opt) |x| db.allocator.free(x);
+                continue;
+            }
+            try rows.append(db.allocator, .{ .resolver = r_opt.?, .namehash = nh_opt.?, .value = val_opt.? });
+        }
+    }
+    if (translated) {
+        const raw = try rows.toOwnedSlice(db.allocator);
+        return try remapRowsToRequesters(std.meta.Child(@TypeOf(raw)), db, raw, pair_resolvers, pair_namehashes, keys);
+    }
+    return try rows.toOwnedSlice(db.allocator);
+}
+
 /// All text record keys set by (resolver, namehash).
+/// One row per (resolver, namehash, key) triple across all requested pairs —
+/// the batched mirror of getTextRecordKeys. Global ORDER BY key means each
+/// pair's keys arrive in the SAME ascending order the point query produces,
+/// so grouping by pair in scan order reproduces its output exactly.
+pub const PairTextKeyRow = struct { resolver: []u8, namehash: []u8, key: []u8 };
+
+pub fn getTextRecordKeysForPairs(db: *Database, resolvers_list: []const Address, namehashes: []const Hash) ![]PairTextKeyRow {
+    std.debug.assert(resolvers_list.len == namehashes.len);
+    var rows: std.ArrayList(PairTextKeyRow) = .empty;
+    errdefer {
+        for (rows.items) |row| {
+            db.allocator.free(row.resolver);
+            db.allocator.free(row.namehash);
+            db.allocator.free(row.key);
+        }
+        rows.deinit(db.allocator);
+    }
+    if (resolvers_list.len == 0) return try rows.toOwnedSlice(db.allocator);
+    const pair_resolvers = resolvers_list;
+    const pair_namehashes = namehashes;
+    const keys = try db.allocator.alloc(Hash, namehashes.len);
+    defer db.allocator.free(keys);
+    const translated = try record_model.resolveRecordKeys(db, resolvers_list, namehashes, keys);
+    const lookup: []const Hash = if (translated) keys else namehashes;
+
+    var off: usize = 0;
+    while (off < resolvers_list.len) : (off += RECORD_BATCH_CHUNK) {
+        const end = @min(off + RECORD_BATCH_CHUNK, resolvers_list.len);
+        const n = end - off;
+
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(db.allocator);
+        try sql.appendSlice(db.allocator, "SELECT DISTINCT resolver, namehash, key FROM resolver_texts WHERE (resolver, namehash) IN (");
+        for (0..n) |i| {
+            if (i > 0) try sql.appendSlice(db.allocator, ", ");
+            try sql.appendSlice(db.allocator, "(?, ?)");
+        }
+        try sql.appendSlice(db.allocator, ") ORDER BY key");
+
+        var arena = std.heap.ArenaAllocator.init(db.allocator);
+        defer arena.deinit();
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        try bindPairsStatic(&q, arena.allocator(), resolvers_list[off..end], lookup[off..end]);
+        while (try q.step()) {
+            // Loop-scoped errdefers — see getTextRecordsBatch for rationale.
+            const r_opt = try q.getText(0);
+            errdefer if (r_opt) |x| db.allocator.free(x);
+            const nh_opt = try q.getText(1);
+            errdefer if (nh_opt) |x| db.allocator.free(x);
+            const key_opt = try q.getText(2);
+            errdefer if (key_opt) |x| db.allocator.free(x);
+            if (r_opt == null or nh_opt == null or key_opt == null) {
+                if (r_opt) |x| db.allocator.free(x);
+                if (nh_opt) |x| db.allocator.free(x);
+                if (key_opt) |x| db.allocator.free(x);
+                continue;
+            }
+            try rows.append(db.allocator, .{ .resolver = r_opt.?, .namehash = nh_opt.?, .key = key_opt.? });
+        }
+    }
+    if (translated) {
+        const raw = try rows.toOwnedSlice(db.allocator);
+        return try remapRowsToRequesters(std.meta.Child(@TypeOf(raw)), db, raw, pair_resolvers, pair_namehashes, keys);
+    }
+    return try rows.toOwnedSlice(db.allocator);
+}
+
+/// Distinct coin types per (resolver, namehash) across all requested pairs —
+/// the batched mirror of getCoinTypes. Global ORDER BY coin_type means each
+/// pair's list arrives in the SAME ascending order the point query produces,
+/// so grouping by pair in scan order reproduces its output exactly.
+pub const PairCoinTypeRow = struct { resolver: []u8, namehash: []u8, coin_type: u64 };
+
+pub fn getCoinTypesForPairs(db: *Database, resolvers_list: []const Address, namehashes: []const Hash) ![]PairCoinTypeRow {
+    std.debug.assert(resolvers_list.len == namehashes.len);
+    var rows: std.ArrayList(PairCoinTypeRow) = .empty;
+    errdefer {
+        for (rows.items) |row| {
+            db.allocator.free(row.resolver);
+            db.allocator.free(row.namehash);
+        }
+        rows.deinit(db.allocator);
+    }
+    if (resolvers_list.len == 0) return try rows.toOwnedSlice(db.allocator);
+    const pair_resolvers = resolvers_list;
+    const pair_namehashes = namehashes;
+    const keys = try db.allocator.alloc(Hash, namehashes.len);
+    defer db.allocator.free(keys);
+    const translated = try record_model.resolveRecordKeys(db, resolvers_list, namehashes, keys);
+    const lookup: []const Hash = if (translated) keys else namehashes;
+
+    var off: usize = 0;
+    while (off < resolvers_list.len) : (off += RECORD_BATCH_CHUNK) {
+        const end = @min(off + RECORD_BATCH_CHUNK, resolvers_list.len);
+        const n = end - off;
+
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(db.allocator);
+        try sql.appendSlice(db.allocator, "SELECT DISTINCT resolver, namehash, coin_type FROM resolver_addresses WHERE (resolver, namehash) IN (");
+        for (0..n) |i| {
+            if (i > 0) try sql.appendSlice(db.allocator, ", ");
+            try sql.appendSlice(db.allocator, "(?, ?)");
+        }
+        try sql.appendSlice(db.allocator, ") ORDER BY coin_type");
+
+        var arena = std.heap.ArenaAllocator.init(db.allocator);
+        defer arena.deinit();
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        try bindPairsStatic(&q, arena.allocator(), resolvers_list[off..end], lookup[off..end]);
+        while (try q.step()) {
+            // Loop-scoped errdefers — see getTextRecordsBatch for rationale.
+            const r_opt = try q.getText(0);
+            errdefer if (r_opt) |x| db.allocator.free(x);
+            const nh_opt = try q.getText(1);
+            errdefer if (nh_opt) |x| db.allocator.free(x);
+            if (r_opt == null or nh_opt == null) {
+                if (r_opt) |x| db.allocator.free(x);
+                if (nh_opt) |x| db.allocator.free(x);
+                continue;
+            }
+            try rows.append(db.allocator, .{ .resolver = r_opt.?, .namehash = nh_opt.?, .coin_type = @intCast(q.getInt64(2)) });
+        }
+    }
+    if (translated) {
+        const raw = try rows.toOwnedSlice(db.allocator);
+        return try remapRowsToRequesters(std.meta.Child(@TypeOf(raw)), db, raw, pair_resolvers, pair_namehashes, keys);
+    }
+    return try rows.toOwnedSlice(db.allocator);
+}
+
+// ============================================================================
+// PAIR BATCH READERS — POINT-QUERY MIRRORS
+// ============================================================================
+
+fn freeRowStrings(allocator: std.mem.Allocator, row: anytype) void {
+    inline for (std.meta.fields(@TypeOf(row))) |f| {
+        if (f.type == []u8) allocator.free(@field(row, f.name));
+    }
+}
+
+fn freeRowStringsUpTo(allocator: std.mem.Allocator, row: anytype, comptime count: usize) void {
+    inline for (std.meta.fields(@TypeOf(row)), 0..) |f, i| {
+        if (i < count and f.type == []u8) allocator.free(@field(row, f.name));
+    }
+}
+
+fn freeRows(comptime Row: type, allocator: std.mem.Allocator, rows: []Row) void {
+    for (rows) |row| freeRowStrings(allocator, row);
+    allocator.free(rows);
+}
+
+/// Read the current result row into `Row`, whose fields are declared in SELECT
+/// column order. A NULL text column skips the row (null result), mirroring the
+/// point readers' `if (try q.getText(i)) |v|` guards.
+fn readRow(comptime Row: type, q: *Query, allocator: std.mem.Allocator) !?Row {
+    var row: Row = undefined;
+    inline for (std.meta.fields(Row), 0..) |f, col| {
+        switch (f.type) {
+            []u8 => {
+                const text = q.getText(col) catch |err| {
+                    freeRowStringsUpTo(allocator, row, col);
+                    return err;
+                } orelse {
+                    freeRowStringsUpTo(allocator, row, col);
+                    return null;
+                };
+                @field(row, f.name) = text;
+            },
+            u64 => @field(row, f.name) = @intCast(q.getInt64(col)),
+            i64 => @field(row, f.name) = q.getInt64(col),
+            else => @compileError("unsupported batch row field type"),
+        }
+    }
+    return row;
+}
+
+fn buildPairInSql(allocator: std.mem.Allocator, prefix: []const u8, n: usize, suffix: []const u8) ![]u8 {
+    var sql: std.ArrayList(u8) = .empty;
+    errdefer sql.deinit(allocator);
+    try sql.appendSlice(allocator, prefix);
+    for (0..n) |i| {
+        if (i > 0) try sql.appendSlice(allocator, ", ");
+        try sql.appendSlice(allocator, "(?, ?)");
+    }
+    try sql.appendSlice(allocator, suffix);
+    return sql.toOwnedSlice(allocator);
+}
+
+const UniquePairs = struct {
+    resolvers: []Address,
+    namehashes: []Hash,
+
+    fn deinit(self: *UniquePairs, allocator: std.mem.Allocator) void {
+        allocator.free(self.resolvers);
+        allocator.free(self.namehashes);
+    }
+};
+
+/// First-seen-order dedupe of (resolver, namehash) pairs: a pair repeated
+/// across two chunks would otherwise be returned once per chunk.
+fn dedupePairs(allocator: std.mem.Allocator, resolvers_list: []const Address, namehashes: []const Hash) !UniquePairs {
+    var seen = std.AutoHashMap([52]u8, void).init(allocator);
+    defer seen.deinit();
+    var r_out: std.ArrayList(Address) = .empty;
+    errdefer r_out.deinit(allocator);
+    var nh_out: std.ArrayList(Hash) = .empty;
+    errdefer nh_out.deinit(allocator);
+    for (resolvers_list, namehashes) |r, nh| {
+        var key: [52]u8 = undefined;
+        @memcpy(key[0..20], &r.bytes);
+        @memcpy(key[20..52], &nh.bytes);
+        const gop = try seen.getOrPut(key);
+        if (gop.found_existing) continue;
+        try r_out.append(allocator, r);
+        try nh_out.append(allocator, nh);
+    }
+    const resolvers_owned = try r_out.toOwnedSlice(allocator);
+    errdefer allocator.free(resolvers_owned);
+    const namehashes_owned = try nh_out.toOwnedSlice(allocator);
+    return .{ .resolvers = resolvers_owned, .namehashes = namehashes_owned };
+}
+
+/// One statement per chunk of deduped (resolver, namehash) pairs, globally
+/// ordered by the key columns and then by the point query's own ORDER BY, so
+/// the caller regroups per pair in scan order and reproduces the point query
+/// exactly. Pairs with no rows contribute nothing. Row strings are exactly what
+/// `q.getText` returns (resolver 0x-lowercase 42 chars, namehash 0x 66 chars),
+/// owned by db.allocator — free via the row type's `free*Rows` helper.
+fn readPairRows(comptime Row: type, db: *Database, resolvers_list: []const Address, namehashes: []const Hash, prefix: []const u8, suffix: []const u8) ![]Row {
+    std.debug.assert(resolvers_list.len == namehashes.len);
+    var rows: std.ArrayList(Row) = .empty;
+    errdefer {
+        for (rows.items) |row| freeRowStrings(db.allocator, row);
+        rows.deinit(db.allocator);
+    }
+    if (resolvers_list.len == 0) return try rows.toOwnedSlice(db.allocator);
+
+    var unique = try dedupePairs(db.allocator, resolvers_list, namehashes);
+    defer unique.deinit(db.allocator);
+
+    // Record-model resolvers store records under a link's record key, not
+    // the name's namehash: query under the same translated keys the point
+    // readers use, then hand rows back under the requesting pairs.
+    const keys = try db.allocator.alloc(Hash, unique.namehashes.len);
+    defer db.allocator.free(keys);
+    const translated = try record_model.resolveRecordKeys(db, unique.resolvers, unique.namehashes, keys);
+    const lookup: []const Hash = if (translated) keys else unique.namehashes;
+
+    var off: usize = 0;
+    while (off < unique.resolvers.len) : (off += RECORD_BATCH_CHUNK) {
+        const end = @min(off + RECORD_BATCH_CHUNK, unique.resolvers.len);
+
+        const sql = try buildPairInSql(db.allocator, prefix, end - off, suffix);
+        defer db.allocator.free(sql);
+
+        var arena = std.heap.ArenaAllocator.init(db.allocator);
+        defer arena.deinit();
+
+        var q = try Query.init(db, sql);
+        defer q.deinit();
+        try bindPairsStatic(&q, arena.allocator(), unique.resolvers[off..end], lookup[off..end]);
+        while (try q.step()) {
+            const row = try readRow(Row, &q, db.allocator) orelse continue;
+            errdefer freeRowStrings(db.allocator, row);
+            try rows.append(db.allocator, row);
+        }
+    }
+    if (translated) {
+        const raw = try rows.toOwnedSlice(db.allocator);
+        return try remapPairRowsToRequesters(Row, db, raw, unique.resolvers, unique.namehashes, keys);
+    }
+    return try rows.toOwnedSlice(db.allocator);
+}
+
+/// `remapRowsToRequesters` for the generic pair rows above: every `[]u8`
+/// field is copied per requester (a record shared by several names yields
+/// one row per requester) and `namehash` becomes the requester's. Consumes
+/// `rows`.
+fn remapPairRowsToRequesters(comptime Row: type, db: *Database, rows: []Row, resolvers: []const Address, namehashes: []const Hash, keys: []const Hash) ![]Row {
+    const a = db.allocator;
+    defer freeRows(Row, a, rows);
+
+    var requesters = std.StringHashMap(std.ArrayList(usize)).init(a);
+    defer {
+        var it = requesters.iterator();
+        while (it.next()) |e| {
+            e.value_ptr.deinit(a);
+            a.free(e.key_ptr.*);
+        }
+        requesters.deinit();
+    }
+    for (resolvers, keys, 0..) |r, k, i| {
+        var kb: [42 + 1 + 66]u8 = undefined;
+        var rb: [42]u8 = undefined;
+        var hb: [66]u8 = undefined;
+        const composite = try std.fmt.bufPrint(&kb, "{s}|{s}", .{ r.toHexBuf(&rb), k.toHexBuf(&hb) });
+        const gop = try requesters.getOrPut(composite);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .empty;
+            gop.key_ptr.* = a.dupe(u8, composite) catch |err| {
+                _ = requesters.remove(composite);
+                return err;
+            };
+        }
+        try gop.value_ptr.append(a, i);
+    }
+
+    var out: std.ArrayList(Row) = .empty;
+    errdefer freeRows(Row, a, out.items);
+    errdefer out.deinit(a);
+    for (rows) |row| {
+        var kb: [42 + 1 + 66]u8 = undefined;
+        const composite = std.fmt.bufPrint(&kb, "{s}|{s}", .{ row.resolver, row.namehash }) catch continue;
+        const idxs = requesters.get(composite) orelse continue;
+        for (idxs.items) |i| {
+            const copy = try dupePairRowForRequester(Row, a, row, namehashes[i]);
+            errdefer freeRowStrings(a, copy);
+            try out.append(a, copy);
+        }
+    }
+    return out.toOwnedSlice(a);
+}
+
+fn dupePairRowForRequester(comptime Row: type, a: std.mem.Allocator, row: Row, namehash: Hash) !Row {
+    var copy: Row = row;
+    var done: usize = 0;
+    errdefer {
+        inline for (std.meta.fields(Row), 0..) |f, i| {
+            if (f.type == []u8 and i < done) a.free(@field(copy, f.name));
+        }
+    }
+    inline for (std.meta.fields(Row), 0..) |f, i| {
+        if (f.type == []u8) {
+            @field(copy, f.name) = if (comptime std.mem.eql(u8, f.name, "namehash"))
+                try namehash.toHex(a)
+            else
+                try a.dupe(u8, @field(row, f.name));
+        }
+        done = i + 1;
+    }
+    return copy;
+}
+
+/// One addr record of a (resolver, namehash) pair — batched mirror of
+/// getAddressRecords (ORDER BY coin_type within the pair).
+pub const PairAddressRow = struct { resolver: []u8, namehash: []u8, coin_type: u64, address: []u8 };
+
+pub fn freePairAddressRows(allocator: std.mem.Allocator, rows: []PairAddressRow) void {
+    freeRows(PairAddressRow, allocator, rows);
+}
+
+pub fn getAddressRecordsForPairs(db: *Database, resolvers_list: []const Address, namehashes: []const Hash) ![]PairAddressRow {
+    return readPairRows(
+        PairAddressRow,
+        db,
+        resolvers_list,
+        namehashes,
+        "SELECT resolver, namehash, coin_type, address FROM resolver_addresses WHERE (resolver, namehash) IN (",
+        ") ORDER BY resolver, namehash, coin_type",
+    );
+}
+
+/// Pubkey rows of a (resolver, namehash) pair — batched mirror of
+/// getPubkeyRecord (an unordered LIMIT 1): ALL rows of the pair are returned;
+/// a pair with more than one row has no defined point-query winner.
+pub const PairPubkeyRow = struct { resolver: []u8, namehash: []u8, x: []u8, y: []u8 };
+
+pub fn freePairPubkeyRows(allocator: std.mem.Allocator, rows: []PairPubkeyRow) void {
+    freeRows(PairPubkeyRow, allocator, rows);
+}
+
+pub fn getPubkeysForPairs(db: *Database, resolvers_list: []const Address, namehashes: []const Hash) ![]PairPubkeyRow {
+    return readPairRows(
+        PairPubkeyRow,
+        db,
+        resolvers_list,
+        namehashes,
+        "SELECT resolver, namehash, x, y FROM resolver_pubkeys WHERE (resolver, namehash) IN (",
+        ") ORDER BY resolver, namehash",
+    );
+}
+
+/// One ABI content type of a (resolver, namehash) pair — batched mirror of
+/// getAbiContentTypes (ORDER BY content_type within the pair).
+pub const PairAbiRow = struct { resolver: []u8, namehash: []u8, content_type: u64 };
+
+pub fn freePairAbiRows(allocator: std.mem.Allocator, rows: []PairAbiRow) void {
+    freeRows(PairAbiRow, allocator, rows);
+}
+
+pub fn getAbiContentTypesForPairs(db: *Database, resolvers_list: []const Address, namehashes: []const Hash) ![]PairAbiRow {
+    return readPairRows(
+        PairAbiRow,
+        db,
+        resolvers_list,
+        namehashes,
+        "SELECT resolver, namehash, content_type FROM resolver_abis WHERE (resolver, namehash) IN (",
+        ") ORDER BY resolver, namehash, content_type",
+    );
+}
+
+/// Reverse-name rows of a (resolver, namehash) pair — batched mirror of
+/// getReverseNameRecord (an unordered LIMIT 1): ALL rows of the pair are
+/// returned; a pair with more than one row has no defined point-query winner.
+pub const PairReverseNameRow = struct { resolver: []u8, namehash: []u8, name: []u8 };
+
+pub fn freePairReverseNameRows(allocator: std.mem.Allocator, rows: []PairReverseNameRow) void {
+    freeRows(PairReverseNameRow, allocator, rows);
+}
+
+pub fn getReverseNamesForPairs(db: *Database, resolvers_list: []const Address, namehashes: []const Hash) ![]PairReverseNameRow {
+    return readPairRows(
+        PairReverseNameRow,
+        db,
+        resolvers_list,
+        namehashes,
+        "SELECT resolver, namehash, name FROM resolver_names WHERE (resolver, namehash) IN (",
+        ") ORDER BY resolver, namehash",
+    );
+}
+
+/// One interface record of a (resolver, namehash) pair — batched mirror of
+/// getInterfaceRecords (ORDER BY interface_id within the pair).
+pub const PairInterfaceRow = struct { resolver: []u8, namehash: []u8, interface_id: []u8, implementer: []u8 };
+
+pub fn freePairInterfaceRows(allocator: std.mem.Allocator, rows: []PairInterfaceRow) void {
+    freeRows(PairInterfaceRow, allocator, rows);
+}
+
+pub fn getInterfaceRecordsForPairs(db: *Database, resolvers_list: []const Address, namehashes: []const Hash) ![]PairInterfaceRow {
+    return readPairRows(
+        PairInterfaceRow,
+        db,
+        resolvers_list,
+        namehashes,
+        "SELECT resolver, namehash, interface_id, implementer FROM resolver_interfaces WHERE (resolver, namehash) IN (",
+        ") ORDER BY resolver, namehash, interface_id",
+    );
+}
+
+/// Node record version of a (resolver, namehash) pair — batched mirror of
+/// getNodeRecordVersion; the table's primary key is the pair, so at most one
+/// row per pair.
+pub const PairVersionRow = struct { resolver: []u8, namehash: []u8, version: i64 };
+
+pub fn freePairVersionRows(allocator: std.mem.Allocator, rows: []PairVersionRow) void {
+    freeRows(PairVersionRow, allocator, rows);
+}
+
+pub fn getNodeRecordVersionsForPairs(db: *Database, resolvers_list: []const Address, namehashes: []const Hash) ![]PairVersionRow {
+    return readPairRows(
+        PairVersionRow,
+        db,
+        resolvers_list,
+        namehashes,
+        "SELECT resolver, namehash, version FROM resolver_versions WHERE (resolver, namehash) IN (",
+        ") ORDER BY resolver, namehash",
+    );
+}
+
+/// One alias of a resolver — batched mirror of getResolverAliases (ORDER BY
+/// from_name within the resolver). Keyed by resolver alone.
+pub const ResolverAliasRow = struct { resolver: []u8, from_name: []u8, to_name: []u8 };
+
+pub fn freeResolverAliasRows(allocator: std.mem.Allocator, rows: []ResolverAliasRow) void {
+    freeRows(ResolverAliasRow, allocator, rows);
+}
+
+pub fn getResolverAliasesForResolvers(db: *Database, resolvers_list: []const Address) ![]ResolverAliasRow {
+    var rows: std.ArrayList(ResolverAliasRow) = .empty;
+    errdefer {
+        for (rows.items) |row| freeRowStrings(db.allocator, row);
+        rows.deinit(db.allocator);
+    }
+    if (resolvers_list.len == 0) return try rows.toOwnedSlice(db.allocator);
+
+    var seen = std.AutoHashMap([20]u8, void).init(db.allocator);
+    defer seen.deinit();
+    var unique: std.ArrayList(Address) = .empty;
+    defer unique.deinit(db.allocator);
+    for (resolvers_list) |r| {
+        const gop = try seen.getOrPut(r.bytes);
+        if (!gop.found_existing) try unique.append(db.allocator, r);
+    }
+
+    var off: usize = 0;
+    while (off < unique.items.len) : (off += RECORD_BATCH_CHUNK) {
+        const end = @min(off + RECORD_BATCH_CHUNK, unique.items.len);
+
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(db.allocator);
+        try sql.appendSlice(db.allocator, "SELECT resolver, from_name, to_name FROM resolver_aliases WHERE resolver IN (");
+        for (0..end - off) |i| {
+            if (i > 0) try sql.appendSlice(db.allocator, ", ");
+            try sql.append(db.allocator, '?');
+        }
+        try sql.appendSlice(db.allocator, ") ORDER BY resolver, from_name");
+
+        var arena = std.heap.ArenaAllocator.init(db.allocator);
+        defer arena.deinit();
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        for (unique.items[off..end]) |r| {
+            const buf = try arena.allocator().create([42]u8);
+            try q.bindTextStatic(r.toHexBuf(buf));
+        }
+        while (try q.step()) {
+            const row = try readRow(ResolverAliasRow, &q, db.allocator) orelse continue;
+            errdefer freeRowStrings(db.allocator, row);
+            try rows.append(db.allocator, row);
+        }
+    }
+    return try rows.toOwnedSlice(db.allocator);
+}
+
 pub fn getTextRecordKeys(db: *Database, resolver: Address, namehash: Hash) ![][]u8 {
     const sql =
         \\SELECT DISTINCT key FROM resolver_texts
@@ -475,13 +1150,14 @@ pub fn getTextRecordKeys(db: *Database, resolver: Address, namehash: Hash) ![][]
         \\ORDER BY key
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash);
+    try q.bindHash(row_key);
 
-    var keys: std.ArrayList([]u8) = .{};
+    var keys: std.ArrayList([]u8) = .empty;
     errdefer {
         for (keys.items) |key| {
             db.allocator.free(key);
@@ -507,11 +1183,12 @@ pub fn getTextRecord(db: *Database, resolver: Address, namehash: Hash, key: []co
         \\LIMIT 1
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash);
+    try q.bindHash(row_key);
     try q.bindText(key);
 
     if (try q.step()) {
@@ -520,225 +1197,48 @@ pub fn getTextRecord(db: *Database, resolver: Address, namehash: Hash, key: []co
     return null;
 }
 
-/// Get resolvers to index for a block range
-/// Uses cache table for O(1) lookup, falls back to full scan on first run
-pub fn getResolversToIndex(db: *Database, protocol: models.Protocol, from_block: u64, to_block: u64) ![][]u8 {
-    // First, discover any NEW resolvers from names table (only those set in this block range)
-    const discover_sql =
-        \\SELECT DISTINCT n.resolver
-        \\FROM names n
-        \\LEFT JOIN known_resolvers kr ON kr.protocol = n.protocol AND kr.address = n.resolver
-        \\WHERE n.protocol = ?
-        \\  AND n.resolver != '0x0000000000000000000000000000000000000000'
-        \\  AND n.created_block >= ?
-        \\  AND n.created_block <= ?
-        \\  AND kr.address IS NULL
-    ;
-
-    const protocol_str = protocol.toString();
-
-    {
-        var q = try Query.init(db, discover_sql);
-        defer q.deinit();
-
-        try q.bindTextStatic(protocol_str);
-        try q.bindInt64(@intCast(from_block));
-        try q.bindInt64(@intCast(to_block));
-
-        // Register newly discovered resolvers
-        while (try q.step()) {
-            if (q.getTextSlice(0)) |addr_slice| {
-                try db.registerResolver(protocol, addr_slice, from_block);
-            }
-        }
-    }
-
-    // Now get ALL known resolvers from cache (very fast)
-    const get_sql =
-        \\SELECT address FROM known_resolvers
-        \\WHERE protocol = ?
-        \\ORDER BY address
-    ;
-
-    var q2 = try Query.init(db, get_sql);
-    defer q2.deinit();
-
-    try q2.bindTextStatic(protocol_str);
-
-    var resolvers: std.ArrayList([]u8) = .{};
-    errdefer {
-        for (resolvers.items) |resolver| {
-            db.allocator.free(resolver);
-        }
-        resolvers.deinit(db.allocator);
-    }
-
-    while (try q2.step()) {
-        if (try q2.getText(0)) |addr| {
-            try resolvers.append(db.allocator, addr);
-        }
-    }
-
-    return resolvers.toOwnedSlice(db.allocator);
-}
-
-/// Result from resolver discovery: all known resolvers + any newly discovered ones
-pub const ResolverDiscoveryResult = struct {
-    all: [][]u8,
-    newly_discovered: [][]u8,
-
-    pub fn deinit(self: *ResolverDiscoveryResult, allocator: std.mem.Allocator) void {
-        for (self.all) |r| allocator.free(r);
-        allocator.free(self.all);
-        for (self.newly_discovered) |r| allocator.free(r);
-        allocator.free(self.newly_discovered);
-    }
-};
-
-/// Get resolvers to index, also returning which ones were newly discovered in this block range.
-/// Newly discovered resolvers need their historical events backfilled.
-pub fn discoverAndGetResolvers(db: *Database, protocol: models.Protocol, from_block: u64, to_block: u64) !ResolverDiscoveryResult {
-    const discover_sql =
-        \\SELECT DISTINCT n.resolver
-        \\FROM names n
-        \\LEFT JOIN known_resolvers kr ON kr.protocol = n.protocol AND kr.address = n.resolver
-        \\WHERE n.protocol = ?
-        \\  AND n.resolver != '0x0000000000000000000000000000000000000000'
-        \\  AND n.created_block >= ?
-        \\  AND n.created_block <= ?
-        \\  AND kr.address IS NULL
-    ;
-
-    const protocol_str = protocol.toString();
-
-    var new_resolvers: std.ArrayList([]u8) = .{};
-    errdefer {
-        for (new_resolvers.items) |r| db.allocator.free(r);
-        new_resolvers.deinit(db.allocator);
-    }
-
-    {
-        var q = try Query.init(db, discover_sql);
-        defer q.deinit();
-
-        try q.bindTextStatic(protocol_str);
-        try q.bindInt64(@intCast(from_block));
-        try q.bindInt64(@intCast(to_block));
-
-        while (try q.step()) {
-            if (q.getTextSlice(0)) |addr_slice| {
-                try db.registerResolver(protocol, addr_slice, from_block);
-                const copy = try db.allocator.dupe(u8, addr_slice);
-                try new_resolvers.append(db.allocator, copy);
-            }
-        }
-    }
-
-    // Get ALL known resolvers from cache
-    const get_sql =
-        \\SELECT address FROM known_resolvers
-        \\WHERE protocol = ?
-        \\ORDER BY address
-    ;
-
-    var q2 = try Query.init(db, get_sql);
-    defer q2.deinit();
-
-    try q2.bindTextStatic(protocol_str);
-
-    var resolvers: std.ArrayList([]u8) = .{};
-    errdefer {
-        for (resolvers.items) |r| db.allocator.free(r);
-        resolvers.deinit(db.allocator);
-    }
-
-    while (try q2.step()) {
-        if (try q2.getText(0)) |addr| {
-            try resolvers.append(db.allocator, addr);
-        }
-    }
-
-    return .{
-        .all = try resolvers.toOwnedSlice(db.allocator),
-        .newly_discovered = try new_resolvers.toOwnedSlice(db.allocator),
-    };
-}
-
-/// Get all distinct resolver addresses set on domains owned by an account
-pub fn getResolversByOwner(db: *Database, protocol: models.Protocol, owner: Address) ![]models.Resolver {
-    const sql =
-        \\SELECT DISTINCT n.resolver, n.name, n.namehash, n.created_block, n.created_at
-        \\FROM names n
-        \\WHERE n.protocol = ? AND n.owner = ? AND n.resolver != '0x0000000000000000000000000000000000000000'
-        \\ORDER BY n.created_at DESC
-    ;
-
+/// VersionChanged record clears. The predicate MUST include protocol: every
+/// record table's only sync-surviving index is its UNIQUE(protocol, resolver,
+/// namehash, ...) constraint, and without the protocol equality the leftmost
+/// prefix can't be used — each delete degraded to a full table scan during
+/// bulk sync (measured 26s per VersionChanged event across the 7 tables).
+/// Protocol scoping is also the correct semantics: the tables are
+/// protocol-partitioned, and an unscoped delete could cross protocols.
+pub fn deleteResolverAddresses(db: *Database, protocol: models.Protocol, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "resolver_addresses", "D", "protocol = ? AND resolver = ? AND namehash = ?", .{ protocol, resolver, namehash });
+    const sql = "DELETE FROM resolver_addresses WHERE protocol = ? AND resolver = ? AND namehash = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
-
     try q.bindTextStatic(protocol.toString());
-    try q.bindAddress(owner);
-
-    var result: std.ArrayList(models.Resolver) = .{};
-    errdefer {
-        for (result.items) |*r| {
-            r.deinit(db.allocator);
-        }
-        result.deinit(db.allocator);
-    }
-
-    while (try q.step()) {
-        const resolver_addr = try q.getAddress(0) orelse continue;
-        const name_str = q.getTextSlice(1) orelse continue;
-        const namehash_val = try q.getHash(2) orelse continue;
-
-        const resolver = models.Resolver{
-            .protocol = protocol,
-            .address = resolver_addr,
-            .name = try db.allocator.dupe(u8, name_str),
-            .namehash = namehash_val,
-            .set_block = @intCast(q.getInt64(3)),
-            .set_at = q.getInt64(4),
-        };
-
-        try result.append(db.allocator, resolver);
-    }
-
-    return result.toOwnedSlice(db.allocator);
-}
-
-// ============================================================================
-// DELETE OPERATIONS (for VersionChanged record clearing)
-// ============================================================================
-
-pub fn deleteResolverAddresses(db: *Database, namehash: Hash, resolver: Address) !void {
-    const sql = "DELETE FROM resolver_addresses WHERE namehash = ? AND resolver = ?";
-    var q = try Query.init(db, sql);
-    defer q.deinit();
-    try q.bindHash(namehash);
     try q.bindAddress(resolver);
+    try q.bindHash(namehash);
     try q.exec();
 }
 
-pub fn deleteResolverContentHash(db: *Database, namehash: Hash, resolver: Address) !void {
-    const sql = "DELETE FROM resolver_contenthashes WHERE namehash = ? AND resolver = ?";
+pub fn deleteResolverContentHash(db: *Database, protocol: models.Protocol, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "resolver_contenthashes", "D", "protocol = ? AND resolver = ? AND namehash = ?", .{ protocol, resolver, namehash });
+    const sql = "DELETE FROM resolver_contenthashes WHERE protocol = ? AND resolver = ? AND namehash = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
-    try q.bindHash(namehash);
+    try q.bindTextStatic(protocol.toString());
     try q.bindAddress(resolver);
+    try q.bindHash(namehash);
     try q.exec();
 }
 
-pub fn deleteResolverTexts(db: *Database, namehash: Hash, resolver: Address) !void {
-    const sql = "DELETE FROM resolver_texts WHERE namehash = ? AND resolver = ?";
+pub fn deleteResolverTexts(db: *Database, protocol: models.Protocol, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "resolver_texts", "D", "protocol = ? AND resolver = ? AND namehash = ?", .{ protocol, resolver, namehash });
+    const sql = "DELETE FROM resolver_texts WHERE protocol = ? AND resolver = ? AND namehash = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
-    try q.bindHash(namehash);
+    try q.bindTextStatic(protocol.toString());
     try q.bindAddress(resolver);
+    try q.bindHash(namehash);
     try q.exec();
 }
 
 pub fn deleteResolverAlias(db: *Database, resolver: Address, from_name: []const u8) !void {
+    try reorg_undo.captureWhere(db, "resolver_aliases", "D", "resolver = ? AND from_name = ?", .{ resolver, from_name });
     const sql = "DELETE FROM resolver_aliases WHERE resolver = ? AND from_name = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -747,39 +1247,47 @@ pub fn deleteResolverAlias(db: *Database, resolver: Address, from_name: []const 
     try q.exec();
 }
 
-pub fn deleteResolverPubkeys(db: *Database, namehash: Hash, resolver: Address) !void {
-    const sql = "DELETE FROM resolver_pubkeys WHERE namehash = ? AND resolver = ?";
+pub fn deleteResolverPubkeys(db: *Database, protocol: models.Protocol, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "resolver_pubkeys", "D", "protocol = ? AND resolver = ? AND namehash = ?", .{ protocol, resolver, namehash });
+    const sql = "DELETE FROM resolver_pubkeys WHERE protocol = ? AND resolver = ? AND namehash = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
-    try q.bindHash(namehash);
+    try q.bindTextStatic(protocol.toString());
     try q.bindAddress(resolver);
+    try q.bindHash(namehash);
     try q.exec();
 }
 
-pub fn deleteResolverAbis(db: *Database, namehash: Hash, resolver: Address) !void {
-    const sql = "DELETE FROM resolver_abis WHERE namehash = ? AND resolver = ?";
+pub fn deleteResolverAbis(db: *Database, protocol: models.Protocol, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "resolver_abis", "D", "protocol = ? AND resolver = ? AND namehash = ?", .{ protocol, resolver, namehash });
+    const sql = "DELETE FROM resolver_abis WHERE protocol = ? AND resolver = ? AND namehash = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
-    try q.bindHash(namehash);
+    try q.bindTextStatic(protocol.toString());
     try q.bindAddress(resolver);
+    try q.bindHash(namehash);
     try q.exec();
 }
 
-pub fn deleteResolverNames(db: *Database, namehash: Hash, resolver: Address) !void {
-    const sql = "DELETE FROM resolver_names WHERE namehash = ? AND resolver = ?";
+pub fn deleteResolverNames(db: *Database, protocol: models.Protocol, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "resolver_names", "D", "protocol = ? AND resolver = ? AND namehash = ?", .{ protocol, resolver, namehash });
+    const sql = "DELETE FROM resolver_names WHERE protocol = ? AND resolver = ? AND namehash = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
-    try q.bindHash(namehash);
+    try q.bindTextStatic(protocol.toString());
     try q.bindAddress(resolver);
+    try q.bindHash(namehash);
     try q.exec();
 }
 
-pub fn deleteResolverInterfaces(db: *Database, namehash: Hash, resolver: Address) !void {
-    const sql = "DELETE FROM resolver_interfaces WHERE namehash = ? AND resolver = ?";
+pub fn deleteResolverInterfaces(db: *Database, protocol: models.Protocol, namehash: Hash, resolver: Address) !void {
+    try reorg_undo.captureWhere(db, "resolver_interfaces", "D", "protocol = ? AND resolver = ? AND namehash = ?", .{ protocol, resolver, namehash });
+    const sql = "DELETE FROM resolver_interfaces WHERE protocol = ? AND resolver = ? AND namehash = ?";
     var q = try Query.init(db, sql);
     defer q.deinit();
-    try q.bindHash(namehash);
+    try q.bindTextStatic(protocol.toString());
     try q.bindAddress(resolver);
+    try q.bindHash(namehash);
     try q.exec();
 }
 
@@ -796,6 +1304,7 @@ pub fn deleteResolverText(
     resolver: Address,
     key: []const u8,
 ) !void {
+    try reorg_undo.captureWhere(db, "resolver_texts", "D", "protocol = ? AND namehash = ? AND resolver = ? AND key = ?", .{ protocol, namehash, resolver, key });
     const sql =
         \\DELETE FROM resolver_texts
         \\WHERE protocol = ? AND namehash = ? AND resolver = ? AND key = ?
@@ -824,12 +1333,9 @@ pub fn storeResolverAuthorisation(
     log_index: u32,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_authorisations
-        \\  (protocol, namehash, resolver, owner, target, is_authorised,
-        \\   block_number, transaction_hash, log_index, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ;
+    try reorg_undo.captureUpsert(db, "resolver_authorisations", .{ protocol, resolver, namehash, owner, target });
+    const sql = try db.upsertSql(db.allocator, "resolver_authorisations", &.{ "protocol", "namehash", "resolver", "owner", "target", "is_authorised", "block_number", "transaction_hash", "log_index", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
     var q = try Query.init(db, sql);
     defer q.deinit();
     try q.bindTextStatic(protocol.toString());
@@ -860,12 +1366,9 @@ pub fn storeResolverDnsRecord(
     log_index: u32,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_dns_records
-        \\  (protocol, namehash, resolver, dns_name, resource, record,
-        \\   block_number, transaction_hash, log_index, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ;
+    try reorg_undo.captureUpsert(db, "resolver_dns_records", .{ protocol, resolver, namehash, dns_name, resource });
+    const sql = try db.upsertSql(db.allocator, "resolver_dns_records", &.{ "protocol", "namehash", "resolver", "dns_name", "resource", "record", "block_number", "transaction_hash", "log_index", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
     var q = try Query.init(db, sql);
     defer q.deinit();
     try q.bindTextStatic(protocol.toString());
@@ -890,6 +1393,7 @@ pub fn deleteResolverDnsRecord(
     dns_name: []const u8,
     resource: u16,
 ) !void {
+    try reorg_undo.captureWhere(db, "resolver_dns_records", "D", "protocol = ? AND namehash = ? AND resolver = ? AND dns_name = ? AND resource = ?", .{ protocol, namehash, resolver, dns_name, resource });
     const sql =
         \\DELETE FROM resolver_dns_records
         \\WHERE protocol = ? AND namehash = ? AND resolver = ?
@@ -918,12 +1422,9 @@ pub fn storeResolverDnsZonehash(
     log_index: u32,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_dns_zonehashes
-        \\  (protocol, namehash, resolver, zonehash, last_zonehash,
-        \\   block_number, transaction_hash, log_index, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ;
+    try reorg_undo.captureUpsert(db, "resolver_dns_zonehashes", .{ protocol, resolver, namehash });
+    const sql = try db.upsertSql(db.allocator, "resolver_dns_zonehashes", &.{ "protocol", "namehash", "resolver", "zonehash", "last_zonehash", "block_number", "transaction_hash", "log_index", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
     var q = try Query.init(db, sql);
     defer q.deinit();
     try q.bindTextStatic(protocol.toString());
@@ -948,11 +1449,9 @@ pub fn storeResolverAlias(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_aliases
-        \\  (resolver, from_name, to_name, protocol, block_number, transaction_hash, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?)
-    ;
+    try reorg_undo.captureUpsert(db, "resolver_aliases", .{ resolver, from_name });
+    const sql = try db.upsertSql(db.allocator, "resolver_aliases", &.{ "resolver", "from_name", "to_name", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -990,7 +1489,7 @@ pub fn getResolverAliases(db: *Database, resolver: Address) ![]AliasRecord {
 
     try q.bindAddress(resolver);
 
-    var records: std.ArrayList(AliasRecord) = .{};
+    var records: std.ArrayList(AliasRecord) = .empty;
     errdefer {
         for (records.items) |*r| r.deinit(db.allocator);
         records.deinit(db.allocator);
@@ -1032,11 +1531,12 @@ pub fn getPubkeyRecord(db: *Database, resolver: Address, namehash_val: Hash) !?P
         \\LIMIT 1
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash_val);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash_val);
+    try q.bindHash(row_key);
 
     if (try q.step()) {
         const x = try q.getText(0) orelse return null;
@@ -1060,13 +1560,14 @@ pub fn getAbiContentTypes(db: *Database, resolver: Address, namehash_val: Hash) 
         \\ORDER BY content_type
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash_val);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash_val);
+    try q.bindHash(row_key);
 
-    var types: std.ArrayList(u64) = .{};
+    var types: std.ArrayList(u64) = .empty;
     errdefer types.deinit(db.allocator);
 
     while (try q.step()) {
@@ -1085,6 +1586,7 @@ pub fn getLatestNameByNamehash(db: *Database, namehash_val: Hash) !?[]u8 {
     const sql =
         \\SELECT name FROM resolver_names
         \\WHERE namehash = ?
+        \\   OR namehash IN (SELECT record_key FROM resolver_links WHERE namehash = ? AND record_id <> '0x0000000000000000000000000000000000000000000000000000000000000000')
         \\ORDER BY block_number DESC, id DESC
         \\LIMIT 1
     ;
@@ -1092,6 +1594,7 @@ pub fn getLatestNameByNamehash(db: *Database, namehash_val: Hash) !?[]u8 {
     var q = try Query.init(db, sql);
     defer q.deinit();
 
+    try q.bindHash(namehash_val);
     try q.bindHash(namehash_val);
 
     if (try q.step()) {
@@ -1108,11 +1611,12 @@ pub fn getReverseNameRecord(db: *Database, resolver: Address, namehash_val: Hash
         \\LIMIT 1
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash_val);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash_val);
+    try q.bindHash(row_key);
 
     if (try q.step()) {
         return try q.getText(0);
@@ -1138,13 +1642,14 @@ pub fn getInterfaceRecords(db: *Database, resolver: Address, namehash_val: Hash)
         \\ORDER BY interface_id
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash_val);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash_val);
+    try q.bindHash(row_key);
 
-    var records: std.ArrayList(InterfaceRecord) = .{};
+    var records: std.ArrayList(InterfaceRecord) = .empty;
     errdefer {
         for (records.items) |*r| r.deinit(db.allocator);
         records.deinit(db.allocator);
@@ -1178,11 +1683,12 @@ pub fn getNodeRecordVersion(db: *Database, resolver: Address, namehash_val: Hash
         \\LIMIT 1
     ;
 
+    const row_key = try record_model.resolveRecordKey(db, resolver, namehash_val);
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindAddress(resolver);
-    try q.bindHash(namehash_val);
+    try q.bindHash(row_key);
 
     if (try q.step()) {
         return @intCast(q.getInt64(0));
@@ -1201,11 +1707,9 @@ pub fn storeResolverPubkey(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_pubkeys
-        \\  (namehash, resolver, x, y, protocol, block_number, transaction_hash, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ;
+    try reorg_undo.captureUpsert(db, "resolver_pubkeys", .{ protocol, resolver, namehash });
+    const sql = try db.upsertSql(db.allocator, "resolver_pubkeys", &.{ "namehash", "resolver", "x", "y", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -1232,11 +1736,9 @@ pub fn storeResolverABI(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_abis
-        \\  (namehash, resolver, content_type, protocol, block_number, transaction_hash, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?)
-    ;
+    try reorg_undo.captureUpsert(db, "resolver_abis", .{ protocol, resolver, namehash, content_type });
+    const sql = try db.upsertSql(db.allocator, "resolver_abis", &.{ "namehash", "resolver", "content_type", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -1262,11 +1764,9 @@ pub fn storeResolverName(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_names
-        \\  (namehash, resolver, name, protocol, block_number, transaction_hash, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?)
-    ;
+    try reorg_undo.captureUpsert(db, "resolver_names", .{ protocol, resolver, namehash });
+    const sql = try db.upsertSql(db.allocator, "resolver_names", &.{ "namehash", "resolver", "name", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -1293,11 +1793,9 @@ pub fn storeResolverInterface(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_interfaces
-        \\  (namehash, resolver, interface_id, implementer, protocol, block_number, transaction_hash, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ;
+    try reorg_undo.captureUpsert(db, "resolver_interfaces", .{ protocol, resolver, namehash, interface_id });
+    const sql = try db.upsertSql(db.allocator, "resolver_interfaces", &.{ "namehash", "resolver", "interface_id", "implementer", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -1324,11 +1822,9 @@ pub fn storeResolverVersion(
     tx_hash: Hash,
     timestamp: i64,
 ) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO resolver_versions
-        \\  (namehash, resolver, version, protocol, block_number, transaction_hash, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?)
-    ;
+    try reorg_undo.captureUpsert(db, "resolver_versions", .{ resolver, namehash });
+    const sql = try db.upsertSql(db.allocator, "resolver_versions", &.{ "namehash", "resolver", "version", "protocol", "block_number", "transaction_hash", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -1348,108 +1844,6 @@ pub fn storeResolverVersion(
 // RESOLVER STATISTICS QUERIES (for top-level resolverDetail query)
 // ============================================================================
 
-/// Count the number of domains (nodes) that use a specific resolver address
-pub fn getResolverNodeCount(db: *Database, resolver: Address) !usize {
-    const sql = "SELECT COUNT(*) FROM names WHERE resolver = ?";
-
-    var q = try Query.init(db, sql);
-    defer q.deinit();
-
-    try q.bindAddress(resolver);
-
-    if (try q.step()) {
-        return @intCast(q.getInt64(0));
-    }
-    return 0;
-}
-
-/// Count the number of aliases defined on a resolver
-pub fn getResolverAliasCount(db: *Database, resolver: Address) !usize {
-    const sql = "SELECT COUNT(*) FROM resolver_aliases WHERE resolver = ?";
-
-    var q = try Query.init(db, sql);
-    defer q.deinit();
-
-    try q.bindAddress(resolver);
-
-    if (try q.step()) {
-        return @intCast(q.getInt64(0));
-    }
-    return 0;
-}
-
-/// Count the number of distinct role holders for a resolver contract
-pub fn getResolverRoleHolderCount(db: *Database, resolver: Address) !usize {
-    const sql = "SELECT COUNT(DISTINCT account) FROM eac_roles WHERE contract_address = ?";
-
-    var q = try Query.init(db, sql);
-    defer q.deinit();
-
-    try q.bindAddress(resolver);
-
-    if (try q.step()) {
-        return @intCast(q.getInt64(0));
-    }
-    return 0;
-}
-
-/// Get all EAC role assignments for a resolver contract address
-pub fn getResolverRoles(db: *Database, resolver: Address) ![]models.EACRoleAssignment {
-    const sql =
-        \\SELECT r.id, r.protocol, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp, n.name
-        \\FROM eac_roles r
-        \\LEFT JOIN names n ON r.resource = n.canonical_id AND r.contract_address = n.registry
-        \\WHERE r.contract_address = ?
-        \\ORDER BY r.timestamp DESC
-    ;
-
-    var q = try Query.init(db, sql);
-    defer q.deinit();
-
-    try q.bindAddress(resolver);
-
-    var roles: std.ArrayList(models.EACRoleAssignment) = .{};
-    errdefer {
-        for (roles.items) |*role| {
-            role.deinit(db.allocator);
-        }
-        roles.deinit(db.allocator);
-    }
-
-    while (try q.step()) {
-        const protocol_col = q.getTextSlice(1) orelse continue;
-        const resource_col = q.getTextSlice(2) orelse continue;
-        const account_col = q.getTextSlice(3) orelse continue;
-        const role_bitmap_col = q.getTextSlice(4) orelse continue;
-        const tx_hash_col = q.getTextSlice(6) orelse continue;
-
-        const name_val: ?[]const u8 = if (q.getTextSlice(9)) |n|
-            try db.allocator.dupe(u8, n)
-        else
-            null;
-        errdefer if (name_val) |n| db.allocator.free(n);
-
-        const role = models.EACRoleAssignment{
-            .id = @intCast(q.getInt64(0)),
-            .protocol = try models.Protocol.fromString(protocol_col),
-            .resource = try db.allocator.dupe(u8, resource_col),
-            .account = try Address.fromHex(account_col),
-            .role_bitmap = try db.allocator.dupe(u8, role_bitmap_col),
-            .block_number = @intCast(q.getInt64(5)),
-            .tx_hash = try Hash.fromHex(tx_hash_col),
-            .log_index = @intCast(q.getInt(7)),
-            .timestamp = q.getInt64(8),
-            .name = name_val,
-            // This query is scoped to a single resolver contract, so every row
-            // is a resolver-EAC assignment — decode against the resolver table.
-            .contract_kind = .resolver,
-        };
-        try roles.append(db.allocator, role);
-    }
-
-    return roles.toOwnedSlice(db.allocator);
-}
-
 // ============================================================================
 // REVERSE RECORDS (V1 ReverseClaimed + V2 ETHReverseRegistrar)
 // ============================================================================
@@ -1467,6 +1861,7 @@ pub fn upsertReverseRecord(
     log_index: u32,
     timestamp: i64,
 ) !void {
+    try reorg_undo.captureWhere(db, "reverse_records", "U", "protocol = ? AND address = LOWER(?)", .{ protocol, address });
     var q = try Query.initCached(db,
         \\INSERT INTO reverse_records
         \\  (protocol, address, namehash, block_number, transaction_hash, log_index, timestamp)

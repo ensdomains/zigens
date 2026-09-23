@@ -4,17 +4,24 @@ const Address = @import("types/address.zig").Address;
 pub const Network = enum {
     sepolia,
     mainnet,
+    /// Base mainnet (chain id 8453). Manifest-only: there are no built-in
+    /// contract defaults — a deployment MUST set MANIFEST_PATH (the committed
+    /// manifests/base.zon is the all-disabled substrate until a Basenames
+    /// adapter wires real contracts).
+    base,
 
     pub fn toString(self: Network) []const u8 {
         return switch (self) {
             .sepolia => "sepolia",
             .mainnet => "mainnet",
+            .base => "base",
         };
     }
 
     pub fn fromString(s: []const u8) !Network {
         if (std.ascii.eqlIgnoreCase(s, "sepolia")) return .sepolia;
         if (std.ascii.eqlIgnoreCase(s, "mainnet")) return .mainnet;
+        if (std.ascii.eqlIgnoreCase(s, "base")) return .base;
         return error.UnknownNetwork;
     }
 
@@ -27,6 +34,16 @@ pub const Network = enum {
         return switch (self) {
             .sepolia => 11155111,
             .mainnet => 1,
+            .base => 8453,
+        };
+    }
+
+    /// The registrar root: 2LDs registered through the base-registrar/controller
+    /// surface become `<label>.<rootName()>`. Basenames registers under base.eth.
+    pub fn rootName(self: Network) []const u8 {
+        return switch (self) {
+            .sepolia, .mainnet => "eth",
+            .base => "base.eth",
         };
     }
 };
@@ -48,12 +65,25 @@ pub const ContractAddresses = struct {
     reverse_registrar: Address,
     name_wrapper: Address,
 
+    // Query-time ENSIP-10 Universal Resolver (Task 06 live-resolution fallback).
+    // Manifest data (Task 08): declared per-network in the code default AND the
+    // reference manifests; RESOLVE_UNIVERSAL_RESOLVER overrides it at deploy time
+    // (config.zig). Address.zero = not wired for this network.
+    universal_resolver: Address,
+
     // ═══════════════════════════════════════════════════════════════════════
     //  V2 Protocol (ENSv2 — Sepolia only today; mainnet not deployed yet)
     // ═══════════════════════════════════════════════════════════════════════
     root_registry: Address,
     eth_registry: Address,
     eth_registrar_v2: Address,
+    // ETHRenewerV1 — standalone renewer that emits the same ETH-registrar
+    // NameRenewed(uint256,string,uint64,uint64,address,bytes32,uint256); renewals can
+    // originate here as well as from eth_registrar_v2. Zero when not deployed.
+    eth_renewer_v1: Address,
+    // LabelStore — on-chain labelhash→label dictionary. Its Label(bytes32,string) events
+    // heal unknown labels (same path as the rainbow table). Zero when not deployed.
+    eth_label_store: Address,
     eth_reverse_registrar: Address,
     // BatchRegistrar — owner-only batch reserve/renew. Used by deployer for the
     // standard production pre-migration flow on mainnet. Same ABI as
@@ -77,6 +107,9 @@ pub const ContractAddresses = struct {
     // ═══════════════════════════════════════════════════════════════════════
     v1_deployment_block: u64, // V1 Permanent Registrar (Base Registrar) deployment
     v2_deployment_block: u64, // V2 protocol deployment (0 if not deployed on this network)
+    // Last block of the V1 era on this network; 0 = V1 has no sunset. Deployment
+    // data, not a code constant — set it only when a real cutover is decided.
+    v1_end_block: u64 = 0,
 
     // V1 historical markers (mainnet specific; 0 on testnets)
     temp_registrar_start_block: u64, // Temporary Registrar deployment (May 2017)
@@ -84,10 +117,23 @@ pub const ContractAddresses = struct {
     name_wrapper_deployment_block: u64, // Name Wrapper deployment (September 2022)
 };
 
+/// True iff `candidate` is an ACTIVE contract that `addr` matches. A DISABLED contract
+/// is represented by the zero address (manifest.zig `status = .disabled` leaves it zero),
+/// so a zero `candidate` never matches — that is precisely how a disabled contract is
+/// excluded from indexing (Task 08 acceptance criterion 5). Every "is this event from
+/// contract X?" check routes through this guard so the zero==disabled invariant holds
+/// uniformly.
+pub fn isActiveContract(addr: Address, candidate: Address) bool {
+    return !candidate.isZero() and addr.eql(candidate);
+}
+
 pub fn getContractAddresses(network: Network) !ContractAddresses {
     return switch (network) {
         .sepolia => sepoliaAddresses(),
         .mainnet => mainnetAddresses(),
+        // Manifest-only network: silent all-zero defaults would violate the
+        // "required present or explicitly disabled; never silent mis-index" rule.
+        .base => error.ManifestRequired,
     };
 }
 
@@ -102,31 +148,38 @@ fn sepoliaAddresses() ContractAddresses {
         .ens_registry = Address.fromHex("0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e") catch unreachable,
         .base_registrar = Address.fromHex("0x57f1887a8bf19b14fc0df6fd9b2acc9af147ea85") catch unreachable,
         .eth_registrar_controller = Address.fromHex("0xfb3cE5D01e0f33f41DbB39035dB9745962F1f968") catch unreachable,
-        .public_resolver = Address.fromHex("0xE99638b40E4Fff0129D56f03b55b6bbC4BBE49b5") catch unreachable,
+        .public_resolver = Address.fromHex("0x5239A812ec9A62F46dbb5de8f346C8eFe7553A9f") catch unreachable,
         .reverse_registrar = Address.fromHex("0xA0a1AbcDAe1a2a4A2EF8e9113Ff0e02DD81DC0C6") catch unreachable,
         .name_wrapper = Address.fromHex("0x0635513f179D50A207757E05759CbD106d7dFcE8") catch unreachable,
 
         // V2 Sepolia Contracts (ENSv2 deployment)
-        .root_registry = Address.fromHex("0xc960f7217d3643b525ef36bec8adf86953cd9ab8") catch unreachable,
-        .eth_registry = Address.fromHex("0xdedb92913a25abe1f7bcdd85d8a344a43b398b67") catch unreachable,
-        .eth_registrar_v2 = Address.fromHex("0x8c2e866b439358c41ae05de9cbe8a00bfefaffca") catch unreachable,
+        .root_registry = Address.fromHex("0x9703DBD26dAB89504490994138cF2c575251a9cE") catch unreachable,
+        .eth_renewer_v1 = Address.fromHex("0xd06e726e9bD8ac0f33A2a45F4Cc28fe10d656a36") catch unreachable,
+        .eth_label_store = Address.fromHex("0x375C082021E677a40eA2AE094D050602dba90992") catch unreachable,
+        .eth_registry = Address.fromHex("0x657eA849311d3D5823348ddEd7C2AaAFb3EDE09E") catch unreachable,
+        .eth_registrar_v2 = Address.fromHex("0xAbe76F6C8DFcEd81AA5A2bB8034202A7136b94ca") catch unreachable,
         .eth_reverse_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable, // TBD
-        .batch_registrar = Address.fromHex("0xb39c2da7143dffa4a097970887fa6f1d17c1d60f") catch unreachable,
-        .premigration_registrar = Address.fromHex("0xdf60c561ca35ad3c89d24bba854654b1c3477078") catch unreachable,
+        .batch_registrar = Address.fromHex("0xBe68Ff9aFc7D5A1864ffef5C82DE0A1C13E6B529") catch unreachable,
+        .premigration_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
 
         // Migration Contracts (V1→V2, Sepolia deployment)
-        .migration_helper = Address.fromHex("0x11cfa7e034dafb7439cc1cc8b6e547f5c82ad021") catch unreachable,
-        .locked_migration_controller = Address.fromHex("0xf91c34ed840889ed96f806f882fd50506a336edb") catch unreachable,
-        .unlocked_migration_controller = Address.fromHex("0x056138ef5660f7113a3b0adc08ac3683310e7fbc") catch unreachable,
+        .migration_helper = Address.fromHex("0x58d12d60471b98F191856e4C2d56886e9c3eA573") catch unreachable,
+        .locked_migration_controller = Address.fromHex("0xab1B57C6eE5E91e6090595c0AF14CB9B8bc7773f") catch unreachable,
+        .unlocked_migration_controller = Address.fromHex("0x7ed171bb143a905F56105e4eA146543Ecb122F55") catch unreachable,
 
-        // Deployment blocks (verified from on-protocol)
-        .v1_deployment_block = 10893210, // Fresh V1+V2 redeployment on Sepolia
-        .v2_deployment_block = 10893210, // Fresh V1+V2 redeployment on Sepolia
+        // Deployment blocks (verified on-chain via eth_getCode bisection)
+        // Both sides start at this deployment: the V1 contracts above are the
+        // long-lived canonical Sepolia ones, but only V1 state from this
+        // deployment onwards is relevant to the V2 migration fixtures.
+        .v1_deployment_block = 11708980,
+        .v2_deployment_block = 11708980,
 
         // Historical markers (not applicable for testnets)
         .temp_registrar_start_block = 0,
         .v1_migration_block = 0,
         .name_wrapper_deployment_block = 0,
+
+        .universal_resolver = Address.fromHex("0xeEeEEEeE14D718C2B47D9923Deab1335E144EeEe") catch unreachable,
     };
 }
 
@@ -146,17 +199,19 @@ fn mainnetAddresses() ContractAddresses {
         .name_wrapper = Address.fromHex("0xD4416b13d2b3a9aBae7AcD5D6C2BbDBE25686401") catch unreachable,
 
         // V2 Mainnet Contracts (ENSv2 — not yet deployed; zero placeholders)
-        .root_registry = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .eth_registry = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .eth_registrar_v2 = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .eth_reverse_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .batch_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .premigration_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
+        .root_registry = Address.zero,
+        .eth_registry = Address.zero,
+        .eth_registrar_v2 = Address.zero,
+        .eth_renewer_v1 = Address.zero,
+        .eth_label_store = Address.zero,
+        .eth_reverse_registrar = Address.zero,
+        .batch_registrar = Address.zero,
+        .premigration_registrar = Address.zero,
 
         // Migration Contracts (Not yet deployed on mainnet)
-        .migration_helper = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .locked_migration_controller = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
-        .unlocked_migration_controller = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
+        .migration_helper = Address.zero,
+        .locked_migration_controller = Address.zero,
+        .unlocked_migration_controller = Address.zero,
 
         // Deployment blocks
         // ENS Registry + Temporary Registrar deployed in block 3327417 (May 2017)
@@ -169,5 +224,7 @@ fn mainnetAddresses() ContractAddresses {
         .temp_registrar_start_block = 3327417, // Temporary Registrar deployment (May 2017)
         .v1_migration_block = 9380410, // V1 Permanent Registrar deployment (May 2019)
         .name_wrapper_deployment_block = 15628465, // Name Wrapper deployment (September 2022)
+
+        .universal_resolver = Address.zero, // no canonical mainnet UR wired as a default yet; supply via manifest or RESOLVE_UNIVERSAL_RESOLVER
     };
 }

@@ -1,77 +1,80 @@
-# ENSv2 Indexer - Deployment Guide
+# ENS Indexer (zigens) — Deployment Guide
+
+Production deployment for the ENS indexer (V1 + V2). Configuration is via a `.env` file (see
+[`.env.example`](../.env.example)); contract addresses are **built into the binary per `NETWORK`**
+(`src/contracts.zig`) — you do not set them manually.
+
+> **Ports:** the binary defaults to `API_PORT=8080` (`.env.example`). The Docker image sets
+> `API_PORT=5655` and exposes `5655` (API) + `3001` (status). The examples below assume the native
+> `8080`; substitute `5655` when running the published image.
 
 ## Quick Start
 
-### Docker Deployment (Recommended)
+### Docker (recommended)
 
-1. **Clone the repository**
+1. **Clone**
 ```bash
 git clone <repository-url>
-cd ensv2-indexer
+cd zigens
 ```
 
-2. **Create configuration**
+2. **Configure**
 ```bash
-cp config.example.json config.json
-# Edit config.json with your RPC endpoints and contract addresses
+cp .env.example .env
+# Edit .env — set RPC_URL and NETWORK (sepolia | mainnet)
 ```
 
-3. **Start with Docker Compose**
+3. **Start**
 ```bash
 docker-compose up -d
 ```
 
-4. **Check status**
+4. **Check status** (Docker maps the API to `5655`)
 ```bash
-docker-compose logs -f ensv2-indexer
-curl http://localhost:8080/api/health
+docker-compose logs -f indexer
+curl http://localhost:5655/api/health
 ```
 
-### Native Deployment
+### Native
 
 #### Prerequisites
-- Zig 0.13.0 or later
+- Zig **0.15.2+**
 - SQLite3
 - systemd (for service management)
 
 #### Build
-
 ```bash
-# Build optimized release
-zig build -Doptimize=ReleaseFast
-
-# Binary will be in zig-out/bin/ensv2-indexer
+zig build                       # all binaries; use -Doptimize=ReleaseSafe for production
+# Binaries land in zig-out/bin/:
+#   ensv2-indexer        (combined V1 + V2 — can also serve the API)
+#   ensv2-indexer-v1 / -v2   (single-protocol)
+#   ensv2-api            (standalone read-only GraphQL API)
+#   rainbow-backfill     (label backfill tool)
 ```
 
-#### Install as System Service
+#### Install as a system service
 
-1. **Create config directory**
+1. **Data directory + config**
 ```bash
-sudo mkdir -p /etc/ensv2-indexer
-sudo cp config.json /etc/ensv2-indexer/
-sudo chmod 600 /etc/ensv2-indexer/config.json
+sudo mkdir -p /var/lib/ensv2-indexer
+sudo cp .env /var/lib/ensv2-indexer/.env       # the binary reads .env from its working dir
+sudo chmod 600 /var/lib/ensv2-indexer/.env
+sudo chown -R ens:ens /var/lib/ensv2-indexer
 ```
 
-2. **Copy binary**
+2. **Binary**
 ```bash
 sudo cp zig-out/bin/ensv2-indexer /usr/local/bin/
 sudo chmod +x /usr/local/bin/ensv2-indexer
 ```
 
-3. **Create data directory**
-```bash
-sudo mkdir -p /var/lib/ensv2-indexer
-sudo chown ens:ens /var/lib/ensv2-indexer
-```
-
-4. **Create systemd service**
+3. **systemd unit**
 ```bash
 sudo nano /etc/systemd/system/ensv2-indexer.service
 ```
-
 ```ini
 [Unit]
-Description=ENSv2 Indexer
+Description=ENS Indexer (zigens)
 After=network.target
 
 [Service]
@@ -99,7 +102,7 @@ SyslogIdentifier=ensv2-indexer
 WantedBy=multi-user.target
 ```
 
-5. **Enable and start service**
+4. **Enable + start**
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable ensv2-indexer
@@ -107,67 +110,55 @@ sudo systemctl start ensv2-indexer
 sudo systemctl status ensv2-indexer
 ```
 
-6. **View logs**
+5. **Logs**
 ```bash
 sudo journalctl -u ensv2-indexer -f
 ```
 
 ## Configuration
 
-### Required Settings
+All configuration is environment variables loaded from `.env` (full list in
+[`.env.example`](../.env.example)). Common settings:
 
-```json
-{
-  "rpc_url": "https://eth-mainnet.g.alchemy.com/v2/YOUR_API_KEY",
-  "root_registry": "0x...",
-  "eth_registry": "0x...",
-  "registry_datastore": "0x...",
-  "start_block": 19000000
-}
+```bash
+RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_API_KEY
+NETWORK=sepolia            # or mainnet — selects the built-in contract address set
+DATABASE_PATH=./data/ens.db
+START_BLOCK=0              # 0 = from the contract deployment block
+POLL_INTERVAL=12          # seconds between chain-head polls
+BATCH_SIZE=1000           # blocks per batch (see note under Performance Tuning)
+API_PORT=8080
+WEBHOOKS_ENABLED=false
 ```
 
-### Contract Addresses
+### Contract addresses
 
-You'll need to obtain the deployed contract addresses for:
-- Root Registry
-- .eth Registry
-- Registry Datastore
-- L1 Registry Datastore
-- L2 Registry Datastore
-- L1 Universal Resolver
-- L1 Fallback Resolver
-- L1/L2 Migration Contracts
-- L1/L2 Ejection Controllers
+You do **not** configure contract addresses manually. They are compiled into the binary per network
+(`src/contracts.zig`); selecting `NETWORK=sepolia` or `NETWORK=mainnet` picks the V1 (legacy registry,
+registrar, name wrapper) and V2 (permissioned registry, L2 registrar) address set. You only provide
+`RPC_URL` for the matching chain.
 
-These will be published by ENS DAO when ENSv2 is deployed.
+### RPC providers
 
-### RPC Providers
-
-Recommended RPC providers:
-- **Alchemy**: https://www.alchemy.com/
-- **Infura**: https://www.infura.io/
-- **QuickNode**: https://www.quicknode.com/
-- **Ankr**: https://www.ankr.com/
-
-### Starting Block Numbers
-
-Set `l1_start_block` and `l2_start_block` to the block where ENSv2 contracts were deployed. This reduces initial sync time.
+Alchemy, Infura, QuickNode, Ankr, or your own node. The indexer rate-limits its own RPC usage
+(`RATE_LIMIT_PER_SECOND`).
 
 ## API Endpoints
 
-### REST API
+API served on `API_PORT` (`8080` native, `5655` in Docker).
 
-- `GET /api/health` - Health check
-- `GET /api/name/{name}` - Get name information
-- `GET /api/owner/{address}` - Get names owned by address
-- `GET /api/events` - Get recent events
+### REST
+- `GET /api/health` — health check
+- `GET /api/name/{name}` — name information
+- `GET /api/owner/{address}` — names owned by an address
+- `GET /api/events` — recent events
+- `GET /api/webhooks` — webhook management (CRUD; optional Basic Auth)
+- `GET /metrics` — Prometheus metrics (when `METRICS_ENABLED=true`)
 
-### GraphQL API
+### GraphQL
+- `GET /graphql` — GraphiQL playground
+- `POST /graphql` — queries
 
-- `GET /graphql` - GraphQL Playground (documentation)
-- `POST /graphql` - GraphQL queries
-
-Example GraphQL query:
 ```graphql
 {
   domain(id: "alice.eth") {
@@ -183,218 +174,172 @@ Example GraphQL query:
 
 ## Webhooks
 
-### Register a Webhook
+Enable with `WEBHOOKS_ENABLED=true`, then register via the REST API:
 
-```sql
-INSERT INTO webhooks (url, event_types, active, max_retries, created_at)
-VALUES (
-  'https://your-server.com/webhook',
-  '["NameRegistered","Transfer","NameRenewed"]',
-  1,
-  3,
-  strftime('%s', 'now')
-);
+```bash
+curl -X POST http://localhost:8080/api/webhooks \
+  -H 'content-type: application/json' \
+  -d '{"url":"https://your-server.com/webhook","event_types":["NameRegistered","Transfer","NameRenewed"]}'
 ```
 
-### Webhook Payload
+A signing `secret` is generated automatically per webhook (used for the `X-Webhook-Signature` HMAC).
+
+### Payload
 
 ```json
 {
   "event_type": "NameRegistered",
-  "chain": "v2",
+  "protocol": "v2",
   "block_number": 12345678,
   "tx_hash": "0x...",
+  "log_index": 7,
   "contract_address": "0x...",
   "name": "alice.eth",
   "namehash": "0x...",
-  "data": {
-    "name": "alice",
-    "owner": "0x...",
-    "expires": 1735689600
-  },
+  "data": { "owner": "0x...", "expires": 1735689600 },
   "timestamp": 1704067200
 }
 ```
 
+Verify `X-Webhook-Signature` = `HMAC-SHA256(secret, "{X-Webhook-Timestamp}.{body}")`.
+
 ## Monitoring
 
-### Health Checks
-
+### Health
 ```bash
-# Check if service is running
 curl http://localhost:8080/api/health
-
-# Should return:
-# {"status":"ok","service":"ensv2-indexer"}
 ```
 
-### Database Monitoring
-
+### Database
 ```bash
-# Check sync state
-sqlite3 /var/lib/ensv2-indexer/ensv2.db "SELECT * FROM sync_state;"
-
-# Check indexed names count
-sqlite3 /var/lib/ensv2-indexer/ensv2.db "SELECT COUNT(*) FROM names;"
-
-# Check recent events
-sqlite3 /var/lib/ensv2-indexer/ensv2.db "SELECT * FROM events ORDER BY timestamp DESC LIMIT 10;"
+DB=/var/lib/ensv2-indexer/data/ens.db
+sqlite3 "$DB" "SELECT * FROM sync_state;"                                  # per-protocol sync state
+sqlite3 "$DB" "SELECT COUNT(*) FROM names;"                                # indexed names
+sqlite3 "$DB" "SELECT * FROM events ORDER BY timestamp DESC LIMIT 10;"     # recent events
 ```
+
+The GraphQL `_meta { block { number } hasIndexingErrors }` field also reports sync head + error state.
 
 ### Logs
-
 ```bash
-# Docker
-docker-compose logs -f ensv2-indexer
-
-# Systemd
-sudo journalctl -u ensv2-indexer -f
-
-# Check for errors
-sudo journalctl -u ensv2-indexer -p err
+docker-compose logs -f indexer            # Docker
+sudo journalctl -u ensv2-indexer -f       # systemd
+sudo journalctl -u ensv2-indexer -p err   # errors only
 ```
 
 ## Performance Tuning
 
-### Database Optimization
-
+### Database optimization
 ```bash
-# Optimize database
-sqlite3 /var/lib/ensv2-indexer/ensv2.db "VACUUM;"
-sqlite3 /var/lib/ensv2-indexer/ensv2.db "ANALYZE;"
+DB=/var/lib/ensv2-indexer/data/ens.db
+sqlite3 "$DB" "VACUUM;"
+sqlite3 "$DB" "ANALYZE;"
 ```
 
-### Polling Interval
+### Polling interval
+`POLL_INTERVAL` (seconds): lower = more real-time, higher RPC usage; higher = less real-time, lower usage.
 
-Adjust `poll_interval` in config.json:
-- Faster polling (6-12s): More real-time, higher RPC usage
-- Slower polling (30-60s): Less real-time, lower RPC usage
-
-### Batch Size
-
-The indexer processes blocks in batches of 1000. For slower RPC endpoints, you may want to reduce this in the source code.
+### Batch size
+`BATCH_SIZE` controls blocks per batch (the indexer also auto-shrinks/grows the range adaptively on RPC
+errors). **Note an in-repo inconsistency to reconcile:** `.env.example` ships `BATCH_SIZE=1000` while the
+compiled default in `src/config.zig` is `2000`. Set it explicitly in `.env` to avoid ambiguity.
 
 ## Backup
 
-### Database Backup
+SQLite — use the online `.backup` command (safe while running, WAL-consistent) or stop + copy:
 
 ```bash
-# Stop indexer
+DB=/var/lib/ensv2-indexer/data/ens.db
+# Online (preferred):
+sqlite3 "$DB" ".backup '/backup/ens-$(date +%Y%m%d).db'"
+
+# Or offline:
 sudo systemctl stop ensv2-indexer
-
-# Backup database
-cp /var/lib/ensv2-indexer/ensv2.db /backup/ensv2-$(date +%Y%m%d).db
-
-# Start indexer
+cp "$DB" /backup/ens-$(date +%Y%m%d).db
 sudo systemctl start ensv2-indexer
 ```
 
-### Automated Backups
-
+### Automated
 ```bash
-# Add to crontab
-0 2 * * * /usr/local/bin/backup-ensv2.sh
+# crontab — daily online backup at 02:00
+0 2 * * * sqlite3 /var/lib/ensv2-indexer/data/ens.db ".backup '/backup/ens-$(date +\%Y\%m\%d).db'"
 ```
 
 ## Troubleshooting
 
-### Indexer Not Syncing
-
-1. Check RPC connectivity
+### Indexer not syncing
 ```bash
+# 1. RPC connectivity
 curl -X POST -H "Content-Type: application/json" \
-  --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
-  YOUR_RPC_URL
-```
+  --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' "$RPC_URL"
 
-2. Check logs for errors
-```bash
+# 2. Logs
 sudo journalctl -u ensv2-indexer -n 100
 ```
+3. Verify `NETWORK` matches your `RPC_URL`'s chain.
 
-3. Verify contract addresses are correct
+### High CPU/memory
+- Increase `POLL_INTERVAL`, reduce `BATCH_SIZE`.
+- Ensure the DB is optimized (`VACUUM`, `ANALYZE`).
+- Check for SQLite write-lock contention during heavy initial sync.
 
-### High CPU/Memory Usage
-
-- Reduce polling interval
-- Reduce batch size
-- Check for database lock issues
-- Ensure database is optimized (VACUUM, ANALYZE)
-
-### API Not Responding
-
-1. Check if service is running
+### API not responding
 ```bash
 sudo systemctl status ensv2-indexer
-```
-
-2. Check if port is accessible
-```bash
-netstat -tuln | grep 8080
-```
-
-3. Check firewall rules
-```bash
+netstat -tuln | grep 8080         # or 5655 under Docker
 sudo ufw status
 ```
 
 ## Security
 
 ### Firewall
-
 ```bash
-# Allow API port (if public)
-sudo ufw allow 8080/tcp
-
-# Or restrict to specific IPs
-sudo ufw allow from YOUR_IP to any port 8080
+sudo ufw allow 8080/tcp                        # native (use 5655 for Docker)
+sudo ufw allow from YOUR_IP to any port 8080   # or restrict to specific IPs
 ```
 
-### API Authentication
+### API exposure
+The GraphQL/REST API is **read-only** and per-IP rate-limited (`RATE_LIMIT_PER_SECOND`; set
+`TRUSTED_PROXY_HOPS` when behind a proxy so limiting keys on the real client IP). The webhook
+management API can require Basic Auth (`WEBHOOK_ADMIN_USERNAME` / `WEBHOOK_ADMIN_PASSWORD`). For a
+public deployment, front it with a reverse proxy.
 
-For production, add authentication:
-- Use reverse proxy (nginx) with basic auth
-- Implement API keys
-- Use OAuth2/JWT tokens
-
-### SSL/TLS
-
-Use a reverse proxy (nginx, caddy) for SSL:
-
+### SSL/TLS (nginx)
 ```nginx
 server {
     listen 443 ssl;
     server_name indexer.yourdomain.com;
 
-    ssl_certificate /path/to/cert.pem;
+    ssl_certificate     /path/to/cert.pem;
     ssl_certificate_key /path/to/key.pem;
 
     location / {
-        proxy_pass http://localhost:8080;
+        proxy_pass http://localhost:8080;     # or 5655 under Docker
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }
 }
 ```
+(Set `TRUSTED_PROXY_HOPS=1` so the rate limiter reads the proxied client IP.)
 
 ## Scaling
 
-### Multiple Instances
+### Multiple instances
+Run multiple indexers for redundancy — separate `DATABASE_PATH` per instance, on different hosts, with
+the API requests load-balanced.
 
-Run multiple indexers for redundancy:
-- Use different database files
-- Run on different servers
-- Load balance API requests
+### Read replicas
+Serve API queries from read-only copies of the SQLite DB:
+1. Snapshot with `sqlite3 ".backup"` (or `rsync` a quiesced copy) — **not** `pg_dump` (this is SQLite).
+2. Run `ensv2-api` instances pointed at the replica (`DATABASE_PATH`).
+3. Route read traffic to the replicas.
 
-### Read Replicas
-
-Create read-only database replicas for API queries:
-1. Replicate database using rsync/pg_dump
-2. Run API-only instances pointing to replica
-3. Route read traffic to replicas
+> A PostgreSQL backend (for real concurrency/replication) is planned but not yet implemented — see
+> [`postgresql-migration-plan.md`](postgresql-migration-plan.md).
 
 ## Support
 
-- GitHub Issues: <repository-url>/issues
-- Documentation: <repository-url>/docs
+- GitHub Issues: `<repository-url>/issues`
+- Docs: [`../README.md`](../README.md), [`TESTING.md`](TESTING.md)
 - ENS Discord: https://chat.ens.domains/

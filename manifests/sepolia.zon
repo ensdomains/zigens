@@ -1,0 +1,37 @@
+// Reference contract manifest — generated from src/contracts.zig defaults.
+// See manifests/README.txt. A test asserts this loads to the code defaults.
+.{
+    .manifest_version = 1,
+    .chain_id = 11155111,
+    .contracts = .{
+        .{ .name = "temporary_registrar", .address = "0x7e02892cfc2bfd53a75275451d73cf620e793fc0" },
+        .{ .name = "old_ens_registry", .address = "0x94f523b8261b815b87effcf4d18e6abef18d6e4b" },
+        .{ .name = "old_public_resolver", .address = "0x0ceec524b2807841739d3b5e161f5bf1430ffa48" },
+        .{ .name = "ens_registry", .address = "0x00000000000c2e074ec69a0dfb2997ba6c7d2e1e" },
+        .{ .name = "base_registrar", .address = "0x57f1887a8bf19b14fc0df6fd9b2acc9af147ea85" },
+        .{ .name = "eth_registrar_controller", .address = "0xfb3ce5d01e0f33f41dbb39035db9745962f1f968" },
+        .{ .name = "public_resolver", .address = "0x5239a812ec9a62f46dbb5de8f346c8efe7553a9f" },
+        .{ .name = "reverse_registrar", .address = "0xa0a1abcdae1a2a4a2ef8e9113ff0e02dd81dc0c6" },
+        .{ .name = "name_wrapper", .address = "0x0635513f179d50a207757e05759cbd106d7dfce8" },
+        .{ .name = "universal_resolver", .address = "0xeeeeeeee14d718c2b47d9923deab1335e144eeee" },
+        .{ .name = "root_registry", .address = "0x9703dbd26dab89504490994138cf2c575251a9ce" },
+        .{ .name = "eth_registry", .address = "0x657ea849311d3d5823348dded7c2aaafb3ede09e" },
+        .{ .name = "eth_registrar_v2", .address = "0xabe76f6c8dfced81aa5a2bb8034202a7136b94ca" },
+        .{ .name = "eth_renewer_v1", .address = "0xd06e726e9bd8ac0f33a2a45f4cc28fe10d656a36" },
+        .{ .name = "eth_label_store", .address = "0x375c082021e677a40ea2ae094d050602dba90992" },
+        .{ .name = "eth_reverse_registrar", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "batch_registrar", .address = "0xbe68ff9afc7d5a1864ffef5c82de0a1c13e6b529" },
+        .{ .name = "premigration_registrar", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "migration_helper", .address = "0x58d12d60471b98f191856e4c2d56886e9c3ea573" },
+        .{ .name = "locked_migration_controller", .address = "0xab1b57c6ee5e91e6090595c0af14cb9b8bc7773f" },
+        .{ .name = "unlocked_migration_controller", .address = "0x7ed171bb143a905f56105e4ea146543ecb122f55" },
+    },
+    .blocks = .{
+        .v1_deployment_block = 11708980,
+        .v2_deployment_block = 11708980,
+        .v1_end_block = 0,
+        .temp_registrar_start_block = 0,
+        .v1_migration_block = 0,
+        .name_wrapper_deployment_block = 0,
+    },
+}

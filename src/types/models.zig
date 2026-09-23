@@ -1,4 +1,5 @@
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const Address = @import("address.zig").Address;
 const Hash = @import("hash.zig").Hash;
 
@@ -126,6 +127,11 @@ pub const Name = struct {
     /// API layer falls back to a query-time `Resolver.addr(coinType:60)` lookup
     /// when null.
     resolved_address: ?Address = null,
+    /// ENSIP-15 normalization status of `name`, computed at ingest (indexer layer)
+    /// and persisted. False when the name is non-normalized or its label is unknown
+    /// (`[0x..]` placeholder). Default-filtered out of GraphQL listings unless
+    /// `includeUnnormalized: true` (mirrors `is_reachable`).
+    is_normalized: bool = true,
 
     pub fn deinit(self: *Name, allocator: std.mem.Allocator) void {
         if (self.name) |n| allocator.free(n);
@@ -141,7 +147,7 @@ pub const Name = struct {
 
     pub fn isExpired(self: Name) bool {
         if (self.expiry == 0) return false;
-        const now: u64 = @intCast(std.time.timestamp());
+        const now: u64 = @intCast(zsys.timestamp());
         return now >= self.expiry;
     }
 };
@@ -188,6 +194,7 @@ pub const EventType = enum {
 
     // Parent events
     parent_updated,
+    registry_created,
 
     // Token events
     token_regenerated,
@@ -212,6 +219,22 @@ pub const EventType = enum {
     // OwnedResolver events
     version_changed,
     alias_changed,
+    // Legacy node-keyed `data(key)` record (IDataResolver.DataChanged)
+    data_changed,
+    // Record-model resolver events (contracts-v2 IRecordResolver): values are
+    // keyed by recordId; `linked` binds a node to a record, `cleared` drops one.
+    resolver_created,
+    linked,
+    cleared,
+    address_updated,
+    text_updated,
+    data_updated,
+    contenthash_updated,
+    abi_updated,
+    interface_updated,
+    name_updated,
+    resource_argument,
+    approval_updated,
 
     // V1 → V2 migration: emitted on the V1 row when a token transfers to a
     // MigrationController. Distinct from `name_registered`/`label_registered`
@@ -253,6 +276,7 @@ pub const EventType = enum {
             .expiry_updated => "ExpiryUpdated",
             .commitment_made => "CommitmentMade",
             .parent_updated => "ParentUpdated",
+            .registry_created => "RegistryCreated",
             .token_regenerated => "TokenRegenerated",
             .approval => "Approval",
             .metadata_changed => "MetadataChanged",
@@ -267,6 +291,19 @@ pub const EventType = enum {
             .eac_roles_changed => "EACRolesChanged",
             .version_changed => "VersionChanged",
             .alias_changed => "AliasChanged",
+            .data_changed => "DataChanged",
+            .resolver_created => "ResolverCreated",
+            .linked => "Linked",
+            .cleared => "Cleared",
+            .address_updated => "AddressUpdated",
+            .text_updated => "TextUpdated",
+            .data_updated => "DataUpdated",
+            .contenthash_updated => "ContenthashUpdated",
+            .abi_updated => "ABIUpdated",
+            .interface_updated => "InterfaceUpdated",
+            .name_updated => "NameUpdated",
+            .resource_argument => "ResourceArgument",
+            .approval_updated => "ApprovalUpdated",
             .name_migrated => "NameMigrated",
             .name_wrapped => "NameWrapped",
             .name_unwrapped => "NameUnwrapped",
@@ -301,11 +338,25 @@ pub const EventType = enum {
         if (std.mem.eql(u8, s, "EACRolesChanged")) return .eac_roles_changed;
         if (std.mem.eql(u8, s, "VersionChanged")) return .version_changed;
         if (std.mem.eql(u8, s, "AliasChanged")) return .alias_changed;
+        if (std.mem.eql(u8, s, "DataChanged")) return .data_changed;
+        if (std.mem.eql(u8, s, "ResolverCreated")) return .resolver_created;
+        if (std.mem.eql(u8, s, "Linked")) return .linked;
+        if (std.mem.eql(u8, s, "Cleared")) return .cleared;
+        if (std.mem.eql(u8, s, "AddressUpdated")) return .address_updated;
+        if (std.mem.eql(u8, s, "TextUpdated")) return .text_updated;
+        if (std.mem.eql(u8, s, "DataUpdated")) return .data_updated;
+        if (std.mem.eql(u8, s, "ContenthashUpdated")) return .contenthash_updated;
+        if (std.mem.eql(u8, s, "ABIUpdated")) return .abi_updated;
+        if (std.mem.eql(u8, s, "InterfaceUpdated")) return .interface_updated;
+        if (std.mem.eql(u8, s, "NameUpdated")) return .name_updated;
+        if (std.mem.eql(u8, s, "ResourceArgument")) return .resource_argument;
+        if (std.mem.eql(u8, s, "ApprovalUpdated")) return .approval_updated;
         if (std.mem.eql(u8, s, "LabelRegistered")) return .label_registered;
         if (std.mem.eql(u8, s, "LabelReserved")) return .label_reserved;
         if (std.mem.eql(u8, s, "LabelUnregistered")) return .label_unregistered;
         if (std.mem.eql(u8, s, "ExpiryUpdated")) return .expiry_updated;
         if (std.mem.eql(u8, s, "ParentUpdated")) return .parent_updated;
+        if (std.mem.eql(u8, s, "RegistryCreated")) return .registry_created;
         if (std.mem.eql(u8, s, "NameMigrated")) return .name_migrated;
         if (std.mem.eql(u8, s, "NameWrapped")) return .name_wrapped;
         if (std.mem.eql(u8, s, "NameUnwrapped")) return .name_unwrapped;
@@ -393,32 +444,6 @@ pub const Webhook = struct {
     }
 };
 
-/// EAC (Enhanced Access Control) role types
-/// Each role is a nybble (4 bits) in the role bitmap
-pub const EACRole = enum(u8) {
-    // Owner roles (lower 128 bits)
-    registrar = 0, // Can register names
-    renew = 4, // Can renew names
-    set_subregistry = 8, // Can set subregistries
-    set_resolver = 12, // Can set resolvers
-    set_token_observer = 16, // Can set token observers
-    burn = 20, // Can burn tokens
-
-    // Admin roles would be at (role + 128)
-    // We don't need to enumerate all of them here
-
-    pub fn toString(self: EACRole) []const u8 {
-        return switch (self) {
-            .registrar => "REGISTRAR",
-            .renew => "RENEW",
-            .set_subregistry => "SET_SUBREGISTRY",
-            .set_resolver => "SET_RESOLVER",
-            .set_token_observer => "SET_TOKEN_OBSERVER",
-            .burn => "BURN",
-        };
-    }
-};
-
 /// Classifies the contract that emitted an `EACRolesChanged` event. Determines
 /// which named-role table the opaque `role_bitmap` is decoded against, since the
 /// same nybble means different permissions on a registry vs a resolver.
@@ -454,6 +479,11 @@ pub const EACRoleAssignment = struct {
     /// Kind of contract that emitted the role event. Used to decode `role_bitmap`
     /// into named permissions. Defaults to `.registry` (the primary EAC path).
     contract_kind: EACContractKind = .registry,
+    /// Contract that emitted the role event. Load-bearing for disambiguation:
+    /// the same resource value (especially ROOT, 0x0) exists on every
+    /// EAC-enabled contract, so a role row is only meaningful together with
+    /// its contract.
+    contract_address: Address = Address.zero,
 
     pub fn deinit(self: *EACRoleAssignment, allocator: std.mem.Allocator) void {
         allocator.free(self.resource);

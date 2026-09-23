@@ -29,10 +29,11 @@ pub fn validateWebhookUrl(url: []const u8) !void {
     }
 
     // Extract hostname using std.Uri's built-in host extraction
-    var hostname_buf: [std.Uri.host_name_max]u8 = undefined;
-    const hostname = uri.getHost(&hostname_buf) catch {
+    var hostname_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host_name = uri.getHost(&hostname_buf) catch {
         return error.InvalidUrlFormat;
     };
+    const hostname = host_name.bytes;
 
     // Block localhost, loopback, private, link-local, and cloud-metadata ranges (SSRF protection).
     // IPv4:

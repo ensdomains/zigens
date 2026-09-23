@@ -1,6 +1,7 @@
 /// Test helpers for ENS Indexer tests
 /// Provides common utilities for creating test databases and fixtures
 const std = @import("std");
+const zsys = @import("lib").zsys;
 const testing = std.testing;
 const lib = @import("lib");
 const Database = lib.Database;
@@ -8,17 +9,70 @@ const Address = lib.Address;
 const Hash = lib.Hash;
 const models = lib.models;
 
-/// Create an in-memory test database with schema loaded
+/// Create a test database with schema loaded. SQLite (in-memory) by default; when
+/// TEST_BACKEND=postgres, opens the local `ensv2_test` Postgres and resets `public` to a
+/// fresh schema per call (PG shares one database, and the test runner is sequential within
+/// a binary, so a per-call DROP SCHEMA gives each test the same isolation a fresh `:memory:`
+/// gives SQLite). This is what lets the existing storage suites run cross-backend.
 pub fn createTestDatabase(allocator: std.mem.Allocator) !*Database {
     const database = try allocator.create(Database);
     errdefer allocator.destroy(database);
 
-    database.* = try Database.init(allocator, ":memory:");
-
-    // Create webhooks table (loaded from separate schema directory in production)
-    try createWebhooksSchema(database);
+    if (wantPostgresBackend(allocator)) {
+        const be = try lib.storage.postgres.open(allocator, .{ .database = "ensv2_test", .password = "postgres" });
+        // Close `be` directly only while we still own it (before initWithBackend takes
+        // ownership). On a DROP failure here, nothing else has a reference to it.
+        be.vtable.execRaw(be.ptr, "DROP SCHEMA public CASCADE; CREATE SCHEMA public") catch |err| {
+            be.vtable.close(be.ptr);
+            return err;
+        };
+        // initWithBackend takes ownership of `be` and closes it on its own failure; once it
+        // succeeds, `database` owns it, so a later failure must go through database.deinit()
+        // (NOT a second be.close — that would double-close).
+        database.* = try Database.initWithBackend(allocator, be); // loads schema/postgres + migrate + reorg
+        errdefer database.deinit();
+        try createWebhooksSchemaPg(database);
+    } else if (forceWritePathUndo()) {
+        // Forced-fallback lane (test-integration-fallback): SQLite with
+        // server_side_undo doctored to false — no capture triggers; the storage
+        // mutators' write-path capture must keep the reorg suite green.
+        var be = try lib.storage.sqlite.open(allocator, ":memory:");
+        be.caps.server_side_undo = false;
+        database.* = try Database.initWithBackend(allocator, be);
+        errdefer database.deinit();
+        try createWebhooksSchema(database);
+    } else {
+        database.* = try Database.init(allocator, ":memory:");
+        // Create webhooks table (loaded from separate schema directory in production)
+        try createWebhooksSchema(database);
+    }
 
     return database;
+}
+
+/// True when the suite must force SQLite onto the write-path undo fallback
+/// (TEST_FORCE_WRITE_PATH_UNDO=1 — the test-integration-fallback lane).
+fn forceWritePathUndo() bool {
+    const v = zsys.getEnvOwned(std.heap.page_allocator, "TEST_FORCE_WRITE_PATH_UNDO") catch return false;
+    defer std.heap.page_allocator.free(v);
+    return std.mem.eql(u8, v, "1");
+}
+
+/// True when the suite is being run against Postgres (TEST_BACKEND=postgres).
+fn wantPostgresBackend(allocator: std.mem.Allocator) bool {
+    const v = zsys.getEnvOwned(allocator, "TEST_BACKEND") catch return false;
+    defer allocator.free(v);
+    return std.ascii.eqlIgnoreCase(v, "postgres");
+}
+
+/// Postgres webhooks schema (generated transpile of the SQLite DDL). Only 001 (the base
+/// schema) is applied: 002 is a SQLite-legacy `ALTER TABLE … ADD COLUMN secret` backfill
+/// that's redundant on a fresh PG DB (001 already has the column) and — unlike SQLite's
+/// exec, which swallows "duplicate column" — errors on Postgres.
+fn createWebhooksSchemaPg(database: *Database) !void {
+    const sql = try zsys.readFileAlloc(database.allocator, "schema/postgres/webhooks/001_webhooks.sql", 1 << 20);
+    defer database.allocator.free(sql);
+    try database.exec(sql);
 }
 
 /// Create webhooks schema for tests
@@ -96,7 +150,7 @@ pub fn createTestName(
     // Parse name parts
     var parts = std.mem.splitScalar(u8, name, '.');
     const label = parts.first();
-    var parent_parts: std.ArrayList(u8) = .{};
+    var parent_parts: std.ArrayList(u8) = .empty;
     defer parent_parts.deinit(allocator);
 
     var first = true;
@@ -151,9 +205,9 @@ pub fn createTestEvent(
     name: ?[]const u8,
     namehash_val: ?Hash,
 ) !void {
-    const timestamp = std.time.timestamp();
+    const timestamp = zsys.timestamp();
     var tx_hash: [32]u8 = undefined;
-    std.crypto.random.bytes(&tx_hash);
+    zsys.randomBytes(&tx_hash);
 
     try database.insertEvent(models.Event{
         .protocol = .v2,
@@ -172,14 +226,14 @@ pub fn createTestEvent(
 /// Generate a random test address
 pub fn randomAddress() Address {
     var bytes: [20]u8 = undefined;
-    std.crypto.random.bytes(&bytes);
+    zsys.randomBytes(&bytes);
     return Address{ .bytes = bytes };
 }
 
 /// Generate a random test hash
 pub fn randomHash() Hash {
     var bytes: [32]u8 = undefined;
-    std.crypto.random.bytes(&bytes);
+    zsys.randomBytes(&bytes);
     return Hash{ .bytes = bytes };
 }
 

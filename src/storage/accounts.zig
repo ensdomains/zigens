@@ -1,5 +1,6 @@
 const std = @import("std");
 const db_module = @import("database.zig");
+const reorg_undo = @import("reorg_undo.zig");
 const Database = db_module.Database;
 const Query = db_module.Query;
 const models = @import("../types/models.zig");
@@ -20,15 +21,24 @@ pub fn upsertAccount(
     timestamp: i64,
 ) !void {
     if (address.len == 0) return;
-    const sql =
+    const existed = try reorg_undo.activeRowExists(db, "accounts", "address = ?", .{address});
+    if (existed) try reorg_undo.captureActiveWhere(db, "accounts", "U", "address = ?", .{address});
+    // Scalar MAX/MIN over two values: MAX/MIN on SQLite, GREATEST/LEAST on Postgres
+    // (all args here are NOT NULL columns, so the NULL-handling difference is moot). The
+    // existing value is table-qualified (accounts.col) because Postgres rejects an
+    // unqualified column in DO UPDATE as ambiguous with `excluded`; SQLite accepts the
+    // qualified form too. Cached by SQL content on both backends.
+    const d = db.dialect();
+    const sql = try std.fmt.allocPrint(db.allocator,
         \\INSERT INTO accounts (address, seen_v1, seen_v2, first_seen_block, first_seen_timestamp)
         \\VALUES (?, ?, ?, ?, ?)
         \\ON CONFLICT(address) DO UPDATE SET
-        \\  seen_v1 = MAX(seen_v1, excluded.seen_v1),
-        \\  seen_v2 = MAX(seen_v2, excluded.seen_v2),
-        \\  first_seen_block = MIN(first_seen_block, excluded.first_seen_block),
-        \\  first_seen_timestamp = MIN(first_seen_timestamp, excluded.first_seen_timestamp)
-    ;
+        \\  seen_v1 = {s}(accounts.seen_v1, excluded.seen_v1),
+        \\  seen_v2 = {s}(accounts.seen_v2, excluded.seen_v2),
+        \\  first_seen_block = {s}(accounts.first_seen_block, excluded.first_seen_block),
+        \\  first_seen_timestamp = {s}(accounts.first_seen_timestamp, excluded.first_seen_timestamp)
+    , .{ d.scalar_max, d.scalar_max, d.scalar_min, d.scalar_min });
+    defer db.allocator.free(sql);
     var q = try Query.initCached(db, sql);
     defer q.deinit();
     const is_v1: i64 = if (protocol == .v1) 1 else 0;
@@ -39,6 +49,7 @@ pub fn upsertAccount(
     try q.bindInt64(@intCast(block_number));
     try q.bindInt64(timestamp);
     try q.exec();
+    if (!existed) try reorg_undo.captureActiveWhere(db, "accounts", "I", "address = ?", .{address});
 }
 
 pub fn getAccountCount(db: *Database) !u64 {
@@ -136,16 +147,16 @@ pub fn getFilteredAccounts(
     order_dir: db_module.OrderDir,
     sort_field: AccountSortField,
 ) ![]Account {
-    var conditions: std.ArrayList([]const u8) = .{};
+    var conditions: std.ArrayList([]const u8) = .empty;
     defer conditions.deinit(db.allocator);
-    var allocated: std.ArrayList([]const u8) = .{};
+    var allocated: std.ArrayList([]const u8) = .empty;
     defer {
         for (allocated.items) |s| db.allocator.free(s);
         allocated.deinit(db.allocator);
     }
     try appendAccountConditions(db, filters, &conditions, &allocated);
 
-    var sql_buf: std.ArrayList(u8) = .{};
+    var sql_buf: std.ArrayList(u8) = .empty;
     defer sql_buf.deinit(db.allocator);
     try sql_buf.appendSlice(db.allocator, "SELECT address, seen_v1, seen_v2, first_seen_block, first_seen_timestamp FROM accounts");
     if (conditions.items.len > 0) {
@@ -166,7 +177,7 @@ pub fn getFilteredAccounts(
     try q.bindInt64(@intCast(limit));
     try q.bindInt64(@intCast(skip));
 
-    var results: std.ArrayList(Account) = .{};
+    var results: std.ArrayList(Account) = .empty;
     defer results.deinit(db.allocator);
     while (try q.step()) {
         try results.append(db.allocator, .{
@@ -180,34 +191,6 @@ pub fn getFilteredAccounts(
     return try results.toOwnedSlice(db.allocator);
 }
 
-pub fn getFilteredAccountCount(db: *Database, filters: AccountFilters) !u64 {
-    var conditions: std.ArrayList([]const u8) = .{};
-    defer conditions.deinit(db.allocator);
-    var allocated: std.ArrayList([]const u8) = .{};
-    defer {
-        for (allocated.items) |s| db.allocator.free(s);
-        allocated.deinit(db.allocator);
-    }
-    try appendAccountConditions(db, filters, &conditions, &allocated);
-
-    var sql_buf: std.ArrayList(u8) = .{};
-    defer sql_buf.deinit(db.allocator);
-    try sql_buf.appendSlice(db.allocator, "SELECT COUNT(*) FROM accounts");
-    if (conditions.items.len > 0) {
-        try sql_buf.appendSlice(db.allocator, " WHERE ");
-        for (conditions.items, 0..) |c, i| {
-            if (i > 0) try sql_buf.appendSlice(db.allocator, " AND ");
-            try sql_buf.appendSlice(db.allocator, c);
-        }
-    }
-
-    var q = try Query.init(db, sql_buf.items);
-    defer q.deinit();
-    try bindAccountFilters(&q, filters);
-    if (!(try q.step())) return 0;
-    return @intCast(q.getInt64(0));
-}
-
 // ============================================================================
 // BACKFILL
 // ============================================================================
@@ -218,6 +201,7 @@ pub fn getFilteredAccountCount(db: *Database, filters: AccountFilters) !u64 {
 // since we don't carry a per-name observation block on `names`.
 
 pub fn backfillFromExistingData(db: *Database) !u64 {
+    try db.namesBarrier();
     const seed_block_sql = "SELECT COALESCE(MIN(last_synced_block), 0) FROM sync_state";
     var seed_q = try Query.init(db, seed_block_sql);
     defer seed_q.deinit();

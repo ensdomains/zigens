@@ -1,6 +1,8 @@
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const constants = @import("../constants.zig");
 const db_module = @import("database.zig");
+const reorg_undo = @import("reorg_undo.zig");
 const Database = db_module.Database;
 const Query = db_module.Query;
 const models = @import("../types/models.zig");
@@ -54,12 +56,17 @@ fn parseEventRow(q: *Query, allocator: std.mem.Allocator) !models.Event {
 // ============================================================================
 
 pub fn insertEvent(db: *Database, event: models.Event) !void {
-    const sql =
-        \\INSERT OR IGNORE INTO events
-        \\(event_type, protocol, block_number, tx_hash, log_index, contract_address,
-        \\ name, namehash, data, timestamp)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ;
+    _ = try insertEventIfNew(db, event);
+}
+
+/// Like `insertEvent`, but reports whether a row actually landed. The insert
+/// conflict-ignores on (protocol, tx_hash, log_index), so re-sweeps of
+/// already-indexed history (init-gap heals, discovery-backfill retries)
+/// revisit stored events — callers gating side effects on genuinely-new
+/// events (webhook notification) need the distinction.
+pub fn insertEventIfNew(db: *Database, event: models.Event) !bool {
+    const sql = try db.upsertSql(db.allocator, "events", &.{ "event_type", "protocol", "block_number", "tx_hash", "log_index", "contract_address", "name", "namehash", "data", "timestamp" }, .ignore);
+    defer db.allocator.free(sql);
 
     var q = try Query.initCached(db, sql);
     defer q.deinit();
@@ -79,6 +86,148 @@ pub fn insertEvent(db: *Database, event: models.Event) !void {
     try q.bindInt64(event.timestamp);
 
     try q.exec();
+    return q.changes() > 0;
+}
+
+const EVENT_COLS = [_][]const u8{ "event_type", "protocol", "block_number", "tx_hash", "log_index", "contract_address", "name", "namehash", "data", "timestamp" };
+
+/// Rows per multi-row INSERT: 10 params each → 900 params, under even the
+/// pre-3.32 SQLite SQLITE_MAX_VARIABLE_NUMBER floor of 999.
+const EVENT_BATCH_ROWS = 400;
+
+/// Bulk-sync insert path: one multi-row conflict-ignoring INSERT per chunk of
+/// up to EVENT_BATCH_ROWS events, instead of one round trip per event — on a
+/// remote Postgres (Neon) the per-statement RTT dominated bulk sync.
+///
+/// Semantics match sequential `insertEvent` calls exactly:
+///   - conflict-ignore on (protocol, tx_hash, log_index); rows whose key
+///     already exists in the table are skipped by the engine,
+///   - duplicates WITHIN the slice are deduped here keep-first, because
+///     Postgres rejects two rows with one conflict key in a single statement
+///     ("cannot affect row a second time") where sequential inserts silently
+///     ignored the second.
+///
+/// All text is bound with static lifetime (the caller's event slice must stay
+/// alive through this call — the write buffer guarantees it): the SQLite
+/// driver binds SQLITE_STATIC, and per-row tracked copies would blow the
+/// statement's MAX_BOUND_STRINGS cap. Derived hex strings live in a per-chunk
+/// arena that outlives the statement (LIFO defers).
+pub fn insertEventsBatch(db: *Database, events_slice: []const models.Event) !void {
+    if (events_slice.len == 0) return;
+
+    const DedupKey = struct { protocol: models.Protocol, tx_hash: [32]u8, log_index: u32 };
+    var seen = std.AutoHashMap(DedupKey, void).init(db.allocator);
+    defer seen.deinit();
+    try seen.ensureTotalCapacity(@intCast(events_slice.len));
+
+    var deduped: std.ArrayList(*const models.Event) = .empty;
+    defer deduped.deinit(db.allocator);
+    try deduped.ensureTotalCapacity(db.allocator, events_slice.len);
+    for (events_slice) |*event| {
+        const gop = seen.getOrPutAssumeCapacity(.{ .protocol = event.protocol, .tx_hash = event.tx_hash.bytes, .log_index = event.log_index });
+        if (gop.found_existing) continue;
+        deduped.appendAssumeCapacity(event);
+    }
+
+    var start: usize = 0;
+    while (start < deduped.items.len) {
+        const rows = @min(EVENT_BATCH_ROWS, deduped.items.len - start);
+        const chunk = deduped.items[start .. start + rows];
+
+        const sql = try db.upsertMultiSql(db.allocator, "events", &EVENT_COLS, rows, .ignore);
+        defer db.allocator.free(sql);
+
+        // Declared before the Query so its hex strings outlive exec (LIFO defers).
+        var arena = std.heap.ArenaAllocator.init(db.allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+
+        var q = try Query.initCached(db, sql);
+        defer q.deinit();
+
+        for (chunk) |event| {
+            try q.bindTextStatic(event.event_type.toString());
+            try q.bindTextStatic(event.protocol.toString());
+            try q.bindInt64(@intCast(event.block_number));
+            const tx_buf = try scratch.create([66]u8);
+            try q.bindTextStatic(event.tx_hash.toHexBuf(tx_buf));
+            try q.bindInt(@intCast(event.log_index));
+            const addr_buf = try scratch.create([42]u8);
+            try q.bindTextStatic(event.contract_address.toHexBuf(addr_buf));
+            if (event.name) |n| try q.bindTextStatic(n) else try q.bindNull();
+            if (event.namehash) |h| {
+                const nh_buf = try scratch.create([66]u8);
+                try q.bindTextStatic(h.toHexBuf(nh_buf));
+            } else try q.bindNull();
+            try q.bindTextStatic(event.data);
+            try q.bindInt64(event.timestamp);
+        }
+        try q.exec();
+        start += rows;
+    }
+}
+
+/// Direct-mode twin of the write-buffer flush repair: re-resolve
+/// placeholder-named events written in [from_block, to_block]. Phase 1 writes
+/// datastore events (ResolverUpdated) BEFORE phase 2 creates the
+/// root-registry names they reference, so same-batch rows land with a
+/// "tokenId:…" name and null namehash — and the names-side placeholder patch
+/// never fires for names that were never placeholders themselves. Runs after
+/// all batch passes; the registry-less canonical lookup is ambiguity-guarded
+/// (collision → row keeps its placeholder). The in-place events name patch is
+/// the documented reorg-capture waiver (denorm-only), same as
+/// updatePlaceholderEventsByName.
+pub fn repairPlaceholderEvents(db: *Database, protocol: models.Protocol, from_block: u64, to_block: u64) !usize {
+    const names_mod = @import("names.zig");
+
+    const Candidate = struct { id: i64, token: u256 };
+    var candidates: std.ArrayList(Candidate) = .empty;
+    defer candidates.deinit(db.allocator);
+
+    {
+        var q = try Query.init(db,
+            \\SELECT id, name FROM events
+            \\WHERE protocol = ? AND block_number >= ? AND block_number <= ? AND name LIKE 'tokenId:%'
+        );
+        defer q.deinit();
+        try q.bindTextStatic(protocol.toString());
+        try q.bindInt64(@intCast(from_block));
+        try q.bindInt64(@intCast(to_block));
+        while (try q.step()) {
+            const name = q.getTextSlice(1) orelse continue;
+            const token = std.fmt.parseInt(u256, name["tokenId:".len..], 10) catch continue;
+            try candidates.append(db.allocator, .{ .id = q.getInt64(0), .token = token });
+        }
+    }
+
+    if (candidates.items.len == 0) return 0;
+
+    // One IN-list sweep instead of one point lookup per candidate — exact,
+    // because nothing below writes the names table (events only).
+    var tokens: std.ArrayList(u256) = .empty;
+    defer tokens.deinit(db.allocator);
+    try tokens.ensureTotalCapacity(db.allocator, candidates.items.len);
+    for (candidates.items) |cand| tokens.appendAssumeCapacity(cand.token);
+    var resolutions = try names_mod.resolveUniqueNamesByCanonicalIds(db, protocol, tokens.items, db.allocator);
+    defer names_mod.freeCanonicalNameResolutions(&resolutions, db.allocator);
+
+    const token_id_utils = @import("../types/token_id.zig");
+    var repaired: usize = 0;
+    for (candidates.items) |cand| {
+        const found = resolutions.get(token_id_utils.getCanonicalId(cand.token)) orelse continue;
+        const real_name = found.name orelse continue;
+        if (std.mem.startsWith(u8, real_name, "tokenId:")) continue;
+
+        var u = try Query.init(db, "UPDATE events SET name = ?, namehash = ? WHERE id = ?");
+        defer u.deinit();
+        try u.bindTextStatic(real_name);
+        var nh_buf: [66]u8 = undefined;
+        try u.bindTextStatic(found.namehash.toHexBuf(&nh_buf));
+        try u.bindInt64(cand.id);
+        try u.exec();
+        repaired += 1;
+    }
+    return repaired;
 }
 
 /// Order direction for event queries
@@ -98,15 +247,74 @@ pub const EventSortField = enum {
     /// sorting in memory.
     expiry,
 
+    /// Non-JSON sort columns (valid verbatim on both backends). `.expiry` extracts JSON
+    /// data fields, so it is dialect-dependent and built via `expirySortExpr` instead.
     pub fn toSql(self: EventSortField) []const u8 {
         return switch (self) {
             .block_number => "block_number",
             .timestamp => "timestamp",
             .name => "name",
-            .expiry => "COALESCE(CAST(json_extract(data, '$.expiry') AS INTEGER), CAST(json_extract(data, '$.expiration') AS INTEGER), timestamp + CAST(json_extract(data, '$.duration') AS INTEGER))",
+            .expiry => "", // built dialect-aware by expirySortExpr; never used directly
         };
     }
 };
+
+/// `CAST(<json data.$.field> AS INTEGER)` — portable numeric JSON access. SQLite:
+/// `CAST(json_extract(data,'$.field') AS INTEGER)` (unchanged); Postgres:
+/// `CAST((data::jsonb ->> 'field') AS INTEGER)`. The explicit CAST (cast_type=null on
+/// jsonExtract) keeps the SQLite form identical and is valid on both. Caller owns result.
+fn jsonDataInt(db: *Database, field: []const u8) ![]u8 {
+    const je = try db.dialect().jsonExtract(db.allocator, "data", field, null);
+    defer db.allocator.free(je);
+    return std.fmt.allocPrint(db.allocator, "CAST({s} AS INTEGER)", .{je});
+}
+
+/// `LOWER(<json data.$.field>)` — portable case-folded text access. Caller owns result.
+fn jsonDataLower(db: *Database, field: []const u8) ![]u8 {
+    const je = try db.dialect().jsonExtract(db.allocator, "data", field, null);
+    defer db.allocator.free(je);
+    return std.fmt.allocPrint(db.allocator, "LOWER({s})", .{je});
+}
+
+/// Dialect-aware expiry ordering/filtering expression: the registration expiry from
+/// `data.$.expiry`/`$.expiration`, else `timestamp + data.$.duration`. `with_expiration`
+/// includes the `$.expiration` fallback (the sort does; the filter doesn't). Caller owns.
+fn expirySortExpr(db: *Database, with_expiration: bool) ![]u8 {
+    const expiry = try jsonDataInt(db, "expiry");
+    defer db.allocator.free(expiry);
+    const duration = try jsonDataInt(db, "duration");
+    defer db.allocator.free(duration);
+    if (with_expiration) {
+        const expiration = try jsonDataInt(db, "expiration");
+        defer db.allocator.free(expiration);
+        return std.fmt.allocPrint(db.allocator, "COALESCE({s}, {s}, timestamp + {s})", .{ expiry, expiration, duration });
+    }
+    return std.fmt.allocPrint(db.allocator, "COALESCE({s}, timestamp + {s})", .{ expiry, duration });
+}
+
+/// The ORDER BY column expression for a sort field, shared by getEventsFiltered and
+/// countEventsBeforeCursor so the fetch order and the cursor-position count agree exactly.
+/// `.name` is COALESCE'd so NULL names order deterministically; `.expiry` is the JSON expr.
+/// Caller owns the returned string.
+fn sortColExpr(db: *Database, sort_field: EventSortField) ![]u8 {
+    return switch (sort_field) {
+        .block_number => db.allocator.dupe(u8, "block_number"),
+        .timestamp => db.allocator.dupe(u8, "timestamp"),
+        .name => db.allocator.dupe(u8, "COALESCE(name, '')"),
+        .expiry => expirySortExpr(db, true),
+    };
+}
+
+/// The ", <tiebreak>" suffix that follows the sort column: (block_number, log_index) is
+/// unique, so appending it makes every sort field a total order (no two rows tie) and
+/// pagination deterministic. Shared by getEventsFiltered and the per-namehash page
+/// loader so their row order is identical.
+fn orderTiebreakSql(filter: EventFilterOptions) []const u8 {
+    return if (filter.sort_field == .block_number)
+        (if (filter.order_dir == .desc) ", log_index DESC" else ", log_index ASC")
+    else
+        (if (filter.order_dir == .desc) ", block_number DESC, log_index DESC" else ", block_number ASC, log_index ASC");
+}
 
 pub fn getRecentEvents(db: *Database, protocol: ?models.Protocol, event_type: ?models.EventType, limit: u32) ![]models.Event {
     return getRecentEventsWithOrder(db, protocol, event_type, limit, .desc);
@@ -166,7 +374,7 @@ pub fn getRecentEventsWithOrder(db: *Database, protocol: ?models.Protocol, event
         try q.bindTextStatic(et.toString());
     }
 
-    var events: std.ArrayList(models.Event) = .{};
+    var events: std.ArrayList(models.Event) = .empty;
     errdefer {
         for (events.items) |*event| {
             event.deinit(db.allocator);
@@ -203,11 +411,20 @@ pub const EventFilterOptions = struct {
     timestamp_lte: ?i64 = null,
     data_json_owner: ?[]const u8 = null,
     data_json_owners: ?[]const []const u8 = null,
+    /// Address involvement (owner OR from OR to in event data) — per-address history.
+    involved: ?[]const u8 = null,
+    /// Exact match on `data.$.resource` (the EACRolesChanged payload), as the fixed
+    /// 66-char lowercase hex the indexer stores — the value exactly as emitted, EAC
+    /// version bits included. Hits idx_events_resource_extracted.
+    resource: ?[]const u8 = null,
     // Expiry filters - uses json_extract(data, '$.expiration')
     expiry_gt: ?i64 = null,
     expiry_gte: ?i64 = null,
     expiry_lt: ?i64 = null,
     expiry_lte: ?i64 = null,
+    /// Subgraph-style boolean composition (GraphQL `and` / `or`), nesting recursively.
+    and_group: ?[]const EventFilterOptions = null,
+    or_group: ?[]const EventFilterOptions = null,
     limit: u32 = constants.Pagination.default_limit,
     skip: u32 = 0,
     order_dir: OrderDir = .desc,
@@ -223,11 +440,25 @@ fn appendEventFilterConditions(
     conditions: *std.ArrayList([]const u8),
     allocated_clauses: *std.ArrayList([]const u8),
 ) !void {
+    // Events have no default-visibility filters — the whole WHERE is the user's
+    // predicate tree (this node's scalars + recursive and/or).
+    if (try buildEventNodeExpr(db, filter, allocated_clauses)) |expr| {
+        try conditions.append(db.allocator, expr);
+    }
+}
+
+/// One event-filter node's scalar predicates (no and/or).
+fn appendEventScalarConditions(
+    db: *Database,
+    filter: EventFilterOptions,
+    conditions: *std.ArrayList([]const u8),
+    allocated_clauses: *std.ArrayList([]const u8),
+) !void {
     if (filter.protocol != null) try conditions.append(db.allocator, "protocol = ?");
     if (filter.event_type != null) try conditions.append(db.allocator, "event_type = ?");
     if (filter.event_type_not != null) try conditions.append(db.allocator, "event_type != ?");
     if (filter.event_types != null and filter.event_types.?.len > 0) {
-        var in_parts: std.ArrayList(u8) = .{};
+        var in_parts: std.ArrayList(u8) = .empty;
         defer in_parts.deinit(db.allocator);
         try in_parts.appendSlice(db.allocator, "event_type IN (");
         for (filter.event_types.?, 0..) |_, i| {
@@ -240,7 +471,7 @@ fn appendEventFilterConditions(
         try conditions.append(db.allocator, clause);
     }
     if (filter.event_types_not != null and filter.event_types_not.?.len > 0) {
-        var in_parts: std.ArrayList(u8) = .{};
+        var in_parts: std.ArrayList(u8) = .empty;
         defer in_parts.deinit(db.allocator);
         try in_parts.appendSlice(db.allocator, "event_type NOT IN (");
         for (filter.event_types_not.?, 0..) |_, i| {
@@ -255,7 +486,7 @@ fn appendEventFilterConditions(
     if (filter.domain != null) try conditions.append(db.allocator, "name = ?");
     if (filter.contract_address != null) try conditions.append(db.allocator, "contract_address = ?");
     if (filter.contract_addresses != null and filter.contract_addresses.?.len > 0) {
-        var in_parts: std.ArrayList(u8) = .{};
+        var in_parts: std.ArrayList(u8) = .empty;
         defer in_parts.deinit(db.allocator);
         try in_parts.appendSlice(db.allocator, "contract_address IN (");
         for (filter.contract_addresses.?, 0..) |_, i| {
@@ -277,12 +508,18 @@ fn appendEventFilterConditions(
     if (filter.timestamp_lt != null) try conditions.append(db.allocator, "timestamp < ?");
     if (filter.timestamp_lte != null) try conditions.append(db.allocator, "timestamp <= ?");
     if (filter.data_json_owner != null) {
-        try conditions.append(db.allocator, "LOWER(json_extract(data, '$.owner')) = LOWER(?)");
+        const owner_lower = try jsonDataLower(db, "owner");
+        defer db.allocator.free(owner_lower);
+        const clause = try std.fmt.allocPrint(db.allocator, "{s} = LOWER(?)", .{owner_lower});
+        try allocated_clauses.append(db.allocator, clause);
+        try conditions.append(db.allocator, clause);
     }
     if (filter.data_json_owners != null and filter.data_json_owners.?.len > 0) {
-        var in_parts: std.ArrayList(u8) = .{};
+        const owner_lower = try jsonDataLower(db, "owner");
+        defer db.allocator.free(owner_lower);
+        var in_parts: std.ArrayList(u8) = .empty;
         defer in_parts.deinit(db.allocator);
-        try in_parts.appendSlice(db.allocator, "LOWER(json_extract(data, '$.owner')) IN (");
+        try in_parts.print(db.allocator, "{s} IN (", .{owner_lower});
         for (filter.data_json_owners.?, 0..) |_, i| {
             if (i > 0) try in_parts.append(db.allocator, ',');
             try in_parts.appendSlice(db.allocator, "LOWER(?)");
@@ -292,16 +529,95 @@ fn appendEventFilterConditions(
         try allocated_clauses.append(db.allocator, clause);
         try conditions.append(db.allocator, clause);
     }
-    // Registration-style expiry filter (V2: data.$.expiry; V1: timestamp + data.$.duration)
-    const expiry_expr = "COALESCE(CAST(json_extract(data, '$.expiry') AS INTEGER), timestamp + CAST(json_extract(data, '$.duration') AS INTEGER))";
-    if (filter.expiry_gt != null) try conditions.append(db.allocator, expiry_expr ++ " > ?");
-    if (filter.expiry_gte != null) try conditions.append(db.allocator, expiry_expr ++ " >= ?");
-    if (filter.expiry_lt != null) try conditions.append(db.allocator, expiry_expr ++ " < ?");
-    if (filter.expiry_lte != null) try conditions.append(db.allocator, expiry_expr ++ " <= ?");
+    if (filter.involved != null) {
+        // Address involvement across the three actor roles; each disjunct hits its own
+        // expression index (idx_events_{owner,to,from}_extracted).
+        const owner_lower = try jsonDataLower(db, "owner");
+        defer db.allocator.free(owner_lower);
+        const to_lower = try jsonDataLower(db, "to");
+        defer db.allocator.free(to_lower);
+        const from_lower = try jsonDataLower(db, "from");
+        defer db.allocator.free(from_lower);
+        const clause = try std.fmt.allocPrint(db.allocator, "({s} = LOWER(?) OR {s} = LOWER(?) OR {s} = LOWER(?))", .{ owner_lower, to_lower, from_lower });
+        try allocated_clauses.append(db.allocator, clause);
+        try conditions.append(db.allocator, clause);
+    }
+    if (filter.resource != null) {
+        const resource_expr = try db.dialect().jsonExtract(db.allocator, "data", "resource", null);
+        defer db.allocator.free(resource_expr);
+        const clause = try std.fmt.allocPrint(db.allocator, "{s} = ?", .{resource_expr});
+        try allocated_clauses.append(db.allocator, clause);
+        try conditions.append(db.allocator, clause);
+    }
+    // Registration-style expiry filter (V2: data.$.expiry; V1: timestamp + data.$.duration).
+    if (filter.expiry_gt != null or filter.expiry_gte != null or filter.expiry_lt != null or filter.expiry_lte != null) {
+        const expiry_expr = try expirySortExpr(db, false); // filter omits the $.expiration fallback
+        defer db.allocator.free(expiry_expr);
+        if (filter.expiry_gt != null) try appendExpiryCond(db, conditions, allocated_clauses, expiry_expr, ">");
+        if (filter.expiry_gte != null) try appendExpiryCond(db, conditions, allocated_clauses, expiry_expr, ">=");
+        if (filter.expiry_lt != null) try appendExpiryCond(db, conditions, allocated_clauses, expiry_expr, "<");
+        if (filter.expiry_lte != null) try appendExpiryCond(db, conditions, allocated_clauses, expiry_expr, "<=");
+    }
 }
 
-/// Bind values for `filter` in the same order `appendEventFilterConditions` appends them.
-fn bindEventFilters(q: *Query, filter: EventFilterOptions) !void {
+fn appendExpiryCond(
+    db: *Database,
+    conditions: *std.ArrayList([]const u8),
+    allocated_clauses: *std.ArrayList([]const u8),
+    expiry_expr: []const u8,
+    op: []const u8,
+) !void {
+    const clause = try std.fmt.allocPrint(db.allocator, "{s} {s} ?", .{ expiry_expr, op });
+    try allocated_clauses.append(db.allocator, clause);
+    try conditions.append(db.allocator, clause);
+}
+
+/// Recursively build one event-filter node's boolean SQL (scalars + and/or).
+fn buildEventNodeExpr(
+    db: *Database,
+    filter: EventFilterOptions,
+    allocated_clauses: *std.ArrayList([]const u8),
+) anyerror!?[]const u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(db.allocator);
+    try appendEventScalarConditions(db, filter, &parts, allocated_clauses);
+    if (filter.and_group) |children| {
+        for (children) |child| {
+            if (try buildEventNodeExpr(db, child, allocated_clauses)) |sub| try parts.append(db.allocator, sub);
+        }
+    }
+    if (filter.or_group) |children| {
+        var or_parts: std.ArrayList([]const u8) = .empty;
+        defer or_parts.deinit(db.allocator);
+        for (children) |child| {
+            if (try buildEventNodeExpr(db, child, allocated_clauses)) |sub| try or_parts.append(db.allocator, sub);
+        }
+        if (or_parts.items.len > 0) {
+            const joined = try db_module.query.joinWrapped(db.allocator, or_parts.items, " OR ");
+            try allocated_clauses.append(db.allocator, joined);
+            try parts.append(db.allocator, joined);
+        }
+    }
+    if (parts.items.len == 0) return null;
+    if (parts.items.len == 1) return parts.items[0];
+    const joined = try db_module.query.joinWrapped(db.allocator, parts.items, " AND ");
+    try allocated_clauses.append(db.allocator, joined);
+    return joined;
+}
+
+/// Bind values for `filter` in the same order the SQL is built: scalars, then and, then or.
+fn bindEventFilters(q: *Query, filter: EventFilterOptions) anyerror!void {
+    try bindEventScalars(q, filter);
+    if (filter.and_group) |children| {
+        for (children) |child| try bindEventFilters(q, child);
+    }
+    if (filter.or_group) |children| {
+        for (children) |child| try bindEventFilters(q, child);
+    }
+}
+
+/// Bind one node's scalars in the same order `appendEventScalarConditions` appends them.
+fn bindEventScalars(q: *Query, filter: EventFilterOptions) !void {
     if (filter.protocol) |c| try q.bindTextStatic(c.toString());
     if (filter.event_type) |t| try q.bindText(t);
     if (filter.event_type_not) |t| try q.bindText(t);
@@ -329,6 +645,13 @@ fn bindEventFilters(q: *Query, filter: EventFilterOptions) !void {
     if (filter.data_json_owners) |owners| {
         for (owners) |o| try q.bindText(o);
     }
+    if (filter.involved) |v| {
+        // Three binds — one per OR disjunct in the involvement clause.
+        try q.bindText(v);
+        try q.bindText(v);
+        try q.bindText(v);
+    }
+    if (filter.resource) |r| try q.bindText(r);
     if (filter.expiry_gt) |v| try q.bindInt64(v);
     if (filter.expiry_gte) |v| try q.bindInt64(v);
     if (filter.expiry_lt) |v| try q.bindInt64(v);
@@ -350,31 +673,39 @@ pub fn countEventsBeforeCursor(
     order_dir: OrderDir,
     filter: EventFilterOptions,
 ) !u32 {
-    // First resolve the cursor event's block_number.
-    var lookup = try Query.init(db, "SELECT block_number FROM events WHERE tx_hash = ? AND log_index = ? LIMIT 1");
+    // Count in the SAME total order the row query uses: (sort_col, block_number, log_index).
+    // A cursor identifies a unique row; count rows strictly before it in that order, so
+    // OFFSET = count + 1 lands exactly on the next page with no dropped/duplicated rows.
+    const sort_expr = try sortColExpr(db, filter.sort_field);
+    defer db.allocator.free(sort_expr);
+    const is_text_sort = filter.sort_field == .name;
+
+    // Resolve the cursor row's full sort tuple (sort_value, block_number, log_index).
+    const lookup_sql = try std.fmt.allocPrint(db.allocator, "SELECT {s}, block_number, log_index FROM events WHERE tx_hash = ? AND log_index = ? LIMIT 1", .{sort_expr});
+    defer db.allocator.free(lookup_sql);
+    var lookup = try Query.init(db, lookup_sql);
     defer lookup.deinit();
     try lookup.bindText(tx_hash);
     try lookup.bindInt(@intCast(log_index));
     if (!try lookup.step()) return 0;
-    const cursor_block = lookup.getInt64(0);
+    const cursor_sort_int: i64 = if (is_text_sort) 0 else lookup.getInt64(0);
+    const cursor_sort_text: []const u8 = try db.allocator.dupe(u8, if (is_text_sort) (lookup.getTextSlice(0) orelse "") else "");
+    defer db.allocator.free(cursor_sort_text);
+    const cursor_block = lookup.getInt64(1);
+    const cursor_log = lookup.getInt64(2);
 
-    // Build SQL: cursor-based position predicate AND every filter that the row query applies.
-    // Without the filters, the offset is computed over the unfiltered superset and pagination
-    // skips too many rows (e.g. with blockNumber_gte/lte bounds, ~60% of edges were missing
-    // before this fix). DESC (newest first): "before" = higher (block_number, log_index);
-    // ASC: "before" = lower.
-    var sql_buf: std.ArrayList(u8) = .{};
+    // "before" in the display order: DESC → higher tuple, ASC → lower tuple. Filters must
+    // match the row query or the offset is taken over the wrong (super)set.
+    const op: []const u8 = if (order_dir == .desc) ">" else "<";
+    var sql_buf: std.ArrayList(u8) = .empty;
     defer sql_buf.deinit(db.allocator);
+    const pred = try std.fmt.allocPrint(db.allocator, "SELECT COUNT(*) FROM events WHERE ({s} {s} ? OR ({s} = ? AND (block_number {s} ? OR (block_number = ? AND log_index {s} ?))))", .{ sort_expr, op, sort_expr, op, op });
+    defer db.allocator.free(pred);
+    try sql_buf.appendSlice(db.allocator, pred);
 
-    const base = if (order_dir == .desc)
-        "SELECT COUNT(*) FROM events WHERE (block_number > ? OR (block_number = ? AND log_index > ?))"
-    else
-        "SELECT COUNT(*) FROM events WHERE (block_number < ? OR (block_number = ? AND log_index < ?))";
-    try sql_buf.appendSlice(db.allocator, base);
-
-    var conditions: std.ArrayList([]const u8) = .{};
+    var conditions: std.ArrayList([]const u8) = .empty;
     defer conditions.deinit(db.allocator);
-    var allocated_clauses: std.ArrayList([]const u8) = .{};
+    var allocated_clauses: std.ArrayList([]const u8) = .empty;
     defer {
         for (allocated_clauses.items) |s| db.allocator.free(s);
         allocated_clauses.deinit(db.allocator);
@@ -387,9 +718,16 @@ pub fn countEventsBeforeCursor(
 
     var q = try Query.initCached(db, sql_buf.items);
     defer q.deinit();
+    if (is_text_sort) {
+        try q.bindText(cursor_sort_text);
+        try q.bindText(cursor_sort_text);
+    } else {
+        try q.bindInt64(cursor_sort_int);
+        try q.bindInt64(cursor_sort_int);
+    }
     try q.bindInt64(cursor_block);
     try q.bindInt64(cursor_block);
-    try q.bindInt(@intCast(log_index));
+    try q.bindInt64(cursor_log);
     try bindEventFilters(&q, filter);
     if (!try q.step()) return 0;
     return @intCast(q.getInt64(0));
@@ -404,11 +742,11 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     @memcpy(sql_buf[sql_len..][0..base_sql.len], base_sql);
     sql_len += base_sql.len;
 
-    var conditions: std.ArrayList([]const u8) = .{};
+    var conditions: std.ArrayList([]const u8) = .empty;
     defer conditions.deinit(db.allocator);
 
     // Track allocated IN clause strings for cleanup
-    var allocated_clauses: std.ArrayList([]const u8) = .{};
+    var allocated_clauses: std.ArrayList([]const u8) = .empty;
     defer {
         for (allocated_clauses.items) |clause| {
             db.allocator.free(clause);
@@ -416,150 +754,7 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
         allocated_clauses.deinit(db.allocator);
     }
 
-    // Build WHERE conditions
-    if (filter.protocol != null) {
-        try conditions.append(db.allocator, "protocol = ?");
-    }
-    if (filter.event_type != null) {
-        try conditions.append(db.allocator, "event_type = ?");
-    }
-    if (filter.event_type_not != null) {
-        try conditions.append(db.allocator, "event_type != ?");
-    }
-    if (filter.event_types != null and filter.event_types.?.len > 0) {
-        var in_clause_buf: [256]u8 = undefined;
-        var in_len: usize = 0;
-        const prefix = "event_type IN (";
-        @memcpy(in_clause_buf[in_len..][0..prefix.len], prefix);
-        in_len += prefix.len;
-        for (filter.event_types.?, 0..) |_, i| {
-            if (i > 0) {
-                in_clause_buf[in_len] = ',';
-                in_len += 1;
-            }
-            in_clause_buf[in_len] = '?';
-            in_len += 1;
-        }
-        in_clause_buf[in_len] = ')';
-        in_len += 1;
-        const clause = try db.allocator.dupe(u8, in_clause_buf[0..in_len]);
-        try allocated_clauses.append(db.allocator, clause);
-        try conditions.append(db.allocator, clause);
-    }
-    if (filter.event_types_not != null and filter.event_types_not.?.len > 0) {
-        var in_clause_buf: [256]u8 = undefined;
-        var in_len: usize = 0;
-        const prefix = "event_type NOT IN (";
-        @memcpy(in_clause_buf[in_len..][0..prefix.len], prefix);
-        in_len += prefix.len;
-        for (filter.event_types_not.?, 0..) |_, i| {
-            if (i > 0) {
-                in_clause_buf[in_len] = ',';
-                in_len += 1;
-            }
-            in_clause_buf[in_len] = '?';
-            in_len += 1;
-        }
-        in_clause_buf[in_len] = ')';
-        in_len += 1;
-        const clause = try db.allocator.dupe(u8, in_clause_buf[0..in_len]);
-        try allocated_clauses.append(db.allocator, clause);
-        try conditions.append(db.allocator, clause);
-    }
-    if (filter.domain != null) {
-        try conditions.append(db.allocator, "name = ?");
-    }
-    if (filter.contract_address != null) {
-        try conditions.append(db.allocator, "contract_address = ?");
-    }
-    if (filter.contract_addresses != null and filter.contract_addresses.?.len > 0) {
-        var in_clause_buf: [512]u8 = undefined;
-        var in_len: usize = 0;
-        const prefix = "contract_address IN (";
-        @memcpy(in_clause_buf[in_len..][0..prefix.len], prefix);
-        in_len += prefix.len;
-        for (filter.contract_addresses.?, 0..) |_, i| {
-            if (i > 0) {
-                in_clause_buf[in_len] = ',';
-                in_len += 1;
-            }
-            in_clause_buf[in_len] = '?';
-            in_len += 1;
-        }
-        in_clause_buf[in_len] = ')';
-        in_len += 1;
-        const clause = try db.allocator.dupe(u8, in_clause_buf[0..in_len]);
-        try allocated_clauses.append(db.allocator, clause);
-        try conditions.append(db.allocator, clause);
-    }
-    if (filter.namehash != null) {
-        try conditions.append(db.allocator, "namehash = ?");
-    }
-    if (filter.block_number_gt != null) {
-        try conditions.append(db.allocator, "block_number > ?");
-    }
-    if (filter.block_number_gte != null) {
-        try conditions.append(db.allocator, "block_number >= ?");
-    }
-    if (filter.block_number_lt != null) {
-        try conditions.append(db.allocator, "block_number < ?");
-    }
-    if (filter.block_number_lte != null) {
-        try conditions.append(db.allocator, "block_number <= ?");
-    }
-    if (filter.timestamp_gt != null) {
-        try conditions.append(db.allocator, "timestamp > ?");
-    }
-    if (filter.timestamp_gte != null) {
-        try conditions.append(db.allocator, "timestamp >= ?");
-    }
-    if (filter.timestamp_lt != null) {
-        try conditions.append(db.allocator, "timestamp < ?");
-    }
-    if (filter.timestamp_lte != null) {
-        try conditions.append(db.allocator, "timestamp <= ?");
-    }
-    if (filter.data_json_owner != null) {
-        try conditions.append(db.allocator, "LOWER(json_extract(data, '$.owner')) = LOWER(?)");
-    }
-    if (filter.data_json_owners != null and filter.data_json_owners.?.len > 0) {
-        var in_clause_buf: [1024]u8 = undefined;
-        var in_len: usize = 0;
-        const prefix = "LOWER(json_extract(data, '$.owner')) IN (";
-        @memcpy(in_clause_buf[in_len..][0..prefix.len], prefix);
-        in_len += prefix.len;
-        for (filter.data_json_owners.?, 0..) |_, i| {
-            if (i > 0) {
-                in_clause_buf[in_len] = ',';
-                in_len += 1;
-            }
-            const placeholder = "LOWER(?)";
-            @memcpy(in_clause_buf[in_len..][0..placeholder.len], placeholder);
-            in_len += placeholder.len;
-        }
-        in_clause_buf[in_len] = ')';
-        in_len += 1;
-        const clause = try db.allocator.dupe(u8, in_clause_buf[0..in_len]);
-        try allocated_clauses.append(db.allocator, clause);
-        try conditions.append(db.allocator, clause);
-    }
-    // Registration events store expiry in two different shapes:
-    //   - V2 LabelRegistered: {"expiry": <absolute unix seconds>}
-    //   - V1 NameRegistered:  {"duration": <seconds>} → absolute = events.timestamp + duration
-    // Fall back to NULL for non-registration events (they'll be filtered out by `> ?` etc.).
-    const expiry_expr = "COALESCE(CAST(json_extract(data, '$.expiry') AS INTEGER), timestamp + CAST(json_extract(data, '$.duration') AS INTEGER))";
-    if (filter.expiry_gt != null) {
-        try conditions.append(db.allocator, expiry_expr ++ " > ?");
-    }
-    if (filter.expiry_gte != null) {
-        try conditions.append(db.allocator, expiry_expr ++ " >= ?");
-    }
-    if (filter.expiry_lt != null) {
-        try conditions.append(db.allocator, expiry_expr ++ " < ?");
-    }
-    if (filter.expiry_lte != null) {
-        try conditions.append(db.allocator, expiry_expr ++ " <= ?");
-    }
+    try appendEventFilterConditions(db, filter, &conditions, &allocated_clauses);
 
     // Add WHERE clause if there are conditions
     if (conditions.items.len > 0) {
@@ -583,7 +778,10 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     @memcpy(sql_buf[sql_len..][0..order_by_prefix.len], order_by_prefix);
     sql_len += order_by_prefix.len;
 
-    const sort_col = filter.sort_field.toSql();
+    // Shared sort-column expression (see sortColExpr) so the fetch order matches the
+    // cursor-position count exactly.
+    const sort_col = try sortColExpr(db, filter.sort_field);
+    defer db.allocator.free(sort_col);
     @memcpy(sql_buf[sql_len..][0..sort_col.len], sort_col);
     sql_len += sort_col.len;
 
@@ -591,12 +789,9 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     @memcpy(sql_buf[sql_len..][0..dir_str.len], dir_str);
     sql_len += dir_str.len;
 
-    // Add secondary sort for block_number to maintain stable ordering
-    if (filter.sort_field == .block_number) {
-        const secondary = if (filter.order_dir == .desc) ", log_index DESC" else ", log_index ASC";
-        @memcpy(sql_buf[sql_len..][0..secondary.len], secondary);
-        sql_len += secondary.len;
-    }
+    const tiebreak = orderTiebreakSql(filter);
+    @memcpy(sql_buf[sql_len..][0..tiebreak.len], tiebreak);
+    sql_len += tiebreak.len;
 
     const limit_prefix = " LIMIT ";
     @memcpy(sql_buf[sql_len..][0..limit_prefix.len], limit_prefix);
@@ -616,86 +811,9 @@ pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Ev
     var q = try Query.initCached(db, sql_buf[0..sql_len]);
     defer q.deinit();
 
-    // Bind parameters in the order they were added to conditions
-    if (filter.protocol) |ch| {
-        try q.bindTextStatic(ch.toString());
-    }
-    if (filter.event_type) |et| {
-        try q.bindText(et);
-    }
-    if (filter.event_type_not) |et| {
-        try q.bindText(et);
-    }
-    if (filter.event_types) |types| {
-        for (types) |t| {
-            try q.bindText(t);
-        }
-    }
-    if (filter.event_types_not) |types| {
-        for (types) |t| {
-            try q.bindText(t);
-        }
-    }
-    if (filter.domain) |d| {
-        try q.bindText(d);
-    }
-    if (filter.contract_address) |ca| {
-        try q.bindText(ca);
-    }
-    if (filter.contract_addresses) |addrs| {
-        for (addrs) |addr| {
-            try q.bindText(addr);
-        }
-    }
-    if (filter.namehash) |nh| {
-        try q.bindText(nh);
-    }
-    if (filter.block_number_gt) |bn| {
-        try q.bindInt64(bn);
-    }
-    if (filter.block_number_gte) |bn| {
-        try q.bindInt64(bn);
-    }
-    if (filter.block_number_lt) |bn| {
-        try q.bindInt64(bn);
-    }
-    if (filter.block_number_lte) |bn| {
-        try q.bindInt64(bn);
-    }
-    if (filter.timestamp_gt) |ts| {
-        try q.bindInt64(ts);
-    }
-    if (filter.timestamp_gte) |ts| {
-        try q.bindInt64(ts);
-    }
-    if (filter.timestamp_lt) |ts| {
-        try q.bindInt64(ts);
-    }
-    if (filter.timestamp_lte) |ts| {
-        try q.bindInt64(ts);
-    }
-    if (filter.data_json_owner) |owner| {
-        try q.bindText(owner);
-    }
-    if (filter.data_json_owners) |owners| {
-        for (owners) |owner| {
-            try q.bindText(owner);
-        }
-    }
-    if (filter.expiry_gt) |exp| {
-        try q.bindInt64(exp);
-    }
-    if (filter.expiry_gte) |exp| {
-        try q.bindInt64(exp);
-    }
-    if (filter.expiry_lt) |exp| {
-        try q.bindInt64(exp);
-    }
-    if (filter.expiry_lte) |exp| {
-        try q.bindInt64(exp);
-    }
+    try bindEventFilters(&q, filter);
 
-    var events: std.ArrayList(models.Event) = .{};
+    var events: std.ArrayList(models.Event) = .empty;
     errdefer {
         for (events.items) |*event| {
             event.deinit(db.allocator);
@@ -727,10 +845,124 @@ pub fn getEventsByDomain(db: *Database, domain_name: []const u8, limit: u32) ![]
     });
 }
 
+const EVENT_SELECT_COLS = "event_type, protocol, block_number, tx_hash, log_index, contract_address, name, namehash, data, timestamp";
+
+/// Namehashes per IN-list statement of the page loader. The hashes bind static from
+/// an arena (no tracked-copy cap), so the chunk is sized for statement length and
+/// the legacy SQLite 999-parameter floor, leaving room for the filter's own binds.
+const EVENT_PAGE_CHUNK: usize = 200;
+
+/// Batched mirror of `getEventsFiltered` over many namehashes: for EACH namehash the
+/// result holds exactly the rows `getEventsFiltered(db, filter with .namehash = that
+/// namehash)` would return — the same predicate tree (appendEventFilterConditions /
+/// bindEventFilters), the same `sortColExpr` + tiebreak order and the same
+/// `filter.limit` / `filter.skip` window — concatenated and ordered by namehash, then
+/// by the filter's ordering. `filter.namehash` is overridden per namehash exactly as
+/// that call would (the IN-list stands in for it), so callers pass null. One
+/// statement per chunk of up to EVENT_PAGE_CHUNK namehashes pages every partition at
+/// once via ROW_NUMBER() OVER (PARTITION BY namehash …), so an API page's per-domain
+/// event lists cost one round trip instead of one per domain. Namehashes with no
+/// matching rows contribute nothing. Rows and the returned slice are allocated with
+/// `allocator`; release via `freeEvents`.
+pub fn getEventsForNamehashesPage(db: *Database, namehashes: []const Hash, page_filter: EventFilterOptions, allocator: std.mem.Allocator) ![]models.Event {
+    var out: std.ArrayList(models.Event) = .empty;
+    errdefer freeEventList(allocator, &out);
+    if (namehashes.len == 0) return try out.toOwnedSlice(allocator);
+
+    var filter = page_filter;
+    filter.namehash = null;
+
+    const sort_col = try sortColExpr(db, filter.sort_field);
+    defer db.allocator.free(sort_col);
+    const dir_str: []const u8 = if (filter.order_dir == .desc) " DESC" else " ASC";
+    const tiebreak = orderTiebreakSql(filter);
+
+    var conditions: std.ArrayList([]const u8) = .empty;
+    defer conditions.deinit(db.allocator);
+    var allocated_clauses: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (allocated_clauses.items) |clause| db.allocator.free(clause);
+        allocated_clauses.deinit(db.allocator);
+    }
+    try appendEventFilterConditions(db, filter, &conditions, &allocated_clauses);
+
+    // ROW_NUMBER is 1-based: rows skip+1 ..= skip+limit are the page, exactly LIMIT/OFFSET.
+    const first_rn: u64 = filter.skip;
+    const last_rn: u64 = @as(u64, filter.skip) + filter.limit;
+
+    // A namehash listed twice (a v1/v2 twin page) must produce its window once:
+    // chunking a repeated input would emit it once per chunk it lands in.
+    var seen = std.AutoHashMap(Hash, void).init(db.allocator);
+    defer seen.deinit();
+    var unique: std.ArrayList(Hash) = .empty;
+    defer unique.deinit(db.allocator);
+    for (namehashes) |nh| {
+        const gop = try seen.getOrPut(nh);
+        if (!gop.found_existing) try unique.append(db.allocator, nh);
+    }
+
+    var start: usize = 0;
+    while (start < unique.items.len) {
+        const chunk = unique.items[start..@min(start + EVENT_PAGE_CHUNK, unique.items.len)];
+        start += chunk.len;
+
+        // Declared before the Query so its hex strings outlive step (LIFO defers).
+        var scratch = std.heap.ArenaAllocator.init(db.allocator);
+        defer scratch.deinit();
+        const scratch_alloc = scratch.allocator();
+
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.appendSlice(scratch_alloc, "SELECT " ++ EVENT_SELECT_COLS ++ " FROM (SELECT " ++ EVENT_SELECT_COLS ++
+            ", ROW_NUMBER() OVER (PARTITION BY namehash ORDER BY ");
+        try sql.appendSlice(scratch_alloc, sort_col);
+        try sql.appendSlice(scratch_alloc, dir_str);
+        try sql.appendSlice(scratch_alloc, tiebreak);
+        try sql.appendSlice(scratch_alloc, ") AS rn FROM events WHERE namehash IN (");
+        for (chunk, 0..) |_, i| {
+            if (i != 0) try sql.append(scratch_alloc, ',');
+            try sql.append(scratch_alloc, '?');
+        }
+        try sql.append(scratch_alloc, ')');
+        for (conditions.items) |cond| {
+            try sql.appendSlice(scratch_alloc, " AND ");
+            try sql.appendSlice(scratch_alloc, cond);
+        }
+        try sql.print(scratch_alloc, ") t WHERE rn > {d} AND rn <= {d} ORDER BY namehash, rn", .{ first_rn, last_rn });
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        for (chunk) |nh| {
+            const buf = try scratch_alloc.create([66]u8);
+            try q.bindTextStatic(nh.toHexBuf(buf));
+        }
+        try bindEventFilters(&q, filter);
+
+        while (try q.step()) {
+            var row = try parseEventRow(&q, allocator);
+            errdefer row.deinit(allocator);
+            try out.append(allocator, row);
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn freeEventList(allocator: std.mem.Allocator, list: *std.ArrayList(models.Event)) void {
+    for (list.items) |*event| event.deinit(allocator);
+    list.deinit(allocator);
+}
+
+/// Release a slice of events (rows + slice) allocated with `allocator`.
+pub fn freeEvents(allocator: std.mem.Allocator, events_slice: []models.Event) void {
+    for (events_slice) |*event| event.deinit(allocator);
+    allocator.free(events_slice);
+}
+
 /// Insert or update an approval
 /// Update token_id for all approvals when a token is regenerated.
 /// Scoped by registry to avoid cross-registry collisions.
 pub fn updateApprovalTokenId(db: *Database, old_token_id: []const u8, new_token_id: []const u8, registry: Address) !void {
+    try reorg_undo.captureWhere(db, "approvals", "U", "token_id = ? AND registry = ?", .{ old_token_id, registry });
     const sql = "UPDATE approvals SET token_id = ? WHERE token_id = ? AND registry = ?";
 
     var q = try Query.initCached(db, sql);
@@ -744,17 +976,15 @@ pub fn updateApprovalTokenId(db: *Database, old_token_id: []const u8, new_token_
 }
 
 pub fn insertApproval(db: *Database, protocol: models.Protocol, token_id: u256, owner: Address, approved: Address, block_number: u64, tx_hash: Hash, registry: Address) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO approvals
-        \\(protocol, token_id, owner, approved, block_number, tx_hash, timestamp, registry)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "approvals", &.{ "protocol", "token_id", "owner", "approved", "block_number", "tx_hash", "timestamp", "registry" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.initCached(db, sql);
     defer q.deinit();
 
     const token_id_str = try std.fmt.allocPrint(db.allocator, "{d}", .{token_id});
     defer db.allocator.free(token_id_str);
+    try reorg_undo.captureUpsert(db, "approvals", .{ protocol, token_id_str, registry });
 
     try q.bindTextStatic(protocol.toString());
     try q.bindText(token_id_str);
@@ -762,7 +992,7 @@ pub fn insertApproval(db: *Database, protocol: models.Protocol, token_id: u256, 
     try q.bindAddress(approved);
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
     try q.bindAddress(registry);
 
     try q.exec();
@@ -771,11 +1001,6 @@ pub fn insertApproval(db: *Database, protocol: models.Protocol, token_id: u256, 
 // ============================================================================
 // AGGREGATION OPERATIONS
 // ============================================================================
-
-/// Get total count of all events in the database
-pub fn getTotalEventCount(db: *Database) !usize {
-    return getEventCount(db, .{});
-}
 
 /// Get count of events with optional filters.
 /// Builds the same WHERE clause as getEventsFiltered but uses SELECT COUNT(*).
@@ -787,10 +1012,10 @@ pub fn getEventCount(db: *Database, filter: EventFilterOptions) !usize {
     @memcpy(sql_buf[sql_len..][0..base_sql.len], base_sql);
     sql_len += base_sql.len;
 
-    var conditions: std.ArrayList([]const u8) = .{};
+    var conditions: std.ArrayList([]const u8) = .empty;
     defer conditions.deinit(db.allocator);
 
-    var allocated_clauses: std.ArrayList([]const u8) = .{};
+    var allocated_clauses: std.ArrayList([]const u8) = .empty;
     defer {
         for (allocated_clauses.items) |clause| {
             db.allocator.free(clause);
@@ -798,147 +1023,7 @@ pub fn getEventCount(db: *Database, filter: EventFilterOptions) !usize {
         allocated_clauses.deinit(db.allocator);
     }
 
-    // Build WHERE conditions (same order as getEventsFiltered)
-    if (filter.protocol != null) {
-        try conditions.append(db.allocator, "protocol = ?");
-    }
-    if (filter.event_type != null) {
-        try conditions.append(db.allocator, "event_type = ?");
-    }
-    if (filter.event_type_not != null) {
-        try conditions.append(db.allocator, "event_type != ?");
-    }
-    if (filter.event_types != null and filter.event_types.?.len > 0) {
-        var in_clause_buf: [256]u8 = undefined;
-        var in_len: usize = 0;
-        const prefix = "event_type IN (";
-        @memcpy(in_clause_buf[in_len..][0..prefix.len], prefix);
-        in_len += prefix.len;
-        for (filter.event_types.?, 0..) |_, i| {
-            if (i > 0) {
-                in_clause_buf[in_len] = ',';
-                in_len += 1;
-            }
-            in_clause_buf[in_len] = '?';
-            in_len += 1;
-        }
-        in_clause_buf[in_len] = ')';
-        in_len += 1;
-        const clause = try db.allocator.dupe(u8, in_clause_buf[0..in_len]);
-        try allocated_clauses.append(db.allocator, clause);
-        try conditions.append(db.allocator, clause);
-    }
-    if (filter.event_types_not != null and filter.event_types_not.?.len > 0) {
-        var in_clause_buf: [256]u8 = undefined;
-        var in_len: usize = 0;
-        const prefix = "event_type NOT IN (";
-        @memcpy(in_clause_buf[in_len..][0..prefix.len], prefix);
-        in_len += prefix.len;
-        for (filter.event_types_not.?, 0..) |_, i| {
-            if (i > 0) {
-                in_clause_buf[in_len] = ',';
-                in_len += 1;
-            }
-            in_clause_buf[in_len] = '?';
-            in_len += 1;
-        }
-        in_clause_buf[in_len] = ')';
-        in_len += 1;
-        const clause = try db.allocator.dupe(u8, in_clause_buf[0..in_len]);
-        try allocated_clauses.append(db.allocator, clause);
-        try conditions.append(db.allocator, clause);
-    }
-    if (filter.domain != null) {
-        try conditions.append(db.allocator, "name = ?");
-    }
-    if (filter.contract_address != null) {
-        try conditions.append(db.allocator, "contract_address = ?");
-    }
-    if (filter.contract_addresses != null and filter.contract_addresses.?.len > 0) {
-        var in_clause_buf: [512]u8 = undefined;
-        var in_len: usize = 0;
-        const prefix = "contract_address IN (";
-        @memcpy(in_clause_buf[in_len..][0..prefix.len], prefix);
-        in_len += prefix.len;
-        for (filter.contract_addresses.?, 0..) |_, i| {
-            if (i > 0) {
-                in_clause_buf[in_len] = ',';
-                in_len += 1;
-            }
-            in_clause_buf[in_len] = '?';
-            in_len += 1;
-        }
-        in_clause_buf[in_len] = ')';
-        in_len += 1;
-        const clause = try db.allocator.dupe(u8, in_clause_buf[0..in_len]);
-        try allocated_clauses.append(db.allocator, clause);
-        try conditions.append(db.allocator, clause);
-    }
-    if (filter.namehash != null) {
-        try conditions.append(db.allocator, "namehash = ?");
-    }
-    if (filter.block_number_gt != null) {
-        try conditions.append(db.allocator, "block_number > ?");
-    }
-    if (filter.block_number_gte != null) {
-        try conditions.append(db.allocator, "block_number >= ?");
-    }
-    if (filter.block_number_lt != null) {
-        try conditions.append(db.allocator, "block_number < ?");
-    }
-    if (filter.block_number_lte != null) {
-        try conditions.append(db.allocator, "block_number <= ?");
-    }
-    if (filter.timestamp_gt != null) {
-        try conditions.append(db.allocator, "timestamp > ?");
-    }
-    if (filter.timestamp_gte != null) {
-        try conditions.append(db.allocator, "timestamp >= ?");
-    }
-    if (filter.timestamp_lt != null) {
-        try conditions.append(db.allocator, "timestamp < ?");
-    }
-    if (filter.timestamp_lte != null) {
-        try conditions.append(db.allocator, "timestamp <= ?");
-    }
-    if (filter.data_json_owner != null) {
-        try conditions.append(db.allocator, "LOWER(json_extract(data, '$.owner')) = LOWER(?)");
-    }
-    if (filter.data_json_owners != null and filter.data_json_owners.?.len > 0) {
-        var in_clause_buf: [1024]u8 = undefined;
-        var in_len: usize = 0;
-        const prefix = "LOWER(json_extract(data, '$.owner')) IN (";
-        @memcpy(in_clause_buf[in_len..][0..prefix.len], prefix);
-        in_len += prefix.len;
-        for (filter.data_json_owners.?, 0..) |_, i| {
-            if (i > 0) {
-                in_clause_buf[in_len] = ',';
-                in_len += 1;
-            }
-            const placeholder = "LOWER(?)";
-            @memcpy(in_clause_buf[in_len..][0..placeholder.len], placeholder);
-            in_len += placeholder.len;
-        }
-        in_clause_buf[in_len] = ')';
-        in_len += 1;
-        const clause = try db.allocator.dupe(u8, in_clause_buf[0..in_len]);
-        try allocated_clauses.append(db.allocator, clause);
-        try conditions.append(db.allocator, clause);
-    }
-    // Same two-shape handling as getEventsFiltered — see there for rationale.
-    const expiry_expr_count = "COALESCE(CAST(json_extract(data, '$.expiry') AS INTEGER), timestamp + CAST(json_extract(data, '$.duration') AS INTEGER))";
-    if (filter.expiry_gt != null) {
-        try conditions.append(db.allocator, expiry_expr_count ++ " > ?");
-    }
-    if (filter.expiry_gte != null) {
-        try conditions.append(db.allocator, expiry_expr_count ++ " >= ?");
-    }
-    if (filter.expiry_lt != null) {
-        try conditions.append(db.allocator, expiry_expr_count ++ " < ?");
-    }
-    if (filter.expiry_lte != null) {
-        try conditions.append(db.allocator, expiry_expr_count ++ " <= ?");
-    }
+    try appendEventFilterConditions(db, filter, &conditions, &allocated_clauses);
 
     if (conditions.items.len > 0) {
         const where_sql = " WHERE ";
@@ -959,84 +1044,7 @@ pub fn getEventCount(db: *Database, filter: EventFilterOptions) !usize {
     var q = try Query.initCached(db, sql_buf[0..sql_len]);
     defer q.deinit();
 
-    // Bind parameters (same order as getEventsFiltered)
-    if (filter.protocol) |ch| {
-        try q.bindTextStatic(ch.toString());
-    }
-    if (filter.event_type) |et| {
-        try q.bindText(et);
-    }
-    if (filter.event_type_not) |et| {
-        try q.bindText(et);
-    }
-    if (filter.event_types) |types| {
-        for (types) |t| {
-            try q.bindText(t);
-        }
-    }
-    if (filter.event_types_not) |types| {
-        for (types) |t| {
-            try q.bindText(t);
-        }
-    }
-    if (filter.domain) |d| {
-        try q.bindText(d);
-    }
-    if (filter.contract_address) |ca| {
-        try q.bindText(ca);
-    }
-    if (filter.contract_addresses) |addrs| {
-        for (addrs) |addr| {
-            try q.bindText(addr);
-        }
-    }
-    if (filter.namehash) |nh| {
-        try q.bindText(nh);
-    }
-    if (filter.block_number_gt) |bn| {
-        try q.bindInt64(bn);
-    }
-    if (filter.block_number_gte) |bn| {
-        try q.bindInt64(bn);
-    }
-    if (filter.block_number_lt) |bn| {
-        try q.bindInt64(bn);
-    }
-    if (filter.block_number_lte) |bn| {
-        try q.bindInt64(bn);
-    }
-    if (filter.timestamp_gt) |ts| {
-        try q.bindInt64(ts);
-    }
-    if (filter.timestamp_gte) |ts| {
-        try q.bindInt64(ts);
-    }
-    if (filter.timestamp_lt) |ts| {
-        try q.bindInt64(ts);
-    }
-    if (filter.timestamp_lte) |ts| {
-        try q.bindInt64(ts);
-    }
-    if (filter.data_json_owner) |owner| {
-        try q.bindText(owner);
-    }
-    if (filter.data_json_owners) |owners| {
-        for (owners) |owner| {
-            try q.bindText(owner);
-        }
-    }
-    if (filter.expiry_gt) |exp| {
-        try q.bindInt64(exp);
-    }
-    if (filter.expiry_gte) |exp| {
-        try q.bindInt64(exp);
-    }
-    if (filter.expiry_lt) |exp| {
-        try q.bindInt64(exp);
-    }
-    if (filter.expiry_lte) |exp| {
-        try q.bindInt64(exp);
-    }
+    try bindEventFilters(&q, filter);
 
     if (try q.step()) {
         return @intCast(q.getInt64(0));
@@ -1057,17 +1065,64 @@ pub fn countEventsByNamehash(db: *Database, namehash: Hash) !usize {
     return 0;
 }
 
-/// Count events for a specific domain (by name)
-pub fn countEventsByDomain(db: *Database, domain_name: []const u8) !usize {
-    var q = try Query.init(db, "SELECT COUNT(*) FROM events WHERE name = ?");
-    defer q.deinit();
+/// One `(namehash, event count)` row from `countEventsForNamehashes`.
+pub const NamehashCountRow = struct {
+    namehash: Hash,
+    count: u64,
+};
 
-    try q.bindText(domain_name);
+/// Batched mirror of `countEventsByNamehash`: one row per namehash that has at
+/// least one event — the same bare `namehash = ?` predicate (no protocol
+/// filter), grouped, ordered by namehash. Namehashes with no events are absent
+/// (the point read answers 0). Duplicates are collapsed before chunking; one
+/// statement per chunk of EVENT_PAGE_CHUNK namehashes with arena-static hex
+/// binds. The returned slice is allocated with `allocator` (rows hold no
+/// strings); release with `allocator.free`.
+pub fn countEventsForNamehashes(db: *Database, namehashes: []const Hash, allocator: std.mem.Allocator) ![]NamehashCountRow {
+    var out: std.ArrayList(NamehashCountRow) = .empty;
+    errdefer out.deinit(allocator);
+    if (namehashes.len == 0) return try out.toOwnedSlice(allocator);
 
-    if (try q.step()) {
-        return @intCast(q.getInt64(0));
+    var seen = std.AutoHashMap(Hash, void).init(db.allocator);
+    defer seen.deinit();
+    var unique: std.ArrayList(Hash) = .empty;
+    defer unique.deinit(db.allocator);
+    for (namehashes) |nh| {
+        const gop = try seen.getOrPut(nh);
+        if (!gop.found_existing) try unique.append(db.allocator, nh);
     }
-    return 0;
+
+    var start: usize = 0;
+    while (start < unique.items.len) {
+        const chunk = unique.items[start..@min(start + EVENT_PAGE_CHUNK, unique.items.len)];
+        start += chunk.len;
+
+        // Declared before the Query so its hex strings outlive step (LIFO defers).
+        var scratch = std.heap.ArenaAllocator.init(db.allocator);
+        defer scratch.deinit();
+        const scratch_alloc = scratch.allocator();
+
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.appendSlice(scratch_alloc, "SELECT namehash, COUNT(*) FROM events WHERE namehash IN (");
+        for (chunk, 0..) |_, i| {
+            if (i != 0) try sql.append(scratch_alloc, ',');
+            try sql.append(scratch_alloc, '?');
+        }
+        try sql.appendSlice(scratch_alloc, ") GROUP BY namehash ORDER BY namehash");
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        for (chunk) |nh| {
+            const buf = try scratch_alloc.create([66]u8);
+            try q.bindTextStatic(nh.toHexBuf(buf));
+        }
+        while (try q.step()) {
+            const nh = (try q.getHash(0)) orelse continue;
+            try out.append(allocator, .{ .namehash = nh, .count = @intCast(q.getInt64(1)) });
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
 }
 
 // ============================================================================
@@ -1561,5 +1616,84 @@ test "EventFilterOptions - all V2 event types" {
 
         try std.testing.expectEqual(@as(usize, 1), type_events.len);
         try std.testing.expectEqual(et, type_events[0].event_type);
+    }
+}
+
+test "connection pagination reproduces the full ordered result with no drops/dupes (all sort fields)" {
+    const allocator = std.testing.allocator;
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    // Insert events with deliberate TIES on every sort field: same block (diff log_index),
+    // same timestamp across blocks, repeated + NULL names — so a non-total order would drop
+    // or duplicate rows across pages.
+    const Row = struct { blk: u64, log: u32, ts: i64, name: ?[]const u8 };
+    const rows = [_]Row{
+        .{ .blk = 100, .log = 0, .ts = 1000, .name = "b.eth" },
+        .{ .blk = 100, .log = 1, .ts = 1000, .name = "a.eth" },
+        .{ .blk = 100, .log = 2, .ts = 1000, .name = null },
+        .{ .blk = 101, .log = 0, .ts = 1000, .name = "a.eth" },
+        .{ .blk = 101, .log = 1, .ts = 1001, .name = "c.eth" },
+        .{ .blk = 102, .log = 0, .ts = 1001, .name = null },
+        .{ .blk = 102, .log = 1, .ts = 1002, .name = "b.eth" },
+        .{ .blk = 103, .log = 0, .ts = 1002, .name = "a.eth" },
+    };
+    for (rows, 0..) |r, i| {
+        var tx = [_]u8{0} ** 32;
+        std.mem.writeInt(u32, tx[0..4], @intCast(i + 1), .big);
+        var ev = models.Event{
+            .event_type = .transfer,
+            .protocol = .v2,
+            .block_number = r.blk,
+            .tx_hash = Hash{ .bytes = tx },
+            .log_index = r.log,
+            .contract_address = Address.zero,
+            .name = if (r.name) |n| try allocator.dupe(u8, n) else null,
+            .namehash = null,
+            .data = try allocator.dupe(u8, "{}"),
+            .timestamp = r.ts,
+        };
+        defer ev.deinit(allocator);
+        try insertEvent(&database, ev);
+    }
+
+    const sorts = [_]EventSortField{ .block_number, .timestamp, .name };
+    const dirs = [_]OrderDir{ .desc, .asc };
+    for (sorts) |sf| {
+        for (dirs) |dir| {
+            // Ground truth: the full ordered result.
+            const full = try getEventsFiltered(&database, .{ .sort_field = sf, .order_dir = dir, .limit = 1000 });
+            defer {
+                for (full) |*e| e.deinit(database.allocator);
+                database.allocator.free(full);
+            }
+
+            // Paginate in pages of 3, walking the cursor exactly like the connection resolver.
+            var collected: std.ArrayList(struct { blk: u64, log: u32 }) = .empty;
+            defer collected.deinit(allocator);
+            var skip: u32 = 0;
+            while (true) {
+                const page = try getEventsFiltered(&database, .{ .sort_field = sf, .order_dir = dir, .limit = 3, .skip = skip });
+                defer {
+                    for (page) |*e| e.deinit(database.allocator);
+                    database.allocator.free(page);
+                }
+                if (page.len == 0) break;
+                for (page) |e| try collected.append(allocator, .{ .blk = e.block_number, .log = e.log_index });
+                const last = page[page.len - 1];
+                const tx_hex = try last.tx_hash.toHex(allocator);
+                defer allocator.free(tx_hex);
+                const before = try countEventsBeforeCursor(&database, tx_hex, last.log_index, dir, .{ .sort_field = sf, .order_dir = dir });
+                skip = before + 1;
+                if (page.len < 3) break;
+            }
+
+            // Paginated sequence must equal the full sequence exactly (order + membership).
+            try std.testing.expectEqual(full.len, collected.items.len);
+            for (full, collected.items) |f, c| {
+                try std.testing.expectEqual(f.block_number, c.blk);
+                try std.testing.expectEqual(f.log_index, c.log);
+            }
+        }
     }
 }

@@ -1,0 +1,1 @@
+{"data":{"registrations":[{"name":"alice.eth","domain":{"resolver":{"texts":["avatar"]}}},{"name":"bob.eth","domain":{"resolver":null}},{"name":"expired.eth","domain":{"resolver":{"texts":[]}}}]}}

@@ -37,6 +37,7 @@ pub const resolveFusesSets = event.resolveFusesSets;
 pub const resolveExpiryUpdateds = event.resolveExpiryUpdateds;
 pub const resolveResolverUpdateds = event.resolveResolverUpdateds;
 pub const resolveLabelRegistereds = event.resolveLabelRegistereds;
+pub const resolveEACRolesChangeds = event.resolveEACRolesChangeds;
 pub const resolveReverseClaimeds = event.resolveReverseClaimeds;
 pub const resolveRegistryTransfers = event.resolveRegistryTransfers;
 
@@ -57,3 +58,5 @@ pub const resolveMetadata = admin.resolveMetadata;
 pub const resolveApprovals = admin.resolveApprovals;
 pub const resolveWrappedDomains = admin.resolveWrappedDomains;
 pub const resolveMeta = admin.resolveMeta;
+pub const resolveFinality = admin.resolveFinality;
+pub const resolveCoverage = admin.resolveCoverage;

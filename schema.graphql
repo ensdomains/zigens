@@ -2,8 +2,17 @@
 # This schema defines the GraphQL API for querying ENS V2 data
 
 type Query {
-  """Get a single domain by name or namehash"""
-  domain(id: String!): Domain
+  """
+  Get a single domain by name or namehash. Exact get: returns the row even if
+  non-normalized (unlike domains/where.name, which default-hide non-normalized
+  names); unreachable rows are still hidden (returns null). `atBlock` (ensv2
+  extension) reconstructs the domain's state as of that block from the event
+  log — V2 names only; scalar fields, `resolver { addr text(key:) contentHash }`
+  and `resolvedAddress` are historical; list record fields return empty at-block;
+  nested domain entities (parent/subdomains) reflect current state; an
+  out-of-range block or a name without V2 event history resolves to null.
+  """
+  domain(id: String!, atBlock: Int): Domain
 
   """Get multiple domains with pagination and filtering (legacy offset-based)"""
   domains(first: Int = 100, skip: Int = 0, where: DomainFilter, orderBy: Domain_orderBy, orderDirection: OrderDirection): [Domain!]!
@@ -62,17 +71,20 @@ type Query {
   """Subgraph parity: top-level `LabelRegistered` events. Inspect via `asLabelRegistered { ... }`."""
   labelRegistereds(first: Int = 100, skip: Int = 0, where: EventFilter, orderBy: Event_orderBy, orderDirection: OrderDirection): [Event!]!
 
+  """Top-level `EACRolesChanged` events (role grant/revoke history). Filter with `where: { resource, contractAddress, blockNumber_* }`; inspect via `asEACRolesChanged { ... }`. For CURRENT holders use `roles` / `roleConnection` instead."""
+  eacRolesChangeds(first: Int = 100, skip: Int = 0, where: EventFilter, orderBy: Event_orderBy, orderDirection: OrderDirection): [Event!]!
+
   """Subgraph parity: top-level `ReverseClaimed` events. Inspect via `asReverseClaimed { ... }`."""
   reverseClaimeds(first: Int = 100, skip: Int = 0, where: EventFilter, orderBy: Event_orderBy, orderDirection: OrderDirection): [Event!]!
 
   """Subgraph parity: top-level `RegistryTransfer` events. Inspect via `asRegistryTransfer { ... }`."""
   registryTransfers(first: Int = 100, skip: Int = 0, where: EventFilter, orderBy: Event_orderBy, orderDirection: OrderDirection): [Event!]!
 
-  """Get EAC role assignments"""
-  roles(resource: String, account: String): [EACRoleAssignment!]!
+  """Get EAC role assignments. Filters combine; `contract` scopes shared resource values (ROOT, 0x0, exists on every EAC-enabled contract) to one registry/resolver. `protocol` selects v1/v2 (default v2). `resource` matches the value exactly as emitted (registry: `canonical_id | eacVersionId`; any hex spelling accepted). Without `resource`, rows superseded by a higher EAC version of the same label on the same contract (a later registration of that label) are omitted; name a resource explicitly to see a superseded generation. A label that was unregistered or expired without being re-registered keeps its last generation listed — read the label's own state for that."""
+  roles(resource: String, account: String, contract: String, protocol: String): [EACRoleAssignment!]!
 
-  """Get EAC role assignments with cursor-based pagination (recommended)"""
-  roleConnection(first: Int, after: String, last: Int, before: String, resource: String, account: String): EACRoleAssignmentConnection!
+  """Get EAC role assignments with cursor-based pagination (recommended). Same filter and superseded-version semantics as `roles`."""
+  roleConnection(first: Int, after: String, last: Int, before: String, resource: String, account: String, contract: String, protocol: String): EACRoleAssignmentConnection!
 
   """
   List resolver contracts owned by a specific account (admin view).
@@ -109,6 +121,61 @@ type Query {
 
   """Indexer health / sync state (subgraph parity)."""
   _meta: _Meta_!
+
+  """
+  Finality signalling (ensv2 extension, NOT subgraph). Per-chain head / safe /
+  finalized block positions so a consumer can judge how settled an answer is.
+  `safe`/`finalized` are null until FINALITY_ENABLED and the indexer has fetched them.
+  """
+  _finality: Finality!
+
+  """
+  What this deployment indexes (ensv2 extension): chain id, per-protocol indexed
+  head + last-sync time, and a staleness flag. `stale` is false when finality data
+  is absent (default deployments); `_finality.isStale` is the conservative variant.
+  """
+  _coverage: Coverage!
+}
+
+"""Deployment coverage declaration (ensv2 extension)."""
+type Coverage {
+  """EVM chain id this deployment indexes."""
+  chainId: Int!
+  """True only when finality data shows the indexed head behind the chain's safe point."""
+  stale: Boolean!
+  """Per-protocol indexed positions."""
+  protocols: [ProtocolCoverage!]!
+}
+
+"""One protocol's indexed position within `Coverage`."""
+type ProtocolCoverage {
+  """Protocol name: "v1" or "v2"."""
+  protocol: String!
+  """Highest block synced for this protocol (0 = never synced)."""
+  indexedHead: Int!
+  """When the head last advanced (unix seconds), or null when never synced."""
+  lastSyncedAt: Int
+}
+
+"""Finality positions + a staleness signal (ensv2 extension)."""
+type Finality {
+  """Indexed head (highest block synced); hash is null across the two protocols."""
+  head: FinalityBlock!
+  """Chain `safe` block position, or null when not fetched."""
+  safe: FinalityBlock
+  """Chain `finalized` block position, or null when not fetched."""
+  finalized: FinalityBlock
+  """True when the indexed head has not reached the chain's safe point (or no safe data)."""
+  isStale: Boolean!
+}
+
+"""A block position within `Finality`."""
+type FinalityBlock {
+  number: Int!
+  """Block hash (hex), or null."""
+  hash: String
+  """When this position was fetched (unix seconds), or null."""
+  updatedAt: Int
 }
 
 """Indexer health / sync state (subgraph parity)."""
@@ -267,7 +334,7 @@ type EACRoleAssignmentConnection {
 
 """An ENS domain name"""
 type Domain {
-  """Domain identifier (name or namehash)"""
+  """Domain namehash (ERC-137 node hash), matching the ENS subgraph. The singular `domain(id:)` lookup still accepts a name or a namehash."""
   id: String!
 
   """Full domain name (e.g., 'vitalik.eth')"""
@@ -362,8 +429,11 @@ type Domain {
   """Whether the name passes ENSIP-15 normalization (computed at query time)"""
   isNormalized: Boolean!
 
+  """Finality tier of this domain's CURRENT state — how settled it is against chain finality. FINALIZED = the last change is at/below the finalized head (will not reorg); SAFE = at/below the safe head; HEAD = in the unsafe zone (may still reorg). Null when finality tracking is disabled (FINALITY_ENABLED off), so a client can distinguish 'unknown' from 'unsafe'."""
+  finality: DomainFinality
+
   """Events associated with this domain"""
-  events(first: Int = 100, where: EventFilter): [Event!]!
+  events(first: Int = 100, where: EventFilter, orderBy: Event_orderBy, orderDirection: OrderDirection): [Event!]!
 
   """Count of direct subdomains (one level only). Filtered by `isReachable = 1` AND excluding fully-burned names (owner=0 AND resolver=0, mirroring subgraph's GC deletion criteria). DEPRECATED: prefer `subdomainCount` (subgraph-compatible name)."""
   subdomainsCount: Int!
@@ -402,6 +472,9 @@ type Account {
 
   """Reverse-resolved primary name for this address (V1 ReverseRegistrar + NameChanged path). Null if not claimed."""
   primaryName: String
+
+  """ENSIP-3 forward verification of `primaryName` (Task 05). Additive — does NOT alter `primaryName`. VERIFIED = the name's forward resolution (via the Universal Resolver when configured) points back to this address; MISMATCH = it resolves to a different address; INVALID_NAME = the claimed name is not ENSIP-15 normalized; NOT_FOUND = no resolver/record; UNVERIFIED = the on-chain read reverted / errored / not checked. Null unless PRIMARY_VERIFY_ENABLED, and computed only for single-entity lookups (never per-row in a list)."""
+  primaryNameVerification: PrimaryNameVerification
 
   """V1 NameWrapper wrapped-domain records owned by this account."""
   wrappedDomains(first: Int = 100, skip: Int = 0): [WrappedDomain!]!
@@ -506,6 +579,18 @@ type InterfaceRecord {
   implementer: String!
 }
 
+"""A name bound to a record on a record-model resolver (contracts-v2 IRecordResolver). Record sharing replaces aliasing: every name linked to the same record serves the same values."""
+type LinkedName {
+  """The bound name (empty for the resolver-wide default record bound to node 0x0)"""
+  name: String!
+
+  """The bound node (namehash)"""
+  namehash: String!
+
+  """The record id (decimal string; a full uint256 — SharedResolver keys records by the name's node itself)"""
+  recordId: String!
+}
+
 """A resolver alias mapping (from OwnedResolver)"""
 type Alias {
   """Source DNS name"""
@@ -571,6 +656,21 @@ type Resolver {
 
   """Current version counter (from VersionChanged events)"""
   version: Int
+
+  """Record-model resolvers (contracts-v2 IRecordResolver) key values by record, not node: the record this name resolves through — its own record, else the resolver's default record (node 0x0). Decimal string; null on legacy node-keyed resolvers or when the name is unlinked and there is no default."""
+  recordId: String
+
+  """True when the resolver announced itself as record-model (ResolverCreated)."""
+  recordModel: Boolean!
+
+  """Every name bound to the same record as this name (record sharing replaces aliasing). Empty on legacy resolvers."""
+  linkedNames: [LinkedName!]
+
+  """ENSIP-24 data(key) record as 0x-hex bytes (null if unset). From DataUpdated (record resolvers) and DataChanged (legacy)."""
+  data(key: String!): String
+
+  """All data(key) keys set on this resolver/name — a scalar list of keys, like `texts`; read values with `data(key:)`."""
+  dataKeys: [String!]
 }
 
 """A domain registration record"""
@@ -612,7 +712,7 @@ type Registration {
   referrer: String
 }
 
-"""Typed payload for `Transfer` events. Spans V1 BaseRegistrar ERC721 (`tokenId` numeric), V1 NameWrapper ERC1155 (`id` is the wrapped namehash, with `operator`/`value`), and V2 registry transfers."""
+"""Typed payload for `Transfer` events. Spans V1 BaseRegistrar ERC721 (`tokenId` numeric), V1 NameWrapper ERC1155 (`id` is the wrapped namehash, with `operator`/`value`), V2 registry transfers, ERC1155 `TransferBatch` summaries (`count`), and V1 Registry `NewOwner` rows (`parentNode`/`labelhash`/`subdomain`/`owner`)."""
 type TransferData {
   """Sender address."""
   from: String
@@ -624,6 +724,16 @@ type TransferData {
   value: String
   """ERC1155 operator address (V1 NameWrapper / V2 only)."""
   operator: String
+  """ERC1155 TransferBatch: number of tokens in the batch (per-token id/value are not stored)."""
+  count: Int
+  """V1 Registry NewOwner rows: parent node namehash."""
+  parentNode: String
+  """V1 Registry NewOwner rows: labelhash of the subdomain label."""
+  labelhash: String
+  """V1 Registry NewOwner rows: namehash of the created/reassigned subdomain node."""
+  subdomain: String
+  """V1 Registry NewOwner rows: new owner address."""
+  owner: String
 }
 
 """Typed payload for `NameRegistered` events (V1 BaseRegistrar + ETHController variants)."""
@@ -720,6 +830,18 @@ type AddressChangedData {
   coinType: Int
   """Address value (hex for ETH, bytes hex for other chains)."""
   address: String
+}
+
+"""Typed payload for `EACRolesChanged` events (EnhancedAccessControl on registries and resolvers)."""
+type EACRolesChangedData {
+  """EAC resource exactly as emitted (32-byte hex). Registries: `canonical_id | eacVersionId`; resolvers: keccak256(node, part) or ROOT (0x0)."""
+  resource: String!
+  """Account whose roles changed."""
+  account: String!
+  """Role bitmap before the change (32-byte hex)."""
+  oldRoleBitmap: String!
+  """Role bitmap after the change (32-byte hex); all zeros = every role revoked."""
+  newRoleBitmap: String!
 }
 
 """Typed payload for `ExpiryUpdated` events (V1 NameWrapper ExpiryExtended + V2 registry expiry updates)."""
@@ -827,11 +949,22 @@ type Event {
   asResolverUpdated: ResolverUpdatedData
   """Typed view of `data` when `type` is `LabelRegistered`. Null otherwise."""
   asLabelRegistered: LabelRegisteredData
+  """Typed view of `data` when `type` is `EACRolesChanged`. Null otherwise."""
+  asEACRolesChanged: EACRolesChangedData
 }
 
 """Filter criteria for querying domains"""
 input DomainFilter {
-  """Exact name match"""
+  """Exact match on the current versioned ERC-1155 token id (ensv2 extension) — the labelhash with its low 32 bits replaced by the token's version counter, exactly what NFT platforms send. Accepts 0x-hex or decimal. Hashing is one-way, so this is the tokenId-to-name reverse path; combine with `registry` to scope to one registry contract."""
+  tokenId: String
+
+  """Exact match on the version-masked canonical id (ensv2 extension; low 32 bits zeroed) — stable across token version bumps, for callers holding a possibly-stale token id. Accepts 0x-hex or decimal."""
+  canonicalId: String
+
+  """Registry contract address filter (ensv2 extension) — the V2 registry that owns this name's label. Combine with tokenId/canonicalId to scope a marketplace tokenId lookup to one registry."""
+  registry: String
+
+  """Exact name match (list filter). Unlike domain(id:), the domains/domainConnection list default-hides non-normalized, unreachable, and synthetic-root rows unless includeUnnormalized / includeUnreachable / isNormalized override."""
   name: String
 
   """Filter by name in list (up to 1000 names)"""
@@ -960,15 +1093,34 @@ input DomainFilter {
   ancestors). Default false — set true for audit / debug queries.
   """
   includeUnreachable: Boolean
-}
 
-"""Nested-relation filter on Account (subgraph parity). Used inside `DomainFilter.owner_`."""
-input AccountFilter {
-  """Match account by exact id (address)."""
-  id: String
+  """
+  Filter by ENSIP-15 normalization status. When omitted, only normalized
+  names are returned (non-normalized names like `Nick.eth` are hidden by
+  default); set explicitly to `true`/`false` to filter, or pass
+  `includeUnnormalized: true` to include both.
+  """
+  isNormalized: Boolean
 
-  """Match account by id in list."""
-  id_in: [String!]
+  """
+  Include non-normalized domains (e.g. `Nick.eth`, `VITALIK`) that are
+  hidden by default. Default false. Ignored when `isNormalized` is set.
+  """
+  includeUnnormalized: Boolean
+
+  """
+  Boolean AND: every sub-filter must match. Each element is a full DomainFilter,
+  nested recursively (subgraph parity). Combined with the other fields by AND.
+  """
+  and: [DomainFilter!]
+
+  """
+  Boolean OR: any sub-filter matches. Each element is a full DomainFilter, nested
+  recursively (subgraph parity). The OR group is AND-combined with sibling fields,
+  so `{ owner: X, or: [{...A}, {...B}] }` means `owner=X AND (A OR B)`. Default
+  visibility (reachable/normalized/non-root) is applied once to the whole result.
+  """
+  or: [DomainFilter!]
 }
 
 """Filter criteria for querying registrations"""
@@ -993,6 +1145,12 @@ input RegistrationFilter {
 
   """Filter by protocol (v1 or v2)"""
   protocol: String
+
+  """Boolean AND: every sub-filter must match. Each element is a full RegistrationFilter, nested recursively (subgraph parity)."""
+  and: [RegistrationFilter!]
+
+  """Boolean OR: any sub-filter matches. Each element is a full RegistrationFilter, nested recursively; the OR group is AND-combined with sibling fields."""
+  or: [RegistrationFilter!]
 }
 
 """Filter criteria for querying events"""
@@ -1012,8 +1170,19 @@ input EventFilter {
   """Filter by domain name"""
   domain: String
 
+  """Exact match on the EAC resource carried in an `EACRolesChanged` payload. Compared exactly as emitted, version bits included; any hex spelling (zero-trimmed, padded, upper-case) is accepted. Combine with `contractAddress` since ROOT (0x0) exists on every EAC-enabled contract."""
+  resource: String
+
   """Filter by contract address"""
   contractAddress: String
+
+  """
+  Address involvement (ensv2 extension): matches events where the address is the
+  owner, sender (`from`), or recipient (`to`). Per-address history is
+  `events(where:{involved:"0x…"}, orderBy: blockNumber, orderDirection: asc)`;
+  per-name history is `events(where:{namehash:"0x…"})`.
+  """
+  involved: String
 
   """Filter by namehash"""
   namehash: String
@@ -1044,6 +1213,12 @@ input EventFilter {
 
   """Filter by protocol (v1 or v2)"""
   protocol: String
+
+  """Boolean AND: every sub-filter must match. Each element is a full EventFilter, nested recursively (subgraph parity)."""
+  and: [EventFilter!]
+
+  """Boolean OR: any sub-filter matches. Each element is a full EventFilter, nested recursively; the OR group is AND-combined with sibling fields."""
+  or: [EventFilter!]
 }
 
 """EAC (Enhanced Access Control) role assignment"""
@@ -1056,6 +1231,9 @@ type EACRoleAssignment {
 
   """Account that has the role"""
   account: String!
+
+  """Contract that emitted the role event. Disambiguates shared resource values: ROOT (0x0) exists on every EAC-enabled contract, so a role row is only meaningful together with its contract."""
+  contractAddress: String!
 
   """Role bitmap (hex string). Preserved verbatim for clients that decode it directly."""
   roleBitmap: String!
@@ -1081,7 +1259,6 @@ type EACRoleAssignment {
   name: String
 }
 
-"""Resolver information"""
 """Detailed resolver information with statistics"""
 type ResolverDetail {
   """Resolver contract address"""
@@ -1110,6 +1287,33 @@ type ResolverDetail {
 
   """Events emitted by this resolver contract"""
   events(first: Int = 100): [Event!]!
+
+  """Resource-name associations announced by this resolver (EAC resource naming; emitted on the first role grant per resource)"""
+  namedResources: [NamedResourceEntry!]!
+}
+
+"""An EAC resource id and the name/record it guards on a resolver. Legacy resolvers announce it per name (Named*Resource); record-model resolvers announce it per setter ARGUMENT (ResourceArgument): `name` is then empty, `recordKey` carries the argument (text/data key, or 0x-hex for interface ids), `coinType` its integer value (coin type or ABI content type), and `recordKind` is derived from the setter roles granted on the resource — one entry per kind, or `argument` before any grant is indexed."""
+type NamedResourceEntry {
+  """Protocol the association was indexed under"""
+  protocol: String!
+
+  """EAC resource id (32-byte hex)"""
+  resource: String!
+
+  """Which record kind the resource guards: name | text | data | addr"""
+  recordKind: String!
+
+  """Text/data record key ('' for name/addr kinds)"""
+  recordKey: String!
+
+  """Coin type for addr-kind resources as a decimal string (ENSIP-11-safe; "-1" when not applicable)"""
+  coinType: String!
+
+  """The dotted name the resource is associated with"""
+  name: String!
+
+  """Block the association was announced at"""
+  blockNumber: Int!
 }
 
 """Registry information"""
@@ -1140,13 +1344,13 @@ type RegistryInfo {
   """
   owner: Account
 
-  """Names whose subregistry is this contract (the labels under this registry, legacy offset-based)."""
+  """Names whose `registry` is this contract — i.e. the labels minted in and managed by this registry (the reverse of a name's parent-registry lookup). Legacy offset-based pagination; prefer `labelConnection`."""
   labels(first: Int, skip: Int, where: DomainFilter, orderBy: Domain_orderBy, orderDirection: OrderDirection): [Domain!]!
 
-  """Cursor-based labels for this registry (recommended)."""
+  """Cursor-based version of `labels`: names whose `registry` is this contract (recommended)."""
   labelConnection(first: Int, after: String, last: Int, before: String, where: DomainFilter, orderBy: Domain_orderBy, orderDirection: OrderDirection): DomainConnection!
 
-  """Total label count for this registry."""
+  """Total count of names whose `registry` is this contract."""
   labelCount: Int!
 
   """Names whose CURRENT subregistry pointer is this contract — i.e. the names that use this registry as their subname registry (the inverse of `Domain.subregistry`; the registry-UI "Referenced by" relation). Legacy offset-based pagination; prefer `referencedByConnection`."""
@@ -1167,13 +1371,13 @@ type RegistryInfo {
   """Total event count emitted by this registry contract."""
   eventCount: Int!
 
-  """EAC role assignments on this registry (legacy offset-based)."""
+  """EAC role assignments on this registry (legacy offset-based). Rows superseded by a higher EAC version of the same label (a later registration of that label) are omitted; an unregistered or expired label that was not re-registered keeps its last generation listed."""
   roles(first: Int, skip: Int, account: String): [EACRoleAssignment!]!
 
-  """Cursor-based EAC role assignments on this registry (recommended)."""
+  """Cursor-based EAC role assignments on this registry (recommended). Same superseded-version semantics as `roles`."""
   roleConnection(first: Int, after: String, last: Int, before: String, account: String): EACRoleAssignmentConnection!
 
-  """Total role-assignment count on this registry."""
+  """Total role-assignment count on this registry (superseded versions excluded)."""
   roleCount: Int!
 }
 
@@ -1235,6 +1439,30 @@ type ResolverApproval {
 enum OrderDirection {
   asc
   desc
+}
+
+"""ENSIP-3 forward-verification verdict for an account's `primaryName` (Task 05)."""
+"""How settled a domain's current state is against chain finality (finality-tiered reads)."""
+enum DomainFinality {
+  """The last change is at/below the finalized head; it will not reorg."""
+  FINALIZED
+  """The last change is at/below the safe head but above finalized."""
+  SAFE
+  """The last change is in the unsafe zone above the safe head; it may still reorg."""
+  HEAD
+}
+
+enum PrimaryNameVerification {
+  """The name's resolver.addr(node) resolves back to this address."""
+  VERIFIED
+  """The name resolves forward to a DIFFERENT address."""
+  MISMATCH
+  """The claimed name is not ENSIP-15 normalized (e.g. confusable/spoofed); never verified."""
+  INVALID_NAME
+  """No forward evidence exists: no resolver, or an empty/zero address record."""
+  NOT_FOUND
+  """The on-chain read could not be completed (revert or RPC error)."""
+  UNVERIFIED
 }
 
 """Fields to order Domain results by"""

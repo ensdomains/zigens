@@ -1,10 +1,114 @@
 const std = @import("std");
+const zsys = @import("../utils/system.zig");
 const db_module = @import("database.zig");
 const Database = db_module.Database;
 const Query = db_module.Query;
 const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
+const reorg_undo = @import("reorg_undo.zig");
+const heal_targets = @import("heal_targets.zig");
+
+// ── Reorg rollback delete-lists ────────────────────────────────────────────────
+// Single source of truth for the tables whose post-N rows `rollbackToBlock` deletes.
+// The comptime coverage guard below cross-checks them against the reorg trigger
+// arrays so a new rollback delete can't silently bypass undo capture.
+
+/// Deleted by `(protocol, block_number > N)` — insert-only logs + derived tables alike.
+pub const reorg_rollback_by_block_number = [_][]const u8{
+    "events",
+    "block_hashes",
+    "orphaned_registrations",
+    "resolver_addresses",
+    "resolver_contenthashes",
+    "resolver_texts",
+    "resolver_aliases",
+    "resolver_pubkeys",
+    "resolver_abis",
+    "resolver_names",
+    "resolver_interfaces",
+    "resolver_versions",
+    "resolver_dns_records",
+    "resolver_dns_zonehashes",
+    "resolver_authorisations",
+    "reverse_records",
+    "approvals",
+    "eac_roles",
+    "resolver_metadata",
+    "resolver_approvals",
+    "resolver_named_resources",
+    "registrations",
+    "name_history",
+    "resolver_links",
+    "resolver_datas",
+    "resolver_kinds",
+};
+
+/// Deleted by `(protocol, created_block > N)`.
+pub const reorg_rollback_by_created_block = [_][]const u8{ "names", "registries" };
+
+/// Deleted by `(protocol, <col> > N)` for a non-`block_number` block column.
+pub const reorg_rollback_by_other_col = [_]struct { name: []const u8, col: []const u8 }{
+    .{ .name = "registry_entries", .col = "updated_block" },
+    .{ .name = "resolvers", .col = "set_block" },
+};
+
+/// Tables deleted on rollback that need NO undo capture: they are insert-only (rows
+/// are only inserted then post-N-deleted — no in-place UPDATE / clear-DELETE of a
+/// pre-N row to reverse). Everything else deleted on rollback MUST be captured by a
+/// reorg trigger (`reorg_undo.PROTECTED_TABLES` ∪ `REORG_ACTIVE_TABLES`).
+const reorg_capture_waived = [_][]const u8{
+    // events: rows are append-only EXCEPT the denormalized name/namehash columns, which
+    // updatePlaceholderEventsByName (names.zig) patches in place once a placeholder name
+    // resolves. Deliberately NOT reorg-captured: the canonical `data` JSON is untouched,
+    // the patch is idempotent and self-heals on re-sync (the resolving event re-fires),
+    // and its `WHERE name=?` (no protocol filter) would make undo capture cross-protocol-
+    // ambiguous. Residual (accepted): if the resolving event is itself reorged out, a
+    // pre-N event row keeps the resolved value in those two derived columns. See
+    // [[events-placeholder-patch-reorg-waiver]].
+    "events",
+    "block_hashes", // append-only block-hash chain (insert + retention-prune only)
+    "name_history", // append-only change log (INSERT only; no in-place mutation)
+    "resolvers", // resolver entity table: insert-only (set_block, INSERT OR IGNORE keeps first); attribute records live in the PROTECTED resolver_* tables
+};
+
+fn reorgCovered(comptime name: []const u8) bool {
+    for (reorg_undo.PROTECTED_TABLES ++ reorg_undo.REORG_ACTIVE_TABLES ++ reorg_capture_waived) |t| {
+        if (std.mem.eql(u8, t, name)) return true;
+    }
+    return false;
+}
+
+fn inRollbackDeleteList(comptime name: []const u8) bool {
+    for (reorg_rollback_by_block_number ++ reorg_rollback_by_created_block) |t| {
+        if (std.mem.eql(u8, t, name)) return true;
+    }
+    for (reorg_rollback_by_other_col) |t| {
+        if (std.mem.eql(u8, t.name, name)) return true;
+    }
+    return false;
+}
+
+comptime {
+    @setEvalBranchQuota(100000);
+    // Guard 1 — every table whose post-N rows `rollbackToBlock` deletes must be either
+    // reorg-captured or explicitly waived as insert-only. Catches "added a rollback
+    // delete but forgot the trigger array" (the 2026-06-02 regression class).
+    for (reorg_rollback_by_block_number ++ reorg_rollback_by_created_block) |t| {
+        if (!reorgCovered(t)) @compileError("reorg coverage gap: '" ++ t ++ "' is deleted on rollback but neither reorg-captured nor waived as insert-only (see sync.zig reorg_capture_waived)");
+    }
+    for (reorg_rollback_by_other_col) |t| {
+        if (!reorgCovered(t.name)) @compileError("reorg coverage gap: '" ++ t.name ++ "' is deleted on rollback but neither reorg-captured nor waived");
+    }
+    // Guard 2 (symmetric) — every PROTECTED table (whose in-place updates are captured)
+    // must ALSO have its post-N inserts deleted by a rollback list; otherwise a reorg
+    // reverses updates but leaves genuinely-new rows behind. REORG_ACTIVE tables are
+    // exempt: replayUndo's op-'I' handler removes their post-N inserts (no protocol
+    // column ⇒ no created-after delete).
+    for (reorg_undo.PROTECTED_TABLES) |t| {
+        if (!inRollbackDeleteList(t)) @compileError("reorg coverage gap: PROTECTED table '" ++ t ++ "' has its updates captured but its post-N inserts are never deleted on rollback (add it to a sync.zig reorg_rollback_* list)");
+    }
+}
 
 /// Safely convert u64 expiry to i64 for SQLite storage.
 /// Values exceeding i64::max are mapped to 0 (never expires).
@@ -31,28 +135,41 @@ pub fn getSyncState(db: *Database, protocol: models.Protocol) !?u64 {
     return null;
 }
 
+pub const ProtocolSync = struct { block: u64, at: i64 };
+
+/// Like getSyncState but also returns when the head was last advanced —
+/// the freshness signal for the coverage surface.
+pub fn getSyncStateFull(db: *Database, protocol: models.Protocol) !?ProtocolSync {
+    const sql = "SELECT last_synced_block, last_synced_at FROM sync_state WHERE protocol = ?";
+
+    var q = try Query.init(db, sql);
+    defer q.deinit();
+
+    try q.bindTextStatic(protocol.toString());
+
+    if (try q.step()) {
+        return .{ .block = @intCast(q.getInt64(0)), .at = q.getInt64(1) };
+    }
+    return null;
+}
+
 pub fn setSyncState(db: *Database, protocol: models.Protocol, block: u64) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO sync_state (protocol, last_synced_block, last_synced_at)
-        \\VALUES (?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "sync_state", &.{ "protocol", "last_synced_block", "last_synced_at" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();
 
     try q.bindTextStatic(protocol.toString());
     try q.bindInt64(@intCast(block));
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
 
     try q.exec();
 }
 
 pub fn storeBlockHash(db: *Database, protocol: models.Protocol, block_number: u64, block_hash: Hash, parent_hash: Hash) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO block_hashes
-        \\(protocol, block_number, block_hash, parent_hash, timestamp)
-        \\VALUES (?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "block_hashes", &.{ "protocol", "block_number", "block_hash", "parent_hash", "timestamp" }, .replace);
+    defer db.allocator.free(sql);
 
     var q = try Query.initCached(db, sql);
     defer q.deinit();
@@ -61,7 +178,7 @@ pub fn storeBlockHash(db: *Database, protocol: models.Protocol, block_number: u6
     try q.bindInt64(@intCast(block_number));
     try q.bindHashBuf(block_hash);
     try q.bindHashBuf(parent_hash);
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
 
     try q.exec();
 }
@@ -83,22 +200,53 @@ pub fn getBlockHash(db: *Database, protocol: models.Protocol, block_number: u64)
 }
 
 /// Rollback all derived state to the given block (for reorg handling).
-/// Deletes:
-///   - events and block_hashes after the block (insert-only tables)
-///   - rows in derived tables (names, registries, resolver_*, approvals, etc.) with created_block > block
-/// Does NOT roll back in-place updates to rows created at or before block_number
-/// (those will be re-derived when events are re-processed on re-sync from block+1).
+/// Atomic (single transaction) and bounded by the block_hashes retention window.
+/// Bit-equivalent to a clean sync stopping at `block_number`:
+///   1. Reverses in-place mutations to rows created at/before the block (owner/
+///      resolver/expiry/… on names, registrant on registrations, and resolver
+///      records removed by clear-events) via the reorg undo-log (see reorg_undo.zig).
+///   2. Deletes rows created after the block (created_block/block_number > block).
+///   3. Deletes insert-only events + block_hashes after the block.
+/// Undo capture requires the indexer to set the per-protocol cursor per event
+/// (reorg_undo.setCursor); without a cursor (backfill/replay) nothing is captured.
 pub fn rollbackToBlock(db: *Database, protocol: models.Protocol, block_number: u64) !void {
     const protocol_str = protocol.toString();
     const block_i64: i64 = @intCast(block_number);
 
-    // Insert-only tables: delete anything after the block
-    const insert_only_tables = [_][]const u8{
-        "events",
-        "block_hashes",
-    };
+    // Reorg-depth guardrail: never roll back further than the block_hashes retention
+    // window (cleanupOldBlockHashes keeps the last 1000 blocks). Beyond it there are
+    // no stored hashes to validate against, so a deeper "rollback" is a blind guess —
+    // fail loud rather than silently corrupt state.
+    {
+        const REORG_RETENTION_BLOCKS: u64 = 1000; // matches cleanupOldBlockHashes keep_blocks
+        const head = (try db.getSyncState(protocol)) orelse block_number;
+        if (head > block_number and head - block_number > REORG_RETENTION_BLOCKS) {
+            std.log.err("Refusing reorg rollback on {s}: depth {d} exceeds retention window {d} (head={d}, target={d})", .{ protocol_str, head - block_number, REORG_RETENTION_BLOCKS, head, block_number });
+            return error.ReorgTooDeep;
+        }
+    }
 
-    inline for (insert_only_tables) |table| {
+    // Atomicity: the entire rollback runs in one transaction. A crash or error
+    // mid-rollback must leave the DB at its pre-rollback state, never half-rolled.
+    // The Tx guard rolls back on any early-error return; commit() below seals it.
+    var tx = try db_module.Tx.begin(db, .immediate);
+    defer tx.deinit();
+
+    // Reverse in-place mutations FIRST: clear the cursor so the restore writes don't
+    // self-capture, then reverse-apply every undo entry with block > N. This must run
+    // before the created-after deletes below — a re-inserted (cleared) row created
+    // after N is then removed by those deletes; an UPDATE-restored pre-N row survives.
+    try reorg_undo.clearCursor(db, protocol);
+    try reorg_undo.replayUndo(db, protocol, block_number);
+
+    // Delete rows created after N, keyed by block_number (insert-only logs + derived
+    // tables alike). replayUndo above already reversed in-place overwrites of pre-N
+    // rows, restoring their as-of-N block_number, so these deletes remove only
+    // genuinely-new rows. If a table is missing from the schema, Query.init (preparing
+    // the DELETE) fails at the `try` boundary and bubbles up — reorg rollback is not
+    // safe to continue on partial failure. The set is the comptime-guarded
+    // `reorg_rollback_by_block_number` (see the coverage assert at module scope).
+    inline for (reorg_rollback_by_block_number) |table| {
         const sql = "DELETE FROM " ++ table ++ " WHERE protocol = ? AND block_number > ?";
         var q = try Query.init(db, sql);
         defer q.deinit();
@@ -109,12 +257,7 @@ pub fn rollbackToBlock(db: *Database, protocol: models.Protocol, block_number: u
 
     // Derived-state tables keyed by created_block: delete rows created after the block.
     // Updates to rows created <= block_number will be re-derived when re-syncing.
-    const derived_tables_by_created_block = [_][]const u8{
-        "names",
-        "registries",
-    };
-
-    inline for (derived_tables_by_created_block) |table| {
+    inline for (reorg_rollback_by_created_block) |table| {
         const sql = "DELETE FROM " ++ table ++ " WHERE protocol = ? AND created_block > ?";
         var q = try Query.init(db, sql);
         defer q.deinit();
@@ -123,49 +266,59 @@ pub fn rollbackToBlock(db: *Database, protocol: models.Protocol, block_number: u
         try q.exec();
     }
 
-    // orphaned_registrations uses block_number
+    // Tables keyed by a non-`block_number` block column: same created-after delete,
+    // different column. registry_entries → updated_block; resolvers (insert-only entity
+    // table) → set_block.
+    inline for (reorg_rollback_by_other_col) |t| {
+        const sql = "DELETE FROM " ++ t.name ++ " WHERE protocol = ? AND " ++ t.col ++ " > ?";
+        var q = try Query.init(db, sql);
+        defer q.deinit();
+        try q.bindTextStatic(protocol_str);
+        try q.bindInt64(block_i64);
+        try q.exec();
+    }
+
+    // v1_controllers (V1-only, no protocol column) drives WHICH contracts get indexed
+    // (getActiveControllers), so a reorged-out ControllerAdded/Removed must be wound back or
+    // subsequent indexing scope is corrupted. It is captured in the undo-log via the
+    // reorg_active triggers (add=INSERT op 'I', remove/re-add=UPDATE op 'U') and reversed by
+    // replayUndo above — which correctly handles a remove-then-readd straddling N that a
+    // column-predicate delete could not. Nothing to do here.
+
+    // accounts is cross-protocol (no protocol column) and rolled back PER protocol and
+    // independently — so we must NOT blanket-delete by first_seen_block (that would drop
+    // the OTHER, still-synced protocol's accounts). Instead the undo-log handles it: the
+    // reorg_active triggers capture each protocol's UPDATE/DELETE (reversed by replayUndo
+    // above) AND its INSERT (op 'I'), and replayUndo's 'I' handler clears only this
+    // protocol's seen flag and drops the row only when neither protocol still claims it.
+
+    // Resolution cache: drop derived answers pinned to a block newer than the
+    // rollback target so the next read re-resolves against the restored chain.
+    // Chain-scoped (one process = one chain), not protocol-scoped — a rollback on
+    // either protocol may purge cache rows attributable to the other, which is
+    // harmless for a disposable overlay (it self-heals on the next lookup).
     {
-        const sql = "DELETE FROM orphaned_registrations WHERE protocol = ? AND block_number > ?";
-        var q = try Query.init(db, sql);
-        defer q.deinit();
-        try q.bindTextStatic(protocol_str);
-        try q.bindInt64(block_i64);
-        try q.exec();
+        var cq = try Query.init(db, "DELETE FROM resolution_cache WHERE chain_id = ? AND block_dep_num > ?");
+        defer cq.deinit();
+        try cq.bindInt64(@intCast(db.chain_id));
+        try cq.bindInt64(block_i64);
+        try cq.exec();
     }
 
-    // Resolver record and EAC tables: block_number with protocol.
-    // Includes all resolver record tables (see deleteDataAfterBlock for canonical list).
-    // If a table is missing from the schema, Query.init (preparing the DELETE) will fail
-    // at the `try` boundary and bubble up — reorg rollback is not safe to continue on partial failure.
-    const resolver_record_tables = [_][]const u8{
-        "resolver_addresses",
-        "resolver_contenthashes",
-        "resolver_texts",
-        "resolver_aliases",
-        "resolver_pubkeys",
-        "resolver_abis",
-        "resolver_names",
-        "resolver_interfaces",
-        "resolver_versions",
-        "approvals",
-        "eac_roles",
-        "resolver_metadata",
-        "resolver_approvals",
-    };
-
-    inline for (resolver_record_tables) |table| {
-        const sql = "DELETE FROM " ++ table ++ " WHERE protocol = ? AND block_number > ?";
-        var q = try Query.init(db, sql);
-        defer q.deinit();
-        try q.bindTextStatic(protocol_str);
-        try q.bindInt64(block_i64);
-        try q.exec();
-    }
+    // Re-arm the init-gap heal ledger: heal sweeps write with undo capture
+    // deliberately disarmed, so the created-after deletes above may have
+    // removed healed rows — a surviving `completed` marker would make that
+    // loss permanent. Re-opening every target costs one idempotent full
+    // re-sweep that converges projections to the surviving chain; attempts
+    // reset too, since prior failures say nothing about this chain.
+    try heal_targets.resetHealTargets(db, protocol);
 
     // Update sync state
     try db.setSyncState(protocol, block_number);
 
-    std.log.warn("Rolled back {s} protocol to block {d} (derived state rolled back, in-place updates to pre-{d} rows will re-derive on re-sync)", .{ protocol_str, block_number, block_number });
+    try tx.commit();
+
+    std.log.warn("Rolled back {s} to block {d} (atomic; in-place updates reversed via undo-log + created-after rows removed)", .{ protocol_str, block_number });
 }
 
 /// Cleanup old block hashes (keep last 1000 blocks for reorg detection)
@@ -185,7 +338,26 @@ pub fn pruneOldBlockHashes(db: *Database, protocol: models.Protocol, current_blo
 }
 
 /// Verify database integrity (uses quick_check for performance on large databases)
+/// Cheap connectivity/liveness probe: one trivial query, no page scans.
+/// The API uses this at startup instead of checkIntegrity — quick_check reads
+/// every btree page, which on a mainnet-scale DB is minutes of full-file I/O
+/// against a live writer, and a read-only consumer can't act on the result
+/// anyway (corruption surfaces at query time regardless).
+pub fn probeLiveness(db: *Database) !bool {
+    var q = try Query.init(db, "SELECT 1");
+    defer q.deinit();
+    return try q.step();
+}
+
 pub fn checkIntegrity(db: *Database) !bool {
+    if (db.isPostgres()) {
+        // Postgres has no PRAGMA quick_check; a successful trivial query is the
+        // connectivity/liveness probe (deep page verification is the server's job).
+        var q = try Query.init(db, "SELECT 1");
+        defer q.deinit();
+        return try q.step();
+    }
+
     const sql = "PRAGMA quick_check";
 
     var q = try Query.init(db, sql);
@@ -203,19 +375,6 @@ pub fn checkIntegrity(db: *Database) !bool {
     return false;
 }
 
-/// Check if a subregistry is already known
-pub fn isSubregistryKnown(db: *Database, protocol: models.Protocol, address: []const u8) !bool {
-    const sql = "SELECT 1 FROM known_subregistries WHERE protocol = ? AND address = ? LIMIT 1";
-
-    var q = try Query.init(db, sql);
-    defer q.deinit();
-
-    try q.bindTextStatic(protocol.toString());
-    try q.bindText(address);
-
-    return try q.step();
-}
-
 /// Register or update a known subregistry.
 ///
 /// `first_seen_block` should be the subregistry's actual creation block
@@ -231,12 +390,13 @@ pub fn registerSubregistry(
     first_seen_block: u64,
     last_indexed_block: u64,
 ) !void {
-    const sql =
+    const sql = try std.fmt.allocPrint(db.allocator,
         \\INSERT INTO known_subregistries (protocol, address, first_seen_block, last_indexed_block)
         \\VALUES (?, ?, ?, ?)
         \\ON CONFLICT(protocol, address) DO UPDATE SET
-        \\  last_indexed_block = MAX(last_indexed_block, excluded.last_indexed_block)
-    ;
+        \\  last_indexed_block = {s}(known_subregistries.last_indexed_block, excluded.last_indexed_block)
+    , .{db.dialect().scalar_max}); // MAX (SQLite) / GREATEST (Postgres); table-qualify the existing
+    defer db.allocator.free(sql); // value — Postgres rejects an unqualified col in DO UPDATE as ambiguous.
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -247,6 +407,20 @@ pub fn registerSubregistry(
     try q.bindInt64(@intCast(last_indexed_block));
 
     try q.exec();
+}
+
+/// The earliest block at which `address` exists as a registry for `protocol` — i.e. the
+/// lower bound for any event it could have emitted (a contract emits nothing before it is
+/// created). Used to scope subregistry backfill to [created_block, …] instead of the
+/// indexer's start_block, which would scan millions of provably-empty pre-creation blocks.
+/// Returns 0 if the address isn't a known registry (caller falls back to start_block).
+pub fn getSubregistryCreatedBlock(db: *Database, protocol: models.Protocol, address: []const u8) !u64 {
+    var q = try Query.initCached(db, "SELECT COALESCE(MIN(created_block), 0) FROM registries WHERE protocol = ? AND address = ?");
+    defer q.deinit();
+    try q.bindTextStatic(protocol.toString());
+    try q.bindText(address);
+    if (try q.step()) return @intCast(q.getInt64(0));
+    return 0;
 }
 
 /// Like registerResolver, but reports whether this was the resolver's FIRST
@@ -271,12 +445,13 @@ pub fn registerResolverIfNew(db: *Database, protocol: models.Protocol, address: 
 
 /// Register or update a known resolver
 pub fn registerResolver(db: *Database, protocol: models.Protocol, address: []const u8, block_number: u64) !void {
-    const sql =
+    const sql = try std.fmt.allocPrint(db.allocator,
         \\INSERT INTO known_resolvers (protocol, address, first_seen_block, last_indexed_block)
         \\VALUES (?, ?, ?, ?)
         \\ON CONFLICT(protocol, address) DO UPDATE SET
-        \\  last_indexed_block = MAX(last_indexed_block, excluded.last_indexed_block)
-    ;
+        \\  last_indexed_block = {s}(known_resolvers.last_indexed_block, excluded.last_indexed_block)
+    , .{db.dialect().scalar_max}); // MAX (SQLite) / GREATEST (Postgres); table-qualify the existing
+    defer db.allocator.free(sql); // value — Postgres rejects an unqualified col in DO UPDATE as ambiguous.
 
     var q = try Query.initCached(db, sql);
     defer q.deinit();
@@ -287,6 +462,21 @@ pub fn registerResolver(db: *Database, protocol: models.Protocol, address: []con
     try q.bindInt64(@intCast(block_number));
 
     try q.exec();
+}
+
+/// Whether `address` is a fully-indexed resolver for `protocol` — one whose record
+/// events this indexer ingests (registered on first sight via registerResolver). For
+/// such a resolver an indexed record MISS is authoritative: the record does not exist
+/// in event-visible storage on-chain, so a live re-read can only refetch the same
+/// emptiness.
+pub fn isKnownResolver(db: *Database, protocol: models.Protocol, address: Address) !bool {
+    var q = try Query.initCached(db,
+        \\SELECT 1 FROM known_resolvers WHERE protocol = ? AND address = ? LIMIT 1
+    );
+    defer q.deinit();
+    try q.bindTextStatic(protocol.toString());
+    try q.bindAddress(address);
+    return try q.step();
 }
 
 /// Get subregistries to index for a block range
@@ -334,7 +524,7 @@ pub fn discoverAndGetSubregistries(db: *Database, protocol: models.Protocol, mai
         \\GROUP BY r.address
     ;
 
-    var new_subregistries: std.ArrayList([]u8) = .{};
+    var new_subregistries: std.ArrayList([]u8) = .empty;
     errdefer {
         for (new_subregistries.items) |s| db.allocator.free(s);
         new_subregistries.deinit(db.allocator);
@@ -379,7 +569,7 @@ pub fn discoverAndGetSubregistries(db: *Database, protocol: models.Protocol, mai
 
     try q2.bindTextStatic(protocol_str);
 
-    var subregistries: std.ArrayList([]u8) = .{};
+    var subregistries: std.ArrayList([]u8) = .empty;
     errdefer {
         for (subregistries.items) |subreg| {
             db.allocator.free(subreg);
@@ -403,11 +593,23 @@ pub fn discoverAndGetSubregistries(db: *Database, protocol: models.Protocol, mai
 pub fn deleteDataAfterBlock(db: *Database, block_number: u64) !void {
     std.log.info("Deleting data after block {d}...", .{block_number});
 
-    // List of tables to clean, with their block_number column name
+    // Tables to clean, with the block column that dates each row. Kept in sync with
+    // rollbackToBlock's coverage so --clean is clean-at-N equivalent for ALL protocols
+    // (no protocol filter here — the replayUndo above ran for both v1 and v2).
     const tables = [_]struct { name: []const u8, block_col: []const u8 }{
         .{ .name = "names", .block_col = "created_block" },
+        .{ .name = "registries", .block_col = "created_block" },
         .{ .name = "events", .block_col = "block_number" },
+        .{ .name = "block_hashes", .block_col = "block_number" },
+        .{ .name = "orphaned_registrations", .block_col = "block_number" },
         .{ .name = "approvals", .block_col = "block_number" },
+        .{ .name = "eac_roles", .block_col = "block_number" },
+        .{ .name = "registrations", .block_col = "block_number" },
+        .{ .name = "registry_entries", .block_col = "updated_block" },
+        .{ .name = "reverse_records", .block_col = "block_number" },
+        .{ .name = "resolvers", .block_col = "set_block" },
+        .{ .name = "name_history", .block_col = "block_number" },
+        .{ .name = "accounts", .block_col = "first_seen_block" },
         .{ .name = "resolver_addresses", .block_col = "block_number" },
         .{ .name = "resolver_contenthashes", .block_col = "block_number" },
         .{ .name = "resolver_texts", .block_col = "block_number" },
@@ -417,14 +619,24 @@ pub fn deleteDataAfterBlock(db: *Database, block_number: u64) !void {
         .{ .name = "resolver_names", .block_col = "block_number" },
         .{ .name = "resolver_interfaces", .block_col = "block_number" },
         .{ .name = "resolver_versions", .block_col = "block_number" },
+        .{ .name = "resolver_metadata", .block_col = "block_number" },
+        .{ .name = "resolver_approvals", .block_col = "block_number" },
+        .{ .name = "resolver_dns_records", .block_col = "block_number" },
+        .{ .name = "resolver_dns_zonehashes", .block_col = "block_number" },
+        .{ .name = "resolver_authorisations", .block_col = "block_number" },
     };
 
-    // Begin transaction for atomic cleanup
-    try db.exec("BEGIN TRANSACTION");
-    errdefer {
-        db.exec("ROLLBACK") catch |err| {
-            std.log.err("CRITICAL: Failed to rollback transaction during cleanup error: {}", .{err});
-        };
+    // Begin transaction for atomic cleanup. The Tx guard rolls back on any
+    // early-error return; commit() below seals it.
+    var tx = try db_module.Tx.begin(db, .deferred);
+    defer tx.deinit();
+
+    // Reverse in-place mutations after the block for BOTH protocols (this path is
+    // protocol-agnostic), so --clean is clean-at-N equivalent and no stale undo
+    // entries survive. Clear cursors first so the restore writes don't self-capture.
+    inline for ([_]models.Protocol{ .v1, .v2 }) |proto| {
+        try reorg_undo.clearCursor(db, proto);
+        try reorg_undo.replayUndo(db, proto, block_number);
     }
 
     for (tables) |table| {
@@ -447,8 +659,21 @@ pub fn deleteDataAfterBlock(db: *Database, block_number: u64) !void {
         }
     }
 
+    // v1_controllers is wound back by the replayUndo calls above (reorg_active undo-log,
+    // both protocols) — no explicit column-predicate cleanup needed.
+
+    // Resolution cache: drop derived answers pinned above the target block (chain-
+    // scoped; protocol-agnostic like this whole path). Self-heals on the next read.
+    {
+        var cq = try Query.init(db, "DELETE FROM resolution_cache WHERE chain_id = ? AND block_dep_num > ?");
+        defer cq.deinit();
+        try cq.bindInt64(@intCast(db.chain_id));
+        try cq.bindInt64(@intCast(block_number));
+        try cq.exec();
+    }
+
     // Commit transaction
-    try db.exec("COMMIT");
+    try tx.commit();
     std.log.info("Data cleanup complete", .{});
 }
 
@@ -487,11 +712,8 @@ pub fn insertOrphanedRegistration(
     tx_hash: Hash,
     log_index: u32,
 ) !void {
-    const sql =
-        \\INSERT OR IGNORE INTO orphaned_registrations
-        \\(protocol, subregistry_address, token_id, label, expiry, owner, block_number, tx_hash, log_index, created_at)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "orphaned_registrations", &.{ "protocol", "subregistry_address", "token_id", "label", "expiry", "owner", "block_number", "tx_hash", "log_index", "created_at" }, .ignore);
+    defer db.allocator.free(sql);
 
     var q = try Query.init(db, sql);
     defer q.deinit();
@@ -508,7 +730,7 @@ pub fn insertOrphanedRegistration(
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
     try q.bindInt(@intCast(log_index));
-    try q.bindInt64(std.time.timestamp());
+    try q.bindInt64(zsys.timestamp());
 
     try q.exec();
 }
@@ -528,7 +750,7 @@ pub fn getOrphanedRegistrations(db: *Database, protocol: models.Protocol, subreg
     try q.bindTextStatic(protocol.toString());
     try q.bindText(subregistry_address);
 
-    var results: std.ArrayList(OrphanedRegistration) = .{};
+    var results: std.ArrayList(OrphanedRegistration) = .empty;
     errdefer {
         for (results.items) |*item| {
             item.deinit(db.allocator);
@@ -566,6 +788,7 @@ pub fn getOrphanedRegistrations(db: *Database, protocol: models.Protocol, subreg
 
 /// Delete orphaned registrations after they've been processed
 pub fn deleteOrphanedRegistrations(db: *Database, protocol: models.Protocol, subregistry_address: []const u8) !void {
+    try reorg_undo.captureWhere(db, "orphaned_registrations", "D", "protocol = ? AND subregistry_address = ?", .{ protocol, subregistry_address });
     const sql = "DELETE FROM orphaned_registrations WHERE protocol = ? AND subregistry_address = ?";
 
     var q = try Query.init(db, sql);
@@ -575,4 +798,20 @@ pub fn deleteOrphanedRegistrations(db: *Database, protocol: models.Protocol, sub
     try q.bindText(subregistry_address);
 
     try q.exec();
+}
+
+test "isKnownResolver is protocol-scoped and requires registration" {
+    const testing = std.testing;
+    var db = try Database.init(testing.allocator, ":memory:");
+    defer db.deinit();
+
+    const r = Address{ .bytes = [_]u8{0x77} ** 20 };
+    try testing.expect(!(try isKnownResolver(&db, .v2, r)));
+
+    const hex = try r.toHex(testing.allocator);
+    defer testing.allocator.free(hex);
+    try registerResolver(&db, .v2, hex, 100);
+
+    try testing.expect(try isKnownResolver(&db, .v2, r));
+    try testing.expect(!(try isKnownResolver(&db, .v1, r)));
 }

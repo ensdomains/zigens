@@ -1,4 +1,5 @@
 const std = @import("std");
+const zsys = @import("../../utils/system.zig");
 const models = @import("../../types/models.zig");
 const db = @import("../../storage/database.zig");
 const Query = db.Query;
@@ -29,12 +30,17 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
 
     std.log.info("Starting pre-migration names backfill...", .{});
 
-    // Query to join temp_pre_migration_names with v1_labels to resolve labels
+    // Query to join temp_pre_migration_names with v1_labels to resolve labels.
+    // Only .eth-parented rows are reconstructible from a bare label: the Name
+    // below is built as `<label>.eth` with its namehash recomputed against the
+    // .eth node, so a temp row with any other parent (cross-parent labelhash
+    // matches are possible) would be silently mis-attributed to `.eth`.
     const query_sql =
         \\SELECT t.namehash, t.label_hash, t.parent_node, t.owner, t.block_number,
         \\       t.tx_hash, t.log_index, t.created_at, v.label
         \\FROM temp_pre_migration_names t
         \\JOIN v1_labels v ON t.label_hash = v.token_id
+        \\WHERE t.parent_node = '0x93cdeb708b7545dc668eb9280176169d1c33cfd8ed6f04690a0bcc88a93fc4ae'
     ;
 
     var q = try Query.init(self.database, query_sql);
@@ -120,6 +126,10 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
             .wrapper_expiry = null,
             .is_v1_name = true,
             .v1_label_hash = v1_label_hash,
+            // Provenance: every temp_pre_migration_names row came from the
+            // legacy 0x314159 registry (the only pre-migration fetch source);
+            // the default false mislabeled backfilled rows as new-registry.
+            .is_legacy = true,
         };
 
         // Check if name already exists (from V1 events processed during sync)
@@ -143,7 +153,7 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
             std.log.debug("Updated creation date for existing name: {s}", .{full_name});
         } else {
             // Name doesn't exist - create it
-            names_storage.insertName(self.database, name) catch |err| {
+            self.insertName(name) catch |err| {
                 std.log.warn("Failed to backfill name {s}: {}", .{ name.name.?, err });
                 name.deinit(self.allocator);
                 continue;
@@ -156,11 +166,15 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
         const namehash_hex = try namehash.toHex(self.allocator);
 
         history: {
-            var hq = Query.init(self.database,
-                \\INSERT OR IGNORE INTO name_history
-                \\(protocol, namehash, name, change_type, old_value, new_value, block_number, tx_hash, log_index, timestamp)
-                \\VALUES (?, ?, ?, 'migration', NULL, 'Migrated from temporary registrar', ?, ?, 0, ?)
+            const hsql = self.database.upsertExprSql(
+                self.database.allocator,
+                "name_history",
+                &.{ "protocol", "namehash", "name", "change_type", "old_value", "new_value", "block_number", "tx_hash", "log_index", "timestamp" },
+                &.{ "?", "?", "?", "'migration'", "NULL", "'Migrated from temporary registrar'", "?", "?", "0", "?" },
+                .ignore,
             ) catch break :history;
+            defer self.database.allocator.free(hsql);
+            var hq = Query.init(self.database, hsql) catch break :history;
             defer hq.deinit();
             hq.bindText("v1") catch break :history;
             hq.bindText(namehash_hex) catch break :history;
@@ -188,12 +202,17 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
 
     // Mark backfill as completed
     mark: {
-        var mq = Query.init(self.database,
-            \\INSERT OR REPLACE INTO backfill_status (task, completed, completed_at, records_processed)
-            \\VALUES ('pre_migration_names', 1, ?, ?)
+        const msql = self.database.upsertExprSql(
+            self.database.allocator,
+            "backfill_status",
+            &.{ "task", "completed", "completed_at", "records_processed" },
+            &.{ "'pre_migration_names'", "1", "?", "?" },
+            .replace,
         ) catch break :mark;
+        defer self.database.allocator.free(msql);
+        var mq = Query.init(self.database, msql) catch break :mark;
         defer mq.deinit();
-        mq.bindInt64(std.time.timestamp()) catch break :mark;
+        mq.bindInt64(zsys.timestamp()) catch break :mark;
         mq.bindInt64(@intCast(count)) catch break :mark;
         mq.exec() catch {};
     }
@@ -235,7 +254,7 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
         total_found += 1;
 
         // Verify this is an .eth 2LD by checking the namehash matches computeEthNamehash(label)
-        const computed_namehash = v1_names.computeEthNamehash(label);
+        const computed_namehash = v1_names.computeChildNamehash(self.root_node, label);
         const stored_namehash = Hash.fromHex(namehash_hex) catch continue;
 
         if (!std.mem.eql(u8, &computed_namehash.bytes, &stored_namehash.bytes)) {
@@ -246,7 +265,7 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
         // This is an .eth 2LD - try to find owner and expiry from events table
         var owner = Address.zero;
         var expiry: u64 = 0;
-        var reg_timestamp: i64 = std.time.timestamp();
+        var reg_timestamp: i64 = zsys.timestamp();
         var reg_block: i64 = first_seen_block;
 
         // Look up registration event for this name (ETH Controller events have namehash set)
@@ -283,13 +302,13 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
 
         // Compute derived values
         const label_hash = v1_names.computeLabelHash(label);
-        const parent_namehash = Hash.fromHex("93cdeb708b7545dc668eb9280176169d1c33cfd8ed6f04690a0bcc88a93fc4ae") catch continue;
-        const registry = Address.fromHex("00000000000C2E074eC69A0dFb2997BA6C7d2e1e") catch continue;
+        const parent_namehash = self.root_node;
+        const registry = self.config.v1_contracts.ens_registry;
 
         // Allocate owned strings for the Name struct
-        const full_name = try std.fmt.allocPrint(self.allocator, "{s}.eth", .{label});
+        const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ label, self.root_name });
         const label_copy = try self.allocator.dupe(u8, label);
-        const parent_name_copy = try self.allocator.dupe(u8, "eth");
+        const parent_name_copy = try self.allocator.dupe(u8, self.root_name);
         const v1_label_hash = try self.allocator.dupe(u8, token_id_str);
 
         var name = models.Name{
@@ -306,11 +325,11 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
             .resolver = Address.zero,
             .token_id = token_id,
             .canonical_id = token_id, // V1 doesn't use versioning
-            // V1 BaseRegistrar tokens are version 1 (matches the pre-migration
-            // backfill above and the live NameRegistered path). Version 0 is
-            // reserved for non-tokenized V1 names (e.g. .eth itself). These
-            // backfilled rows are .eth 2LDs registered through the controller.
-            .token_version = 1,
+            // Match the LIVE registrar path and the replay arm, which both write
+            // token_version = 0 for registrar 2LDs — a heal-created row must be
+            // byte-identical to the row live indexing would have produced. (The
+            // pre-migration backfill above keeps 1 for its temp-registrar rows.)
+            .token_version = 0,
             .expiry = expiry,
             .registry_locked = false,
             .migrated = false,
@@ -318,7 +337,7 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
             .created_at = reg_timestamp,
             .registered_at = reg_timestamp,
             .updated_block = @intCast(reg_block),
-            .updated_at = std.time.timestamp(),
+            .updated_at = zsys.timestamp(),
             .is_wrapped = false,
             .wrapper_fuses = null,
             .wrapper_expiry = null,
@@ -327,7 +346,7 @@ pub fn backfillMissingEth2LDNames(self: *Indexer) !void {
         };
         defer name.deinit(self.allocator);
 
-        names_storage.insertName(self.database, name) catch |err| {
+        self.insertName(name) catch |err| {
             std.log.warn("Failed to create missing .eth 2LD name {s}: {}", .{ full_name, err });
             continue;
         };

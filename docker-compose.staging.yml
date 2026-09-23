@@ -7,6 +7,17 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Release profile for the Zig build: ReleaseSafe (default; keeps
+        # runtime safety checks) or ReleaseFast. Set ZIG_OPTIMIZE in the
+        # deploy environment; keep both services' args identical so they
+        # share one image build.
+        - ZIG_OPTIMIZE=${ZIG_OPTIMIZE:-ReleaseSafe}
+        # Staging only ever runs ensv2-indexer-v2 and ensv2-api, so skip
+        # compiling the combined + V1 binaries (each is a separate whole-
+        # program optimized compile — this roughly halves the image build).
+        # Set ZIG_TARGETS=all to get the full binary set.
+        - ZIG_TARGETS=${ZIG_TARGETS:-v2api}
     container_name: ensv2-indexer-v2-staging
     restart: unless-stopped
     command: ["/app/ensv2-indexer-v2"]
@@ -19,6 +30,22 @@ services:
       - webhook-data-staging:/app/webhooks
     environment:
       - DATABASE_PATH=/app/data/ens_staging.db
+      # Postgres (e.g. Neon): set DATABASE_URL to a postgres:// string to switch off
+      # SQLite. Backend is inferred from the URL scheme; the image is built with
+      # -Dpg-tls=true so a `?sslmode=require` Neon URL negotiates TLS.
+      - DATABASE_BACKEND=${DATABASE_BACKEND:-}
+      - DATABASE_URL=${DATABASE_URL:-}
+      - DATABASE_POOL_SIZE=${DATABASE_POOL_SIZE:-8}
+      # Postgres only: bound per-statement runtime (seconds) so a stuck query fails
+      # loudly instead of hanging forever; 0 disables. Raise for heavy bulk reindexes.
+      - DATABASE_STATEMENT_TIMEOUT=${DATABASE_STATEMENT_TIMEOUT:-120}
+      # Postgres only: trade per-commit WAL durability for bulk-sync speed. One of
+      # on|off|local|remote_write|remote_apply; blank = server default (on). Safe for an
+      # indexer — it re-syncs from the chain on restart.
+      - DATABASE_SYNCHRONOUS_COMMIT=${DATABASE_SYNCHRONOUS_COMMIT:-}
+      # Postgres only: reuse server-side prepared statements (big win on remote DBs);
+      # set to 0 to disable if it ever misbehaves.
+      - DATABASE_STMT_CACHE=${DATABASE_STMT_CACHE:-1}
       - RAINBOW_PATH=/app/data/ens_rainbow.db
       - DOWNLOAD_RAINBOW=true
       - RPC_URL=${RPC_URL}
@@ -27,6 +54,10 @@ services:
       - POLL_INTERVAL=12
       - RATE_LIMIT_PER_SECOND=25
       - STATUS_PORT=3002
+      # Track the chain's safe/finalized heads each poll (Task 09). Feeds the
+      # ensv2_finality_* metrics and the API's freshness signal; two extra RPC
+      # calls per poll.
+      - FINALITY_ENABLED=${FINALITY_ENABLED:-true}
       - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
       - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
       - WEBHOOK_MAX_RETRIES=${WEBHOOK_MAX_RETRIES:-3}
@@ -49,6 +80,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        - ZIG_OPTIMIZE=${ZIG_OPTIMIZE:-ReleaseSafe}
+        - ZIG_TARGETS=${ZIG_TARGETS:-v2api}
     container_name: ensv2-api-staging
     restart: unless-stopped
     command: ["/app/api-entrypoint.sh"]
@@ -63,16 +97,46 @@ services:
       - webhook-data-staging:/app/webhooks
     environment:
       - DATABASE_PATH=/app/data/ens_staging.db
+      # Postgres (e.g. Neon): set DATABASE_URL to a postgres:// string to switch off
+      # SQLite. Backend is inferred from the URL scheme; the image is built with
+      # -Dpg-tls=true so a `?sslmode=require` Neon URL negotiates TLS.
+      - DATABASE_BACKEND=${DATABASE_BACKEND:-}
+      - DATABASE_URL=${DATABASE_URL:-}
+      - DATABASE_POOL_SIZE=${DATABASE_POOL_SIZE:-8}
+      # Postgres only: bound per-statement runtime (seconds) so a stuck query fails
+      # loudly instead of hanging forever; 0 disables. Raise for heavy bulk reindexes.
+      - DATABASE_STATEMENT_TIMEOUT=${DATABASE_STATEMENT_TIMEOUT:-120}
+      # Postgres only: trade per-commit WAL durability for bulk-sync speed. One of
+      # on|off|local|remote_write|remote_apply; blank = server default (on). Safe for an
+      # indexer — it re-syncs from the chain on restart.
+      - DATABASE_SYNCHRONOUS_COMMIT=${DATABASE_SYNCHRONOUS_COMMIT:-}
+      # Postgres only: reuse server-side prepared statements (big win on remote DBs);
+      # set to 0 to disable if it ever misbehaves.
+      - DATABASE_STMT_CACHE=${DATABASE_STMT_CACHE:-1}
       - RAINBOW_PATH=/app/data/ens_rainbow.db
       - DOWNLOAD_RAINBOW=false
       - API_PORT=5656
       - GRAPHQL_MAX_DEPTH=10
       - GRAPHQL_MAX_COST=${GRAPHQL_MAX_COST:-10000}
+      # Live resolution (ENSIP-10 Universal Resolver fallback) for single-name
+      # queries; needs an RPC the API can call — RESOLVE_RPC_URL falls back to
+      # the indexer's RPC_URL value from the environment.
+      - RESOLVE_LIVE_ENABLED=${RESOLVE_LIVE_ENABLED:-true}
+      - RESOLVE_RPC_URL=${RESOLVE_RPC_URL:-${RPC_URL}}
+      # ENSIP-3 forward verification of primary names (claimed vs verified);
+      # exposes Account.primaryNameVerification and the verify-primary endpoint.
+      - PRIMARY_VERIFY_ENABLED=${PRIMARY_VERIFY_ENABLED:-true}
+      # CCIP-Read offchain lookups ride on live resolution; startup fails fast
+      # if enabled without RESOLVE_LIVE_ENABLED.
+      - RESOLVE_CCIP_ENABLED=${RESOLVE_CCIP_ENABLED:-false}
+      # Behind Traefik: trust one proxy hop so rate limiting keys on the real
+      # client IP instead of the proxy's.
+      - TRUSTED_PROXY_HOPS=${TRUSTED_PROXY_HOPS:-1}
       - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
       - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
       - WEBHOOK_ADMIN_USERNAME=${WEBHOOK_ADMIN_USERNAME:-}
       - WEBHOOK_ADMIN_PASSWORD=${WEBHOOK_ADMIN_PASSWORD:-}
-      - METRICS_ENABLED=false
+      - METRICS_ENABLED=${METRICS_ENABLED:-false}
     depends_on:
       - indexer-v2
     healthcheck:

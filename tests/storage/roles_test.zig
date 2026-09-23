@@ -215,15 +215,15 @@ test "live Sepolia ALL_ROLES bitmap decodes to full resolver permission set" {
     const perms = try eac_roles.decodeHex(allocator, all_roles_hex, .resolver);
     defer eac_roles.freePermissions(allocator, perms);
 
-    // 11 resolver roles + 11 admin counterparts.
-    try testing.expectEqual(@as(usize, 22), perms.len);
+    // 10 resolver roles + 10 admin counterparts (record-model PermissionedResolverLib).
+    try testing.expectEqual(@as(usize, 20), perms.len);
 
     // Spot-check a couple of resolver-specific names are present.
     var has_set_addr = false;
     var has_set_name = false;
     for (perms) |p| {
-        if (std.mem.eql(u8, p, "SET_ADDR")) has_set_addr = true;
-        if (std.mem.eql(u8, p, "SET_NAME")) has_set_name = true;
+        if (std.mem.eql(u8, p, "SET_ADDRESS")) has_set_addr = true;
+        if (std.mem.eql(u8, p, "LINK")) has_set_name = true;
     }
     try testing.expect(has_set_addr);
     try testing.expect(has_set_name);
@@ -244,7 +244,7 @@ test "EAC row from a known resolver classifies as resolver and decodes resolver 
     // Sepolia shape — which previously failed the resolvers name-binding JOIN.
     const resource = "0x0000000000000000000000000000000000000000000000000000000000000000";
     const tx_hash = helpers.randomHash();
-    // 1 << 24 = nybble 6 → SET_NAME on a resolver (SET_RESOLVER on a registry).
+    // 1 << 24 = nybble 6 → SET_DATA on a resolver (SET_RESOLVER on a registry).
     const bitmap_hex = "0x0000000000000000000000000000000000000000000000000000000001000000";
     try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_1, bitmap_hex, 1000, tx_hash, 0, helpers.TEST_RESOLVER);
 
@@ -261,8 +261,8 @@ test "EAC row from a known resolver classifies as resolver and decodes resolver 
     const perms = try eac_roles.decodeHex(allocator, role_list[0].role_bitmap, role_list[0].contract_kind);
     defer eac_roles.freePermissions(allocator, perms);
     try testing.expectEqual(@as(usize, 1), perms.len);
-    // Resolver name for nybble 6 — the bug previously yielded registry's SET_RESOLVER.
-    try testing.expectEqualStrings("SET_NAME", perms[0]);
+    // Resolver name for nybble 6 — the bug previously yielded registry SET_RESOLVER.
+    try testing.expectEqualStrings("SET_DATA", perms[0]);
 }
 
 test "registerResolverIfNew reports first sighting exactly once" {
@@ -282,4 +282,534 @@ test "registerResolverIfNew reports first sighting exactly once" {
     try testing.expect(!try database.registerResolverIfNew(.v2, resolver_hex, 200));
     // The same address under the other protocol is its own first sighting.
     try testing.expect(try database.registerResolverIfNew(.v1, resolver_hex, 300));
+}
+
+// ============================================================================
+// CONTRACT SCOPING (getRolesFiltered)
+// ============================================================================
+// The same resource value — ROOT (0x0) on every EAC-enabled contract being the
+// guaranteed case — can carry role rows on MANY contracts. These pin the
+// disambiguation: contract_address is populated on every returned row, and the
+// contract filter isolates one emitting contract.
+
+test "rows carry the emitting contract and the contract filter isolates it" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const root_resource = "0x0000000000000000000000000000000000000000000000000000000000000000";
+    const contract_a = Address{ .bytes = [_]u8{0xAA} ** 20 };
+    const contract_b = Address{ .bytes = [_]u8{0xBB} ** 20 };
+
+    try roles.upsertEACRole(database, .v2, root_resource, helpers.TEST_OWNER_1, "0x01", 1000, helpers.randomHash(), 0, contract_a);
+    try roles.upsertEACRole(database, .v2, root_resource, helpers.TEST_OWNER_2, "0x02", 1000, helpers.randomHash(), 1, contract_b);
+
+    // Unscoped: both contracts' rows, each stamped with its emitting contract.
+    const all = try roles.getRolesFiltered(database, .v2, .{ .resource = root_resource });
+    defer {
+        for (all) |*r| r.deinit(allocator);
+        allocator.free(all);
+    }
+    try testing.expectEqual(@as(usize, 2), all.len);
+    for (all) |r| {
+        const expected: Address = if (r.account.eql(helpers.TEST_OWNER_1)) contract_a else contract_b;
+        try testing.expectEqualSlices(u8, &expected.bytes, &r.contract_address.bytes);
+    }
+
+    // Scoped: exactly the one contract's row.
+    const scoped = try roles.getRolesFiltered(database, .v2, .{ .resource = root_resource, .contract_address = contract_b });
+    defer {
+        for (scoped) |*r| r.deinit(allocator);
+        allocator.free(scoped);
+    }
+    try testing.expectEqual(@as(usize, 1), scoped.len);
+    try testing.expectEqualSlices(u8, &contract_b.bytes, &scoped[0].contract_address.bytes);
+    try testing.expectEqualSlices(u8, &helpers.TEST_OWNER_2.bytes, &scoped[0].account.bytes);
+}
+
+test "contract filter combines with account and works alone" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const contract_a = Address{ .bytes = [_]u8{0xAA} ** 20 };
+    const contract_b = Address{ .bytes = [_]u8{0xBB} ** 20 };
+
+    // Same account holds roles on two contracts; a second account on one.
+    try roles.upsertEACRole(database, .v2, "0x01", helpers.TEST_OWNER_1, "0x01", 1000, helpers.randomHash(), 0, contract_a);
+    try roles.upsertEACRole(database, .v2, "0x02", helpers.TEST_OWNER_1, "0x01", 1000, helpers.randomHash(), 1, contract_b);
+    try roles.upsertEACRole(database, .v2, "0x03", helpers.TEST_OWNER_2, "0x01", 1000, helpers.randomHash(), 2, contract_b);
+
+    const by_account_and_contract = try roles.getRolesFiltered(database, .v2, .{ .account = helpers.TEST_OWNER_1, .contract_address = contract_b });
+    defer {
+        for (by_account_and_contract) |*r| r.deinit(allocator);
+        allocator.free(by_account_and_contract);
+    }
+    try testing.expectEqual(@as(usize, 1), by_account_and_contract.len);
+    try testing.expectEqualStrings("0x02", by_account_and_contract[0].resource);
+
+    const by_contract = try roles.getRolesFiltered(database, .v2, .{ .contract_address = contract_b });
+    defer {
+        for (by_contract) |*r| r.deinit(allocator);
+        allocator.free(by_contract);
+    }
+    try testing.expectEqual(@as(usize, 2), by_contract.len);
+}
+
+test "equal-timestamp rows order deterministically (id tiebreak)" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const resource = "0xdead";
+    // Same block => same timestamp; insertion order fixes ids.
+    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_1, "0x01", 1000, helpers.randomHash(), 0, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_2, "0x02", 1000, helpers.randomHash(), 1, helpers.TEST_RESOLVER);
+
+    const list = try roles.getRolesFiltered(database, .v2, .{ .resource = resource });
+    defer {
+        for (list) |*r| r.deinit(allocator);
+        allocator.free(list);
+    }
+    try testing.expectEqual(@as(usize, 2), list.len);
+    // timestamp DESC, id DESC: the later insert (higher id) comes first.
+    try testing.expect(list[0].id > list[1].id);
+}
+
+test "resource filter matches padded, trimmed, and verbatim spellings" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // A resource whose hash starts with a ZERO nibble: storage carries the
+    // 64-padded spelling (as chain events emit), the API serializes tokenId
+    // zero-trimmed — clients feed either back. Derive every form from ONE
+    // value so the fixture cannot drift.
+    const v: u256 = (@as(u256, 0x0a24) << 240) | (@as(u256, 0xff) << 32);
+    var padded_buf: [66]u8 = undefined;
+    const padded = try std.fmt.bufPrint(&padded_buf, "0x{x:0>64}", .{v});
+    var trimmed_buf: [66]u8 = undefined;
+    const trimmed = try std.fmt.bufPrint(&trimmed_buf, "0x{x}", .{v});
+    try testing.expect(padded.len != trimmed.len); // the leading-zero premise
+
+    try roles.upsertEACRole(database, .v2, padded, helpers.TEST_OWNER_1, "0x0110", 1000, helpers.randomHash(), 0, helpers.TEST_REGISTRY);
+
+    for ([_][]const u8{ padded, trimmed }) |form| {
+        const got = try roles.getRolesFiltered(database, .v2, .{ .resource = form });
+        defer {
+            for (got) |*r| {
+                var m = r.*;
+                m.deinit(allocator);
+            }
+            allocator.free(got);
+        }
+        try testing.expectEqual(@as(usize, 1), got.len);
+        try testing.expectEqualStrings(padded, got[0].resource);
+    }
+
+    // Exotic non-hex resource strings keep exact-match semantics.
+    const none = try roles.getRolesFiltered(database, .v2, .{ .resource = "not-hex!" });
+    defer allocator.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "upsertEACRolesBatch matches direct upsert semantics and preserves id on conflict" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const tx1 = helpers.randomHash();
+    try roles.upsertEACRole(database, .v2, "777001", helpers.TEST_OWNER_1, "0x01", 1000, tx1, 0, helpers.TEST_RESOLVER);
+
+    const before = try roles.getRolesByResource(database, .v2, "777001");
+    defer {
+        for (before) |*r| r.deinit(allocator);
+        allocator.free(before);
+    }
+    try testing.expectEqual(@as(usize, 1), before.len);
+    const original_id = before[0].id;
+
+    const tx2 = helpers.randomHash();
+    const rows = [_]roles.RoleUpsertRow{
+        // Conflicts with the pre-existing row: must UPDATE in place, not
+        // delete+reinsert (INSERT OR REPLACE would churn the id).
+        .{ .protocol = .v2, .resource = "777001", .account = helpers.TEST_OWNER_1, .role_bitmap = "0x07", .block_number = 2000, .tx_hash = tx2, .log_index = 3, .contract_address = helpers.TEST_RESOLVER },
+        .{ .protocol = .v2, .resource = "777001", .account = helpers.TEST_OWNER_2, .role_bitmap = "0x02", .block_number = 2000, .tx_hash = tx2, .log_index = 4, .contract_address = helpers.TEST_RESOLVER },
+        .{ .protocol = .v2, .resource = "777002", .account = helpers.TEST_OWNER_1, .role_bitmap = "0x04", .block_number = 2001, .tx_hash = tx2, .log_index = 5, .contract_address = helpers.TEST_RESOLVER },
+    };
+    try roles.upsertEACRolesBatch(database, &rows);
+
+    const after = try roles.getRolesByResource(database, .v2, "777001");
+    defer {
+        for (after) |*r| r.deinit(allocator);
+        allocator.free(after);
+    }
+    try testing.expectEqual(@as(usize, 2), after.len);
+    var conflicted_seen = false;
+    for (after) |r| {
+        if (r.account.eql(helpers.TEST_OWNER_1)) {
+            conflicted_seen = true;
+            try testing.expectEqual(original_id, r.id);
+            try testing.expectEqualStrings("0x07", r.role_bitmap);
+            try testing.expectEqual(@as(u64, 2000), r.block_number);
+            try testing.expectEqual(@as(u32, 3), r.log_index);
+        }
+    }
+    try testing.expect(conflicted_seen);
+
+    const other = try roles.getRolesByResource(database, .v2, "777002");
+    defer {
+        for (other) |*r| r.deinit(allocator);
+        allocator.free(other);
+    }
+    try testing.expectEqual(@as(usize, 1), other.len);
+    try testing.expectEqualStrings("0x04", other[0].role_bitmap);
+}
+
+test "upsertEACRolesBatch handles batches past the chunk boundary and tracked-string cap" {
+    // 120 rows crosses both the 90-row chunk split and the 32-tracked-string
+    // statement cap that a copying bind would hit (the 2026-08-21 dual-run
+    // regression: TooManyBoundParams looped the batch forever).
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const tx = helpers.randomHash();
+    var resources: [120][8]u8 = undefined;
+    var rows: [120]roles.RoleUpsertRow = undefined;
+    for (0..120) |i| {
+        _ = std.fmt.bufPrint(&resources[i], "88{d:0>4}", .{i}) catch unreachable;
+        rows[i] = .{
+            .protocol = .v2,
+            .resource = resources[i][0..6],
+            .account = helpers.TEST_OWNER_1,
+            .role_bitmap = "0x01",
+            .block_number = 3000 + i,
+            .tx_hash = tx,
+            .log_index = @intCast(i),
+            .contract_address = helpers.TEST_RESOLVER,
+        };
+    }
+    try roles.upsertEACRolesBatch(database, &rows);
+
+    const first = try roles.getRolesByResource(database, .v2, "880000");
+    defer {
+        for (first) |*r| r.deinit(allocator);
+        allocator.free(first);
+    }
+    try testing.expectEqual(@as(usize, 1), first.len);
+    const last = try roles.getRolesByResource(database, .v2, "880119");
+    defer {
+        for (last) |*r| r.deinit(allocator);
+        allocator.free(last);
+    }
+    try testing.expectEqual(@as(usize, 1), last.len);
+    try testing.expectEqual(@as(u64, 3119), last[0].block_number);
+}
+
+// ============================================================================
+// VERBATIM REGISTRY RESOURCES (EAC version bits)
+// ============================================================================
+
+/// A label's canonical id (low 32 bits zero) and its versioned resources, in the
+/// fixed 66-char hex the indexer stores.
+const VersionedLabel = struct {
+    canonical: [66]u8,
+    v0: [66]u8,
+    v1: [66]u8,
+    v2: [66]u8,
+
+    fn init(canonical_id: u256) VersionedLabel {
+        var out: VersionedLabel = undefined;
+        _ = std.fmt.bufPrint(&out.canonical, "0x{x:0>64}", .{canonical_id}) catch unreachable;
+        _ = std.fmt.bufPrint(&out.v0, "0x{x:0>64}", .{canonical_id}) catch unreachable;
+        _ = std.fmt.bufPrint(&out.v1, "0x{x:0>64}", .{canonical_id | 1}) catch unreachable;
+        _ = std.fmt.bufPrint(&out.v2, "0x{x:0>64}", .{canonical_id | 2}) catch unreachable;
+        return out;
+    }
+};
+
+const LABEL_CANONICAL: u256 = 0x53f632a801578489983227b234817273b09ffad9c79c50366f6ff4d600000000;
+
+fn seedRegistryName(allocator: std.mem.Allocator, database: *Database, name: []const u8, canonical_id: u256, registry: Address) !void {
+    const nh = try lib.namehash(allocator, name);
+    var parts = std.mem.splitScalar(u8, name, '.');
+    const label = parts.first();
+    const parent = parts.rest();
+    try database.insertName(models.Name{
+        .protocol = .v2,
+        .name = name,
+        .namehash = nh,
+        .label = label,
+        .label_hash = try lib.labelhash(allocator, label),
+        .parent_name = parent,
+        .parent_namehash = try lib.namehash(allocator, parent),
+        .registry = registry,
+        .owner = helpers.TEST_OWNER_2,
+        .registrant = helpers.TEST_OWNER_2,
+        .resolver = Address.zero,
+        .token_id = canonical_id | 2,
+        .canonical_id = canonical_id,
+        .token_version = 2,
+        .expiry = 2000000000,
+        .registry_locked = false,
+        .migrated = false,
+        .created_block = 1000,
+        .created_at = 1700000000,
+        .registered_at = 1700000000,
+        .updated_block = 1000,
+        .updated_at = 1700000000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    });
+}
+
+fn freeRoles(allocator: std.mem.Allocator, list: []models.EACRoleAssignment) void {
+    for (list) |*r| r.deinit(allocator);
+    allocator.free(list);
+}
+
+test "registry resource keeps its EAC version bits and a superseded version drops out of listings" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+    const lbl = VersionedLabel.init(LABEL_CANONICAL);
+    const registry = helpers.TEST_REGISTRY;
+    const root = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+    // First registration: owner 1 holds roles at version 0. Unregister +
+    // re-register bumps eacVersionId → the new owner's grant lands on version 1.
+    try roles.upsertEACRole(database, .v2, &lbl.v0, helpers.TEST_OWNER_1, "0x0111", 1000, helpers.randomHash(), 0, registry);
+    try roles.upsertEACRole(database, .v2, &lbl.v1, helpers.TEST_OWNER_2, "0x0111", 2000, helpers.randomHash(), 0, registry);
+    // Registry-wide ROOT roles have no version and must never be filtered out.
+    try roles.upsertEACRole(database, .v2, root, helpers.TEST_OWNER_1, "0x1111", 900, helpers.randomHash(), 0, registry);
+
+    // Stored exactly as emitted.
+    const v1_rows = try roles.getRolesFiltered(database, .v2, .{ .resource = &lbl.v1 });
+    defer freeRoles(allocator, v1_rows);
+    try testing.expectEqual(@as(usize, 1), v1_rows.len);
+    try testing.expectEqualStrings(&lbl.v1, v1_rows[0].resource);
+
+    // Contract listing: the superseded version-0 grant is gone, ROOT stays.
+    const listing = try roles.getRolesFiltered(database, .v2, .{ .contract_address = registry });
+    defer freeRoles(allocator, listing);
+    try testing.expectEqual(@as(usize, 2), listing.len);
+    for (listing) |r| try testing.expect(!std.mem.eql(u8, r.resource, &lbl.v0));
+    try testing.expectEqual(@as(usize, 2), try roles.getRoleCountFiltered(database, .{ .protocol = .v2, .contract_address = registry }));
+
+    const paged = try roles.getRolesWithPagination(database, .v2, .{ .contract_address = registry, .limit = 10 });
+    defer freeRoles(allocator, paged);
+    try testing.expectEqual(@as(usize, 2), paged.len);
+
+    // Asking for the old resource explicitly still returns its rows: history
+    // is preserved, just not presented as current.
+    const old = try roles.getRolesFiltered(database, .v2, .{ .resource = &lbl.v0 });
+    defer freeRoles(allocator, old);
+    try testing.expectEqual(@as(usize, 1), old.len);
+    try testing.expect(old[0].account.eql(helpers.TEST_OWNER_1));
+    try testing.expectEqual(@as(usize, 1), try roles.getRoleCountFiltered(database, .{ .protocol = .v2, .contract_address = registry, .resource = &lbl.v0 }));
+
+    // The account view of the old holder is likewise current-only.
+    const by_account = try roles.getRolesFiltered(database, .v2, .{ .account = helpers.TEST_OWNER_1 });
+    defer freeRoles(allocator, by_account);
+    try testing.expectEqual(@as(usize, 1), by_account.len);
+    try testing.expectEqualStrings(root, by_account[0].resource);
+}
+
+test "versioned registry resources attribute to the label by canonical prefix" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+    const lbl = VersionedLabel.init(LABEL_CANONICAL);
+    const registry = helpers.TEST_REGISTRY;
+    try seedRegistryName(allocator, database, "versioned.eth", LABEL_CANONICAL, registry);
+
+    try roles.upsertEACRole(database, .v2, &lbl.v2, helpers.TEST_OWNER_2, "0x0111", 3000, helpers.randomHash(), 0, registry);
+    // Same resource value on ANOTHER contract must not borrow the name.
+    try roles.upsertEACRole(database, .v2, &lbl.v2, helpers.TEST_OWNER_1, "0x0001", 3000, helpers.randomHash(), 1, helpers.TEST_RESOLVER);
+
+    const rows = try roles.getRolesFiltered(database, .v2, .{ .resource = &lbl.v2 });
+    defer freeRoles(allocator, rows);
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    for (rows) |r| {
+        if (r.contract_address.eql(registry)) {
+            try testing.expectEqualStrings("versioned.eth", r.name.?);
+        } else {
+            try testing.expect(r.name == null);
+        }
+    }
+}
+
+test "getLabelRoleHolderCount counts only the label's current EAC version" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+    const lbl = VersionedLabel.init(LABEL_CANONICAL);
+    const registry = helpers.TEST_REGISTRY;
+    const owner3 = Address{ .bytes = [_]u8{0x33} ** 20 };
+
+    try roles.upsertEACRole(database, .v2, &lbl.v0, helpers.TEST_OWNER_1, "0x0111", 1000, helpers.randomHash(), 0, registry);
+    try testing.expectEqual(@as(usize, 1), try roles.getLabelRoleHolderCount(database, .v2, &lbl.canonical, registry));
+
+    try roles.upsertEACRole(database, .v2, &lbl.v1, helpers.TEST_OWNER_2, "0x0111", 2000, helpers.randomHash(), 0, registry);
+    try roles.upsertEACRole(database, .v2, &lbl.v1, owner3, "0x0100", 2000, helpers.randomHash(), 1, registry);
+    // Version 1 is current: its two holders count, the version-0 holder does not.
+    try testing.expectEqual(@as(usize, 2), try roles.getLabelRoleHolderCount(database, .v2, &lbl.canonical, registry));
+    // Zero-trimmed canonical spelling resolves the same label.
+    var trimmed_buf: [66]u8 = undefined;
+    const trimmed = try std.fmt.bufPrint(&trimmed_buf, "0x{x}", .{LABEL_CANONICAL});
+    try testing.expectEqual(@as(usize, 2), try roles.getLabelRoleHolderCount(database, .v2, trimmed, registry));
+    // Another registry with the same canonical id is a different label.
+    try testing.expectEqual(@as(usize, 0), try roles.getLabelRoleHolderCount(database, .v2, &lbl.canonical, helpers.TEST_RESOLVER));
+}
+
+// ============================================================================
+// BATCH HOLDER COUNTS (API page loader): regroups to exactly the point read
+// ============================================================================
+
+const ZERO_BITMAP = "0x0000000000000000000000000000000000000000000000000000000000000000";
+const ROOT_RESOURCE = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+fn holderCountFor(rows: []const roles.LabelRoleHolderCountRow, canonical_id_hex: []const u8, registry: Address) ?u64 {
+    var registry_buf: [42]u8 = undefined;
+    const registry_hex = registry.toHexBuf(&registry_buf);
+    for (rows) |r| {
+        if (std.mem.eql(u8, r.canonical_id, canonical_id_hex) and std.mem.eql(u8, r.registry, registry_hex)) return r.count;
+    }
+    return null;
+}
+
+fn expectBatchMatchesPoint(database: *Database, rows: []const roles.LabelRoleHolderCountRow, canonical_id_hexes: []const []const u8, registries: []const Address) !void {
+    for (canonical_id_hexes, registries) |cid, registry| {
+        const expected: u64 = @intCast(try roles.getLabelRoleHolderCount(database, .v2, cid, registry));
+        try testing.expectEqual(expected, holderCountFor(rows, cid, registry) orelse 0);
+    }
+}
+
+test "getLabelRoleHolderCountsForLabels regroups to exactly getLabelRoleHolderCount per label" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+    const registry = helpers.TEST_REGISTRY;
+    const owner3 = Address{ .bytes = [_]u8{0x33} ** 20 };
+
+    // Two versions: only the holders at the MAX resource (v1) count → 2.
+    const versioned = VersionedLabel.init(LABEL_CANONICAL);
+    try roles.upsertEACRole(database, .v2, &versioned.v0, helpers.TEST_OWNER_1, "0x0111", 1000, helpers.randomHash(), 0, registry);
+    try roles.upsertEACRole(database, .v2, &versioned.v1, helpers.TEST_OWNER_2, "0x0111", 2000, helpers.randomHash(), 0, registry);
+    try roles.upsertEACRole(database, .v2, &versioned.v1, owner3, "0x0100", 2000, helpers.randomHash(), 1, registry);
+    // Same resource on another contract is a different label → 1.
+    try roles.upsertEACRole(database, .v2, &versioned.v1, helpers.TEST_OWNER_1, "0x0111", 2000, helpers.randomHash(), 2, helpers.TEST_RESOLVER);
+
+    // An all-zero bitmap holder at the current version is excluded → 1.
+    const zeroed = VersionedLabel.init(0x1111111111111111111111111111111111111111111111111111111100000000);
+    try roles.upsertEACRole(database, .v2, &zeroed.v0, helpers.TEST_OWNER_1, ZERO_BITMAP, 1000, helpers.randomHash(), 0, registry);
+    try roles.upsertEACRole(database, .v2, &zeroed.v0, helpers.TEST_OWNER_2, "0x0001", 1000, helpers.randomHash(), 1, registry);
+
+    // Only zero-bitmap rows at the MAX version: the point read answers 0, the
+    // batch has no row.
+    const revoked = VersionedLabel.init(0x2222222222222222222222222222222222222222222222222222222200000000);
+    try roles.upsertEACRole(database, .v2, &revoked.v0, helpers.TEST_OWNER_1, "0x0001", 1000, helpers.randomHash(), 0, registry);
+    try roles.upsertEACRole(database, .v2, &revoked.v1, helpers.TEST_OWNER_2, ZERO_BITMAP, 2000, helpers.randomHash(), 0, registry);
+
+    // A canonical id with leading zero nibbles has two spellings; each is its
+    // own batch key and both count the same holders → 2.
+    const leading = VersionedLabel.init(0x00000000abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd00000000);
+    try roles.upsertEACRole(database, .v2, &leading.v0, helpers.TEST_OWNER_1, "0x0111", 1000, helpers.randomHash(), 0, registry);
+    try roles.upsertEACRole(database, .v2, &leading.v0, helpers.TEST_OWNER_2, "0x0011", 1000, helpers.randomHash(), 1, registry);
+    var trimmed_buf: [66]u8 = undefined;
+    const trimmed = try std.fmt.bufPrint(&trimmed_buf, "0x{x}", .{@as(u256, 0x00000000abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd00000000)});
+    try testing.expect(!std.mem.eql(u8, trimmed, &leading.canonical));
+
+    // Registry-wide ROOT role: outside every label's canonical range, so it
+    // never counts toward a label.
+    try roles.upsertEACRole(database, .v2, ROOT_RESOURCE, helpers.TEST_OWNER_1, "0x1111", 900, helpers.randomHash(), 0, registry);
+    // Other protocol never counts.
+    const bare = VersionedLabel.init(0x3333333333333333333333333333333333333333333333333333333300000000);
+    try roles.upsertEACRole(database, .v1, &bare.v0, helpers.TEST_OWNER_1, "0x0111", 1000, helpers.randomHash(), 0, registry);
+    const none = VersionedLabel.init(0x4444444444444444444444444444444444444444444444444444444400000000);
+
+    const cids = [_][]const u8{
+        &versioned.canonical, // 2
+        &zeroed.canonical, // 1
+        &revoked.canonical, // absent → 0
+        &versioned.canonical, // duplicate pair
+        &leading.canonical, // 2
+        trimmed, // second spelling, its own key → 2
+        &versioned.canonical, // other registry → 1
+        &bare.canonical, // v1-only → absent
+        &none.canonical, // no roles → absent
+        "not-hex", // unparseable → skipped
+    };
+    const regs = [_]Address{
+        registry,
+        registry,
+        registry,
+        registry,
+        registry,
+        registry,
+        helpers.TEST_RESOLVER,
+        registry,
+        registry,
+        registry,
+    };
+    const rows = try roles.getLabelRoleHolderCountsForLabels(database, .v2, &cids, &regs, allocator);
+    defer roles.freeLabelRoleHolderCountRows(allocator, rows);
+
+    try expectBatchMatchesPoint(database, rows, &cids, &regs);
+    try testing.expectEqual(@as(u64, 2), holderCountFor(rows, &versioned.canonical, registry).?);
+    try testing.expectEqual(@as(u64, 1), holderCountFor(rows, &zeroed.canonical, registry).?);
+    try testing.expectEqual(@as(u64, 2), holderCountFor(rows, &leading.canonical, registry).?);
+    try testing.expectEqual(@as(u64, 2), holderCountFor(rows, trimmed, registry).?);
+    try testing.expectEqual(@as(u64, 1), holderCountFor(rows, &versioned.canonical, helpers.TEST_RESOLVER).?);
+    try testing.expect(holderCountFor(rows, &revoked.canonical, registry) == null);
+    try testing.expect(holderCountFor(rows, &bare.canonical, registry) == null);
+    try testing.expect(holderCountFor(rows, &none.canonical, registry) == null);
+    try testing.expect(holderCountFor(rows, "not-hex", registry) == null);
+    // One row per distinct present key, ordered by (canonical_id, registry).
+    try testing.expectEqual(@as(usize, 5), rows.len);
+    try testing.expectEqualStrings(&leading.canonical, rows[0].canonical_id);
+    try testing.expectEqualStrings(&zeroed.canonical, rows[1].canonical_id);
+    try testing.expectEqualStrings(&versioned.canonical, rows[2].canonical_id);
+    try testing.expectEqualStrings(&versioned.canonical, rows[3].canonical_id);
+    try testing.expectEqualStrings(trimmed, rows[4].canonical_id);
+    var registry_buf: [42]u8 = undefined;
+    try testing.expectEqualStrings(registry.toHexBuf(&registry_buf), rows[2].registry);
+    var resolver_buf: [42]u8 = undefined;
+    try testing.expectEqualStrings(helpers.TEST_RESOLVER.toHexBuf(&resolver_buf), rows[3].registry);
+}
+
+test "getLabelRoleHolderCountsForLabels spans the 200-pair chunk boundary" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+    const registry = helpers.TEST_REGISTRY;
+
+    // 205 labels queried; every 50th has a holder at its current version,
+    // including one past the chunk boundary.
+    const total: usize = 205;
+    var canonical_bufs: [total][66]u8 = undefined;
+    var cids: [total][]const u8 = undefined;
+    var regs: [total]Address = undefined;
+    var seeded: usize = 0;
+    for (0..total) |i| {
+        const canonical_id: u256 = (@as(u256, 0x5555) << 224) | (@as(u256, i + 1) << 32);
+        cids[i] = try std.fmt.bufPrint(&canonical_bufs[i], "0x{x:0>64}", .{canonical_id});
+        regs[i] = registry;
+        if (i % 50 == 0) {
+            const lbl = VersionedLabel.init(canonical_id);
+            try roles.upsertEACRole(database, .v2, &lbl.v0, helpers.TEST_OWNER_1, "0x0001", 1000, helpers.randomHash(), 0, registry);
+            try roles.upsertEACRole(database, .v2, &lbl.v2, helpers.TEST_OWNER_2, "0x0001", 2000, helpers.randomHash(), 0, registry);
+            seeded += 1;
+        }
+    }
+
+    const rows = try roles.getLabelRoleHolderCountsForLabels(database, .v2, &cids, &regs, allocator);
+    defer roles.freeLabelRoleHolderCountRows(allocator, rows);
+    try testing.expectEqual(seeded, rows.len);
+    try expectBatchMatchesPoint(database, rows, &cids, &regs);
+    try testing.expectEqual(@as(u64, 1), holderCountFor(rows, cids[200], registry).?);
 }

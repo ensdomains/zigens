@@ -10,6 +10,7 @@ const parser = common.parser;
 const pagination = common.pagination;
 const builders = @import("../builders/builders.zig");
 const loaders = common.loaders;
+const domain_resolvers = @import("domain.zig");
 const NestedContext = builders.NestedContext;
 
 fn mapRegistrationOrderBy(order_by: ?[]const u8) db.EventSortField {
@@ -32,17 +33,51 @@ const ParsedRegistrationFilter = struct {
     expiry_lt: ?i64 = null,
     expiry_lte: ?i64 = null,
     chain: ?models.Protocol = null,
+    and_filters: ?[]ParsedRegistrationFilter = null,
+    or_filters: ?[]ParsedRegistrationFilter = null,
 
     pub fn deinit(self: *ParsedRegistrationFilter, allocator: std.mem.Allocator) void {
         if (self.registrant_in) |s| allocator.free(s);
+        if (self.and_filters) |group| {
+            for (group) |*c| c.deinit(allocator);
+            allocator.free(group);
+        }
+        if (self.or_filters) |group| {
+            for (group) |*c| c.deinit(allocator);
+            allocator.free(group);
+        }
     }
 };
 
 fn parseRegistrationWhere(field: *const parser.Field, allocator: std.mem.Allocator) !ParsedRegistrationFilter {
+    const where_args = common.getObjectArg(field, "where") orelse return ParsedRegistrationFilter{};
+    return parseRegWhereArgs(where_args, allocator);
+}
+
+/// Parse a RegistrationFilter argument list (top-level `where:` or a nested `and`/`or`
+/// element) into a `ParsedRegistrationFilter`. Recursive for the boolean groups.
+fn parseRegWhereArgs(where_args: []const parser.Argument, allocator: std.mem.Allocator) anyerror!ParsedRegistrationFilter {
     var out = ParsedRegistrationFilter{};
     errdefer out.deinit(allocator);
-    const where_args = common.getObjectArg(field, "where") orelse return out;
     for (where_args) |a| {
+        if ((std.mem.eql(u8, a.name, "and") or std.mem.eql(u8, a.name, "or")) and a.value == .list) {
+            const is_and = std.mem.eql(u8, a.name, "and");
+            var group: std.ArrayList(ParsedRegistrationFilter) = .empty;
+            errdefer {
+                for (group.items) |*c| c.deinit(allocator);
+                group.deinit(allocator);
+            }
+            for (a.value.list) |item| {
+                if (item == .object) try group.append(allocator, try parseRegWhereArgs(item.object, allocator));
+            }
+            const slice = try group.toOwnedSlice(allocator);
+            if (is_and) {
+                out.and_filters = slice;
+            } else {
+                out.or_filters = slice;
+            }
+            continue;
+        }
         if (std.mem.eql(u8, a.name, "protocol") and a.value == .string) {
             out.chain = models.Protocol.fromString(a.value.string) catch return error.InvalidProtocol;
             continue;
@@ -58,6 +93,29 @@ fn parseRegistrationWhere(field: *const parser.Field, allocator: std.mem.Allocat
             common.matchIntArg(a, "expiryDate_lte", &out.expiry_lte);
     }
     return out;
+}
+
+/// Map a parsed registration filter node to storage `RegistrationFilterOptions`,
+/// recursively translating the `and`/`or` groups. Allocations are request-arena-backed.
+fn toRegFilter(p: *const ParsedRegistrationFilter, allocator: std.mem.Allocator) anyerror!db.RegistrationFilterOptions {
+    return db.RegistrationFilterOptions{
+        .protocol = p.chain,
+        .registrant = p.registrant,
+        .registrant_in = p.registrant_in,
+        .expiry_gt = p.expiry_gt,
+        .expiry_gte = p.expiry_gte,
+        .expiry_lt = p.expiry_lt,
+        .expiry_lte = p.expiry_lte,
+        .and_group = try mapRegGroup(p.and_filters, allocator),
+        .or_group = try mapRegGroup(p.or_filters, allocator),
+    };
+}
+
+fn mapRegGroup(group: ?[]const ParsedRegistrationFilter, allocator: std.mem.Allocator) anyerror!?[]const db.RegistrationFilterOptions {
+    const children = group orelse return null;
+    const arr = try allocator.alloc(db.RegistrationFilterOptions, children.len);
+    for (children, 0..) |*c, i| arr[i] = try toRegFilter(c, allocator);
+    return arr;
 }
 
 /// Resolver for registrationConnection query (cursor-based pagination)
@@ -93,6 +151,8 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
         .expiry_gte = parsed.expiry_gte,
         .expiry_lt = parsed.expiry_lt,
         .expiry_lte = parsed.expiry_lte,
+        .and_group = try mapRegGroup(parsed.and_filters, allocator),
+        .or_group = try mapRegGroup(parsed.or_filters, allocator),
     };
 
     // Check which top-level fields are requested (for totalCount-only fast path)
@@ -165,9 +225,9 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
     const events = try database.getRegistrations(fetch_filter);
     defer {
         for (events) |*event| {
-            event.deinit(allocator);
+            event.deinit(database.allocator);
         }
-        allocator.free(events);
+        database.allocator.free(events);
     }
 
     // We fetched `params.limit + 1` to detect a trailing page; if we actually got
@@ -181,6 +241,11 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
     }
 
     const items_slice = events[0..actual_items];
+
+    // Page-batch the nested domain rows + resolver records/texts so the
+    // per-row handlers serve them from memory (the domains-list treatment;
+    // without this, domain{resolver{text}} pays point queries per row).
+    domain_resolvers.prefetchDomainsForEventPage(database, allocator, ctx.loaders, items_slice, node_selections);
 
     // Wrapper type for registrations
     const RegistrationWithSelections = struct {
@@ -218,6 +283,7 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
                 .depth = 0,
                 .allocator = allocator,
                 .loaders = ctx.loaders,
+                .resolve = null, // list context: live resolution is single-name only, never per-row
             },
             .id = id,
         };
@@ -242,7 +308,7 @@ pub fn resolveRegistrationConnection(ctx: parser.ExecutionContext, field: *const
     defer connection.deinit(allocator);
 
     // Build JSON from connection
-    var json: std.ArrayList(u8) = .{};
+    var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);
 
     try json.appendSlice(allocator, "{\"pageInfo\":{");
@@ -332,22 +398,29 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
         .expiry_gte = parsed.expiry_gte,
         .expiry_lt = parsed.expiry_lt,
         .expiry_lte = parsed.expiry_lte,
+        .and_group = try mapRegGroup(parsed.and_filters, allocator),
+        .or_group = try mapRegGroup(parsed.or_filters, allocator),
     });
     defer {
         for (events_result) |*event| {
-            event.deinit(allocator);
+            event.deinit(database.allocator);
         }
-        allocator.free(events_result);
+        database.allocator.free(events_result);
     }
 
     // Data is sorted by SQL for all paths now
     // Build JSON, applying skip
-    var json: std.ArrayList(u8) = .{};
+    var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);
 
     try json.appendSlice(allocator, "[");
     const start_idx: usize = @min(@as(usize, @intCast(skip)), events_result.len);
     const end_idx: usize = @min(start_idx + @as(usize, @intCast(first)), events_result.len);
+
+    // Page-batch the nested domain rows + resolver records/texts (see the
+    // connection path / domains list for rationale).
+    domain_resolvers.prefetchDomainsForEventPage(database, allocator, ctx.loaders, events_result[start_idx..end_idx], field.selections);
+
     for (events_result[start_idx..end_idx], 0..) |*event, i| {
         if (i > 0) try json.appendSlice(allocator, ",");
 
@@ -356,6 +429,7 @@ pub fn resolveRegistrations(ctx: parser.ExecutionContext, field: *const parser.F
             .depth = 0,
             .allocator = allocator,
             .loaders = ctx.loaders,
+            .resolve = null, // list context: live resolution is single-name only, never per-row
         });
         defer allocator.free(reg_json);
         try json.appendSlice(allocator, reg_json);

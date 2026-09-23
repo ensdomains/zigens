@@ -29,10 +29,6 @@ pub const ContractKind = models.EACContractKind;
 /// which is exactly this value.
 pub const ALL_ROLES: u256 = 0x1111111111111111111111111111111111111111111111111111111111111111;
 
-/// `ADMIN_ROLES` mask from `EACBaseRolesLib` — only the upper 128 bits (the 32
-/// admin nybbles) set.
-pub const ADMIN_ROLES: u256 = 0x1111111111111111111111111111111100000000000000000000000000000000;
-
 /// Number of admin role nybbles / the bit shift separating a regular role from
 /// its admin counterpart.
 const ADMIN_SHIFT: u9 = 128;
@@ -50,19 +46,21 @@ const RoleSlot = struct {
     admin_only: bool = false,
 };
 
-/// Resolver role slots — from `PermissionedResolverLib.sol`.
-/// Nybble index = bit offset / 4 (e.g. `1 << 24` → nybble 6).
+/// Resolver role slots — from `PermissionedResolverLib.sol` of the record-model
+/// PermissionedResolver (contracts-v2 migration_new_names, Sepolia 2026-09-03).
+/// Nybble index = bit offset / 4 (e.g. `1 << 24` → nybble 6). Name-scoped
+/// roles no longer exist: every role is granted on ROOT (all names) or on a
+/// setter-argument resource (see ResourceArgument).
 const RESOLVER_ROLES = [_]RoleSlot{
-    .{ .name = "SET_ADDR", .nybble = 0 }, // 1 << 0
+    .{ .name = "SET_ADDRESS", .nybble = 0 }, // 1 << 0
     .{ .name = "SET_TEXT", .nybble = 1 }, // 1 << 4
     .{ .name = "SET_CONTENTHASH", .nybble = 2 }, // 1 << 8
-    .{ .name = "SET_PUBKEY", .nybble = 3 }, // 1 << 12
-    .{ .name = "SET_ABI", .nybble = 4 }, // 1 << 16
-    .{ .name = "SET_INTERFACE", .nybble = 5 }, // 1 << 20
-    .{ .name = "SET_NAME", .nybble = 6 }, // 1 << 24
-    .{ .name = "SET_ALIAS", .nybble = 7 }, // 1 << 28
-    .{ .name = "CLEAR", .nybble = 8 }, // 1 << 32
-    .{ .name = "SET_DATA", .nybble = 9 }, // 1 << 36
+    .{ .name = "SET_ABI", .nybble = 3 }, // 1 << 12
+    .{ .name = "SET_INTERFACE", .nybble = 4 }, // 1 << 16
+    .{ .name = "SET_NAME", .nybble = 5 }, // 1 << 20
+    .{ .name = "SET_DATA", .nybble = 6 }, // 1 << 24
+    .{ .name = "LINK", .nybble = 7 }, // 1 << 28
+    .{ .name = "CAN_NAME", .nybble = 30 }, // 1 << 120
     .{ .name = "UPGRADE", .nybble = 31 }, // 1 << 124
 };
 
@@ -134,7 +132,7 @@ pub fn parseBitmap(hex: []const u8) !u256 {
 /// Caller owns the returned slice and each contained string; free with
 /// `freePermissions`.
 pub fn decode(allocator: std.mem.Allocator, bitmap: u256, kind: ContractKind) ![]const []const u8 {
-    var list: std.ArrayList([]const u8) = .{};
+    var list: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (list.items) |item| allocator.free(item);
         list.deinit(allocator);
@@ -226,15 +224,14 @@ test "decode resolver ALL_ROLES (live Sepolia 0x11..11) yields all resolver perm
     const perms = try decode(allocator, ALL_ROLES, .resolver);
     defer freePermissions(allocator, perms);
 
-    // 11 named resolver slots → 11 regular + 11 admin = 22 names.
-    try testing.expectEqual(@as(usize, 22), perms.len);
+    // 10 named resolver slots → 10 regular + 10 admin = 20 names.
+    try testing.expectEqual(@as(usize, 20), perms.len);
     try expectPerms(&.{
-        "SET_ADDR",         "SET_TEXT",            "SET_CONTENTHASH", "SET_PUBKEY",
-        "SET_ABI",          "SET_INTERFACE",       "SET_NAME",        "SET_ALIAS",
-        "CLEAR",            "SET_DATA",            "UPGRADE",         "SET_ADDR_ADMIN",
-        "SET_NAME_ADMIN",   "UPGRADE_ADMIN",       "SET_DATA_ADMIN",  "CLEAR_ADMIN",
-        "SET_ALIAS_ADMIN",  "SET_ABI_ADMIN",       "SET_TEXT_ADMIN",  "SET_CONTENTHASH_ADMIN",
-        "SET_PUBKEY_ADMIN", "SET_INTERFACE_ADMIN",
+        "SET_ADDRESS",           "SET_TEXT",      "SET_CONTENTHASH",     "SET_ABI",
+        "SET_INTERFACE",         "SET_NAME",      "SET_DATA",            "LINK",
+        "CAN_NAME",              "UPGRADE",       "SET_ADDRESS_ADMIN",   "SET_TEXT_ADMIN",
+        "SET_CONTENTHASH_ADMIN", "SET_ABI_ADMIN", "SET_INTERFACE_ADMIN", "SET_NAME_ADMIN",
+        "SET_DATA_ADMIN",        "LINK_ADMIN",    "CAN_NAME_ADMIN",      "UPGRADE_ADMIN",
     }, perms);
 }
 
@@ -273,19 +270,19 @@ test "decode registry CAN_TRANSFER: regular nybble 7 emits nothing, admin nybble
     }
 }
 
-test "decode resolver single regular role SET_ADDR" {
+test "decode resolver single regular role SET_ADDRESS" {
     const allocator = testing.allocator;
-    // ROLE_SET_ADDR = 1 << 0
+    // ROLE_SET_ADDRESS = 1 << 0
     const perms = try decode(allocator, 1 << 0, .resolver);
     defer freePermissions(allocator, perms);
-    try expectPerms(&.{"SET_ADDR"}, perms);
+    try expectPerms(&.{"SET_ADDRESS"}, perms);
 }
 
-test "decode resolver SET_NAME lives at nybble 6 (1 << 24)" {
+test "decode resolver SET_DATA lives at nybble 6 (1 << 24) and LINK at nybble 7" {
     const allocator = testing.allocator;
-    const perms = try decode(allocator, 1 << 24, .resolver);
+    const perms = try decode(allocator, (1 << 24) | (1 << 28), .resolver);
     defer freePermissions(allocator, perms);
-    try expectPerms(&.{"SET_NAME"}, perms);
+    try expectPerms(&.{ "SET_DATA", "LINK" }, perms);
 }
 
 test "decode registry SET_RESOLVER lives at nybble 6 (1 << 24) — same bit, different name" {
@@ -317,7 +314,7 @@ test "decode counts > 1 in a nybble still names the role once" {
     // Nybble 0 with count = 3 (binary 0011) — contract stores assignee counts.
     const perms = try decode(allocator, 0x3, .resolver);
     defer freePermissions(allocator, perms);
-    try expectPerms(&.{"SET_ADDR"}, perms);
+    try expectPerms(&.{"SET_ADDRESS"}, perms);
 }
 
 test "decode empty bitmap yields no permissions" {
@@ -336,11 +333,11 @@ test "decode unknown contract falls back to generic ROLE_<n> identifiers" {
 
 test "decode resolver ignores set-but-undefined nybbles (only named roles emitted)" {
     const allocator = testing.allocator;
-    // SET_ADDR (nybble 0, known) + nybble 15 (undefined on resolver) → only SET_ADDR.
+    // SET_ADDRESS (nybble 0, known) + nybble 15 (undefined on resolver) → only SET_ADDR.
     const bitmap: u256 = (1 << 0) | (@as(u256, 1) << (15 * 4));
     const perms = try decode(allocator, bitmap, .resolver);
     defer freePermissions(allocator, perms);
-    try expectPerms(&.{"SET_ADDR"}, perms);
+    try expectPerms(&.{"SET_ADDRESS"}, perms);
 }
 
 test "decode unknown contract ALL_ROLES emits all 64 generic identifiers" {
@@ -362,5 +359,5 @@ test "decodeHex round-trips the stored fixed-width ALL_ROLES form" {
     const allocator = testing.allocator;
     const perms = try decodeHex(allocator, "0x1111111111111111111111111111111111111111111111111111111111111111", .resolver);
     defer freePermissions(allocator, perms);
-    try testing.expectEqual(@as(usize, 22), perms.len);
+    try testing.expectEqual(@as(usize, 20), perms.len);
 }

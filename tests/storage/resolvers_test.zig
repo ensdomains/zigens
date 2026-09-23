@@ -494,7 +494,7 @@ test "deleteResolverPubkeys clears pubkey" {
     }
 
     // Delete
-    try resolvers.deleteResolverPubkeys(database, nh, helpers.TEST_RESOLVER);
+    try resolvers.deleteResolverPubkeys(database, .v2, nh, helpers.TEST_RESOLVER);
 
     const result = try resolvers.getPubkeyRecord(database, helpers.TEST_RESOLVER, nh);
     try testing.expect(result == null);
@@ -549,7 +549,7 @@ test "deleteResolverAbis clears all ABI records" {
     try resolvers.storeResolverABI(database, nh, helpers.TEST_RESOLVER, 1, .v2, 1000, tx_hash, 1700000000);
     try resolvers.storeResolverABI(database, nh, helpers.TEST_RESOLVER, 2, .v2, 1000, tx_hash, 1700000000);
 
-    try resolvers.deleteResolverAbis(database, nh, helpers.TEST_RESOLVER);
+    try resolvers.deleteResolverAbis(database, .v2, nh, helpers.TEST_RESOLVER);
 
     const content_types = try resolvers.getAbiContentTypes(database, helpers.TEST_RESOLVER, nh);
     defer allocator.free(content_types);
@@ -617,7 +617,7 @@ test "deleteResolverNames clears reverse name" {
     const tx_hash = helpers.randomHash();
 
     try resolvers.storeResolverName(database, nh, helpers.TEST_RESOLVER, "name.eth", .v2, 1000, tx_hash, 1700000000);
-    try resolvers.deleteResolverNames(database, nh, helpers.TEST_RESOLVER);
+    try resolvers.deleteResolverNames(database, .v2, nh, helpers.TEST_RESOLVER);
 
     const result = try resolvers.getReverseNameRecord(database, helpers.TEST_RESOLVER, nh);
     try testing.expect(result == null);
@@ -702,7 +702,7 @@ test "deleteResolverInterfaces clears all interfaces" {
     try resolvers.storeResolverInterface(database, nh, helpers.TEST_RESOLVER, "0x01ffc9a7", "0xaaaa", .v2, 1000, tx_hash, 1700000000);
     try resolvers.storeResolverInterface(database, nh, helpers.TEST_RESOLVER, "0x3b3b57de", "0xbbbb", .v2, 1000, tx_hash, 1700000000);
 
-    try resolvers.deleteResolverInterfaces(database, nh, helpers.TEST_RESOLVER);
+    try resolvers.deleteResolverInterfaces(database, .v2, nh, helpers.TEST_RESOLVER);
 
     const ifaces = try resolvers.getInterfaceRecords(database, helpers.TEST_RESOLVER, nh);
     defer allocator.free(ifaces);
@@ -771,7 +771,7 @@ test "deleteResolverAddresses clears all addresses for namehash" {
     try resolvers.storeResolverAddress(database, nh, helpers.TEST_RESOLVER, 60, "0xeth", .v2, 1000, tx_hash, 1700000000);
     try resolvers.storeResolverAddress(database, nh, helpers.TEST_RESOLVER, 0, "bc1q", .v2, 1000, tx_hash, 1700000000);
 
-    try resolvers.deleteResolverAddresses(database, nh, helpers.TEST_RESOLVER);
+    try resolvers.deleteResolverAddresses(database, .v2, nh, helpers.TEST_RESOLVER);
 
     const addresses = try resolvers.getAddressRecords(database, helpers.TEST_RESOLVER, nh);
     defer allocator.free(addresses);
@@ -788,7 +788,7 @@ test "deleteResolverContentHash clears contenthash" {
     const tx_hash = helpers.randomHash();
 
     try resolvers.storeResolverContentHash(database, nh, helpers.TEST_RESOLVER, "ipfs://Qm123", .v2, 1000, tx_hash, 1700000000);
-    try resolvers.deleteResolverContentHash(database, nh, helpers.TEST_RESOLVER);
+    try resolvers.deleteResolverContentHash(database, .v2, nh, helpers.TEST_RESOLVER);
 
     const result = try resolvers.getContentHashRecord(database, helpers.TEST_RESOLVER, nh);
     try testing.expect(result == null);
@@ -805,7 +805,7 @@ test "deleteResolverTexts clears all text records" {
     try resolvers.storeResolverText(database, nh, helpers.TEST_RESOLVER, "avatar", "img.png", .v2, 1000, tx_hash, 1700000000);
     try resolvers.storeResolverText(database, nh, helpers.TEST_RESOLVER, "url", "https://x.com", .v2, 1000, tx_hash, 1700000000);
 
-    try resolvers.deleteResolverTexts(database, nh, helpers.TEST_RESOLVER);
+    try resolvers.deleteResolverTexts(database, .v2, nh, helpers.TEST_RESOLVER);
 
     const keys = try resolvers.getTextRecordKeys(database, helpers.TEST_RESOLVER, nh);
     defer allocator.free(keys);
@@ -1062,4 +1062,987 @@ test "getFilteredNameCount with resolver filter" {
     );
 
     try testing.expectEqual(@as(usize, 2), count);
+}
+
+// ============================================================================
+// Resolver approvals (the Approved event's write path, stored with context=""
+// so the UNIQUE key conflicts and re-indexing stays idempotent — SQL NULLs
+// never conflict). Readers use portable NULL-or-equal context matching
+// (`context IS ?` is SQLite-only; PostgreSQL rejects it).
+// ============================================================================
+
+test "resolver approvals: upsert + revoke flip in place and read back" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const resolver = helpers.TEST_RESOLVER;
+    const delegate = helpers.TEST_OWNER_2;
+    const nh = helpers.randomHash();
+
+    try database.upsertResolverApproval(.v2, resolver, nh, "", delegate, true, 100, helpers.randomHash(), 0);
+    try testing.expect(try database.isApprovedFor(.v2, resolver, nh, "", delegate));
+
+    // Revoke: same (protocol,resolver,namehash,context,delegate) key — must
+    // UPDATE the row, not insert a second one.
+    try database.upsertResolverApproval(.v2, resolver, nh, "", delegate, false, 101, helpers.randomHash(), 1);
+    try testing.expect(!try database.isApprovedFor(.v2, resolver, nh, "", delegate));
+
+    const approvals = try database.getApprovalsForName(.v2, nh, null);
+    defer {
+        for (approvals) |*a| a.deinit(allocator);
+        allocator.free(approvals);
+    }
+    try testing.expectEqual(@as(usize, 1), approvals.len);
+    try testing.expect(!approvals[0].approved);
+    try testing.expectEqualStrings("", approvals[0].context.?);
+}
+
+test "resolver approvals: context filter matches exactly; null means any" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const resolver = helpers.TEST_RESOLVER;
+    const delegate = helpers.TEST_OWNER_2;
+    const nh = helpers.randomHash();
+
+    try database.upsertResolverApproval(.v2, resolver, nh, "", delegate, true, 100, helpers.randomHash(), 0);
+    try database.upsertResolverApproval(.v2, resolver, nh, "ctx-a", delegate, true, 101, helpers.randomHash(), 1);
+
+    try testing.expect(try database.isApprovedFor(.v2, resolver, nh, "ctx-a", delegate));
+    try testing.expect(!try database.isApprovedFor(.v2, resolver, nh, "ctx-b", delegate));
+
+    const all = try database.getApprovalsForName(.v2, nh, null);
+    defer {
+        for (all) |*a| a.deinit(allocator);
+        allocator.free(all);
+    }
+    try testing.expectEqual(@as(usize, 2), all.len);
+
+    const only_a = try database.getApprovalsForName(.v2, nh, "ctx-a");
+    defer {
+        for (only_a) |*a| a.deinit(allocator);
+        allocator.free(only_a);
+    }
+    try testing.expectEqual(@as(usize, 1), only_a.len);
+}
+
+test "named resources: upsert per (resolver,resource) updates in place; reader orders by block" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const resolver = helpers.TEST_RESOLVER;
+    const res_a = "0x00000000000000000000000000000000000000000000000000000000000000a1";
+    const res_b = "0x00000000000000000000000000000000000000000000000000000000000000b2";
+
+    try database.upsertNamedResource(.v2, resolver, res_a, "text", "url", -1, "alice.eth", 100, helpers.randomHash(), 0);
+    // Re-announce of the same resource (e.g. re-index): updates, no second row.
+    try database.upsertNamedResource(.v2, resolver, res_a, "text", "url", -1, "alice.eth", 100, helpers.randomHash(), 0);
+    try database.upsertNamedResource(.v2, resolver, res_b, "addr", "", 60, "bob.eth", 101, helpers.randomHash(), 1);
+
+    const rows = try database.getNamedResources(allocator, .v2, resolver);
+    defer {
+        for (rows) |*r| r.deinit(allocator);
+        allocator.free(rows);
+    }
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings(res_a, rows[0].resource);
+    try testing.expectEqualStrings("text", rows[0].record_kind);
+    try testing.expectEqualStrings("url", rows[0].record_key);
+    try testing.expectEqualStrings("alice.eth", rows[0].name);
+    try testing.expectEqual(@as(i64, -1), rows[0].coin_type);
+    try testing.expectEqualStrings("addr", rows[1].record_kind);
+    try testing.expectEqual(@as(i64, 60), rows[1].coin_type);
+}
+
+// ============================================================================
+// PAIR BATCH READERS — CHUNK BOUNDARY
+// ============================================================================
+
+test "pair batch readers cross the chunk boundary and the tracked-bind cap" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // 210 pairs: two chunks at RECORD_BATCH_CHUNK=200, and far past the
+    // 32-tracked-string bind cap that the static-bind path must avoid — a
+    // regression to copied binds fails this test with TooManyBoundParams.
+    const total = 210;
+    const resolver = helpers.TEST_RESOLVER;
+    const tx = helpers.randomHash();
+
+    var pair_resolvers: [total]Address = undefined;
+    var pair_namehashes: [total]Hash = undefined;
+    for (0..total) |i| {
+        var nh = Hash{ .bytes = [_]u8{0} ** 32 };
+        nh.bytes[31] = @intCast(i & 0xFF);
+        nh.bytes[30] = @intCast(i >> 8);
+        nh.bytes[0] = 0xBC;
+        pair_resolvers[i] = resolver;
+        pair_namehashes[i] = nh;
+        if (i % 3 == 0) {
+            try resolvers.storeResolverAddress(database, nh, resolver, 60, "0x1111111111111111111111111111111111111111", .v2, 100, tx, 1700000000);
+            try resolvers.storeResolverAddress(database, nh, resolver, 0, "0x2222222222222222222222222222222222222222", .v2, 100, tx, 1700000000);
+            try resolvers.storeResolverText(database, nh, resolver, "avatar", "https://example.com/a.png", .v2, 100, tx, 1700000000);
+            try resolvers.storeResolverContentHash(database, nh, resolver, "0xe301", .v2, 100, tx, 1700000000);
+        }
+    }
+    const seeded = 70; // i in 0..210 with i % 3 == 0
+
+    const ct_rows = try resolvers.getCoinTypesForPairs(database, &pair_resolvers, &pair_namehashes);
+    defer {
+        for (ct_rows) |row| {
+            database.allocator.free(row.resolver);
+            database.allocator.free(row.namehash);
+        }
+        database.allocator.free(ct_rows);
+    }
+    try testing.expectEqual(@as(usize, seeded * 2), ct_rows.len);
+
+    const key_rows = try resolvers.getTextRecordKeysForPairs(database, &pair_resolvers, &pair_namehashes);
+    defer {
+        for (key_rows) |row| {
+            database.allocator.free(row.resolver);
+            database.allocator.free(row.namehash);
+            database.allocator.free(row.key);
+        }
+        database.allocator.free(key_rows);
+    }
+    try testing.expectEqual(@as(usize, seeded), key_rows.len);
+
+    const addr_rows = try resolvers.getAddressRecordsBatch(database, &pair_resolvers, &pair_namehashes, 60);
+    defer {
+        for (addr_rows) |*row| row.deinit(database.allocator);
+        database.allocator.free(addr_rows);
+    }
+    try testing.expectEqual(@as(usize, seeded), addr_rows.len);
+
+    const txt_rows = try resolvers.getTextRecordsBatch(database, &pair_resolvers, &pair_namehashes, "avatar");
+    defer {
+        for (txt_rows) |*row| row.deinit(database.allocator);
+        database.allocator.free(txt_rows);
+    }
+    try testing.expectEqual(@as(usize, seeded), txt_rows.len);
+
+    const ch_rows = try resolvers.getContentHashesBatch(database, &pair_resolvers, &pair_namehashes);
+    defer {
+        for (ch_rows) |*row| row.deinit(database.allocator);
+        database.allocator.free(ch_rows);
+    }
+    try testing.expectEqual(@as(usize, seeded), ch_rows.len);
+
+    // A seeded pair in the SECOND chunk (index 207 > 200) must reproduce the
+    // point query exactly: same coin types, same ascending order.
+    const last_nh = pair_namehashes[207];
+    const point = try resolvers.getCoinTypes(database, resolver, last_nh);
+    defer database.allocator.free(point);
+    try testing.expectEqual(@as(usize, 2), point.len);
+    try testing.expectEqual(@as(u64, 0), point[0]);
+    try testing.expectEqual(@as(u64, 60), point[1]);
+
+    const last_hex = try last_nh.toHex(allocator);
+    defer allocator.free(last_hex);
+    var batched_cts: [4]u64 = undefined;
+    var batched_n: usize = 0;
+    for (ct_rows) |row| {
+        if (std.mem.eql(u8, row.namehash, last_hex)) {
+            batched_cts[batched_n] = row.coin_type;
+            batched_n += 1;
+        }
+    }
+    try testing.expectEqual(point.len, batched_n);
+    for (point, batched_cts[0..batched_n]) |p, b| try testing.expectEqual(p, b);
+
+    // Exhaustive equivalence: for EVERY requested pair, the batched rows must
+    // reproduce the point queries exactly — same values, same order, same
+    // presence/absence — across all five readers.
+    for (pair_namehashes) |nh| {
+        const hex = try nh.toHex(allocator);
+        defer allocator.free(hex);
+
+        const p_cts = try resolvers.getCoinTypes(database, resolver, nh);
+        defer database.allocator.free(p_cts);
+        var ct_got: usize = 0;
+        for (ct_rows) |row| {
+            if (!std.mem.eql(u8, row.namehash, hex)) continue;
+            try testing.expect(ct_got < p_cts.len);
+            try testing.expectEqual(p_cts[ct_got], row.coin_type);
+            ct_got += 1;
+        }
+        try testing.expectEqual(p_cts.len, ct_got);
+
+        const p_keys = try resolvers.getTextRecordKeys(database, resolver, nh);
+        defer {
+            for (p_keys) |k| database.allocator.free(k);
+            database.allocator.free(p_keys);
+        }
+        var key_got: usize = 0;
+        for (key_rows) |row| {
+            if (!std.mem.eql(u8, row.namehash, hex)) continue;
+            try testing.expect(key_got < p_keys.len);
+            try testing.expectEqualStrings(p_keys[key_got], row.key);
+            key_got += 1;
+        }
+        try testing.expectEqual(p_keys.len, key_got);
+
+        const p_addr = try resolvers.getAddressRecord(database, resolver, nh, 60);
+        defer if (p_addr) |v| database.allocator.free(v);
+        var addr_match: ?[]const u8 = null;
+        for (addr_rows) |row| {
+            if (std.mem.eql(u8, row.namehash, hex)) addr_match = row.value;
+        }
+        if (p_addr) |v| {
+            try testing.expectEqualStrings(v, addr_match orelse return error.MissingBatchedRow);
+        } else {
+            try testing.expectEqual(@as(?[]const u8, null), addr_match);
+        }
+
+        const p_txt = try resolvers.getTextRecord(database, resolver, nh, "avatar");
+        defer if (p_txt) |v| database.allocator.free(v);
+        var txt_match: ?[]const u8 = null;
+        for (txt_rows) |row| {
+            if (std.mem.eql(u8, row.namehash, hex)) txt_match = row.value;
+        }
+        if (p_txt) |v| {
+            try testing.expectEqualStrings(v, txt_match orelse return error.MissingBatchedRow);
+        } else {
+            try testing.expectEqual(@as(?[]const u8, null), txt_match);
+        }
+
+        const p_ch = try resolvers.getContentHashRecord(database, resolver, nh);
+        defer if (p_ch) |v| database.allocator.free(v);
+        var ch_match: ?[]const u8 = null;
+        for (ch_rows) |row| {
+            if (std.mem.eql(u8, row.namehash, hex)) ch_match = row.value;
+        }
+        if (p_ch) |v| {
+            try testing.expectEqualStrings(v, ch_match orelse return error.MissingBatchedRow);
+        } else {
+            try testing.expectEqual(@as(?[]const u8, null), ch_match);
+        }
+    }
+}
+
+// ============================================================================
+// RECORD-MODEL RESOLVERS — links + read-side indirection
+// ============================================================================
+
+const resolver_records = lib.storage.resolver_records;
+
+fn recNode(n: u8) Hash {
+    var h = Hash{ .bytes = [_]u8{0} ** 32 };
+    h.bytes[31] = n;
+    h.bytes[0] = 0xAC;
+    return h;
+}
+
+test "record resolver: own record, shared record, default record, unlink and legacy fallback" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const resolver = Address{ .bytes = [_]u8{0xDD} ** 20 };
+    const legacy = Address{ .bytes = [_]u8{0xEE} ** 20 };
+    const tx = helpers.randomHash();
+    const rk1 = resolver_records.recordKey(1);
+    const rk2 = resolver_records.recordKey(2);
+
+    // carol -> record 1 (own), erin -> record 1 (shared via linkToRecord),
+    // default (node 0x0) -> record 2, dave has no link, frank was unlinked (0).
+    try resolver_records.upsertResolverLink(database, .v2, resolver, recNode(1), 1, "carol.eth", 100, tx, 0, 1700000000);
+    try resolver_records.upsertResolverLink(database, .v2, resolver, recNode(3), 1, "erin.eth", 101, tx, 1, 1700000001);
+    try resolver_records.upsertResolverLink(database, .v2, resolver, Hash.zero, 2, "", 102, tx, 2, 1700000002);
+    try resolver_records.upsertResolverLink(database, .v2, resolver, recNode(4), 1, "frank.eth", 103, tx, 3, 1700000003);
+    try resolver_records.upsertResolverLink(database, .v2, resolver, recNode(4), 0, "frank.eth", 104, tx, 4, 1700000004);
+
+    // Values live under the synthetic record keys.
+    try resolvers.storeResolverText(database, rk1, resolver, "avatar", "https://r1/a.png", .v2, 105, tx, 1700000005);
+    try resolvers.storeResolverText(database, rk1, resolver, "url", "https://r1", .v2, 105, tx, 1700000005);
+    try resolvers.storeResolverAddress(database, rk1, resolver, 60, "0x1111111111111111111111111111111111111111", .v2, 105, tx, 1700000005);
+    try resolvers.storeResolverContentHash(database, rk1, resolver, "0xe301r1", .v2, 105, tx, 1700000005);
+    try resolvers.storeResolverText(database, rk2, resolver, "avatar", "https://default/a.png", .v2, 106, tx, 1700000006);
+    try resolvers.storeResolverAddress(database, rk2, resolver, 0, "0xbtc", .v2, 106, tx, 1700000006);
+    // A legacy node-keyed resolver row for dave on a different resolver.
+    try resolvers.storeResolverText(database, recNode(2), legacy, "avatar", "https://legacy/a.png", .v2, 107, tx, 1700000007);
+
+    // resolveRecordKey mirrors the contract's _record(node).
+    try testing.expect((try resolver_records.resolveRecordKey(database, resolver, recNode(1))).eql(rk1));
+    try testing.expect((try resolver_records.resolveRecordKey(database, resolver, recNode(3))).eql(rk1));
+    try testing.expect((try resolver_records.resolveRecordKey(database, resolver, recNode(2))).eql(rk2)); // no link -> default
+    try testing.expect((try resolver_records.resolveRecordKey(database, resolver, recNode(4))).eql(rk2)); // unlinked -> default
+    try testing.expect((try resolver_records.resolveRecordKey(database, resolver, Hash.zero)).eql(rk2));
+    try testing.expect((try resolver_records.resolveRecordKey(database, legacy, recNode(2))).eql(recNode(2))); // legacy passthrough
+    try testing.expectEqual(@as(?u256, 1), try resolver_records.getEffectiveRecordId(database, resolver, recNode(3)));
+    try testing.expectEqual(@as(?u256, 2), try resolver_records.getEffectiveRecordId(database, resolver, recNode(4)));
+    try testing.expectEqual(@as(?u256, null), try resolver_records.getEffectiveRecordId(database, legacy, recNode(2)));
+
+    // Point reads go through the indirection.
+    const carol_keys = try resolvers.getTextRecordKeys(database, resolver, recNode(1));
+    defer {
+        for (carol_keys) |k| database.allocator.free(k);
+        database.allocator.free(carol_keys);
+    }
+    try testing.expectEqual(@as(usize, 2), carol_keys.len);
+    try testing.expectEqualStrings("avatar", carol_keys[0]);
+    const erin_avatar = (try resolvers.getTextRecord(database, resolver, recNode(3), "avatar")).?;
+    defer database.allocator.free(erin_avatar);
+    try testing.expectEqualStrings("https://r1/a.png", erin_avatar);
+    const dave_avatar = (try resolvers.getTextRecord(database, resolver, recNode(2), "avatar")).?;
+    defer database.allocator.free(dave_avatar);
+    try testing.expectEqualStrings("https://default/a.png", dave_avatar);
+    const legacy_avatar = (try resolvers.getTextRecord(database, legacy, recNode(2), "avatar")).?;
+    defer database.allocator.free(legacy_avatar);
+    try testing.expectEqualStrings("https://legacy/a.png", legacy_avatar);
+    const carol_addr = (try resolvers.getAddressRecord(database, resolver, recNode(1), 60)).?;
+    defer database.allocator.free(carol_addr);
+    try testing.expectEqualStrings("0x1111111111111111111111111111111111111111", carol_addr);
+    try testing.expectEqual(@as(?[]u8, null), try resolvers.getAddressRecord(database, resolver, recNode(2), 60));
+    const dave_cts = try resolvers.getCoinTypes(database, resolver, recNode(2));
+    defer database.allocator.free(dave_cts);
+    try testing.expectEqual(@as(usize, 1), dave_cts.len);
+    try testing.expectEqual(@as(u64, 0), dave_cts[0]);
+    const carol_ch = (try resolvers.getContentHashRecord(database, resolver, recNode(1))).?;
+    defer database.allocator.free(carol_ch);
+    try testing.expectEqualStrings("0xe301r1", carol_ch);
+
+    // Batch sweeps: rows come back keyed by the REQUESTED namehash, one copy
+    // per requester of a shared record, defaults applied, legacy untouched.
+    const pair_resolvers = [_]Address{ resolver, resolver, resolver, resolver, legacy };
+    const pair_namehashes = [_]Hash{ recNode(1), recNode(3), recNode(2), recNode(4), recNode(2) };
+    const key_rows = try resolvers.getTextRecordKeysForPairs(database, &pair_resolvers, &pair_namehashes);
+    defer {
+        for (key_rows) |row| {
+            database.allocator.free(row.resolver);
+            database.allocator.free(row.namehash);
+            database.allocator.free(row.key);
+        }
+        database.allocator.free(key_rows);
+    }
+    var counts = [_]usize{0} ** 5;
+    for (key_rows) |row| {
+        for (pair_resolvers, pair_namehashes, 0..) |r, h, i| {
+            var rb: [42]u8 = undefined;
+            var hb: [66]u8 = undefined;
+            if (std.mem.eql(u8, row.resolver, r.toHexBuf(&rb)) and std.mem.eql(u8, row.namehash, h.toHexBuf(&hb))) counts[i] += 1;
+        }
+    }
+    try testing.expectEqual([_]usize{ 2, 2, 1, 1, 1 }, counts);
+
+    const ct_rows = try resolvers.getCoinTypesForPairs(database, &pair_resolvers, &pair_namehashes);
+    defer {
+        for (ct_rows) |row| {
+            database.allocator.free(row.resolver);
+            database.allocator.free(row.namehash);
+        }
+        database.allocator.free(ct_rows);
+    }
+    try testing.expectEqual(@as(usize, 4), ct_rows.len); // carol 60, erin 60, dave 0, frank 0
+
+    const addr_rows = try resolvers.getAddressRecordsBatch(database, &pair_resolvers, &pair_namehashes, 60);
+    defer {
+        for (addr_rows) |*row| row.deinit(database.allocator);
+        database.allocator.free(addr_rows);
+    }
+    try testing.expectEqual(@as(usize, 2), addr_rows.len);
+
+    const txt_rows = try resolvers.getTextRecordsBatch(database, &pair_resolvers, &pair_namehashes, "avatar");
+    defer {
+        for (txt_rows) |*row| row.deinit(database.allocator);
+        database.allocator.free(txt_rows);
+    }
+    try testing.expectEqual(@as(usize, 5), txt_rows.len);
+
+    const ch_rows = try resolvers.getContentHashesBatch(database, &pair_resolvers, &pair_namehashes);
+    defer {
+        for (ch_rows) |*row| row.deinit(database.allocator);
+        database.allocator.free(ch_rows);
+    }
+    try testing.expectEqual(@as(usize, 2), ch_rows.len);
+
+    // Batched translation agrees with the point translation.
+    var keys: [5]Hash = undefined;
+    try testing.expect(try resolver_records.resolveRecordKeys(database, &pair_resolvers, &pair_namehashes, &keys));
+    try testing.expect(keys[0].eql(rk1) and keys[1].eql(rk1) and keys[2].eql(rk2) and keys[3].eql(rk2) and keys[4].eql(recNode(2)));
+    const legacy_only = [_]Address{legacy};
+    const legacy_nh = [_]Hash{recNode(2)};
+    var one: [1]Hash = undefined;
+    try testing.expect(!try resolver_records.resolveRecordKeys(database, &legacy_only, &legacy_nh, &one));
+
+    // Sharing view.
+    const linked = try resolver_records.getLinkedNames(database, allocator, resolver, 1);
+    defer {
+        for (linked) |*l| l.deinit(allocator);
+        allocator.free(linked);
+    }
+    try testing.expectEqual(@as(usize, 2), linked.len);
+    try testing.expectEqualStrings("carol.eth", linked[0].name);
+    try testing.expectEqualStrings("erin.eth", linked[1].name);
+}
+
+test "record resolver: data records, resolver kind, and reverse-name lookup through a link" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const resolver = Address{ .bytes = [_]u8{0xDD} ** 20 };
+    const tx = helpers.randomHash();
+    const rk1 = resolver_records.recordKey(1);
+    try resolver_records.upsertResolverLink(database, .v2, resolver, recNode(1), 1, "carol.eth", 100, tx, 0, 1700000000);
+
+    try resolver_records.storeResolverData(database, rk1, resolver, "blob", "0xdeadbeef", .v2, 101, tx, 1700000001);
+    const v = (try resolver_records.getDataRecord(database, resolver, recNode(1), "blob")).?;
+    defer database.allocator.free(v);
+    try testing.expectEqualStrings("0xdeadbeef", v);
+    const keys = try resolver_records.getDataKeys(database, resolver, recNode(1));
+    defer {
+        for (keys) |k| database.allocator.free(k);
+        database.allocator.free(keys);
+    }
+    try testing.expectEqual(@as(usize, 1), keys.len);
+    try resolver_records.deleteResolverData(database, .v2, rk1, resolver, "blob");
+    try testing.expectEqual(@as(?[]u8, null), try resolver_records.getDataRecord(database, resolver, recNode(1), "blob"));
+
+    try testing.expectEqual(@as(?[]u8, null), try resolver_records.getResolverKind(database, resolver));
+    try resolver_records.upsertResolverKind(database, .v2, resolver, "record", 99, tx, 0, 1700000000);
+    const kind = (try resolver_records.getResolverKind(database, resolver)).?;
+    defer database.allocator.free(kind);
+    try testing.expectEqualStrings("record", kind);
+
+    // NameUpdated stores name() under the record key; the primary-name path
+    // asks by the reverse node and must find it through the link.
+    try resolvers.storeResolverName(database, rk1, resolver, "carol.eth", .v2, 102, tx, 1700000002);
+    const primary = (try resolvers.getLatestNameByNamehash(database, recNode(1))).?;
+    defer database.allocator.free(primary);
+    try testing.expectEqualStrings("carol.eth", primary);
+    const rev = (try resolvers.getReverseNameRecord(database, resolver, recNode(1))).?;
+    defer database.allocator.free(rev);
+    try testing.expectEqualStrings("carol.eth", rev);
+}
+
+// ============================================================================
+// PAIR BATCH READERS — POINT-QUERY MIRRORS
+// ============================================================================
+
+fn isPairRow(row: anytype, r_hex: []const u8, nh_hex: []const u8) bool {
+    return std.mem.eql(u8, row.resolver, r_hex) and std.mem.eql(u8, row.namehash, nh_hex);
+}
+
+/// Rows must arrive sorted by (resolver, namehash), which makes each pair's
+/// rows contiguous — the property the API loader regroups on.
+fn expectPairOrder(rows: anytype) !void {
+    if (rows.len < 2) return;
+    for (rows[0 .. rows.len - 1], rows[1..]) |a, b| {
+        const by_resolver = std.mem.order(u8, a.resolver, b.resolver);
+        if (by_resolver == .gt) return error.RowsOutOfOrder;
+        if (by_resolver == .eq and std.mem.order(u8, a.namehash, b.namehash) == .gt) return error.RowsOutOfOrder;
+    }
+}
+
+fn expectAddressMirror(allocator: std.mem.Allocator, database: *Database, rows: []const resolvers.PairAddressRow, resolver: Address, nh: Hash) !void {
+    const r_hex = try resolver.toHex(allocator);
+    defer allocator.free(r_hex);
+    const nh_hex = try nh.toHex(allocator);
+    defer allocator.free(nh_hex);
+    const point = try resolvers.getAddressRecords(database, resolver, nh);
+    defer {
+        for (point) |*p| p.deinit(database.allocator);
+        database.allocator.free(point);
+    }
+    var got: usize = 0;
+    for (rows) |row| {
+        if (!isPairRow(row, r_hex, nh_hex)) continue;
+        try testing.expect(got < point.len);
+        try testing.expectEqual(point[got].coin_type, row.coin_type);
+        try testing.expectEqualStrings(point[got].address, row.address);
+        got += 1;
+    }
+    try testing.expectEqual(point.len, got);
+}
+
+fn expectPubkeyMirror(allocator: std.mem.Allocator, database: *Database, rows: []const resolvers.PairPubkeyRow, resolver: Address, nh: Hash) !void {
+    const r_hex = try resolver.toHex(allocator);
+    defer allocator.free(r_hex);
+    const nh_hex = try nh.toHex(allocator);
+    defer allocator.free(nh_hex);
+    var point = try resolvers.getPubkeyRecord(database, resolver, nh);
+    defer if (point) |*p| p.deinit(database.allocator);
+    var got: usize = 0;
+    for (rows) |row| {
+        if (!isPairRow(row, r_hex, nh_hex)) continue;
+        try testing.expect(point != null);
+        try testing.expectEqualStrings(point.?.x, row.x);
+        try testing.expectEqualStrings(point.?.y, row.y);
+        got += 1;
+    }
+    try testing.expectEqual(@as(usize, if (point != null) 1 else 0), got);
+}
+
+fn expectAbiMirror(allocator: std.mem.Allocator, database: *Database, rows: []const resolvers.PairAbiRow, resolver: Address, nh: Hash) !void {
+    const r_hex = try resolver.toHex(allocator);
+    defer allocator.free(r_hex);
+    const nh_hex = try nh.toHex(allocator);
+    defer allocator.free(nh_hex);
+    const point = try resolvers.getAbiContentTypes(database, resolver, nh);
+    defer database.allocator.free(point);
+    var got: usize = 0;
+    for (rows) |row| {
+        if (!isPairRow(row, r_hex, nh_hex)) continue;
+        try testing.expect(got < point.len);
+        try testing.expectEqual(point[got], row.content_type);
+        got += 1;
+    }
+    try testing.expectEqual(point.len, got);
+}
+
+fn expectReverseNameMirror(allocator: std.mem.Allocator, database: *Database, rows: []const resolvers.PairReverseNameRow, resolver: Address, nh: Hash) !void {
+    const r_hex = try resolver.toHex(allocator);
+    defer allocator.free(r_hex);
+    const nh_hex = try nh.toHex(allocator);
+    defer allocator.free(nh_hex);
+    const point = try resolvers.getReverseNameRecord(database, resolver, nh);
+    defer if (point) |p| database.allocator.free(p);
+    var got: usize = 0;
+    for (rows) |row| {
+        if (!isPairRow(row, r_hex, nh_hex)) continue;
+        try testing.expect(point != null);
+        try testing.expectEqualStrings(point.?, row.name);
+        got += 1;
+    }
+    try testing.expectEqual(@as(usize, if (point != null) 1 else 0), got);
+}
+
+fn expectInterfaceMirror(allocator: std.mem.Allocator, database: *Database, rows: []const resolvers.PairInterfaceRow, resolver: Address, nh: Hash) !void {
+    const r_hex = try resolver.toHex(allocator);
+    defer allocator.free(r_hex);
+    const nh_hex = try nh.toHex(allocator);
+    defer allocator.free(nh_hex);
+    const point = try resolvers.getInterfaceRecords(database, resolver, nh);
+    defer {
+        for (point) |*p| p.deinit(database.allocator);
+        database.allocator.free(point);
+    }
+    var got: usize = 0;
+    for (rows) |row| {
+        if (!isPairRow(row, r_hex, nh_hex)) continue;
+        try testing.expect(got < point.len);
+        try testing.expectEqualStrings(point[got].interface_id, row.interface_id);
+        try testing.expectEqualStrings(point[got].implementer, row.implementer);
+        got += 1;
+    }
+    try testing.expectEqual(point.len, got);
+}
+
+fn expectVersionMirror(allocator: std.mem.Allocator, database: *Database, rows: []const resolvers.PairVersionRow, resolver: Address, nh: Hash) !void {
+    const r_hex = try resolver.toHex(allocator);
+    defer allocator.free(r_hex);
+    const nh_hex = try nh.toHex(allocator);
+    defer allocator.free(nh_hex);
+    const point = try resolvers.getNodeRecordVersion(database, resolver, nh);
+    var got: usize = 0;
+    for (rows) |row| {
+        if (!isPairRow(row, r_hex, nh_hex)) continue;
+        try testing.expect(point != null);
+        try testing.expectEqual(@as(i64, @intCast(point.?)), row.version);
+        got += 1;
+    }
+    try testing.expectEqual(@as(usize, if (point != null) 1 else 0), got);
+}
+
+fn expectAliasMirror(allocator: std.mem.Allocator, database: *Database, rows: []const resolvers.ResolverAliasRow, resolver: Address) !void {
+    const r_hex = try resolver.toHex(allocator);
+    defer allocator.free(r_hex);
+    const point = try resolvers.getResolverAliases(database, resolver);
+    defer {
+        for (point) |*p| p.deinit(database.allocator);
+        database.allocator.free(point);
+    }
+    var got: usize = 0;
+    for (rows) |row| {
+        if (!std.mem.eql(u8, row.resolver, r_hex)) continue;
+        try testing.expect(got < point.len);
+        try testing.expectEqualStrings(point[got].from_name, row.from_name);
+        try testing.expectEqualStrings(point[got].to_name, row.to_name);
+        got += 1;
+    }
+    try testing.expectEqual(point.len, got);
+}
+
+test "getAddressRecordsForPairs regroups to getAddressRecords per pair" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const r1 = helpers.TEST_RESOLVER;
+    const r2 = helpers.TEST_OWNER_2;
+    const nh1 = try namehash_fn(allocator, "one.eth");
+    const nh2 = try namehash_fn(allocator, "two.eth");
+    const nh3 = try namehash_fn(allocator, "empty.eth");
+    const tx = helpers.randomHash();
+
+    try resolvers.storeResolverAddress(database, nh1, r1, 501, "sol-one", .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverAddress(database, nh1, r1, 60, "0xeth-one", .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverAddress(database, nh1, r1, 0, "bc1-one", .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverAddress(database, nh2, r1, 60, "0xeth-two", .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverAddress(database, nh2, r1, 2, "ltc-two", .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverAddress(database, nh1, r2, 60, "0xeth-one-r2", .v2, 100, tx, 1700000000);
+
+    const in_r = [_]Address{ r1, r1, r1, r2, r1 };
+    const in_nh = [_]Hash{ nh1, nh2, nh3, nh1, nh1 };
+    const rows = try resolvers.getAddressRecordsForPairs(database, &in_r, &in_nh);
+    defer resolvers.freePairAddressRows(database.allocator, rows);
+
+    try testing.expectEqual(@as(usize, 6), rows.len);
+    try expectPairOrder(rows);
+    try expectAddressMirror(allocator, database, rows, r1, nh1);
+    try expectAddressMirror(allocator, database, rows, r1, nh2);
+    try expectAddressMirror(allocator, database, rows, r1, nh3);
+    try expectAddressMirror(allocator, database, rows, r2, nh1);
+    try expectAddressMirror(allocator, database, rows, r2, nh2);
+
+    const none = try resolvers.getAddressRecordsForPairs(database, &.{}, &.{});
+    defer resolvers.freePairAddressRows(database.allocator, none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "getPubkeysForPairs regroups to getPubkeyRecord per pair" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const r1 = helpers.TEST_RESOLVER;
+    const r2 = helpers.TEST_OWNER_2;
+    const nh1 = try namehash_fn(allocator, "one.eth");
+    const nh2 = try namehash_fn(allocator, "two.eth");
+    const nh3 = try namehash_fn(allocator, "empty.eth");
+    const tx = helpers.randomHash();
+
+    try resolvers.storeResolverPubkey(database, nh1, r1, "0x01", "0x02", .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverPubkey(database, nh1, r1, "0x11", "0x12", .v2, 200, tx, 1700000100);
+    try resolvers.storeResolverPubkey(database, nh2, r1, "0x21", "0x22", .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverPubkey(database, nh1, r2, "0x31", "0x32", .v2, 100, tx, 1700000000);
+
+    const in_r = [_]Address{ r1, r1, r2, r1, r1 };
+    const in_nh = [_]Hash{ nh1, nh3, nh1, nh2, nh1 };
+    const rows = try resolvers.getPubkeysForPairs(database, &in_r, &in_nh);
+    defer resolvers.freePairPubkeyRows(database.allocator, rows);
+
+    try testing.expectEqual(@as(usize, 3), rows.len);
+    try expectPairOrder(rows);
+    try expectPubkeyMirror(allocator, database, rows, r1, nh1);
+    try expectPubkeyMirror(allocator, database, rows, r1, nh2);
+    try expectPubkeyMirror(allocator, database, rows, r1, nh3);
+    try expectPubkeyMirror(allocator, database, rows, r2, nh1);
+    try expectPubkeyMirror(allocator, database, rows, r2, nh2);
+}
+
+test "getAbiContentTypesForPairs regroups to getAbiContentTypes per pair" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const r1 = helpers.TEST_RESOLVER;
+    const r2 = helpers.TEST_OWNER_2;
+    const nh1 = try namehash_fn(allocator, "one.eth");
+    const nh2 = try namehash_fn(allocator, "two.eth");
+    const nh3 = try namehash_fn(allocator, "empty.eth");
+    const tx = helpers.randomHash();
+
+    try resolvers.storeResolverABI(database, nh1, r1, 8, .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverABI(database, nh1, r1, 1, .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverABI(database, nh1, r1, 4, .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverABI(database, nh2, r1, 2, .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverABI(database, nh1, r2, 1, .v2, 100, tx, 1700000000);
+
+    const in_r = [_]Address{ r1, r2, r1, r1, r1 };
+    const in_nh = [_]Hash{ nh1, nh1, nh1, nh2, nh3 };
+    const rows = try resolvers.getAbiContentTypesForPairs(database, &in_r, &in_nh);
+    defer resolvers.freePairAbiRows(database.allocator, rows);
+
+    try testing.expectEqual(@as(usize, 5), rows.len);
+    try expectPairOrder(rows);
+    try expectAbiMirror(allocator, database, rows, r1, nh1);
+    try expectAbiMirror(allocator, database, rows, r1, nh2);
+    try expectAbiMirror(allocator, database, rows, r1, nh3);
+    try expectAbiMirror(allocator, database, rows, r2, nh1);
+    try expectAbiMirror(allocator, database, rows, r2, nh2);
+}
+
+test "getReverseNamesForPairs regroups to getReverseNameRecord per pair" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const r1 = helpers.TEST_RESOLVER;
+    const r2 = helpers.TEST_OWNER_2;
+    const nh1 = try namehash_fn(allocator, "one.eth");
+    const nh2 = try namehash_fn(allocator, "two.eth");
+    const nh3 = try namehash_fn(allocator, "empty.eth");
+    const tx = helpers.randomHash();
+
+    try resolvers.storeResolverName(database, nh1, r1, "old.eth", .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverName(database, nh1, r1, "alice.eth", .v2, 200, tx, 1700000100);
+    try resolvers.storeResolverName(database, nh2, r1, "bob.eth", .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverName(database, nh1, r2, "carol.eth", .v2, 100, tx, 1700000000);
+
+    const in_r = [_]Address{ r1, r1, r1, r2, r1 };
+    const in_nh = [_]Hash{ nh2, nh1, nh3, nh1, nh2 };
+    const rows = try resolvers.getReverseNamesForPairs(database, &in_r, &in_nh);
+    defer resolvers.freePairReverseNameRows(database.allocator, rows);
+
+    try testing.expectEqual(@as(usize, 3), rows.len);
+    try expectPairOrder(rows);
+    try expectReverseNameMirror(allocator, database, rows, r1, nh1);
+    try expectReverseNameMirror(allocator, database, rows, r1, nh2);
+    try expectReverseNameMirror(allocator, database, rows, r1, nh3);
+    try expectReverseNameMirror(allocator, database, rows, r2, nh1);
+    try expectReverseNameMirror(allocator, database, rows, r2, nh2);
+}
+
+test "getInterfaceRecordsForPairs regroups to getInterfaceRecords per pair" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const r1 = helpers.TEST_RESOLVER;
+    const r2 = helpers.TEST_OWNER_2;
+    const nh1 = try namehash_fn(allocator, "one.eth");
+    const nh2 = try namehash_fn(allocator, "two.eth");
+    const nh3 = try namehash_fn(allocator, "empty.eth");
+    const tx = helpers.randomHash();
+
+    try resolvers.storeResolverInterface(database, nh1, r1, "0xf1cb7e06", "0xcccc", .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverInterface(database, nh1, r1, "0x01ffc9a7", "0xaaaa", .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverInterface(database, nh1, r1, "0x3b3b57de", "0xbbbb", .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverInterface(database, nh2, r1, "0x01ffc9a7", "0xdddd", .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverInterface(database, nh1, r2, "0x01ffc9a7", "0xeeee", .v2, 100, tx, 1700000000);
+
+    const in_r = [_]Address{ r2, r1, r1, r1, r1 };
+    const in_nh = [_]Hash{ nh1, nh1, nh2, nh1, nh3 };
+    const rows = try resolvers.getInterfaceRecordsForPairs(database, &in_r, &in_nh);
+    defer resolvers.freePairInterfaceRows(database.allocator, rows);
+
+    try testing.expectEqual(@as(usize, 5), rows.len);
+    try expectPairOrder(rows);
+    try expectInterfaceMirror(allocator, database, rows, r1, nh1);
+    try expectInterfaceMirror(allocator, database, rows, r1, nh2);
+    try expectInterfaceMirror(allocator, database, rows, r1, nh3);
+    try expectInterfaceMirror(allocator, database, rows, r2, nh1);
+    try expectInterfaceMirror(allocator, database, rows, r2, nh2);
+}
+
+test "getNodeRecordVersionsForPairs regroups to getNodeRecordVersion per pair" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const r1 = helpers.TEST_RESOLVER;
+    const r2 = helpers.TEST_OWNER_2;
+    const nh1 = try namehash_fn(allocator, "one.eth");
+    const nh2 = try namehash_fn(allocator, "two.eth");
+    const nh3 = try namehash_fn(allocator, "empty.eth");
+    const tx = helpers.randomHash();
+
+    try resolvers.storeResolverVersion(database, nh1, r1, 1, .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverVersion(database, nh1, r1, 3, .v2, 200, tx, 1700000100);
+    try resolvers.storeResolverVersion(database, nh2, r1, 1, .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverVersion(database, nh1, r2, 7, .v2, 100, tx, 1700000000);
+
+    const in_r = [_]Address{ r1, r1, r1, r2, r1 };
+    const in_nh = [_]Hash{ nh1, nh2, nh1, nh1, nh3 };
+    const rows = try resolvers.getNodeRecordVersionsForPairs(database, &in_r, &in_nh);
+    defer resolvers.freePairVersionRows(database.allocator, rows);
+
+    try testing.expectEqual(@as(usize, 3), rows.len);
+    try expectPairOrder(rows);
+    try expectVersionMirror(allocator, database, rows, r1, nh1);
+    try expectVersionMirror(allocator, database, rows, r1, nh2);
+    try expectVersionMirror(allocator, database, rows, r1, nh3);
+    try expectVersionMirror(allocator, database, rows, r2, nh1);
+    try expectVersionMirror(allocator, database, rows, r2, nh2);
+}
+
+test "getResolverAliasesForResolvers regroups to getResolverAliases per resolver" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const r1 = helpers.TEST_RESOLVER;
+    const r2 = helpers.TEST_OWNER_2;
+    const r3 = helpers.TEST_OWNER_1;
+    const tx = helpers.randomHash();
+
+    try resolvers.storeResolverAlias(database, r1, "zed.eth", "target-z.eth", .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverAlias(database, r1, "alpha.eth", "target-a.eth", .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverAlias(database, r1, "mid.eth", "target-m.eth", .v2, 100, tx, 1700000000);
+    try resolvers.storeResolverAlias(database, r1, "alpha.eth", "target-a2.eth", .v2, 200, tx, 1700000100);
+    try resolvers.storeResolverAlias(database, r2, "solo.eth", "target-s.eth", .v2, 100, tx, 1700000000);
+
+    const in_r = [_]Address{ r2, r1, r3, r1 };
+    const rows = try resolvers.getResolverAliasesForResolvers(database, &in_r);
+    defer resolvers.freeResolverAliasRows(database.allocator, rows);
+
+    try testing.expectEqual(@as(usize, 4), rows.len);
+    if (rows.len >= 2) {
+        for (rows[0 .. rows.len - 1], rows[1..]) |a, b| {
+            const by_resolver = std.mem.order(u8, a.resolver, b.resolver);
+            try testing.expect(by_resolver != .gt);
+            if (by_resolver == .eq) try testing.expect(std.mem.order(u8, a.from_name, b.from_name) != .gt);
+        }
+    }
+    try expectAliasMirror(allocator, database, rows, r1);
+    try expectAliasMirror(allocator, database, rows, r2);
+    try expectAliasMirror(allocator, database, rows, r3);
+
+    const none = try resolvers.getResolverAliasesForResolvers(database, &.{});
+    defer resolvers.freeResolverAliasRows(database.allocator, none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "pair batch point-query mirrors cross the chunk boundary" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // 250 distinct pairs (and 250 distinct alias resolvers): two chunks at
+    // RECORD_BATCH_CHUNK=200 and far past the 32-tracked-string bind cap.
+    const total = 250;
+    const resolver = helpers.TEST_RESOLVER;
+    const tx = helpers.randomHash();
+
+    var pair_resolvers: [total]Address = undefined;
+    var pair_namehashes: [total]Hash = undefined;
+    var alias_resolvers: [total]Address = undefined;
+    for (0..total) |i| {
+        var nh = Hash{ .bytes = [_]u8{0} ** 32 };
+        nh.bytes[31] = @intCast(i & 0xFF);
+        nh.bytes[30] = @intCast(i >> 8);
+        nh.bytes[0] = 0xBD;
+        var ar = Address{ .bytes = [_]u8{0} ** 20 };
+        ar.bytes[19] = @intCast(i & 0xFF);
+        ar.bytes[18] = @intCast(i >> 8);
+        ar.bytes[0] = 0xAB;
+        pair_resolvers[i] = resolver;
+        pair_namehashes[i] = nh;
+        alias_resolvers[i] = ar;
+        if (i % 2 != 0) continue;
+        try resolvers.storeResolverAddress(database, nh, resolver, 60, "0x1111111111111111111111111111111111111111", .v2, 100, tx, 1700000000);
+        try resolvers.storeResolverAddress(database, nh, resolver, 0, "0x2222222222222222222222222222222222222222", .v2, 100, tx, 1700000000);
+        try resolvers.storeResolverPubkey(database, nh, resolver, "0xaa", "0xbb", .v2, 100, tx, 1700000000);
+        try resolvers.storeResolverABI(database, nh, resolver, 4, .v2, 100, tx, 1700000000);
+        try resolvers.storeResolverABI(database, nh, resolver, 1, .v2, 100, tx, 1700000000);
+        try resolvers.storeResolverName(database, nh, resolver, "chunk.eth", .v2, 100, tx, 1700000000);
+        try resolvers.storeResolverInterface(database, nh, resolver, "0x3b3b57de", "0xbbbb", .v2, 100, tx, 1700000000);
+        try resolvers.storeResolverInterface(database, nh, resolver, "0x01ffc9a7", "0xaaaa", .v2, 100, tx, 1700000000);
+        try resolvers.storeResolverVersion(database, nh, resolver, @intCast(i), .v2, 100, tx, 1700000000);
+        try resolvers.storeResolverAlias(database, ar, "b.eth", "to-b.eth", .v2, 100, tx, 1700000000);
+        try resolvers.storeResolverAlias(database, ar, "a.eth", "to-a.eth", .v2, 100, tx, 1700000000);
+    }
+    const seeded = 125;
+
+    const addr_rows = try resolvers.getAddressRecordsForPairs(database, &pair_resolvers, &pair_namehashes);
+    defer resolvers.freePairAddressRows(database.allocator, addr_rows);
+    try testing.expectEqual(@as(usize, seeded * 2), addr_rows.len);
+    try expectPairOrder(addr_rows);
+
+    const pk_rows = try resolvers.getPubkeysForPairs(database, &pair_resolvers, &pair_namehashes);
+    defer resolvers.freePairPubkeyRows(database.allocator, pk_rows);
+    try testing.expectEqual(@as(usize, seeded), pk_rows.len);
+    try expectPairOrder(pk_rows);
+
+    const abi_rows = try resolvers.getAbiContentTypesForPairs(database, &pair_resolvers, &pair_namehashes);
+    defer resolvers.freePairAbiRows(database.allocator, abi_rows);
+    try testing.expectEqual(@as(usize, seeded * 2), abi_rows.len);
+    try expectPairOrder(abi_rows);
+
+    const name_rows = try resolvers.getReverseNamesForPairs(database, &pair_resolvers, &pair_namehashes);
+    defer resolvers.freePairReverseNameRows(database.allocator, name_rows);
+    try testing.expectEqual(@as(usize, seeded), name_rows.len);
+    try expectPairOrder(name_rows);
+
+    const iface_rows = try resolvers.getInterfaceRecordsForPairs(database, &pair_resolvers, &pair_namehashes);
+    defer resolvers.freePairInterfaceRows(database.allocator, iface_rows);
+    try testing.expectEqual(@as(usize, seeded * 2), iface_rows.len);
+    try expectPairOrder(iface_rows);
+
+    const ver_rows = try resolvers.getNodeRecordVersionsForPairs(database, &pair_resolvers, &pair_namehashes);
+    defer resolvers.freePairVersionRows(database.allocator, ver_rows);
+    try testing.expectEqual(@as(usize, seeded), ver_rows.len);
+    try expectPairOrder(ver_rows);
+
+    const alias_rows = try resolvers.getResolverAliasesForResolvers(database, &alias_resolvers);
+    defer resolvers.freeResolverAliasRows(database.allocator, alias_rows);
+    try testing.expectEqual(@as(usize, seeded * 2), alias_rows.len);
+
+    for (pair_namehashes, alias_resolvers) |nh, ar| {
+        try expectAddressMirror(allocator, database, addr_rows, resolver, nh);
+        try expectPubkeyMirror(allocator, database, pk_rows, resolver, nh);
+        try expectAbiMirror(allocator, database, abi_rows, resolver, nh);
+        try expectReverseNameMirror(allocator, database, name_rows, resolver, nh);
+        try expectInterfaceMirror(allocator, database, iface_rows, resolver, nh);
+        try expectVersionMirror(allocator, database, ver_rows, resolver, nh);
+        try expectAliasMirror(allocator, database, alias_rows, ar);
+    }
+}
+
+test "record resolver: the pair batch readers translate record keys like their point readers" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const resolver = Address{ .bytes = [_]u8{0xDD} ** 20 };
+    const legacy = Address{ .bytes = [_]u8{0xEE} ** 20 };
+    const tx = helpers.randomHash();
+    const rk1 = resolver_records.recordKey(1);
+    const rk2 = resolver_records.recordKey(2);
+
+    // carol -> record 1 (own), erin -> record 1 (shared), default -> record 2,
+    // dave has no link (default), legacy resolver keeps node-keyed rows.
+    try resolver_records.upsertResolverLink(database, .v2, resolver, recNode(1), 1, "carol.eth", 100, tx, 0, 1700000000);
+    try resolver_records.upsertResolverLink(database, .v2, resolver, recNode(3), 1, "erin.eth", 101, tx, 1, 1700000001);
+    try resolver_records.upsertResolverLink(database, .v2, resolver, Hash.zero, 2, "", 102, tx, 2, 1700000002);
+
+    try resolvers.storeResolverAddress(database, rk1, resolver, 60, "0x1111111111111111111111111111111111111111", .v2, 105, tx, 1700000005);
+    try resolvers.storeResolverAddress(database, rk1, resolver, 0, "0xbtc1", .v2, 105, tx, 1700000005);
+    try resolvers.storeResolverAddress(database, rk2, resolver, 0, "0xbtc2", .v2, 106, tx, 1700000006);
+    try resolvers.storeResolverPubkey(database, rk1, resolver, "0x01", "0x02", .v2, 105, tx, 1700000005);
+    try resolvers.storeResolverABI(database, rk1, resolver, 8, .v2, 105, tx, 1700000005);
+    try resolvers.storeResolverABI(database, rk1, resolver, 1, .v2, 105, tx, 1700000005);
+    try resolvers.storeResolverName(database, rk2, resolver, "default.eth", .v2, 106, tx, 1700000006);
+    try resolvers.storeResolverInterface(database, rk1, resolver, "0x9061b923", "0x0000000000000000000000000000000000000001", .v2, 105, tx, 1700000005);
+    try resolvers.storeResolverVersion(database, rk1, resolver, 3, .v2, 105, tx, 1700000005);
+    try resolvers.storeResolverAddress(database, recNode(2), legacy, 60, "0x2222222222222222222222222222222222222222", .v2, 107, tx, 1700000007);
+
+    const pair_resolvers = [_]Address{ resolver, resolver, resolver, legacy };
+    const pair_namehashes = [_]Hash{ recNode(1), recNode(3), recNode(2), recNode(2) };
+
+    const addr_rows = try resolvers.getAddressRecordsForPairs(database, &pair_resolvers, &pair_namehashes);
+    defer resolvers.freePairAddressRows(database.allocator, addr_rows);
+    for (pair_resolvers, pair_namehashes) |r, nh| try expectAddressMirror(allocator, database, addr_rows, r, nh);
+    // carol 2 rows, erin 2 rows (shared record), dave 1 row (default), legacy 1 row.
+    try testing.expectEqual(@as(usize, 6), addr_rows.len);
+
+    const pk_rows = try resolvers.getPubkeysForPairs(database, &pair_resolvers, &pair_namehashes);
+    defer resolvers.freePairPubkeyRows(database.allocator, pk_rows);
+    for (pair_resolvers, pair_namehashes) |r, nh| try expectPubkeyMirror(allocator, database, pk_rows, r, nh);
+    try testing.expectEqual(@as(usize, 2), pk_rows.len);
+
+    const abi_rows = try resolvers.getAbiContentTypesForPairs(database, &pair_resolvers, &pair_namehashes);
+    defer resolvers.freePairAbiRows(database.allocator, abi_rows);
+    for (pair_resolvers, pair_namehashes) |r, nh| try expectAbiMirror(allocator, database, abi_rows, r, nh);
+
+    const rn_rows = try resolvers.getReverseNamesForPairs(database, &pair_resolvers, &pair_namehashes);
+    defer resolvers.freePairReverseNameRows(database.allocator, rn_rows);
+    for (pair_resolvers, pair_namehashes) |r, nh| try expectReverseNameMirror(allocator, database, rn_rows, r, nh);
+    try testing.expectEqual(@as(usize, 1), rn_rows.len); // dave via the default record
+
+    const if_rows = try resolvers.getInterfaceRecordsForPairs(database, &pair_resolvers, &pair_namehashes);
+    defer resolvers.freePairInterfaceRows(database.allocator, if_rows);
+    for (pair_resolvers, pair_namehashes) |r, nh| try expectInterfaceMirror(allocator, database, if_rows, r, nh);
+
+    const ver_rows = try resolvers.getNodeRecordVersionsForPairs(database, &pair_resolvers, &pair_namehashes);
+    defer resolvers.freePairVersionRows(database.allocator, ver_rows);
+    for (pair_resolvers, pair_namehashes) |r, nh| try expectVersionMirror(allocator, database, ver_rows, r, nh);
+    try testing.expectEqual(@as(usize, 2), ver_rows.len);
 }

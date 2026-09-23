@@ -1,21 +1,57 @@
 /// Library root module for test imports
 /// Re-exports all components needed for testing
+pub const zsys = @import("utils/system.zig");
 pub const storage = struct {
     pub const database = @import("storage/database.zig");
+    pub const backend = @import("storage/backend.zig");
+    pub const postgres_dialect = @import("storage/drivers/postgres_dialect.zig");
+    pub const postgres = @import("storage/drivers/postgres.zig");
+    pub const sqlite = @import("storage/drivers/sqlite.zig");
     pub const Database = database.Database;
     pub const Query = database.Query;
 
     pub const names = @import("storage/names.zig");
     pub const events = @import("storage/events.zig");
     pub const resolvers = @import("storage/resolvers.zig");
+    pub const resolver_records = @import("storage/resolver_records.zig");
     pub const roles = @import("storage/roles.zig");
     pub const webhooks = @import("storage/webhooks.zig");
     pub const registrations = @import("storage/registrations.zig");
     pub const sync = @import("storage/sync.zig");
+    pub const reorg_undo = @import("storage/reorg_undo.zig");
+    pub const v1_controllers = @import("storage/v1_controllers.zig");
+    pub const unknown_labels = @import("storage/unknown_labels.zig");
+    pub const registry_entries = @import("storage/registry_entries.zig");
+    pub const name_prefetch = @import("storage/name_prefetch.zig");
+    pub const names_registry = @import("storage/names_registry.zig");
+    pub const db_open = @import("storage/db_open.zig");
+    pub const pool = @import("storage/pool.zig");
 };
+
+pub const config = @import("config.zig");
+pub const contracts = @import("contracts.zig");
 
 pub const api = struct {
     pub const eac_roles = @import("api/eac_roles.zig");
+    // Exposed so the conformance harness reaches GraphQLHandler through the SAME
+    // module graph as `lib.Database` (one Database type across the test).
+    pub const handler = @import("api/handler.zig");
+};
+
+/// Resolution layer (Tasks 04-06). Exposed so tests can build a LiveContext / Resolver
+/// and drive the flag-ON live-resolution path against a pre-seeded cache (no network).
+pub const resolve = struct {
+    pub const client = @import("resolve/client.zig");
+    pub const cache = @import("resolve/cache.zig");
+    pub const universal = @import("resolve/universal.zig");
+    pub const primary = @import("resolve/primary.zig");
+};
+pub const rpc = struct {
+    pub const client = @import("rpc/client.zig");
+};
+
+pub const indexer = struct {
+    pub const label_backfill = @import("indexer/label_backfill.zig");
 };
 
 pub const types = struct {

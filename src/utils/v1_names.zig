@@ -5,12 +5,6 @@ const std = @import("std");
 const Hash = @import("../types/hash.zig").Hash;
 const Keccak256 = std.crypto.hash.sha3.Keccak256;
 
-// SQLITE_TRANSIENT - For Zig 0.15.1, we can't use the C constant due to alignment issues
-// Instead, we use null which tells SQLite to make a copy of the string
-inline fn SQLITE_TRANSIENT() @import("../storage/database.zig").c.sqlite3_destructor_type {
-    return null;
-}
-
 /// Runtime keccak256 hash function
 inline fn keccak256Runtime(input: []const u8) [32]u8 {
     var hash: [32]u8 = undefined;
@@ -53,6 +47,21 @@ pub fn computeEthNamehash(label: []const u8) Hash {
     var result: Hash = undefined;
     @memcpy(&result.bytes, &name_node_bytes);
 
+    return result;
+}
+
+/// Namehash of `<label>.<root>` from a precomputed root node — the root-aware
+/// sibling of computeEthNamehash. On .eth networks root_node = namehash("eth");
+/// on Base it is namehash("base.eth"), so registrar/controller 2LDs land under
+/// the right parent.
+pub fn computeChildNamehash(root_node: Hash, label: []const u8) Hash {
+    const label_hash = keccak256Runtime(label);
+    var input: [64]u8 = undefined;
+    @memcpy(input[0..32], &root_node.bytes);
+    @memcpy(input[32..64], &label_hash);
+    const node = keccak256Runtime(&input);
+    var result: Hash = undefined;
+    @memcpy(&result.bytes, &node);
     return result;
 }
 
@@ -118,11 +127,8 @@ pub fn storeTokenIdLabel(
     const db_module = @import("../storage/database.zig");
     const Query = db_module.Query;
 
-    const sql =
-        \\INSERT OR IGNORE INTO v1_labels
-        \\(token_id, label, namehash, first_seen_block, first_seen_tx, source)
-        \\VALUES (?, ?, ?, ?, ?, ?)
-    ;
+    const sql = try db.upsertSql(db.allocator, "v1_labels", &.{ "token_id", "label", "namehash", "first_seen_block", "first_seen_tx", "source" }, .ignore);
+    defer db.allocator.free(sql);
 
     var q = try Query.initCached(db, sql);
     defer q.deinit();
