@@ -1754,3 +1754,62 @@ test "migrated legacy schema matches a fresh schema on expiryDate filters" {
     try testing.expectEqual(expected_lte.len, actual_lte.len);
     for (expected_lte, actual_lte) |want, got| try testing.expectEqualStrings(want, got);
 }
+
+/// True when `name` is a live index. Backend-specific by necessity: the whole
+/// point is to observe whether a schema replay rebuilt it.
+fn indexExists(database: *Database, name: []const u8) !bool {
+    // pg_indexes spans every schema and the PG tests run in isolated ones, so
+    // scope the lookup to the connection's own schema or a sibling test's index
+    // answers for ours.
+    const sql = if (database.isPostgres())
+        "SELECT 1 FROM pg_indexes WHERE indexname = ? AND schemaname = COALESCE(current_schema(), 'public')"
+    else
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?";
+    var q = try lib.storage.Query.init(database, sql);
+    defer q.deinit();
+    try q.bindText(name);
+    return try q.step();
+}
+
+test "loadSchemaFiles recreates a table missing from an existing database" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // The two tables that were added to schema.sql after the original schema and
+    // never got a hand-written CREATE in migrate(): a database that predates them
+    // used to be stuck without them forever, and writing a named resource then
+    // failed the batch on every retry.
+    try database.exec("DROP TABLE IF EXISTS resolver_named_resources");
+    try database.exec("DROP TABLE IF EXISTS replay_status");
+    try testing.expect(!database.hasTable("resolver_named_resources"));
+    try testing.expect(!database.hasTable("replay_status"));
+
+    try database.loadSchemaFiles();
+
+    try testing.expect(database.hasTable("resolver_named_resources"));
+    try testing.expect(database.hasTable("replay_status"));
+    // Idempotent: a second pass finds nothing missing and changes nothing.
+    try database.loadSchemaFiles();
+    try testing.expect(database.hasTable("resolver_named_resources"));
+}
+
+test "loadSchemaFiles leaves dropped indexes alone when no table is missing" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // A bulk sync deliberately drops indexes; a boot in that state must NOT
+    // rebuild them, or the deferred-index strategy pays minutes per restart.
+    try database.exec("DROP INDEX IF EXISTS idx_names_owner");
+    try testing.expect(!try indexExists(database, "idx_names_owner"));
+
+    try database.loadSchemaFiles();
+    try testing.expect(!try indexExists(database, "idx_names_owner"));
+
+    // But a missing TABLE is drift: the replay runs, and the index returns with it.
+    try database.exec("DROP TABLE IF EXISTS replay_status");
+    try database.loadSchemaFiles();
+    try testing.expect(database.hasTable("replay_status"));
+    try testing.expect(try indexExists(database, "idx_names_owner"));
+}

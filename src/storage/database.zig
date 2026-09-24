@@ -557,6 +557,7 @@ pub const Database = struct {
     pub const probeLiveness = sync.probeLiveness;
     pub const ensureSyncPathIndexes = schema.ensureSyncPathIndexes;
     pub const migrate = schema.migrate;
+    pub const loadSchemaFiles = schema.loadSchemaFiles;
     pub const registerSubregistry = sync.registerSubregistry;
     pub const registerResolver = sync.registerResolver;
     pub const registerResolverIfNew = sync.registerResolverIfNew;
