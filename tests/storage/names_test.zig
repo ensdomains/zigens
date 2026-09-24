@@ -1606,3 +1606,210 @@ test "getFilteredNames: token_id and canonical_id exact filters (marketplace tok
         try testing.expectEqual(@as(usize, 0), names.len);
     }
 }
+
+// ============================================================================
+// LEGACY-SCHEMA MIGRATION (generated `expiry_effective` column)
+// ============================================================================
+
+/// Reshape `names` into the pre-`expiry_effective` layout a database created by an
+/// older binary has: drop the index over the generated column, then the column.
+/// Both backends allow this (SQLite >= 3.35 DROP COLUMN, Postgres natively);
+/// SQLite refuses while the index still references it, hence the order.
+fn stripExpiryEffective(database: *Database) !void {
+    try database.exec("DROP INDEX IF EXISTS idx_names_expiry_effective");
+    try database.exec("ALTER TABLE names DROP COLUMN expiry_effective");
+    try testing.expect(!database.columnExistsIncludingGenerated("names", "expiry_effective"));
+}
+
+/// The rows the grace rule distinguishes: the unwrapped v1 .eth 2LD that earns
+/// +7776000, the wrapped v1 and the v2 row that pass through raw, and a near-max
+/// expiry that must not overflow the addition.
+fn seedExpiryShapes(allocator: std.mem.Allocator, database: *Database) !void {
+    try database.insertName(try mkExpiryName(allocator, "plainv1.eth", .v1, 1000, false));
+    try database.insertName(try mkExpiryName(allocator, "wrappedv1.eth", .v1, 1000, true));
+    try database.insertName(try mkExpiryName(allocator, "plainv2.eth", .v2, 1000, false));
+    try database.insertName(try mkExpiryName(allocator, "nearmax.eth", .v1, std.math.maxInt(i64), false));
+}
+
+/// Names matched by `filters`, ordered by the generated column so the sort-field
+/// mapping is exercised alongside the WHERE clauses. Caller owns the result.
+fn expiryDatePage(allocator: std.mem.Allocator, database: *Database, filters: names_storage.NameFilters) ![][]u8 {
+    const rows = try database.getFilteredNames(filters, 0, 100, .asc, .expiry_effective);
+    defer {
+        for (rows) |*n| n.deinit(allocator);
+        allocator.free(rows);
+    }
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |s| allocator.free(s);
+        out.deinit(allocator);
+    }
+    for (rows) |row| try out.append(allocator, try allocator.dupe(u8, row.name orelse ""));
+    return out.toOwnedSlice(allocator);
+}
+
+fn freeExpiryDatePage(allocator: std.mem.Allocator, page: [][]u8) void {
+    for (page) |s| allocator.free(s);
+    allocator.free(page);
+}
+
+fn pageContains(page: [][]u8, name: []const u8) bool {
+    for (page) |entry| {
+        if (std.mem.eql(u8, entry, name)) return true;
+    }
+    return false;
+}
+
+test "migrate adds the generated expiry_effective column to a legacy names table" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    try seedExpiryShapes(allocator, database);
+    try stripExpiryEffective(database);
+
+    // The column is named in LIVE query SQL, so a pre-migration database fails
+    // every expiryDate filter outright — not just the index rebuild.
+    if (database.getFilteredNames(.{ .expiry_date_gt = 0 }, 0, 100, .asc, .name)) |rows| {
+        for (rows) |*n| n.deinit(allocator);
+        allocator.free(rows);
+        return error.ExpectedMissingColumnBeforeMigrate;
+    } else |_| {}
+
+    try database.migrate();
+    try testing.expect(database.columnExistsIncludingGenerated("names", "expiry_effective"));
+
+    // The statement the production log reported as a hard failure.
+    try database.exec("CREATE INDEX IF NOT EXISTS idx_names_expiry_effective ON names(expiry_effective)");
+
+    // Idempotent: a second boot re-runs migrate() over the already-migrated shape.
+    try database.migrate();
+    try testing.expect(database.columnExistsIncludingGenerated("names", "expiry_effective"));
+
+    const page = try expiryDatePage(allocator, database, .{ .expiry_date_gt = 0 });
+    defer freeExpiryDatePage(allocator, page);
+    try testing.expectEqual(@as(usize, 4), page.len);
+}
+
+test "createSyncIndexes skips idx_names_expiry_effective when the column is absent" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    try seedExpiryShapes(allocator, database);
+    try stripExpiryEffective(database);
+
+    // One un-creatable index must not poison the recreate: every other statement
+    // succeeded, so the pass reports success and only warns about this one.
+    try database.createSyncIndexes();
+
+    // And once migrate() supplies the column, the same pass creates it.
+    try database.migrate();
+    try database.createSyncIndexes();
+    try testing.expect(database.columnExistsIncludingGenerated("names", "expiry_effective"));
+}
+
+test "migrated legacy schema matches a fresh schema on expiryDate filters" {
+    const allocator = testing.allocator;
+
+    // Phase 1: fresh schema — the generated column comes from schema.sql.
+    // Sequential, not concurrent: the Postgres lane shares one database and
+    // resets `public` on every createTestDatabase call.
+    var expected_gt: [][]u8 = undefined;
+    var expected_lte: [][]u8 = undefined;
+    {
+        const fresh = try helpers.createTestDatabase(allocator);
+        defer helpers.destroyTestDatabase(allocator, fresh);
+        try seedExpiryShapes(allocator, fresh);
+        expected_gt = try expiryDatePage(allocator, fresh, .{ .expiry_date_gt = 1_000_000 });
+        expected_lte = try expiryDatePage(allocator, fresh, .{ .expiry_date_lte = 1000 });
+    }
+    defer freeExpiryDatePage(allocator, expected_gt);
+    defer freeExpiryDatePage(allocator, expected_lte);
+
+    // The grace rule itself: only the unwrapped v1 .eth 2LD clears 1_000_000 on
+    // its 1000 stored expiry, and the near-max row compares raw (no overflow).
+    try testing.expectEqual(@as(usize, 2), expected_gt.len);
+    try testing.expectEqualStrings("plainv1.eth", expected_gt[0]);
+    try testing.expectEqualStrings("nearmax.eth", expected_gt[1]);
+    // Wrapped v1 + v2 pass through raw, so both still sit at 1000.
+    try testing.expectEqual(@as(usize, 2), expected_lte.len);
+    try testing.expect(pageContains(expected_lte, "wrappedv1.eth"));
+    try testing.expect(pageContains(expected_lte, "plainv2.eth"));
+
+    // Phase 2: the same rows on a legacy table that migrate() upgraded in place.
+    const migrated = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, migrated);
+    try seedExpiryShapes(allocator, migrated);
+    try stripExpiryEffective(migrated);
+    try migrated.migrate();
+
+    const actual_gt = try expiryDatePage(allocator, migrated, .{ .expiry_date_gt = 1_000_000 });
+    defer freeExpiryDatePage(allocator, actual_gt);
+    const actual_lte = try expiryDatePage(allocator, migrated, .{ .expiry_date_lte = 1000 });
+    defer freeExpiryDatePage(allocator, actual_lte);
+
+    try testing.expectEqual(expected_gt.len, actual_gt.len);
+    for (expected_gt, actual_gt) |want, got| try testing.expectEqualStrings(want, got);
+    try testing.expectEqual(expected_lte.len, actual_lte.len);
+    for (expected_lte, actual_lte) |want, got| try testing.expectEqualStrings(want, got);
+}
+
+/// True when `name` is a live index. Backend-specific by necessity: the whole
+/// point is to observe whether a schema replay rebuilt it.
+fn indexExists(database: *Database, name: []const u8) !bool {
+    // pg_indexes spans every schema and the PG tests run in isolated ones, so
+    // scope the lookup to the connection's own schema or a sibling test's index
+    // answers for ours.
+    const sql = if (database.isPostgres())
+        "SELECT 1 FROM pg_indexes WHERE indexname = ? AND schemaname = COALESCE(current_schema(), 'public')"
+    else
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?";
+    var q = try lib.storage.Query.init(database, sql);
+    defer q.deinit();
+    try q.bindText(name);
+    return try q.step();
+}
+
+test "loadSchemaFiles recreates a table missing from an existing database" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // The two tables that were added to schema.sql after the original schema and
+    // never got a hand-written CREATE in migrate(): a database that predates them
+    // used to be stuck without them forever, and writing a named resource then
+    // failed the batch on every retry.
+    try database.exec("DROP TABLE IF EXISTS resolver_named_resources");
+    try database.exec("DROP TABLE IF EXISTS replay_status");
+    try testing.expect(!database.hasTable("resolver_named_resources"));
+    try testing.expect(!database.hasTable("replay_status"));
+
+    try database.loadSchemaFiles();
+
+    try testing.expect(database.hasTable("resolver_named_resources"));
+    try testing.expect(database.hasTable("replay_status"));
+    // Idempotent: a second pass finds nothing missing and changes nothing.
+    try database.loadSchemaFiles();
+    try testing.expect(database.hasTable("resolver_named_resources"));
+}
+
+test "loadSchemaFiles leaves dropped indexes alone when no table is missing" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // A bulk sync deliberately drops indexes; a boot in that state must NOT
+    // rebuild them, or the deferred-index strategy pays minutes per restart.
+    try database.exec("DROP INDEX IF EXISTS idx_names_owner");
+    try testing.expect(!try indexExists(database, "idx_names_owner"));
+
+    try database.loadSchemaFiles();
+    try testing.expect(!try indexExists(database, "idx_names_owner"));
+
+    // But a missing TABLE is drift: the replay runs, and the index returns with it.
+    try database.exec("DROP TABLE IF EXISTS replay_status");
+    try database.loadSchemaFiles();
+    try testing.expect(database.hasTable("replay_status"));
+    try testing.expect(try indexExists(database, "idx_names_owner"));
+}

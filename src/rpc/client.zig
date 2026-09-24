@@ -314,6 +314,206 @@ fn refreshTlsValidationClock(http_client: *std.http.Client) void {
     http_client.now = null;
 }
 
+/// Exponential backoff for retry `attempt` (1-based: the attempt that just
+/// failed): 1s, 2s, 4s, 8s, then flat, so no retry loop ever parks for minutes.
+pub fn retryBackoffMs(attempt: u32) u64 {
+    const shift: u6 = @intCast(@min(attempt -| 1, 3));
+    return @as(u64, 1000) << shift;
+}
+
+/// Attempts a single request gets once the provider answers with a rate-limit
+/// rejection. Three attempts spend at most retryBackoffMs(1) + retryBackoffMs(2)
+/// = 3s sleeping — the same budget executeHttpRequest already allows a transport
+/// failure, and two orders of magnitude inside SYNC_FAILURE_EXIT_MINUTES — so a
+/// throttled provider slows a request instead of stalling the sync past its own
+/// watchdog. Callers that want more patience retry the returned
+/// error.RpcRateLimited themselves (see the discovery anchor probe).
+const MAX_RATE_LIMIT_ATTEMPTS: u32 = 3;
+
+/// Phrasings providers use for rate-limit / compute-unit rejections, matched
+/// case-insensitively anywhere in the JSON-RPC error message.
+const RATE_LIMIT_PHRASES = [_][]const u8{
+    "compute unit",
+    "rate limit",
+    "rate-limit",
+    "ratelimit",
+    "too many request",
+    "throttl",
+    "capacity",
+    "quota",
+    "over limit",
+    "request limit",
+    "rps limit",
+};
+
+/// A bare "exceeded" counts as a rate limit only next to one of these: "the
+/// requested range exceeds the maximum" is a size complaint the caller answers
+/// by shrinking its request, not by waiting.
+const RATE_LIMIT_QUOTA_WORDS = [_][]const u8{
+    "per second",
+    "per minute",
+    "per day",
+    "daily",
+    "monthly",
+    "compute",
+    "quota",
+    "capacity",
+    "credit",
+    "throughput",
+    "allowance",
+};
+
+fn containsIgnoreCase(haystack: []const u8, needle_lower: []const u8) bool {
+    if (needle_lower.len == 0) return true;
+    if (haystack.len < needle_lower.len) return false;
+    var i: usize = 0;
+    while (i + needle_lower.len <= haystack.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle_lower.len and std.ascii.toLower(haystack[i + j]) == needle_lower[j]) : (j += 1) {}
+        if (j == needle_lower.len) return true;
+    }
+    return false;
+}
+
+/// "429" as its own token — not the tail of a balance or a hex blob, which is
+/// how it otherwise shows up in "insufficient funds ... have 42912..." errors.
+fn mentionsHttp429(message: []const u8) bool {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, message, from, "429")) |at| : (from = at + 1) {
+        const left_ok = at == 0 or !std.ascii.isAlphanumeric(message[at - 1]);
+        const right = at + 3;
+        const right_ok = right >= message.len or !std.ascii.isAlphanumeric(message[right]);
+        if (left_ok and right_ok) return true;
+    }
+    return false;
+}
+
+/// True when a JSON-RPC error message describes a transient rate-limit or
+/// compute-unit rejection, i.e. the provider will answer the very same request
+/// after a backoff. Providers return these with HTTP 200, so the 429/408 status
+/// retry in executeHttpRequest never sees them. An execution revert is never a
+/// rate limit, whatever digits its revert string carries.
+pub fn isRateLimitMessage(message: []const u8) bool {
+    if (containsIgnoreCase(message, "revert")) return false;
+    for (RATE_LIMIT_PHRASES) |phrase| {
+        if (containsIgnoreCase(message, phrase)) return true;
+    }
+    if (mentionsHttp429(message)) return true;
+    if (containsIgnoreCase(message, "exceed")) {
+        for (RATE_LIMIT_QUOTA_WORDS) |word| {
+            if (containsIgnoreCase(message, word)) return true;
+        }
+    }
+    return false;
+}
+
+/// JSON-RPC `error` member → its message, tolerating the non-conformant shapes
+/// providers have been seen to return (bare strings, message-less objects).
+fn rpcErrorMessage(err_value: std.json.Value) []const u8 {
+    if (err_value == .string) return err_value.string;
+    if (err_value != .object) return "(malformed error)";
+    const message = err_value.object.get("message") orelse return "(no message)";
+    return if (message == .string) message.string else "(non-string message)";
+}
+
+/// Classify a JSON-RPC `error` member, without logging: rate-limit rejections
+/// become error.RpcRateLimited (transient — retry the same request), everything
+/// else stays error.RpcError, which the indexer's adaptive chunking answers by
+/// shrinking its requests (the wrong answer to a throttle).
+fn rpcErrorOf(err_value: std.json.Value) anyerror {
+    return if (isRateLimitMessage(rpcErrorMessage(err_value))) error.RpcRateLimited else error.RpcError;
+}
+
+/// rpcErrorOf plus the log line: a rate limit is expected and recoverable, so
+/// it warns; a genuine provider error keeps error level.
+fn classifyRpcError(context: []const u8, err_value: std.json.Value) anyerror {
+    const message = rpcErrorMessage(err_value);
+    const err = rpcErrorOf(err_value);
+    if (err == error.RpcRateLimited) {
+        std.log.warn("{s} (rate limited): {s}", .{ context, message });
+    } else {
+        std.log.err("{s}: {s}", .{ context, message });
+    }
+    return err;
+}
+
+/// Whether a rate-limited `attempt` (1-based) may be retried, sleeping the
+/// shared backoff first when it may.
+fn awaitRateLimitRetry(context: []const u8, attempt: u32) bool {
+    if (attempt >= MAX_RATE_LIMIT_ATTEMPTS) return false;
+    const delay_ms = retryBackoffMs(attempt);
+    std.log.warn("{s} rate limited, retrying in {d}ms (attempt {d}/{d})", .{ context, delay_ms, attempt + 1, MAX_RATE_LIMIT_ATTEMPTS });
+    zsys.sleep(delay_ms * std.time.ns_per_ms);
+    return true;
+}
+
+test "isRateLimitMessage: provider throttles classify as rate limits" {
+    try std.testing.expect(isRateLimitMessage("Your app has exceeded its compute units per second capacity. If you have retries enabled, you can safely ignore this message. Contact support@alchemy.com to upgrade your plan and increase your rate limits."));
+    try std.testing.expect(isRateLimitMessage("Too Many Requests"));
+    try std.testing.expect(isRateLimitMessage("429 Too Many Requests"));
+    try std.testing.expect(isRateLimitMessage("429"));
+    try std.testing.expect(isRateLimitMessage("daily request count exceeded, request rate limited"));
+    try std.testing.expect(isRateLimitMessage("rate limit exceeded"));
+    try std.testing.expect(isRateLimitMessage("request throttled, please slow down"));
+    try std.testing.expect(isRateLimitMessage("You've exceeded the RPS limit"));
+    try std.testing.expect(isRateLimitMessage("monthly capacity exceeded"));
+}
+
+test "isRateLimitMessage: genuine provider errors are not rate limits" {
+    try std.testing.expect(!isRateLimitMessage("execution reverted"));
+    try std.testing.expect(!isRateLimitMessage("execution reverted: ERC721: invalid token ID"));
+    try std.testing.expect(!isRateLimitMessage("Log response size exceeded. this block range should work: [0x1, 0x2]"));
+    try std.testing.expect(!isRateLimitMessage("query returned more than 10000 results"));
+    try std.testing.expect(!isRateLimitMessage("requested range exceeds the maximum of 2000 blocks"));
+    try std.testing.expect(!isRateLimitMessage("invalid argument 0: hex string without 0x prefix"));
+    try std.testing.expect(!isRateLimitMessage("missing trie node"));
+    // A balance that merely contains the digits 429 is not an HTTP 429.
+    try std.testing.expect(!isRateLimitMessage("insufficient funds for gas * price + value: have 42912345 want 50000000"));
+    try std.testing.expect(!isRateLimitMessage("execution reverted: exceeded compute budget"));
+    try std.testing.expect(!isRateLimitMessage(""));
+}
+
+test "retryBackoffMs: doubles then flattens at 8s" {
+    try std.testing.expectEqual(@as(u64, 1000), retryBackoffMs(0));
+    try std.testing.expectEqual(@as(u64, 1000), retryBackoffMs(1));
+    try std.testing.expectEqual(@as(u64, 2000), retryBackoffMs(2));
+    try std.testing.expectEqual(@as(u64, 4000), retryBackoffMs(3));
+    try std.testing.expectEqual(@as(u64, 8000), retryBackoffMs(4));
+    try std.testing.expectEqual(@as(u64, 8000), retryBackoffMs(9));
+}
+
+test "rpcErrorOf: rate limits and genuine errors get distinct error values" {
+    const Case = struct { body: []const u8, want: anyerror };
+    // Real batch-response shapes, including the Alchemy compute-unit rejection
+    // that arrives with HTTP 200 and the non-conformant shapes providers send.
+    const cases = [_]Case{
+        .{ .body =
+        \\{"error":{"code":429,"message":"Your app has exceeded its compute units per second capacity. If you have retries enabled, you can safely ignore this message."}}
+        , .want = error.RpcRateLimited },
+        .{ .body =
+        \\{"error":{"code":-32005,"message":"daily request count exceeded, request rate limited"}}
+        , .want = error.RpcRateLimited },
+        .{ .body =
+        \\{"error":{"code":3,"message":"execution reverted"}}
+        , .want = error.RpcError },
+        .{ .body =
+        \\{"error":{"code":-32602,"message":"Log response size exceeded. this block range should work: [0x1, 0x2]"}}
+        , .want = error.RpcError },
+        .{ .body =
+        \\{"error":-32000}
+        , .want = error.RpcError },
+        .{ .body =
+        \\{"error":{"code":-32000}}
+        , .want = error.RpcError },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.body, .{});
+        defer parsed.deinit();
+        const err_value = parsed.value.object.get("error").?;
+        try std.testing.expectEqual(case.want, rpcErrorOf(err_value));
+    }
+}
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     rpc_url: []const u8,
@@ -429,7 +629,7 @@ pub const Client = struct {
 
         while (attempt < max_retries) : (attempt += 1) {
             if (attempt > 0) {
-                const delay_ms: u64 = @as(u64, 1000) * (@as(u64, 1) << @intCast(attempt - 1));
+                const delay_ms = retryBackoffMs(attempt);
                 std.log.warn("RPC request failed, retrying in {d}ms (attempt {d}/{d})", .{ delay_ms, attempt + 1, max_retries });
                 zsys.sleep(delay_ms * std.time.ns_per_ms);
             }
@@ -550,7 +750,21 @@ pub const Client = struct {
         return last_error orelse error.HttpError;
     }
 
+    /// Single JSON-RPC call, retrying provider rate-limit rejections (which
+    /// arrive as a JSON-RPC error over HTTP 200, invisible to the status-code
+    /// retry in executeHttpRequest) with the same exponential backoff.
     fn makeRpcCall(self: *Client, method: []const u8, params: anytype) !std.json.Parsed(std.json.Value) {
+        var attempt: u32 = 1;
+        while (true) : (attempt += 1) {
+            return self.makeRpcCallOnce(method, params) catch |err| {
+                if (err != error.RpcRateLimited) return err;
+                if (!awaitRateLimitRetry("RPC request", attempt)) return err;
+                continue;
+            };
+        }
+    }
+
+    fn makeRpcCallOnce(self: *Client, method: []const u8, params: anytype) !std.json.Parsed(std.json.Value) {
         const request_id = self.nextRequestId();
 
         // Use arena allocator for request/response buffers
@@ -610,14 +824,7 @@ pub const Client = struct {
         const response = parsed.value.object;
 
         // Check for errors
-        if (response.get("error")) |err| {
-            const error_message = if (err == .object)
-                (if (err.object.get("message")) |m| (if (m == .string) m.string else "(non-string message)") else "(no message)")
-            else
-                "(malformed error)";
-            std.log.err("RPC error: {s}", .{error_message});
-            return error.RpcError;
-        }
+        if (response.get("error")) |err| return classifyRpcError("RPC error", err);
 
         return parsed;
     }
@@ -656,14 +863,21 @@ pub const Client = struct {
     }
 
     fn makeRpcCallWithParams(self: *Client, method: []const u8, params: std.json.Value) !std.json.Parsed(std.json.Value) {
+        var attempt: u32 = 1;
+        while (true) : (attempt += 1) {
+            return self.makeRpcCallWithParamsOnce(method, params) catch |err| {
+                if (err != error.RpcRateLimited) return err;
+                if (!awaitRateLimitRetry("RPC request", attempt)) return err;
+                continue;
+            };
+        }
+    }
+
+    fn makeRpcCallWithParamsOnce(self: *Client, method: []const u8, params: std.json.Value) !std.json.Parsed(std.json.Value) {
         const parsed = try self.makeRpcCallRaw(method, params);
         errdefer parsed.deinit();
         // Check for errors
-        if (parsed.value.object.get("error")) |err| {
-            const error_message = err.object.get("message").?.string;
-            std.log.err("RPC error: {s}", .{error_message});
-            return error.RpcError;
-        }
+        if (parsed.value.object.get("error")) |err| return classifyRpcError("RPC error", err);
         return parsed;
     }
 
@@ -685,13 +899,27 @@ pub const Client = struct {
         try writer.writeAll("]");
     }
 
-    /// Make multiple RPC calls in a single HTTP request (JSON-RPC batch)
+    /// Make multiple RPC calls in a single HTTP request (JSON-RPC batch).
+    /// Rate-limit rejections come back as a JSON-RPC error with HTTP 200, so the
+    /// status-code retry never sees them; retry the whole batch with the shared
+    /// backoff before handing error.RpcRateLimited to the caller.
+    fn makeBatchRpcCall(self: *Client, requests: []const BatchRequest) !std.json.Parsed(std.json.Value) {
+        var attempt: u32 = 1;
+        while (true) : (attempt += 1) {
+            return self.makeBatchRpcCallOnce(requests) catch |err| {
+                if (err != error.RpcRateLimited) return err;
+                if (!awaitRateLimitRetry("RPC batch", attempt)) return err;
+                continue;
+            };
+        }
+    }
+
     /// Returns array of responses in the same order as requests. When the
     /// provider caps batch sizes (max_batch_requests > 0), oversized batches
     /// are transparently split into sequential sub-batches and the response
     /// arrays merged before parsing — ids are globally unique, so the id-sort
     /// below restores request order across sub-batches.
-    fn makeBatchRpcCall(self: *Client, requests: []const BatchRequest) !std.json.Parsed(std.json.Value) {
+    fn makeBatchRpcCallOnce(self: *Client, requests: []const BatchRequest) !std.json.Parsed(std.json.Value) {
         // Use arena allocator for request/response buffers
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -758,12 +986,7 @@ pub const Client = struct {
         // Check each response for errors
         for (parsed.value.array.items) |response_value| {
             const response = response_value.object;
-            if (response.get("error")) |err| {
-                const error_obj = err.object;
-                const error_message = error_obj.get("message").?.string;
-                std.log.err("RPC batch error: {s}", .{error_message});
-                return error.RpcError;
-            }
+            if (response.get("error")) |err| return classifyRpcError("RPC batch error", err);
         }
 
         return parsed;

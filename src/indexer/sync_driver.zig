@@ -614,7 +614,7 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
             // registrations; the retry re-registers and re-queues them.
             self.pending_resolver_backfills.clearRetainingCapacity();
 
-            if ((err == error.RpcError or err == error.StreamTooLong) and current_batch_size > ABSOLUTE_MIN_BATCH) {
+            if ((err == error.RpcError or err == error.RpcRateLimited or err == error.StreamTooLong) and current_batch_size > ABSOLUTE_MIN_BATCH) {
                 current_batch_size = @max(ABSOLUTE_MIN_BATCH, current_batch_size / 2);
                 // The retry restarts at the batch head, often in a different density
                 // regime than the tail this state was learned from — a stale estimate

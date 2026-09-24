@@ -52,10 +52,24 @@ pub const Kind = enum {
 
 /// Interior probes per open interval per round (8-ary search).
 const PROBES_PER_ROUND: usize = 7;
-/// eth_getCode probes per HTTP request, and the size retried when a provider
-/// rejects a full batch.
+/// eth_getCode probes per HTTP request. Deliberately not its own env knob:
+/// RPC_MAX_BATCH_REQUESTS already caps what the rpc client puts in one HTTP
+/// batch, and the ladder below learns a size the provider actually accepts.
 const PROBE_HTTP_BATCH: usize = 96;
+/// Size a non-rate-limit rejection (batch cap, response size) falls back to.
 const PROBE_FALLBACK_BATCH: usize = 8;
+/// Sizes a rate-limited probe walks down before any contract degrades to the
+/// floor — single probes are the last rung, since a throttling provider answers
+/// a narrow request long before a wide one.
+const PROBE_BATCH_LADDER = [_]usize{ PROBE_HTTP_BATCH, 32, PROBE_FALLBACK_BATCH, 1 };
+/// Same-size retries per rung after a rate-limit rejection. One, because the
+/// rpc client has already retried that request itself with backoff.
+const PROBE_RATE_LIMIT_RETRIES: u32 = 1;
+/// Cooldown waits a whole discovery backfill may spend sitting out throttles.
+/// They escalate 1s, 2s, 4s, 8s (rpc.retryBackoffMs), so the run waits at most
+/// ~31s in total before anchors start degrading to the floor — bounded far
+/// inside SYNC_FAILURE_EXIT_MINUTES, and the heal ledger still owns the rest.
+const PROBE_COOLDOWN_BUDGET: u32 = 6;
 /// Contracts per multi-address eth_getLogs request.
 const GROUP_MAX_ADDRESSES: usize = 100;
 const SWEEP_MIN_CHUNK: u64 = 500;
@@ -178,44 +192,101 @@ pub fn searchAnchors(allocator: std.mem.Allocator, prober: anytype, addrs: []con
     return out;
 }
 
+/// Batch size to try after a failure at `current`, or null when the ladder is
+/// spent and the affected contracts must degrade to the floor. A rate limit
+/// walks every rung (the provider is busy, not strict); any other rejection
+/// keeps the historical single shrink to PROBE_FALLBACK_BATCH.
+fn nextProbeBatchSize(current: usize, rate_limited: bool) ?usize {
+    if (current <= 1) return null;
+    if (!rate_limited) return if (current > PROBE_FALLBACK_BATCH) PROBE_FALLBACK_BATCH else null;
+    for (PROBE_BATCH_LADDER) |rung| {
+        if (rung < current) return rung;
+    }
+    return null;
+}
+
+fn rejectionLabel(rate_limited: bool) []const u8 {
+    return if (rate_limited) "rate limit" else "provider rejection";
+}
+
+/// Fill `out` from `ctx`, batching probes and walking the batch ladder whenever
+/// the provider rejects a request. `ctx` must expose `fetch(probes, out) !void`
+/// and `cooldown() bool` (sleep before retrying the same batch; false once the
+/// run's wait budget is spent). A rate limit retries the SAME batch first — a
+/// narrower request is no more welcome than the wide one while a provider is
+/// throttling — and only then shrinks. Entries still unanswered when the ladder
+/// is spent stay null, which the caller degrades to the configured floor, and
+/// every one of those says so in the log. Once the wait budget is gone a
+/// throttle is handled like any other rejection — one shrink, then the floor —
+/// so a provider that rejects everything cannot grind the round through every
+/// rung for every probe; the heal ledger retries those targets later. Returns
+/// the batch size in force at the end so the caller keeps what it learned.
+fn probeBatched(ctx: anytype, probes: []const rpc.Client.CodeProbe, out: []?bool, batch_start: usize) usize {
+    @memset(out, null);
+    var batch = @max(batch_start, 1);
+    var start: usize = 0;
+    var attempt: u32 = 0;
+    var waits_spent = false;
+    while (start < probes.len) {
+        const end = @min(start + batch, probes.len);
+        if (ctx.fetch(probes[start..end], out[start..end])) {
+            start = end;
+            attempt = 0;
+        } else |err| {
+            const rate_limited = err == error.RpcRateLimited;
+            if (rate_limited and attempt < PROBE_RATE_LIMIT_RETRIES and !waits_spent) {
+                if (ctx.cooldown()) {
+                    attempt += 1;
+                    continue;
+                }
+                waits_spent = true;
+            }
+            const walk_ladder = rate_limited and !waits_spent;
+            if (nextProbeBatchSize(batch, walk_ladder)) |next| {
+                std.log.warn("  Discovery anchor probe batch of {d} failed ({}, {s}); retrying in batches of {d}", .{ end - start, err, rejectionLabel(rate_limited), next });
+                batch = next;
+                attempt = 0;
+                continue;
+            }
+            std.log.warn("  Discovery anchor probe batch of {d} failed ({}, {s}) with the batch ladder exhausted; {d} contract(s) fall back to the configured floor", .{ end - start, err, rejectionLabel(rate_limited), end - start });
+            @memset(out[start..end], null);
+            start = end;
+            attempt = 0;
+        }
+    }
+    return batch;
+}
+
 const RpcProber = struct {
     indexer: *Indexer,
     client: *rpc.Client,
     calls: *usize,
+    /// Batch size learned this run: a provider that rejected the wide batch is
+    /// not asked for it again every round. It never persists below the
+    /// non-rate-limit fallback, because throttles pass.
+    batch: *usize,
+    cooldowns_left: *u32,
 
-    /// Provider rejected a full-size batch (batch cap, size limit): retry the
-    /// same probes in small batches so one strict provider costs a few extra
-    /// round trips instead of collapsing every anchor to the floor.
-    fn probeSmall(self: RpcProber, probes: []const rpc.Client.CodeProbe, out: []?bool) void {
-        var start: usize = 0;
-        while (start < probes.len) : (start += PROBE_FALLBACK_BATCH) {
-            const end = @min(start + PROBE_FALLBACK_BATCH, probes.len);
-            self.indexer.rate_limiter.acquire();
-            self.calls.* += 1;
-            const answers = self.client.getCodeBatch(probes[start..end]) catch |err| {
-                std.log.warn("  Discovery anchor probe batch failed ({}); {d} contract(s) fall back to the configured floor", .{ err, end - start });
-                @memset(out[start..end], null);
-                continue;
-            };
-            defer self.client.allocator.free(answers);
-            @memcpy(out[start..end], answers);
-        }
+    fn fetch(self: RpcProber, probes: []const rpc.Client.CodeProbe, out: []?bool) !void {
+        self.indexer.rate_limiter.acquire();
+        self.calls.* += 1;
+        const answers = try self.client.getCodeBatch(probes);
+        defer self.client.allocator.free(answers);
+        @memcpy(out, answers);
+    }
+
+    fn cooldown(self: RpcProber) bool {
+        if (self.cooldowns_left.* == 0) return false;
+        const spent = PROBE_COOLDOWN_BUDGET - self.cooldowns_left.*;
+        self.cooldowns_left.* -= 1;
+        const delay_ms = rpc.retryBackoffMs(spent + 1);
+        std.log.warn("  Discovery anchor probe rate-limited; waiting {d}ms before retrying the same batch ({d} wait(s) left this run)", .{ delay_ms, self.cooldowns_left.* });
+        zsys.sleep(delay_ms * std.time.ns_per_ms);
+        return true;
     }
 
     fn probe(self: RpcProber, probes: []const rpc.Client.CodeProbe, out: []?bool) void {
-        var start: usize = 0;
-        while (start < probes.len) : (start += PROBE_HTTP_BATCH) {
-            const end = @min(start + PROBE_HTTP_BATCH, probes.len);
-            self.indexer.rate_limiter.acquire();
-            self.calls.* += 1;
-            if (self.client.getCodeBatch(probes[start..end])) |answers| {
-                defer self.client.allocator.free(answers);
-                @memcpy(out[start..end], answers);
-            } else |err| {
-                std.log.warn("  Discovery anchor probe batch of {d} failed ({}); retrying in batches of {d}", .{ end - start, err, PROBE_FALLBACK_BATCH });
-                self.probeSmall(probes[start..end], out[start..end]);
-            }
-        }
+        self.batch.* = probeBatched(self, probes, out, @max(self.batch.*, PROBE_FALLBACK_BATCH));
     }
 };
 
@@ -245,7 +316,15 @@ pub fn backfillDiscovered(self: *Indexer, protocol: models.Protocol, client: *rp
     }
 
     var probe_calls: usize = 0;
-    const prober = RpcProber{ .indexer = self, .client = client, .calls = &probe_calls };
+    var probe_batch: usize = PROBE_HTTP_BATCH;
+    var probe_cooldowns: u32 = PROBE_COOLDOWN_BUDGET;
+    const prober = RpcProber{
+        .indexer = self,
+        .client = client,
+        .calls = &probe_calls,
+        .batch = &probe_batch,
+        .cooldowns_left = &probe_cooldowns,
+    };
     const anchors = searchAnchors(self.allocator, prober, addrs, floor, to_block) catch |err| {
         std.log.warn("  Discovery anchor search failed ({}); {d} {s}(s) left for the heal ledger", .{ err, addrs.len, kind.label() });
         for (addrs) |addr| recordOutcome(self, kind, protocol, addr, err);
@@ -318,7 +397,7 @@ fn sweepTargets(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, 
         outcome.swept += group.len;
         return;
     };
-    const splittable = group.len > 1 and (err == error.BackfillIncomplete or err == error.RpcError or err == error.StreamTooLong);
+    const splittable = group.len > 1 and (err == error.BackfillIncomplete or err == error.RpcError or err == error.RpcRateLimited or err == error.StreamTooLong);
     if (splittable) {
         std.log.warn("  {s} group sweep {d}-{d} rejected for {d} contract(s) ({}); splitting the group", .{ kind.label(), group[0].anchor, to_block, group.len, err });
         const mid = group.len / 2;
@@ -373,7 +452,7 @@ fn sweepGroup(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, ki
                 .addresses = addrs,
                 .topic0_or = topics,
             }) catch |err| {
-                if (err != error.RpcError and err != error.StreamTooLong) {
+                if (err != error.RpcError and err != error.RpcRateLimited and err != error.StreamTooLong) {
                     transient_failures += 1;
                     if (transient_failures > 3) {
                         result.err = err;
@@ -570,4 +649,163 @@ test "searchAnchors resolves a contract deployed one block after the floor" {
     const anchors = try searchAnchors(testing.allocator, prober, &addrs, 100, 1_000_000);
     defer testing.allocator.free(anchors);
     try testing.expectEqual(@as(?u64, 101), anchors[0]);
+}
+
+/// Records the batch sizes it is asked for and fails the first `failures`
+/// fetches, so the ladder/backoff progression is observable without network.
+const StubProber = struct {
+    fail_with: anyerror,
+    failures: *usize,
+    sizes: *std.ArrayList(usize),
+    cooldowns: *usize,
+    cooldowns_left: *usize,
+    allocator: std.mem.Allocator,
+
+    fn fetch(self: StubProber, probes: []const rpc.Client.CodeProbe, out: []?bool) anyerror!void {
+        self.sizes.append(self.allocator, probes.len) catch @panic("stub sizes append");
+        if (self.failures.* > 0) {
+            self.failures.* -= 1;
+            return self.fail_with;
+        }
+        @memset(out, true);
+    }
+
+    fn cooldown(self: StubProber) bool {
+        if (self.cooldowns_left.* == 0) return false;
+        self.cooldowns_left.* -= 1;
+        self.cooldowns.* += 1;
+        return true;
+    }
+};
+
+/// A FakeProber that rate-limits its first `fails_left` fetches, driven through
+/// the real probeBatched ladder.
+const FlakyProber = struct {
+    inner: FakeProber,
+    fails_left: *usize,
+    batch: *usize,
+    cooldowns: *usize,
+
+    fn fetch(self: FlakyProber, probes: []const rpc.Client.CodeProbe, out: []?bool) anyerror!void {
+        if (self.fails_left.* > 0) {
+            self.fails_left.* -= 1;
+            return error.RpcRateLimited;
+        }
+        self.inner.probe(probes, out);
+    }
+
+    fn cooldown(self: FlakyProber) bool {
+        self.cooldowns.* += 1;
+        return true;
+    }
+
+    fn probe(self: FlakyProber, probes: []const rpc.Client.CodeProbe, out: []?bool) void {
+        self.batch.* = probeBatched(self, probes, out, self.batch.*);
+    }
+};
+
+const StubRun = struct {
+    sizes: std.ArrayList(usize) = .empty,
+    failures: usize = 0,
+    cooldowns: usize = 0,
+    cooldowns_left: usize = 0,
+    learned: usize = 0,
+    out: [PROBE_HTTP_BATCH]?bool = undefined,
+
+    fn deinit(self: *StubRun) void {
+        self.sizes.deinit(testing.allocator);
+    }
+
+    fn run(self: *StubRun, fail_with: anyerror) void {
+        var probes: [PROBE_HTTP_BATCH]rpc.Client.CodeProbe = undefined;
+        for (&probes, 0..) |*p, i| p.* = .{ .address = testAddress(@intCast(i % 200)), .block = 11_708_980 + i };
+        const stub = StubProber{
+            .fail_with = fail_with,
+            .failures = &self.failures,
+            .sizes = &self.sizes,
+            .cooldowns = &self.cooldowns,
+            .cooldowns_left = &self.cooldowns_left,
+            .allocator = testing.allocator,
+        };
+        self.learned = probeBatched(stub, &probes, &self.out, PROBE_HTTP_BATCH);
+    }
+};
+
+test "nextProbeBatchSize: a rate limit walks the ladder, other rejections shrink once" {
+    try testing.expectEqual(@as(?usize, 32), nextProbeBatchSize(PROBE_HTTP_BATCH, true));
+    try testing.expectEqual(@as(?usize, 8), nextProbeBatchSize(32, true));
+    try testing.expectEqual(@as(?usize, 1), nextProbeBatchSize(8, true));
+    try testing.expectEqual(@as(?usize, null), nextProbeBatchSize(1, true));
+    // An off-ladder size (provider-capped start) still descends.
+    try testing.expectEqual(@as(?usize, 8), nextProbeBatchSize(16, true));
+    // Unchanged behaviour for batch-cap / response-size rejections.
+    try testing.expectEqual(@as(?usize, 8), nextProbeBatchSize(PROBE_HTTP_BATCH, false));
+    try testing.expectEqual(@as(?usize, null), nextProbeBatchSize(8, false));
+    try testing.expectEqual(@as(?usize, null), nextProbeBatchSize(1, false));
+}
+
+test "anchor probe: a rate limit retries the same batch and keeps its size" {
+    var run: StubRun = .{ .failures = 1, .cooldowns_left = 10 };
+    defer run.deinit();
+    run.run(error.RpcRateLimited);
+    try testing.expectEqualSlices(usize, &[_]usize{ PROBE_HTTP_BATCH, PROBE_HTTP_BATCH }, run.sizes.items);
+    try testing.expectEqual(@as(usize, 1), run.cooldowns);
+    try testing.expectEqual(@as(usize, PROBE_HTTP_BATCH), run.learned);
+    for (run.out) |answer| try testing.expectEqual(@as(?bool, true), answer);
+}
+
+test "anchor probe: a persistent rate limit shrinks 96-32-8-1 before the floor" {
+    var run: StubRun = .{ .failures = std.math.maxInt(usize), .cooldowns_left = 1000 };
+    defer run.deinit();
+    run.run(error.RpcRateLimited);
+    try testing.expectEqualSlices(usize, &[_]usize{ 96, 96, 32, 32, 8, 8, 1, 1 }, run.sizes.items[0..8]);
+    try testing.expectEqual(@as(usize, 1), run.learned);
+    try testing.expect(run.cooldowns >= 4);
+    // Only after the whole ladder is spent does a contract degrade to the floor.
+    for (run.out) |answer| try testing.expectEqual(@as(?bool, null), answer);
+}
+
+test "anchor probe: a non-rate-limit rejection keeps the single shrink and never waits" {
+    var run: StubRun = .{ .failures = std.math.maxInt(usize), .cooldowns_left = 1000 };
+    defer run.deinit();
+    run.run(error.RpcError);
+    try testing.expectEqualSlices(usize, &[_]usize{ 96, 8, 8 }, run.sizes.items[0..3]);
+    try testing.expectEqual(@as(usize, PROBE_FALLBACK_BATCH), run.learned);
+    try testing.expectEqual(@as(usize, 0), run.cooldowns);
+    for (run.out) |answer| try testing.expectEqual(@as(?bool, null), answer);
+}
+
+test "anchor probe: an exhausted wait budget degrades to the cheap single shrink" {
+    var run: StubRun = .{ .failures = std.math.maxInt(usize), .cooldowns_left = 0 };
+    defer run.deinit();
+    run.run(error.RpcRateLimited);
+    // No waits left, so a throttle costs what a plain rejection costs: one
+    // shrink to the fallback size, then the floor — never the whole ladder.
+    try testing.expectEqualSlices(usize, &[_]usize{ 96, 8, 8 }, run.sizes.items[0..3]);
+    try testing.expectEqual(@as(usize, 0), run.cooldowns);
+    try testing.expectEqual(@as(usize, PROBE_FALLBACK_BATCH), run.learned);
+}
+
+test "searchAnchors resolves exact anchors despite a rate-limited probe round" {
+    const addrs = [_]Address{ testAddress(1), testAddress(2), testAddress(3) };
+    const deployed = [_]?u64{ 11_708_990, 11_708_997, null };
+    var calls: usize = 0;
+    var probe_count: usize = 0;
+    var fails_left: usize = 2;
+    var batch: usize = PROBE_HTTP_BATCH;
+    var cooldowns: usize = 0;
+    const flaky = FlakyProber{
+        .inner = .{ .deployed = &deployed, .addrs = &addrs, .calls = &calls, .probes = &probe_count },
+        .fails_left = &fails_left,
+        .batch = &batch,
+        .cooldowns = &cooldowns,
+    };
+    const anchors = try searchAnchors(testing.allocator, flaky, &addrs, 11_708_980, 11_709_000);
+    defer testing.allocator.free(anchors);
+    try testing.expectEqual(@as(?u64, 11_708_990), anchors[0]);
+    try testing.expectEqual(@as(?u64, 11_708_997), anchors[1]);
+    try testing.expectEqual(@as(?u64, null), anchors[2]);
+    try testing.expect(cooldowns >= 1);
+    // The retry answered, so nothing fell back to the floor.
+    try testing.expect(anchors[0].? > 11_708_980);
 }
