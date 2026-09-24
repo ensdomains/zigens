@@ -100,6 +100,52 @@ pub fn migrate(self: *Database) !void {
         try self.exec("CREATE INDEX IF NOT EXISTS idx_names_is_normalized ON names(is_normalized)");
     }
 
+    // Add the grace-inclusive generated `expiry_effective` column to pre-existing
+    // `names` tables. NOT cosmetic: names_filter compares the `expiryDate_*`
+    // filters against it and maps the `expiryDate` ordering onto it, so a database
+    // that predates the column fails EVERY such query with "no such column" —
+    // the failed `idx_names_expiry_effective` rebuild is only the visible symptom.
+    //
+    // SQLite cannot ALTER IN the STORED form ("cannot add a STORED column" the
+    // moment the table has rows, since ADD COLUMN never rewrites them), so the
+    // in-place upgrade adds the VIRTUAL form: same expression, same values, and
+    // an index over it is still sargable. Postgres takes the STORED form its
+    // generated schema declares — that rewrites the table under an exclusive
+    // lock, which matters on a large database, but fresh PG schemas already
+    // carry the column so the guard makes it a no-op in practice.
+    //
+    // The expression is a verbatim copy of schema/schema.sql's, so a migrated
+    // database and a fresh one agree row for row.
+    if (self.hasTable("names")) {
+        if (!self.columnExistsIncludingGenerated("names", "expiry_effective")) {
+            if (self.isPostgres()) {
+                try self.exec(
+                    \\ALTER TABLE names ADD COLUMN IF NOT EXISTS expiry_effective BIGINT GENERATED ALWAYS AS (
+                    \\  CASE WHEN protocol = 'v1' AND parent_name = 'eth' AND is_wrapped = 0
+                    \\         AND expiry > 0 AND expiry <= 9223372036846999807
+                    \\       THEN expiry + 7776000 ELSE expiry END
+                    \\) STORED
+                );
+            } else {
+                try self.exec(
+                    \\ALTER TABLE names ADD COLUMN expiry_effective INTEGER GENERATED ALWAYS AS (
+                    \\  CASE WHEN protocol = 'v1' AND parent_name = 'eth' AND is_wrapped = 0
+                    \\         AND expiry > 0 AND expiry <= 9223372036846999807
+                    \\       THEN expiry + 7776000 ELSE expiry END
+                    \\) VIRTUAL
+                );
+            }
+            std.log.info("Added generated `expiry_effective` column to pre-existing `names` table", .{});
+        }
+        // Same rationale as the post-schema index block below (one-time cost on a
+        // large table), but probed rather than unconditional: a database whose
+        // column could not be added must still boot — createSyncIndexes warns and
+        // skips the same index.
+        if (self.columnExistsIncludingGenerated("names", "expiry_effective")) {
+            try self.exec(SYNC_CREATE_EXPIRY_EFFECTIVE_INDEX);
+        }
+    }
+
     // Indexes added after the original schema: `loadSchemaFiles` is skipped on
     // existing DBs and `createSyncIndexes` only runs after a bulk sync dropped
     // them, so a caught-up DB gets them here. IF NOT EXISTS is a no-op on both
@@ -543,13 +589,18 @@ pub fn ensureSyncPathIndexes(self: *Database) void {
         std.log.err("ensure idx_names_created_at failed: {}", .{err});
 }
 
+/// Conditional, hence kept out of the unconditional list below: the generated
+/// `expiry_effective` column arrived after the original schema, and a database
+/// whose in-place upgrade could not run has no column to index. Shared with
+/// `migrate`, which creates the index right after adding the column.
+const SYNC_CREATE_EXPIRY_EFFECTIVE_INDEX = "CREATE INDEX IF NOT EXISTS idx_names_expiry_effective ON names(expiry_effective)";
+
 /// Recreate all indexes after bulk sync is complete.
 /// This is much faster than maintaining indexes during bulk inserts.
 /// Every statement is attempted even if one fails, so a single bad DDL cannot
 /// strand the rest of the list; the first error is still surfaced at the end.
 const SYNC_CREATE_NAMES_INDEXES = [_][]const u8{
     "CREATE INDEX IF NOT EXISTS idx_names_canonical_id ON names(canonical_id)",
-    "CREATE INDEX IF NOT EXISTS idx_names_expiry_effective ON names(expiry_effective)",
     "CREATE INDEX IF NOT EXISTS idx_names_is_reachable ON names(protocol, is_reachable)",
     "CREATE INDEX IF NOT EXISTS idx_names_registry_reachable ON names(protocol, registry, is_reachable)",
     "CREATE INDEX IF NOT EXISTS idx_names_is_normalized ON names(is_normalized)",
@@ -585,6 +636,18 @@ pub fn createSyncIndexes(self: *Database) !void {
             std.log.err("create names index failed: {} [sql: {s}]", .{ err, sql });
             if (first_err == null) first_err = err;
         };
+    }
+    // Missing `expiry_effective` is a schema-age condition, not a DDL failure:
+    // warn and skip rather than poison `first_err` and report the whole recreate
+    // as failed while every other index succeeded. migrate() adds the column on
+    // every boot, so this only fires on a database it could not upgrade.
+    if (self.columnExistsIncludingGenerated("names", "expiry_effective")) {
+        self.exec(SYNC_CREATE_EXPIRY_EFFECTIVE_INDEX) catch |err| {
+            std.log.err("create names index failed: {} [sql: {s}]", .{ err, SYNC_CREATE_EXPIRY_EFFECTIVE_INDEX });
+            if (first_err == null) first_err = err;
+        };
+    } else {
+        std.log.warn("skipping idx_names_expiry_effective: `names` has no `expiry_effective` column; expiryDate filters and ordering will fail until migrate() adds it", .{});
     }
     const expression_indexes: []const []const u8 = if (self.isPostgres())
         &SYNC_CREATE_EXPRESSION_INDEXES_PG

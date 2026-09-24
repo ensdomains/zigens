@@ -227,6 +227,29 @@ pub const Database = struct {
         return (q.step() catch return false);
     }
 
+    /// Like `columnExists`, but also sees GENERATED columns. `pragma_table_info`
+    /// omits them (virtual and stored alike) — only `pragma_table_xinfo` lists
+    /// them — so a generated-column migration guard that used `columnExists`
+    /// would report "absent" on a database that already has the column and
+    /// re-run its ALTER on every boot. Postgres has no such hole
+    /// (`information_schema.columns` lists generated columns), hence the
+    /// SQLite-only pragma branch.
+    pub fn columnExistsIncludingGenerated(self: *Database, table_name: []const u8, column_name: []const u8) bool {
+        if (!self.isPostgres()) {
+            var q = Query.init(self, "SELECT 1 FROM pragma_table_xinfo(?) WHERE name = ?") catch return false;
+            defer q.deinit();
+            q.bindText(table_name) catch return false;
+            q.bindText(column_name) catch return false;
+            return (q.step() catch return false);
+        }
+        const cols = self.introspectColumns(self.allocator, table_name) catch return false;
+        defer backend_mod.freeColumnInfo(self.allocator, cols);
+        for (cols) |col| {
+            if (std.mem.eql(u8, col.name, column_name)) return true;
+        }
+        return false;
+    }
+
     /// Execute a parameterless statement, dispatched through the backend.
     pub fn exec(self: *Database, sql: []const u8) !void {
         return self.backend.vtable.execRaw(self.backend.ptr, sql);
@@ -533,6 +556,7 @@ pub const Database = struct {
     pub const checkIntegrity = sync.checkIntegrity;
     pub const probeLiveness = sync.probeLiveness;
     pub const ensureSyncPathIndexes = schema.ensureSyncPathIndexes;
+    pub const migrate = schema.migrate;
     pub const registerSubregistry = sync.registerSubregistry;
     pub const registerResolver = sync.registerResolver;
     pub const registerResolverIfNew = sync.registerResolverIfNew;
