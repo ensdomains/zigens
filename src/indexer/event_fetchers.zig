@@ -583,7 +583,7 @@ pub fn indexResolverEvents(self: *Indexer, protocol: models.Protocol, client: *r
             .topic0_or = &event_topics,
         }) catch |err| {
             fetch_ms += zsys.milliTimestamp() - fetch_t;
-            if ((err == error.RpcError or err == error.StreamTooLong) and resolver_chunk > 10) {
+            if ((err == error.RpcError or err == error.RpcRateLimited or err == error.StreamTooLong) and resolver_chunk > 10) {
                 resolver_chunk = @max(10, resolver_chunk / 2);
                 std.log.warn("  Resolver-events chunk too large, retrying {d}-{d} at {d} blocks", .{ chunk_lo, chunk_hi, resolver_chunk });
                 continue;

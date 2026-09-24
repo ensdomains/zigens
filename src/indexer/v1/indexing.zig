@@ -102,7 +102,7 @@ pub fn indexV1EventsChunked(
             // Try the RPC call - retry with smaller chunks if buffer overflow
             const batch_results = client.getLogsBatch(batch_requests) catch |err| {
                 // Handle both RPC provider buffer overflow (error.RpcError) and http buffer overflow (error.StreamTooLong)
-                if ((err == error.RpcError or err == error.StreamTooLong) and retry_chunk_size > ABSOLUTE_MIN_CHUNK) {
+                if ((err == error.RpcError or err == error.RpcRateLimited or err == error.StreamTooLong) and retry_chunk_size > ABSOLUTE_MIN_CHUNK) {
                     // Learn the halved size, not the failed one: a ceiling set to the
                     // failing size lets the predictor re-attempt it while the +10%
                     // regrowth climbs back over a provider's hard range cap within a
@@ -378,7 +378,7 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
             // Execute combined batch RPC call - retry with smaller chunks if buffer overflow
             const fetch_timer = zsys.milliTimestamp();
             const batch_results = client.getLogsMultiAddressBatch(requests) catch |err| {
-                if ((err == error.RpcError or err == error.StreamTooLong) and retry_chunk_size > ABSOLUTE_MIN_CHUNK) {
+                if ((err == error.RpcError or err == error.RpcRateLimited or err == error.StreamTooLong) and retry_chunk_size > ABSOLUTE_MIN_CHUNK) {
                     // Learn the halved size, not the failed one: a ceiling set to the
                     // failing size lets the predictor re-attempt it while the +10%
                     // regrowth climbs back over a provider's hard range cap (Alchemy:
@@ -727,7 +727,7 @@ pub fn indexPreMigrationRegistryEvents(self: *Indexer, protocol: models.Protocol
             }
 
             const batch_results = client.getLogsBatch(batch_requests) catch |err| {
-                if ((err == error.RpcError or err == error.StreamTooLong) and retry_chunk_size > ABSOLUTE_MIN_CHUNK) {
+                if ((err == error.RpcError or err == error.RpcRateLimited or err == error.StreamTooLong) and retry_chunk_size > ABSOLUTE_MIN_CHUNK) {
                     retry_chunk_size = @max(ABSOLUTE_MIN_CHUNK, retry_chunk_size / 2);
                     std.log.warn("  🔄 Buffer overflow! Retrying with smaller chunk: {d} blocks", .{retry_chunk_size});
                     continue :retry_loop;
