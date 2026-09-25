@@ -42,6 +42,7 @@ services:
       start_period: 60s
     networks:
       - ens-network
+      - dokploy-network
     logging:
       driver: "json-file"
       options:
@@ -92,6 +93,7 @@ services:
       start_period: 10s
     networks:
       - ens-network
+      - dokploy-network
     logging:
       driver: "json-file"
       options:
@@ -99,8 +101,14 @@ services:
         max-file: "3"
 
 networks:
+  # Internal indexer<->api traffic.
   ens-network:
     driver: bridge
+  # Dokploy's shared network, where the managed Postgres/pgdog services live.
+  # External: Dokploy owns it, so compose must join rather than create it —
+  # declaring it per-project would make a second, isolated network instead.
+  dokploy-network:
+    external: true
 
 volumes:
   ens-data:
