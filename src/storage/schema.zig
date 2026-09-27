@@ -100,6 +100,13 @@ pub fn loadSchemaFiles(self: *Database) !void {
         for (missing.items) |t| {
             std.log.warn("Schema drift: table `{s}` is missing; replaying the schema files to create it", .{t});
         }
+        // The replay is all-or-nothing per file. `CREATE TABLE IF NOT EXISTS` skips
+        // tables that already exist, so a column added to one of them in this release
+        // is absent while the file's indexes still reference it — and one such index
+        // aborts the whole exec. If the exec below fails with "column ... does not
+        // exist", the missing piece is a paired `ALTER TABLE ... ADD COLUMN` in
+        // `migrate()`, which runs before this precisely so the replay can rely on it.
+        std.log.info("Schema replay on an existing database: any column added this release must have a paired ALTER in migrate()", .{});
     }
 
     // Execute each schema file in order

@@ -159,7 +159,27 @@ pub const Database = struct {
         // every table. The `migrate()` scaffold is kept as a thin hook so future
         // emergency in-place migrations have a wired path without re-introducing the
         // per-file migration ladder.
+        // `migrate()` runs both before and after the schema files, and the
+        // pre-pass is conditional.
+        //
+        // Before, on an existing database: when a table is missing, loadSchemaFiles
+        // replays the whole schema file as one multi-statement exec, where
+        // `CREATE TABLE IF NOT EXISTS` no-ops on the tables that already exist. An
+        // index in that file referencing a column added this release then fails with
+        // "column does not exist" and aborts the entire exec — including the table
+        // the replay existed to create — before the migration that would have added
+        // the column ever ran. That deadlocked boot on every pre-existing database.
+        //
+        // NOT before, on a fresh database: the generated schema files are
+        // authoritative there, and `migrate()` carries inline
+        // `CREATE TABLE IF NOT EXISTS` statements written in SQLite types, so running
+        // it first would create `accounts` and friends with int4 columns and leave
+        // the file's BIGINT definitions a no-op — silently narrowing
+        // first_seen_timestamp past 2038.
+        if (database.hasTable("names")) try schema.migrate(&database);
         try schema.loadSchemaFiles(&database);
+        // Again afterwards: idempotent, and it covers any migration that needs the
+        // completed schema (a table the replay just created) rather than preceding it.
         try schema.migrate(&database);
 
         // Reorg undo-log: capture tables + per-table triggers so rollbackToBlock can
