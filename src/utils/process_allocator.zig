@@ -82,6 +82,7 @@ pub const Counting = struct {
     peak: std.atomic.Value(usize) = .init(0),
     reported: std.atomic.Value(bool) = .init(false),
     largest_reported: std.atomic.Value(usize) = .init(0),
+    refusals: std.atomic.Value(usize) = .init(0),
     /// Tests set this false to drive the refusal path without logging.
     report_refusals: bool = true,
 
@@ -145,12 +146,27 @@ pub const Counting = struct {
     /// Unlike `reportFailure` this is not rate-limited: a refusal the log never
     /// mentions is worse than no guard at all. `report_refusals` exists so a
     /// test can drive the refusal path without emitting an error.
-    fn reportRefusal(self: *Counting, n: usize) void {
+    fn reportRefusal(self: *Counting, n: usize, ret_addr: usize) void {
+        _ = self.refusals.fetchAdd(1, .monotonic);
         if (!self.report_refusals) return;
-        std.log.err("REFUSED a single allocation of {d} bytes ({d} MB), over the {d} MB sanity ceiling. " ++
-            "Nothing here legitimately allocates this much at once, so a length reached an allocator " ++
-            "unvalidated (a wire-declared size, a decoded payload length). Raise MAX_SINGLE_ALLOC_MB, " ++
-            "or set it to 0 to disable, if this is genuine.", .{ n, n / (1024 * 1024), max_single.load(.monotonic) / (1024 * 1024) });
+        // maxInt(usize) exactly is worth calling out by name: it is the "clamp on
+        // u256 overflow" sentinel that decoders use (readUint256AsUsize and
+        // friends), so seeing it means a 32-byte word of 0xff reached a length
+        // without being range-checked — a different bug from merely asking for
+        // too much.
+        // Advice has to differ by case. maxInt(usize) exactly is the sentinel a
+        // decoder returns when a 32-byte word overflows a usize, so raising the
+        // ceiling would only let a corrupt length through to fail as a real OOM,
+        // and disabling the guard restores the opaque stall it exists to name.
+        const advice = if (n == std.math.maxInt(usize))
+            " This is exactly maxInt(usize) — the sentinel a decoder returns when a 32-byte word overflows a usize, i.e. an unchecked wire-declared length, NOT a large-but-real request. Do NOT raise MAX_SINGLE_ALLOC_MB for this: the fix belongs at the decode site."
+        else
+            " Raise MAX_SINGLE_ALLOC_MB, or set it to 0 to disable, if this request is genuine.";
+        std.log.err("REFUSED a single allocation of {d} bytes ({d} MB), over the {d} MB sanity ceiling.{s}", .{ n, n / (1024 * 1024), max_single.load(.monotonic) / (1024 * 1024), advice });
+        // The call site is the whole answer and ret_addr is already in hand;
+        // without it a refusal only says "somewhere". Unwinding is best-effort:
+        // a stripped build simply prints less.
+        std.debug.dumpCurrentStackTrace(.{ .first_address = ret_addr });
     }
 
     /// Only reports a size larger than any already reported, so a repeating
@@ -176,7 +192,7 @@ pub const Counting = struct {
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *Counting = @ptrCast(@alignCast(ctx));
         if (exceedsSingleCap(len)) {
-            self.reportRefusal(len);
+            self.reportRefusal(len, ret_addr);
             return null;
         }
         const p = self.backing.rawAlloc(len, alignment, ret_addr) orelse {
@@ -220,7 +236,7 @@ pub const Counting = struct {
         // A grow in place commits memory without ever reaching `alloc`, so the
         // ceiling has to be checked here too or it is bypassed by one realloc.
         if (new_len > memory.len and exceedsSingleCap(new_len)) {
-            self.reportRefusal(new_len);
+            self.reportRefusal(new_len, ret_addr);
             return false;
         }
         if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
@@ -235,7 +251,7 @@ pub const Counting = struct {
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         const self: *Counting = @ptrCast(@alignCast(ctx));
         if (new_len > memory.len and exceedsSingleCap(new_len)) {
-            self.reportRefusal(new_len);
+            self.reportRefusal(new_len, ret_addr);
             return null;
         }
         // No failure report here: `Allocator.realloc` probes `rawRemap` first
@@ -304,6 +320,14 @@ pub fn deinit() bool {
 pub fn liveBytes() usize {
     if (!initialized) return 0;
     return counting.live.load(.monotonic);
+}
+
+/// How many allocations the sanity ceiling has refused. A caller comparing this
+/// across an operation can tell a poison length (refused) from genuine memory
+/// pressure (the backing allocator said no) — the two need opposite recoveries.
+pub fn refusalCount() usize {
+    if (!initialized) return 0;
+    return counting.refusals.load(.monotonic);
 }
 
 pub fn peakBytes() usize {

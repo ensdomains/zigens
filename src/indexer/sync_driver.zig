@@ -25,6 +25,7 @@ const status_mod = @import("../server/status.zig");
 const IndexerStatus = status_mod.IndexerStatus;
 const reorg_undo = @import("../storage/reorg_undo.zig");
 const memstat = @import("../utils/memstat.zig");
+const process_allocator = @import("../utils/process_allocator.zig");
 const ens_normalize = @import("../utils/ens_normalize.zig");
 const replay_mod = @import("replay.zig");
 const alias_sync = @import("v2/alias_sync.zig");
@@ -601,6 +602,10 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
         // Use transaction for batch atomicity
         try self.database.beginTransaction();
 
+        // A refusal during this attempt means an allocation size came from an
+        // unvalidated length, which is invariant in the batch size — see below.
+        const refusals_before = process_allocator.refusalCount();
+
         // Try indexing - on RPC response size errors, rollback, halve batch, retry
         self.indexBlockRange(protocol, client, from_block, to_block) catch |err| {
             self.database.rollbackTransaction();
@@ -615,12 +620,24 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
             // registrations; the retry re-registers and re-queues them.
             self.pending_resolver_backfills.clearRetainingCapacity();
 
-            // OutOfMemory shrinks the batch for the same reason the size errors
-            // do: a batch whose working set will not fit is too big, and half of
-            // it may well fit. Without it one refused mapping aborted the batch,
-            // rolled the transaction back, left the cursor unmoved and re-failed
-            // identically forever — a memory blip became a permanent sync stall
-            // ending in a supervisor restart loop. Bounded by ABSOLUTE_MIN_BATCH.
+            // An OutOfMemory that came from a REFUSED allocation is not a volume
+            // problem and shrinking cannot fix it: the refused size was a corrupt
+            // length (maxInt(usize) and the like), which is identical at 1000
+            // blocks and at 100. Shrinking anyway walks the batch down to the floor
+            // over several minutes, gives up, restarts at full size and repeats —
+            // a futile loop that buries the real cause under "response too large".
+            // Fail fast and say so instead; the fix belongs at the decode site.
+            const refused = process_allocator.refusalCount() > refusals_before;
+            if (refused) {
+                std.log.err("batch {d}-{d} aborted by a refused allocation, not by memory pressure — NOT shrinking, because a corrupt length is the same size at any batch width. Fix the decode site named in the refusal above.", .{ from_block, to_block });
+                return err;
+            }
+
+            // Genuine OutOfMemory shrinks for the same reason the size errors do: a
+            // batch whose working set will not fit is too big, and half of it may
+            // well fit. Without it one refused mapping aborted the batch, rolled
+            // the transaction back, left the cursor unmoved and re-failed
+            // identically forever. Bounded by ABSOLUTE_MIN_BATCH.
             if ((err == error.RpcError or err == error.RpcRateLimited or err == error.StreamTooLong or err == error.OutOfMemory) and current_batch_size > ABSOLUTE_MIN_BATCH) {
                 current_batch_size = @max(ABSOLUTE_MIN_BATCH, current_batch_size / 2);
                 // The retry restarts at the batch head, often in a different density
@@ -628,7 +645,7 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
                 // predicts oversized chunks and cascades through overflow retries.
                 self.v1_events_per_block = 0;
                 self.v1_rpc_chunk_ceiling = 0;
-                std.log.warn("RPC response too large for blocks {d}-{d}! Reducing batch size to {d} blocks and retrying", .{ from_block, to_block, current_batch_size });
+                std.log.warn("batch {d}-{d} failed with {} — reducing batch size to {d} blocks and retrying", .{ from_block, to_block, err, current_batch_size });
                 continue; // Retry same from_block with smaller batch
             }
 
