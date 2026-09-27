@@ -4,11 +4,13 @@ const Rainbow = @import("rainbow/rainbow.zig").Rainbow;
 const Hash = @import("types/hash.zig").Hash;
 const v1_names = @import("utils/v1_names.zig");
 const unknown_labels_storage = @import("storage/unknown_labels.zig");
+const process_allocator = @import("utils/process_allocator.zig");
 
 pub fn main(init: std.process.Init) !void {
-    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    // Bulk pass over millions of rainbow-table labels: the same burst-plus-
+    // survivors shape that makes `DebugAllocator` retain unboundedly.
+    const allocator = process_allocator.init();
+    defer if (process_allocator.deinit()) std.log.warn("allocator reported leaks at shutdown", .{});
 
     std.log.info("=== Rainbow Table Backfill Tool ===", .{});
 

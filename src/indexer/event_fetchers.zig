@@ -584,7 +584,14 @@ pub fn indexResolverEvents(self: *Indexer, protocol: models.Protocol, client: *r
             .topic0_or = &event_topics,
         }) catch |err| {
             fetch_ms += zsys.milliTimestamp() - fetch_t;
-            if ((err == error.RpcError or err == error.RpcRateLimited or err == error.StreamTooLong) and resolver_chunk > 10) {
+            // OutOfMemory belongs here with the size errors: a chunk that will
+            // not fit in memory is a chunk that is too large, and halving is
+            // the same recovery. Without it an allocation failure propagated
+            // out of the last phase and abandoned the whole already-processed
+            // batch, which is how a memory problem became a permanent sync
+            // stall rather than a slower pass. Bounded — the floor of 10 ends
+            // the retreat and returns the error.
+            if ((err == error.RpcError or err == error.RpcRateLimited or err == error.StreamTooLong or err == error.OutOfMemory) and resolver_chunk > 10) {
                 resolver_chunk = @max(10, resolver_chunk / 2);
                 std.log.warn("  Resolver-events chunk too large, retrying {d}-{d} at {d} blocks", .{ chunk_lo, chunk_hi, resolver_chunk });
                 continue;

@@ -615,7 +615,13 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
             // registrations; the retry re-registers and re-queues them.
             self.pending_resolver_backfills.clearRetainingCapacity();
 
-            if ((err == error.RpcError or err == error.RpcRateLimited or err == error.StreamTooLong) and current_batch_size > ABSOLUTE_MIN_BATCH) {
+            // OutOfMemory shrinks the batch for the same reason the size errors
+            // do: a batch whose working set will not fit is too big, and half of
+            // it may well fit. Without it one refused mapping aborted the batch,
+            // rolled the transaction back, left the cursor unmoved and re-failed
+            // identically forever — a memory blip became a permanent sync stall
+            // ending in a supervisor restart loop. Bounded by ABSOLUTE_MIN_BATCH.
+            if ((err == error.RpcError or err == error.RpcRateLimited or err == error.StreamTooLong or err == error.OutOfMemory) and current_batch_size > ABSOLUTE_MIN_BATCH) {
                 current_batch_size = @max(ABSOLUTE_MIN_BATCH, current_batch_size / 2);
                 // The retry restarts at the batch head, often in a different density
                 // regime than the tail this state was learned from — a stale estimate
@@ -642,7 +648,14 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
         const progress = (@as(f64, @floatFromInt(blocks_indexed)) / @as(f64, @floatFromInt(total_blocks))) * 100.0;
         std.log.info("Progress: {d:.1}% ({d}/{d} blocks) - Batch {d}-{d} indexed", .{ progress, blocks_indexed, total_blocks, from_block, to_block });
         if (memstat.rssBytes()) |rss| {
-            std.log.info("  Memory: rss {d} MB, allocator live {d} MB", .{ rss / (1024 * 1024), (memstat.liveBytes() orelse 0) / (1024 * 1024) });
+            // rss climbing while live stays flat is allocator retention, not a
+            // leak; both climbing together is a leak. Printing them side by
+            // side is what makes that call possible from a log alone.
+            std.log.info("  Memory: rss {d} MB, allocator live {d} MB, peak {d} MB", .{
+                rss / (1024 * 1024),
+                (memstat.liveBytes() orelse 0) / (1024 * 1024),
+                (memstat.peakBytes() orelse 0) / (1024 * 1024),
+            });
         }
 
         // --- Block-hash lineage (reorg detection) ---
