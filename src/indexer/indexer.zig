@@ -19,6 +19,7 @@ const NetworkHealth = @import("../utils/network_health.zig").NetworkHealth;
 const status_mod = @import("../server/status.zig");
 const IndexerStatus = status_mod.IndexerStatus;
 const handlers_v2_registry = @import("v2/handlers_registry.zig");
+const alias_sync = @import("v2/alias_sync.zig");
 const handlers_v2_resolver = @import("v2/handlers_resolver.zig");
 const handlers_v2_records = @import("v2/handlers_resolver_records.zig");
 const event_fetchers = @import("event_fetchers.zig");
@@ -119,6 +120,10 @@ pub const Indexer = struct {
     // there makes the AFTER UPDATE/DELETE triggers skip capture — eliminating the reorg_undo
     // writes + trigger work for the millions of old blocks in a backfill.
     reorg_arm: bool = true,
+    /// Batches since the shared-registry alias candidates were last re-enqueued. Zero
+    /// means "never this process", which triggers a sweep on the first batch so a dropped
+    /// queue (or a database that predates the queue) heals at startup.
+    alias_batches_since_sweep: u64 = 0,
     // Write buffer for batching DB operations during chunk processing
     write_buffer: WriteBuffer,
     /// Which canonical/token ids have placeholder rows on disk — gates the
@@ -431,6 +436,7 @@ pub const Indexer = struct {
     pub const replayAccountsCore = replay_mod.replayAccountsCore;
     /// Rebuild the V2 registries + registry_entries projections (bootstrap + pointer changes).
     pub const replayV2RegistriesCore = replay_mod.replayV2RegistriesCore;
+    pub const replayV2AliasesCore = replay_mod.replayV2AliasesCore;
     pub const trackBlockHash = caches.trackBlockHash;
     pub const resetBlockHashTracking = caches.resetBlockHashTracking;
     pub const getBlockTimestamp = caches.getBlockTimestamp;
@@ -522,6 +528,7 @@ pub const Indexer = struct {
     // V2 registry handlers (extracted to handlers_v2_registry.zig)
     pub const processOrphanedRegistration = handlers_v2_registry.processOrphanedRegistration;
     pub const processRemainingOrphans = handlers_v2_registry.processRemainingOrphans;
+    pub const syncSharedRegistryAliases = alias_sync.syncSharedRegistryAliases;
     pub const handleNameRegistered = handlers_v2_registry.handleNameRegistered;
     pub const handleNameRenewed = handlers_v2_registry.handleNameRenewed;
     pub const handleTransfer = handlers_v2_registry.handleTransfer;

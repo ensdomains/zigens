@@ -574,7 +574,7 @@ fn expectInPlaceOwnerReversed(protocol: models.Protocol) !void {
 
     // Block 200: owner changed to B (in-place UPDATE — captured, tagged block 200).
     try lib.storage.reorg_undo.setCursor(&database, protocol, 200);
-    try database.updateNameOwner(nh, owner_b);
+    try database.updateNameOwner(.v2, nh, owner_b);
     try testing.expectEqualSlices(u8, &owner_b.bytes, &(try ownerOf(allocator, &database, nh)).bytes);
 
     // Reorg to 150: the block-200 update is reversed; the name (created 100) survives.
@@ -638,7 +638,7 @@ test "reorg undo-log: uncaptured PCC materialize survives a later reorg" {
     // Re-arm and make a genuinely-captured mutation at block 200.
     const owner_b = try Address.fromHex("0x00000000000000000000000000000000000000bb");
     try lib.storage.reorg_undo.setCursor(&database, .v1, 200);
-    try database.updateNameOwner(nh, owner_b);
+    try database.updateNameOwner(.v2, nh, owner_b);
 
     // Reorg to 150: the owner update reverses (proves rollback ran), but the
     // materialized expiry is untouched (it was never captured).
@@ -874,7 +874,7 @@ test "reorg undo-log: created-after removed AND updated pre-reorg restored toget
     try database.insertName(ny);
 
     try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
-    try database.updateNameOwner(x, owner_b);
+    try database.updateNameOwner(.v2, x, owner_b);
 
     // Reorg to 150: X (created 100) restored to owner A; Y (created 300) deleted.
     try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
@@ -901,7 +901,7 @@ test "reorg undo-log: rollback is idempotent" {
     defer n.deinit(allocator);
     try database.insertName(n);
     try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
-    try database.updateNameOwner(nh, owner_b);
+    try database.updateNameOwner(.v2, nh, owner_b);
 
     try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
     try lib.storage.sync.rollbackToBlock(&database, .v2, 150); // second time = no-op
@@ -968,11 +968,11 @@ test "reorg undo-log restores exact state-as-of-N across multiple updates" {
 
     // owner A→B@200, B→C@250, C→D@300.
     try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
-    try database.updateNameOwner(nh, b);
+    try database.updateNameOwner(.v2, nh, b);
     try lib.storage.reorg_undo.setCursor(&database, .v2, 250);
-    try database.updateNameOwner(nh, c);
+    try database.updateNameOwner(.v2, nh, c);
     try lib.storage.reorg_undo.setCursor(&database, .v2, 300);
-    try database.updateNameOwner(nh, d);
+    try database.updateNameOwner(.v2, nh, d);
 
     // Reorg to 220: last update ≤ 220 was @200 (→B), so owner must be B (not A, not C/D).
     try lib.storage.sync.rollbackToBlock(&database, .v2, 220);
@@ -1004,9 +1004,9 @@ test "reorg undo-log: rolling back one protocol leaves the other untouched" {
     try database.insertName(nv2);
 
     try lib.storage.reorg_undo.setCursor(&database, .v1, 200);
-    try database.updateNameOwner(v1nh, b);
+    try database.updateNameOwner(.v2, v1nh, b);
     try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
-    try database.updateNameOwner(v2nh, b);
+    try database.updateNameOwner(.v2, v2nh, b);
 
     // Reorg ONLY v2 to 150: v2 reverts to A; v1 stays at B.
     try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
@@ -1653,7 +1653,7 @@ fn applyReconcileBaseline(allocator: std.mem.Allocator, db: *Database) !void {
     try lib.storage.v1_controllers.addController(db, c1, 110, txs);
 
     try lib.storage.reorg_undo.setCursor(db, .v2, 120);
-    try db.updateNameOwner(nh_foo, b); // in-place update, ≤ N
+    try db.updateNameOwner(.v2, nh_foo, b); // in-place update, ≤ N
 
     try lib.storage.reorg_undo.setCursor(db, .v2, 130);
     try db.upsertReverseRecord(.v2, a, nh_foo, 130, tx, 0, 1700000130);
@@ -1675,7 +1675,7 @@ fn applyReconcileReorged(allocator: std.mem.Allocator, db: *Database) !void {
     const acc_z = "0x00000000000000000000000000000000000000a2";
 
     try lib.storage.reorg_undo.setCursor(db, .v2, 200);
-    try db.updateNameOwner(nh_foo, cc_owner); // owner B→new (revert to B)
+    try db.updateNameOwner(.v2, nh_foo, cc_owner); // owner B→new (revert to B)
     try db.storeResolverText(nh_foo, resolver, "url", "b", .v2, 200, tx, 1700000200); // overwrite (revert to "a")
     try db.upsertAccount(.v2, acc_z, 200, 1700000200); // new account (remove)
     var bar = try makeReorgName(allocator, "bar.eth", .v2, a, 200); // new name (remove)
@@ -1725,7 +1725,7 @@ test "reorg undo-log: reconcile comparator detects planted drift" {
     try applyReconcileBaseline(allocator, &b);
     // Plant one extra in-place change in b only.
     try lib.storage.reorg_undo.setCursor(&b, .v2, 145);
-    try b.updateNameOwner(try namehash(allocator, "foo.eth"), try Address.fromHex("0x00000000000000000000000000000000000000ee"));
+    try b.updateNameOwner(.v2, try namehash(allocator, "foo.eth"), try Address.fromHex("0x00000000000000000000000000000000000000ee"));
 
     try testing.expect(!(try reconcileEqual(allocator, &a, &b, false)));
     std.debug.print("✓ reconcile comparator detects planted drift (negative control)\n", .{});

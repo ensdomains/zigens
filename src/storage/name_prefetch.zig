@@ -128,7 +128,12 @@ pub const NamePrefetch = struct {
     }
 
     /// Mirror of names_read.getNameByTokenIdAndRegistry
-    /// (`WHERE canonical_id = ? AND registry = ? LIMIT 1` — no protocol filter).
+    /// (`WHERE canonical_id = ? AND registry = ? AND is_alias = 0
+    ///   ORDER BY created_block, namehash LIMIT 1` — no
+    /// protocol filter). The alias exclusion lives in the loader
+    /// (getNamesByCanonicalIds), so this map never holds an alias row and the
+    /// count>1 punt below stays reserved for the genuine ambiguity it was written
+    /// for, not the shared-registry rows we derive ourselves.
     pub fn pairedLookup(self: *NamePrefetch, token_id: u256, registry: Address, out_alloc: std.mem.Allocator) !Lookup {
         const cid = token_id_utils.getCanonicalId(token_id);
         const list = self.by_cid.get(cid) orelse {

@@ -345,9 +345,10 @@ pub fn indexSubregistryEvents(self: *Indexer, protocol: models.Protocol, client:
     // first_seen_block here is ignored on conflict (the row already exists
     // from discovery, where it was populated with the actual created_block);
     // we pass to_block as a harmless placeholder to satisfy the signature.
-    for (discovery.all) |subreg_hex| {
-        try self.database.registerSubregistry(protocol, subreg_hex, to_block, to_block);
-    }
+    // One statement per 150, not one per subregistry: this ran 229 UPSERTs every batch on the
+    // reference deployment (~6.2s/batch against Neon) to advance checkpoints that were mostly
+    // already at the head.
+    try self.database.registerSubregistriesBatch(protocol, discovery.all, to_block);
 
     const total_processed = ens_processed + transfer_processed;
     if (total_processed > 0) {

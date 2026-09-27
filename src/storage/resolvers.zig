@@ -1582,12 +1582,36 @@ pub fn getAbiContentTypes(db: *Database, resolver: Address, namehash_val: Hash) 
 /// to a node; the most recent `NameChanged` against that node — across resolvers —
 /// is the displayed primary name. Resolver_names has no log_index column, so we
 /// tiebreak with the autoincrement `id` (monotone in insertion order).
+/// The reverse-resolution / primary-name answer for a node.
+///
+/// Three things about the ordering, all deliberate:
+///
+///   * **Protocol preference, not protocol chance.** The table is
+///     UNIQUE(protocol, resolver, namehash), so a migrated node can hold a row per protocol.
+///     V2 wins, matching the twin-suppression rule the `names` listings and
+///     `getNameByNamehash` already use, so the point answer and the listings agree.
+///   * **`resolver` before `id`.** Within one block two different resolvers can each have
+///     written a name for this node, and `resolver` is a stable tiebreak while `id` is
+///     AUTOINCREMENT — i.e. INSERTION order. Insertion order differs between a live run and a
+///     `--backfill` replay, so breaking the tie on `id` alone made a user's primary name
+///     depend on which of the two produced the database. `id` stays last only to make the
+///     order total.
+///   * The `resolver_links` arm is unchanged: a record-model resolver stores the name under a
+///     synthetic record key, so both the direct node and its linked key have to be considered.
+///
+/// Measured on the reference mirror: 0 within-block ties, 0 nodes with rows from more than one
+/// resolver, 0 nodes spanning both protocols — so this is latent today, and the ordering is
+/// what stops it becoming a wrong answer later.
+///
+/// NOT fixed here: the query does not prefer the node's CURRENT resolver, so a name written by
+/// a resolver the node has since moved away from can still win. That needs a join to
+/// `names.resolver` and is a semantic change, not a tiebreak.
 pub fn getLatestNameByNamehash(db: *Database, namehash_val: Hash) !?[]u8 {
     const sql =
         \\SELECT name FROM resolver_names
         \\WHERE namehash = ?
         \\   OR namehash IN (SELECT record_key FROM resolver_links WHERE namehash = ? AND record_id <> '0x0000000000000000000000000000000000000000000000000000000000000000')
-        \\ORDER BY block_number DESC, id DESC
+        \\ORDER BY CASE WHEN protocol = 'v2' THEN 0 ELSE 1 END ASC, block_number DESC, resolver DESC, id DESC
         \\LIMIT 1
     ;
 

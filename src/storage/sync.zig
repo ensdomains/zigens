@@ -383,6 +383,63 @@ pub fn checkIntegrity(db: *Database) !bool {
 /// indexed from this subregistry. On conflict, we keep the MAX of the
 /// existing and new value so callers advancing the checkpoint never go
 /// backwards.
+/// Advance `last_indexed_block` for MANY subregistries in one statement.
+///
+/// The per-batch checkpoint advance used to be one `registerSubregistry` call per known
+/// subregistry — 229 individual UPSERTs on the reference deployment, every batch, growing
+/// linearly with the number of subregistries ever discovered. Round-trip-bound rather than
+/// work-bound: against Neon at ~27ms that is **6.2 seconds per batch** doing almost nothing,
+/// since the vast majority of those rows are already at the head.
+///
+/// Semantics are identical to the single-row version: `first_seen_block` is ignored on
+/// conflict (discovery already set it from the real `created_block`) and `last_indexed_block`
+/// is a MAX/GREATEST merge, so it can never regress and the result does not depend on the
+/// order rows appear in the batch.
+///
+/// Binds are static and fed from an arena: the per-statement TRACKED-copy cap is 32, which a
+/// chunk of address binds would blow straight through (the names bulk writer does the same).
+pub fn registerSubregistriesBatch(
+    db: *Database,
+    protocol: models.Protocol,
+    addresses: []const []const u8,
+    last_indexed_block: u64,
+) !void {
+    if (addresses.len == 0) return;
+
+    const CHUNK: usize = 150;
+    var off: usize = 0;
+    while (off < addresses.len) : (off += CHUNK) {
+        const chunk = addresses[off..@min(off + CHUNK, addresses.len)];
+
+        // Arena declared before the statement so static binds outlive it (LIFO defers).
+        var scratch = std.heap.ArenaAllocator.init(db.allocator);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.appendSlice(sa,
+            \\INSERT INTO known_subregistries (protocol, address, first_seen_block, last_indexed_block)
+            \\VALUES
+        );
+        for (chunk, 0..) |_, i| {
+            try sql.appendSlice(sa, if (i == 0) " (?, ?, ?, ?)" else ", (?, ?, ?, ?)");
+        }
+        try sql.appendSlice(sa, "\nON CONFLICT(protocol, address) DO UPDATE SET\n  last_indexed_block = ");
+        try sql.appendSlice(sa, db.dialect().scalar_max);
+        try sql.appendSlice(sa, "(known_subregistries.last_indexed_block, excluded.last_indexed_block)");
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        for (chunk) |address| {
+            try q.bindTextStatic(protocol.toString());
+            try q.bindTextStatic(try sa.dupe(u8, address));
+            try q.bindInt64(@intCast(last_indexed_block));
+            try q.bindInt64(@intCast(last_indexed_block));
+        }
+        try q.exec();
+    }
+}
+
 pub fn registerSubregistry(
     db: *Database,
     protocol: models.Protocol,
@@ -798,6 +855,63 @@ pub fn deleteOrphanedRegistrations(db: *Database, protocol: models.Protocol, sub
     try q.bindText(subregistry_address);
 
     try q.exec();
+}
+
+test "registerSubregistriesBatch matches the per-row writer: MAX merge, first_seen preserved, chunk boundary" {
+    const testing = std.testing;
+    var db = try Database.init(testing.allocator, ":memory:");
+    defer db.deinit();
+
+    // Enough addresses to cross the 150-row chunk boundary, so the multi-statement path is the
+    // one under test rather than a single convenient statement.
+    const total: usize = 160;
+    var store: [total][42]u8 = undefined;
+    var addrs: [total][]const u8 = undefined;
+    for (0..total) |i| {
+        var a = Address{ .bytes = [_]u8{0} ** 20 };
+        a.bytes[19] = @intCast(i % 256);
+        a.bytes[18] = @intCast(i / 256);
+        addrs[i] = a.toHexBuf(&store[i]);
+    }
+
+    // Discovery seeds first_seen_block with the real created_block, one row at a time.
+    for (addrs, 0..) |hex, i| {
+        try registerSubregistry(&db, .v2, hex, 1000 + i, 1000 + i);
+    }
+
+    // The per-batch advance. first_seen_block must be UNTOUCHED (ignored on conflict) and
+    // last_indexed_block must move to the new head.
+    try registerSubregistriesBatch(&db, .v2, &addrs, 5000);
+    {
+        var q = try Query.init(&db, "SELECT count(*), min(first_seen_block), max(first_seen_block), min(last_indexed_block), max(last_indexed_block) FROM known_subregistries WHERE protocol = 'v2'");
+        defer q.deinit();
+        try testing.expect(try q.step());
+        try testing.expectEqual(@as(i64, @intCast(total)), q.getInt64(0));
+        try testing.expectEqual(@as(i64, 1000), q.getInt64(1));
+        try testing.expectEqual(@as(i64, 1000 + @as(i64, @intCast(total)) - 1), q.getInt64(2));
+        try testing.expectEqual(@as(i64, 5000), q.getInt64(3));
+        try testing.expectEqual(@as(i64, 5000), q.getInt64(4));
+    }
+
+    // A LOWER head must not regress the checkpoint — the merge is MAX/GREATEST, so replaying an
+    // older batch is harmless and the result does not depend on batch order.
+    try registerSubregistriesBatch(&db, .v2, &addrs, 4000);
+    {
+        var q = try Query.init(&db, "SELECT min(last_indexed_block) FROM known_subregistries WHERE protocol = 'v2'");
+        defer q.deinit();
+        try testing.expect(try q.step());
+        try testing.expectEqual(@as(i64, 5000), q.getInt64(0));
+    }
+
+    // And it is protocol-scoped: v1 rows are untouched by a v2 advance.
+    try registerSubregistry(&db, .v1, addrs[0], 10, 10);
+    try registerSubregistriesBatch(&db, .v2, &addrs, 6000);
+    {
+        var q = try Query.init(&db, "SELECT last_indexed_block FROM known_subregistries WHERE protocol = 'v1'");
+        defer q.deinit();
+        try testing.expect(try q.step());
+        try testing.expectEqual(@as(i64, 10), q.getInt64(0));
+    }
 }
 
 test "isKnownResolver is protocol-scoped and requires registration" {

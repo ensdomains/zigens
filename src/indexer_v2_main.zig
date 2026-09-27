@@ -147,6 +147,7 @@ pub fn main(init: std.process.Init) !void {
         try idx.replayV2EacRolesCore();
         try idx.replayV2RegistrationsCore();
         try idx.replayV2RegistriesCore();
+        try idx.replayV2AliasesCore(); // after names + registries (needs the rebuilt registry_entries mirror)
         try idx.replayAccountsCore();
         try idx.writeReplayStatus();
         std.log.info("Backfill complete. Exiting.", .{});

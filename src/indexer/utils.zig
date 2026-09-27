@@ -77,9 +77,12 @@ pub fn emitEvent(
 /// Resolve a zero namehash by looking up the actual namehash from the resolver address.
 /// In ENSv2, each name has its own dedicated resolver, so events may emit a zeroed namehash.
 /// Returns true if the namehash is valid (non-zero or resolved), false if it should be skipped.
-pub fn resolveNamehash(self: *Indexer, namehash: *Hash, resolver: Address, event_name: []const u8) !bool {
+pub fn resolveNamehash(self: *Indexer, protocol: models.Protocol, namehash: *Hash, resolver: Address, event_name: []const u8) !bool {
     if (!namehash.isZero()) return true;
-    if (try self.database.getNamehashByResolver(resolver)) |actual| {
+    // Null covers two cases and both must skip: the resolver is unknown, or it is SHARED by
+    // several names so the attribution is unanswerable. Skipping loses one event's record;
+    // guessing wrote it to a name chosen arbitrarily out of as many as 159k.
+    if (try self.database.getNamehashByResolver(protocol, resolver)) |actual| {
         namehash.* = actual;
         return true;
     }

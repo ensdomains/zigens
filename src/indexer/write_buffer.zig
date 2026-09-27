@@ -33,7 +33,15 @@ pub const WriteBuffer = struct {
     /// Buffered name operations, keyed by namehash (32 bytes).
     /// For new names: stores full record with all subsequent updates applied in-place.
     /// For existing DB names: stores only the pending field updates.
-    names: std.AutoHashMap([32]u8, BufferedName),
+    /// Keyed by (protocol, namehash), NOT namehash alone.
+    ///
+    /// `names` is UNIQUE(protocol, namehash) and a MIGRATED name has a row in each protocol,
+    /// while both the V1 handlers and the V2 ones buffer field updates through here. Keyed on
+    /// the namehash alone, a V1 NewOwner and a V2 Transfer for the same node shared one entry:
+    /// the later call silently overwrote the earlier one's pending owner, and the flush then
+    /// wrote that single value to BOTH protocols' rows. The protocol has to be part of the
+    /// identity, not an afterthought at flush time.
+    names: std.AutoHashMap(NameKey, BufferedName),
 
     /// Buffered events (append-only, no deduplication needed).
     events: std.ArrayList(models.Event),
@@ -87,6 +95,9 @@ pub const WriteBuffer = struct {
         block_number: u64,
         tx_hash: Hash,
         log_index: u32,
+        /// The BLOCK's timestamp, carried through the buffer so the flush does not have to
+        /// invent one. See storage/roles.zig's upsertEACRole.
+        block_timestamp: i64,
     };
 
     pub const BufferedRegistration = struct {
@@ -136,6 +147,16 @@ pub const WriteBuffer = struct {
         first_seen_timestamp: i64,
     };
 
+    /// Identity of a buffered `names` row. See the `names` field comment.
+    pub const NameKey = struct {
+        protocol: models.Protocol,
+        namehash: [32]u8,
+    };
+
+    fn nameKey(protocol: models.Protocol, namehash: Hash) NameKey {
+        return .{ .protocol = protocol, .namehash = namehash.bytes };
+    }
+
     pub const BufferedName = struct {
         /// True if this name was INSERT'd in this chunk (vs UPDATE to existing DB record).
         is_new: bool,
@@ -169,7 +190,7 @@ pub const WriteBuffer = struct {
     pub fn init(allocator: std.mem.Allocator) WriteBuffer {
         return .{
             .allocator = allocator,
-            .names = std.AutoHashMap([32]u8, BufferedName).init(allocator),
+            .names = std.AutoHashMap(NameKey, BufferedName).init(allocator),
             .events = .empty,
             .roles = std.StringHashMap(BufferedRole).init(allocator),
             .registrations = .empty,
@@ -259,7 +280,7 @@ pub const WriteBuffer = struct {
 
     /// Buffer a new name INSERT. Dupes all string fields so the caller can free theirs.
     pub fn insertName(self: *WriteBuffer, name: models.Name) !void {
-        const key = name.namehash.bytes;
+        const key = nameKey(name.protocol, name.namehash);
         const gop = try self.names.getOrPut(key);
 
         if (gop.found_existing) {
@@ -291,15 +312,15 @@ pub const WriteBuffer = struct {
     /// like the direct path: field updates land on the pending record in-place
     /// instead of no-op'ing against a DB row that doesn't exist yet. The
     /// pointer is invalidated by the next names-map mutation — use immediately.
-    pub fn pendingNewName(self: *WriteBuffer, namehash: Hash) ?*models.Name {
-        const entry = self.names.getPtr(namehash.bytes) orelse return null;
+    pub fn pendingNewName(self: *WriteBuffer, protocol: models.Protocol, namehash: Hash) ?*models.Name {
+        const entry = self.names.getPtr(nameKey(protocol, namehash)) orelse return null;
         if (!entry.is_new) return null;
         return &entry.record.?;
     }
 
     /// Buffer an owner update. If the name was INSERT'd this chunk, updates in-place.
-    pub fn updateNameOwner(self: *WriteBuffer, namehash: Hash, owner: Address) !void {
-        const key = namehash.bytes;
+    pub fn updateNameOwner(self: *WriteBuffer, protocol: models.Protocol, namehash: Hash, owner: Address) !void {
+        const key = nameKey(protocol, namehash);
         const gop = try self.names.getOrPut(key);
 
         if (gop.found_existing) {
@@ -318,8 +339,8 @@ pub const WriteBuffer = struct {
     /// Buffer a V1→V2 migration: sets `owner=controller` and `migrated=true`.
     /// If the name was INSERT'd this chunk (rare for migrations), updates the
     /// buffered record in-place; otherwise records pending update.
-    pub fn markNameMigrated(self: *WriteBuffer, namehash: Hash, controller: Address) !void {
-        const key = namehash.bytes;
+    pub fn markNameMigrated(self: *WriteBuffer, protocol: models.Protocol, namehash: Hash, controller: Address) !void {
+        const key = nameKey(protocol, namehash);
         const gop = try self.names.getOrPut(key);
 
         if (gop.found_existing) {
@@ -338,7 +359,10 @@ pub const WriteBuffer = struct {
     /// flush through names_storage.updateV1RenewalExpiry (grace-aware CASE for
     /// wrapped rows); records buffered this chunk store the bare value.
     pub fn updateV1RenewalExpiry(self: *WriteBuffer, namehash: Hash, expires: u64) !void {
-        const key = namehash.bytes;
+        // NameWrapper and V1 renewals are V1-only concepts, so the buffered row can only
+        // ever be the V1 one — see the `names` field comment on why the key carries protocol.
+        const protocol = models.Protocol.v1;
+        const key = nameKey(protocol, namehash);
         const gop = try self.names.getOrPut(key);
 
         if (gop.found_existing) {
@@ -358,8 +382,8 @@ pub const WriteBuffer = struct {
     }
 
     /// Buffer a resolver update.
-    pub fn updateNameResolver(self: *WriteBuffer, namehash: Hash, resolver: Address) !void {
-        const key = namehash.bytes;
+    pub fn updateNameResolver(self: *WriteBuffer, protocol: models.Protocol, namehash: Hash, resolver: Address) !void {
+        const key = nameKey(protocol, namehash);
         const gop = try self.names.getOrPut(key);
 
         if (gop.found_existing) {
@@ -375,7 +399,10 @@ pub const WriteBuffer = struct {
 
     /// Buffer a wrapper state update (NameWrapped event).
     pub fn updateNameWrapperState(self: *WriteBuffer, namehash: Hash, fuses: u32, expiry: u64) !void {
-        const key = namehash.bytes;
+        // NameWrapper and V1 renewals are V1-only concepts, so the buffered row can only
+        // ever be the V1 one — see the `names` field comment on why the key carries protocol.
+        const protocol = models.Protocol.v1;
+        const key = nameKey(protocol, namehash);
         const gop = try self.names.getOrPut(key);
 
         if (gop.found_existing) {
@@ -401,7 +428,10 @@ pub const WriteBuffer = struct {
 
     /// Buffer a name unwrap (NameUnwrapped event).
     pub fn clearNameWrapperState(self: *WriteBuffer, namehash: Hash) !void {
-        const key = namehash.bytes;
+        // NameWrapper and V1 renewals are V1-only concepts, so the buffered row can only
+        // ever be the V1 one — see the `names` field comment on why the key carries protocol.
+        const protocol = models.Protocol.v1;
+        const key = nameKey(protocol, namehash);
         const gop = try self.names.getOrPut(key);
 
         if (gop.found_existing) {
@@ -425,7 +455,10 @@ pub const WriteBuffer = struct {
 
     /// Buffer a fuses-only update (FusesSet event).
     pub fn updateNameWrapperFuses(self: *WriteBuffer, namehash: Hash, fuses: u32) !void {
-        const key = namehash.bytes;
+        // NameWrapper and V1 renewals are V1-only concepts, so the buffered row can only
+        // ever be the V1 one — see the `names` field comment on why the key carries protocol.
+        const protocol = models.Protocol.v1;
+        const key = nameKey(protocol, namehash);
         const gop = try self.names.getOrPut(key);
 
         if (gop.found_existing) {
@@ -444,7 +477,10 @@ pub const WriteBuffer = struct {
 
     /// Buffer a wrapper expiry-only update (ExpiryExtended event).
     pub fn updateNameWrapperExpiry(self: *WriteBuffer, namehash: Hash, expiry: u64) !void {
-        const key = namehash.bytes;
+        // NameWrapper and V1 renewals are V1-only concepts, so the buffered row can only
+        // ever be the V1 one — see the `names` field comment on why the key carries protocol.
+        const protocol = models.Protocol.v1;
+        const key = nameKey(protocol, namehash);
         const gop = try self.names.getOrPut(key);
 
         if (gop.found_existing) {
@@ -488,6 +524,7 @@ pub const WriteBuffer = struct {
         tx_hash: Hash,
         log_index: u32,
         contract_address: Address,
+        block_timestamp: i64,
     ) !void {
         var account_buf: [42]u8 = undefined;
         var contract_buf: [42]u8 = undefined;
@@ -519,6 +556,7 @@ pub const WriteBuffer = struct {
             .block_number = block_number,
             .tx_hash = tx_hash,
             .log_index = log_index,
+            .block_timestamp = block_timestamp,
         };
     }
 
@@ -531,10 +569,10 @@ pub const WriteBuffer = struct {
     /// wrote, so drop them — otherwise a burn + re-register in one batch
     /// would flush a stale owner over the new row. Buffered INSERTs (V1
     /// bulk) are untouched.
-    pub fn discardPendingName(self: *WriteBuffer, namehash: Hash) void {
-        const entry = self.names.getPtr(namehash.bytes) orelse return;
+    pub fn discardPendingName(self: *WriteBuffer, protocol: models.Protocol, namehash: Hash) void {
+        const entry = self.names.getPtr(nameKey(protocol, namehash)) orelse return;
         if (entry.is_new) return;
-        _ = self.names.remove(namehash.bytes);
+        _ = self.names.remove(nameKey(protocol, namehash));
     }
 
     // ========================================================================
@@ -718,7 +756,8 @@ pub const WriteBuffer = struct {
                 try new_names.append(self.allocator, .{ .seq = bn.seq, .name = bn.record.? });
             } else {
                 // Apply individual updates to existing DB record
-                const namehash = Hash{ .bytes = entry.key_ptr.* };
+                const namehash = Hash{ .bytes = entry.key_ptr.namehash };
+                const key_protocol = entry.key_ptr.protocol;
                 const address_only = bn.migrated_to == null and bn.expiry == null and bn.wrapper_state == null and
                     !bn.unwrap and bn.fuses_update == null and bn.wrapper_expiry_update == null and
                     (bn.owner != null or bn.resolver != null);
@@ -754,7 +793,7 @@ pub const WriteBuffer = struct {
                     op_count[3] += 1;
                 } else if (bn.owner) |owner| {
                     const t0 = zsys.nanoTimestamp();
-                    try names_storage.updateNameOwner(db, namehash, owner);
+                    try names_storage.updateNameOwner(db, key_protocol, namehash, owner);
                     op_ns[3] += zsys.nanoTimestamp() - t0;
                     op_count[3] += 1;
                 }
@@ -766,7 +805,7 @@ pub const WriteBuffer = struct {
                 }
                 if (bn.resolver) |resolver| {
                     const t0 = zsys.nanoTimestamp();
-                    try names_storage.updateNameResolver(db, namehash, resolver);
+                    try names_storage.updateNameResolver(db, key_protocol, namehash, resolver);
                     op_ns[5] += zsys.nanoTimestamp() - t0;
                     op_count[5] += 1;
                 }
@@ -846,6 +885,7 @@ pub const WriteBuffer = struct {
                         .account = r.account,
                         .role_bitmap = bitmap,
                         .block_number = r.block_number,
+                        .block_timestamp = r.block_timestamp,
                         .tx_hash = r.tx_hash,
                         .log_index = r.log_index,
                         .contract_address = r.contract_address,
@@ -1138,14 +1178,14 @@ test "a direct row write discards buffered updates but not buffered inserts" {
     var wb = WriteBuffer.init(testing.allocator);
     defer wb.deinit();
     const nh = Hash{ .bytes = [_]u8{1} ** 32 };
-    try wb.updateNameOwner(nh, testAddr(1));
-    try wb.updateNameResolver(nh, testAddr(2));
+    try wb.updateNameOwner(.v2, nh, testAddr(1));
+    try wb.updateNameResolver(.v2, nh, testAddr(2));
     try testing.expectEqual(@as(u32, 1), wb.names.count());
-    wb.discardPendingName(nh);
+    wb.discardPendingName(.v2, nh);
     try testing.expectEqual(@as(u32, 0), wb.names.count());
 
     const rec = models.Name{ .name = "x.eth", .label = "x", .parent_name = "eth", .namehash = nh, .protocol = .v1, .label_hash = Hash.zero, .parent_namehash = Hash.zero, .registry = testAddr(0), .owner = testAddr(1), .registrant = testAddr(1), .resolver = testAddr(0), .token_id = 0, .canonical_id = 0, .token_version = 0, .expiry = 0, .registry_locked = false, .migrated = false, .created_block = 0, .created_at = 0, .registered_at = 0, .updated_block = 0, .updated_at = 0, .is_wrapped = false, .wrapper_fuses = null, .wrapper_expiry = null, .is_v1_name = true, .v1_label_hash = null };
     try wb.insertName(rec);
-    wb.discardPendingName(nh);
+    wb.discardPendingName(.v2, nh);
     try testing.expectEqual(@as(u32, 1), wb.names.count());
 }

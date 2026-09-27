@@ -55,14 +55,17 @@ pub fn bufferingEntities(self: *Indexer) bool {
     return self.write_buffer.active and !self.reorg_arm;
 }
 
+/// V2 only: every caller is a V2 registry handler. The protocol is explicit because `names`
+/// is UNIQUE(protocol, namehash) and a migrated name has a V1 twin that must not be touched.
 pub fn setNameOwner(self: *Indexer, namehash: Hash, owner: Address) !void {
-    if (self.bufferingEntities()) return self.write_buffer.updateNameOwner(namehash, owner);
-    try self.database.updateNameOwner(namehash, owner);
+    if (self.bufferingEntities()) return self.write_buffer.updateNameOwner(.v2, namehash, owner);
+    try self.database.updateNameOwner(.v2, namehash, owner);
 }
 
+/// V2 only — see `setNameOwner`.
 pub fn setNameResolver(self: *Indexer, namehash: Hash, resolver: Address) !void {
-    if (self.bufferingEntities()) return self.write_buffer.updateNameResolver(namehash, resolver);
-    try self.database.updateNameResolver(namehash, resolver);
+    if (self.bufferingEntities()) return self.write_buffer.updateNameResolver(.v2, namehash, resolver);
+    try self.database.updateNameResolver(.v2, namehash, resolver);
 }
 
 /// True when the row (protocol scope of `registry`, `namehash`) already
@@ -324,7 +327,7 @@ pub fn getNameFromNamehash(self: *Indexer, namehash: Hash) ?[]const u8 {
     // this, same-chunk lookups (e.g. events.name) silently resolve to null.
     // Not cached: the pending record is mutable until flush.
     if (self.write_buffer.active) {
-        if (self.write_buffer.pendingNewName(namehash)) |pr| {
+        if (self.write_buffer.pendingNewName(.v2, namehash)) |pr| {
             if (pr.name) |n| return self.allocator.dupe(u8, n) catch null;
         }
     }

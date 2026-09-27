@@ -35,6 +35,7 @@ test "upsertEACRole inserts new role" {
         tx_hash,
         0,
         helpers.TEST_RESOLVER,
+        1_700_000_000,
     );
 
     // Verify by querying
@@ -58,11 +59,11 @@ test "upsertEACRole updates existing role bitmap" {
     const tx_hash = helpers.randomHash();
 
     // Insert initial role
-    try roles.upsertEACRole(database, .v2, resource, account, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, resource, account, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER, 1_700_000_000);
 
     // Update role bitmap
     const tx_hash2 = helpers.randomHash();
-    try roles.upsertEACRole(database, .v2, resource, account, "0x03", 2000, tx_hash2, 0, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, resource, account, "0x03", 2000, tx_hash2, 0, helpers.TEST_RESOLVER, 1_700_000_000);
 
     // Verify updated
     const role_list = try roles.getRolesByResource(database, .v2, resource);
@@ -88,8 +89,8 @@ test "getRolesByResource returns roles for resource" {
     const tx_hash = helpers.randomHash();
 
     // Assign multiple accounts to same resource
-    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER);
-    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_2, "0x02", 1000, tx_hash, 1, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER, 1_700_000_000);
+    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_2, "0x02", 1000, tx_hash, 1, helpers.TEST_RESOLVER, 1_700_000_000);
 
     const role_list = try roles.getRolesByResource(database, .v2, resource);
     defer {
@@ -108,9 +109,9 @@ test "getRolesByAccount returns roles for account" {
     const tx_hash = helpers.randomHash();
 
     // Assign account to multiple resources
-    try roles.upsertEACRole(database, .v2, "resource1", helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER);
-    try roles.upsertEACRole(database, .v2, "resource2", helpers.TEST_OWNER_1, "0x02", 1000, tx_hash, 1, helpers.TEST_RESOLVER);
-    try roles.upsertEACRole(database, .v2, "resource3", helpers.TEST_OWNER_1, "0x04", 1000, tx_hash, 2, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, "resource1", helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER, 1_700_000_000);
+    try roles.upsertEACRole(database, .v2, "resource2", helpers.TEST_OWNER_1, "0x02", 1000, tx_hash, 1, helpers.TEST_RESOLVER, 1_700_000_000);
+    try roles.upsertEACRole(database, .v2, "resource3", helpers.TEST_OWNER_1, "0x04", 1000, tx_hash, 2, helpers.TEST_RESOLVER, 1_700_000_000);
 
     const role_list = try roles.getRolesByAccount(database, .v2, helpers.TEST_OWNER_1);
     defer {
@@ -146,7 +147,7 @@ test "deleteEACRole removes role assignment" {
     const tx_hash = helpers.randomHash();
 
     // Insert role
-    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER, 1_700_000_000);
 
     // Verify exists
     {
@@ -190,7 +191,7 @@ test "stored role defaults to registry contract_kind and decodes registry names"
     const tx_hash = helpers.randomHash();
     // ROLE_SET_RESOLVER = 1 << 24 on a registry.
     const bitmap_hex = "0x0000000000000000000000000000000000000000000000000000000001000000";
-    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_1, bitmap_hex, 1000, tx_hash, 0, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_1, bitmap_hex, 1000, tx_hash, 0, helpers.TEST_RESOLVER, 1_700_000_000);
 
     const role_list = try roles.getRolesByResource(database, .v2, resource);
     defer {
@@ -246,7 +247,7 @@ test "EAC row from a known resolver classifies as resolver and decodes resolver 
     const tx_hash = helpers.randomHash();
     // 1 << 24 = nybble 6 → SET_DATA on a resolver (SET_RESOLVER on a registry).
     const bitmap_hex = "0x0000000000000000000000000000000000000000000000000000000001000000";
-    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_1, bitmap_hex, 1000, tx_hash, 0, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_1, bitmap_hex, 1000, tx_hash, 0, helpers.TEST_RESOLVER, 1_700_000_000);
 
     const role_list = try roles.getRolesByResource(database, .v2, resource);
     defer {
@@ -301,8 +302,8 @@ test "rows carry the emitting contract and the contract filter isolates it" {
     const contract_a = Address{ .bytes = [_]u8{0xAA} ** 20 };
     const contract_b = Address{ .bytes = [_]u8{0xBB} ** 20 };
 
-    try roles.upsertEACRole(database, .v2, root_resource, helpers.TEST_OWNER_1, "0x01", 1000, helpers.randomHash(), 0, contract_a);
-    try roles.upsertEACRole(database, .v2, root_resource, helpers.TEST_OWNER_2, "0x02", 1000, helpers.randomHash(), 1, contract_b);
+    try roles.upsertEACRole(database, .v2, root_resource, helpers.TEST_OWNER_1, "0x01", 1000, helpers.randomHash(), 0, contract_a, 1_700_000_000);
+    try roles.upsertEACRole(database, .v2, root_resource, helpers.TEST_OWNER_2, "0x02", 1000, helpers.randomHash(), 1, contract_b, 1_700_000_000);
 
     // Unscoped: both contracts' rows, each stamped with its emitting contract.
     const all = try roles.getRolesFiltered(database, .v2, .{ .resource = root_resource });
@@ -336,9 +337,9 @@ test "contract filter combines with account and works alone" {
     const contract_b = Address{ .bytes = [_]u8{0xBB} ** 20 };
 
     // Same account holds roles on two contracts; a second account on one.
-    try roles.upsertEACRole(database, .v2, "0x01", helpers.TEST_OWNER_1, "0x01", 1000, helpers.randomHash(), 0, contract_a);
-    try roles.upsertEACRole(database, .v2, "0x02", helpers.TEST_OWNER_1, "0x01", 1000, helpers.randomHash(), 1, contract_b);
-    try roles.upsertEACRole(database, .v2, "0x03", helpers.TEST_OWNER_2, "0x01", 1000, helpers.randomHash(), 2, contract_b);
+    try roles.upsertEACRole(database, .v2, "0x01", helpers.TEST_OWNER_1, "0x01", 1000, helpers.randomHash(), 0, contract_a, 1_700_000_000);
+    try roles.upsertEACRole(database, .v2, "0x02", helpers.TEST_OWNER_1, "0x01", 1000, helpers.randomHash(), 1, contract_b, 1_700_000_000);
+    try roles.upsertEACRole(database, .v2, "0x03", helpers.TEST_OWNER_2, "0x01", 1000, helpers.randomHash(), 2, contract_b, 1_700_000_000);
 
     const by_account_and_contract = try roles.getRolesFiltered(database, .v2, .{ .account = helpers.TEST_OWNER_1, .contract_address = contract_b });
     defer {
@@ -363,8 +364,8 @@ test "equal-timestamp rows order deterministically (id tiebreak)" {
 
     const resource = "0xdead";
     // Same block => same timestamp; insertion order fixes ids.
-    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_1, "0x01", 1000, helpers.randomHash(), 0, helpers.TEST_RESOLVER);
-    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_2, "0x02", 1000, helpers.randomHash(), 1, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_1, "0x01", 1000, helpers.randomHash(), 0, helpers.TEST_RESOLVER, 1_700_000_000);
+    try roles.upsertEACRole(database, .v2, resource, helpers.TEST_OWNER_2, "0x02", 1000, helpers.randomHash(), 1, helpers.TEST_RESOLVER, 1_700_000_000);
 
     const list = try roles.getRolesFiltered(database, .v2, .{ .resource = resource });
     defer {
@@ -392,7 +393,7 @@ test "resource filter matches padded, trimmed, and verbatim spellings" {
     const trimmed = try std.fmt.bufPrint(&trimmed_buf, "0x{x}", .{v});
     try testing.expect(padded.len != trimmed.len); // the leading-zero premise
 
-    try roles.upsertEACRole(database, .v2, padded, helpers.TEST_OWNER_1, "0x0110", 1000, helpers.randomHash(), 0, helpers.TEST_REGISTRY);
+    try roles.upsertEACRole(database, .v2, padded, helpers.TEST_OWNER_1, "0x0110", 1000, helpers.randomHash(), 0, helpers.TEST_REGISTRY, 1_700_000_000);
 
     for ([_][]const u8{ padded, trimmed }) |form| {
         const got = try roles.getRolesFiltered(database, .v2, .{ .resource = form });
@@ -419,7 +420,7 @@ test "upsertEACRolesBatch matches direct upsert semantics and preserves id on co
     defer helpers.destroyTestDatabase(allocator, database);
 
     const tx1 = helpers.randomHash();
-    try roles.upsertEACRole(database, .v2, "777001", helpers.TEST_OWNER_1, "0x01", 1000, tx1, 0, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, "777001", helpers.TEST_OWNER_1, "0x01", 1000, tx1, 0, helpers.TEST_RESOLVER, 1_700_000_000);
 
     const before = try roles.getRolesByResource(database, .v2, "777001");
     defer {
@@ -433,9 +434,9 @@ test "upsertEACRolesBatch matches direct upsert semantics and preserves id on co
     const rows = [_]roles.RoleUpsertRow{
         // Conflicts with the pre-existing row: must UPDATE in place, not
         // delete+reinsert (INSERT OR REPLACE would churn the id).
-        .{ .protocol = .v2, .resource = "777001", .account = helpers.TEST_OWNER_1, .role_bitmap = "0x07", .block_number = 2000, .tx_hash = tx2, .log_index = 3, .contract_address = helpers.TEST_RESOLVER },
-        .{ .protocol = .v2, .resource = "777001", .account = helpers.TEST_OWNER_2, .role_bitmap = "0x02", .block_number = 2000, .tx_hash = tx2, .log_index = 4, .contract_address = helpers.TEST_RESOLVER },
-        .{ .protocol = .v2, .resource = "777002", .account = helpers.TEST_OWNER_1, .role_bitmap = "0x04", .block_number = 2001, .tx_hash = tx2, .log_index = 5, .contract_address = helpers.TEST_RESOLVER },
+        .{ .protocol = .v2, .resource = "777001", .account = helpers.TEST_OWNER_1, .role_bitmap = "0x07", .block_number = 2000, .tx_hash = tx2, .log_index = 3, .contract_address = helpers.TEST_RESOLVER, .block_timestamp = 1_700_000_000 },
+        .{ .protocol = .v2, .resource = "777001", .account = helpers.TEST_OWNER_2, .role_bitmap = "0x02", .block_number = 2000, .tx_hash = tx2, .log_index = 4, .contract_address = helpers.TEST_RESOLVER, .block_timestamp = 1_700_000_000 },
+        .{ .protocol = .v2, .resource = "777002", .account = helpers.TEST_OWNER_1, .role_bitmap = "0x04", .block_number = 2001, .tx_hash = tx2, .log_index = 5, .contract_address = helpers.TEST_RESOLVER, .block_timestamp = 1_700_000_000 },
     };
     try roles.upsertEACRolesBatch(database, &rows);
 
@@ -488,6 +489,7 @@ test "upsertEACRolesBatch handles batches past the chunk boundary and tracked-st
             .tx_hash = tx,
             .log_index = @intCast(i),
             .contract_address = helpers.TEST_RESOLVER,
+            .block_timestamp = 1_700_000_000,
         };
     }
     try roles.upsertEACRolesBatch(database, &rows);
@@ -582,10 +584,10 @@ test "registry resource keeps its EAC version bits and a superseded version drop
 
     // First registration: owner 1 holds roles at version 0. Unregister +
     // re-register bumps eacVersionId → the new owner's grant lands on version 1.
-    try roles.upsertEACRole(database, .v2, &lbl.v0, helpers.TEST_OWNER_1, "0x0111", 1000, helpers.randomHash(), 0, registry);
-    try roles.upsertEACRole(database, .v2, &lbl.v1, helpers.TEST_OWNER_2, "0x0111", 2000, helpers.randomHash(), 0, registry);
+    try roles.upsertEACRole(database, .v2, &lbl.v0, helpers.TEST_OWNER_1, "0x0111", 1000, helpers.randomHash(), 0, registry, 1_700_000_000);
+    try roles.upsertEACRole(database, .v2, &lbl.v1, helpers.TEST_OWNER_2, "0x0111", 2000, helpers.randomHash(), 0, registry, 1_700_000_000);
     // Registry-wide ROOT roles have no version and must never be filtered out.
-    try roles.upsertEACRole(database, .v2, root, helpers.TEST_OWNER_1, "0x1111", 900, helpers.randomHash(), 0, registry);
+    try roles.upsertEACRole(database, .v2, root, helpers.TEST_OWNER_1, "0x1111", 900, helpers.randomHash(), 0, registry, 1_700_000_000);
 
     // Stored exactly as emitted.
     const v1_rows = try roles.getRolesFiltered(database, .v2, .{ .resource = &lbl.v1 });
@@ -627,9 +629,9 @@ test "versioned registry resources attribute to the label by canonical prefix" {
     const registry = helpers.TEST_REGISTRY;
     try seedRegistryName(allocator, database, "versioned.eth", LABEL_CANONICAL, registry);
 
-    try roles.upsertEACRole(database, .v2, &lbl.v2, helpers.TEST_OWNER_2, "0x0111", 3000, helpers.randomHash(), 0, registry);
+    try roles.upsertEACRole(database, .v2, &lbl.v2, helpers.TEST_OWNER_2, "0x0111", 3000, helpers.randomHash(), 0, registry, 1_700_000_000);
     // Same resource value on ANOTHER contract must not borrow the name.
-    try roles.upsertEACRole(database, .v2, &lbl.v2, helpers.TEST_OWNER_1, "0x0001", 3000, helpers.randomHash(), 1, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, &lbl.v2, helpers.TEST_OWNER_1, "0x0001", 3000, helpers.randomHash(), 1, helpers.TEST_RESOLVER, 1_700_000_000);
 
     const rows = try roles.getRolesFiltered(database, .v2, .{ .resource = &lbl.v2 });
     defer freeRoles(allocator, rows);
@@ -651,11 +653,11 @@ test "getLabelRoleHolderCount counts only the label's current EAC version" {
     const registry = helpers.TEST_REGISTRY;
     const owner3 = Address{ .bytes = [_]u8{0x33} ** 20 };
 
-    try roles.upsertEACRole(database, .v2, &lbl.v0, helpers.TEST_OWNER_1, "0x0111", 1000, helpers.randomHash(), 0, registry);
+    try roles.upsertEACRole(database, .v2, &lbl.v0, helpers.TEST_OWNER_1, "0x0111", 1000, helpers.randomHash(), 0, registry, 1_700_000_000);
     try testing.expectEqual(@as(usize, 1), try roles.getLabelRoleHolderCount(database, .v2, &lbl.canonical, registry));
 
-    try roles.upsertEACRole(database, .v2, &lbl.v1, helpers.TEST_OWNER_2, "0x0111", 2000, helpers.randomHash(), 0, registry);
-    try roles.upsertEACRole(database, .v2, &lbl.v1, owner3, "0x0100", 2000, helpers.randomHash(), 1, registry);
+    try roles.upsertEACRole(database, .v2, &lbl.v1, helpers.TEST_OWNER_2, "0x0111", 2000, helpers.randomHash(), 0, registry, 1_700_000_000);
+    try roles.upsertEACRole(database, .v2, &lbl.v1, owner3, "0x0100", 2000, helpers.randomHash(), 1, registry, 1_700_000_000);
     // Version 1 is current: its two holders count, the version-0 holder does not.
     try testing.expectEqual(@as(usize, 2), try roles.getLabelRoleHolderCount(database, .v2, &lbl.canonical, registry));
     // Zero-trimmed canonical spelling resolves the same label.
@@ -698,38 +700,38 @@ test "getLabelRoleHolderCountsForLabels regroups to exactly getLabelRoleHolderCo
 
     // Two versions: only the holders at the MAX resource (v1) count → 2.
     const versioned = VersionedLabel.init(LABEL_CANONICAL);
-    try roles.upsertEACRole(database, .v2, &versioned.v0, helpers.TEST_OWNER_1, "0x0111", 1000, helpers.randomHash(), 0, registry);
-    try roles.upsertEACRole(database, .v2, &versioned.v1, helpers.TEST_OWNER_2, "0x0111", 2000, helpers.randomHash(), 0, registry);
-    try roles.upsertEACRole(database, .v2, &versioned.v1, owner3, "0x0100", 2000, helpers.randomHash(), 1, registry);
+    try roles.upsertEACRole(database, .v2, &versioned.v0, helpers.TEST_OWNER_1, "0x0111", 1000, helpers.randomHash(), 0, registry, 1_700_000_000);
+    try roles.upsertEACRole(database, .v2, &versioned.v1, helpers.TEST_OWNER_2, "0x0111", 2000, helpers.randomHash(), 0, registry, 1_700_000_000);
+    try roles.upsertEACRole(database, .v2, &versioned.v1, owner3, "0x0100", 2000, helpers.randomHash(), 1, registry, 1_700_000_000);
     // Same resource on another contract is a different label → 1.
-    try roles.upsertEACRole(database, .v2, &versioned.v1, helpers.TEST_OWNER_1, "0x0111", 2000, helpers.randomHash(), 2, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, &versioned.v1, helpers.TEST_OWNER_1, "0x0111", 2000, helpers.randomHash(), 2, helpers.TEST_RESOLVER, 1_700_000_000);
 
     // An all-zero bitmap holder at the current version is excluded → 1.
     const zeroed = VersionedLabel.init(0x1111111111111111111111111111111111111111111111111111111100000000);
-    try roles.upsertEACRole(database, .v2, &zeroed.v0, helpers.TEST_OWNER_1, ZERO_BITMAP, 1000, helpers.randomHash(), 0, registry);
-    try roles.upsertEACRole(database, .v2, &zeroed.v0, helpers.TEST_OWNER_2, "0x0001", 1000, helpers.randomHash(), 1, registry);
+    try roles.upsertEACRole(database, .v2, &zeroed.v0, helpers.TEST_OWNER_1, ZERO_BITMAP, 1000, helpers.randomHash(), 0, registry, 1_700_000_000);
+    try roles.upsertEACRole(database, .v2, &zeroed.v0, helpers.TEST_OWNER_2, "0x0001", 1000, helpers.randomHash(), 1, registry, 1_700_000_000);
 
     // Only zero-bitmap rows at the MAX version: the point read answers 0, the
     // batch has no row.
     const revoked = VersionedLabel.init(0x2222222222222222222222222222222222222222222222222222222200000000);
-    try roles.upsertEACRole(database, .v2, &revoked.v0, helpers.TEST_OWNER_1, "0x0001", 1000, helpers.randomHash(), 0, registry);
-    try roles.upsertEACRole(database, .v2, &revoked.v1, helpers.TEST_OWNER_2, ZERO_BITMAP, 2000, helpers.randomHash(), 0, registry);
+    try roles.upsertEACRole(database, .v2, &revoked.v0, helpers.TEST_OWNER_1, "0x0001", 1000, helpers.randomHash(), 0, registry, 1_700_000_000);
+    try roles.upsertEACRole(database, .v2, &revoked.v1, helpers.TEST_OWNER_2, ZERO_BITMAP, 2000, helpers.randomHash(), 0, registry, 1_700_000_000);
 
     // A canonical id with leading zero nibbles has two spellings; each is its
     // own batch key and both count the same holders → 2.
     const leading = VersionedLabel.init(0x00000000abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd00000000);
-    try roles.upsertEACRole(database, .v2, &leading.v0, helpers.TEST_OWNER_1, "0x0111", 1000, helpers.randomHash(), 0, registry);
-    try roles.upsertEACRole(database, .v2, &leading.v0, helpers.TEST_OWNER_2, "0x0011", 1000, helpers.randomHash(), 1, registry);
+    try roles.upsertEACRole(database, .v2, &leading.v0, helpers.TEST_OWNER_1, "0x0111", 1000, helpers.randomHash(), 0, registry, 1_700_000_000);
+    try roles.upsertEACRole(database, .v2, &leading.v0, helpers.TEST_OWNER_2, "0x0011", 1000, helpers.randomHash(), 1, registry, 1_700_000_000);
     var trimmed_buf: [66]u8 = undefined;
     const trimmed = try std.fmt.bufPrint(&trimmed_buf, "0x{x}", .{@as(u256, 0x00000000abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd00000000)});
     try testing.expect(!std.mem.eql(u8, trimmed, &leading.canonical));
 
     // Registry-wide ROOT role: outside every label's canonical range, so it
     // never counts toward a label.
-    try roles.upsertEACRole(database, .v2, ROOT_RESOURCE, helpers.TEST_OWNER_1, "0x1111", 900, helpers.randomHash(), 0, registry);
+    try roles.upsertEACRole(database, .v2, ROOT_RESOURCE, helpers.TEST_OWNER_1, "0x1111", 900, helpers.randomHash(), 0, registry, 1_700_000_000);
     // Other protocol never counts.
     const bare = VersionedLabel.init(0x3333333333333333333333333333333333333333333333333333333300000000);
-    try roles.upsertEACRole(database, .v1, &bare.v0, helpers.TEST_OWNER_1, "0x0111", 1000, helpers.randomHash(), 0, registry);
+    try roles.upsertEACRole(database, .v1, &bare.v0, helpers.TEST_OWNER_1, "0x0111", 1000, helpers.randomHash(), 0, registry, 1_700_000_000);
     const none = VersionedLabel.init(0x4444444444444444444444444444444444444444444444444444444400000000);
 
     const cids = [_][]const u8{
@@ -801,8 +803,8 @@ test "getLabelRoleHolderCountsForLabels spans the 200-pair chunk boundary" {
         regs[i] = registry;
         if (i % 50 == 0) {
             const lbl = VersionedLabel.init(canonical_id);
-            try roles.upsertEACRole(database, .v2, &lbl.v0, helpers.TEST_OWNER_1, "0x0001", 1000, helpers.randomHash(), 0, registry);
-            try roles.upsertEACRole(database, .v2, &lbl.v2, helpers.TEST_OWNER_2, "0x0001", 2000, helpers.randomHash(), 0, registry);
+            try roles.upsertEACRole(database, .v2, &lbl.v0, helpers.TEST_OWNER_1, "0x0001", 1000, helpers.randomHash(), 0, registry, 1_700_000_000);
+            try roles.upsertEACRole(database, .v2, &lbl.v2, helpers.TEST_OWNER_2, "0x0001", 2000, helpers.randomHash(), 0, registry, 1_700_000_000);
             seeded += 1;
         }
     }

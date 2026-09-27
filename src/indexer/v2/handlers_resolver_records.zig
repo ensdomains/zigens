@@ -248,7 +248,7 @@ pub fn handleDataChanged(self: *Indexer, protocol: models.Protocol, resolver: Ad
     var namehash = log.topics[1];
     const data_values = try abi.decodeValues(log.data, &.{ .string, .bytes }, self.allocator);
     defer abi.freeValues(data_values, self.allocator);
-    if (!try utils.resolveNamehash(self, &namehash, resolver, "DataChanged")) return;
+    if (!try utils.resolveNamehash(self, protocol, &namehash, resolver, "DataChanged")) return;
     try storeDataRecord(self, protocol, resolver, log, namehash, data_values[0].string, data_values[1].bytes, "DataChanged", .data_changed, null);
 }
 

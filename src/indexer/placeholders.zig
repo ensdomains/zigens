@@ -42,6 +42,21 @@ pub const PlaceholderLedger = struct {
 
     /// Load every placeholder currently on disk. Any failure leaves the
     /// ledger unseeded, i.e. every registration patches as before.
+    /// Seed once per process. The ledger is in-memory and grows on its own during a run
+    /// (`noteName` / `noteCanonicalId`), so re-deriving it from disk mid-run is pure waste —
+    /// and worse than waste, because it CLEARS what the run has learned and rebuilds it with
+    /// four unindexed prefix scans. Those measured **970ms combined on the reference mirror**
+    /// (170k names / 1.1M events) to recover 22 rows, and they were running once per
+    /// `indexProtocol` call — i.e. once per poll cycle per protocol, forever, growing with the
+    /// event table.
+    ///
+    /// A forced re-seed IS required after a reorg rollback, whose undo rows can resurrect
+    /// placeholders the ledger already forgot; that call site uses `seed` directly.
+    pub fn seedOnce(self: *PlaceholderLedger, db: *Database) void {
+        if (self.seeded) return;
+        self.seed(db);
+    }
+
     pub fn seed(self: *PlaceholderLedger, db: *Database) void {
         self.canonical_ids.clearRetainingCapacity();
         self.token_ids.clearRetainingCapacity();

@@ -1131,16 +1131,20 @@ fn writeRegistryField(
         return true;
     }
     if (std.mem.eql(u8, sel.name, "labels")) {
-        try writeRegistryNameList(allocator, database, sel, output_key, writer, ctx, .{ .registry = registry.address });
+        // exclude_aliases: these three are "labels minted in this registry", one row per
+        // mint — a label in a registry with several live parents has one Domain per
+        // parent, and counting those would multiply the label count.
+        try writeRegistryNameList(allocator, database, sel, output_key, writer, ctx, .{ .registry = registry.address, .exclude_aliases = true });
         return true;
     }
     if (std.mem.eql(u8, sel.name, "labelConnection")) {
-        try writeRegistryNameConnection(allocator, database, sel, output_key, writer, ctx, .{ .registry = registry.address });
+        try writeRegistryNameConnection(allocator, database, sel, output_key, writer, ctx, .{ .registry = registry.address, .exclude_aliases = true });
         return true;
     }
     if (std.mem.eql(u8, sel.name, "labelCount")) {
         const count = try database.getFilteredNameCount(.{
             .registry = registry.address,
+            .exclude_aliases = true,
         });
         try writer.print("\"{s}\":{d}", .{ output_key, count });
         return true;
