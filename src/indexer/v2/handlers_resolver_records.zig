@@ -244,7 +244,16 @@ pub fn handleDataUpdated(self: *Indexer, protocol: models.Protocol, resolver: Ad
 /// DataChanged(bytes32 indexed node, string indexed indexedKey, string key, bytes value)
 /// Legacy node-keyed `data(key)` record (PublicResolverV2, older PermissionedResolver).
 pub fn handleDataChanged(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
-    if (log.topics.len < 2) return error.InvalidTopicCount;
+    // Exactly 3 topics, not "at least 2". `indexed` is NOT part of the signature
+    // hash, so a contract declaring the same `DataChanged(bytes32,string,string,bytes)`
+    // with THREE indexed parameters emits an identical topic0 while leaving only
+    // one parameter in `data`. Decoding that against the two-parameter schema
+    // below reads the first value's length word as the second value's tail
+    // offset, lands mid-word and takes a payload byte as a length — which is how
+    // one such log reached an unchecked add in the codec and stalled a sync.
+    // The layout of the extra indexed parameter is unknowable from the hash, so
+    // skip rather than guess: a wrong key/value pair is worse than a missing one.
+    if (log.topics.len != 3) return error.InvalidTopicCount;
     var namehash = log.topics[1];
     const data_values = try abi.decodeValues(log.data, &.{ .string, .bytes }, self.allocator);
     defer abi.freeValues(data_values, self.allocator);
@@ -722,6 +731,24 @@ test "record handlers: ResourceArgument and legacy DataChanged" {
     const v = (try db.getDataRecord(TEST_LEGACY, node, "blob")).?;
     defer db.allocator.free(v);
     try testing.expectEqualStrings("0x01", v);
+
+    // The production shape that stalled a sync. The SAME DataChanged signature
+    // hash, emitted by a contract that marks three parameters `indexed` — so a
+    // single value sits in `data` instead of two. `indexed` is not part of the
+    // topic0 hash, so it lands in this handler regardless, and decoding it as two
+    // parameters read the first value's length word as the second's tail offset.
+    // Skipped, not guessed: the extra indexed parameter's identity is not
+    // recoverable, and a wrong key/value pair is worse than a missing one.
+    const three_indexed = try rig.log(
+        TEST_LEGACY,
+        &.{ wordHash(0), node, wordHash(0), wordHash(0) },
+        try abiEncode(a, &.{.{ .dyn = "knowledge.proposal.acme-dev.eth" }}),
+    );
+    try testing.expectError(error.InvalidTopicCount, handleDataChanged(idx, .v2, TEST_LEGACY, three_indexed));
+    // ...and the error must be on the skip list, or dispatch aborts the batch
+    // instead of dropping the single event.
+    try testing.expect(utils.isMalformedEventError(error.InvalidTopicCount));
+    try testing.expect(utils.isMalformedEventError(error.AbiPayloadMismatch));
     const keys = try db.getDataKeys(TEST_LEGACY, node);
     defer {
         for (keys) |k| db.allocator.free(k);

@@ -130,6 +130,11 @@ fn dispatchEntryLessThan(_: void, a: DispatchEntry, b: DispatchEntry) bool {
 pub fn isMalformedEventError(err: anyerror) bool {
     return switch (err) {
         error.DataTooShort, error.ArrayDataTooShort, error.InvalidTopicCount => true,
+        // The payload did not match the schema the handler decodes it against —
+        // a contract sharing a signature hash but not our layout. Skipping costs
+        // one event; letting it through reached an unchecked add in the codec
+        // that either panicked or requested 16 EiB, taking the batch with it.
+        error.AbiPayloadMismatch => true,
         // Decoded fine but a numeric field exceeds what the schema can hold
         // (e.g. a hostile uint256 coinType) — same skip-with-coordinates
         // treatment as an undecodable payload.
