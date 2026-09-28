@@ -56,6 +56,32 @@ const PROBES_PER_ROUND: usize = 7;
 /// eth_getCode probes per HTTP request. Deliberately not its own env knob:
 /// RPC_MAX_BATCH_REQUESTS already caps what the rpc client puts in one HTTP
 /// batch, and the ladder below learns a size the provider actually accepts.
+/// Cap on the memoised-anchor map. One entry is 28 bytes, so this is a few MB at
+/// the ceiling; past it the cache simply stops growing and those contracts are
+/// bisected as before, which is a slowdown and never a wrong answer.
+const ANCHOR_CACHE_MAX: usize = 200_000;
+
+/// A found deployment block is immutable, so it is worth remembering: the
+/// bisection costs ~log2(ceil - floor) `eth_getCode` probes per contract and
+/// `backfillDiscovered` re-ran it on every call. A batch that rolls back and
+/// retries re-registers its resolvers (sync_driver drops the dedup caches on
+/// purpose, so the retry re-queues them), so a shrinking batch paid the full
+/// probe cost once per attempt.
+///
+/// Only FOUND anchors are stored. A null means "no code up to this ceiling",
+/// which a later, higher ceiling may well resolve — memoising that would make a
+/// contract deployed after the probe permanently invisible.
+pub const AnchorCache = std.AutoHashMap([20]u8, u64);
+
+fn anchorCacheGet(cache: *AnchorCache, addr: Address) ?u64 {
+    return cache.get(addr.bytes);
+}
+
+fn anchorCachePut(cache: *AnchorCache, addr: Address, anchor: u64) void {
+    if (cache.count() >= ANCHOR_CACHE_MAX) return;
+    cache.put(addr.bytes, anchor) catch {};
+}
+
 const PROBE_HTTP_BATCH: usize = 96;
 /// Size a non-rate-limit rejection (batch cap, response size) falls back to.
 const PROBE_FALLBACK_BATCH: usize = 8;
@@ -78,6 +104,8 @@ const SWEEP_MIN_CHUNK: u64 = 500;
 pub const Outcome = struct {
     total: usize = 0,
     no_history: usize = 0,
+    /// Contracts whose deployment block was already memoised, so they cost no probes.
+    anchors_cached: usize = 0,
     swept: usize = 0,
     failed: usize = 0,
     groups: usize = 0,
@@ -326,13 +354,51 @@ pub fn backfillDiscovered(self: *Indexer, protocol: models.Protocol, client: *rp
         .batch = &probe_batch,
         .cooldowns_left = &probe_cooldowns,
     };
-    const anchors = searchAnchors(self.allocator, prober, addrs, floor, to_block) catch |err| {
-        std.log.warn("  Discovery anchor search failed ({}); {d} {s}(s) left for the heal ledger", .{ err, addrs.len, kind.label() });
+    // Split off the contracts whose deployment block is already known; only the
+    // rest reach the prober. A fully cached call issues no probes at all.
+    var to_probe: std.ArrayList(Address) = .empty;
+    defer to_probe.deinit(self.allocator);
+    const anchors = self.allocator.alloc(?u64, addrs.len) catch |err| {
         for (addrs) |addr| recordOutcome(self, kind, protocol, addr, err);
         outcome.failed = addrs.len;
         return outcome;
     };
     defer self.allocator.free(anchors);
+    for (addrs, anchors) |addr, *slot| {
+        if (anchorCacheGet(&self.anchor_cache, addr)) |cached| {
+            slot.* = cached;
+        } else {
+            slot.* = null;
+            to_probe.append(self.allocator, addr) catch |err| {
+                // Same treatment as the other allocation failures here: leave every
+                // target owed in the ledger rather than probe a partial set and
+                // mis-scatter the results.
+                for (addrs) |a| recordOutcome(self, kind, protocol, a, err);
+                outcome.failed = addrs.len;
+                return outcome;
+            };
+        }
+    }
+    outcome.anchors_cached = addrs.len - to_probe.items.len;
+
+    if (to_probe.items.len > 0) {
+        const probed = searchAnchors(self.allocator, prober, to_probe.items, floor, to_block) catch |err| {
+            std.log.warn("  Discovery anchor search failed ({}); {d} {s}(s) left for the heal ledger", .{ err, addrs.len, kind.label() });
+            for (addrs) |addr| recordOutcome(self, kind, protocol, addr, err);
+            outcome.failed = addrs.len;
+            return outcome;
+        };
+        defer self.allocator.free(probed);
+        // Scatter the results back onto the slots they came from, in order.
+        var pi: usize = 0;
+        for (addrs, anchors) |addr, *slot| {
+            if (slot.* != null) continue;
+            slot.* = probed[pi];
+            if (probed[pi]) |a| anchorCachePut(&self.anchor_cache, addr, a);
+            pi += 1;
+        }
+        std.debug.assert(pi == to_probe.items.len);
+    }
     outcome.calls += probe_calls;
 
     var targets: std.ArrayList(Target) = .empty;
@@ -360,13 +426,14 @@ pub fn backfillDiscovered(self: *Indexer, protocol: models.Protocol, client: *rp
         start = end;
     }
 
-    std.log.info("Discovery backfill: {d} {s}(s) — {d} without history, {d} swept in {d} group(s), {d} failed; {d} events, {d} RPC calls, {d}ms", .{
+    std.log.info("Discovery backfill: {d} {s}(s) — {d} without history, {d} swept in {d} group(s), {d} failed; {d} anchors cached, {d} events, {d} RPC calls, {d}ms", .{
         outcome.total,
         kind.label(),
         outcome.no_history,
         outcome.swept,
         outcome.groups,
         outcome.failed,
+        outcome.anchors_cached,
         outcome.events,
         outcome.calls,
         zsys.milliTimestamp() - started,
@@ -611,6 +678,39 @@ fn testAddress(n: u8) Address {
     var a: Address = .{ .bytes = [_]u8{0} ** 20 };
     a.bytes[19] = n;
     return a;
+}
+
+test "anchor cache round-trips a found deployment block" {
+    var cache = AnchorCache.init(testing.allocator);
+    defer cache.deinit();
+    const a = testAddress(7);
+    try testing.expectEqual(@as(?u64, null), anchorCacheGet(&cache, a));
+    anchorCachePut(&cache, a, 11_400_001);
+    try testing.expectEqual(@as(?u64, 11_400_001), anchorCacheGet(&cache, a));
+    // A different address must not read another's anchor.
+    try testing.expectEqual(@as(?u64, null), anchorCacheGet(&cache, testAddress(8)));
+}
+
+test "anchor cache stops growing at its cap instead of refusing to answer" {
+    var cache = AnchorCache.init(testing.allocator);
+    defer cache.deinit();
+    // Fill to the cap, then prove a further insert is dropped while every existing
+    // entry still answers — past the cap the cost is a re-bisection, never a wrong
+    // anchor.
+    var i: usize = 0;
+    while (i < ANCHOR_CACHE_MAX) : (i += 1) {
+        var addr = Address{ .bytes = @splat(0) };
+        std.mem.writeInt(u64, addr.bytes[0..8], i, .little);
+        anchorCachePut(&cache, addr, 1000 + i);
+    }
+    try testing.expectEqual(ANCHOR_CACHE_MAX, cache.count());
+    const overflow = testAddress(200);
+    anchorCachePut(&cache, overflow, 999);
+    try testing.expectEqual(ANCHOR_CACHE_MAX, cache.count());
+    try testing.expectEqual(@as(?u64, null), anchorCacheGet(&cache, overflow));
+    var first = Address{ .bytes = @splat(0) };
+    std.mem.writeInt(u64, first.bytes[0..8], @as(u64, 0), .little);
+    try testing.expectEqual(@as(?u64, 1000), anchorCacheGet(&cache, first));
 }
 
 test "searchAnchors finds exact deployment blocks for many contracts in few rounds" {
