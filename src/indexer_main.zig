@@ -123,7 +123,7 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("RPC: [CONFIGURED]", .{});
     std.log.info("Start block: {d}", .{cfg.start_block});
     std.log.info("Batch size: {d}", .{cfg.batch_size});
-    std.log.info("Rate limit: {d} req/s", .{cfg.rate_limit_per_second});
+    std.log.info("RPC rate limit: {d} req/s (outbound)", .{cfg.rpc_rate_limit_per_second});
 
     // Initialize database (backend selected by config: SQLite path or DATABASE_URL).
     var database = try db_open.openFromConfig(allocator, cfg);

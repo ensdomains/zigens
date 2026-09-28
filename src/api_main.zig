@@ -104,6 +104,19 @@ pub fn main(init: std.process.Init) !void {
     _ = ens_normalize.shared();
     std.log.info("ENS normalizer initialized", .{});
 
+    // State the effective limiter policy at boot. Both halves of it were wrong in a
+    // deployment and neither was observable: the rate limit sat on the indexer
+    // service instead of this one, so the API silently ran the code default, and
+    // TRUSTED_PROXY_HOPS was 0 behind a proxy, which collapses the per-IP buckets
+    // into one shared by every client. Printing the numbers makes a re-occurrence a
+    // glance rather than a load test.
+    std.log.info("Rate limit: {d} req/s per client, burst {d}; trusted proxy hops: {d}{s}", .{
+        cfg.rate_limit_per_second,
+        cfg.rate_limit_per_second * 2,
+        cfg.trusted_proxy_hops,
+        if (cfg.trusted_proxy_hops == 0) " (keying on the DIRECT TCP PEER — correct only when nothing proxies this service)" else "",
+    });
+
     // Start API server with complexity limits and metrics from config
     // Only pass webhook_db_path if webhooks are enabled
     const webhook_path: ?[]const u8 = if (cfg.webhooks_enabled) cfg.webhook_db_path else null;
