@@ -4,8 +4,15 @@
 const std = @import("std");
 const zsys = @import("system.zig");
 
-/// Installed by the executable's main: returns the GPA's currently requested bytes.
+/// Installed by the executable's main: returns bytes currently live in the
+/// process allocator. Truthful for whichever allocator is selected — see
+/// utils/process_allocator.zig.
 pub var live_bytes_fn: ?*const fn () usize = null;
+
+/// Installed alongside `live_bytes_fn`: the high-water mark of live bytes.
+/// Peak is what decides whether a batch fits in the host, so it belongs next
+/// to the instantaneous figure.
+pub var peak_bytes_fn: ?*const fn () usize = null;
 
 pub fn rssBytes() ?usize {
     var backing: [512]u8 = undefined;
@@ -20,5 +27,10 @@ pub fn rssBytes() ?usize {
 
 pub fn liveBytes() ?usize {
     const f = live_bytes_fn orelse return null;
+    return f();
+}
+
+pub fn peakBytes() ?usize {
+    const f = peak_bytes_fn orelse return null;
     return f();
 }

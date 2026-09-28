@@ -100,6 +100,13 @@ pub fn loadSchemaFiles(self: *Database) !void {
         for (missing.items) |t| {
             std.log.warn("Schema drift: table `{s}` is missing; replaying the schema files to create it", .{t});
         }
+        // The replay is all-or-nothing per file. `CREATE TABLE IF NOT EXISTS` skips
+        // tables that already exist, so a column added to one of them in this release
+        // is absent while the file's indexes still reference it — and one such index
+        // aborts the whole exec. If the exec below fails with "column ... does not
+        // exist", the missing piece is a paired `ALTER TABLE ... ADD COLUMN` in
+        // `migrate()`, which runs before this precisely so the replay can rely on it.
+        std.log.info("Schema replay on an existing database: any column added this release must have a paired ALTER in migrate()", .{});
     }
 
     // Execute each schema file in order
@@ -146,6 +153,54 @@ pub fn migrate(self: *Database) !void {
     if (!self.isPostgres() and self.hasTable("names")) {
         try self.exec("ALTER TABLE names ADD COLUMN is_normalized INTEGER NOT NULL DEFAULT 1");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_names_is_normalized ON names(is_normalized)");
+    }
+
+    // Add the shared-registry alias marker to pre-existing `names` tables. Not
+    // cosmetic: every (canonical_id, registry) lookup in the indexer filters
+    // `is_alias = 0` to stay single-valued, so a database that predates the column
+    // fails those lookups with "no such column". DEFAULT 0 is the correct value for
+    // every pre-existing row — they were all written as the attributed primary.
+    // Both backends take it: the column is plain (not generated), so SQLite's
+    // ADD COLUMN is an O(1) metadata change and Postgres's is too.
+    if (self.hasTable("names") and !self.columnExistsIncludingGenerated("names", "is_alias")) {
+        if (self.isPostgres()) {
+            try self.exec("ALTER TABLE names ADD COLUMN IF NOT EXISTS is_alias BIGINT NOT NULL DEFAULT 0");
+        } else {
+            try self.exec("ALTER TABLE names ADD COLUMN is_alias INTEGER NOT NULL DEFAULT 0");
+        }
+        std.log.info("Added `is_alias` column to pre-existing `names` table", .{});
+    }
+
+    // Split the second cause out of `is_reachable` — see the column comment in schema.sql.
+    // DEFAULT 1 is right for every pre-existing row: a row that was soft-deleted has
+    // is_reachable = 0 already, and the only way to learn WHY from history is a replay, so the
+    // conservative value is "label exists" (which cannot resurrect anything on its own,
+    // because is_reachable stays 0 until something flips it).
+    if (self.hasTable("names") and !self.columnExistsIncludingGenerated("names", "label_live")) {
+        if (self.isPostgres()) {
+            try self.exec("ALTER TABLE names ADD COLUMN IF NOT EXISTS label_live BIGINT NOT NULL DEFAULT 1");
+        } else {
+            try self.exec("ALTER TABLE names ADD COLUMN label_live INTEGER NOT NULL DEFAULT 1");
+        }
+        std.log.info("Added `label_live` column to pre-existing `names` table", .{});
+    }
+    if (self.hasTable("names") and self.columnExistsIncludingGenerated("names", "is_alias")) {
+        try self.exec(SYNC_CREATE_ALIAS_EDGE_INDEX);
+    }
+
+    // The shared-registry derivation pages one registry's labels in canonical_id order
+    // from a persisted cursor; without this index that page is a full re-scan (3.9s over
+    // 200k labels, measured) instead of an index seek (0.04ms). Idempotent on both
+    // backends.
+    if (self.hasTable("names")) {
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_names_registry_canonical ON names(protocol, registry, canonical_id)");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_names_alias_probe ON names(registry, canonical_id, parent_namehash) WHERE is_alias = 1");
+
+        // Placeholder-ledger seed indexes — see schema.sql. 970ms of prefix scans per seed
+        // without them on the reference dataset.
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_events_placeholder_name ON events(name) WHERE name LIKE 'canonicalId:%' OR name LIKE 'tokenId:%'");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_names_placeholder_parent ON names(parent_name) WHERE parent_name LIKE 'canonicalId:%'");
+        try self.exec("CREATE INDEX IF NOT EXISTS idx_registries_placeholder_name ON registries(name) WHERE name LIKE 'canonicalId:%'");
     }
 
     // Add the grace-inclusive generated `expiry_effective` column to pre-existing
@@ -643,6 +698,12 @@ pub fn ensureSyncPathIndexes(self: *Database) void {
 /// whose in-place upgrade could not run has no column to index. Shared with
 /// `migrate`, which creates the index right after adding the column.
 const SYNC_CREATE_EXPIRY_EFFECTIVE_INDEX = "CREATE INDEX IF NOT EXISTS idx_names_expiry_effective ON names(expiry_effective)";
+
+/// Conditional for the same reason (the column arrived after the original schema).
+/// Deliberately NOT enrolled in the drop/recreate pair below: the partial predicate
+/// excludes every row on a single-parent deployment, so maintaining it through bulk
+/// sync costs nothing — and the per-batch alias derivation needs it while sync runs.
+const SYNC_CREATE_ALIAS_EDGE_INDEX = "CREATE INDEX IF NOT EXISTS idx_names_alias_edge ON names(parent_namehash, registry) WHERE is_alias = 1";
 
 /// Recreate all indexes after bulk sync is complete.
 /// This is much faster than maintaining indexes during bulk inserts.

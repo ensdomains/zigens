@@ -247,7 +247,7 @@ test "getResolversToIndex discovers new resolvers" {
     _ = try helpers.createTestName(allocator, database, "discover.eth", helpers.TEST_OWNER_1);
 
     // Update the name with a non-zero resolver
-    try database.updateNameResolver(try namehash_fn(allocator, "discover.eth"), helpers.TEST_RESOLVER);
+    try database.updateNameResolver(.v2, try namehash_fn(allocator, "discover.eth"), helpers.TEST_RESOLVER);
 
     // Discovery should find the resolver
     const discovered = try resolvers.getResolversToIndex(database, .v2, 900, 1100);
@@ -267,10 +267,10 @@ test "getResolversByOwner returns owner resolvers" {
 
     // Create names with resolvers for the owner
     const nh1 = try helpers.createTestName(allocator, database, "owned1.eth", helpers.TEST_OWNER_1);
-    try database.updateNameResolver(nh1, helpers.TEST_RESOLVER);
+    try database.updateNameResolver(.v2, nh1, helpers.TEST_RESOLVER);
 
     const nh2 = try helpers.createTestName(allocator, database, "owned2.eth", helpers.TEST_OWNER_1);
-    try database.updateNameResolver(nh2, helpers.TEST_RESOLVER);
+    try database.updateNameResolver(.v2, nh2, helpers.TEST_RESOLVER);
 
     const resolver_list = try resolvers.getResolversByOwner(database, .v2, helpers.TEST_OWNER_1);
     defer {
@@ -824,10 +824,10 @@ test "getResolverNodeCount counts domains using resolver" {
 
     // Create names and set resolver
     const nh1 = try helpers.createTestName(allocator, database, "stat1.eth", helpers.TEST_OWNER_1);
-    try database.updateNameResolver(nh1, helpers.TEST_RESOLVER);
+    try database.updateNameResolver(.v2, nh1, helpers.TEST_RESOLVER);
 
     const nh2 = try helpers.createTestName(allocator, database, "stat2.eth", helpers.TEST_OWNER_1);
-    try database.updateNameResolver(nh2, helpers.TEST_RESOLVER);
+    try database.updateNameResolver(.v2, nh2, helpers.TEST_RESOLVER);
 
     // Create a name with a different resolver
     _ = try helpers.createTestName(allocator, database, "stat3.eth", helpers.TEST_OWNER_1);
@@ -880,10 +880,10 @@ test "getResolverRoleHolderCount counts distinct accounts" {
     const tx_hash = helpers.randomHash();
 
     // Two different accounts on the same resolver contract
-    try roles.upsertEACRole(database, .v2, "resource1", helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER);
-    try roles.upsertEACRole(database, .v2, "resource2", helpers.TEST_OWNER_2, "0x02", 1000, tx_hash, 1, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, "resource1", helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER, 1_700_000_000);
+    try roles.upsertEACRole(database, .v2, "resource2", helpers.TEST_OWNER_2, "0x02", 1000, tx_hash, 1, helpers.TEST_RESOLVER, 1_700_000_000);
     // Same account, different resource — should not add to distinct count
-    try roles.upsertEACRole(database, .v2, "resource3", helpers.TEST_OWNER_1, "0x04", 1000, tx_hash, 2, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, "resource3", helpers.TEST_OWNER_1, "0x04", 1000, tx_hash, 2, helpers.TEST_RESOLVER, 1_700_000_000);
 
     const count = try resolvers.getResolverRoleHolderCount(database, helpers.TEST_RESOLVER);
     try testing.expectEqual(@as(usize, 2), count);
@@ -909,10 +909,10 @@ test "getResolverRoles returns roles by contract address" {
     const other_resolver = helpers.randomAddress();
 
     // Roles on TEST_RESOLVER
-    try roles.upsertEACRole(database, .v2, "res1", helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER);
-    try roles.upsertEACRole(database, .v2, "res2", helpers.TEST_OWNER_2, "0x02", 1000, tx_hash, 1, helpers.TEST_RESOLVER);
+    try roles.upsertEACRole(database, .v2, "res1", helpers.TEST_OWNER_1, "0x01", 1000, tx_hash, 0, helpers.TEST_RESOLVER, 1_700_000_000);
+    try roles.upsertEACRole(database, .v2, "res2", helpers.TEST_OWNER_2, "0x02", 1000, tx_hash, 1, helpers.TEST_RESOLVER, 1_700_000_000);
     // Role on different resolver — should not be returned
-    try roles.upsertEACRole(database, .v2, "res3", helpers.TEST_OWNER_1, "0x04", 1000, tx_hash, 2, other_resolver);
+    try roles.upsertEACRole(database, .v2, "res3", helpers.TEST_OWNER_1, "0x04", 1000, tx_hash, 2, other_resolver, 1_700_000_000);
 
     const role_list = try resolvers.getResolverRoles(database, helpers.TEST_RESOLVER);
     defer {
@@ -948,10 +948,10 @@ test "getNamesByResolver returns names using resolver" {
 
     // Create names and set resolver
     const nh1 = try helpers.createTestName(allocator, database, "byres1.eth", helpers.TEST_OWNER_1);
-    try database.updateNameResolver(nh1, helpers.TEST_RESOLVER);
+    try database.updateNameResolver(.v2, nh1, helpers.TEST_RESOLVER);
 
     const nh2 = try helpers.createTestName(allocator, database, "byres2.eth", helpers.TEST_OWNER_1);
-    try database.updateNameResolver(nh2, helpers.TEST_RESOLVER);
+    try database.updateNameResolver(.v2, nh2, helpers.TEST_RESOLVER);
 
     // Name with different resolver — should not appear
     _ = try helpers.createTestName(allocator, database, "byres3.eth", helpers.TEST_OWNER_1);
@@ -973,13 +973,13 @@ test "getNamesByResolver respects limit" {
     const names = lib.storage.names;
 
     const nh1 = try helpers.createTestName(allocator, database, "lim1.eth", helpers.TEST_OWNER_1);
-    try database.updateNameResolver(nh1, helpers.TEST_RESOLVER);
+    try database.updateNameResolver(.v2, nh1, helpers.TEST_RESOLVER);
 
     const nh2 = try helpers.createTestName(allocator, database, "lim2.eth", helpers.TEST_OWNER_1);
-    try database.updateNameResolver(nh2, helpers.TEST_RESOLVER);
+    try database.updateNameResolver(.v2, nh2, helpers.TEST_RESOLVER);
 
     const nh3 = try helpers.createTestName(allocator, database, "lim3.eth", helpers.TEST_OWNER_1);
-    try database.updateNameResolver(nh3, helpers.TEST_RESOLVER);
+    try database.updateNameResolver(.v2, nh3, helpers.TEST_RESOLVER);
 
     const name_list = try names.getNamesByResolver(database, helpers.TEST_RESOLVER, 2);
     defer {
@@ -1017,10 +1017,10 @@ test "getFilteredNames with resolver filter" {
 
     // Create names, set resolver on some
     const nh1 = try helpers.createTestName(allocator, database, "filt1.eth", helpers.TEST_OWNER_1);
-    try database.updateNameResolver(nh1, helpers.TEST_RESOLVER);
+    try database.updateNameResolver(.v2, nh1, helpers.TEST_RESOLVER);
 
     const nh2 = try helpers.createTestName(allocator, database, "filt2.eth", helpers.TEST_OWNER_1);
-    try database.updateNameResolver(nh2, helpers.TEST_RESOLVER);
+    try database.updateNameResolver(.v2, nh2, helpers.TEST_RESOLVER);
 
     // Name without resolver update (resolver = zero)
     _ = try helpers.createTestName(allocator, database, "filt3.eth", helpers.TEST_OWNER_1);
@@ -1049,10 +1049,10 @@ test "getFilteredNameCount with resolver filter" {
     const names = lib.storage.names;
 
     const nh1 = try helpers.createTestName(allocator, database, "cnt1.eth", helpers.TEST_OWNER_1);
-    try database.updateNameResolver(nh1, helpers.TEST_RESOLVER);
+    try database.updateNameResolver(.v2, nh1, helpers.TEST_RESOLVER);
 
     const nh2 = try helpers.createTestName(allocator, database, "cnt2.eth", helpers.TEST_OWNER_1);
-    try database.updateNameResolver(nh2, helpers.TEST_RESOLVER);
+    try database.updateNameResolver(.v2, nh2, helpers.TEST_RESOLVER);
 
     _ = try helpers.createTestName(allocator, database, "cnt3.eth", helpers.TEST_OWNER_1);
 

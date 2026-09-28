@@ -2347,8 +2347,8 @@ test "populateRoleHolderCounts: matches getLabelRoleHolderCount, zero when no ro
 
     const tx = Hash{ .bytes = [_]u8{0xEE} ** 32 };
     // Only holders at the MAX resource version count; the v0 holder does not.
-    try test_db.upsertEACRole(.v2, &v0, holder_1, "0x0111", 1000, tx, 0, registry);
-    try test_db.upsertEACRole(.v2, &v1, holder_2, "0x0111", 2000, tx, 1, registry);
+    try test_db.upsertEACRole(.v2, &v0, holder_1, "0x0111", 1000, tx, 0, registry, 1_700_000_000);
+    try test_db.upsertEACRole(.v2, &v1, holder_2, "0x0111", 2000, tx, 1, registry, 1_700_000_100);
 
     const ctx = try LoaderContext.init(allocator, &test_db);
     defer ctx.deinit();

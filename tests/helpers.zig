@@ -138,12 +138,29 @@ pub fn createTestRegistry(
     });
 }
 
-/// Create a test name in the database
+/// Create a test name in the database (V2 — the default for most suites).
 pub fn createTestName(
     allocator: std.mem.Allocator,
     database: *Database,
     name: []const u8,
     owner: Address,
+) !Hash {
+    return createTestNameForProtocol(allocator, database, name, owner, .v2);
+}
+
+/// Create a test name under an explicit protocol.
+///
+/// Needed because several `names` columns are single-protocol by design — the NameWrapper
+/// fields, `ttl`, `is_legacy` and `resolved_address` are V1-only — and their writers are
+/// scoped to `protocol = 'v1'` so a migrated name's V2 twin cannot be hit. A test exercising
+/// one of those has to seed a V1 row, or it is asserting against a write that correctly does
+/// nothing.
+pub fn createTestNameForProtocol(
+    allocator: std.mem.Allocator,
+    database: *Database,
+    name: []const u8,
+    owner: Address,
+    protocol: models.Protocol,
 ) !Hash {
     const nh = try lib.namehash(allocator, name);
 
@@ -166,7 +183,7 @@ pub fn createTestName(
     const label_hash = try lib.labelhash(allocator, label);
 
     try database.insertName(models.Name{
-        .protocol = .v2,
+        .protocol = protocol,
         .name = name,
         .namehash = nh,
         .label = label,

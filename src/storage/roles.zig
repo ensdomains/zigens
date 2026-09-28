@@ -1,5 +1,4 @@
 const std = @import("std");
-const zsys = @import("../utils/system.zig");
 const db_module = @import("database.zig");
 const reorg_undo = @import("reorg_undo.zig");
 const Database = db_module.Database;
@@ -13,8 +12,14 @@ const names_common = @import("names_common.zig");
 // EAC ROLE OPERATIONS
 // ============================================================================
 
-/// Insert or update EAC role assignment
-pub fn upsertEACRole(db: *Database, protocol: models.Protocol, resource: []const u8, account: Address, role_bitmap: []const u8, block_number: u64, tx_hash: Hash, log_index: u32, contract_address: Address) !void {
+/// Insert or update EAC role assignment.
+///
+/// `block_timestamp` is the BLOCK's timestamp, not the indexer's clock. It used to be
+/// `zsys.timestamp()` — the wall clock at write time — which made the column unreproducible:
+/// a `--backfill` rebuild stamped different values than the live run, and `Resolver.roles`
+/// (which sorts by it) returned a different ORDER depending on when the indexer happened to
+/// run. Anything persisted has to come from the chain or it cannot be compared.
+pub fn upsertEACRole(db: *Database, protocol: models.Protocol, resource: []const u8, account: Address, role_bitmap: []const u8, block_number: u64, tx_hash: Hash, log_index: u32, contract_address: Address, block_timestamp: i64) !void {
     try reorg_undo.captureUpsert(db, "eac_roles", .{ protocol, resource, account, contract_address });
     const sql =
         \\INSERT INTO eac_roles
@@ -38,7 +43,7 @@ pub fn upsertEACRole(db: *Database, protocol: models.Protocol, resource: []const
     try q.bindInt64(@intCast(block_number));
     try q.bindHash(tx_hash);
     try q.bindInt(@intCast(log_index));
-    try q.bindInt64(@intCast(zsys.timestamp()));
+    try q.bindInt64(block_timestamp);
     try q.bindAddress(contract_address);
 
     try q.exec();
@@ -53,6 +58,8 @@ pub const RoleUpsertRow = struct {
     tx_hash: Hash,
     log_index: u32,
     contract_address: Address,
+    /// The BLOCK's timestamp. See `upsertEACRole` — never the indexer's clock.
+    block_timestamp: i64,
 };
 
 /// Multi-row twin of `upsertEACRole` — same column list and the same explicit
@@ -127,7 +134,7 @@ pub fn upsertEACRolesBatch(db: *Database, rows: []const RoleUpsertRow) !void {
             const tx_buf = try scratch.create([66]u8);
             try q.bindTextStatic(row.tx_hash.toHexBuf(tx_buf));
             try q.bindInt(@intCast(row.log_index));
-            try q.bindInt64(@intCast(zsys.timestamp()));
+            try q.bindInt64(row.block_timestamp);
             const contract_buf = try scratch.create([42]u8);
             try q.bindTextStatic(row.contract_address.toHexBuf(contract_buf));
         }
@@ -180,7 +187,8 @@ const EAC_SELECT_COLUMNS =
     \\       CASE WHEN kr.address IS NOT NULL THEN 1 ELSE 0 END AS is_resolver,
     \\       r.contract_address
     \\FROM eac_roles r
-    \\LEFT JOIN names reg_name ON reg_name.canonical_id = (substr(r.resource, 1, 58) || '00000000') AND r.contract_address = reg_name.registry
+    \\LEFT JOIN names reg_name ON reg_name.canonical_id = (substr(r.resource, 1, 58) || '00000000')
+    \\                          AND r.contract_address = reg_name.registry AND reg_name.is_alias = 0
     \\LEFT JOIN resolvers res ON r.contract_address = res.address AND r.resource = res.namehash AND res.protocol = r.protocol
     \\LEFT JOIN names resolver_name ON res.namehash = resolver_name.namehash AND resolver_name.protocol = r.protocol
     \\LEFT JOIN known_resolvers kr ON kr.address = r.contract_address AND kr.protocol = r.protocol

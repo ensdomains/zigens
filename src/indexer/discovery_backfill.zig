@@ -26,6 +26,7 @@ const rpc = @import("../rpc/client.zig");
 const Hash = @import("../types/hash.zig").Hash;
 const Address = @import("../types/address.zig").Address;
 const Indexer = @import("indexer.zig").Indexer;
+const utils = @import("utils.zig");
 
 pub const RESOLVER_HEAL_TASK = "resolver_init_gaps";
 pub const SUBREGISTRY_HEAL_TASK = "subregistry_init_gaps";
@@ -508,7 +509,15 @@ fn dispatch(self: *Indexer, protocol: models.Protocol, kind: Kind, logs: []const
                 inline for (Indexer.RESOLVER_EVENTS) |cfg| {
                     if (sig.eql(cfg.event_hash)) {
                         cfg.handler(self, protocol, log.address, log) catch |err| {
-                            std.log.warn("  Backfill handler error ({s}): {}", .{ cfg.name, err });
+                            // Coordinates, not just the event name: without the
+                            // block/tx/log_index there is no way to find the
+                            // payload that failed. The batch dispatch path
+                            // already logs them via skipMalformedEvent.
+                            if (utils.isMalformedEventError(err)) {
+                                utils.skipMalformedEvent(log, err);
+                            } else {
+                                std.log.warn("  Backfill handler error ({s}) at block {d} log_index {d}: {}", .{ cfg.name, log.block_number, log.log_index, err });
+                            }
                         };
                         processed += 1;
                         break;

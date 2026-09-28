@@ -1353,15 +1353,16 @@ pub const Client = struct {
         const responses = parsed.value.array;
 
         // Allocate array for results
-        var results = try self.allocator.alloc([]Log, requests.len);
+        const results = try self.allocator.alloc([]Log, requests.len);
+        // Count the filled prefix: entries past it are undefined memory. The old
+        // `if (i > 0)` guard was wrong twice over — it skipped a legitimately
+        // parsed index 0 (leaking that slice) and still walked the undefined tail
+        // above the failure point, calling deinit on garbage pointers.
+        var filled: usize = 0;
         errdefer {
-            for (results, 0..) |logs, i| {
-                if (i > 0) { // Only free already-processed results
-                    for (logs) |*log| {
-                        log.deinit(self.allocator);
-                    }
-                    self.allocator.free(logs);
-                }
+            for (results[0..filled]) |logs| {
+                for (logs) |*log| log.deinit(self.allocator);
+                self.allocator.free(logs);
             }
             self.allocator.free(results);
         }
@@ -1372,11 +1373,10 @@ pub const Client = struct {
             const result = response.get("result").?;
             const logs_array = result.array;
 
-            var logs = try self.allocator.alloc(Log, logs_array.items.len);
+            const logs = try self.allocator.alloc(Log, logs_array.items.len);
+            var parsed_logs: usize = 0;
             errdefer {
-                for (logs, 0..) |*log, j| {
-                    if (j > 0) log.deinit(self.allocator);
-                }
+                for (logs[0..parsed_logs]) |*log| log.deinit(self.allocator);
                 self.allocator.free(logs);
             }
 
@@ -1385,7 +1385,11 @@ pub const Client = struct {
 
                 // Parse topics
                 const topics_json = log_obj.get("topics").?.array;
-                var log_topics = try self.allocator.alloc(Hash, topics_json.items.len);
+                const log_topics = try self.allocator.alloc(Hash, topics_json.items.len);
+                // Owned by this iteration until the Log below takes them; not yet
+                // reachable from `logs`, so a malformed topic or a refused data
+                // allocation would otherwise leak both.
+                errdefer self.allocator.free(log_topics);
                 for (topics_json.items, 0..) |topic_val, k| {
                     log_topics[k] = try Hash.fromHex(topic_val.string);
                 }
@@ -1393,6 +1397,7 @@ pub const Client = struct {
                 // Parse data
                 const data_hex = log_obj.get("data").?.string;
                 const data_bytes = try self.hexToBytes(data_hex);
+                errdefer self.allocator.free(data_bytes);
 
                 logs[j] = Log{
                     .address = try Address.fromHex(log_obj.get("address").?.string),
@@ -1406,9 +1411,11 @@ pub const Client = struct {
                     .block_timestamp = if (log_obj.get("blockTimestamp")) |ts| std.fmt.parseInt(u64, ts.string[2..], 16) catch null else null,
                     .block_hash = if (log_obj.get("blockHash")) |bh| Hash.fromHex(bh.string) catch null else null,
                 };
+                parsed_logs = j + 1;
             }
 
             results[i] = logs;
+            filled = i + 1;
         }
 
         return results;
@@ -1482,11 +1489,14 @@ pub const Client = struct {
         const logs_array = result.array;
 
         // Allocate result logs
-        var logs = try self.allocator.alloc(Log, logs_array.items.len);
+        const logs = try self.allocator.alloc(Log, logs_array.items.len);
+        // Only the prefix parsed so far is initialized; the rest is undefined
+        // memory, and calling `deinit` on it frees garbage pointers. This
+        // errdefer runs precisely when a topic is malformed or an allocation is
+        // refused mid-loop, so it has to free the prefix and nothing more.
+        var parsed_logs: usize = 0;
         errdefer {
-            for (logs) |*log| {
-                log.deinit(self.allocator);
-            }
+            for (logs[0..parsed_logs]) |*log| log.deinit(self.allocator);
             self.allocator.free(logs);
         }
 
@@ -1497,7 +1507,11 @@ pub const Client = struct {
 
             // Parse topics
             const topics_json = log_obj.get("topics").?.array;
-            var log_topics = try self.allocator.alloc(Hash, topics_json.items.len);
+            const log_topics = try self.allocator.alloc(Hash, topics_json.items.len);
+            // Owned by this iteration until the Log below takes them; a
+            // malformed topic or a refused data allocation would otherwise
+            // leak both, and neither is reachable from `logs` yet.
+            errdefer self.allocator.free(log_topics);
             for (topics_json.items, 0..) |topic_val, k| {
                 log_topics[k] = try Hash.fromHex(topic_val.string);
             }
@@ -1505,6 +1519,7 @@ pub const Client = struct {
             // Parse data
             const data_hex = log_obj.get("data").?.string;
             const data_bytes = try self.hexToBytes(data_hex);
+            errdefer self.allocator.free(data_bytes);
 
             logs[i] = Log{
                 .address = try Address.fromHex(log_obj.get("address").?.string),
@@ -1518,6 +1533,7 @@ pub const Client = struct {
                 .block_timestamp = if (log_obj.get("blockTimestamp")) |ts| std.fmt.parseInt(u64, ts.string[2..], 16) catch null else null,
                 .block_hash = if (log_obj.get("blockHash")) |bh| Hash.fromHex(bh.string) catch null else null,
             };
+            parsed_logs = i + 1;
         }
         const parse_elapsed = zsys.milliTimestamp() - parse_start;
 
@@ -1597,15 +1613,16 @@ pub const Client = struct {
         const responses = parsed.value.array;
 
         // Allocate array for results
-        var results = try self.allocator.alloc([]Log, requests.len);
+        const results = try self.allocator.alloc([]Log, requests.len);
+        // Count the filled prefix: entries past it are undefined memory. The old
+        // `if (i > 0)` guard was wrong twice over — it skipped a legitimately
+        // parsed index 0 (leaking that slice) and still walked the undefined tail
+        // above the failure point, calling deinit on garbage pointers.
+        var filled: usize = 0;
         errdefer {
-            for (results, 0..) |logs, i| {
-                if (i > 0) {
-                    for (logs) |*log| {
-                        log.deinit(self.allocator);
-                    }
-                    self.allocator.free(logs);
-                }
+            for (results[0..filled]) |logs| {
+                for (logs) |*log| log.deinit(self.allocator);
+                self.allocator.free(logs);
             }
             self.allocator.free(results);
         }
@@ -1618,11 +1635,10 @@ pub const Client = struct {
             const result = response.get("result").?;
             const logs_array = result.array;
 
-            var logs = try self.allocator.alloc(Log, logs_array.items.len);
+            const logs = try self.allocator.alloc(Log, logs_array.items.len);
+            var parsed_logs: usize = 0;
             errdefer {
-                for (logs, 0..) |*log, j| {
-                    if (j > 0) log.deinit(self.allocator);
-                }
+                for (logs[0..parsed_logs]) |*log| log.deinit(self.allocator);
                 self.allocator.free(logs);
             }
 
@@ -1631,7 +1647,11 @@ pub const Client = struct {
 
                 // Parse topics
                 const topics_json = log_obj.get("topics").?.array;
-                var log_topics = try self.allocator.alloc(Hash, topics_json.items.len);
+                const log_topics = try self.allocator.alloc(Hash, topics_json.items.len);
+                // Owned by this iteration until the Log below takes them; not yet
+                // reachable from `logs`, so a malformed topic or a refused data
+                // allocation would otherwise leak both.
+                errdefer self.allocator.free(log_topics);
                 for (topics_json.items, 0..) |topic_val, k| {
                     log_topics[k] = try Hash.fromHex(topic_val.string);
                 }
@@ -1639,6 +1659,7 @@ pub const Client = struct {
                 // Parse data
                 const data_hex = log_obj.get("data").?.string;
                 const data_bytes = try self.hexToBytes(data_hex);
+                errdefer self.allocator.free(data_bytes);
 
                 logs[j] = Log{
                     .address = try Address.fromHex(log_obj.get("address").?.string),
@@ -1652,9 +1673,11 @@ pub const Client = struct {
                     .block_timestamp = if (log_obj.get("blockTimestamp")) |ts| std.fmt.parseInt(u64, ts.string[2..], 16) catch null else null,
                     .block_hash = if (log_obj.get("blockHash")) |bh| Hash.fromHex(bh.string) catch null else null,
                 };
+                parsed_logs = j + 1;
             }
 
             results[i] = logs;
+            filled = i + 1;
             total_logs += logs.len;
         }
         const parse_elapsed = zsys.milliTimestamp() - parse_start;

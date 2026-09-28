@@ -182,6 +182,7 @@ fn appendNameScalarConditions(
     }
     if (filters.resolver != null) try conditions.append(db.allocator, "resolver = ?");
     if (filters.registry != null) try conditions.append(db.allocator, "registry = ?");
+    if (filters.exclude_aliases) try conditions.append(db.allocator, "is_alias = 0");
     if (filters.token_id != null) try conditions.append(db.allocator, "token_id = ?");
     if (filters.canonical_id != null) try conditions.append(db.allocator, "canonical_id = ?");
     if (filters.subregistry_pointer != null) {
@@ -519,6 +520,16 @@ pub const NameFilters = struct {
     /// Implemented as a correlated EXISTS join over `registry_entries`; there is no
     /// subregistry column on `names`.
     subregistry_pointer: ?Address = null,
+    /// Exclude the derived shared-registry alias rows (`is_alias = 1`).
+    ///
+    /// Only `RegistryInfo.labels` / `labelConnection` / `labelCount` set this, and
+    /// they have to: a registry pointed at by N live parents makes every label in
+    /// it resolve as N fully-qualified names, so each is its own Domain row — but
+    /// those three fields are defined as "the labels minted in and managed by this
+    /// registry", one per mint. Counting rows would report N per label. Every other
+    /// read path leaves this false, because an alias is a real, resolvable name and
+    /// belongs in listings.
+    exclude_aliases: bool = false,
     // Migration filter
     migrated: ?bool = null,
     // Subdomain filters (requires subquery)

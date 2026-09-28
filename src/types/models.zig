@@ -132,6 +132,13 @@ pub const Name = struct {
     /// (`[0x..]` placeholder). Default-filtered out of GraphQL listings unless
     /// `includeUnnormalized: true` (mirrors `is_reachable`).
     is_normalized: bool = true,
+    /// Shared-registry alias marker. True when this row is a derived
+    /// fully-qualified name for a label whose registry is pointed at by more
+    /// than one live parent — see the `is_alias` column comment in
+    /// schema/schema.sql. Exactly one row per (protocol, registry, canonical_id)
+    /// has this false; handlers only ever write that one, and
+    /// storage/name_aliases derives and refreshes the rest.
+    is_alias: bool = false,
 
     pub fn deinit(self: *Name, allocator: std.mem.Allocator) void {
         if (self.name) |n| allocator.free(n);

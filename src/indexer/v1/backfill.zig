@@ -133,7 +133,7 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
         };
 
         // Check if name already exists (from V1 events processed during sync)
-        const existing_name = names_storage.getNameByNamehash(self.database, namehash) catch null;
+        const existing_name = names_storage.getNameByNamehashAndProtocol(self.database, namehash, .v1) catch null;
 
         if (existing_name) |existing| {
             // Free the existing name record (we only needed to check existence)
