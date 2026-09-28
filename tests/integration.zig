@@ -574,7 +574,9 @@ fn expectInPlaceOwnerReversed(protocol: models.Protocol) !void {
 
     // Block 200: owner changed to B (in-place UPDATE — captured, tagged block 200).
     try lib.storage.reorg_undo.setCursor(&database, protocol, 200);
-    try database.updateNameOwner(.v2, nh, owner_b);
+    // `protocol`, not a hardcoded `.v2`: this helper runs for both protocols and
+    // updateNameOwner is protocol-scoped, so the v1 pass silently matched no row.
+    try database.updateNameOwner(protocol, nh, owner_b);
     try testing.expectEqualSlices(u8, &owner_b.bytes, &(try ownerOf(allocator, &database, nh)).bytes);
 
     // Reorg to 150: the block-200 update is reversed; the name (created 100) survives.
@@ -1004,7 +1006,9 @@ test "reorg undo-log: rolling back one protocol leaves the other untouched" {
     try database.insertName(nv2);
 
     try lib.storage.reorg_undo.setCursor(&database, .v1, 200);
-    try database.updateNameOwner(.v2, v1nh, b);
+    // v1nh is the v1 name, so the scoped writer needs `.v1` — the whole point of
+    // this test is that the two protocols stay independent.
+    try database.updateNameOwner(.v1, v1nh, b);
     try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
     try database.updateNameOwner(.v2, v2nh, b);
 
@@ -1493,11 +1497,11 @@ test "reorg undo-log reverses an eac_roles overwrite (v2)" {
 
     // Block 100: grant a role (survives a rollback to 150).
     try lib.storage.reorg_undo.setCursor(&database, .v2, 100);
-    try database.upsertEACRole(.v2, resource, account, bitmap_v1, 100, tx, 0, contract);
+    try database.upsertEACRole(.v2, resource, account, bitmap_v1, 100, tx, 0, contract, 1_700_000_000);
 
     // Block 200: overwrite the bitmap (ON CONFLICT DO UPDATE — captured, tagged 200).
     try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
-    try database.upsertEACRole(.v2, resource, account, bitmap_v2, 200, tx, 1, contract);
+    try database.upsertEACRole(.v2, resource, account, bitmap_v2, 200, tx, 1, contract, 1_700_000_200);
     try expectSingleRoleBitmap(allocator, &database, resource, bitmap_v2);
 
     // Reorg to 150: the block-200 overwrite is reversed; the role (granted 100) is back at v1.
@@ -1518,7 +1522,7 @@ test "reorg undo-log reverses an eac_roles delete (v2)" {
 
     // Block 100: grant a role.
     try lib.storage.reorg_undo.setCursor(&database, .v2, 100);
-    try database.upsertEACRole(.v2, resource, account, bitmap, 100, tx, 0, contract);
+    try database.upsertEACRole(.v2, resource, account, bitmap, 100, tx, 0, contract, 1_700_000_000);
 
     // Block 200: revoke it (DELETE — captured, tagged 200).
     try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
