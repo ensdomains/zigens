@@ -177,7 +177,7 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
     if (parent_node.eql(constants.WellKnown.root_namehash)) {
         // TLD: parent is root, no suffix needed
         parent_name_str = null;
-    } else if (try names_storage.getNameByNamehash(self.database, parent_node)) |parent_record| {
+    } else if (try names_storage.getNameByNamehashAndProtocol(self.database, parent_node, .v1)) |parent_record| {
         parent_record_to_free = parent_record;
         parent_name_str = parent_record.name;
     }
@@ -200,11 +200,11 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
     // forced a whole-buffer flush for GC visibility — a net loss in burn-heavy
     // eras. The buffer's same-chunk visibility fixes (pendingNewName gates in
     // NewResolver/NewTTL/RegistryTransfer) are independent and remain.
-    if (try names_storage.getNameByNamehash(self.database, subdomain_namehash)) |existing| {
+    if (try names_storage.getNameByNamehashAndProtocol(self.database, subdomain_namehash, .v1)) |existing| {
         // Name already exists — update owner
         var existing_mut = existing;
         existing_mut.deinit(self.allocator);
-        try names_storage.updateNameOwner(self.database, subdomain_namehash, owner);
+        try names_storage.updateNameOwner(self.database, .v1, subdomain_namehash, owner);
 
         // Subgraph parity: when V1 NewOwner repoints to the zero address, the
         // name is considered burned. If the row is also fully cleared
@@ -212,7 +212,7 @@ pub fn handleV1NewOwner(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
         // walk UP the parent chain GCing empty ancestors. V2 hard-deletes on
         // burn already (LabelUnregistered cascade), so this only fires for V1.
         if (owner.isZero()) {
-            const deleted = self.database.recursivelyGcEmptyDomain(subdomain_namehash) catch |err| blk: {
+            const deleted = self.database.recursivelyGcEmptyDomain(.v1, subdomain_namehash) catch |err| blk: {
                 std.log.warn("recursivelyGcEmptyDomain failed for V1 NewOwner: {}", .{err});
                 break :blk 0;
             };
@@ -326,15 +326,15 @@ pub fn handleV1RegistryTransfer(self: *Indexer, protocol: models.Protocol, log: 
     // ownership update has nothing to attach to and a synthetic orphan row
     // would lack name/label/parent context.
     if (self.write_buffer.active) {
-        if (self.write_buffer.pendingNewName(node)) |pr| {
+        if (self.write_buffer.pendingNewName(.v1, node)) |pr| {
             pr.owner = owner;
             pr.is_legacy = isFromLegacyRegistry(self, log.address);
         } else {
-            try self.write_buffer.updateNameOwner(node, owner);
+            try self.write_buffer.updateNameOwner(.v1, node, owner);
             names_storage.updateNameIsLegacy(self.database, node, isFromLegacyRegistry(self, log.address)) catch {};
         }
     } else {
-        try names_storage.updateNameOwner(self.database, node, owner);
+        try names_storage.updateNameOwner(self.database, .v1, node, owner);
         // Track provenance: this event came from either the legacy pre-2020
         // Registry or the canonical post-2020 Registry. No-op if no row exists.
         names_storage.updateNameIsLegacy(self.database, node, isFromLegacyRegistry(self, log.address)) catch {};
@@ -347,7 +347,7 @@ pub fn handleV1RegistryTransfer(self: *Indexer, protocol: models.Protocol, log: 
     // for V1. Skipped while write_buffer is active — the GC needs to read
     // the row's owner/resolver/parent_namehash which is not yet flushed.
     if (owner.isZero() and !self.write_buffer.active) {
-        const deleted = self.database.recursivelyGcEmptyDomain(node) catch |err| blk: {
+        const deleted = self.database.recursivelyGcEmptyDomain(.v1, node) catch |err| blk: {
             std.log.warn("recursivelyGcEmptyDomain failed for V1 RegistryTransfer: {}", .{err});
             break :blk 0;
         };
@@ -392,7 +392,7 @@ pub fn handleV1NewResolver(self: *Indexer, protocol: models.Protocol, log: rpc.L
     // without the resolver set. This trades a small completeness gap for
     // schema integrity.
     if (self.write_buffer.active) blk: {
-        const pr = self.write_buffer.pendingNewName(node) orelse break :blk;
+        const pr = self.write_buffer.pendingNewName(.v1, node) orelse break :blk;
         if (!resolver.isZero()) {
             self.database.upsertResolverEntity(
                 protocol,
@@ -417,7 +417,7 @@ pub fn handleV1NewResolver(self: *Indexer, protocol: models.Protocol, log: rpc.L
         return;
     }
 
-    const existing = names_storage.getNameByNamehash(self.database, node) catch null;
+    const existing = names_storage.getNameByNamehashAndProtocol(self.database, node, .v1) catch null;
     if (existing) |row| {
         var row_mut = row;
         // Capture the name before deinit so we can record the Resolver entity
@@ -439,9 +439,9 @@ pub fn handleV1NewResolver(self: *Indexer, protocol: models.Protocol, log: rpc.L
         }
         row_mut.deinit(self.allocator);
         if (self.write_buffer.active) {
-            try self.write_buffer.updateNameResolver(node, resolver);
+            try self.write_buffer.updateNameResolver(.v1, node, resolver);
         } else {
-            try names_storage.updateNameResolver(self.database, node, resolver);
+            try names_storage.updateNameResolver(self.database, .v1, node, resolver);
         }
         // Track legacy/canonical Registry provenance on the same event.
         names_storage.updateNameIsLegacy(self.database, node, isFromLegacyRegistry(self, log.address)) catch {};
@@ -510,7 +510,7 @@ pub fn handleV1NewTTL(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !
     // Persist TTL on the Name row. No-op if the row doesn't exist yet —
     // V1 NewTTL on an unregistered node has nothing to attach to.
     if (self.write_buffer.active) {
-        if (self.write_buffer.pendingNewName(node)) |pr| {
+        if (self.write_buffer.pendingNewName(.v1, node)) |pr| {
             pr.ttl = ttl;
             pr.is_legacy = isFromLegacyRegistry(self, log.address);
         } else {
@@ -564,10 +564,10 @@ pub fn handleV1NameWrapped(self: *Indexer, protocol: models.Protocol, log: rpc.L
 
     if (self.write_buffer.active) {
         try self.write_buffer.updateNameWrapperState(node, fuses, expiry);
-        try self.write_buffer.updateNameOwner(node, owner);
+        try self.write_buffer.updateNameOwner(.v1, node, owner);
     } else {
         try names_storage.updateNameWrapperState(self.database, node, fuses, expiry);
-        try names_storage.updateNameOwner(self.database, node, owner);
+        try names_storage.updateNameOwner(self.database, .v1, node, owner);
     }
 
     // PCC-aware Domain.expiry mirror per subgraph semantics: when the
@@ -621,10 +621,10 @@ pub fn handleV1NameUnwrapped(self: *Indexer, protocol: models.Protocol, log: rpc
 
     if (self.write_buffer.active) {
         try self.write_buffer.clearNameWrapperState(node);
-        try self.write_buffer.updateNameOwner(node, owner);
+        try self.write_buffer.updateNameOwner(.v1, node, owner);
     } else {
         try names_storage.updateNameUnwrapperState(self.database, node);
-        try names_storage.updateNameOwner(self.database, node, owner);
+        try names_storage.updateNameOwner(self.database, .v1, node, owner);
     }
 
     // Subgraph parity (`NameWrapper.ts:250-259`): on unwrap, reset
@@ -639,7 +639,7 @@ pub fn handleV1NameUnwrapped(self: *Indexer, protocol: models.Protocol, log: rpc
     // sync, NameUnwrapped is rare on .eth subnames; a residual stale expiry
     // gets a chance to be corrected by post-sync passes.
     if (!self.write_buffer.active) {
-        if (try names_storage.getNameByNamehash(self.database, node)) |row_raw| {
+        if (try names_storage.getNameByNamehashAndProtocol(self.database, node, .v1)) |row_raw| {
             var row = row_raw;
             defer row.deinit(self.allocator);
             if (!row.parent_namehash.eql(constants.WellKnown.eth_namehash)) {
@@ -692,7 +692,7 @@ pub fn handleV1FusesSet(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
     // doesn't carry an expiry value of its own).
     const PARENT_CANNOT_CONTROL: u32 = 0x10000;
     if ((fuses & PARENT_CANNOT_CONTROL) != 0) {
-        if (try self.database.getNameByNamehash(node)) |existing_raw| {
+        if (try self.database.getNameByNamehashAndProtocol(node, .v1)) |existing_raw| {
             var existing = existing_raw;
             defer existing.deinit(self.database.allocator);
             if (existing.wrapper_expiry) |wexp| {
@@ -746,7 +746,7 @@ pub fn handleV1ExpiryExtended(self: *Indexer, protocol: models.Protocol, log: rp
     // expiry into Domain.expiry. wrapper_fuses is stored as a decimal TEXT
     // string; parse failure or null → treat as fuses=0 (no PCC) → skip mirror.
     const PARENT_CANNOT_CONTROL: u32 = 0x10000;
-    if (try self.database.getNameByNamehash(node)) |existing_raw| {
+    if (try self.database.getNameByNamehashAndProtocol(node, .v1)) |existing_raw| {
         var existing = existing_raw;
         defer existing.deinit(self.database.allocator);
         const existing_fuses: u32 = if (existing.wrapper_fuses) |fuses_str|
@@ -824,7 +824,7 @@ pub fn handleV1ERC721Transfer(self: *Indexer, protocol: models.Protocol, log: rp
             // V1→V2 migration: mark the V1 row as migrated and update owner to the
             // controller. Don't lose the prior owner — it's emitted in the event.
             if (self.write_buffer.active) {
-                try self.write_buffer.markNameMigrated(namehash, to);
+                try self.write_buffer.markNameMigrated(.v1, namehash, to);
             } else {
                 try names_storage.markNameMigrated(self.database, namehash, to);
             }
@@ -837,9 +837,9 @@ pub fn handleV1ERC721Transfer(self: *Indexer, protocol: models.Protocol, log: rp
         } else {
             // Update the name's owner (normal transfer)
             if (self.write_buffer.active) {
-                try self.write_buffer.updateNameOwner(namehash, to);
+                try self.write_buffer.updateNameOwner(.v1, namehash, to);
             } else {
-                try names_storage.updateNameOwner(self.database, namehash, to);
+                try names_storage.updateNameOwner(self.database, .v1, namehash, to);
             }
 
             // Subgraph parity (`Registrar.ts:287, 313-327`): the Registration's
@@ -1718,7 +1718,7 @@ pub fn handleBasenamesRegistrarNameRegisteredWithRecord(self: *Indexer, protocol
     var node_hex_buf: [66]u8 = undefined;
     const node_hex = node.toHexBuf(&node_hex_buf);
 
-    if (names_storage.getNameByNamehash(self.database, node) catch null) |row| {
+    if (names_storage.getNameByNamehashAndProtocol(self.database, node, .v1) catch null) |row| {
         var row_mut = row;
         self.database.upsertResolverEntity(
             protocol,
@@ -1733,9 +1733,9 @@ pub fn handleBasenamesRegistrarNameRegisteredWithRecord(self: *Indexer, protocol
         row_mut.deinit(self.allocator);
     }
     if (self.write_buffer.active) {
-        try self.write_buffer.updateNameResolver(node, resolver);
+        try self.write_buffer.updateNameResolver(.v1, node, resolver);
     } else {
-        try names_storage.updateNameResolver(self.database, node, resolver);
+        try names_storage.updateNameResolver(self.database, .v1, node, resolver);
     }
 }
 
@@ -1874,7 +1874,7 @@ fn healLabelsFromDNSName(self: *Indexer, name_bytes: []const u8, wrapped_node: H
 
     if (full_name) |name_str| {
         // Try to heal the wrapped name itself — update label and name fields if missing
-        if (try names_storage.getNameByNamehash(self.database, wrapped_node)) |existing| {
+        if (try names_storage.getNameByNamehashAndProtocol(self.database, wrapped_node, .v1)) |existing| {
             var existing_mut = existing;
             defer existing_mut.deinit(self.allocator);
 
@@ -1945,7 +1945,7 @@ fn healLabelsFromDNSName(self: *Indexer, name_bytes: []const u8, wrapped_node: H
         const node_hash = Hash{ .bytes = current_namehash };
 
         // Check if this name has an unresolved label
-        if (try names_storage.getNameByNamehash(self.database, node_hash)) |existing| {
+        if (try names_storage.getNameByNamehashAndProtocol(self.database, node_hash, .v1)) |existing| {
             var existing_mut = existing;
             defer existing_mut.deinit(self.allocator);
 
@@ -1986,15 +1986,15 @@ fn applyNameWrapperOwnerChange(self: *Indexer, id: u256, to: Address) !void {
     std.mem.writeInt(u256, &buf, id, .big);
     const namehash = Hash{ .bytes = buf };
 
-    const maybe_name = names_storage.getNameByNamehash(self.database, namehash) catch null;
+    const maybe_name = names_storage.getNameByNamehashAndProtocol(self.database, namehash, .v1) catch null;
     if (maybe_name) |name| {
         var name_copy = name;
         defer name_copy.deinit(self.allocator);
 
         if (self.write_buffer.active) {
-            try self.write_buffer.updateNameOwner(namehash, to);
+            try self.write_buffer.updateNameOwner(.v1, namehash, to);
         } else {
-            try names_storage.updateNameOwner(self.database, namehash, to);
+            try names_storage.updateNameOwner(self.database, .v1, namehash, to);
         }
 
         var nh_buf: [66]u8 = undefined;

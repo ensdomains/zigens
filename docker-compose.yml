@@ -7,6 +7,17 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: ensv2-indexer-v2
+    # Hard memory ceiling. Without one, a single service can consume the whole
+    # host and take its neighbour down with it — an indexer growing unbounded is
+    # what crash-looped the API previously. Docker kills the container on
+    # breach and `restart: unless-stopped` brings it back, turning a host-wide
+    # stall into one restarted service. Sized for a 4 GB host; raise both
+    # values together via the environment on a larger box.
+    deploy:
+      resources:
+        limits:
+          memory: ${INDEXER_MEMORY_LIMIT:-2g}
+    mem_swappiness: 0
     restart: unless-stopped
     command: ["/app/ensv2-indexer-v2"]
     ulimits:
@@ -54,6 +65,11 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: ensv2-api
+    deploy:
+      resources:
+        limits:
+          memory: ${API_MEMORY_LIMIT:-1g}
+    mem_swappiness: 0
     restart: unless-stopped
     command: ["/app/api-entrypoint.sh"]
     ulimits:

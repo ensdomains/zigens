@@ -362,6 +362,10 @@ pub const BackfillStats = struct {
 /// `Label` event. The protocol is taken from the existing name row, so both V1 and V2
 /// names heal. No-op if the name is absent, already has a real label, or its parent
 /// is not indexed yet (leaves the `[labelhash]` placeholder for a later heal).
+/// Deliberately protocol-agnostic: `unknown_labels` has no protocol column, and this heal is
+/// driven from both the V1 rainbow backfill and the V2 LabelStore handler. The namehash reads
+/// below therefore use the twin-preferring `getNameByNamehash` (V2 wins, deterministically)
+/// rather than pinning a protocol — pinning `.v1` here made a V2 placeholder unhealable.
 pub fn healSubdomainLabel(
     allocator: std.mem.Allocator,
     database: *db_module.Database,

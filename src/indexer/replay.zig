@@ -16,6 +16,7 @@ const v1_names = @import("../utils/v1_names.zig");
 const Indexer = @import("indexer.zig").Indexer;
 const utils = @import("utils.zig");
 const reorg_undo = @import("../storage/reorg_undo.zig");
+const alias_sync = @import("v2/alias_sync.zig");
 
 const Keccak256 = std.crypto.hash.sha3.Keccak256;
 
@@ -384,7 +385,7 @@ fn replayNewOwner(self: *Indexer, q: *Query) !void {
     if (try names_storage.getNameByNamehash(self.database, subdomain_namehash)) |existing| {
         var existing_mut = existing;
         existing_mut.deinit(self.allocator);
-        try names_storage.updateNameOwner(self.database, subdomain_namehash, owner);
+        try names_storage.updateNameOwner(self.database, .v1, subdomain_namehash, owner);
     } else {
         const registry = self.config.v1_contracts.ens_registry;
 
@@ -442,7 +443,7 @@ fn replayRegistryTransfer(self: *Indexer, q: *Query) !void {
     const node = try Hash.fromHex(node_hex);
     const owner = try Address.fromHex(owner_hex);
 
-    names_storage.updateNameOwner(self.database, node, owner) catch {};
+    names_storage.updateNameOwner(self.database, .v1, node, owner) catch {};
 }
 
 /// Replay NewResolver: update resolver by namehash.
@@ -454,7 +455,7 @@ fn replayNewResolver(self: *Indexer, q: *Query) !void {
     const node = try Hash.fromHex(node_hex);
     const resolver = try Address.fromHex(resolver_hex);
 
-    names_storage.updateNameResolver(self.database, node, resolver) catch {};
+    names_storage.updateNameResolver(self.database, .v1, node, resolver) catch {};
 }
 
 /// Replay ERC721Transfer: look up label by tokenId, update owner.
@@ -472,7 +473,7 @@ fn replayERC721Transfer(self: *Indexer, q: *Query) !void {
     // Look up label from cache
     if (try self.getCachedV1Label(token_id_hex)) |label| {
         const namehash = v1_names.computeChildNamehash(self.root_node, label);
-        names_storage.updateNameOwner(self.database, namehash, to) catch {};
+        names_storage.updateNameOwner(self.database, .v1, namehash, to) catch {};
     }
     // If label not found, skip (same as live indexing)
 }
@@ -573,7 +574,7 @@ fn replayNameWrapped(self: *Indexer, q: *Query) !void {
     const expiry: u64 = jsonU64(data, "expiry") orelse 0;
 
     names_storage.updateNameWrapperState(self.database, node, fuses, expiry) catch {};
-    names_storage.updateNameOwner(self.database, node, owner) catch {};
+    names_storage.updateNameOwner(self.database, .v1, node, owner) catch {};
 }
 
 /// Replay NameUnwrapped: clear wrapper state + update owner.
@@ -587,7 +588,7 @@ fn replayNameUnwrapped(self: *Indexer, q: *Query) !void {
     const owner = try Address.fromHex(owner_hex);
 
     names_storage.updateNameUnwrapperState(self.database, node) catch {};
-    names_storage.updateNameOwner(self.database, node, owner) catch {};
+    names_storage.updateNameOwner(self.database, .v1, node, owner) catch {};
 }
 
 /// Replay FusesSet: update wrapper fuses.
@@ -824,7 +825,7 @@ fn replayV2Event(self: *Indexer, q: *Query) !void {
         .transfer => {
             const nh = (try v2Namehash(q)) orelse return; // TransferBatch has null namehash -> skip
             const to = Address.fromHex(jsonString(data, "to") orelse return) catch return;
-            names_storage.updateNameOwner(self.database, nh, to) catch {};
+            names_storage.updateNameOwner(self.database, .v2, nh, to) catch {};
         },
         .name_renewed => {
             const nh = (try v2Namehash(q)) orelse return;
@@ -847,7 +848,7 @@ fn replayV2Event(self: *Indexer, q: *Query) !void {
             if (self.database.getNameByTokenIdAndRegistry(token_id, contract_addr) catch null) |n_row| {
                 var n = n_row;
                 defer n.deinit(self.allocator);
-                names_storage.updateNameResolver(self.database, n.namehash, r) catch {};
+                names_storage.updateNameResolver(self.database, .v2, n.namehash, r) catch {};
             }
         },
         .token_regenerated => {
@@ -858,6 +859,35 @@ fn replayV2Event(self: *Indexer, q: *Query) !void {
         .name_burned => {
             const nh = (try v2Namehash(q)) orelse return;
             self.database.deleteNameByNamehash(nh) catch {};
+        },
+        .name_registered => {
+            // ONLY the orphan-queue shape. A name created from the orphan queue has no
+            // LabelRegistered event of its own — the originating log was consumed into
+            // orphaned_registrations — so this synthetic event is the only record of it and
+            // without this arm the name vanished on every rebuild.
+            //
+            // Gated on `backfilled`, and that gate is load-bearing: a registrar NameRegistered
+            // fires for the SAME node as the registry's LabelRegistered, carries no `registry`
+            // and no `sender`, and replaying it would overwrite the row with the eth registry and
+            // drop the migration provenance — whichever of the two happened to have the higher
+            // log_index would win.
+            if (std.mem.indexOf(u8, data, "\"backfilled\":true") != null) {
+                try replayV2LabelRegistered(self, q, data);
+            }
+        },
+        .label_unregistered => {
+            // Live marks the label's own row unreachable (handlers_registry's
+            // handleLabelUnregistered) on top of clearing the parent's pointer. Without this
+            // arm, `--backfill` RESURRECTED every name the live indexer had soft-deleted:
+            // the pointer clear is replayed by the registries pass, but the per-name soft
+            // delete had no replay at all, so a rebuilt database disagreed with the live one
+            // on exactly the names a user had unregistered.
+            //
+            // Block/timestamp come from the event row, never from the replay's own clock, so
+            // the rebuilt row carries the same `unreachable_since` the live run wrote.
+            const nh = (try v2Namehash(q)) orelse return;
+            const block_number: u64 = @intCast(q.getInt64(V2_BLOCK_NUMBER));
+            self.database.markNameUnreachableByNamehash(.v2, nh, block_number, q.getInt64(V2_TIMESTAMP)) catch {};
         },
         else => {}, // registry/resolver-record/EAC events don't rebuild `names` (subregistry parent = follow-on)
     }
@@ -1031,6 +1061,16 @@ pub fn replayV2RecordsCore(self: *Indexer) !void {
                 .address_changed, .text_changed, .contenthash_changed, .data_changed, .resolver_created, .linked, .cleared, .address_updated, .text_updated, .data_updated, .contenthash_updated, .abi_updated, .interface_updated, .name_updated => {
                     replayV2RecordEvent(self, &q, et) catch |err| {
                         std.log.warn("V2 record replay error event={s}: {}", .{ q.getTextSlice(V2_EVENT_TYPE) orelse "?", err });
+                    };
+                },
+                .version_changed => {
+                    // Live wipes every record of this (resolver, namehash) pair and stores the
+                    // new version. Replaying only the value-SETTING events left records that a
+                    // version bump had cleared, so a rebuilt database served stale texts and
+                    // addresses the chain no longer returns. Scoped by resolver exactly as live
+                    // is, so an A->B->A resolver swap cannot wipe the other resolver's rows.
+                    replayV2VersionChanged(self, &q) catch |err| {
+                        std.log.warn("V2 version_changed replay error: {}", .{err});
                     };
                 },
                 else => {},
@@ -1245,7 +1285,7 @@ fn replayV2EacRolesEvent(self: *Indexer, q: *Query) !void {
         const block_number: u64 = @intCast(q.getInt64(V2_BLOCK_NUMBER));
         const tx_hash = if (q.getTextSlice(V2_TX_HASH)) |t| (Hash.fromHex(t) catch Hash.zero) else Hash.zero;
         const log_index: u32 = @intCast(q.getInt64(V2_LOG_INDEX));
-        self.database.upsertEACRole(.v2, resource, account, new_bitmap, block_number, tx_hash, log_index, contract) catch |err| std.log.warn("upsertEACRole replay: {}", .{err});
+        self.database.upsertEACRole(.v2, resource, account, new_bitmap, block_number, tx_hash, log_index, contract, q.getInt64(V2_TIMESTAMP)) catch |err| std.log.warn("upsertEACRole replay: {}", .{err});
     }
 }
 
@@ -1402,6 +1442,64 @@ pub fn replayV2RegistriesCore(self: *Indexer) !void {
         }
     }
     try database.commitTransaction();
+}
+
+/// Rebuild the shared-registry alias rows. Must run AFTER replayV2NamesCore (which
+/// wipes every V2 `names` row, aliases included, and rebuilds the primaries from the
+/// FQDN frozen into each event) and AFTER replayV2RegistriesCore (which rebuilds both
+/// `registries` and the `registry_entries` mirror the derivation reads).
+///
+/// This is why the derivation is state-derived rather than event-driven: a
+/// `LabelRegistered` event carries exactly one FQDN, so the names replay can only
+/// ever reconstruct one row per label, and the mirror it would need to find the other
+/// parents does not exist yet at that point in the replay order. Recomputing from the
+/// finished tables instead lands on the same rows a live run did, and needs no
+/// timestamp of its own — a stale alias is deleted, never stamped.
+pub fn replayV2AliasesCore(self: *Indexer) !void {
+    // Unbounded: a replay must reach the fixpoint in one pass so the rebuilt
+    // database is byte-comparable against a live one.
+    // Evaluate parent expiry as of the replayed head, so the rebuilt rows match what a live run
+    // holding the same head would have.
+    const head_ts = blk: {
+        var q = Query.init(self.database, "SELECT MAX(timestamp) FROM events WHERE protocol = 'v2'") catch break :blk 0;
+        defer q.deinit();
+        break :blk if (q.step() catch false) q.getInt64(0) else 0;
+    };
+    const stats = try alias_sync.runToFixpoint(self, .v2, head_ts);
+    if (stats.aliases_written > 0 or stats.aliases_deleted > 0) {
+        std.log.info("V2 alias replay: +{d} derived, -{d} stale, {d} collision(s) skipped", .{ stats.aliases_written, stats.aliases_deleted, stats.skipped_collisions });
+    }
+    // The fixpoint must actually be reached, or the rebuilt database is not the one a
+    // live run would have produced and a byte-comparison against it is meaningless.
+    if (stats.work_remaining) {
+        std.log.warn("V2 alias replay did not converge in one pass — page guard hit; re-run --backfill", .{});
+    }
+}
+
+/// Mirror `handleVersionChanged`: clear every record of this (resolver, namehash) pair and
+/// store the new version. The resolver is the event's emitting contract, so the scope is
+/// identical to live's.
+///
+/// Aliases are deliberately NOT cleared — they live in `_storage().aliases`, not
+/// `_record(node)`, so a version bump does not touch them on-chain either. Keeping that
+/// asymmetry is the point: a replay that cleared them would diverge the other way.
+fn replayV2VersionChanged(self: *Indexer, q: *Query) !void {
+    const nh = (try v2Namehash(q)) orelse return;
+    const resolver = Address.fromHex(q.getTextSlice(V2_CONTRACT) orelse return) catch return;
+    const data = q.getTextSlice(V2_DATA) orelse "";
+
+    self.database.deleteResolverAddresses(.v2, nh, resolver) catch {};
+    self.database.deleteResolverContentHash(.v2, nh, resolver) catch {};
+    self.database.deleteResolverTexts(.v2, nh, resolver) catch {};
+    self.database.deleteResolverPubkeys(.v2, nh, resolver) catch {};
+    self.database.deleteResolverAbis(.v2, nh, resolver) catch {};
+    self.database.deleteResolverNames(.v2, nh, resolver) catch {};
+    self.database.deleteResolverInterfaces(.v2, nh, resolver) catch {};
+
+    const new_version = jsonU64(data, "newVersion") orelse jsonU64(data, "version") orelse 0;
+    const block_number: u64 = @intCast(q.getInt64(V2_BLOCK_NUMBER));
+    const tx = Hash.fromHex(q.getTextSlice(V2_TX_HASH) orelse "") catch Hash.zero;
+    self.database.storeResolverVersion(nh, resolver, new_version, .v2, block_number, tx, q.getInt64(V2_TIMESTAMP)) catch {};
 }
 
 fn replayV2RegistryCreated(self: *Indexer, q: *Query) !void {
@@ -1651,7 +1749,7 @@ test "replay(events) rebuilds V2 names (main-registry + subregistry + reserved +
                     .is_v1_name = false,
                     .v1_label_hash = null,
                 });
-                try @import("../storage/names.zig").updateNameOwner(database, fnh, try Address.fromHex(o2));
+                try @import("../storage/names.zig").updateNameOwner(database, .v2, fnh, try Address.fromHex(o2));
                 try @import("../storage/names.zig").updateNameExpiry(database, fnh, 2000000);
 
                 const bar_lh = try hash_mod2.keccak256(a, "bar");
@@ -1844,6 +1942,140 @@ test "replayV2RecordsCore rebuilds resolver records (address/text/contenthash) w
     try std.testing.expectEqualStrings("he said \"hi\"", val.?); // unescaped back to the original
     const ch = try one(database, allocator, "SELECT contenthash FROM resolver_contenthashes");
     try std.testing.expectEqualStrings("0xe30101701220ab", ch.?);
+}
+
+test "replay reconstructs an orphan-queue name, and ignores a registrar NameRegistered" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cfg = @import("../config.zig").Config.fromEnv(allocator) catch return;
+    cfg.status_port = null;
+    cfg.webhooks_enabled = false;
+    defer cfg.deinit();
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+
+    const database = try allocator.create(db_module.Database);
+    database.* = try db_module.Database.init(allocator, ":memory:");
+    defer {
+        database.deinit();
+        allocator.destroy(database);
+    }
+    var idx = try Indexer.init(allocator, threaded.io(), cfg, database, null);
+    defer idx.deinit();
+
+    const sub_reg = "0x4444444444444444444444444444444444444444";
+    const owner = "0x1111111111111111111111111111111111111111";
+    const orphan_nh = try hash_mod2.namehash(allocator, "late.foo.eth");
+    const plain_nh = try hash_mod2.namehash(allocator, "plain.eth");
+
+    const ev = struct {
+        fn go(db: *db_module.Database, et: models.EventType, name: []const u8, nh: Hash, data: []const u8, li: u32) !void {
+            try @import("../storage/events.zig").insertEvent(db, .{
+                .event_type = et,
+                .protocol = .v2,
+                .block_number = 300 + li,
+                .tx_hash = Hash.zero,
+                .log_index = li,
+                .contract_address = Address.zero,
+                .name = name,
+                .namehash = nh,
+                .data = data,
+                .timestamp = 1000,
+            });
+        }
+    }.go;
+
+    // The orphan-queue shape: `backfilled`, and it carries the registry + token id, because it is
+    // the ONLY record of a registration whose originating log went into orphaned_registrations.
+    const orphan_data = try std.fmt.allocPrint(allocator, "{{\"name\":\"late.foo.eth\",\"label\":\"late\",\"owner\":\"{s}\",\"expiry\":1500000,\"tokenId\":77,\"registry\":\"{s}\",\"backfilled\":true}}", .{ owner, sub_reg });
+    try ev(database, .name_registered, "late.foo.eth", orphan_nh, orphan_data, 0);
+
+    // A registrar NameRegistered: same shape of event type, but NO registry and NO backfilled
+    // marker. Replaying it would write the eth registry over whatever LabelRegistered produced,
+    // so it must be ignored here.
+    const registrar_data = try std.fmt.allocPrint(allocator, "{{\"label\":\"plain\",\"tokenId\":88,\"namehash\":\"0x00\",\"owner\":\"{s}\",\"expiration\":1600000}}", .{owner});
+    try ev(database, .name_registered, "plain.eth", plain_nh, registrar_data, 1);
+
+    try replayV2NamesCore(&idx);
+
+    // The orphan name is reconstructed, with its real registry — not the eth registry.
+    var row = (try database.getNameByNamehash(orphan_nh)).?;
+    defer row.deinit(allocator);
+    try std.testing.expectEqualStrings("late.foo.eth", row.name.?);
+    try std.testing.expectEqualStrings("foo.eth", row.parent_name.?);
+    var reg_buf: [42]u8 = undefined;
+    try std.testing.expectEqualStrings(sub_reg, row.registry.toHexBuf(&reg_buf));
+
+    // The registrar event produced nothing: LabelRegistered owns that node.
+    try std.testing.expect((try database.getNameByNamehash(plain_nh)) == null);
+}
+
+test "replayV2RecordsCore applies VersionChanged, so a rebuild does not serve records the chain cleared" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cfg = @import("../config.zig").Config.fromEnv(allocator) catch return;
+    cfg.status_port = null;
+    cfg.webhooks_enabled = false;
+    defer cfg.deinit();
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+
+    const database = try allocator.create(db_module.Database);
+    database.* = try db_module.Database.init(allocator, ":memory:");
+    defer {
+        database.deinit();
+        allocator.destroy(database);
+    }
+    var idx = try Indexer.init(allocator, threaded.io(), cfg, database, null);
+    defer idx.deinit();
+
+    const node = try hash_mod2.namehash(allocator, "ver.eth");
+    const resolver_a = try Address.fromHex("0x5555555555555555555555555555555555555555");
+    const resolver_b = try Address.fromHex("0x6666666666666666666666666666666666666666");
+    const nh_hex = try node.toHex(allocator);
+
+    const ev = struct {
+        fn go(db: *db_module.Database, et: models.EventType, nh: Hash, contract: Address, data: []const u8, li: u32) !void {
+            try @import("../storage/events.zig").insertEvent(db, .{
+                .event_type = et,
+                .protocol = .v2,
+                .block_number = 200 + li,
+                .tx_hash = Hash.zero,
+                .log_index = li,
+                .contract_address = contract,
+                .name = "ver.eth",
+                .namehash = nh,
+                .data = data,
+                .timestamp = 1000,
+            });
+        }
+    }.go;
+
+    // Two resolvers hold a text for the same node; then resolver A bumps its version, which
+    // on-chain clears A's records for that node and leaves B's alone.
+    const a_text = try std.fmt.allocPrint(allocator, "{{\"namehash\":\"{s}\",\"resolver\":\"0x5555555555555555555555555555555555555555\",\"key\":\"note\",\"value\":\"from-a\"}}", .{nh_hex});
+    const b_text = try std.fmt.allocPrint(allocator, "{{\"namehash\":\"{s}\",\"resolver\":\"0x6666666666666666666666666666666666666666\",\"key\":\"note\",\"value\":\"from-b\"}}", .{nh_hex});
+    const bump = try std.fmt.allocPrint(allocator, "{{\"namehash\":\"{s}\",\"newVersion\":7}}", .{nh_hex});
+    try ev(database, .text_changed, node, resolver_a, a_text, 0);
+    try ev(database, .text_changed, node, resolver_b, b_text, 1);
+    try ev(database, .version_changed, node, resolver_a, bump, 2);
+
+    try replayV2RecordsCore(&idx);
+
+    // Without the version_changed arm the replay kept "from-a" — a value the chain no longer
+    // returns — so a rebuilt database served a stale text. A's row must be gone.
+    var qa = try Query.init(database, "SELECT COUNT(*) FROM resolver_texts WHERE resolver = '0x5555555555555555555555555555555555555555'");
+    defer qa.deinit();
+    try std.testing.expect(try qa.step());
+    try std.testing.expectEqual(@as(i64, 0), qa.getInt64(0));
+
+    // B's record is untouched: the clear is scoped to the emitting resolver, exactly as live.
+    var qb = try Query.init(database, "SELECT value FROM resolver_texts WHERE resolver = '0x6666666666666666666666666666666666666666'");
+    defer qb.deinit();
+    try std.testing.expect(try qb.step());
+    try std.testing.expectEqualStrings("from-b", qb.getTextSlice(0).?);
 }
 
 test "replayV2EacRolesCore + replayV2RegistrationsCore rebuild roles and registrations from events" {

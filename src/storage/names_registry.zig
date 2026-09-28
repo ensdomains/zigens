@@ -62,44 +62,93 @@ pub fn setSeededSubregistryCreation(db: *Database, address: Address, protocol: m
     try q.exec();
 }
 
-/// Update a registry that was created with a canonicalId placeholder name to use the actual name.
-/// Also updates names that used this placeholder as parent_name, and events stored with the
-/// placeholder in their name/namehash columns (see updatePlaceholderEventsByName for event payload
-/// handling — we only patch the indexed columns, not the raw JSON data blob).
-pub fn updateRegistryPlaceholderName(db: *Database, placeholder_name: []const u8, actual_name: []const u8, namehash: Hash) !u32 {
+/// Resolve a `canonicalId:N` placeholder to the real name, for ONE parent registry.
+///
+/// `parent_registry` is not optional, and leaving it out was a cross-parent corruption bug of
+/// exactly the same shape as the shared-registry misattribution. The placeholder string is
+/// derived from the canonical id alone — `canonicalId:{d}` — and a canonical id is
+/// `keccak(label)` with the version bits cleared, so the SAME LABEL under two different
+/// parents produces the SAME placeholder. Unscoped, resolving `blue` under koala.eth rewrote
+/// the `registries` row, the child `names` rows and the `events` rows belonging to `blue`
+/// under kangaroo.eth as well — naming them after a parent they have nothing to do with.
+///
+/// Each of the three patches is scoped by the thing that actually disambiguates it:
+///   * `registries` — `parent_registry`, which is the registry the parent label lives in and
+///     is exactly what the placeholder row recorded at creation
+///     (`processSubregistryPointerChange`);
+///   * `names` — the child rows live in the SUBREGISTRY contract, so they are scoped to the
+///     addresses the first patch just resolved;
+///   * `events` — the placeholder event was emitted BY the parent registry, so
+///     `contract_address` is the scope.
+///
+/// KNOWN RESIDUAL: the child `names` rows get a corrected `name` / `parent_name` /
+/// `parent_namehash`, but their own `namehash` is NOT recomputed — it was derived from the
+/// placeholder parent and stays stale. Fixing it means a per-row keccak (not expressible in
+/// SQL) plus a row-identity change under UNIQUE(protocol, namehash), so it is a separate
+/// change; the label-heal path handles the same class for unknown labels.
+pub fn updateRegistryPlaceholderName(
+    db: *Database,
+    parent_registry: Address,
+    placeholder_name: []const u8,
+    actual_name: []const u8,
+    namehash: Hash,
+) !u32 {
     try db.namesBarrier();
-    try reorg_undo.captureWhere(db, "registries", "U", "name = ?", .{placeholder_name});
-    var reg_q = try Query.init(db, "UPDATE registries SET name = ?, namehash = ? WHERE name = ?");
+
+    // Which subregistry contracts does this placeholder name, under THIS parent registry?
+    var subregistries: std.ArrayList([42]u8) = .empty;
+    defer subregistries.deinit(db.allocator);
+    {
+        var q = try Query.initCached(db, "SELECT address FROM registries WHERE name = ? AND parent_registry = ?");
+        defer q.deinit();
+        try q.bindText(placeholder_name);
+        try q.bindAddress(parent_registry);
+        while (try q.step()) {
+            const hex = q.getTextSlice(0) orelse continue;
+            var buf: [42]u8 = undefined;
+            const n = @min(hex.len, buf.len);
+            @memcpy(buf[0..n], hex[0..n]);
+            if (n == buf.len) try subregistries.append(db.allocator, buf);
+        }
+    }
+
+    try reorg_undo.captureWhere(db, "registries", "U", "name = ? AND parent_registry = ?", .{ placeholder_name, parent_registry });
+    var reg_q = try Query.init(db, "UPDATE registries SET name = ?, namehash = ? WHERE name = ? AND parent_registry = ?");
     defer reg_q.deinit();
     try reg_q.bindText(actual_name);
     try reg_q.bindHash(namehash);
     try reg_q.bindText(placeholder_name);
+    try reg_q.bindAddress(parent_registry);
     try reg_q.exec();
     const registry_changes = reg_q.changes();
 
-    try reorg_undo.captureWhere(db, "names", "U", "parent_name = ?", .{placeholder_name});
-    var names_q = try Query.init(db,
-        \\UPDATE names
-        \\SET parent_name = ?,
-        \\    parent_namehash = ?,
-        \\    name = label || '.' || ?
-        \\WHERE parent_name = ?
-    );
-    defer names_q.deinit();
-    try names_q.bindText(actual_name);
-    try names_q.bindHash(namehash);
-    try names_q.bindText(actual_name);
-    try names_q.bindText(placeholder_name);
-    try names_q.exec();
-    const names_changes = names_q.changes();
-    // Multi-row names rewrite keyed by placeholder parent — no per-row key,
-    // so conservatively clear the dispatch-scoped name prefetch. Gated: this
-    // runs once per registration and almost always matches zero rows; an
-    // unconditional clear would disable the prefetch in exactly the
-    // registration-heavy batches it exists for.
+    var names_changes: u32 = 0;
+    for (subregistries.items) |*subreg| {
+        const sub_hex: []const u8 = subreg[0..];
+        try reorg_undo.captureWhere(db, "names", "U", "parent_name = ? AND registry = ?", .{ placeholder_name, sub_hex });
+        var names_q = try Query.initCached(db,
+            \\UPDATE names
+            \\SET parent_name = ?,
+            \\    parent_namehash = ?,
+            \\    name = label || '.' || ?
+            \\WHERE parent_name = ? AND registry = ?
+        );
+        defer names_q.deinit();
+        try names_q.bindText(actual_name);
+        try names_q.bindHash(namehash);
+        try names_q.bindText(actual_name);
+        try names_q.bindText(placeholder_name);
+        try names_q.bindText(sub_hex);
+        try names_q.exec();
+        names_changes += names_q.changes();
+    }
+    // Multi-row names rewrite keyed by placeholder parent — no per-row key, so conservatively
+    // clear the dispatch-scoped name prefetch. Gated: this runs once per registration and
+    // almost always matches zero rows; an unconditional clear would disable the prefetch in
+    // exactly the registration-heavy batches it exists for.
     if (names_changes > 0) db.noteNamesBulkWrite();
 
-    const event_changes = try updatePlaceholderEventsByName(db, placeholder_name, actual_name, namehash);
+    const event_changes = try updatePlaceholderEventsByName(db, parent_registry, placeholder_name, actual_name, namehash);
 
     if (registry_changes > 0 or names_changes > 0 or event_changes > 0) {
         // Debug-level: this fires once per migrated/registered name during a sync,
@@ -116,12 +165,17 @@ pub fn updateRegistryPlaceholderName(db: *Database, placeholder_name: []const u8
 /// "tokenId:N" from ResolverUpdated) once the name is known. Updates the top-level name/namehash
 /// columns only; the raw JSON data blob is left intact as a historical record of what the handler
 /// decoded at event-process time.
-pub fn updatePlaceholderEventsByName(db: *Database, placeholder_name: []const u8, actual_name: []const u8, namehash: Hash) !u32 {
-    var q = try Query.init(db, "UPDATE events SET name = ?, namehash = ? WHERE name = ?");
+pub fn updatePlaceholderEventsByName(db: *Database, emitting_contract: Address, placeholder_name: []const u8, actual_name: []const u8, namehash: Hash) !u32 {
+    // Scoped by the emitting contract for the same reason the registry patch is scoped by
+    // parent_registry: a `canonicalId:N` / `tokenId:N` placeholder is not unique across
+    // registries, so an unscoped rewrite renamed other registries' events.
+    try reorg_undo.captureWhere(db, "events", "U", "name = ? AND contract_address = ?", .{ placeholder_name, emitting_contract });
+    var q = try Query.initCached(db, "UPDATE events SET name = ?, namehash = ? WHERE name = ? AND contract_address = ?");
     defer q.deinit();
     try q.bindText(actual_name);
     try q.bindHash(namehash);
     try q.bindText(placeholder_name);
+    try q.bindAddress(emitting_contract);
     try q.exec();
     return q.changes();
 }
@@ -181,12 +235,38 @@ pub fn getRegistriesByOwner(db: *Database, protocol: models.Protocol, owner: Add
 /// entries (which can happen on V2 since `INSERT OR IGNORE` keeps the first
 /// SubregistryUpdate per registry but the table is keyed by
 /// `UNIQUE(protocol, address, namehash)`).
+/// The registry entity at `address`: which name owns this contract.
+///
+/// `registries` is append-only history, UNIQUE(protocol, address, namehash) — one row per
+/// (contract, parent name) pair ever seen — so this is a one-to-MANY question, and
+/// `ORDER BY created_block DESC LIMIT 1` answered it with the most recent linker. That is the
+/// same defect as the subname misattribution the indexer side just had, on the read side:
+/// for a contract shared by several parents it named whichever adopted it last, INCLUDING a
+/// parent that has since repointed away and no longer resolves it at all. It is why
+/// `Domain.subregistry` and `registry(address:)` reported the wrong owning name.
+///
+/// Now: prefer a parent whose pointer is still LIVE (the `registry_entries` mirror, joined
+/// through the parent's own `names` row), oldest link first so the answer is stable as later
+/// parents adopt the contract. History remains the fallback, for a contract whose parent row
+/// has not landed yet. `referencedBy` already exposes the full set and is unchanged — this
+/// only fixes which single parent the singular field names.
+///
+/// Ordering is a TOTAL order (`is_live`, then created_block, then namehash), so the answer
+/// cannot differ between SQLite and Postgres.
 pub fn getRegistry(db: *Database, protocol: models.Protocol, address: Address) !?models.Registry {
+    try db.namesBarrier();
     var q = try Query.init(db,
         \\SELECT r.address, r.protocol, r.name, r.namehash, r.parent_registry, r.created_block, r.created_at
         \\FROM registries r
+        \\LEFT JOIN names pp ON pp.protocol = r.protocol AND pp.namehash = r.namehash
+        \\                  AND pp.is_alias = 0 AND pp.is_reachable = 1
         \\WHERE r.protocol = ? AND r.address = ?
-        \\ORDER BY r.created_block DESC
+        \\ORDER BY CASE WHEN EXISTS (
+        \\           SELECT 1 FROM registry_entries re
+        \\           WHERE re.protocol = r.protocol AND re.parent_registry = pp.registry
+        \\             AND re.canonical_id = pp.canonical_id AND re.subregistry = r.address
+        \\         ) THEN 0 ELSE 1 END ASC,
+        \\         r.created_block ASC, r.namehash ASC
         \\LIMIT 1
     );
     defer q.deinit();
@@ -271,13 +351,26 @@ pub fn getRegistriesByAddresses(db: *Database, protocol: models.Protocol, addres
         defer scratch.deinit();
         const scratch_alloc = scratch.allocator();
 
+        // Same live-pointer-first total order as the point read `getRegistry`, because the
+        // loader's contract is "first row per address == what getRegistry returns". Change
+        // one and the batched API answer silently diverges from the point-query answer for
+        // exactly the shared registries this ordering exists to get right — there is a test
+        // pinning the two together.
         var sql: std.ArrayList(u8) = .empty;
-        try sql.appendSlice(scratch_alloc, "SELECT " ++ REGISTRY_SELECT_COLS ++ " FROM registries r WHERE r.protocol = ? AND r.address IN (");
+        try sql.appendSlice(scratch_alloc, "SELECT " ++ REGISTRY_SELECT_COLS ++
+            " FROM registries r" ++
+            " LEFT JOIN names pp ON pp.protocol = r.protocol AND pp.namehash = r.namehash" ++
+            "                   AND pp.is_alias = 0 AND pp.is_reachable = 1" ++
+            " WHERE r.protocol = ? AND r.address IN (");
         for (chunk, 0..) |_, i| {
             if (i != 0) try sql.appendSlice(scratch_alloc, ", ");
             try sql.append(scratch_alloc, '?');
         }
-        try sql.appendSlice(scratch_alloc, ") ORDER BY r.address, r.created_block DESC, r.namehash");
+        try sql.appendSlice(scratch_alloc, ") ORDER BY r.address, CASE WHEN EXISTS (" ++
+            "SELECT 1 FROM registry_entries re WHERE re.protocol = r.protocol" ++
+            " AND re.parent_registry = pp.registry AND re.canonical_id = pp.canonical_id" ++
+            " AND re.subregistry = r.address) THEN 0 ELSE 1 END ASC," ++
+            " r.created_block ASC, r.namehash ASC");
 
         var q = try Query.init(db, sql.items);
         defer q.deinit();

@@ -164,6 +164,7 @@ fn seedFixture(db: *Database, a: std.mem.Allocator) !void {
         tx,
         0,
         resolver,
+        FIXED_TS,
     );
     // Same resource on a SECOND contract: locks the cross-contract semantics —
     // the unscoped query returns both rows (with contractAddress telling them
@@ -180,6 +181,7 @@ fn seedFixture(db: *Database, a: std.mem.Allocator) !void {
         tx,
         1,
         other_contract,
+        FIXED_TS,
     );
 
     // Versioned registry resources: `versioned.eth` on registry 0x7777 was
@@ -221,9 +223,9 @@ fn seedFixture(db: *Database, a: std.mem.Allocator) !void {
     const versioned_v0 = "0x53f632a801578489983227b234817273b09ffad9c79c50366f6ff4d600000000";
     const versioned_v1 = "0x53f632a801578489983227b234817273b09ffad9c79c50366f6ff4d600000001";
     const root_resource = "0x0000000000000000000000000000000000000000000000000000000000000000";
-    try db.upsertEACRole(.v2, versioned_v0, owner1, "0x0000000000000000000000000000000000000000000000000000000000000111", 300, tx, 2, other_contract);
-    try db.upsertEACRole(.v2, versioned_v1, owner2, "0x0000000000000000000000000000000000000000000000000000000000000111", 320, tx, 3, other_contract);
-    try db.upsertEACRole(.v2, root_resource, owner1, "0x0000000000000000000000000000000000000000000000000000000000010001", 290, tx, 4, other_contract);
+    try db.upsertEACRole(.v2, versioned_v0, owner1, "0x0000000000000000000000000000000000000000000000000000000000000111", 300, tx, 2, other_contract, FIXED_TS);
+    try db.upsertEACRole(.v2, versioned_v1, owner2, "0x0000000000000000000000000000000000000000000000000000000000000111", 320, tx, 3, other_contract, FIXED_TS);
+    try db.upsertEACRole(.v2, root_resource, owner1, "0x0000000000000000000000000000000000000000000000000000000000010001", 290, tx, 4, other_contract, FIXED_TS);
     const RoleEv = struct { blk: u64, li: u32, data: []const u8 };
     const role_events = [_]RoleEv{
         .{ .blk = 290, .li = 9100, .data = "{\"resource\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"account\":\"0x1111111111111111111111111111111111111111\",\"oldRoleBitmap\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"newRoleBitmap\":\"0x0000000000000000000000000000000000000000000000000000000000010001\"}" },
@@ -654,7 +656,7 @@ fn seedRecordResolverFixture(db: *Database, a: std.mem.Allocator) !void {
     var resource_buf: [66]u8 = undefined;
     const resource_hex = (Hash{ .bytes = resource }).toHexBuf(&resource_buf);
     try db.upsertNamedResource(.v2, rec, resource_hex, "argument", "avatar", -1, "", FIXED_BLOCK, tx, 4);
-    try db.upsertEACRole(.v2, resource_hex, owner1, "0x10", FIXED_BLOCK, tx, 5, rec);
+    try db.upsertEACRole(.v2, resource_hex, owner1, "0x10", FIXED_BLOCK, tx, 5, rec, FIXED_TS);
 }
 
 test "conformance goldens: record-model resolvers" {

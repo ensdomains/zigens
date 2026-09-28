@@ -295,7 +295,7 @@ test "updateNameWrapperState with expiry > i64::max stores as 0" {
     const database = try helpers.createTestDatabase(allocator);
     defer helpers.destroyTestDatabase(allocator, database);
 
-    const nh = try helpers.createTestName(allocator, database, "wrapped.eth", helpers.TEST_OWNER_1);
+    const nh = try helpers.createTestNameForProtocol(allocator, database, "wrapped.eth", helpers.TEST_OWNER_1, .v1);
 
     const huge_expiry: u64 = @as(u64, @intCast(std.math.maxInt(i64))) + 1;
     try names_storage.updateNameWrapperState(database, nh, 196608, huge_expiry);
@@ -314,7 +314,7 @@ test "updateNameWrapperExpiry with expiry > i64::max stores as 0" {
     const database = try helpers.createTestDatabase(allocator);
     defer helpers.destroyTestDatabase(allocator, database);
 
-    const nh = try helpers.createTestName(allocator, database, "wrapexp.eth", helpers.TEST_OWNER_1);
+    const nh = try helpers.createTestNameForProtocol(allocator, database, "wrapexp.eth", helpers.TEST_OWNER_1, .v1);
 
     // First wrap the name
     try names_storage.updateNameWrapperState(database, nh, 196608, 1800000000);
@@ -442,7 +442,7 @@ test "updateNameOwner transfers ownership" {
     const nh = try helpers.createTestName(allocator, database, "transfer.eth", helpers.TEST_OWNER_1);
 
     // Transfer to new owner
-    try database.updateNameOwner(nh, helpers.TEST_OWNER_2);
+    try database.updateNameOwner(.v2, nh, helpers.TEST_OWNER_2);
 
     // Verify
     const name_opt = try database.getNameByNamehash(nh);
@@ -461,7 +461,7 @@ test "updateNameResolver changes resolver address" {
     const nh = try helpers.createTestName(allocator, database, "resolver.eth", helpers.TEST_OWNER_1);
 
     // Update resolver
-    try database.updateNameResolver(nh, helpers.TEST_RESOLVER);
+    try database.updateNameResolver(.v2, nh, helpers.TEST_RESOLVER);
 
     // Verify
     const name_opt = try database.getNameByNamehash(nh);
@@ -1366,6 +1366,40 @@ test "getUnknownLabelsByLabelhash returns rows for a labelhash" {
     const child_nh_hex = try child_nh.toHex(allocator);
     defer allocator.free(child_nh_hex);
     try testing.expectEqualStrings(child_nh_hex, rows[0].namehash);
+}
+
+test "getNamehashByResolver answers only for a dedicated resolver, never guesses for a shared one" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    const dedicated = Address{ .bytes = [_]u8{0xD1} ** 20 };
+    const shared = Address{ .bytes = [_]u8{0x5A} ** 20 };
+
+    const solo = try helpers.createTestName(allocator, database, "solo.eth", helpers.TEST_OWNER_1);
+    try database.updateNameResolver(.v2, solo, dedicated);
+
+    // ENSv2's premise — one resolver per name — holds here, so the zero-namehash fallback can
+    // attribute the event to that one name.
+    const got = try database.getNamehashByResolver(.v2, dedicated);
+    try testing.expect(got != null);
+    try testing.expect(got.?.eql(solo));
+
+    // Two names on one resolver: the question has no single answer. On the reference mirror
+    // 1,002 resolvers are in this state and the busiest serves 159,143 names, so a `LIMIT 1`
+    // pick was an arbitrary attribution. It must refuse rather than guess.
+    const a = try helpers.createTestName(allocator, database, "a.eth", helpers.TEST_OWNER_1);
+    const b = try helpers.createTestName(allocator, database, "b.eth", helpers.TEST_OWNER_2);
+    try database.updateNameResolver(.v2, a, shared);
+    try database.updateNameResolver(.v2, b, shared);
+    try testing.expect((try database.getNamehashByResolver(.v2, shared)) == null);
+
+    // And it is protocol-scoped: the dedicated resolver is invisible to the other protocol.
+    try testing.expect((try database.getNamehashByResolver(.v1, dedicated)) == null);
+
+    // An unknown resolver is null too — the caller treats both the same way (skip the event).
+    const unknown = Address{ .bytes = [_]u8{0xEE} ** 20 };
+    try testing.expect((try database.getNamehashByResolver(.v2, unknown)) == null);
 }
 
 test "healSubdomainLabel materializes a placeholder V2 subname" {

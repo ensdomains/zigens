@@ -15,6 +15,7 @@ const resolvers = @import("resolvers.zig");
 const resolver_records = @import("resolver_records.zig");
 const heal_targets = @import("heal_targets.zig");
 const registry_entries = @import("registry_entries.zig");
+const name_aliases = @import("name_aliases.zig");
 const reorg_undo = @import("reorg_undo.zig");
 const resolve_cache = @import("../resolve/cache.zig");
 const finality = @import("finality.zig");
@@ -158,7 +159,27 @@ pub const Database = struct {
         // every table. The `migrate()` scaffold is kept as a thin hook so future
         // emergency in-place migrations have a wired path without re-introducing the
         // per-file migration ladder.
+        // `migrate()` runs both before and after the schema files, and the
+        // pre-pass is conditional.
+        //
+        // Before, on an existing database: when a table is missing, loadSchemaFiles
+        // replays the whole schema file as one multi-statement exec, where
+        // `CREATE TABLE IF NOT EXISTS` no-ops on the tables that already exist. An
+        // index in that file referencing a column added this release then fails with
+        // "column does not exist" and aborts the entire exec — including the table
+        // the replay existed to create — before the migration that would have added
+        // the column ever ran. That deadlocked boot on every pre-existing database.
+        //
+        // NOT before, on a fresh database: the generated schema files are
+        // authoritative there, and `migrate()` carries inline
+        // `CREATE TABLE IF NOT EXISTS` statements written in SQLite types, so running
+        // it first would create `accounts` and friends with int4 columns and leave
+        // the file's BIGINT definitions a no-op — silently narrowing
+        // first_seen_timestamp past 2038.
+        if (database.hasTable("names")) try schema.migrate(&database);
         try schema.loadSchemaFiles(&database);
+        // Again afterwards: idempotent, and it covers any migration that needs the
+        // completed schema (a table the replay just created) rather than preceding it.
         try schema.migrate(&database);
 
         // Reorg undo-log: capture tables + per-table triggers so rollbackToBlock can
@@ -446,10 +467,12 @@ pub const Database = struct {
     pub const getReverseRecordNamehash = resolvers.getReverseRecordNamehash;
     pub const updateNameResolver = names.updateNameResolver;
     pub const recursivelyGcEmptyDomain = names.recursivelyGcEmptyDomain;
+    pub const deleteNameByNamehashScoped = names.deleteNameByNamehashScoped;
     pub const applyLatestResolverFromEvents = resolvers.applyLatestResolverFromEvents;
     pub const getNameByTokenIdAndRegistry = names.getNameByTokenIdAndRegistry;
     pub const getUniqueNameByCanonicalId = names.getUniqueNameByCanonicalId;
     pub const getNamesByCanonicalIds = names.getNamesByCanonicalIds;
+    pub const getNamesInRegistry = names.getNamesInRegistry;
     pub const getNamesByNamehashes = names.getNamesByNamehashes;
     pub const deleteNameByNamehash = names.deleteNameByNamehash;
     pub const updateNameTokenIdByNamehash = names.updateNameTokenIdByNamehash;
@@ -559,6 +582,7 @@ pub const Database = struct {
     pub const migrate = schema.migrate;
     pub const loadSchemaFiles = schema.loadSchemaFiles;
     pub const registerSubregistry = sync.registerSubregistry;
+    pub const registerSubregistriesBatch = sync.registerSubregistriesBatch;
     pub const registerResolver = sync.registerResolver;
     pub const registerResolverIfNew = sync.registerResolverIfNew;
     pub const isKnownResolver = sync.isKnownResolver;
@@ -641,6 +665,22 @@ pub const Database = struct {
     pub const reconcileV2Reachability = registry_entries.reconcileV2Reachability;
     pub const setRegistriesReachability = registry_entries.setRegistriesReachability;
     pub const markNameUnreachableByNamehash = registry_entries.markNameUnreachableByNamehash;
+
+    // Shared-registry aliases — one Domain per live referring parent
+    pub const getLiveParentNames = name_aliases.getLiveParentNames;
+    pub const getLiveParentNamesAsOf = name_aliases.getLiveParentNamesAsOf;
+    pub const aliasPlanBatch = name_aliases.aliasPlanBatch;
+    pub const deleteStaleAliasesScoped = name_aliases.deleteStaleAliasesScoped;
+    pub const enqueueAliasWork = name_aliases.enqueueAliasWork;
+    pub const takeAliasWork = name_aliases.takeAliasWork;
+    pub const freeAliasWork = name_aliases.freeAliasWork;
+    pub const saveAliasWorkCursorHex = name_aliases.saveAliasWorkCursorHex;
+    pub const completeAliasWork = name_aliases.completeAliasWork;
+    pub const enqueueAllAliasCandidates = name_aliases.enqueueAllAliasCandidates;
+    pub const buildAliasRow = name_aliases.buildAliasRow;
+    pub const primaryExistsAt = name_aliases.primaryExistsAt;
+    pub const deleteStaleAliases = name_aliases.deleteStaleAliases;
+    pub const freeLiveParents = name_aliases.freeLiveParents;
 
     // Accounts module — first-class Account entity (subgraph parity)
     pub const upsertAccount = accounts.upsertAccount;

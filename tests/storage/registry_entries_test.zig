@@ -495,24 +495,24 @@ test "isRegistryReachable: root, reachable subregistry, and orphaned (incl. deep
     const roots = [_]Address{ETH_REGISTRY};
 
     // A root is always reachable, even with no edges.
-    try testing.expect(try database.isRegistryReachable(allocator, .v2, ETH_REGISTRY, &roots));
+    try testing.expect(try database.isRegistryReachable(allocator, .v2, ETH_REGISTRY, &roots, 1_800_000_000));
 
     // fresh.eth → SUB_A → SUB_A1 (a 2-level chain), both reachable from the root.
     _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_A, 1000, 1700000000);
     _ = try database.upsertRegistryEntrySubregistry(.v2, SUB_A, 0x2200, SUB_A1, 1001, 1700000060);
-    try testing.expect(try database.isRegistryReachable(allocator, .v2, SUB_A, &roots));
-    try testing.expect(try database.isRegistryReachable(allocator, .v2, SUB_A1, &roots));
+    try testing.expect(try database.isRegistryReachable(allocator, .v2, SUB_A, &roots, 1_800_000_000));
+    try testing.expect(try database.isRegistryReachable(allocator, .v2, SUB_A1, &roots, 1_800_000_000));
 
     // A registry nothing points to is unreachable.
-    try testing.expect(!try database.isRegistryReachable(allocator, .v2, SUB_B, &roots));
+    try testing.expect(!try database.isRegistryReachable(allocator, .v2, SUB_B, &roots, 1_800_000_000));
 
     // Repoint fresh.eth away from SUB_A: the WHOLE SUB_A subtree (SUB_A and the
     // deeper SUB_A1) is now unreachable. A single-level "is it pointed-to by
     // anyone" check would wrongly call SUB_A1 reachable — SUB_A still points to
     // it — which is exactly the band-aid this upward walk avoids.
     _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_B, 1002, 1700000120);
-    try testing.expect(!try database.isRegistryReachable(allocator, .v2, SUB_A, &roots));
-    try testing.expect(!try database.isRegistryReachable(allocator, .v2, SUB_A1, &roots));
+    try testing.expect(!try database.isRegistryReachable(allocator, .v2, SUB_A, &roots, 1_800_000_000));
+    try testing.expect(!try database.isRegistryReachable(allocator, .v2, SUB_A1, &roots, 1_800_000_000));
 }
 
 test "reconcileV2Reachability heals an orphan the repoint cascade never marked (phase-ordering gap)" {
@@ -833,6 +833,47 @@ fn firstRegistryRow(rows: []const models.Registry, address: Address) ?models.Reg
     return null;
 }
 
+/// A parent name living in `registry`, enough for the live-pointer join in `getRegistry`.
+fn seedParentName(
+    allocator: std.mem.Allocator,
+    database: *Database,
+    name: []const u8,
+    namehash: Hash,
+    registry: Address,
+    canonical_id: u256,
+) !void {
+    const dot = std.mem.indexOfScalar(u8, name, '.') orelse name.len;
+    try database.insertName(.{
+        .protocol = .v2,
+        .name = name,
+        .namehash = namehash,
+        .label = name[0..dot],
+        .label_hash = try lib.labelhash(allocator, name[0..dot]),
+        .parent_name = "eth",
+        .parent_namehash = try lib.namehash(allocator, "eth"),
+        .registry = registry,
+        .owner = OWNER_1,
+        .registrant = OWNER_1,
+        .resolver = Address.zero,
+        .token_id = canonical_id,
+        .canonical_id = canonical_id,
+        .token_version = 0,
+        .expiry = 0,
+        .registry_locked = false,
+        .migrated = false,
+        .created_block = 1000,
+        .created_at = 1_700_000_000,
+        .registered_at = 1_700_000_000,
+        .updated_block = 1000,
+        .updated_at = 1_700_000_000,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    });
+}
+
 test "getRegistriesByAddresses first row per address equals getRegistry (two rows, unknown address, duplicate)" {
     const allocator = testing.allocator;
     const database = try helpers.createTestDatabase(allocator);
@@ -856,13 +897,20 @@ test "getRegistriesByAddresses first row per address equals getRegistry (two row
         allocator.free(rows);
     }
 
-    // All three v2 rows, ordered by address (SUB_A 0xaa… < SUB_B 0xbb…), then
-    // created_block DESC within SUB_A.
+    // All three v2 rows, ordered by address (SUB_A 0xaa… < SUB_B 0xbb…), then — within one
+    // address — live-pointer-first, and OLDEST LINK first among equals.
+    //
+    // The oldest-first tiebreak is a deliberate change from the old `created_block DESC`.
+    // Neither row here has a live pointer (no `names` / `registry_entries` rows seeded), so
+    // both fall to the history tier, and there the oldest link is the stable answer: a later
+    // parent adopting the same contract must not silently rename the registry every existing
+    // subname was attributed through. DESC did exactly that — it is the read-side half of the
+    // subname misattribution bug.
     try testing.expectEqual(@as(usize, 3), rows.len);
     try testing.expect(rows[0].address.eql(two_rows));
-    try testing.expectEqual(@as(u64, 2000), rows[0].created_block);
+    try testing.expectEqual(@as(u64, 1000), rows[0].created_block);
     try testing.expect(rows[1].address.eql(two_rows));
-    try testing.expectEqual(@as(u64, 1000), rows[1].created_block);
+    try testing.expectEqual(@as(u64, 2000), rows[1].created_block);
     try testing.expect(rows[2].address.eql(one_row));
 
     for (addresses) |address| {
@@ -876,7 +924,190 @@ test "getRegistriesByAddresses first row per address equals getRegistry (two row
         }
     }
     try testing.expect(firstRegistryRow(rows, unknown) == null);
-    try testing.expectEqualStrings("new.eth", firstRegistryRow(rows, two_rows).?.name);
+    // The oldest link wins in the history tier — see the ordering note above.
+    try testing.expectEqualStrings("old.eth", firstRegistryRow(rows, two_rows).?.name);
+}
+
+test "an expired parent stops its subtree resolving, and a renewal brings it back" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // eth registry -> parent label "gone" -> SUB_A. On-chain, getSubregistry returns zero once the
+    // entry expires, so nothing under SUB_A resolves — but NO EVENT fires when an expiry merely
+    // passes, so the mirror keeps claiming the pointer is live. That is the gap this closes.
+    try seedParentName(allocator, database, "gone.eth", hashAt(31), ETH_REGISTRY, FRESH_CANONICAL_ID);
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_A, 1000, 1_700_000_000);
+
+    const roots = [_]Address{ETH_REGISTRY};
+    const T: i64 = 1_700_000_000;
+
+    // No expiry recorded yet (0 = NEVER EXPIRES here — the OPPOSITE of the contract's 0, which
+    // means expired). Treating our 0 as expired would mark the root, `eth` and every reserved
+    // label dead, so this direction of the sentinel matters more than the literal contract rule.
+    try testing.expect(try database.isRegistryReachable(allocator, .v2, SUB_A, &roots, T));
+
+    // Parent expires at T-1: the edge is dead as of T, so SUB_A is no longer reachable.
+    try database.exec("UPDATE names SET expiry = 1699999999 WHERE name = 'gone.eth'");
+    try testing.expect(!try database.isRegistryReachable(allocator, .v2, SUB_A, &roots, T));
+
+    // Evaluated BEFORE the expiry, the same edge is live — the predicate is a function of the
+    // evaluation time, not of the wall clock, which is what keeps a replay reproducible.
+    try testing.expect(try database.isRegistryReachable(allocator, .v2, SUB_A, &roots, 1699999998));
+
+    // A renewal pushes the expiry out: reachable again, no pointer event involved.
+    try database.exec("UPDATE names SET expiry = 1800000000 WHERE name = 'gone.eth'");
+    try testing.expect(try database.isRegistryReachable(allocator, .v2, SUB_A, &roots, T));
+
+    // Expiry exactly AT the evaluation time counts as expired, matching the contract's
+    // inclusive-at-T test.
+    try database.exec("UPDATE names SET expiry = 1700000000 WHERE name = 'gone.eth'");
+    try testing.expect(!try database.isRegistryReachable(allocator, .v2, SUB_A, &roots, T));
+
+    // Fail-OPEN: with the parent's names row absent entirely we cannot establish an expiry, and
+    // hiding a name that resolves is the worse error — so the edge is left alone.
+    try database.exec("DELETE FROM names WHERE name = 'gone.eth'");
+    try testing.expect(try database.isRegistryReachable(allocator, .v2, SUB_A, &roots, T));
+}
+
+test "an unregistered label is not resurrected when its registry becomes reachable again" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // Two names in one registry. One is unregistered by the user (per-NAME soft delete), the
+    // other is hidden because the registry got tree-orphaned (per-REGISTRY marking). Both end up
+    // with is_reachable = 0, and before `label_live` existed nothing could tell them apart.
+    const kept = try helpers.createTestName(allocator, database, "kept.eth", OWNER_1);
+    const burned = try helpers.createTestName(allocator, database, "burned.eth", OWNER_1);
+    try database.exec("UPDATE names SET registry = lower('0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')");
+
+    try lib.storage.registry_entries.markNameUnreachableByNamehash(database, .v2, burned, 200, 1_700_000_200);
+    const registries = [_]Address{SUB_A};
+    _ = try lib.storage.registry_entries.setRegistriesReachability(database, .v2, &registries, false, 210, 1_700_000_210);
+
+    // Both hidden now, for different reasons.
+    {
+        var q = try lib.storage.Query.init(database, "SELECT count(*) FROM names WHERE is_reachable = 0");
+        defer q.deinit();
+        try testing.expect(try q.step());
+        try testing.expectEqual(@as(i64, 2), q.getInt64(0));
+    }
+
+    // The ancestor repoints back, so the REGISTRY is reachable again. `kept.eth` must come back;
+    // `burned.eth` must NOT — its label no longer exists on-chain, and resurrecting it would show
+    // a name as live that does not resolve.
+    _ = try lib.storage.registry_entries.setRegistriesReachability(database, .v2, &registries, true, 220, 1_700_000_220);
+
+    var kept_row = (try database.getNameByNamehash(kept)).?;
+    defer kept_row.deinit(allocator);
+    try testing.expect(kept_row.is_reachable);
+
+    var burned_row = (try database.getNameByNamehash(burned)).?;
+    defer burned_row.deinit(allocator);
+    try testing.expect(!burned_row.is_reachable);
+
+    // Re-registering the label legitimately revives it: an insert means the label exists again.
+    _ = try helpers.createTestName(allocator, database, "burned.eth", OWNER_1);
+    var revived = (try database.getNameByNamehash(burned)).?;
+    defer revived.deinit(allocator);
+    try testing.expect(revived.is_reachable);
+    // And it is genuinely revived, not merely flipped: a later registry-wide cycle keeps it.
+    _ = try lib.storage.registry_entries.setRegistriesReachability(database, .v2, &registries, false, 230, 1_700_000_230);
+    _ = try lib.storage.registry_entries.setRegistriesReachability(database, .v2, &registries, true, 240, 1_700_000_240);
+    var again = (try database.getNameByNamehash(burned)).?;
+    defer again.deinit(allocator);
+    try testing.expect(again.is_reachable);
+}
+
+test "resolving a placeholder never renames another parent's rows" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // The placeholder string is `canonicalId:{keccak(label) with version bits cleared}` — derived
+    // from the LABEL alone. So the same label under two different parents produces the SAME
+    // placeholder, and an unscoped patch renamed both. Same root shape as the subname
+    // misattribution: a key that is not unique treated as if it were.
+    const PARENT_A = Address{ .bytes = [_]u8{0xA0} ** 20 };
+    const PARENT_B = Address{ .bytes = [_]u8{0xB0} ** 20 };
+    const SUB_FOR_A = Address{ .bytes = [_]u8{0xA1} ** 20 };
+    const SUB_FOR_B = Address{ .bytes = [_]u8{0xB1} ** 20 };
+    const placeholder = "canonicalId:12345";
+
+    for ([_]struct { parent: Address, sub: Address }{
+        .{ .parent = PARENT_A, .sub = SUB_FOR_A },
+        .{ .parent = PARENT_B, .sub = SUB_FOR_B },
+    }) |row| {
+        try database.insertRegistry(.{
+            .address = row.sub,
+            .protocol = .v2,
+            .name = placeholder,
+            .namehash = Hash.zero,
+            .parent_registry = row.parent,
+            .created_block = 100,
+            .created_at = 1_700_000_000,
+        });
+    }
+
+    // Resolve only A's placeholder.
+    const a_nh = hashAt(21);
+    _ = try names_registry.updateRegistryPlaceholderName(database, PARENT_A, placeholder, "a-parent.eth", a_nh);
+
+    // A's row is named; B's is untouched and still resolvable later.
+    var reg_a = (try database.getRegistry(.v2, SUB_FOR_A)).?;
+    defer reg_a.deinit(allocator);
+    try testing.expectEqualStrings("a-parent.eth", reg_a.name);
+
+    var reg_b = (try database.getRegistry(.v2, SUB_FOR_B)).?;
+    defer reg_b.deinit(allocator);
+    try testing.expectEqualStrings(placeholder, reg_b.name);
+
+    // And B still resolves correctly afterwards — the two are independent.
+    const b_nh = hashAt(22);
+    _ = try names_registry.updateRegistryPlaceholderName(database, PARENT_B, placeholder, "b-parent.eth", b_nh);
+    var reg_b2 = (try database.getRegistry(.v2, SUB_FOR_B)).?;
+    defer reg_b2.deinit(allocator);
+    try testing.expectEqualStrings("b-parent.eth", reg_b2.name);
+}
+
+test "getRegistry names the parent whose pointer is still live, not the last linker" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+
+    // Two parents have linked SUB_A over time. `first.eth` linked earlier and STILL points at
+    // it; `later.eth` linked afterwards and has since repointed away, so it no longer resolves
+    // anything in SUB_A — but its `registries` row survives, because that table is append-only.
+    //
+    // `ORDER BY created_block DESC LIMIT 1` therefore named `later.eth`: the read-side half of
+    // the subname misattribution bug, and the reason `Domain.subregistry` / `registry(address:)`
+    // reported a name that has nothing to do with the contract any more.
+    const first_nh = hashAt(11);
+    const later_nh = hashAt(12);
+    try insertRegistryRow(database, .v2, SUB_A, "first.eth", first_nh, 1000);
+    try insertRegistryRow(database, .v2, SUB_A, "later.eth", later_nh, 2000);
+
+    // Both parents exist as names in the eth registry...
+    try seedParentName(allocator, database, "first.eth", first_nh, ETH_REGISTRY, FRESH_CANONICAL_ID);
+    try seedParentName(allocator, database, "later.eth", later_nh, ETH_REGISTRY, ONE_CANONICAL_ID);
+    // ...but only first.eth's entry still points at SUB_A. later.eth moved to SUB_B.
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, FRESH_CANONICAL_ID, SUB_A, 1000, 1_700_000_000);
+    _ = try database.upsertRegistryEntrySubregistry(.v2, ETH_REGISTRY, ONE_CANONICAL_ID, SUB_B, 2100, 1_700_000_100);
+
+    var reg = (try database.getRegistry(.v2, SUB_A)).?;
+    defer reg.deinit(allocator);
+    try testing.expectEqualStrings("first.eth", reg.name);
+
+    // And the batched loader must agree, or the API's list answer diverges from its point answer
+    // for exactly the registries this ordering exists to get right.
+    const addresses = [_]Address{SUB_A};
+    const rows = try names_registry.getRegistriesByAddresses(database, .v2, &addresses, allocator);
+    defer {
+        for (rows) |*r| r.deinit(allocator);
+        allocator.free(rows);
+    }
+    try testing.expectEqualStrings("first.eth", firstRegistryRow(rows, SUB_A).?.name);
 }
 
 test "getRegistriesByAddresses spans the 200-address chunk boundary" {

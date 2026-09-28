@@ -29,25 +29,25 @@ const SQL_SELECT_NAMES =
     \\       owner, registrant, resolver, token_id, canonical_id, token_version, namehash, expiry,
     \\       registry_locked, migrated, created_block, created_at, registered_at, updated_block, updated_at,
     \\       is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash,
-    \\       is_reachable, unreachable_since, ttl, is_legacy, resolved_address, is_normalized
+    \\       is_reachable, unreachable_since, ttl, is_legacy, resolved_address, is_normalized, is_alias
     \\FROM names
 ;
 
-/// Shorter SELECT for queries that don't need wrapper fields (27 columns).
+/// Shorter SELECT for the hot paths, wrapper fields last (34 columns).
 /// Still includes is_reachable/unreachable_since/ttl so callers can honor
 /// reachability filtering and serialize the flag.
 const SQL_SELECT_NAMES_SHORT =
     \\SELECT name, label, label_hash, parent_name, parent_namehash, protocol, registry,
     \\       owner, registrant, resolver, token_id, canonical_id, token_version, namehash, expiry,
     \\       registry_locked, migrated, created_block, created_at, registered_at, updated_block, updated_at,
-    \\       is_reachable, unreachable_since, ttl, is_legacy, resolved_address, is_normalized, is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash
+    \\       is_reachable, unreachable_since, ttl, is_legacy, resolved_address, is_normalized, is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash, is_alias
     \\FROM names
 ;
 
 /// SQL_SELECT_NAMES_SHORT's column list plus a per-parent rank (name ASC, the
 /// getSubdomains order) as a trailing column, derived at comptime so the two
 /// lists cannot drift: a `SELECT * FROM (…) t` over it still parses with
-/// parseNameRowShort (indices 0..32). Backs the batched getSubdomains mirror.
+/// parseNameRowShort (indices 0..33). Backs the batched getSubdomains mirror.
 const SQL_SELECT_NAMES_FROM = "\nFROM names";
 const SQL_SELECT_NAMES_SHORT_RANKED_BY_PARENT = blk: {
     std.debug.assert(std.mem.endsWith(u8, SQL_SELECT_NAMES_SHORT, SQL_SELECT_NAMES_FROM));
@@ -167,6 +167,7 @@ fn parseNameRow(q: *Query, allocator: std.mem.Allocator) !models.Name {
         else
             null,
         .is_normalized = q.getBool(32),
+        .is_alias = q.getBool(33),
     };
 }
 
@@ -249,6 +250,7 @@ fn parseNameRowShort(q: *Query, allocator: std.mem.Allocator) !models.Name {
         else
             null,
         .is_normalized = q.getBool(27),
+        .is_alias = q.getBool(33),
     };
 }
 
@@ -256,9 +258,23 @@ fn parseNameRowShort(q: *Query, allocator: std.mem.Allocator) !models.Name {
 // NAME QUERY OPERATIONS
 // ============================================================================
 
+/// A namehash identifies a node, and `names` is UNIQUE(protocol, namehash) — so a name
+/// MIGRATED from V1 to V2 has a row in each protocol and this lookup has two candidates.
+///
+/// It used to have no `ORDER BY` at all, so which twin a caller got was decided by the
+/// storage engine: SQLite returned rowid order, Postgres heap order, and the two could
+/// disagree about a migrated name's owner, expiry and resolver. The tiebreak below makes the
+/// answer deterministic AND consistent with the list queries, which suppress the V1 row
+/// whenever a V2 twin exists (`names_filter`'s twin-suppression predicate) — so the point
+/// read and the listing can no longer disagree about the same node.
+///
+/// Callers that mean one specific protocol should say so: `getNameByNamehashAndProtocol`
+/// binds the full unique key. Every V1 indexer handler uses that one.
+const TWIN_PREFERENCE = " ORDER BY CASE WHEN protocol = 'v2' THEN 0 ELSE 1 END, protocol ASC LIMIT 1";
+
 pub fn getNameByNamehash(db: *Database, namehash: Hash) !?models.Name {
     try db.namesBarrier();
-    var q = try Query.initCached(db, SQL_SELECT_NAMES ++ " WHERE namehash = ?");
+    var q = try Query.initCached(db, SQL_SELECT_NAMES ++ " WHERE namehash = ?" ++ TWIN_PREFERENCE);
     defer q.deinit();
 
     try q.bindHash(namehash);
@@ -274,7 +290,8 @@ pub fn getNameByNamehash(db: *Database, namehash: Hash) !?models.Name {
 /// need the human-readable name string (reverse-resolution hot path in the indexer).
 pub fn getNameStringByNamehash(db: *Database, namehash: Hash, allocator: std.mem.Allocator) !?[]u8 {
     try db.namesBarrier();
-    var q = try Query.initCached(db, "SELECT name FROM names WHERE namehash = ? LIMIT 1");
+    // Same twin preference as getNameByNamehash — see TWIN_PREFERENCE.
+    var q = try Query.initCached(db, "SELECT name FROM names WHERE namehash = ?" ++ TWIN_PREFERENCE);
     defer q.deinit();
 
     try q.bindHash(namehash);
@@ -305,18 +322,34 @@ pub fn getNameByNamehashAndProtocol(db: *Database, namehash: Hash, protocol: mod
 }
 
 /// Get namehash by resolver address
-pub fn getNamehashByResolver(db: *Database, resolver: Address) !?Hash {
+/// The name a resolver belongs to, or null when that question has no single answer.
+///
+/// This backs the zero-namehash fallback for resolver events: ENSv2 deploys a dedicated
+/// resolver per name, so an event whose node is zero can be attributed to that resolver's one
+/// name. The premise fails for a SHARED resolver, and it fails hard — on the reference mirror
+/// 1,002 resolvers serve more than one name and the most-used serves **159,143**. With
+/// `LIMIT 1` and no ORDER BY this returned an arbitrary one of them, so a record would be
+/// attributed to a name picked effectively at random (and differently on SQLite vs Postgres).
+///
+/// So it refuses to guess: `LIMIT 2` and null when a second row exists, the same
+/// count-must-be-1 guard `getUniqueNameByCanonicalId` uses. The caller's existing
+/// "unknown resolver" branch then skips the event, which loses one event's attribution instead
+/// of writing it to the wrong name. Protocol-scoped for the usual reason — `names` is
+/// UNIQUE(protocol, namehash) and nothing stops the two protocols sharing a resolver address.
+pub fn getNamehashByResolver(db: *Database, protocol: models.Protocol, resolver: Address) !?Hash {
     try db.namesBarrier();
-    var q = try Query.initCached(db, "SELECT namehash FROM names WHERE resolver = ? LIMIT 1");
+    var q = try Query.initCached(db, "SELECT namehash FROM names WHERE protocol = ? AND resolver = ? LIMIT 2");
     defer q.deinit();
 
+    try q.bindTextStatic(protocol.toString());
     try q.bindAddress(resolver);
 
-    if (try q.step()) {
-        const namehash_str = q.getTextSlice(0) orelse return null;
-        return try Hash.fromHex(namehash_str);
-    }
-    return null;
+    if (!try q.step()) return null;
+    const namehash_str = q.getTextSlice(0) orelse return null;
+    const first = try Hash.fromHex(namehash_str);
+    // A second row means the resolver is shared and the question is unanswerable.
+    if (try q.step()) return null;
+    return first;
 }
 
 /// Get name by token ID and registry address (avoids cross-registry tokenId collisions).
@@ -324,7 +357,22 @@ pub fn getNamehashByResolver(db: *Database, resolver: Address) !?Hash {
 /// version of the token_id and is resilient to TokenRegenerated events.
 pub fn getNameByTokenIdAndRegistry(db: *Database, token_id: u256, registry: Address) !?models.Name {
     try db.namesBarrier();
-    var q = try Query.initCached(db, SQL_SELECT_NAMES ++ " WHERE canonical_id = ? AND registry = ? LIMIT 1");
+    // `is_alias = 0` is what keeps this single-valued. A registry pointed at by
+    // several live parents holds one row per (label, parent) — all sharing this
+    // (canonical_id, registry) pair — and the unfiltered `LIMIT 1` would pick an
+    // arbitrary one, backend-defined, sending every ownership / expiry / resolver
+    // write to a random FQDN of the label. Exactly one row per pair is the
+    // attributed primary; the alias rows are derived from it (storage/name_aliases).
+    // ORDER BY is belt-and-braces on top of `is_alias = 0`. The invariant says one
+    // primary per (canonical_id, registry), but it is maintained across events rather
+    // than enforced by a constraint: re-registering a label in a shared registry whose
+    // original parent has since un-pointed makes the handler derive a different FQDN,
+    // and the upsert writes `is_alias = 0` there while the old primary keeps its flag.
+    // A bare LIMIT 1 would then pick backend-defined garbage; oldest-first makes the
+    // degraded case pick the same row every time, on both backends, so ownership and
+    // expiry writes stay on one FQDN instead of alternating.
+    var q = try Query.initCached(db, SQL_SELECT_NAMES ++
+        " WHERE canonical_id = ? AND registry = ? AND is_alias = 0 ORDER BY created_block ASC, namehash ASC LIMIT 1");
     defer q.deinit();
 
     const token_id_utils = @import("../types/token_id.zig");
@@ -349,7 +397,12 @@ pub fn getNameByTokenIdAndRegistry(db: *Database, token_id: u256, registry: Addr
 /// must skip rather than guess in that case.
 pub fn getUniqueNameByCanonicalId(db: *Database, protocol: models.Protocol, token_id: u256) !?models.Name {
     try db.namesBarrier();
-    var q = try Query.initCached(db, SQL_SELECT_NAMES ++ " WHERE canonical_id = ? AND protocol = ? LIMIT 2");
+    // Alias rows are excluded before the uniqueness guard runs: they share the
+    // canonical id of their primary by construction, so counting them would make
+    // this return null for every shared-registry label and degrade event naming to
+    // the `tokenId:N` placeholder. The guard still fires for the genuine
+    // cross-registry collision it exists for.
+    var q = try Query.initCached(db, SQL_SELECT_NAMES ++ " WHERE canonical_id = ? AND protocol = ? AND is_alias = 0 LIMIT 2");
     defer q.deinit();
 
     const token_id_utils = @import("../types/token_id.zig");
@@ -378,6 +431,12 @@ pub fn getUniqueNameByCanonicalId(db: *Database, protocol: models.Protocol, toke
 /// prefetch) holds the COMPLETE row set per id and can mirror both point
 /// lookups above exactly, authoritative misses included. Rows and the
 /// returned slice are allocated with `allocator`.
+///
+/// `is_alias = 0` matches the two point lookups: both exclude the derived
+/// shared-registry alias rows, and both of this function's callers reduce their
+/// result with a count-must-be-1 uniqueness guard, which alias rows (sharing
+/// their primary's canonical id by construction) would trip on every
+/// shared-registry label.
 pub fn getNamesByCanonicalIds(db: *Database, canonical_ids: []const u256, allocator: std.mem.Allocator) ![]models.Name {
     try db.namesBarrier();
     var out: std.ArrayList(models.Name) = .empty;
@@ -396,7 +455,7 @@ pub fn getNamesByCanonicalIds(db: *Database, canonical_ids: []const u256, alloca
         defer scratch.deinit();
 
         var sql: std.ArrayList(u8) = .empty;
-        try sql.appendSlice(scratch.allocator(), SQL_SELECT_NAMES ++ " WHERE canonical_id IN (");
+        try sql.appendSlice(scratch.allocator(), SQL_SELECT_NAMES ++ " WHERE is_alias = 0 AND canonical_id IN (");
         for (chunk, 0..) |_, i| {
             if (i != 0) try sql.append(scratch.allocator(), ',');
             try sql.append(scratch.allocator(), '?');
@@ -417,6 +476,40 @@ pub fn getNamesByCanonicalIds(db: *Database, canonical_ids: []const u256, alloca
     }
 
     return try out.toOwnedSlice(allocator);
+}
+
+/// The `is_alias = 0` rows of one registry contract: the labels that registry has
+/// minted, one row each. Backs the shared-registry alias derivation
+/// (storage/name_aliases.zig), which copies each of these into one row per extra
+/// live referring parent, so the alias rows themselves must stay out — including
+/// them would make the derivation copy its own output. Ordered by namehash so a
+/// pass emits its rows in the same sequence on every run and under replay. Rows
+/// and the returned slice are allocated with `allocator`.
+pub fn getNamesInRegistry(
+    db: *Database,
+    allocator: std.mem.Allocator,
+    protocol: models.Protocol,
+    registry: Address,
+) ![]models.Name {
+    try db.namesBarrier();
+    var out: std.ArrayList(models.Name) = .empty;
+    errdefer {
+        for (out.items) |*n| n.deinit(allocator);
+        out.deinit(allocator);
+    }
+
+    var q = try Query.initCached(db, SQL_SELECT_NAMES ++
+        " WHERE protocol = ? AND registry = ? AND is_alias = 0 ORDER BY namehash ASC");
+    defer q.deinit();
+    try q.bindTextStatic(protocol.toString());
+    try q.bindAddress(registry);
+
+    while (try q.step()) {
+        var row = try parseNameRow(&q, allocator);
+        errdefer row.deinit(allocator);
+        try out.append(allocator, row);
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 /// Every row whose namehash is in `namehashes` — no protocol filter, no

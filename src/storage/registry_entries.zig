@@ -22,6 +22,37 @@ fn formatU256HexBuf(buf: *[66]u8, value: u256) []const u8 {
     return std.fmt.bufPrint(buf, "0x{x:0>64}", .{value}) catch unreachable;
 }
 
+/// Is a pointer edge dead because the PARENT LABEL has expired?
+///
+/// On-chain, `PermissionedRegistry.getSubregistry(label)` returns `address(0)` for an expired
+/// entry, so an expired parent resolves nothing beneath it — but nothing EMITS an event when an
+/// expiry merely passes, and the mirror has no expiry column of its own. It does not need one:
+/// `registry_entries` is keyed (protocol, parent_registry, canonical_id), which is exactly the
+/// `names` key (protocol, registry, canonical_id) of the parent label, so the expiry is one join
+/// away and cannot drift out of sync with the row that owns it.
+///
+/// Two conventions to keep straight, and they disagree:
+///   * ON-CHAIN, `_isExpired` is inclusive and treats 0 as EXPIRED.
+///   * HERE, a stored `expiry` of 0 (or NULL) means NEVER EXPIRES — that is what
+///     `safeU64ToI64` produces for a clamped maximum and what every reader already assumes
+///     (`models.Name.isExpired`, `names_common`). Reinterpreting 0 as expired would mark the
+///     root, `eth`, and every reserved label as dead.
+///
+/// Phrased as NOT-EXISTS-an-expired-parent rather than EXISTS-a-live-one, so it FAILS OPEN: a
+/// parent whose `names` row has not landed yet (phase ordering) leaves the edge alone instead of
+/// hiding a subtree. Hiding a name that resolves is the worse error, and it is the direction the
+/// rest of this module fails in too.
+///
+/// One bind: the evaluation time, in chain seconds — never a wall clock.
+const EDGE_NOT_EXPIRED =
+    \\NOT EXISTS (
+    \\  SELECT 1 FROM names pl
+    \\  WHERE pl.protocol = re.protocol AND pl.registry = re.parent_registry
+    \\    AND pl.canonical_id = re.canonical_id
+    \\    AND pl.expiry IS NOT NULL AND pl.expiry <> 0 AND pl.expiry <= ?
+    \\)
+;
+
 /// One live (parent_registry, canonical_id) entry currently pointing at a
 /// subregistry. Strings are allocator-owned; free via `freeLiveParents`.
 pub const LiveParent = struct {
@@ -99,6 +130,10 @@ pub fn isRegistryReachable(
     protocol: models.Protocol,
     registry: Address,
     roots: []const Address,
+    /// Chain time the walk is evaluated at. An edge whose parent label had expired by then does
+    /// not count — see EDGE_NOT_EXPIRED. Pass the block timestamp of whatever is triggering the
+    /// evaluation, never a wall clock, or the stored flag stops being reproducible.
+    now: i64,
 ) !bool {
     for (roots) |r| if (registry.eql(r)) return true;
 
@@ -115,12 +150,13 @@ pub fn isRegistryReachable(
         const cur_hex = cur.toHexBuf(&cur_buf);
 
         var q = try Query.initCached(db,
-            \\SELECT DISTINCT parent_registry FROM registry_entries
-            \\WHERE protocol = ? AND subregistry = ?
-        );
+            \\SELECT DISTINCT re.parent_registry FROM registry_entries re
+            \\WHERE re.protocol = ? AND re.subregistry = ?
+        ++ "\n  AND " ++ EDGE_NOT_EXPIRED);
         defer q.deinit();
         try q.bindTextStatic(protocol.toString());
         try q.bindText(cur_hex);
+        try q.bindInt64(now);
 
         while (try q.step()) {
             const parent_str = q.getTextSlice(0) orelse continue;
@@ -389,7 +425,7 @@ pub fn recomputeSubtreeReachability(
     var to_unreachable: std.ArrayList(Address) = .empty;
     defer to_unreachable.deinit(allocator);
     for (ordered.items) |r| {
-        const reachable = isRegistryReachable(db, allocator, protocol, r, roots) catch |err| {
+        const reachable = isRegistryReachable(db, allocator, protocol, r, roots, block_timestamp) catch |err| {
             std.log.warn("reachability probe failed for {any}: {} — keeping its current state (fail-safe)", .{ r, err });
             continue;
         };
@@ -494,7 +530,11 @@ pub fn setRegistriesReachability(
         var where_buf: std.ArrayList(u8) = .empty;
         defer where_buf.deinit(db.allocator);
         try where_buf.appendSlice(db.allocator, if (reachable)
-            "protocol = ? AND is_reachable = 0 AND registry IN ("
+            // `label_live = 1` is the whole point of that column: a registry-wide revive must not
+            // resurrect a name whose LABEL was unregistered or burned. Without it, the moment an
+            // ancestor repointed back, every individually soft-deleted name in the registry
+            // reappeared as live.
+            "protocol = ? AND is_reachable = 0 AND label_live = 1 AND registry IN ("
         else
             "protocol = ? AND is_reachable = 1 AND registry IN (");
         for (chunk, 0..) |_, i| {
@@ -572,7 +612,7 @@ pub fn reconcileV2Reachability(
     var orphaned: std.ArrayList(Address) = .empty;
     defer orphaned.deinit(allocator);
     for (regs.items) |r| {
-        const reachable = isRegistryReachable(db, allocator, .v2, r, roots) catch true;
+        const reachable = isRegistryReachable(db, allocator, .v2, r, roots, block_timestamp) catch true;
         if (!reachable) try orphaned.append(allocator, r);
     }
 
@@ -583,6 +623,14 @@ pub fn reconcileV2Reachability(
 /// Soft-delete a single name by namehash (sets is_reachable = 0). Used by
 /// LabelUnregistered so re-registration can reactivate via the UPSERT
 /// instead of losing history.
+/// The PER-NAME soft delete: this label stopped existing on-chain (LabelUnregistered expires the
+/// entry; a burn removes it). Distinct from the per-REGISTRY tree-orphan marking, which is what
+/// `setRegistriesReachability` does.
+///
+/// Clearing `label_live` alongside `is_reachable` is what makes the two causes separable. Before
+/// that column existed, the next registry-wide revive resurrected this row as live, because the
+/// revive could not tell "hidden because its registry was orphaned" from "hidden because the user
+/// unregistered it".
 pub fn markNameUnreachableByNamehash(
     db: *Database,
     protocol: models.Protocol,
@@ -593,7 +641,7 @@ pub fn markNameUnreachableByNamehash(
     try db.namesBarrier();
     try reorg_undo.captureWhere(db, "names", "U", "protocol = ? AND namehash = ?", .{ protocol, namehash });
     var q = try Query.initCached(db,
-        \\UPDATE names SET is_reachable = 0, unreachable_since = ?, updated_block = ?, updated_at = ?
+        \\UPDATE names SET is_reachable = 0, label_live = 0, unreachable_since = ?, updated_block = ?, updated_at = ?
         \\WHERE protocol = ? AND namehash = ?
     );
     defer q.deinit();

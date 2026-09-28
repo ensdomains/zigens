@@ -25,8 +25,10 @@ const status_mod = @import("../server/status.zig");
 const IndexerStatus = status_mod.IndexerStatus;
 const reorg_undo = @import("../storage/reorg_undo.zig");
 const memstat = @import("../utils/memstat.zig");
+const process_allocator = @import("../utils/process_allocator.zig");
 const ens_normalize = @import("../utils/ens_normalize.zig");
 const replay_mod = @import("replay.zig");
+const alias_sync = @import("v2/alias_sync.zig");
 const backfill_mod = @import("v1/backfill.zig");
 const WriteBuffer = @import("write_buffer.zig").WriteBuffer;
 const Rainbow = @import("../rainbow/rainbow.zig").Rainbow;
@@ -551,7 +553,7 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
     // for the rest of the bulk sync. Armed batches re-set the cursor per block.
     reorg_undo.clearCursor(self.database, protocol) catch |err|
         std.log.warn("reorg undo-log: failed to clear cursor at sync start: {}", .{err});
-    self.placeholders.seed(self.database);
+    self.placeholders.seedOnce(self.database);
     self.invalidateReorgCursor();
 
     // Index in batches with adaptive batch sizing
@@ -600,6 +602,10 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
         // Use transaction for batch atomicity
         try self.database.beginTransaction();
 
+        // A refusal during this attempt means an allocation size came from an
+        // unvalidated length, which is invariant in the batch size — see below.
+        const refusals_before = process_allocator.refusalCount();
+
         // Try indexing - on RPC response size errors, rollback, halve batch, retry
         self.indexBlockRange(protocol, client, from_block, to_block) catch |err| {
             self.database.rollbackTransaction();
@@ -614,14 +620,32 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
             // registrations; the retry re-registers and re-queues them.
             self.pending_resolver_backfills.clearRetainingCapacity();
 
-            if ((err == error.RpcError or err == error.RpcRateLimited or err == error.StreamTooLong) and current_batch_size > ABSOLUTE_MIN_BATCH) {
+            // An OutOfMemory that came from a REFUSED allocation is not a volume
+            // problem and shrinking cannot fix it: the refused size was a corrupt
+            // length (maxInt(usize) and the like), which is identical at 1000
+            // blocks and at 100. Shrinking anyway walks the batch down to the floor
+            // over several minutes, gives up, restarts at full size and repeats —
+            // a futile loop that buries the real cause under "response too large".
+            // Fail fast and say so instead; the fix belongs at the decode site.
+            const refused = process_allocator.refusalCount() > refusals_before;
+            if (refused) {
+                std.log.err("batch {d}-{d} aborted by a refused allocation, not by memory pressure — NOT shrinking, because a corrupt length is the same size at any batch width. Fix the decode site named in the refusal above.", .{ from_block, to_block });
+                return err;
+            }
+
+            // Genuine OutOfMemory shrinks for the same reason the size errors do: a
+            // batch whose working set will not fit is too big, and half of it may
+            // well fit. Without it one refused mapping aborted the batch, rolled
+            // the transaction back, left the cursor unmoved and re-failed
+            // identically forever. Bounded by ABSOLUTE_MIN_BATCH.
+            if ((err == error.RpcError or err == error.RpcRateLimited or err == error.StreamTooLong or err == error.OutOfMemory) and current_batch_size > ABSOLUTE_MIN_BATCH) {
                 current_batch_size = @max(ABSOLUTE_MIN_BATCH, current_batch_size / 2);
                 // The retry restarts at the batch head, often in a different density
                 // regime than the tail this state was learned from — a stale estimate
                 // predicts oversized chunks and cascades through overflow retries.
                 self.v1_events_per_block = 0;
                 self.v1_rpc_chunk_ceiling = 0;
-                std.log.warn("RPC response too large for blocks {d}-{d}! Reducing batch size to {d} blocks and retrying", .{ from_block, to_block, current_batch_size });
+                std.log.warn("batch {d}-{d} failed with {} — reducing batch size to {d} blocks and retrying", .{ from_block, to_block, err, current_batch_size });
                 continue; // Retry same from_block with smaller batch
             }
 
@@ -641,7 +665,14 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
         const progress = (@as(f64, @floatFromInt(blocks_indexed)) / @as(f64, @floatFromInt(total_blocks))) * 100.0;
         std.log.info("Progress: {d:.1}% ({d}/{d} blocks) - Batch {d}-{d} indexed", .{ progress, blocks_indexed, total_blocks, from_block, to_block });
         if (memstat.rssBytes()) |rss| {
-            std.log.info("  Memory: rss {d} MB, allocator live {d} MB", .{ rss / (1024 * 1024), (memstat.liveBytes() orelse 0) / (1024 * 1024) });
+            // rss climbing while live stays flat is allocator retention, not a
+            // leak; both climbing together is a leak. Printing them side by
+            // side is what makes that call possible from a log alone.
+            std.log.info("  Memory: rss {d} MB, allocator live {d} MB, peak {d} MB", .{
+                rss / (1024 * 1024),
+                (memstat.liveBytes() orelse 0) / (1024 * 1024),
+                (memstat.peakBytes() orelse 0) / (1024 * 1024),
+            });
         }
 
         // --- Block-hash lineage (reorg detection) ---
@@ -834,6 +865,16 @@ pub fn indexBlockRange(self: *Indexer, protocol: models.Protocol, client: *rpc.C
         // so any unknown_labels created in this range are present to heal. No-op when
         // LabelStore isn't deployed.
         try self.indexLabelStoreEvents(protocol, client, from_block, to_block);
+
+        // Phase 7: shared-registry aliases. A subregistry contract pointed at by
+        // several live parents makes every label in it resolve under every one of
+        // them, so each of those fully-qualified names needs its own row. Derived
+        // from state rather than fanned out in the handler: one log cannot back N
+        // `events`/`registrations` rows, and an adopting parent's pointer arrives
+        // after the labels it adopts. Runs last in the V2 block so the registry
+        // pointers and the labels of this range are both already landed; a no-op
+        // (one grouped scan) unless a registry really has two live parents.
+        aliasSync(self, protocol, to_block);
     }
 
     // === RESOLVER RECORD EVENTS (V1 and V2) ===
@@ -871,4 +912,39 @@ pub fn indexBlockRange(self: *Indexer, protocol: models.Protocol, client: *rpc.C
         };
         if (repaired > 0) std.log.info("  Repaired {d} placeholder event name(s)", .{repaired});
     }
+}
+
+/// Best-effort wrapper around the shared-registry alias derivation: it is a
+/// self-healing projection, so a transient failure must never abort the batch —
+/// the next batch (or `--backfill`) recomputes it from scratch.
+/// Batches between full re-enqueues of every shared-registry candidate.
+///
+/// The derivation is change-driven: the handlers enqueue a registry when something that
+/// can alter its derived names happens. This sweep is the safety net for a missed
+/// enqueue — it converts "we forgot a hook" from a permanently missing name into a
+/// bounded delay. Cheap enough to run often: it reads the small `registry_entries`
+/// mirror (0.09ms measured) plus the registries that still hold derived rows.
+const ALIAS_SWEEP_EVERY_BATCHES: u64 = 64;
+
+/// Best-effort wrapper around the shared-registry alias derivation. It is a self-healing
+/// projection, so a transient failure must never abort the batch — the next batch (or
+/// `--backfill`) recomputes from the queue and the sweep.
+fn aliasSync(self: *Indexer, protocol: models.Protocol, to_block: u64) void {
+    // First pass of the process, and periodically after: re-enqueue every candidate so a
+    // dropped queue or a missed hook heals on its own.
+    if (self.alias_batches_since_sweep == 0 or self.alias_batches_since_sweep >= ALIAS_SWEEP_EVERY_BATCHES) {
+        _ = alias_sync.sweep(self, protocol, to_block) catch |err| {
+            std.log.warn("shared-registry alias sweep failed: {} (retried next batch)", .{err});
+        };
+        self.alias_batches_since_sweep = 1;
+    } else {
+        self.alias_batches_since_sweep += 1;
+    }
+
+    // Chain time for the parent-expiry test, from the batch head rather than the clock.
+    const now = self.getBlockTimestamp(protocol, to_block, null) catch 0;
+    _ = alias_sync.syncSharedRegistryAliases(self, protocol, now) catch |err| {
+        std.log.warn("shared-registry alias derivation failed: {} (retried next batch)", .{err});
+        return;
+    };
 }

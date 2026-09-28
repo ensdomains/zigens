@@ -4,16 +4,18 @@ const api = @import("api/server.zig");
 const db = @import("storage/database.zig");
 const pool_mod = @import("storage/pool.zig");
 const shutdown = @import("utils/shutdown.zig");
+const process_allocator = @import("utils/process_allocator.zig");
 const ens_normalize = @import("ens_normalize");
 
 pub fn main(init: std.process.Init) !void {
     // Configure SQLite for thread safety BEFORE any other operations
     db.configureSqliteThreadSafety();
 
-    // Use thread-safe allocator for concurrent request handling
-    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    // Thread-safe libc malloc for concurrent request handling. The API is as
+    // long-running as the indexer, so it must not be backed by
+    // `DebugAllocator` either — see utils/process_allocator.zig.
+    const allocator = process_allocator.init();
+    defer if (process_allocator.deinit()) std.log.warn("allocator reported leaks at shutdown", .{});
     const io = init.io;
 
     // Load configuration from .env

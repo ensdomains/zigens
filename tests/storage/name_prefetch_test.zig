@@ -209,7 +209,7 @@ test "non-projection writes invalidate conservatively; keyless projection writes
     defer database.name_write_listener = null;
 
     // Namehash-keyed update (outside the projection) drops the touched entry.
-    try database.updateNameResolver(nthHash(3), REG_3);
+    try database.updateNameResolver(.v2, nthHash(3), REG_3);
     try testing.expectEqual(Tag.unknown, std.meta.activeTag(try np.pairedLookup(CID_SOLO, REG_1, allocator)));
     // Untouched entries keep serving.
     try testing.expectEqual(Tag.miss, std.meta.activeTag(try np.uniqueLookup(.v2, CID_AMBIG, allocator)));
@@ -247,13 +247,28 @@ test "non-projection writes invalidate conservatively; keyless projection writes
     var child = fixtureName(41, .v2, REG_1, @as(u256, 41) << 32, "kid.canonicalId:12345");
     child.parent_name = "canonicalId:12345";
     try database.insertName(child);
+    // The production shape: the placeholder `registries` row is what links the placeholder
+    // string to a specific subregistry contract, and the patch is scoped through it — a
+    // `canonicalId:N` string alone is NOT unique across registries (same label, two parents),
+    // so an unscoped patch renamed other registries' rows. The child lives in REG_1, recorded
+    // under parent registry PARENT_REG.
+    const PARENT_REG = Address{ .bytes = [_]u8{0xCE} ** 20 };
+    try database.insertRegistry(.{
+        .address = REG_1,
+        .protocol = .v2,
+        .name = "canonicalId:12345",
+        .namehash = Hash.zero,
+        .parent_registry = PARENT_REG,
+        .created_block = 100,
+        .created_at = 1_700_000_000,
+    });
     var np3 = NamePrefetch.init(allocator);
     defer np3.deinit();
     try np3.populate(database, &[_]u256{CID_AMBIG});
     database.name_write_listener = np3.listener();
     defer database.name_write_listener = null;
-    _ = try lib.storage.names_registry.updateRegistryPlaceholderName(database, "canonicalId:99999", "no-match.eth", nthHash(42));
+    _ = try lib.storage.names_registry.updateRegistryPlaceholderName(database, PARENT_REG, "canonicalId:99999", "no-match.eth", nthHash(42));
     try expectHitName(try np3.pairedLookup(CID_AMBIG, REG_1, allocator), "ambig-r1.eth", allocator);
-    _ = try lib.storage.names_registry.updateRegistryPlaceholderName(database, "canonicalId:12345", "patched.eth", nthHash(40));
+    _ = try lib.storage.names_registry.updateRegistryPlaceholderName(database, PARENT_REG, "canonicalId:12345", "patched.eth", nthHash(40));
     try testing.expectEqual(Tag.unknown, std.meta.activeTag(try np3.pairedLookup(CID_AMBIG, REG_1, allocator)));
 }
