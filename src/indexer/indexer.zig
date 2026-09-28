@@ -95,6 +95,12 @@ pub const Indexer = struct {
     // In-memory dedup of registered resolvers (membership-only — known_resolvers'
     // last_indexed_block is never read), so the same resolver isn't re-upserted on
     // every ResolverUpdated/NewResolver. See registerResolverOnce.
+    /// Deployment block per contract, memoised for the process lifetime so a
+    /// contract handed to `backfillDiscovered` more than once is bisected only
+    /// once. Keyed on the address alone: the search floor is
+    /// `config.start_block`, constant for the run, and a FOUND anchor does not
+    /// move when the ceiling rises. See discovery_backfill.anchorCacheGet.
+    anchor_cache: std.AutoHashMap([20]u8, u64),
     known_resolver_cache: std.StringHashMap(void),
     // In-memory dedup of account observations per (protocol,address) this run: accounts'
     // first_seen is a MIN and seen_v1/seen_v2 are MAX, and the indexer processes forward,
@@ -218,7 +224,7 @@ pub const Indexer = struct {
             .shared_http_client = http_client,
             .webhook_manager = webhook_manager,
             .should_stop = std.atomic.Value(bool).init(false),
-            .rate_limiter = RateLimiter.init(cfg.rate_limit_per_second, cfg.rate_limit_per_second),
+            .rate_limiter = RateLimiter.init(cfg.rpc_rate_limit_per_second, cfg.rpc_rate_limit_per_second),
             .blocks_since_checkpoint = 0,
             .initial_sync_complete = std.atomic.Value(bool).init(false),
             .v1_network_health = NetworkHealth.init(allocator, cfg.rpc_url, constants.Timing.network_check_interval_ms),
@@ -228,6 +234,7 @@ pub const Indexer = struct {
             .block_timestamp_cache = std.AutoHashMap(u64, i64).init(allocator),
             .v1_label_cache = std.StringHashMap([]const u8).init(allocator),
             .rainbow_cache = std.AutoHashMap([32]u8, []const u8).init(allocator),
+            .anchor_cache = std.AutoHashMap([20]u8, u64).init(allocator),
             .known_resolver_cache = std.StringHashMap(void).init(allocator),
             .account_obs_cache = std.StringHashMap(void).init(allocator),
             .name_by_namehash_cache = std.AutoHashMap(Hash, []const u8).init(allocator),
@@ -321,7 +328,7 @@ pub const Indexer = struct {
             .shared_http_client = http_client,
             .webhook_manager = webhook_manager,
             .should_stop = std.atomic.Value(bool).init(false),
-            .rate_limiter = RateLimiter.init(cfg.rate_limit_per_second, cfg.rate_limit_per_second),
+            .rate_limiter = RateLimiter.init(cfg.rpc_rate_limit_per_second, cfg.rpc_rate_limit_per_second),
             .blocks_since_checkpoint = 0,
             .initial_sync_complete = std.atomic.Value(bool).init(false),
             .v1_network_health = NetworkHealth.init(allocator, cfg.rpc_url, constants.Timing.network_check_interval_ms),
@@ -331,6 +338,7 @@ pub const Indexer = struct {
             .block_timestamp_cache = std.AutoHashMap(u64, i64).init(allocator),
             .v1_label_cache = std.StringHashMap([]const u8).init(allocator),
             .rainbow_cache = std.AutoHashMap([32]u8, []const u8).init(allocator),
+            .anchor_cache = std.AutoHashMap([20]u8, u64).init(allocator),
             .known_resolver_cache = std.StringHashMap(void).init(allocator),
             .account_obs_cache = std.StringHashMap(void).init(allocator),
             .name_by_namehash_cache = std.AutoHashMap(Hash, []const u8).init(allocator),
@@ -390,6 +398,7 @@ pub const Indexer = struct {
         // Free cached resolver-dedup keys
         var rk_it = self.known_resolver_cache.keyIterator();
         while (rk_it.next()) |k| self.allocator.free(k.*);
+        self.anchor_cache.deinit();
         self.known_resolver_cache.deinit();
 
         // Free cached account-dedup keys

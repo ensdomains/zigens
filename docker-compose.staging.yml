@@ -132,6 +132,11 @@ services:
       - RAINBOW_PATH=/app/data/ens_rainbow.db
       - DOWNLOAD_RAINBOW=false
       - API_PORT=5656
+      # Inbound per-IP HTTP limiting for the API. This has to live on THIS service:
+      # the indexer also reads RATE_LIMIT_PER_SECOND, but for its own OUTBOUND RPC
+      # throttle, so setting it only there left the API on the code default (15/s)
+      # and capped the public surface without anyone choosing that number.
+      - RATE_LIMIT_PER_SECOND=${API_RATE_LIMIT_PER_SECOND:-25}
       - GRAPHQL_MAX_DEPTH=10
       - GRAPHQL_MAX_COST=${GRAPHQL_MAX_COST:-10000}
       # Live resolution (ENSIP-10 Universal Resolver fallback) for single-name
