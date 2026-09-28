@@ -47,6 +47,12 @@ pub const Config = struct {
     /// DB lookups.
     name_prefetch: bool = true,
     rate_limit_per_second: u32,
+    /// Outbound RPC throttle for the indexer, distinct from the API's inbound
+    /// per-IP limit above. They were one variable, so tuning the public API
+    /// limit silently re-throttled (or un-throttled) every RPC call the indexer
+    /// makes. Defaults to `rate_limit_per_second` so existing deployments keep
+    /// the behaviour they have today.
+    rpc_rate_limit_per_second: u32,
     /// Provider ceiling on JSON-RPC batch sizes (requests per HTTP batch);
     /// 0 = unlimited. Set when a provider rejects large batches.
     rpc_max_batch_requests: u32 = 0,
@@ -186,6 +192,7 @@ pub const Config = struct {
             .v2_event_buffer = env_mod.getEnvBool(&env_map, "V2_EVENT_BUFFER", true),
             .name_prefetch = env_mod.getEnvBool(&env_map, "NAME_PREFETCH", true),
             .rate_limit_per_second = env_mod.getEnvInt(&env_map, u32, "RATE_LIMIT_PER_SECOND", 15),
+            .rpc_rate_limit_per_second = env_mod.getEnvInt(&env_map, u32, "RPC_RATE_LIMIT_PER_SECOND", env_mod.getEnvInt(&env_map, u32, "RATE_LIMIT_PER_SECOND", 15)),
             .rpc_max_batch_requests = env_mod.getEnvInt(&env_map, u32, "RPC_MAX_BATCH_REQUESTS", 0),
             .trusted_proxy_hops = env_mod.getEnvInt(&env_map, u32, "TRUSTED_PROXY_HOPS", 0),
             .request_timeout_ms = env_mod.getEnvInt(&env_map, u32, "REQUEST_TIMEOUT_MS", 10000),
