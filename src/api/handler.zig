@@ -342,6 +342,8 @@ pub const GraphQLHandler = struct {
                 return try self.buildErrorResponseWithCode("Invalid protocol: must be 'v1' or 'v2'", ErrorCode.INVALID_ARGUMENT);
             } else if (err == error.TooManyNames) {
                 return try self.buildErrorResponseWithCode("name_in: too many names (cap is 1000 per query)", ErrorCode.INVALID_ARGUMENT);
+            } else if (err == error.UndefinedVariable) {
+                return try self.buildErrorResponseWithCode("Undefined variable: an argument references a `$variable` the operation does not declare, or a required one that was not provided", ErrorCode.VALIDATION_ERROR);
             } else if (err == error.UnknownRootField) {
                 return try self.buildErrorResponseWithCode("Unknown root field: query references a Query field that does not exist in the schema. Check the schema or run an introspection query.", ErrorCode.VALIDATION_ERROR);
             } else if (err == error.SubSelectionOnScalar) {

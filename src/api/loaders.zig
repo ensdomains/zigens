@@ -139,13 +139,11 @@ pub const LoaderContext = struct {
     coin_type_lists: std.StringHashMap([]const u64),
     /// Per-page batch prefetch of each account's nested `domains` page
     /// (accounts lists resolve it per row otherwise — the N+1 behind the 36s
-    /// Grafana max). Keyed by 0x-lowercase owner hex; value = EXACTLY the
-    /// page getAllNames(owner, skip, first) returns (possibly empty). Valid
-    /// only for the (skip, first) recorded at populate time — lookups with
-    /// different args fall back. Rows are db-allocator-owned.
-    account_domains: std.StringHashMap([]models.Name),
-    account_domains_skip: u32 = 0,
-    account_domains_first: u32 = 0,
+    /// Grafana max). Keyed by (0x-lowercase owner hex, skip, first); value =
+    /// EXACTLY the page getAllNames(owner, skip, first) returns (possibly
+    /// empty), so several page shapes (aliased `domains` selections) coexist.
+    /// Rows are db-allocator-owned.
+    account_domains: PageMap,
 
     /// Per-page batch prefetch of Domain rows for event-shaped parents
     /// (registrations/events lists resolving `domain { … }` per row). Key
@@ -190,11 +188,10 @@ pub const LoaderContext = struct {
     subdomain_counts: std.StringHashMap(u32),
     event_counts: std.AutoHashMap(Hash, u64),
     role_holder_counts: std.StringHashMap(u64),
-    /// Domain.subdomains pages keyed by parent name, valid for the recorded
-    /// (skip, first) only — same contract as account_domains.
-    subdomain_pages: std.StringHashMap([]models.Name),
-    subdomain_pages_skip: u32 = 0,
-    subdomain_pages_first: u32 = 0,
+    /// Domain.subdomains pages keyed by (parent name, skip, first) — same
+    /// contract as account_domains, so each nesting level and aliased sibling
+    /// keeps its own batch. Keys, slices and rows are arena-owned.
+    subdomain_pages: PageMap,
     finality_memo: ?FinalityMemo = null,
     /// Resolver record families keyed by "<resolver_hex>|<namehash_hex>"
     /// (aliases: by resolver hex). Lists are complete per pair; single-value
@@ -206,6 +203,30 @@ pub const LoaderContext = struct {
     interface_lists: std.StringHashMap([]resolvers_storage.InterfaceRecord),
     versions: std.StringHashMap(?i64),
     alias_lists: std.StringHashMap([]resolvers_storage.AliasRecord),
+
+    /// One `(skip, first)` page of a per-key list (`Account.domains` by owner
+    /// hex, `Domain.subdomains` by parent name).
+    pub const PageKey = struct {
+        key: []const u8,
+        skip: u32,
+        first: u32,
+    };
+
+    const PageKeyContext = struct {
+        pub fn hash(_: PageKeyContext, k: PageKey) u64 {
+            var hasher = std.hash.Wyhash.init(0);
+            hasher.update(k.key);
+            std.hash.autoHash(&hasher, k.skip);
+            std.hash.autoHash(&hasher, k.first);
+            return hasher.final();
+        }
+
+        pub fn eql(_: PageKeyContext, a: PageKey, b: PageKey) bool {
+            return a.skip == b.skip and a.first == b.first and std.mem.eql(u8, a.key, b.key);
+        }
+    };
+
+    pub const PageMap = std.HashMap(PageKey, []models.Name, PageKeyContext, std.hash_map.default_max_load_percentage);
 
     /// Identity of one nested `events` page shape: pagination, ordering and a
     /// fingerprint over every filter field the domain-events handler can set.
@@ -263,7 +284,7 @@ pub const LoaderContext = struct {
             .text_key_lists = std.StringHashMap([]const []const u8).init(allocator),
             .coin_type_lists = std.StringHashMap([]const u64).init(allocator),
             .domains = std.AutoHashMap(Hash, ?models.Name).init(allocator),
-            .account_domains = std.StringHashMap([]models.Name).init(allocator),
+            .account_domains = PageMap.init(allocator),
             .domain_events = std.AutoHashMap(Hash, []models.Event).init(allocator),
             .domain_by_resolver = std.AutoHashMap([20]u8, ?models.Name).init(allocator),
             .batch_arena = std.heap.ArenaAllocator.init(allocator),
@@ -291,7 +312,7 @@ pub const LoaderContext = struct {
         ctx.subdomain_counts = std.StringHashMap(u32).init(batch);
         ctx.event_counts = std.AutoHashMap(Hash, u64).init(batch);
         ctx.role_holder_counts = std.StringHashMap(u64).init(batch);
-        ctx.subdomain_pages = std.StringHashMap([]models.Name).init(batch);
+        ctx.subdomain_pages = PageMap.init(batch);
         ctx.address_lists = std.StringHashMap([]resolvers_storage.CoinAddress).init(batch);
         ctx.pubkeys = std.StringHashMap(?resolvers_storage.PubkeyRecord).init(batch);
         ctx.abi_lists = std.StringHashMap([]u64).init(batch);
@@ -308,12 +329,6 @@ pub const LoaderContext = struct {
     /// handler's absent-vs-empty distinction stays exact. Best-effort.
     pub fn populateAccountDomains(self: *LoaderContext, database: *db.Database, owners: []const Address, skip: u32, first: u32) void {
         if (owners.len == 0) return;
-        // A different page shape (another `accounts` alias with other
-        // domains(first/skip) args) must not be served from lists batched
-        // for the previous shape.
-        if (self.account_domains.count() > 0 and (self.account_domains_skip != skip or self.account_domains_first != first)) {
-            self.clearAccountDomains();
-        }
         const rows = names_filter.getNamesByOwnersPage(database, owners, skip, first, self.db_allocator) catch return;
         defer self.db_allocator.free(rows);
         var consumed: usize = 0;
@@ -325,9 +340,6 @@ pub const LoaderContext = struct {
     }
 
     fn populateAccountDomainsInner(self: *LoaderContext, owners: []const Address, rows: []models.Name, skip: u32, first: u32, consumed: *usize) !void {
-        self.account_domains_skip = skip;
-        self.account_domains_first = first;
-
         // Rows arrive grouped per owner (window partition order); slice them
         // into per-owner sublists without copying the row structs twice.
         var groups = std.StringHashMap(std.ArrayList(models.Name)).init(self.allocator);
@@ -366,7 +378,7 @@ pub const LoaderContext = struct {
         for (owners) |owner| {
             var owner_buf: [42]u8 = undefined;
             const owner_hex = owner.toHexBuf(&owner_buf);
-            if (self.account_domains.contains(owner_hex)) continue;
+            if (self.account_domains.contains(.{ .key = owner_hex, .skip = skip, .first = first })) continue;
             const list: []models.Name = blk: {
                 if (groups.getPtr(owner_hex)) |gl| break :blk try gl.toOwnedSlice(self.allocator);
                 break :blk try self.allocator.alloc(models.Name, 0);
@@ -380,7 +392,7 @@ pub const LoaderContext = struct {
             }
             const key_owned = try self.allocator.dupe(u8, owner_hex);
             errdefer self.allocator.free(key_owned);
-            try self.account_domains.put(key_owned, list);
+            try self.account_domains.put(.{ .key = key_owned, .skip = skip, .first = first }, list);
         }
     }
 
@@ -394,14 +406,13 @@ pub const LoaderContext = struct {
                 mut.deinit(self.db_allocator);
             }
             self.allocator.free(entry.value_ptr.*);
-            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.key_ptr.key);
         }
         self.account_domains.clearRetainingCapacity();
     }
 
     pub fn lookupAccountDomains(self: *LoaderContext, owner_hex: []const u8, skip: u32, first: u32) ?[]const models.Name {
-        if (skip != self.account_domains_skip or first != self.account_domains_first) return null;
-        return self.account_domains.get(owner_hex);
+        return self.account_domains.get(.{ .key = owner_hex, .skip = skip, .first = first });
     }
 
     /// Batch-prefetch Domain rows for a page of namehashes: one IN-list query
@@ -1335,15 +1346,9 @@ pub const LoaderContext = struct {
     /// Batch-prefetch each page row's nested `subdomains` page: one windowed
     /// IN query for the whole page instead of one query per row. Keyed by the
     /// parent name; value = EXACTLY the page getSubdomains(parent, skip,
-    /// first) returns (possibly empty). Valid only for the (skip, first)
-    /// recorded at populate time — a different shape clears the map first.
-    /// Best-effort.
+    /// first) returns (possibly empty). Pages batched for other (skip, first)
+    /// shapes stay cached alongside. Best-effort.
     pub fn populateSubdomainPages(self: *LoaderContext, database: *db.Database, rows: []const models.Name, skip: u32, first: u32) void {
-        if (self.subdomain_pages.count() > 0 and (self.subdomain_pages_skip != skip or self.subdomain_pages_first != first)) {
-            self.subdomain_pages.clearRetainingCapacity();
-        }
-        self.subdomain_pages_skip = skip;
-        self.subdomain_pages_first = first;
         self.populateSubdomainPagesInner(database, rows, skip, first) catch {};
     }
 
@@ -1358,7 +1363,7 @@ pub const LoaderContext = struct {
             // the point query there. Postgres pages each parent through the
             // (parent_name, name, protocol) index instead.
             if (!database.isPostgres() and std.mem.indexOfScalar(u8, name, '.') == null) continue;
-            if (self.subdomain_pages.contains(name)) continue;
+            if (self.subdomain_pages.contains(.{ .key = name, .skip = skip, .first = first })) continue;
             const gop = try seen.getOrPut(name);
             if (!gop.found_existing) try parents.append(arena, name);
         }
@@ -1376,15 +1381,14 @@ pub const LoaderContext = struct {
                 if (groups.getPtr(name)) |gl| break :blk try gl.toOwnedSlice(arena);
                 break :blk try arena.alloc(models.Name, 0);
             };
-            try self.subdomain_pages.put(try arena.dupe(u8, name), list);
+            try self.subdomain_pages.put(.{ .key = try arena.dupe(u8, name), .skip = skip, .first = first }, list);
         }
     }
 
     /// Null = not batched for these args (caller runs its own query);
     /// otherwise the parent's complete page (may be empty). Loader-owned.
     pub fn lookupSubdomainPage(self: *LoaderContext, parent_name: []const u8, skip: u32, first: u32) ?[]const models.Name {
-        if (self.subdomain_pages_skip != skip or self.subdomain_pages_first != first) return null;
-        return self.subdomain_pages.get(parent_name);
+        return self.subdomain_pages.get(.{ .key = parent_name, .skip = skip, .first = first });
     }
 
     // ---- Resolver.addresses / pubkey / abis / reverseName / interfaces / version / aliases ----
@@ -2406,11 +2410,13 @@ test "populateSubdomainPages: per-parent windows for the recorded args, empty en
     try std.testing.expectEqual(@as(usize, 0), page_b.len);
     // Other args: not served.
     try std.testing.expectEqual(@as(?[]const models.Name, null), ctx.lookupSubdomainPage("a.eth", 0, 2));
-    // Re-priming a different shape replaces the cache.
+    // A second shape (another nesting level, an aliased sibling) is batched
+    // alongside the first instead of evicting it.
     ctx.populateSubdomainPages(&test_db, &page, 0, 10);
     const full = ctx.lookupSubdomainPage("a.eth", 0, 10) orelse return error.ExpectedBatched;
     try std.testing.expectEqual(@as(usize, 3), full.len);
-    try std.testing.expectEqual(@as(?[]const models.Name, null), ctx.lookupSubdomainPage("a.eth", 1, 2));
+    const still = ctx.lookupSubdomainPage("a.eth", 1, 2) orelse return error.ExpectedBatched;
+    try std.testing.expectEqual(@as(usize, 2), still.len);
 }
 
 test "populateResolverFamilies: lists complete per pair, single-value families, multi-row pairs stay absent" {

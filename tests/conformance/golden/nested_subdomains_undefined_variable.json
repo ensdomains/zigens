@@ -1,0 +1,1 @@
+{"errors":[{"message":"Undefined variable: an argument references a `$variable` the operation does not declare, or a required one that was not provided","extensions":{"code":"VALIDATION_ERROR"}}],"data":null}

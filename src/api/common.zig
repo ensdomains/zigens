@@ -14,6 +14,14 @@ const Address = @import("../types/address.zig").Address;
 /// at a size that keeps server-side allocations bounded.
 pub const MAX_FIRST: i64 = 1000;
 
+/// Default page size of a list nested under an entity (`Domain.subdomains`,
+/// `Account.domains`, `Account.registrations`, the nested connections) when
+/// `first` is omitted. Deliberately below the root lists' 100: the complexity
+/// budget charges a nested list 1 however many rows it returns, so this is
+/// the only bound on nested fan-out. schema.graphql declares the same default
+/// on each of those fields.
+pub const NESTED_DEFAULT_FIRST: i64 = 10;
+
 /// Default skip (offset) when pagination args are omitted.
 pub const DEFAULT_SKIP: i64 = 0;
 

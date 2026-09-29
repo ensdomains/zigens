@@ -697,3 +697,86 @@ test "conformance goldens: record-model resolvers" {
     for (ops) |op| try checkOp(a, &handler, db, op, mode);
     std.debug.print("conformance (record resolvers): all tests passed\n", .{});
 }
+
+// ============================================================================
+// Nested list pagination — own fixture, with more children than the nested
+// default page, so the default, `first`, `skip` and variables are all
+// observable. The main fixture's single-child parent cannot tell them apart.
+// ============================================================================
+
+const PAGER_OWNER = Address{ .bytes = [_]u8{0x33} ** 20 };
+
+/// many.eth has 12 children c00..c11 (two over the default page of 10);
+/// c00.many.eth has 3 children of its own. PAGER_OWNER owns all 16 names and
+/// has 12 registrations.
+fn seedNestedPaginationFixture(db: *Database, a: std.mem.Allocator) !void {
+    try db.setSyncState(.v1, 0);
+    try db.setSyncState(.v2, 12345);
+    const tx = Hash{ .bytes = [_]u8{0xAA} ** 32 };
+    const owner = PAGER_OWNER;
+    const resolver = helpers.TEST_RESOLVER;
+
+    _ = try seedName(db, a, "many.eth", "many", "eth", owner, resolver, 0x3000, 2000000000, false, null);
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        const label = try std.fmt.allocPrint(a, "c{d:0>2}", .{i});
+        const name = try std.fmt.allocPrint(a, "{s}.many.eth", .{label});
+        const nh = try seedName(db, a, name, label, "many.eth", owner, resolver, 0x3100 + i, 0, false, null);
+        try db.insertRegistration(.v2, nh, label, "many.eth", owner, FIXED_TS + @as(i64, @intCast(i)), 2000000000, FIXED_BLOCK, tx, @intCast(i), .name_registered);
+    }
+    i = 0;
+    while (i < 3) : (i += 1) {
+        const label = try std.fmt.allocPrint(a, "g{d}", .{i});
+        const name = try std.fmt.allocPrint(a, "{s}.c00.many.eth", .{label});
+        _ = try seedName(db, a, name, label, "c00.many.eth", owner, resolver, 0x3200 + i, 0, false, null);
+    }
+
+    var owner_buf: [42]u8 = undefined;
+    try db.upsertAccount(.v2, owner.toHexBuf(&owner_buf), FIXED_BLOCK, FIXED_TS);
+}
+
+test "conformance goldens: nested list pagination" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const db = try helpers.createTestDatabase(a);
+    defer helpers.destroyTestDatabase(a, db);
+    try seedNestedPaginationFixture(db, a);
+    var handler = try GraphQLHandler.init(a, 30, 100000, false);
+    defer handler.deinit();
+    const mode: Mode = if (zsys.hasEnv("CONFORMANCE_PRINT"))
+        .print
+    else if (zsys.hasEnv("CONFORMANCE_UPDATE"))
+        .update
+    else
+        .compare;
+
+    var many_buf: [66]u8 = undefined;
+    const many_hex = (try lib.namehash(a, "many.eth")).toHexBuf(&many_buf);
+    const many_vars = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\"}}", .{many_hex});
+    const many_page_vars = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\",\"n\":2,\"s\":1}}", .{many_hex});
+    var owner_buf: [42]u8 = undefined;
+    const owner_hex = PAGER_OWNER.toHexBuf(&owner_buf);
+    const owner_vars = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\"}}", .{owner_hex});
+    const owner_page_vars = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\",\"n\":1}}", .{owner_hex});
+
+    const ops = [_]Op{
+        // No args: the declared default page of 10 out of 12 children.
+        .{ .name = "nested_subdomains_default", .query = "query($id:String!){ domain(id:$id){ subdomainCount subdomains { name } } }", .vars = many_vars },
+        .{ .name = "nested_subdomains_first_skip", .query = "query($id:String!){ domain(id:$id){ subdomains(first: 3, skip: 10) { name } } }", .vars = many_vars },
+        // Nested arguments resolve variables like root arguments do.
+        .{ .name = "nested_subdomains_variables", .query = "query($id:String!, $n:Int, $s:Int){ domain(id:$id){ subdomains(first: $n, skip: $s) { name } } }", .vars = many_page_vars },
+        .{ .name = "nested_subdomains_undefined_variable", .query = "query($id:String!){ domain(id:$id){ subdomains(first: $missing) { name } } }", .vars = many_vars },
+        // List path (page-batched): aliased siblings and differing args per level.
+        .{ .name = "nested_subdomains_aliased", .query = "{ domains(where:{name:\"many.eth\"}){ a: subdomains(first: 2) { name } b: subdomains(first: 2, skip: 2) { name } } }" },
+        .{ .name = "nested_subdomains_mixed_levels", .query = "{ domains(where:{name:\"many.eth\"}){ subdomains(first: 1) { name subdomains(first: 2) { name } } } }" },
+        .{ .name = "nested_account_domains_default", .query = "query($id:String!){ account(id:$id){ domains { name } } }", .vars = owner_vars },
+        .{ .name = "nested_account_domains_variables", .query = "query($id:String!, $n:Int){ account(id:$id){ domains(first: $n, skip: $n) { name } } }", .vars = owner_page_vars },
+        .{ .name = "nested_account_registrations_default", .query = "query($id:String!){ account(id:$id){ registrations { name } } }", .vars = owner_vars },
+        .{ .name = "nested_accounts_aliased", .query = "{ accounts { a: domains(first: 1) { name } b: domains(first: 1, skip: 1) { name } } }" },
+        // Codegen reads the defaults from introspection, so they must be there.
+        .{ .name = "nested_pagination_introspection", .query = "{ __type(name: \"Account\") { fields { name args { name defaultValue } } } }" },
+    };
+    for (ops) |op| try checkOp(a, &handler, db, op, mode);
+    std.debug.print("conformance (nested pagination): all tests passed\n", .{});
+}
