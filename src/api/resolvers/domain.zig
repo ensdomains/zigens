@@ -510,22 +510,23 @@ fn prefetchDomainNestedFields(database: *db.Database, allocator: std.mem.Allocat
     if (findSelection(selections, "roleHolderCount") != null) {
         lc.populateRoleHolderCounts(database, page);
     }
-    if (findSelection(selections, "subdomains")) |sub_sel| {
-        const pg = common.parsePagination(sub_sel, 10) catch return;
-        prefetchSubdomainPages(database, allocator, lc, page, pg.skip, pg.first, sub_sel.selections);
-    } else if (findSelection(selections, "subdomainConnection")) |conn_sel| {
-        // Mirrors domainSubdomainConnectionHandler: page (0, limit + 1) plus
-        // the count when totalCount is selected.
-        const limit: u32 = @min((common.parsePagination(conn_sel, 10) catch return).first, 100);
-        if (findSelection(conn_sel.selections, "totalCount") != null) lc.populateSubdomainCounts(database, page);
-        const node_selections = connectionNodeSelections(conn_sel);
-        prefetchSubdomainPages(database, allocator, lc, page, 0, limit + 1, node_selections);
+    for (selections) |*sel| {
+        if (std.mem.eql(u8, sel.name, "subdomains")) {
+            const pg = common.parsePagination(sel, common.NESTED_DEFAULT_FIRST) catch continue;
+            prefetchSubdomainPages(database, allocator, lc, page, pg.skip, pg.first, sel.selections);
+        } else if (std.mem.eql(u8, sel.name, "subdomainConnection")) {
+            // Mirrors domainSubdomainConnectionHandler: page (0, limit + 1) plus
+            // the count when totalCount is selected.
+            const limit: u32 = @min((common.parsePagination(sel, common.NESTED_DEFAULT_FIRST) catch continue).first, 100);
+            if (findSelection(sel.selections, "totalCount") != null) lc.populateSubdomainCounts(database, page);
+            prefetchSubdomainPages(database, allocator, lc, page, 0, limit + 1, connectionNodeSelections(sel));
+        }
     }
     if (findSelection(selections, "events") == null) {
         if (findSelection(selections, "eventsConnection")) |conn_sel| {
             // Mirrors domainEventsConnectionHandler's filter exactly; skipped
             // when `events` is also selected (the loader holds one page shape).
-            const limit: u32 = @min((common.parsePagination(conn_sel, 10) catch return).first, 100);
+            const limit: u32 = @min((common.parsePagination(conn_sel, common.NESTED_DEFAULT_FIRST) catch return).first, 100);
             if (findSelection(conn_sel.selections, "totalCount") != null) lc.populateEventCounts(database, page);
             const namehashes = allocator.alloc(Hash, page.len) catch return;
             defer allocator.free(namehashes);
@@ -696,14 +697,6 @@ pub fn prefetchDomainsForAccountsPage(database: *db.Database, allocator: std.mem
     const lp = loaders_ptr orelse return;
     const lc: *loaders.LoaderContext = @ptrCast(@alignCast(lp));
 
-    const domains_sel: *const parser.Field = blk: {
-        for (account_selections) |*sel| {
-            if (std.mem.eql(u8, sel.name, "domains")) break :blk sel;
-        }
-        return;
-    };
-    const page = common.parsePagination(domains_sel, 10) catch return;
-
     var owners: std.ArrayList(Address) = .empty;
     defer owners.deinit(allocator);
     for (accounts) |acct| {
@@ -711,20 +704,29 @@ pub fn prefetchDomainsForAccountsPage(database: *db.Database, allocator: std.mem
         owners.append(allocator, addr) catch return;
     }
     if (owners.items.len == 0) return;
-    lc.populateAccountDomains(database, owners.items, page.skip, page.first);
+
+    for (account_selections) |*sel| {
+        if (!std.mem.eql(u8, sel.name, "domains")) continue;
+        prefetchAccountDomainsPage(database, allocator, lc, owners.items, sel);
+    }
+}
+
+fn prefetchAccountDomainsPage(database: *db.Database, allocator: std.mem.Allocator, lc: *loaders.LoaderContext, owners: []const Address, domains_sel: *const parser.Field) void {
+    const page = common.parsePagination(domains_sel, common.NESTED_DEFAULT_FIRST) catch return;
+    lc.populateAccountDomains(database, owners, page.skip, page.first);
 
     // Prime the domains' nested resolver records/texts from the batched rows
     // (shallow copies; strings stay loader-owned).
     var page_rows: std.ArrayList(models.Name) = .empty;
     defer page_rows.deinit(allocator);
-    for (owners.items) |owner| {
+    for (owners) |owner| {
         var owner_buf: [42]u8 = undefined;
         const owner_hex = owner.toHexBuf(&owner_buf);
         const batched = lc.lookupAccountDomains(owner_hex, page.skip, page.first) orelse continue;
         for (batched) |row| page_rows.append(allocator, row) catch return;
     }
     if (page_rows.items.len == 0) return;
-    prefetchResolverRecords(database, allocator, loaders_ptr, page_rows.items, domains_sel.selections);
+    prefetchResolverRecords(database, allocator, @ptrCast(lc), page_rows.items, domains_sel.selections);
 }
 
 pub fn resolveDomains(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
