@@ -1,0 +1,1 @@
+{"errors":[{"message":"Unknown field in input object: `EventFilter` has no field `bogus`.","locations":[{"line":1,"column":36}],"extensions":{"code":"VALIDATION_ERROR"}}],"data":null}
