@@ -117,12 +117,22 @@ pub const Database = struct {
     /// still overrides inside dropSyncIndexes. Paths that never bulk-sync
     /// (API, tools, tests) keep the default.
     sync_cache_mb: u64 = 512,
+    /// COVERAGE_STALE_AFTER_SECONDS: how long a protocol may go without
+    /// committing a batch before the coverage `stale` flag trips on a deployment
+    /// with no finality data. Set by the API pool from Config; 0 (off) keeps
+    /// `stale` a pure function of DB state.
+    stale_after_seconds: u32 = 0,
 
     /// Records the chain ID this database serves data for. The value flows
     /// into Resolver entity IDs at JSON-build time. Called by both the
     /// indexer and the API at startup from the network config.
     pub fn setChainId(self: *Database, chain_id: u64) void {
         self.chain_id = chain_id;
+    }
+
+    /// Arms the no-finality staleness fallback for the coverage surface.
+    pub fn setStaleAfterSeconds(self: *Database, seconds: u32) void {
+        self.stale_after_seconds = seconds;
     }
 
     // ========================================================================

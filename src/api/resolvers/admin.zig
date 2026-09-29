@@ -2096,21 +2096,17 @@ pub fn resolveFinality(ctx: parser.ExecutionContext, field: *const parser.Field)
 
 /// `_coverage`: what this deployment indexes — chain id, per-protocol indexed head +
 /// freshness, and a staleness flag. Additive; does not touch the subgraph `_meta` shape.
-/// `stale` deliberately uses /ready's convention (false when finality data is absent)
-/// rather than `_finality.isStale`'s conservative true — a default deployment without
-/// FINALITY_ENABLED must not permanently declare itself stale on a coverage surface.
+/// `stale` is api/common.coverageStale, shared with /ready, /coverage and /metrics —
+/// not `_finality.isStale`, which is true whenever there is no safe data.
 pub fn resolveCoverage(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
     const allocator = ctx.allocator;
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
 
     const v1 = try database.getSyncStateFull(.v1);
     const v2 = try database.getSyncStateFull(.v2);
-    const v1_block: u64 = if (v1) |s| s.block else 0;
-    const v2_block: u64 = if (v2) |s| s.block else 0;
-    const head: u64 = if (v1_block > v2_block) v1_block else v2_block;
     // Same degrade-to-null as resolveFinality: absent finality_state = no signal.
     const safe = database.getFinality(database.chain_id, .safe) catch null;
-    const is_stale = if (safe) |snap| head < snap.number else false;
+    const is_stale = common.coverageStale(v1, v2, if (safe) |snap| snap.number else null, database.stale_after_seconds, common.zsys.timestamp());
 
     var json: std.Io.Writer.Allocating = .init(allocator);
     defer json.deinit();

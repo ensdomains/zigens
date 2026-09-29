@@ -122,6 +122,10 @@ pub const Config = struct {
     /// indexer poll loop (Task 09). Off by default. The additive `_finality` API field is
     /// always present but returns nulls until this is on and positions are fetched.
     finality_enabled: bool,
+    /// Seconds a protocol may go without committing a batch before the coverage
+    /// `stale` flag trips on a deployment with no finality data. 0 (the default)
+    /// disables the fallback; see parseStaleAfterSeconds.
+    coverage_stale_after_seconds: u32,
 
     pub fn fromEnv(allocator: std.mem.Allocator) !Config {
         var env_map = try env_mod.loadEnv(allocator, ".env");
@@ -258,6 +262,13 @@ pub const Config = struct {
             .ccip_gateway_timeout_ms = env_mod.getEnvInt(&env_map, u32, "CCIP_GATEWAY_TIMEOUT_MS", 5000),
             .ccip_max_redirects = env_mod.getEnvInt(&env_map, u32, "CCIP_MAX_REDIRECTS", 4),
             .finality_enabled = env_mod.getEnvBool(&env_map, "FINALITY_ENABLED", false),
+            .coverage_stale_after_seconds = blk: {
+                const raw = env_mod.getEnv(&env_map, "COVERAGE_STALE_AFTER_SECONDS", "");
+                break :blk parseStaleAfterSeconds(raw) orelse {
+                    std.log.warn("Invalid COVERAGE_STALE_AFTER_SECONDS '{s}' (want whole seconds, or 0/off to disable); the no-finality stale check is OFF", .{raw});
+                    break :blk 0;
+                };
+            },
         };
     }
 
@@ -295,6 +306,30 @@ pub const Config = struct {
         if (self.resolve_ccip_enabled and !self.resolve_live_enabled) return error.CcipRequiresLive;
     }
 };
+
+/// COVERAGE_STALE_AFTER_SECONDS: whole seconds, or empty / `0` / `off` /
+/// `false` / `no` to disable. Null for anything else, so a typo is reported
+/// instead of silently picking a threshold.
+pub fn parseStaleAfterSeconds(raw: []const u8) ?u32 {
+    const value = std.mem.trim(u8, raw, " \t");
+    if (value.len == 0) return 0;
+    for ([_][]const u8{ "off", "false", "no" }) |word| {
+        if (std.ascii.eqlIgnoreCase(value, word)) return 0;
+    }
+    return std.fmt.parseInt(u32, value, 10) catch null;
+}
+
+test "parseStaleAfterSeconds: unset and the off spellings disable, seconds pass through, junk is rejected" {
+    try std.testing.expectEqual(@as(?u32, 0), parseStaleAfterSeconds(""));
+    try std.testing.expectEqual(@as(?u32, 0), parseStaleAfterSeconds("0"));
+    try std.testing.expectEqual(@as(?u32, 0), parseStaleAfterSeconds("off"));
+    try std.testing.expectEqual(@as(?u32, 0), parseStaleAfterSeconds("OFF"));
+    try std.testing.expectEqual(@as(?u32, 0), parseStaleAfterSeconds("false"));
+    try std.testing.expectEqual(@as(?u32, 3600), parseStaleAfterSeconds("3600"));
+    try std.testing.expectEqual(@as(?u32, 3600), parseStaleAfterSeconds(" 3600 "));
+    try std.testing.expectEqual(@as(?u32, null), parseStaleAfterSeconds("1h"));
+    try std.testing.expectEqual(@as(?u32, null), parseStaleAfterSeconds("-5"));
+}
 
 test "validateResolution: CCIP without live is a hard error; both-off / both-on / live-only are OK" {
     var c: Config = undefined;

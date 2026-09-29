@@ -37,6 +37,9 @@ pub const Options = struct {
     size: u32 = 10,
     /// EIP-155 chain id, set on every session (entity-ID formatting).
     chain_id: u64 = 0,
+    /// COVERAGE_STALE_AFTER_SECONDS, set on every session. 0 leaves the
+    /// no-finality stale fallback off.
+    stale_after_seconds: u32 = 0,
 };
 
 pub const Pool = struct {
@@ -76,6 +79,7 @@ pub const Pool = struct {
                 .backend = try db_open.selectBackend(allocator, opts.kind, opts.sqlite_path, opts.database_url),
             };
             s.setChainId(opts.chain_id);
+            s.setStaleAfterSeconds(opts.stale_after_seconds);
             sessions[opened] = s;
             opened += 1;
         }

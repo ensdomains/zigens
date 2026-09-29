@@ -223,3 +223,19 @@ const ThreadSafeAllocator = struct {
         return self.child_allocator.rawFree(buf, alignment, ra);
     }
 };
+
+test "pool arms the coverage stale threshold on every session" {
+    const file = "/tmp/zigens_pool_stale_after.db";
+    defer cleanupSqliteFile(file);
+
+    var opts = fileOptions(2, file);
+    opts.stale_after_seconds = 3600;
+    var pool = try Pool.open(testing.allocator, opts);
+    defer pool.deinit();
+
+    for (pool.sessions) |s| try testing.expectEqual(@as(u32, 3600), s.stale_after_seconds);
+
+    var off = try Pool.open(testing.allocator, .{ .kind = .sqlite, .sqlite_path = ":memory:", .size = 1, .chain_id = 1 });
+    defer off.deinit();
+    try testing.expectEqual(@as(u32, 0), off.sessions[0].stale_after_seconds);
+}
