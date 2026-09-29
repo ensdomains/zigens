@@ -30,6 +30,7 @@ pub const matchBoolArg = api_common.matchBoolArg;
 pub const matchAddressArg = api_common.matchAddressArg;
 pub const parseStringListArg = api_common.parseStringListArg;
 pub const parseAddressListArg = api_common.parseAddressListArg;
+pub const NESTED_DEFAULT_FIRST = api_common.NESTED_DEFAULT_FIRST;
 
 /// Normalize a client-supplied EAC resource to the fixed 66-char lowercase hex
 /// the indexer stores (zero-trimmed `0x1`, padded and upper-case spellings all

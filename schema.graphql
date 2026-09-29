@@ -349,8 +349,8 @@ type Domain {
   """Parent domain"""
   parent: Domain
 
-  """Subdomains of this domain"""
-  subdomains: [Domain!]!
+  """Direct subdomains of this domain, ordered by name. Returns at most `first` children (default 10, max 1000); page with `skip` and compare against `subdomainCount` before assuming the list is complete."""
+  subdomains(first: Int = 10, skip: Int = 0): [Domain!]!
 
   """Address this domain resolves to"""
   resolvedAddress: Account
@@ -464,11 +464,11 @@ type Account {
   """Ethereum address"""
   id: String!
 
-  """Domains owned by this account"""
-  domains: [Domain!]!
+  """Domains owned by this account, newest first. Returns at most `first` domains (default 10, max 1000); page with `skip`."""
+  domains(first: Int = 10, skip: Int = 0): [Domain!]!
 
-  """Registrations made by this account"""
-  registrations(first: Int = 100, skip: Int = 0): [Registration!]!
+  """Registrations made by this account. Returns at most `first` registrations (default 10, max 1000); page with `skip`."""
+  registrations(first: Int = 10, skip: Int = 0): [Registration!]!
 
   """Reverse-resolved primary name for this address (V1 ReverseRegistrar + NameChanged path). Null if not claimed."""
   primaryName: String

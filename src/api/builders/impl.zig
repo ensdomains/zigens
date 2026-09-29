@@ -613,7 +613,7 @@ fn accountDomainsHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx
     const addr: *const Address = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
-    const page = try api_common.parsePagination(field, 10);
+    const page = try api_common.parsePagination(field, api_common.NESTED_DEFAULT_FIRST);
 
     // Page-batched rows first (the accounts list primes one windowed query
     // for the whole page — see resolveAccounts); absent or arg-mismatched →
@@ -682,7 +682,7 @@ fn accountRegistrationsHandler(ctx: *anyopaque, field: *const parser.Field, nest
     const addr: *const Address = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
-    const page = try api_common.parsePagination(field, 10);
+    const page = try api_common.parsePagination(field, api_common.NESTED_DEFAULT_FIRST);
 
     const registrant_hex = try addr.toHex(nested_ctx.allocator);
     defer nested_ctx.allocator.free(registrant_hex);
@@ -1947,7 +1947,7 @@ fn domainSubdomainsHandler(ctx: *anyopaque, field: *const parser.Field, nested_c
     const domain: *const models.Name = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
 
-    const page = try api_common.parsePagination(field, 10);
+    const page = try api_common.parsePagination(field, api_common.NESTED_DEFAULT_FIRST);
 
     var json: std.Io.Writer.Allocating = .init(nested_ctx.allocator);
     errdefer json.deinit();
@@ -2376,7 +2376,7 @@ fn domainSubdomainConnectionHandler(ctx: *anyopaque, field: *const parser.Field,
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
     const allocator = nested_ctx.allocator;
 
-    const limit: u32 = @min((try api_common.parsePagination(field, 10)).first, 100);
+    const limit: u32 = @min((try api_common.parsePagination(field, api_common.NESTED_DEFAULT_FIRST)).first, 100);
 
     var json: std.Io.Writer.Allocating = .init(allocator);
     errdefer json.deinit();
@@ -2482,7 +2482,7 @@ fn domainEventsConnectionHandler(ctx: *anyopaque, field: *const parser.Field, ne
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
     const allocator = nested_ctx.allocator;
 
-    const limit: u32 = @min((try api_common.parsePagination(field, 10)).first, 100);
+    const limit: u32 = @min((try api_common.parsePagination(field, api_common.NESTED_DEFAULT_FIRST)).first, 100);
 
     // Check if totalCount is requested
     var wants_total_count = false;
