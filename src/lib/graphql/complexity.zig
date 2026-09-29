@@ -158,6 +158,23 @@ pub const ComplexityAnalyzer = struct {
         };
     }
 
+    /// A fragment's selections, spliced in at the spread's own depth.
+    fn analyzeSpread(self: *ComplexityAnalyzer, selections: []const parser.Field, current_depth: u32) error{OutOfMemory}!ComplexityAnalysis {
+        var max_depth: u32 = current_depth;
+        var total_cost: u32 = 0;
+        for (selections) |*sel| {
+            const sub = try self.analyzeField(sel, current_depth);
+            max_depth = @max(max_depth, sub.depth);
+            total_cost +|= sub.cost;
+        }
+        return ComplexityAnalysis{
+            .depth = max_depth,
+            .cost = total_cost,
+            .exceeded_depth = max_depth > self.limits.max_depth,
+            .exceeded_cost = total_cost > self.limits.max_cost,
+        };
+    }
+
     /// Analyze a field recursively. Fragment spreads are expanded inline so
     /// nested selections inside fragments contribute to depth & cost just like
     /// inline selections.
@@ -166,23 +183,10 @@ pub const ComplexityAnalyzer = struct {
         // Fragment spread: charge the spread location as 0 cost (it's a syntactic
         // marker, not a real field) and recurse into the fragment's selections at
         // the SAME depth. Without this, `query { ...Frag }` reports depth 1 + cost 0.
+        if (field.inline_fragment) return self.analyzeSpread(field.selections, current_depth);
         if (field.fragment_spread) |frag_name| {
             for (self.fragments) |*frag| {
-                if (std.mem.eql(u8, frag.name, frag_name)) {
-                    var max_depth: u32 = current_depth;
-                    var total_cost: u32 = 0;
-                    for (frag.selections) |*sel| {
-                        const sub = try self.analyzeField(sel, current_depth);
-                        max_depth = @max(max_depth, sub.depth);
-                        total_cost +|= sub.cost;
-                    }
-                    return ComplexityAnalysis{
-                        .depth = max_depth,
-                        .cost = total_cost,
-                        .exceeded_depth = max_depth > self.limits.max_depth,
-                        .exceeded_cost = total_cost > self.limits.max_cost,
-                    };
-                }
+                if (std.mem.eql(u8, frag.name, frag_name)) return self.analyzeSpread(frag.selections, current_depth);
             }
             // Unknown fragment — charge zero, mirroring executor's permissive behavior.
             return ComplexityAnalysis{

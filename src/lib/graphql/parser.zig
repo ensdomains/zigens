@@ -365,6 +365,8 @@ pub const Field = struct {
     fragment_spread: ?[]const u8, // If this is a fragment spread (...FragmentName), this is the fragment name
     directives: []Directive, // Field directives (e.g., @skip, @include)
     pos: usize = 0, // Byte offset of the field's first token in the source (alias when aliased)
+    /// `... on T { … }`: `name` holds the type condition, `selections` the body.
+    inline_fragment: bool = false,
 
     pub fn deinit(self: *Field, allocator: std.mem.Allocator) void {
         for (self.arguments) |*arg| {
@@ -937,6 +939,7 @@ pub const Parser = struct {
                 .fragment_spread = null, // Not a named fragment spread
                 .directives = directives,
                 .pos = start_pos,
+                .inline_fragment = true,
             };
         }
 
@@ -1576,18 +1579,23 @@ pub const Executor = struct {
                 continue;
             }
 
-            if (field.fragment_spread) |frag_name| {
-                // This is a fragment spread - expand it
-                if (self.getFragment(frag_name)) |frag| {
-                    const frag_fields = try self.expandSelections(frag.selections);
-                    defer self.allocator.free(frag_fields);
-                    expanded.appendSlice(self.allocator, frag_fields) catch |err| {
-                        self.freeExpandedFieldContents(frag_fields);
-                        return err;
-                    };
-                } else {
-                    std.log.warn("Unknown fragment: {s}", .{frag_name});
-                }
+            if (field.inline_fragment or field.fragment_spread != null) {
+                // Schema validation has already checked that the type condition
+                // is the enclosing type (the schema has no interfaces or unions),
+                // so the fragment's fields always apply here.
+                const frag_selections = if (field.fragment_spread) |frag_name|
+                    (self.getFragment(frag_name) orelse {
+                        std.log.warn("Unknown fragment: {s}", .{frag_name});
+                        continue;
+                    }).selections
+                else
+                    field.selections;
+                const frag_fields = try self.expandSelections(frag_selections);
+                defer self.allocator.free(frag_fields);
+                expanded.appendSlice(self.allocator, frag_fields) catch |err| {
+                    self.freeExpandedFieldContents(frag_fields);
+                    return err;
+                };
                 continue;
             }
 

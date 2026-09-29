@@ -21,15 +21,8 @@ pub const Context = struct {
     fragments: []const parser.Fragment,
 };
 
-const INTROSPECTION_TYPES = [_][]const u8{ "__Schema", "__Type", "__Field", "__InputValue", "__EnumValue", "__Directive" };
-
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
-}
-
-fn isIntrospectionTypeName(name: []const u8) bool {
-    for (INTROSPECTION_TYPES) |t| if (eql(t, name)) return true;
-    return false;
 }
 
 /// The introspection type reached through `field` of `parent` (drives `__typename`).
@@ -66,7 +59,7 @@ pub fn findType(ctx: Context, name: []const u8) ?std.json.Value {
 }
 
 fn isFragmentLike(field: *const parser.Field) bool {
-    return field.fragment_spread != null or (isIntrospectionTypeName(field.name) and field.selections.len > 0 and field.arguments.len == 0);
+    return field.fragment_spread != null or field.inline_fragment;
 }
 
 /// True when the selection asks for anything beyond `name` / `__typename`
