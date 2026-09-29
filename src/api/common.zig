@@ -33,6 +33,87 @@ pub const DEFAULT_SKIP: i64 = 0;
 pub const MAX_SKIP: i64 = 1_000_000;
 
 // ============================================================================
+// STALENESS
+// ============================================================================
+
+pub const ProtocolSync = @import("../storage/sync.zig").ProtocolSync;
+
+pub const StalenessInputs = struct {
+    /// Highest block synced across protocols.
+    head: u64,
+    /// Chain `safe` position, or null when finality data was never fetched.
+    safe: ?u64,
+    /// `last_synced_at` of each protocol; null when the protocol has no
+    /// sync_state row, i.e. this deployment does not index it.
+    synced_at: []const ?i64,
+    /// Seconds without a committed batch before the no-finality fallback
+    /// trips. 0 disables the fallback.
+    stale_after_seconds: u32,
+    now: i64,
+};
+
+/// The `stale` flag behind /ready, /coverage, `_coverage` and the
+/// `ensv2_indexing_stale` gauge. With finality data the safe-head comparison
+/// is exact. Without it, and only when the fallback is armed, a deployment is
+/// stale when any protocol it indexes has gone longer than the threshold
+/// without committing a batch, or when no protocol has ever synced. One live
+/// protocol must not mask a dead one.
+///
+/// The fallback is the only wall-clock read on the read path, so it is opt-in:
+/// `stale_after_seconds == 0` keeps the answer a pure function of DB state.
+pub fn isStale(in: StalenessInputs) bool {
+    if (in.safe) |safe_num| return in.head < safe_num;
+    if (in.stale_after_seconds == 0) return false;
+    var any_synced = false;
+    for (in.synced_at) |maybe_at| {
+        const at = maybe_at orelse continue;
+        if (at <= 0) continue;
+        any_synced = true;
+        // A timestamp ahead of this host's clock is clock skew between the
+        // indexer and API hosts, not a fresh sync; it reads as age 0.
+        const age = @max(in.now -| at, 0);
+        if (age > in.stale_after_seconds) return true;
+    }
+    return !any_synced;
+}
+
+/// Seconds a `last_synced_at` may sit ahead of this host's clock before it is
+/// reported as skew rather than ordinary drift between hosts.
+pub const CLOCK_SKEW_WARN_SECONDS: i64 = 60;
+
+var clock_skew_warned = std.atomic.Value(bool).init(false);
+
+/// isStale over the two protocols' sync_state rows, shared by every surface
+/// that reports staleness so they cannot disagree. Warns once per process when
+/// a sync timestamp is ahead of the local clock: the fallback compares the
+/// indexer host's clock with this one, and skew in that direction hides a stall.
+pub fn coverageStale(v1: ?ProtocolSync, v2: ?ProtocolSync, safe: ?u64, stale_after_seconds: u32, now: i64) bool {
+    const synced_at = [_]?i64{ if (v1) |s| s.at else null, if (v2) |s| s.at else null };
+    if (stale_after_seconds != 0 and safe == null) {
+        for (synced_at) |maybe_at| {
+            const at = maybe_at orelse continue;
+            if (at -| now > CLOCK_SKEW_WARN_SECONDS and !clock_skew_warned.swap(true, .monotonic)) {
+                std.log.warn("coverage staleness: last_synced_at {d} is {d}s ahead of this host's clock; the indexer and API clocks disagree, so the no-finality stale check is unreliable", .{ at, at -| now });
+            }
+        }
+    }
+    return isStale(.{
+        .head = indexedHead(v1, v2),
+        .safe = safe,
+        .synced_at = &synced_at,
+        .stale_after_seconds = stale_after_seconds,
+        .now = now,
+    });
+}
+
+/// Highest block synced across the two protocols; 0 when neither has synced.
+pub fn indexedHead(v1: ?ProtocolSync, v2: ?ProtocolSync) u64 {
+    const v1_block: u64 = if (v1) |s| s.block else 0;
+    const v2_block: u64 = if (v2) |s| s.block else 0;
+    return @max(v1_block, v2_block);
+}
+
+// ============================================================================
 // PAGINATION
 // ============================================================================
 
@@ -395,4 +476,75 @@ test "parseOrderDirection round-trips both directions for events" {
         EventOrderDir.desc,
         parseOrderDirection(&makeField(&none), EventOrderDir, .desc),
     );
+}
+
+fn staleAt(safe: ?u64, synced_at: []const ?i64, stale_after_seconds: u32, now: i64) bool {
+    return isStale(.{ .head = 100, .safe = safe, .synced_at = synced_at, .stale_after_seconds = stale_after_seconds, .now = now });
+}
+
+test "isStale: finality data present decides on its own" {
+    // Head past safe: caught up. Head behind safe: stale, regardless of clock.
+    try testing.expect(!staleAt(100, &.{ null, null }, 0, 0));
+    try testing.expect(staleAt(101, &.{ null, null }, 0, 0));
+    // A fresh clock never rescues a head that is behind safe.
+    try testing.expect(staleAt(101, &.{ null, 1000 }, 900, 1000));
+    // An old sync never overrides a head that is at safe.
+    try testing.expect(!staleAt(100, &.{ null, 1 }, 900, 1_000_000));
+}
+
+test "isStale: without finality data, a frozen head reads stale" {
+    // The regression this guards: no finality data used to mean `false` even
+    // when the indexer had not advanced in days.
+    const day = 86400;
+    try testing.expect(staleAt(null, &.{ null, 1000 }, 900, 1000 + day));
+    try testing.expect(!staleAt(null, &.{ null, 1000 }, 900, 1000 + 899));
+    // Exactly at the threshold is not yet stale (strict >).
+    try testing.expect(!staleAt(null, &.{ null, 1000 }, 900, 1000 + 900));
+    try testing.expect(staleAt(null, &.{ null, 1000 }, 900, 1000 + 901));
+}
+
+test "isStale: a live protocol does not mask a dead one" {
+    // Split binaries: v1 keeps committing while v2 stopped a day ago.
+    try testing.expect(staleAt(null, &.{ 100_000, 100_000 - 86400 }, 900, 100_000));
+    try testing.expect(staleAt(null, &.{ 100_000 - 86400, 100_000 }, 900, 100_000));
+    // A protocol this deployment does not index (no row) is ignored.
+    try testing.expect(!staleAt(null, &.{ null, 100_000 }, 900, 100_000));
+}
+
+test "isStale: never synced reads stale once the fallback is armed" {
+    // An API pointed at a database whose indexer never started.
+    try testing.expect(staleAt(null, &.{ null, null }, 900, 100_000));
+    try testing.expect(staleAt(null, &.{ 0, 0 }, 900, 100_000));
+    // Disabled fallback keeps the old answer.
+    try testing.expect(!staleAt(null, &.{ null, null }, 0, 100_000));
+}
+
+test "isStale: disabled fallback ignores the clock" {
+    try testing.expect(!staleAt(null, &.{ null, 1000 }, 0, 1000 + 86400));
+}
+
+test "isStale: a sync timestamp ahead of the clock reads as fresh, not negative" {
+    try testing.expect(!staleAt(null, &.{ null, 5000 }, 900, 1000));
+    // Hostile DB values cannot overflow the subtraction.
+    try testing.expect(!staleAt(null, &.{ null, std.math.maxInt(i64) }, 900, std.math.minInt(i64)));
+    try testing.expect(staleAt(null, &.{ null, 1 }, 900, std.math.maxInt(i64)));
+}
+
+test "coverageStale: reads both protocol rows and the head they imply" {
+    const now: i64 = 1_700_000_000;
+    const fresh = ProtocolSync{ .block = 50, .at = now };
+    const dead = ProtocolSync{ .block = 40, .at = now - 86400 };
+    try testing.expect(!coverageStale(null, fresh, null, 900, now));
+    try testing.expect(coverageStale(dead, fresh, null, 900, now));
+    try testing.expect(coverageStale(null, null, null, 900, now));
+    try testing.expect(!coverageStale(null, null, null, 0, now));
+    // Head is max(v1, v2): 50 is behind safe 60, and at safe 50 it is not.
+    try testing.expect(coverageStale(dead, fresh, 60, 0, now));
+    try testing.expect(!coverageStale(dead, fresh, 50, 900, now));
+}
+
+test "indexedHead: highest protocol wins, absent reads as 0" {
+    try testing.expectEqual(@as(u64, 0), indexedHead(null, null));
+    try testing.expectEqual(@as(u64, 7), indexedHead(.{ .block = 7, .at = 1 }, null));
+    try testing.expectEqual(@as(u64, 9), indexedHead(.{ .block = 7, .at = 1 }, .{ .block = 9, .at = 1 }));
 }

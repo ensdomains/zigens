@@ -74,6 +74,10 @@ services:
       - API_PORT=5655
       - GRAPHQL_MAX_DEPTH=10
       - GRAPHQL_MAX_COST=${GRAPHQL_MAX_COST:-10000}
+      # Without finality data, report stale=true once a protocol has gone this long
+      # without committing a batch (see .env.example). Above the longest healthy
+      # batch; set 0 for a --backfill or an END_BLOCK-pinned deployment.
+      - COVERAGE_STALE_AFTER_SECONDS=${COVERAGE_STALE_AFTER_SECONDS:-3600}
       - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
       - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
       - WEBHOOK_ADMIN_USERNAME=${WEBHOOK_ADMIN_USERNAME:-}

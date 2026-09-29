@@ -603,6 +603,61 @@ test "task06: indexed-miss addr resolves via Universal Resolver only when live i
 }
 
 // ============================================================================
+// `_coverage.stale` with the no-finality fallback armed. Not a golden: the
+// fallback reads the wall clock, so timestamps are pinned relative to it.
+// ============================================================================
+
+fn coverageStaleFlag(a: std.mem.Allocator, handler: *GraphQLHandler, db: *Database) !bool {
+    const result = try handler.handleQuery(db, "{ _coverage { stale } }", null, null, false);
+    defer a.free(result);
+    if (std.mem.eql(u8, result, "{\"data\":{\"_coverage\":{\"stale\":true}}}")) return true;
+    if (std.mem.eql(u8, result, "{\"data\":{\"_coverage\":{\"stale\":false}}}")) return false;
+    std.debug.print("unexpected _coverage response: {s}\n", .{result});
+    return error.UnexpectedCoverageResponse;
+}
+
+fn pinSyncState(db: *Database, protocol: []const u8, block: u64, at: i64) !void {
+    var q = try lib.storage.Query.init(db, "INSERT INTO sync_state (protocol, last_synced_block, last_synced_at) VALUES (?, ?, ?) ON CONFLICT (protocol) DO UPDATE SET last_synced_block = excluded.last_synced_block, last_synced_at = excluded.last_synced_at");
+    defer q.deinit();
+    try q.bindTextStatic(protocol);
+    try q.bindInt64(@intCast(block));
+    try q.bindInt64(at);
+    try q.exec();
+}
+
+test "_coverage.stale: no-finality fallback over the real handler" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const db = try helpers.createTestDatabase(a);
+    defer helpers.destroyTestDatabase(a, db);
+    var handler = try GraphQLHandler.init(a, 30, 100000, false);
+    defer handler.deinit();
+
+    // Fallback off (the default): nothing synced, nothing stale.
+    try testing.expect(!try coverageStaleFlag(a, &handler, db));
+
+    db.setStaleAfterSeconds(900);
+    // Armed, and the indexer never started.
+    try testing.expect(try coverageStaleFlag(a, &handler, db));
+
+    const now = zsys.timestamp();
+    try pinSyncState(db, "v2", 100, now);
+    try testing.expect(!try coverageStaleFlag(a, &handler, db));
+
+    // v1 keeps committing, v2 stopped a day ago: v1 must not mask it.
+    try pinSyncState(db, "v1", 100, now);
+    try pinSyncState(db, "v2", 100, now - 86400);
+    try testing.expect(try coverageStaleFlag(a, &handler, db));
+
+    // Finality data wins over the clock both ways.
+    try db.setFinality(db.chain_id, .safe, 100, Hash.zero, now);
+    try testing.expect(!try coverageStaleFlag(a, &handler, db));
+    try db.setFinality(db.chain_id, .safe, 101, Hash.zero, now);
+    try testing.expect(try coverageStaleFlag(a, &handler, db));
+}
+
+// ============================================================================
 // Record-model resolvers (contracts-v2 IRecordResolver) — own fixture so the
 // main goldens above stay byte-identical.
 // ============================================================================

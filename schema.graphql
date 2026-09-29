@@ -131,8 +131,10 @@ type Query {
 
   """
   What this deployment indexes (ensv2 extension): chain id, per-protocol indexed
-  head + last-sync time, and a staleness flag. `stale` is false when finality data
-  is absent (default deployments); `_finality.isStale` is the conservative variant.
+  head + last-sync time, and a staleness flag. Without finality data `stale` can
+  fall back to how long each protocol has gone without committing a batch (opt-in,
+  `COVERAGE_STALE_AFTER_SECONDS`); `_finality.isStale` remains the conservative
+  variant (true whenever no safe data).
   """
   _coverage: Coverage!
 }
@@ -141,7 +143,7 @@ type Query {
 type Coverage {
   """EVM chain id this deployment indexes."""
   chainId: Int!
-  """True only when finality data shows the indexed head behind the chain's safe point."""
+  """True when the indexed head is behind the chain's safe point. Without finality data it is false unless the deployment sets `COVERAGE_STALE_AFTER_SECONDS`, in which case it is true when any indexed protocol has gone that long without committing a batch, or when nothing has synced yet."""
   stale: Boolean!
   """Per-protocol indexed positions."""
   protocols: [ProtocolCoverage!]!
