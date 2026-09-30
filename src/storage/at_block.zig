@@ -182,8 +182,19 @@ fn applyEvent(st: *AtBlockState, q: *Query, et: models.EventType, data: []const 
     switch (et) {
         .label_registered, .label_reserved => try applyRegistration(st, q, data, namehash, et == .label_reserved),
         .transfer => {
+            // Same key as live and as replay: ownership moves only when the
+            // (tokenId, emitting registry) pair is this name's. A tokenId collides
+            // across registries, and an events row can carry a placeholder name —
+            // applying `to` on the namehash alone handed this name an owner from
+            // someone else's transfer. Mirrors .resolver_updated below.
             const to = Address.fromHex(jsonString(data, "to") orelse return) catch return;
-            if (st.name) |*n| n.owner = to;
+            // TransferBatch emits one row with "count" and no "id"; its per-token
+            // ids never reach the payload, so it cannot be applied here either.
+            const token_id = jsonU256(data, "id") orelse return;
+            const contract_addr = Address.fromHex(q.getTextSlice(COL_CONTRACT) orelse return) catch return;
+            if (st.name) |*n| {
+                if (n.token_id == token_id and n.registry.eql(contract_addr)) n.owner = to;
+            }
         },
         .name_renewed => {
             const exp = jsonU64(data, "newExpiry") orelse jsonU64(data, "newExpiration") orelse return;

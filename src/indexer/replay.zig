@@ -823,9 +823,26 @@ fn replayV2Event(self: *Indexer, q: *Query) !void {
         .label_registered => try replayV2LabelRegistered(self, q, data),
         .label_reserved => try replayV2LabelReserved(self, q, data),
         .transfer => {
-            const nh = (try v2Namehash(q)) orelse return; // TransferBatch has null namehash -> skip
+            // Live keys ownership off (id, emitting registry) — handlers_registry's
+            // handleTransfer via lookupPairedName — and deliberately does nothing when
+            // that pair is unknown, because a tokenId collides across registries.
+            // Replaying off the events row's namehash instead is not the same read:
+            // that column is a denormalised copy, null on an orphaned transfer and
+            // only later healed by the placeholder repair ledger, so a rebuild
+            // silently skipped transfers live had applied and applied one live had
+            // not. Re-derive it the way live does, exactly as .resolver_updated above
+            // does for the same reason. token_regenerated keeps names.token_id in
+            // step during replay, so the pair resolves as it did live.
+            const contract_addr = Address.fromHex(q.getTextSlice(V2_CONTRACT) orelse return) catch return;
             const to = Address.fromHex(jsonString(data, "to") orelse return) catch return;
-            names_storage.updateNameOwner(self.database, .v2, nh, to) catch {};
+            // TransferBatch emits a single row carrying "count" and no "id": its
+            // per-token ids never reach the event payload, so no rebuild can
+            // reproduce them from here. Absent "id" is that row, and it skips.
+            const id = jsonU256(data, "id") orelse return;
+            const row = (self.database.getNameByTokenIdAndRegistry(id, contract_addr) catch null) orelse return;
+            var row_mut = row;
+            defer row_mut.deinit(self.allocator);
+            names_storage.updateNameOwner(self.database, .v2, row_mut.namehash, to) catch {};
         },
         .name_renewed => {
             const nh = (try v2Namehash(q)) orelse return;
@@ -1138,6 +1155,15 @@ fn replayV2RecordEvent(self: *Indexer, q: *Query, et: models.EventType) !void {
         },
         .data_changed => {
             const key = jsonObjStr(obj, "key") orelse return;
+            // A row written from a log whose `value` parameter was indexed carries
+            // `valueHash` and no `value`: only keccak256(value) was ever on chain, so
+            // live stores no value and deletes any stale one. Replay must reach the
+            // same state, and it must not mistake the hash for a value — hence the
+            // explicit arm rather than leaning on a missing field defaulting to empty.
+            if (obj.get("valueHash") != null) {
+                self.database.deleteResolverData(.v2, nh, resolver, key) catch {};
+                return;
+            }
             const value = jsonObjStr(obj, "value") orelse "";
             if (value.len <= 2) {
                 self.database.deleteResolverData(.v2, nh, resolver, key) catch {};
@@ -1629,15 +1655,18 @@ test "replay(events) rebuilds V2 names (main-registry + subregistry + reserved +
 
     const sub_reg = "0x4444444444444444444444444444444444444444"; // subregistry contract for foo.eth
 
+    // The emitting contract is part of the fixture, not a placeholder: replay keys
+    // ownership and resolver updates off (tokenId, emitting registry), so an event
+    // attributed to the zero address is not a shape live can produce.
     const ev = struct {
-        fn go(db: *db_module.Database, et: models.EventType, name: []const u8, nh: ?Hash, data: []const u8, blk: u64, li: u32) !void {
+        fn go(db: *db_module.Database, et: models.EventType, name: []const u8, nh: ?Hash, data: []const u8, blk: u64, li: u32, contract: Address) !void {
             try @import("../storage/events.zig").insertEvent(db, .{
                 .event_type = et,
                 .protocol = .v2,
                 .block_number = blk,
                 .tx_hash = Hash.zero,
                 .log_index = li,
-                .contract_address = Address.zero,
+                .contract_address = contract,
                 .name = name,
                 .namehash = nh,
                 .data = data,
@@ -1656,11 +1685,15 @@ test "replay(events) rebuilds V2 names (main-registry + subregistry + reserved +
 
             const reg_data = try std.fmt.allocPrint(a, "{{\"name\":\"foo.eth\",\"tokenId\":{s},\"owner\":\"{s}\",\"expiry\":1000000,\"sender\":\"{s}\",\"registry\":\"{s}\"}}", .{ bt, o1, o1, r });
             defer a.free(reg_data);
-            try ev(database, .label_registered, "foo.eth", fnh, reg_data, 100, 0);
-            const xfer_data = try std.fmt.allocPrint(a, "{{\"to\":\"{s}\"}}", .{o2});
+            const reg_addr = try Address.fromHex(r);
+            try ev(database, .label_registered, "foo.eth", fnh, reg_data, 100, 0, reg_addr);
+            // Live's Transfer payload always carries the token id, and ownership is
+            // keyed off (id, emitting registry) — the events row's namehash is a
+            // denormalised copy that may still be a placeholder.
+            const xfer_data = try std.fmt.allocPrint(a, "{{\"to\":\"{s}\",\"id\":{s},\"value\":1}}", .{ o2, bt });
             defer a.free(xfer_data);
-            try ev(database, .transfer, "foo.eth", fnh, xfer_data, 101, 1);
-            try ev(database, .name_renewed, "foo.eth", fnh, "{\"newExpiry\":2000000}", 102, 2);
+            try ev(database, .transfer, "foo.eth", fnh, xfer_data, 101, 1, reg_addr);
+            try ev(database, .name_renewed, "foo.eth", fnh, "{\"newExpiry\":2000000}", 102, 2, reg_addr);
 
             // Subregistry-parented child: bar.foo.eth registered on foo.eth's subregistry
             // contract. At index time the handler resolved the parent via `registries` and froze
@@ -1668,7 +1701,7 @@ test "replay(events) rebuilds V2 names (main-registry + subregistry + reserved +
             const bar_nh = try hash_mod2.namehash(a, "bar.foo.eth");
             const child_data = try std.fmt.allocPrint(a, "{{\"name\":\"bar.foo.eth\",\"tokenId\":42,\"canonicalId\":42,\"owner\":\"{s}\",\"expiry\":1500000,\"sender\":\"{s}\",\"registry\":\"{s}\"}}", .{ o1, o1, sub_reg });
             defer a.free(child_data);
-            try ev(database, .label_registered, "bar.foo.eth", bar_nh, child_data, 103, 3);
+            try ev(database, .label_registered, "bar.foo.eth", bar_nh, child_data, 103, 3, try Address.fromHex(sub_reg));
 
             // V1→V2 LOCKED migration. A pre-existing wrapped V1 row for mig.eth is seeded into BOTH
             // DBs (pre-migration state, not a replayed event). When the locked migration controller
@@ -1707,14 +1740,14 @@ test "replay(events) rebuilds V2 names (main-registry + subregistry + reserved +
             });
             const mig_data = try std.fmt.allocPrint(a, "{{\"name\":\"mig.eth\",\"tokenId\":77,\"canonicalId\":77,\"owner\":\"{s}\",\"expiry\":2500000,\"sender\":\"{s}\",\"registry\":\"{s}\"}}", .{ o1, mc, r });
             defer a.free(mig_data);
-            try ev(database, .label_registered, "mig.eth", mig_nh, mig_data, 104, 4);
+            try ev(database, .label_registered, "mig.eth", mig_nh, mig_data, 104, 4, reg_addr);
 
             // Reserved label: owner-zero name row created by a LabelReserved event (the bulk of
             // real names). Replay must reconstruct it via replayV2LabelReserved.
             const resv_nh = try hash_mod2.namehash(a, "resv.eth");
             const resv_data = try std.fmt.allocPrint(a, "{{\"name\":\"resv.eth\",\"tokenId\":88,\"expiry\":1800000,\"sender\":\"{s}\",\"registry\":\"{s}\",\"reserved\":true}}", .{ o1, r });
             defer a.free(resv_data);
-            try ev(database, .label_reserved, "resv.eth", resv_nh, resv_data, 105, 5);
+            try ev(database, .label_reserved, "resv.eth", resv_nh, resv_data, 105, 5, reg_addr);
 
             if (apply_names) {
                 // Mirror what the live handlers produce (the ground-truth expected state).
@@ -2387,7 +2420,11 @@ test "reconstructV2AtBlock matches truncated live replay at every lifecycle chec
         .{ .et = .address_changed, .blk = 106, .li = 3, .contract = rsv, .data = "{\"resolver\":\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"coinType\":60,\"address\":\"0x9999999999999999999999999999999999999999\"}" },
         .{ .et = .text_changed, .blk = 108, .li = 4, .contract = rsv, .data = "{\"resolver\":\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"key\":\"url\",\"value\":\"https://a\"}" },
         .{ .et = .text_changed, .blk = 110, .li = 5, .contract = rsv, .data = "{\"resolver\":\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"key\":\"url\",\"value\":\"\"}" },
-        .{ .et = .transfer, .blk = 112, .li = 6, .contract = reg, .data = "{\"to\":\"0x2222222222222222222222222222222222222222\"}" },
+        // Transfer carries its tokenId and is emitted BY the registry; ownership is
+        // keyed on that pair, so a same-node transfer from a foreign registry is a
+        // no-op exactly like the ResolverUpdated above.
+        .{ .et = .transfer, .blk = 111, .li = 11, .contract = wrong_reg, .data = "{\"to\":\"0x4444444444444444444444444444444444444444\",\"id\":500,\"value\":1}" },
+        .{ .et = .transfer, .blk = 112, .li = 6, .contract = reg, .data = "{\"to\":\"0x2222222222222222222222222222222222222222\",\"id\":500,\"value\":1}" },
         .{ .et = .name_renewed, .blk = 114, .li = 7, .contract = reg, .data = "{\"newExpiry\":2000000}" },
         .{ .et = .token_regenerated, .blk = 116, .li = 8, .contract = reg, .data = "{\"oldTokenId\":500,\"newTokenId\":501}" },
         .{ .et = .name_burned, .blk = 120, .li = 9, .contract = reg, .data = "{\"tokenId\":501}" },
