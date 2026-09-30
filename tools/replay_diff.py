@@ -51,6 +51,7 @@ TABLES = [
     "resolver_dns_records", "resolver_dns_zonehashes", "resolver_authorisations",
     "reverse_records", "approvals", "eac_roles", "accounts", "v1_controllers",
     "name_history", "resolver_links", "resolver_named_resources", "unknown_labels",
+    "resolver_datas",
 ]
 
 # Columns excluded everywhere: the surrogate key is insertion order by construction, so it
