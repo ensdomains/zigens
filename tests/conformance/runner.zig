@@ -366,6 +366,9 @@ test "conformance goldens" {
     defer a.free(exp_vars);
     const owner_vars = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\"}}", .{owner_hex});
     defer a.free(owner_vars);
+    var resolver_buf: [42]u8 = undefined;
+    const resolver_vars = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\"}}", .{helpers.TEST_RESOLVER.toHexBuf(&resolver_buf)});
+    defer a.free(resolver_vars);
 
     const ops = [_]Op{
         .{ .name = "meta", .query = "{ _meta { block { number hash } hasIndexingErrors } }" },
@@ -458,12 +461,26 @@ test "conformance goldens" {
         .{ .name = "err_unknown_argument", .query = "{ domains(bogusArg: 1) { id } }" },
         .{ .name = "err_unknown_where_field", .query = "{ domains(where: {totallyBogus: 1}) { id } }" },
         .{ .name = "err_unknown_query", .query = "{ notARealQueryField { id } }" },
-        // --- leniency ops: document (and lock) where zigens is LENIENT in non-strict
-        //     mode rather than raising a validation error — an unknown field resolves to
-        //     null, and an invalid orderBy enum is ignored (default order). These are
-        //     intentional divergences from strict GraphQL; the goldens guard against a
-        //     silent change either way.
-        .{ .name = "lenient_unknown_field", .query = "{ domains(first:1){ notARealField } }" },
+        // Unknown selection fields, and unknown arguments below the root, used to
+        // resolve to null or be silently dropped; they now fail validation.
+        .{ .name = "err_unknown_field", .query = "{ domains(first:1){ notARealField } }" },
+        .{ .name = "err_unknown_nested_field", .query = "{ domains(first:1){ owner { notARealField } } }" },
+        .{ .name = "err_unknown_fragment_field", .query = "query Q { domains(first:1){ ...F } } fragment F on Domain { notARealField }" },
+        .{ .name = "err_unknown_root_fragment_field", .query = "query Q { ...Root } fragment Root on Query { domains(first:1){ notARealField } }" },
+        .{ .name = "err_unknown_nested_argument", .query = "{ domains(first:1){ subdomains(bogus: 1) { id } } }" },
+        .{ .name = "err_unknown_nested_where_field", .query = "{ domains(first:1){ events(where: {bogus: 1}) { id } } }" },
+        .{ .name = "err_fragment_wrong_type", .query = "{ domains(first:1){ ... on Account { id } } }" },
+        // __typename, aliases, named and inline fragments (spliced in, not
+        // resolved as a field named after the type), and root-level fragments.
+        .{ .name = "ok_typename_and_fragments", .query = "query Q { domains(first:1){ __typename n: name ...F ... on Domain { labelName } } } fragment F on Domain { id }" },
+        .{ .name = "ok_root_fragment", .query = "query Q { ...Root } fragment Root on Query { domains(first:1){ name } }" },
+        // Served fields that were missing from the schema, now declared: they must
+        // keep answering rather than become validation errors.
+        .{ .name = "ok_declared_domain_fields", .query = "query($id:String!){ domain(id:$id){ namehash domain { name } subdomainConnection { totalCount pageInfo { hasNextPage } edges { node { name } } } eventsConnection(first: 2) { totalCount edges { node { type } } } } }", .vars = alice_vars },
+        .{ .name = "ok_declared_registration_fields", .query = "{ registrations(first:1, orderBy: registrationDate, orderDirection: asc){ name block blockNumber timestamp registrationDate } }" },
+        .{ .name = "ok_declared_resolver_detail_fields", .query = "query($id:String!){ resolver(id:$id){ address recordModel domain { name } texts coinTypes addr text(key: \"avatar\") } }", .vars = resolver_vars },
+        // An invalid orderBy enum is ignored (default order): an intentional
+        // leniency, locked so it does not change silently.
         .{ .name = "lenient_invalid_orderby", .query = "{ domains(orderBy: notARealField){ id } }" },
         // An empty selection set is spec-invalid but accepted; the fast path must
         // emit the namehash id like every other Domain serialization.

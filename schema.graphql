@@ -459,6 +459,18 @@ type Domain {
 
   """Wrapped owner (V1 NameWrapper EOA). Null when not wrapped."""
   wrappedOwner: Account
+
+  """The namehash (ERC-137 node) of this domain; the same value as `id`."""
+  namehash: String!
+
+  """This same domain; `domain { … }` on a Domain resolves to itself."""
+  domain: Domain!
+
+  """First page of direct subdomains as a connection, ordered by name: at most `first` (default 10, max 100) with `totalCount` and `pageInfo.hasNextPage`. There is no `after` here; page further with `subdomains(first, skip)`."""
+  subdomainConnection(first: Int = 10): DomainConnection!
+
+  """Most recent events for this domain as a connection: at most `first` (default 10, max 100) with `totalCount` and `pageInfo.hasNextPage`. There is no `after` here; page further with `events` or the root `eventConnection(where: { namehash })`."""
+  eventsConnection(first: Int = 10): EventConnection!
 }
 
 """An Ethereum account (address)"""
@@ -688,6 +700,15 @@ type Registration {
 
   """Timestamp when domain was registered"""
   registrationDate: Int!
+
+  """Block number of the registration event."""
+  blockNumber: Int!
+
+  """Block number of the registration event; the same value as `blockNumber`."""
+  block: Int!
+
+  """Timestamp of the registration event; the same value as `registrationDate`."""
+  timestamp: Int!
 
   """Timestamp when domain expires"""
   expiryDate: Int!
@@ -1292,6 +1313,57 @@ type ResolverDetail {
 
   """Resource-name associations announced by this resolver (EAC resource naming; emitted on the first role grant per resource)"""
   namedResources: [NamedResourceEntry!]!
+
+  """Canonical Domain associated with this resolver (first by namehash). Null when this resolver isn't bound to any name."""
+  domain: Domain
+
+  """True when the resolver announced itself as record-model (ResolverCreated)."""
+  recordModel: Boolean!
+
+  """Address record for a coin type (default 60, ETH). ResolverDetail has no name context, so this reads the zero node (0x0): on a record-model resolver that is the resolver-wide default record, on a legacy resolver it is usually empty."""
+  addr(coinType: Int = 60): String
+
+  """All set addresses across coin types. ResolverDetail has no name context, so this reads the zero node (0x0): on a record-model resolver that is the resolver-wide default record, on a legacy resolver it is usually empty."""
+  addresses: [CoinAddress!]
+
+  """All set coin types as decimal strings. ResolverDetail has no name context, so this reads the zero node (0x0): on a record-model resolver that is the resolver-wide default record, on a legacy resolver it is usually empty."""
+  coinTypes: [String!]
+
+  """Content hash. ResolverDetail has no name context, so this reads the zero node (0x0): on a record-model resolver that is the resolver-wide default record, on a legacy resolver it is usually empty."""
+  contentHash: String
+
+  """Text-record keys (keys only; read values with `text(key:)`). ResolverDetail has no name context, so this reads the zero node (0x0): on a record-model resolver that is the resolver-wide default record, on a legacy resolver it is usually empty."""
+  texts: [String!]
+
+  """A text record value by key. ResolverDetail has no name context, so this reads the zero node (0x0): on a record-model resolver that is the resolver-wide default record, on a legacy resolver it is usually empty."""
+  text(key: String!): String
+
+  """Public key record. ResolverDetail has no name context, so this reads the zero node (0x0): on a record-model resolver that is the resolver-wide default record, on a legacy resolver it is usually empty."""
+  pubkey: Pubkey
+
+  """ABI content types. ResolverDetail has no name context, so this reads the zero node (0x0): on a record-model resolver that is the resolver-wide default record, on a legacy resolver it is usually empty."""
+  abis: [Int!]
+
+  """Reverse name record. ResolverDetail has no name context, so this reads the zero node (0x0): on a record-model resolver that is the resolver-wide default record, on a legacy resolver it is usually empty."""
+  reverseName: String
+
+  """Interface implementations. ResolverDetail has no name context, so this reads the zero node (0x0): on a record-model resolver that is the resolver-wide default record, on a legacy resolver it is usually empty."""
+  interfaces: [InterfaceRecord!]
+
+  """Version counter. ResolverDetail has no name context, so this reads the zero node (0x0): on a record-model resolver that is the resolver-wide default record, on a legacy resolver it is usually empty."""
+  version: Int
+
+  """Record the zero node resolves through, as a decimal string. ResolverDetail has no name context, so this reads the zero node (0x0): on a record-model resolver that is the resolver-wide default record, on a legacy resolver it is usually empty."""
+  recordId: String
+
+  """Names bound to the same record as the zero node. ResolverDetail has no name context, so this reads the zero node (0x0): on a record-model resolver that is the resolver-wide default record, on a legacy resolver it is usually empty."""
+  linkedNames: [LinkedName!]
+
+  """ENSIP-24 data(key) record as 0x-hex bytes. ResolverDetail has no name context, so this reads the zero node (0x0): on a record-model resolver that is the resolver-wide default record, on a legacy resolver it is usually empty."""
+  data(key: String!): String
+
+  """ENSIP-24 data keys (keys only; read values with `data(key:)`). ResolverDetail has no name context, so this reads the zero node (0x0): on a record-model resolver that is the resolver-wide default record, on a legacy resolver it is usually empty."""
+  dataKeys: [String!]
 }
 
 """An EAC resource id and the name/record it guards on a resolver. Legacy resolvers announce it per name (Named*Resource); record-model resolvers announce it per setter ARGUMENT (ResourceArgument): `name` is then empty, `recordKey` carries the argument (text/data key, or 0x-hex for interface ids), `coinType` its integer value (coin type or ABI content type), and `recordKind` is derived from the setter roles granted on the resource — one entry per kind, or `argument` before any grant is indexed."""
