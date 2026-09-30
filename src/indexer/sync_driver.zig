@@ -24,12 +24,16 @@ const NetworkHealth = @import("../utils/network_health.zig").NetworkHealth;
 const status_mod = @import("../server/status.zig");
 const IndexerStatus = status_mod.IndexerStatus;
 const reorg_undo = @import("../storage/reorg_undo.zig");
+const memstat = @import("../utils/memstat.zig");
+const process_allocator = @import("../utils/process_allocator.zig");
 const ens_normalize = @import("../utils/ens_normalize.zig");
 const replay_mod = @import("replay.zig");
+const alias_sync = @import("v2/alias_sync.zig");
 const backfill_mod = @import("v1/backfill.zig");
 const WriteBuffer = @import("write_buffer.zig").WriteBuffer;
 const Rainbow = @import("../rainbow/rainbow.zig").Rainbow;
 const Indexer = @import("indexer.zig").Indexer;
+const SyncFailureWatchdog = @import("sync_watchdog.zig").SyncFailureWatchdog;
 
 /// Near the tip, block lineage is stored per-block (not just at batch boundaries) so a
 /// reorg's fork point is located exactly. A batch larger than this is stored at the
@@ -44,7 +48,12 @@ const BlockLineage = struct { number: u64, hash: Hash, parent_hash: Hash };
 /// being down for hours must stall indexing, not kill it); anything else gets a
 /// bounded pause. The cursor is unchanged, so the next iteration resumes where
 /// this one failed.
-fn handleSyncError(self: *Indexer, protocol: models.Protocol, err: anyerror) void {
+///
+/// Only the non-network branch feeds the fail-fast watchdog: cycles that keep
+/// failing while `waitForHealthy` (fresh http.Client, so immune to any rot in
+/// the indexer's long-lived one) says the endpoint is fine are exactly the
+/// process-local-state failures a restart cures.
+fn handleSyncError(self: *Indexer, watchdog: *SyncFailureWatchdog, protocol: models.Protocol, err: anyerror) void {
     switch (err) {
         error.HttpError, error.NetworkUnreachable, error.ConnectionRefused, error.ConnectionTimedOut, error.ConnectionResetByPeer, error.WriteFailed, error.BrokenPipe, error.EndOfStream, error.UnexpectedReadFailure => {
             std.log.warn("{s} network error detected: {}, waiting for connection...", .{ protocol.toString(), err });
@@ -58,6 +67,10 @@ fn handleSyncError(self: *Indexer, protocol: models.Protocol, err: anyerror) voi
         },
         else => {
             std.log.err("{s} indexing error: {}", .{ protocol.toString(), err });
+            if (watchdog.failureWindowElapsed(zsys.milliTimestamp())) {
+                std.log.err("no successful sync cycle in {d} minutes with the network reachable; exiting for a supervisor restart (SYNC_FAILURE_EXIT_MINUTES, 0 disables)", .{watchdog.exit_after_ms / std.time.ms_per_min});
+                std.process.exit(1);
+            }
             _ = shutdown.sleepInterruptible(constants.Timing.error_recovery_delay_ms * std.time.ns_per_ms);
         },
     }
@@ -107,18 +120,22 @@ pub fn start(self: *Indexer) !void {
         self.database.ensureSyncPathIndexes();
     }
 
+    var watchdog: SyncFailureWatchdog = .init(self.config.sync_failure_exit_minutes);
+
     while (!self.should_stop.load(.acquire) and !shutdown.isRequested()) {
         // Index V1 first (SQLite doesn't support concurrent writes from different threads)
         self.indexProtocol(.v1, self.v1_client) catch |err| {
-            handleSyncError(self, .v1, err);
+            handleSyncError(self, &watchdog, .v1, err);
             continue;
         };
 
         // Then index V2
         self.indexProtocol(.v2, self.v1_client) catch |err| {
-            handleSyncError(self, .v2, err);
+            handleSyncError(self, &watchdog, .v2, err);
             continue;
         };
+
+        watchdog.recordSuccess();
 
         // After first successful sync of both chains, recreate indexes and start webhook workers
         if (!self.initial_sync_complete.load(.acquire)) {
@@ -285,8 +302,11 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
         self.database.ensureSyncPathIndexes();
     }
 
+    var watchdog: SyncFailureWatchdog = .init(self.config.sync_failure_exit_minutes);
+
     while (!self.should_stop.load(.acquire) and !shutdown.isRequested()) {
         if (self.indexProtocol(protocol, client)) |_| {
+            watchdog.recordSuccess();
             // Success - after first successful sync, recreate indexes and start webhook workers
             if (!self.initial_sync_complete.load(.acquire)) {
                 // Only pay the rebuild + ANALYZE when this process dropped
@@ -372,7 +392,7 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
                 }
             }
         } else |err| {
-            handleSyncError(self, protocol, err);
+            handleSyncError(self, &watchdog, protocol, err);
             continue;
         }
 
@@ -459,6 +479,8 @@ pub fn rollbackToLastValidBlock(self: *Indexer, protocol: models.Protocol, clien
 
     std.log.warn("Rolling back {s} to block {d}", .{ protocol.toString(), rollback_to });
     try self.database.rollbackToBlock(protocol, rollback_to);
+    // Undo rows can resurrect placeholder rows the ledger already forgot.
+    self.placeholders.seed(self.database);
     // rollbackToBlock cleared the reorg_cursor row; drop the in-memory mirror so the
     // next event re-arms it (otherwise capture stays silently disabled for that block).
     self.invalidateReorgCursor();
@@ -531,6 +553,7 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
     // for the rest of the bulk sync. Armed batches re-set the cursor per block.
     reorg_undo.clearCursor(self.database, protocol) catch |err|
         std.log.warn("reorg undo-log: failed to clear cursor at sync start: {}", .{err});
+    self.placeholders.seedOnce(self.database);
     self.invalidateReorgCursor();
 
     // Index in batches with adaptive batch sizing
@@ -579,6 +602,10 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
         // Use transaction for batch atomicity
         try self.database.beginTransaction();
 
+        // A refusal during this attempt means an allocation size came from an
+        // unvalidated length, which is invariant in the batch size — see below.
+        const refusals_before = process_allocator.refusalCount();
+
         // Try indexing - on RPC response size errors, rollback, halve batch, retry
         self.indexBlockRange(protocol, client, from_block, to_block) catch |err| {
             self.database.rollbackTransaction();
@@ -593,14 +620,32 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
             // registrations; the retry re-registers and re-queues them.
             self.pending_resolver_backfills.clearRetainingCapacity();
 
-            if ((err == error.RpcError or err == error.StreamTooLong) and current_batch_size > ABSOLUTE_MIN_BATCH) {
+            // An OutOfMemory that came from a REFUSED allocation is not a volume
+            // problem and shrinking cannot fix it: the refused size was a corrupt
+            // length (maxInt(usize) and the like), which is identical at 1000
+            // blocks and at 100. Shrinking anyway walks the batch down to the floor
+            // over several minutes, gives up, restarts at full size and repeats —
+            // a futile loop that buries the real cause under "response too large".
+            // Fail fast and say so instead; the fix belongs at the decode site.
+            const refused = process_allocator.refusalCount() > refusals_before;
+            if (refused) {
+                std.log.err("batch {d}-{d} aborted by a refused allocation, not by memory pressure — NOT shrinking, because a corrupt length is the same size at any batch width. Fix the decode site named in the refusal above.", .{ from_block, to_block });
+                return err;
+            }
+
+            // Genuine OutOfMemory shrinks for the same reason the size errors do: a
+            // batch whose working set will not fit is too big, and half of it may
+            // well fit. Without it one refused mapping aborted the batch, rolled
+            // the transaction back, left the cursor unmoved and re-failed
+            // identically forever. Bounded by ABSOLUTE_MIN_BATCH.
+            if ((err == error.RpcError or err == error.RpcRateLimited or err == error.StreamTooLong or err == error.OutOfMemory) and current_batch_size > ABSOLUTE_MIN_BATCH) {
                 current_batch_size = @max(ABSOLUTE_MIN_BATCH, current_batch_size / 2);
                 // The retry restarts at the batch head, often in a different density
                 // regime than the tail this state was learned from — a stale estimate
                 // predicts oversized chunks and cascades through overflow retries.
                 self.v1_events_per_block = 0;
                 self.v1_rpc_chunk_ceiling = 0;
-                std.log.warn("RPC response too large for blocks {d}-{d}! Reducing batch size to {d} blocks and retrying", .{ from_block, to_block, current_batch_size });
+                std.log.warn("batch {d}-{d} failed with {} — reducing batch size to {d} blocks and retrying", .{ from_block, to_block, err, current_batch_size });
                 continue; // Retry same from_block with smaller batch
             }
 
@@ -619,6 +664,16 @@ pub fn indexProtocol(self: *Indexer, protocol: models.Protocol, client: *rpc.Cli
         blocks_indexed += batch_blocks;
         const progress = (@as(f64, @floatFromInt(blocks_indexed)) / @as(f64, @floatFromInt(total_blocks))) * 100.0;
         std.log.info("Progress: {d:.1}% ({d}/{d} blocks) - Batch {d}-{d} indexed", .{ progress, blocks_indexed, total_blocks, from_block, to_block });
+        if (memstat.rssBytes()) |rss| {
+            // rss climbing while live stays flat is allocator retention, not a
+            // leak; both climbing together is a leak. Printing them side by
+            // side is what makes that call possible from a log alone.
+            std.log.info("  Memory: rss {d} MB, allocator live {d} MB, peak {d} MB", .{
+                rss / (1024 * 1024),
+                (memstat.liveBytes() orelse 0) / (1024 * 1024),
+                (memstat.peakBytes() orelse 0) / (1024 * 1024),
+            });
+        }
 
         // --- Block-hash lineage (reorg detection) ---
         // Near the tip, store per-block (hash, parent_hash) so a reorg's fork point is
@@ -759,13 +814,27 @@ pub fn indexBlockRange(self: *Indexer, protocol: models.Protocol, client: *rpc.C
     // direct DB visibility — but events are append-only within a batch, so
     // buffering them turns thousands of per-event round trips into a few
     // multi-row inserts at flush. That per-statement RTT was the measured
-    // Neon bulk-sync bottleneck. Near the tip (reorg_arm) writes stay direct,
-    // exactly like V1. Known, accepted skew shared with V1 bulk: a
+    // Neon bulk-sync bottleneck. Known, accepted skew shared with V1 bulk: a
     // placeholder→real name patch during this batch misses same-batch
     // buffered events (denorm-only; see the events reorg-capture waiver).
-    const buffer_v2_events = should_index_v2 and !self.reorg_arm and self.config.v2_event_buffer;
-    if (buffer_v2_events) self.write_buffer.active = true;
+    //
+    // Buffered for the ENTIRE initial catch-up — including the near-tip
+    // (reorg_arm) batches the old `!reorg_arm` gate excluded: webhooks are
+    // suppressed until initial_sync_complete, so per-event notify isn't owed,
+    // and events are a deliberate reorg-capture waiver (rollback removes
+    // created-after rows by block number), so armed batches lose nothing by
+    // buffering. The 2026-08-20 restart catch-up paid ~1 Neon round trip per
+    // event (thousands per batch) for exactly these armed batches.
+    // Steady-state polls (initial_sync_complete true) stay direct so live
+    // webhook notifications keep firing per event.
+    const buffer_v2_events = should_index_v2 and !self.initial_sync_complete.load(.acquire) and self.config.v2_event_buffer;
+    if (buffer_v2_events) {
+        self.write_buffer.active = true;
+        self.write_buffer.ledger = &self.placeholders;
+        self.database.names_barrier = .{ .ctx = self, .flush = Indexer.namesBarrierFlush };
+    }
     errdefer if (buffer_v2_events) {
+        self.database.names_barrier = null;
         self.write_buffer.active = false;
         self.write_buffer.reset();
     };
@@ -796,6 +865,16 @@ pub fn indexBlockRange(self: *Indexer, protocol: models.Protocol, client: *rpc.C
         // so any unknown_labels created in this range are present to heal. No-op when
         // LabelStore isn't deployed.
         try self.indexLabelStoreEvents(protocol, client, from_block, to_block);
+
+        // Phase 7: shared-registry aliases. A subregistry contract pointed at by
+        // several live parents makes every label in it resolve under every one of
+        // them, so each of those fully-qualified names needs its own row. Derived
+        // from state rather than fanned out in the handler: one log cannot back N
+        // `events`/`registrations` rows, and an adopting parent's pointer arrives
+        // after the labels it adopts. Runs last in the V2 block so the registry
+        // pointers and the labels of this range are both already landed; a no-op
+        // (one grouped scan) unless a registry really has two live parents.
+        aliasSync(self, protocol, to_block);
     }
 
     // === RESOLVER RECORD EVENTS (V1 and V2) ===
@@ -821,6 +900,7 @@ pub fn indexBlockRange(self: *Indexer, protocol: models.Protocol, client: *rpc.C
     // re-processes the batch into conflict-ignored inserts.
     if (buffer_v2_events) {
         self.write_buffer.active = false;
+        defer self.database.names_barrier = null;
         try self.write_buffer.flush(self.database);
     } else if (should_index_v2) {
         // Direct-mode twin of the flush repair: phase 1 writes datastore
@@ -832,4 +912,39 @@ pub fn indexBlockRange(self: *Indexer, protocol: models.Protocol, client: *rpc.C
         };
         if (repaired > 0) std.log.info("  Repaired {d} placeholder event name(s)", .{repaired});
     }
+}
+
+/// Best-effort wrapper around the shared-registry alias derivation: it is a
+/// self-healing projection, so a transient failure must never abort the batch —
+/// the next batch (or `--backfill`) recomputes it from scratch.
+/// Batches between full re-enqueues of every shared-registry candidate.
+///
+/// The derivation is change-driven: the handlers enqueue a registry when something that
+/// can alter its derived names happens. This sweep is the safety net for a missed
+/// enqueue — it converts "we forgot a hook" from a permanently missing name into a
+/// bounded delay. Cheap enough to run often: it reads the small `registry_entries`
+/// mirror (0.09ms measured) plus the registries that still hold derived rows.
+const ALIAS_SWEEP_EVERY_BATCHES: u64 = 64;
+
+/// Best-effort wrapper around the shared-registry alias derivation. It is a self-healing
+/// projection, so a transient failure must never abort the batch — the next batch (or
+/// `--backfill`) recomputes from the queue and the sweep.
+fn aliasSync(self: *Indexer, protocol: models.Protocol, to_block: u64) void {
+    // First pass of the process, and periodically after: re-enqueue every candidate so a
+    // dropped queue or a missed hook heals on its own.
+    if (self.alias_batches_since_sweep == 0 or self.alias_batches_since_sweep >= ALIAS_SWEEP_EVERY_BATCHES) {
+        _ = alias_sync.sweep(self, protocol, to_block) catch |err| {
+            std.log.warn("shared-registry alias sweep failed: {} (retried next batch)", .{err});
+        };
+        self.alias_batches_since_sweep = 1;
+    } else {
+        self.alias_batches_since_sweep += 1;
+    }
+
+    // Chain time for the parent-expiry test, from the batch head rather than the clock.
+    const now = self.getBlockTimestamp(protocol, to_block, null) catch 0;
+    _ = alias_sync.syncSharedRegistryAliases(self, protocol, now) catch |err| {
+        std.log.warn("shared-registry alias derivation failed: {} (retried next batch)", .{err});
+        return;
+    };
 }

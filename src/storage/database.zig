@@ -12,8 +12,10 @@ const Hash = @import("../types/hash.zig").Hash;
 // Import all module functions
 const names = @import("names.zig");
 const resolvers = @import("resolvers.zig");
+const resolver_records = @import("resolver_records.zig");
 const heal_targets = @import("heal_targets.zig");
 const registry_entries = @import("registry_entries.zig");
+const name_aliases = @import("name_aliases.zig");
 const reorg_undo = @import("reorg_undo.zig");
 const resolve_cache = @import("../resolve/cache.zig");
 const finality = @import("finality.zig");
@@ -43,7 +45,11 @@ pub const AccountFilters = accounts.AccountFilters;
 pub const AccountSortField = accounts.AccountSortField;
 pub const Account = accounts.Account;
 pub const PairTextKeyRow = resolvers.PairTextKeyRow;
+pub const PairCoinTypeRow = resolvers.PairCoinTypeRow;
+pub const ResolverLink = resolver_records.ResolverLink;
+pub const LinkedName = resolver_records.LinkedName;
 pub const NamedResource = named_resources.NamedResource;
+pub const ResolverEntity = resolvers.ResolverEntity;
 pub const ResolverEntityFilters = resolvers.ResolverEntityFilters;
 pub const ResolverEntitySortField = resolvers.ResolverEntitySortField;
 
@@ -65,6 +71,11 @@ pub const Tx = backend_mod.Tx;
 /// rows can never go stale: every writer in names_write.zig (plus the
 /// reachability cascades in registry_entries.zig) notifies through this hook.
 /// Callbacks must be infallible and cheap — they run inline on the write path.
+pub const NamesBarrier = struct {
+    ctx: *anyopaque,
+    flush: *const fn (ctx: *anyopaque) anyerror!void,
+};
+
 pub const NameWriteListener = struct {
     ctx: *anyopaque,
     /// insertName/insertNamesBatch: the post-upsert values of the prefetch
@@ -95,17 +106,33 @@ pub const Database = struct {
     /// Names-write observer (see NameWriteListener). Null outside the
     /// indexer's dispatch-scoped prefetch window.
     name_write_listener: ?NameWriteListener = null,
+    /// Flush barrier for buffered `names` rows (indexer/write_buffer.zig).
+    /// Armed by the indexer while V2 name inserts are buffered; every storage
+    /// function that reads or writes the names table calls `namesBarrier()`
+    /// first, so its SQL always sees exactly the rows the direct per-event path
+    /// would have written by then. Unarmed (API, replay, tests): a no-op.
+    names_barrier: ?NamesBarrier = null,
     /// SQLite page-cache size (MB) applied by dropSyncIndexes for bulk sync.
     /// Set by the indexer from Config (SYNC_CACHE_MB, .env-aware); process env
     /// still overrides inside dropSyncIndexes. Paths that never bulk-sync
     /// (API, tools, tests) keep the default.
     sync_cache_mb: u64 = 512,
+    /// COVERAGE_STALE_AFTER_SECONDS: how long a protocol may go without
+    /// committing a batch before the coverage `stale` flag trips on a deployment
+    /// with no finality data. Set by the API pool from Config; 0 (off) keeps
+    /// `stale` a pure function of DB state.
+    stale_after_seconds: u32 = 0,
 
     /// Records the chain ID this database serves data for. The value flows
     /// into Resolver entity IDs at JSON-build time. Called by both the
     /// indexer and the API at startup from the network config.
     pub fn setChainId(self: *Database, chain_id: u64) void {
         self.chain_id = chain_id;
+    }
+
+    /// Arms the no-finality staleness fallback for the coverage surface.
+    pub fn setStaleAfterSeconds(self: *Database, seconds: u32) void {
+        self.stale_after_seconds = seconds;
     }
 
     // ========================================================================
@@ -142,7 +169,27 @@ pub const Database = struct {
         // every table. The `migrate()` scaffold is kept as a thin hook so future
         // emergency in-place migrations have a wired path without re-introducing the
         // per-file migration ladder.
+        // `migrate()` runs both before and after the schema files, and the
+        // pre-pass is conditional.
+        //
+        // Before, on an existing database: when a table is missing, loadSchemaFiles
+        // replays the whole schema file as one multi-statement exec, where
+        // `CREATE TABLE IF NOT EXISTS` no-ops on the tables that already exist. An
+        // index in that file referencing a column added this release then fails with
+        // "column does not exist" and aborts the entire exec — including the table
+        // the replay existed to create — before the migration that would have added
+        // the column ever ran. That deadlocked boot on every pre-existing database.
+        //
+        // NOT before, on a fresh database: the generated schema files are
+        // authoritative there, and `migrate()` carries inline
+        // `CREATE TABLE IF NOT EXISTS` statements written in SQLite types, so running
+        // it first would create `accounts` and friends with int4 columns and leave
+        // the file's BIGINT definitions a no-op — silently narrowing
+        // first_seen_timestamp past 2038.
+        if (database.hasTable("names")) try schema.migrate(&database);
         try schema.loadSchemaFiles(&database);
+        // Again afterwards: idempotent, and it covers any migration that needs the
+        // completed schema (a table the replay just created) rather than preceding it.
         try schema.migrate(&database);
 
         // Reorg undo-log: capture tables + per-table triggers so rollbackToBlock can
@@ -211,6 +258,29 @@ pub const Database = struct {
         return (q.step() catch return false);
     }
 
+    /// Like `columnExists`, but also sees GENERATED columns. `pragma_table_info`
+    /// omits them (virtual and stored alike) — only `pragma_table_xinfo` lists
+    /// them — so a generated-column migration guard that used `columnExists`
+    /// would report "absent" on a database that already has the column and
+    /// re-run its ALTER on every boot. Postgres has no such hole
+    /// (`information_schema.columns` lists generated columns), hence the
+    /// SQLite-only pragma branch.
+    pub fn columnExistsIncludingGenerated(self: *Database, table_name: []const u8, column_name: []const u8) bool {
+        if (!self.isPostgres()) {
+            var q = Query.init(self, "SELECT 1 FROM pragma_table_xinfo(?) WHERE name = ?") catch return false;
+            defer q.deinit();
+            q.bindText(table_name) catch return false;
+            q.bindText(column_name) catch return false;
+            return (q.step() catch return false);
+        }
+        const cols = self.introspectColumns(self.allocator, table_name) catch return false;
+        defer backend_mod.freeColumnInfo(self.allocator, cols);
+        for (cols) |col| {
+            if (std.mem.eql(u8, col.name, column_name)) return true;
+        }
+        return false;
+    }
+
     /// Execute a parameterless statement, dispatched through the backend.
     pub fn exec(self: *Database, sql: []const u8) !void {
         return self.backend.vtable.execRaw(self.backend.ptr, sql);
@@ -230,6 +300,11 @@ pub const Database = struct {
     /// ROWID of the most recent successful INSERT on this connection.
     pub fn lastInsertId(self: *Database) i64 {
         return self.backend.vtable.lastInsertId(self.backend.ptr);
+    }
+
+    /// See `names_barrier`. Called at the top of every names-table accessor.
+    pub fn namesBarrier(self: *Database) !void {
+        if (self.names_barrier) |b| try b.flush(b.ctx);
     }
 
     pub fn noteNameUpsert(self: *Database, protocol: models.Protocol, registry: Address, canonical_id: u256, namehash: Hash, name: ?[]const u8) void {
@@ -385,6 +460,8 @@ pub const Database = struct {
 
     // Names module (15 functions)
     pub const insertRegistry = names.insertRegistry;
+    pub const setSeededRootRegistryCreation = names.setSeededRootRegistryCreation;
+    pub const setSeededSubregistryCreation = names.setSeededSubregistryCreation;
     pub const insertName = names.insertName;
     pub const insertNamesBatch = names.insertNamesBatch;
     pub const getNameByNamehash = names.getNameByNamehash;
@@ -400,10 +477,12 @@ pub const Database = struct {
     pub const getReverseRecordNamehash = resolvers.getReverseRecordNamehash;
     pub const updateNameResolver = names.updateNameResolver;
     pub const recursivelyGcEmptyDomain = names.recursivelyGcEmptyDomain;
+    pub const deleteNameByNamehashScoped = names.deleteNameByNamehashScoped;
     pub const applyLatestResolverFromEvents = resolvers.applyLatestResolverFromEvents;
     pub const getNameByTokenIdAndRegistry = names.getNameByTokenIdAndRegistry;
     pub const getUniqueNameByCanonicalId = names.getUniqueNameByCanonicalId;
     pub const getNamesByCanonicalIds = names.getNamesByCanonicalIds;
+    pub const getNamesInRegistry = names.getNamesInRegistry;
     pub const getNamesByNamehashes = names.getNamesByNamehashes;
     pub const deleteNameByNamehash = names.deleteNameByNamehash;
     pub const updateNameTokenIdByNamehash = names.updateNameTokenIdByNamehash;
@@ -436,6 +515,23 @@ pub const Database = struct {
     pub const getContentHashesBatch = resolvers.getContentHashesBatch;
     pub const getTextRecordsBatch = resolvers.getTextRecordsBatch;
     pub const getTextRecordKeysForPairs = resolvers.getTextRecordKeysForPairs;
+    pub const getCoinTypesForPairs = resolvers.getCoinTypesForPairs;
+    pub const upsertResolverLink = resolver_records.upsertResolverLink;
+    pub const getResolverLink = resolver_records.getResolverLink;
+    pub const resolveRecordKey = resolver_records.resolveRecordKey;
+    pub const resolveRecordKeys = resolver_records.resolveRecordKeys;
+    pub const getEffectiveRecordId = resolver_records.getEffectiveRecordId;
+    pub const getLinkedNames = resolver_records.getLinkedNames;
+    pub const storeResolverData = resolver_records.storeResolverData;
+    pub const deleteResolverData = resolver_records.deleteResolverData;
+    pub const deleteResolverDatas = resolver_records.deleteResolverDatas;
+    pub const deleteResolverAddress = resolver_records.deleteResolverAddress;
+    pub const getDataRecord = resolver_records.getDataRecord;
+    pub const getDataKeys = resolver_records.getDataKeys;
+    pub const upsertResolverKind = resolver_records.upsertResolverKind;
+    pub const getResolverKind = resolver_records.getResolverKind;
+    pub const recordKey = resolver_records.recordKey;
+    pub const getResourceRoleUnion = resolver_records.getResourceRoleUnion;
     pub const getTextRecordKeys = resolvers.getTextRecordKeys;
     pub const getTextRecord = resolvers.getTextRecord;
     pub const getResolversByOwner = resolvers.getResolversByOwner;
@@ -475,6 +571,7 @@ pub const Database = struct {
     // Names module - resolver query
     pub const getNamesByResolver = names.getNamesByResolver;
     pub const getDomainByResolver = names.getDomainByResolver;
+    pub const getDomainsByResolvers = names.getDomainsByResolvers;
     pub const WrappedDomainFilters = names.WrappedDomainFilters;
     pub const getWrappedDomains = names.getWrappedDomains;
 
@@ -492,7 +589,10 @@ pub const Database = struct {
     pub const checkIntegrity = sync.checkIntegrity;
     pub const probeLiveness = sync.probeLiveness;
     pub const ensureSyncPathIndexes = schema.ensureSyncPathIndexes;
+    pub const migrate = schema.migrate;
+    pub const loadSchemaFiles = schema.loadSchemaFiles;
     pub const registerSubregistry = sync.registerSubregistry;
+    pub const registerSubregistriesBatch = sync.registerSubregistriesBatch;
     pub const registerResolver = sync.registerResolver;
     pub const registerResolverIfNew = sync.registerResolverIfNew;
     pub const isKnownResolver = sync.isKnownResolver;
@@ -511,6 +611,7 @@ pub const Database = struct {
     pub const insertEventIfNew = events.insertEventIfNew;
     pub const getRecentEvents = events.getRecentEvents;
     pub const getEventsFiltered = events.getEventsFiltered;
+    pub const getEventsForNamehashesPage = events.getEventsForNamehashesPage;
     pub const getEventsByNamehash = events.getEventsByNamehash;
     pub const getEventsByDomain = events.getEventsByDomain;
     pub const insertApproval = events.insertApproval;
@@ -570,9 +671,26 @@ pub const Database = struct {
     pub const getRegistryEntryLiveParents = registry_entries.getLiveParents;
     pub const collectSubregistrySubtree = registry_entries.collectSubtreeRooted;
     pub const isRegistryReachable = registry_entries.isRegistryReachable;
+    pub const recomputeSubtreeReachability = registry_entries.recomputeSubtreeReachability;
     pub const reconcileV2Reachability = registry_entries.reconcileV2Reachability;
     pub const setRegistriesReachability = registry_entries.setRegistriesReachability;
     pub const markNameUnreachableByNamehash = registry_entries.markNameUnreachableByNamehash;
+
+    // Shared-registry aliases — one Domain per live referring parent
+    pub const getLiveParentNames = name_aliases.getLiveParentNames;
+    pub const getLiveParentNamesAsOf = name_aliases.getLiveParentNamesAsOf;
+    pub const aliasPlanBatch = name_aliases.aliasPlanBatch;
+    pub const deleteStaleAliasesScoped = name_aliases.deleteStaleAliasesScoped;
+    pub const enqueueAliasWork = name_aliases.enqueueAliasWork;
+    pub const takeAliasWork = name_aliases.takeAliasWork;
+    pub const freeAliasWork = name_aliases.freeAliasWork;
+    pub const saveAliasWorkCursorHex = name_aliases.saveAliasWorkCursorHex;
+    pub const completeAliasWork = name_aliases.completeAliasWork;
+    pub const enqueueAllAliasCandidates = name_aliases.enqueueAllAliasCandidates;
+    pub const buildAliasRow = name_aliases.buildAliasRow;
+    pub const primaryExistsAt = name_aliases.primaryExistsAt;
+    pub const deleteStaleAliases = name_aliases.deleteStaleAliases;
+    pub const freeLiveParents = name_aliases.freeLiveParents;
 
     // Accounts module — first-class Account entity (subgraph parity)
     pub const upsertAccount = accounts.upsertAccount;

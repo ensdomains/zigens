@@ -201,6 +201,7 @@ pub fn getFilteredAccounts(
 // since we don't carry a per-name observation block on `names`.
 
 pub fn backfillFromExistingData(db: *Database) !u64 {
+    try db.namesBarrier();
     const seed_block_sql = "SELECT COALESCE(MIN(last_synced_block), 0) FROM sync_state";
     var seed_q = try Query.init(db, seed_block_sql);
     defer seed_q.deinit();

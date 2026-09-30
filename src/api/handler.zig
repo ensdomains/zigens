@@ -13,7 +13,14 @@ const resolvers = @import("resolvers/resolvers.zig");
 /// GraphQL query handler for ENSv2 Indexer
 /// Provides subgraph-compatible GraphQL API
 const schema_validator_mod = @import("schema_validator.zig");
+const introspection_projection = @import("introspection_projection.zig");
 const query_validator = @import("query_validator.zig");
+
+/// Executions at or above this take the slow-query warn path (GRAPHQL_SLOW_QUERY_MS).
+pub const DEFAULT_SLOW_QUERY_THRESHOLD_US: u64 = 2_000_000;
+
+/// Byte cap on the query text quoted in a slow-query log line.
+pub const SLOW_QUERY_EXCERPT_BYTES = 300;
 
 pub const GraphQLHandler = struct {
     allocator: std.mem.Allocator,
@@ -25,6 +32,10 @@ pub const GraphQLHandler = struct {
     complexity_max_depth: u32,
     complexity_max_cost: u32,
     metrics: metrics_mod.Metrics,
+    /// Executions (successful or failed) that take at least this long are logged
+    /// at warn level with depth, cost, outcome and a query excerpt, so a histogram
+    /// outlier can be attributed to a concrete document. Set from config after init.
+    slow_query_threshold_us: u64 = DEFAULT_SLOW_QUERY_THRESHOLD_US,
 
     pub fn init(allocator: std.mem.Allocator, max_depth: u32, max_cost: u32, metrics_enabled: bool) !GraphQLHandler {
         // Create execution context. The database is per-request: handleQuery sets it
@@ -61,6 +72,7 @@ pub const GraphQLHandler = struct {
         try executor.registerResolver("expiryUpdateds", resolvers.resolveExpiryUpdateds);
         try executor.registerResolver("resolverUpdateds", resolvers.resolveResolverUpdateds);
         try executor.registerResolver("labelRegistereds", resolvers.resolveLabelRegistereds);
+        try executor.registerResolver("eacRolesChangeds", resolvers.resolveEACRolesChangeds);
         try executor.registerResolver("reverseClaimeds", resolvers.resolveReverseClaimeds);
         try executor.registerResolver("registryTransfers", resolvers.resolveRegistryTransfers);
         try executor.registerResolver("roles", resolvers.resolveRoles);
@@ -106,16 +118,14 @@ pub const GraphQLHandler = struct {
         self.introspection_parsed.deinit();
     }
 
-    /// Walk the parsed operations and validate each root field against the
-    /// schema. The validator skips meta fields (`__typename`, `__schema`, …)
-    /// and unknown root field names (those are surfaced separately by the
-    /// executor as `UnknownRootField`).
-    fn validateDocumentArgs(self: *GraphQLHandler, document: *const parser.Document) schema_validator_mod.SchemaValidator.Error!void {
+    /// Validate every operation's selection set against the schema. The
+    /// validator skips meta fields (`__typename`, `__schema`, …) and unknown
+    /// root field names (those are surfaced separately by the executor as
+    /// `UnknownRootField`).
+    fn validateDocument(self: *GraphQLHandler, allocator: std.mem.Allocator, document: *const parser.Document) schema_validator_mod.SchemaValidator.Error!void {
         schema_validator_mod.clearDiag();
-        for (document.operations) |op| {
-            for (op.fields) |*field| {
-                try self.schema_validator.validateRootField(field);
-            }
+        for (document.operations) |*op| {
+            try self.schema_validator.validateOperation(allocator, op, document.fragments);
         }
     }
 
@@ -211,10 +221,9 @@ pub const GraphQLHandler = struct {
                 break :intro; // multiple unnamed ops -> let the executor error
             };
             for (op.fields) |*f| {
-                if (std.mem.eql(u8, f.name, "__schema")) return try self.handleIntrospectionQuery();
-            }
-            for (op.fields) |*f| {
-                if (std.mem.eql(u8, f.name, "__type")) return try self.handleTypeIntrospectionQuery(f, variables);
+                if (std.mem.eql(u8, f.name, "__schema") or std.mem.eql(u8, f.name, "__type")) {
+                    return try self.handleIntrospectionRoots(op, &document, variables);
+                }
             }
         }
 
@@ -276,12 +285,13 @@ pub const GraphQLHandler = struct {
         std.log.debug("Query complexity: depth={d}, cost={d}", .{ analysis.depth, analysis.cost });
 
         // Schema validation pass — runs against the parsed document before any
-        // resolver runs. Catches missing required args, unknown args, and
-        // unknown fields inside input objects. Replaces per-resolver manual
+        // resolver runs. Catches missing required args, unknown args, unknown
+        // fields in selection sets and input objects, and fragments on the
+        // wrong type, at every depth. Replaces per-resolver manual
         // checks for the generic-cases (specific InvalidAddress / TooManyNames
         // / etc. type errors stay in the resolvers — they need value-level
         // context that schema validation can't see).
-        if (self.validateDocumentArgs(&document)) {} else |val_err| {
+        if (self.validateDocument(request_alloc, &document)) {} else |val_err| {
             self.metrics.recordError();
             // Stable message-family prefixes (external detectors match on them and
             // on extensions.code); the tail names the offending field/argument and
@@ -291,6 +301,8 @@ pub const GraphQLHandler = struct {
                 error.MissingRequiredArg => "Missing required argument",
                 error.UnknownArgument => "Unknown argument",
                 error.UnknownInputObjectField => "Unknown field in input object",
+                error.UnknownField => "Unknown field",
+                error.InvalidFragmentType => "Invalid fragment",
                 else => "Query validation failed",
             };
             var msg_buf: [280]u8 = undefined;
@@ -308,7 +320,9 @@ pub const GraphQLHandler = struct {
             // warn, not err: execution failures include client-driven rejections
             // (complexity LimitExceeded, bad arguments) — not server faults.
             std.log.warn("Failed to execute GraphQL query: {}", .{err});
-            self.metrics.recordError();
+            const failed_after_us = timer.elapsedMicroseconds();
+            self.metrics.recordErrorWithDuration(failed_after_us);
+            self.logSlowQuery(failed_after_us, analysis.depth, analysis.cost, @errorName(err), query);
             if (err == error.OperationNotFound) {
                 return try self.buildErrorResponseWithCode("Operation not found", ErrorCode.VALIDATION_ERROR);
             } else if (err == error.OperationNameRequired) {
@@ -329,6 +343,8 @@ pub const GraphQLHandler = struct {
                 return try self.buildErrorResponseWithCode("Invalid protocol: must be 'v1' or 'v2'", ErrorCode.INVALID_ARGUMENT);
             } else if (err == error.TooManyNames) {
                 return try self.buildErrorResponseWithCode("name_in: too many names (cap is 1000 per query)", ErrorCode.INVALID_ARGUMENT);
+            } else if (err == error.UndefinedVariable) {
+                return try self.buildErrorResponseWithCode("Undefined variable: an argument references a `$variable` the operation does not declare, or a required one that was not provided", ErrorCode.VALIDATION_ERROR);
             } else if (err == error.UnknownRootField) {
                 return try self.buildErrorResponseWithCode("Unknown root field: query references a Query field that does not exist in the schema. Check the schema or run an introspection query.", ErrorCode.VALIDATION_ERROR);
             } else if (err == error.SubSelectionOnScalar) {
@@ -349,71 +365,87 @@ pub const GraphQLHandler = struct {
         // Record successful query with timing
         const duration_us = timer.elapsedMicroseconds();
         self.metrics.recordQuery(duration_us, analysis.depth, analysis.cost);
+        self.logSlowQuery(duration_us, analysis.depth, analysis.cost, "ok", query);
 
         // Dupe result from arena to GPA for the caller (arena is freed on return)
         return try self.allocator.dupe(u8, result);
     }
 
-    fn handleIntrospectionQuery(self: *GraphQLHandler) ![]u8 {
-        // Return GraphQL introspection response for autocomplete
-        // Generated from schema.graphql at build time
-        const introspection_response = @embedFile("introspection.json");
-        return try self.allocator.dupe(u8, introspection_response);
+    /// Warn about an execution at or above `slow_query_threshold_us`. `outcome` is
+    /// "ok" or the execution error name. Stack-only: the excerpt lives in a local
+    /// buffer so the slow path adds no allocation to the request.
+    fn logSlowQuery(self: *const GraphQLHandler, duration_us: u64, depth: u32, cost: u32, outcome: []const u8, query: []const u8) void {
+        if (duration_us < self.slow_query_threshold_us) return;
+        var excerpt_buf: [SLOW_QUERY_EXCERPT_BYTES]u8 = undefined;
+        const excerpt = queryExcerpt(query, &excerpt_buf);
+        std.log.warn("slow graphql query: {d} ms, depth {d}, cost {d}, {s}, query: {s}", .{ duration_us / std.time.us_per_ms, depth, cost, outcome, excerpt });
     }
 
-    fn handleTypeIntrospectionQuery(self: *GraphQLHandler, field: *const parser.Field, variables: ?std.json.Value) ![]u8 {
-        // Read the requested type name from the parsed __type(name: ...) field. The literal
-        // form `__type(name: "Domain")` resolves via getStringArg; the variable form
-        // `__type(name: $name)` (used by the graphql-http conformance suite and by clients
-        // that parameterize introspection) is resolved here against the request variables.
-        const type_name = blk: {
-            if (parser.getStringArg(field, "name", null)) |literal| break :blk literal;
-            for (field.arguments) |*arg| {
-                if (!std.mem.eql(u8, arg.name, "name")) continue;
-                switch (arg.value) {
-                    .variable => |var_name| {
-                        if (variables) |vars| {
-                            if (vars == .object) {
-                                if (vars.object.get(var_name)) |jv| {
-                                    if (jv == .string) break :blk jv.string;
-                                }
+    /// Answer every introspection root of the operation (`__schema`, `__type`,
+    /// `__typename`) under its alias, narrowed to the requested selection set —
+    /// see `introspection_projection`. Data fields mixed into the same operation
+    /// are not executed (introspection is intercepted before the executor).
+    fn handleIntrospectionRoots(self: *GraphQLHandler, op: *const parser.Operation, document: *const parser.Document, variables: ?std.json.Value) ![]u8 {
+        const schema = self.introspection_parsed.value.object.get("data").?.object.get("__schema").?;
+        const ctx = introspection_projection.Context{
+            .allocator = self.allocator,
+            .types = schema.object.get("types").?.array.items,
+            .fragments = document.fragments,
+        };
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "{\"data\":{");
+        var first = true;
+        for (op.fields) |*f| {
+            const is_schema = std.mem.eql(u8, f.name, "__schema");
+            const is_type = std.mem.eql(u8, f.name, "__type");
+            const is_typename = std.mem.eql(u8, f.name, "__typename");
+            if (!is_schema and !is_type and !is_typename) continue;
+
+            if (!first) try out.append(self.allocator, ',');
+            first = false;
+            const key = try std.json.Stringify.valueAlloc(self.allocator, f.alias orelse f.name, .{});
+            defer self.allocator.free(key);
+            try out.appendSlice(self.allocator, key);
+            try out.append(self.allocator, ':');
+
+            if (is_typename) {
+                try out.appendSlice(self.allocator, "\"Query\"");
+            } else if (is_schema) {
+                try introspection_projection.writeProjected(ctx, &out, schema, f.selections, "__Schema");
+            } else {
+                const type_name = resolveTypeNameArg(f, variables) orelse
+                    return try self.buildErrorResponseWithCode("Invalid __type query: missing name argument", ErrorCode.VALIDATION_ERROR);
+                const found = introspection_projection.findType(ctx, type_name) orelse std.json.Value.null;
+                try introspection_projection.writeProjected(ctx, &out, found, f.selections, "__Type");
+            }
+        }
+        try out.appendSlice(self.allocator, "}}");
+        return try out.toOwnedSlice(self.allocator);
+    }
+
+    /// The `name` argument of a `__type` field: literal form, or the variable
+    /// form resolved against the request variables (used by the graphql-http
+    /// conformance suite and by clients that parameterize introspection).
+    fn resolveTypeNameArg(field: *const parser.Field, variables: ?std.json.Value) ?[]const u8 {
+        if (parser.getStringArg(field, "name", null)) |literal| return literal;
+        for (field.arguments) |*arg| {
+            if (!std.mem.eql(u8, arg.name, "name")) continue;
+            switch (arg.value) {
+                .variable => |var_name| {
+                    if (variables) |vars| {
+                        if (vars == .object) {
+                            if (vars.object.get(var_name)) |jv| {
+                                if (jv == .string) return jv.string;
                             }
                         }
-                    },
-                    else => {},
-                }
-            }
-            return try self.buildErrorResponseWithCode("Invalid __type query: missing name argument", ErrorCode.VALIDATION_ERROR);
-        };
-
-        // Reuse the introspection parsed once at handler init (no per-request re-parse).
-        const parsed = self.introspection_parsed;
-
-        // Find the requested type
-        const types = parsed.value.object.get("data").?.object.get("__schema").?.object.get("types").?.array;
-
-        var found_type: ?std.json.Value = null;
-        for (types.items) |type_val| {
-            const name = type_val.object.get("name").?.string;
-            if (std.mem.eql(u8, name, type_name)) {
-                found_type = type_val;
-                break;
+                    }
+                },
+                else => {},
             }
         }
-
-        if (found_type == null) {
-            // Type not found - return null per GraphQL spec
-            return try self.allocator.dupe(u8, "{\"data\":{\"__type\":null}}");
-        }
-
-        // Serialize the type object to JSON
-        const type_json = std.json.Stringify.valueAlloc(self.allocator, found_type.?, .{}) catch {
-            return try self.buildErrorResponseWithCode("Failed to serialize type data", ErrorCode.INTERNAL_ERROR);
-        };
-        defer self.allocator.free(type_json);
-
-        // Build response
-        return try std.fmt.allocPrint(self.allocator, "{{\"data\":{{\"__type\":{s}}}}}", .{type_json});
+        return null;
     }
 
     const ErrorLocation = struct {
@@ -519,7 +551,92 @@ pub const GraphQLHandler = struct {
     }
 };
 
+/// Single-line excerpt of a query for log output: whitespace runs collapse to
+/// one space and the result is cut at the buffer size, backing off to a UTF-8
+/// boundary so a truncated string-literal cannot leave a split codepoint.
+pub fn queryExcerpt(query: []const u8, buf: *[SLOW_QUERY_EXCERPT_BYTES]u8) []const u8 {
+    var len: usize = 0;
+    var pending_space = false;
+    var truncated = false;
+    for (query) |c| {
+        if (std.ascii.isWhitespace(c)) {
+            pending_space = len > 0;
+            continue;
+        }
+        if (pending_space) {
+            if (len == buf.len) {
+                truncated = true;
+                break;
+            }
+            buf[len] = ' ';
+            len += 1;
+            pending_space = false;
+        }
+        if (len == buf.len) {
+            truncated = true;
+            break;
+        }
+        buf[len] = c;
+        len += 1;
+    }
+    if (truncated) {
+        while (len > 0 and (buf[len - 1] & 0xC0) == 0x80) len -= 1;
+        if (len > 0 and buf[len - 1] >= 0xC0) len -= 1;
+    }
+    return buf[0..len];
+}
+
 const testing = std.testing;
+
+test "queryExcerpt: collapses whitespace runs and trims the edges" {
+    var buf: [SLOW_QUERY_EXCERPT_BYTES]u8 = undefined;
+    const out = queryExcerpt("  query   Q {\n\tdomains(first: 1) {\n\t\tid\n\t}\n}\n", &buf);
+    try testing.expectEqualStrings("query Q { domains(first: 1) { id } }", out);
+}
+
+test "queryExcerpt: truncates to the buffer size on a UTF-8 boundary" {
+    var buf: [SLOW_QUERY_EXCERPT_BYTES]u8 = undefined;
+
+    const long = "{ domains(where:{name:\"" ++ ("a" ** 400) ++ "\"}){ id } }";
+    const cut = queryExcerpt(long, &buf);
+    try testing.expectEqual(@as(usize, SLOW_QUERY_EXCERPT_BYTES), cut.len);
+    try testing.expect(std.mem.startsWith(u8, cut, "{ domains(where:{name:\"aaaa"));
+
+    // 297 ASCII bytes then a 4-byte codepoint: the codepoint straddles the cap and is dropped whole.
+    const straddle = ("b" ** 297) ++ "\u{1F600}" ++ "tail";
+    const trimmed = queryExcerpt(straddle, &buf);
+    try testing.expectEqual(@as(usize, 297), trimmed.len);
+    try testing.expect(std.unicode.utf8ValidateSlice(trimmed));
+
+    const short = queryExcerpt("{ _meta { block { number } } }", &buf);
+    try testing.expectEqualStrings("{ _meta { block { number } } }", short);
+}
+
+test "handleQuery: slow-query threshold of zero logs but does not alter the response" {
+    const allocator = testing.allocator;
+    var database = try db.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var handler = try GraphQLHandler.init(allocator, 10, 10000, true);
+    defer handler.deinit();
+    try testing.expectEqual(DEFAULT_SLOW_QUERY_THRESHOLD_US, handler.slow_query_threshold_us);
+    handler.slow_query_threshold_us = 0;
+
+    // Success path: every execution is "slow", response is still plain data.
+    const ok = try handler.handleQuery(&database, "{ domains(first:1){ id } }", null, null, false);
+    defer allocator.free(ok);
+    try testing.expect(std.mem.indexOf(u8, ok, "\"data\"") != null);
+    try testing.expect(std.mem.indexOf(u8, ok, "\"errors\"") == null);
+
+    // Failure path: an execution error is timed into the histogram and slow-logged too.
+    const bad = try handler.handleQuery(&database, "{ account(id:\"nope\"){ id } }", null, null, false);
+    defer allocator.free(bad);
+    try testing.expect(std.mem.indexOf(u8, bad, "\"code\":\"INVALID_ARGUMENT\"") != null);
+
+    const snapshot = handler.metrics.getSnapshot();
+    try testing.expectEqual(@as(u64, 1), snapshot.successful_queries);
+    try testing.expectEqual(@as(u64, 1), snapshot.failed_queries);
+    try testing.expectEqual(@as(u64, 2), snapshot.duration_count);
+}
 
 // Build a handler over a fresh in-memory DB (full schema loaded by Database.init),
 // run a query end-to-end through handleQuery, and assert the response is a DATA
@@ -547,6 +664,51 @@ test "handleQuery: __schema inside a string argument is data, not introspection"
 
 test "handleQuery: operation named IntrospectionQuery still executes its data fields" {
     try expectQueryReturnsData("query IntrospectionQuery { domains(first:1){ id } }", "IntrospectionQuery");
+}
+
+fn introspect(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
+    var database = try db.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var handler = try GraphQLHandler.init(allocator, 10, 10000, false);
+    defer handler.deinit();
+    return try handler.handleQuery(&database, query, null, null, false);
+}
+
+test "introspection: __schema honours the selection set and expands queryType" {
+    const a = testing.allocator;
+    const result = try introspect(a, "{ __schema { queryType { fields { name } } } }");
+    defer a.free(result);
+    try testing.expect(std.mem.startsWith(u8, result, "{\"data\":{\"__schema\":{\"queryType\":{\"fields\":[{\"name\":\"domain\"}"));
+    try testing.expect(std.mem.indexOf(u8, result, "\"types\"") == null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"name\":\"roles\"") != null);
+}
+
+test "introspection: aliased __type lands under the alias and only carries requested fields" {
+    const a = testing.allocator;
+    const result = try introspect(a, "{ q: __type(name: \"EventFilter\") { name inputFields { name } } t: __typename }");
+    defer a.free(result);
+    try testing.expect(std.mem.startsWith(u8, result, "{\"data\":{\"q\":{\"name\":\"EventFilter\",\"inputFields\":[{\"name\":\"type\"}"));
+    try testing.expect(std.mem.indexOf(u8, result, "\"name\":\"resource\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"kind\"") == null);
+    try testing.expect(std.mem.endsWith(u8, result, ",\"t\":\"Query\"}}"));
+}
+
+test "introspection: GraphiQL-style fragments over __schema.types" {
+    const a = testing.allocator;
+    const result = try introspect(a, "query IntrospectionQuery { __schema { types { ...FullType } } } fragment FullType on __Type { kind name }");
+    defer a.free(result);
+    try testing.expect(std.mem.indexOf(u8, result, "{\"kind\":\"OBJECT\",\"name\":\"Query\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"fields\"") == null);
+}
+
+test "introspection: unknown __type is null and a missing name argument is a validation error" {
+    const a = testing.allocator;
+    const none = try introspect(a, "{ __type(name: \"Nope\") { name } }");
+    defer a.free(none);
+    try testing.expectEqualStrings("{\"data\":{\"__type\":null}}", none);
+    const bad = try introspect(a, "{ __type { name } }");
+    defer a.free(bad);
+    try testing.expect(std.mem.indexOf(u8, bad, "VALIDATION_ERROR") != null);
 }
 
 test "handleQuery: __type( inside a string argument is data, not introspection" {

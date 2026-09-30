@@ -39,6 +39,7 @@ fn pgTestConfig() !config.Config {
         .poll_interval = 12,
         .batch_size = 2000,
         .rate_limit_per_second = 15,
+        .rpc_rate_limit_per_second = 15,
         .trusted_proxy_hops = 0,
         .request_timeout_ms = 10000,
         .max_concurrent_connections = 512,
@@ -69,6 +70,7 @@ fn pgTestConfig() !config.Config {
         .ccip_gateway_timeout_ms = 5000,
         .ccip_max_redirects = 4,
         .finality_enabled = false,
+        .coverage_stale_after_seconds = 0,
     };
 }
 

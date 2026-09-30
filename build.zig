@@ -557,6 +557,24 @@ pub fn build(b: *std.Build) void {
     const run_storage_webhooks_tests = b.addRunArtifact(storage_webhooks_tests);
     run_storage_webhooks_tests.setCwd(b.path("."));
 
+    // Storage tests - page loaders (per-namehash events window, domain-by-resolver)
+    const storage_page_loaders_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/storage/page_loaders_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "helpers", .module = helpers_mod },
+                .{ .name = "lib", .module = lib_mod },
+            },
+        }),
+    });
+    storage_page_loaders_tests.root_module.link_libc = true;
+    storage_page_loaders_tests.root_module.linkSystemLibrary("sqlite3", .{});
+
+    const run_storage_page_loaders_tests = b.addRunArtifact(storage_page_loaders_tests);
+    run_storage_page_loaders_tests.setCwd(b.path("."));
+
     // Storage tests - init-gap heal ledger
     const storage_heal_targets_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -628,6 +646,24 @@ pub fn build(b: *std.Build) void {
 
     const run_storage_registry_entries_tests = b.addRunArtifact(storage_registry_entries_tests);
     run_storage_registry_entries_tests.setCwd(b.path("."));
+
+    // Storage tests - shared-registry alias derivation (one Domain per live referring parent)
+    const storage_name_aliases_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/storage/name_aliases_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "helpers", .module = helpers_mod },
+                .{ .name = "lib", .module = lib_mod },
+            },
+        }),
+    });
+    storage_name_aliases_tests.root_module.link_libc = true;
+    storage_name_aliases_tests.root_module.linkSystemLibrary("sqlite3", .{});
+
+    const run_storage_name_aliases_tests = b.addRunArtifact(storage_name_aliases_tests);
+    run_storage_name_aliases_tests.setCwd(b.path("."));
 
     // Query abstraction tests (the backend statement seam) — uses the `lib`
     // module (in-memory DB via Database.initWithoutSchema).
@@ -757,9 +793,11 @@ pub fn build(b: *std.Build) void {
     storage_test_step.dependOn(&run_storage_roles_tests.step);
     storage_test_step.dependOn(&run_storage_webhooks_tests.step);
     storage_test_step.dependOn(&run_storage_heal_targets_tests.step);
+    storage_test_step.dependOn(&run_storage_page_loaders_tests.step);
     storage_test_step.dependOn(&run_storage_batch_insert_tests.step);
     storage_test_step.dependOn(&run_storage_name_prefetch_tests.step);
     storage_test_step.dependOn(&run_storage_registry_entries_tests.step);
+    storage_test_step.dependOn(&run_storage_name_aliases_tests.step);
     storage_test_step.dependOn(&run_storage_query_tests.step);
     storage_test_step.dependOn(&run_storage_schema_keys_tests.step);
     storage_test_step.dependOn(&run_storage_pg_dialect_tests.step);
@@ -776,9 +814,11 @@ pub fn build(b: *std.Build) void {
         storage_resolvers_tests,
         storage_roles_tests,
         storage_registry_entries_tests,
+        storage_name_aliases_tests,
         storage_query_tests,
         storage_webhooks_tests,
         storage_heal_targets_tests,
+        storage_page_loaders_tests,
         storage_batch_insert_tests,
         storage_name_prefetch_tests,
         backend_conformance_tests,
@@ -806,6 +846,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_storage_batch_insert_tests.step);
     test_step.dependOn(&run_storage_name_prefetch_tests.step);
     test_step.dependOn(&run_storage_registry_entries_tests.step);
+    test_step.dependOn(&run_storage_name_aliases_tests.step);
     test_step.dependOn(&run_backend_conformance_tests.step);
     test_step.dependOn(&run_pool_tests.step);
     test_step.dependOn(&run_normalize_tests.step);

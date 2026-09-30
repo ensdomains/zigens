@@ -182,6 +182,7 @@ fn appendNameScalarConditions(
     }
     if (filters.resolver != null) try conditions.append(db.allocator, "resolver = ?");
     if (filters.registry != null) try conditions.append(db.allocator, "registry = ?");
+    if (filters.exclude_aliases) try conditions.append(db.allocator, "is_alias = 0");
     if (filters.token_id != null) try conditions.append(db.allocator, "token_id = ?");
     if (filters.canonical_id != null) try conditions.append(db.allocator, "canonical_id = ?");
     if (filters.subregistry_pointer != null) {
@@ -328,6 +329,7 @@ pub fn countRowsBeforeNamehash(
     order_dir: OrderDir,
     filters: NameFilters,
 ) !u32 {
+    try db.namesBarrier();
     const field_outer = sort_field.toSqlQualified("names.");
     const field_cursor = sort_field.toSqlQualified("c.");
     // "before" means "would appear earlier in the result set" — depends on sort direction:
@@ -518,6 +520,16 @@ pub const NameFilters = struct {
     /// Implemented as a correlated EXISTS join over `registry_entries`; there is no
     /// subregistry column on `names`.
     subregistry_pointer: ?Address = null,
+    /// Exclude the derived shared-registry alias rows (`is_alias = 1`).
+    ///
+    /// Only `RegistryInfo.labels` / `labelConnection` / `labelCount` set this, and
+    /// they have to: a registry pointed at by N live parents makes every label in
+    /// it resolve as N fully-qualified names, so each is its own Domain row — but
+    /// those three fields are defined as "the labels minted in and managed by this
+    /// registry", one per mint. Counting rows would report N per label. Every other
+    /// read path leaves this false, because an alias is a real, resolvable name and
+    /// belongs in listings.
+    exclude_aliases: bool = false,
     // Migration filter
     migrated: ?bool = null,
     // Subdomain filters (requires subquery)
@@ -544,6 +556,7 @@ pub const NameFilters = struct {
 
 /// Get names with filters pushed down to DB query
 pub fn getFilteredNames(db: *Database, filters: NameFilters, skip: u32, limit: u32, order_dir: OrderDir, sort_field: NameSortField) ![]models.Name {
+    try db.namesBarrier();
     const order_str = if (order_dir == .desc) "DESC" else "ASC";
 
     // Build WHERE conditions via the shared helper so all callers (getFilteredNames,
@@ -642,6 +655,7 @@ fn bindKeysetValue(q: *Query, sort_field: NameSortField, value: []const u8) !voi
 /// parallel (read from an extra `{field} AS _sortval` column) so the caller can build
 /// per-edge cursors without materializing the sort field on models.Name.
 pub fn getFilteredNamesKeyset(db: *Database, filters: NameFilters, anchor: ?KeysetAnchor, limit: u32, order_dir: OrderDir, sort_field: NameSortField) !KeysetResult {
+    try db.namesBarrier();
     const order_str = if (order_dir == .desc) "DESC" else "ASC";
     const op = if (order_dir == .desc) "<" else ">";
 
@@ -717,6 +731,7 @@ pub fn getFilteredNamesKeyset(db: *Database, filters: NameFilters, anchor: ?Keys
 
 /// Get all names with configurable order direction
 pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u32, order_dir: OrderDir, sort_field: NameSortField) ![]models.Name {
+    try db.namesBarrier();
     const order_str = if (order_dir == .desc) "DESC" else "ASC";
     // Secondary sort on namehash (same direction) — see countRowsBeforeNamehash for why.
     // is_reachable = 1 filter is applied by default; unreachable rows are
@@ -753,6 +768,70 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
     return parseNameRows(&q, db.allocator);
 }
 
+/// Batched mirror of getAllNames for a page of owners: one windowed IN query
+/// instead of one point query per account row (the accounts-list N+1). Each
+/// owner gets EXACTLY the page getAllNames(owner, skip, limit) would return —
+/// same visibility filters, same ORDER BY created_at DESC, namehash DESC,
+/// same per-owner LIMIT/OFFSET, applied per partition via ROW_NUMBER. Rows
+/// come back grouped in partition order; the caller groups by owner.
+pub fn getNamesByOwnersPage(db: *Database, owners: []const Address, skip: u32, limit: u32, allocator: std.mem.Allocator) ![]models.Name {
+    try db.namesBarrier();
+    if (owners.len == 0) return try allocator.alloc(models.Name, 0);
+
+    var out: std.ArrayList(models.Name) = .empty;
+    errdefer {
+        for (out.items) |*n| n.deinit(allocator);
+        out.deinit(allocator);
+    }
+
+    const CHUNK = 24; // tracked address binds are capped at 32 per statement
+    var off: usize = 0;
+    while (off < owners.len) : (off += CHUNK) {
+        const chunk = owners[off..@min(off + CHUNK, owners.len)];
+
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(db.allocator);
+        try sql.appendSlice(db.allocator,
+            \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, protocol,
+            \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated,
+            \\       created_at, registered_at, created_block, updated_at, updated_block,
+            \\       is_reachable, unreachable_since, ttl, is_legacy, is_normalized, is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash
+            \\FROM (
+            \\  SELECT names.*, ROW_NUMBER() OVER (PARTITION BY owner ORDER BY created_at DESC, namehash DESC) AS rn
+            \\  FROM names
+            \\  WHERE is_reachable = 1 AND is_normalized = 1
+            \\    AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000'
+            \\    AND NOT (names.protocol = 'v1' AND EXISTS (SELECT 1 FROM names v2twin WHERE v2twin.namehash = names.namehash AND v2twin.protocol = 'v2'))
+            \\    AND owner IN (
+        );
+        for (chunk, 0..) |_, i| {
+            if (i > 0) try sql.appendSlice(db.allocator, ", ");
+            try sql.append(db.allocator, '?');
+        }
+        try sql.appendSlice(db.allocator, ")\n) sub WHERE rn > ? AND rn <= ?");
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        for (chunk) |o| try q.bindAddress(o);
+        try q.bindInt(@intCast(skip));
+        try q.bindInt(@intCast(skip + limit));
+
+        const rows = try parseNameRows(&q, allocator);
+        defer allocator.free(rows);
+        // Reserve BEFORE moving rows in: a mid-loop append failure would leak
+        // the not-yet-moved tail (owned rows in a freed slice).
+        out.ensureUnusedCapacity(allocator, rows.len) catch |err| {
+            for (rows) |row| {
+                var mut = row;
+                mut.deinit(allocator);
+            }
+            return err;
+        };
+        for (rows) |row| out.appendAssumeCapacity(row);
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
 // ============================================================================
 // AGGREGATION OPERATIONS
 // ============================================================================
@@ -760,6 +839,7 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
 /// Get count of names with optional filters.
 /// Builds the same WHERE clause as getFilteredNames but uses SELECT COUNT(*).
 pub fn getFilteredNameCount(db: *Database, filters: NameFilters) !usize {
+    try db.namesBarrier();
     var conditions: std.ArrayList([]const u8) = .empty;
     defer conditions.deinit(db.allocator);
 

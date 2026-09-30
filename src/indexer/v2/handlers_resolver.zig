@@ -32,7 +32,7 @@ pub fn handleLegacyAddrChanged(self: *Indexer, protocol: models.Protocol, resolv
     defer abi.freeValues(data_values, self.allocator);
     const addr = Address{ .bytes = data_values[0].address };
 
-    if (!try utils.resolveNamehash(self, &namehash, resolver, "AddrChanged")) return;
+    if (!try utils.resolveNamehash(self, protocol, &namehash, resolver, "AddrChanged")) return;
 
     const addr_hex = try addr.toHex(self.allocator);
     defer self.allocator.free(addr_hex);
@@ -71,7 +71,7 @@ pub fn handleLegacyContentChanged(self: *Indexer, protocol: models.Protocol, res
     defer abi.freeValues(data_values, self.allocator);
     const content_hash = Hash{ .bytes = data_values[0].fixed_bytes.data };
 
-    if (!try utils.resolveNamehash(self, &namehash, resolver, "ContentChanged")) return;
+    if (!try utils.resolveNamehash(self, protocol, &namehash, resolver, "ContentChanged")) return;
 
     const content_hex = try content_hash.toHex(self.allocator);
     defer self.allocator.free(content_hex);
@@ -137,7 +137,7 @@ pub fn handleAddressChanged(self: *Indexer, protocol: models.Protocol, resolver:
         _ = try std.fmt.bufPrint(address_hex[2 + i * 2 .. 4 + i * 2], "{x:0>2}", .{byte});
     }
 
-    if (!try utils.resolveNamehash(self, &namehash, resolver, "AddressChanged")) return;
+    if (!try utils.resolveNamehash(self, protocol, &namehash, resolver, "AddressChanged")) return;
 
     // ENSIP-11 coin types fit u32 (0x80000000 | chainId); the column is a
     // 64-bit INTEGER. A hostile contract can emit any uint256 — reject it as
@@ -205,7 +205,7 @@ pub fn handleContentHashChanged(self: *Indexer, protocol: models.Protocol, resol
         _ = try std.fmt.bufPrint(content_hash_hex[2 + i * 2 .. 4 + i * 2], "{x:0>2}", .{byte});
     }
 
-    if (!try utils.resolveNamehash(self, &namehash, resolver, "ContenthashChanged")) return;
+    if (!try utils.resolveNamehash(self, protocol, &namehash, resolver, "ContenthashChanged")) return;
 
     const nh_hex_log = try namehash.toHex(self.allocator);
     defer self.allocator.free(nh_hex_log);
@@ -271,7 +271,7 @@ pub fn handleTextChanged(self: *Indexer, protocol: models.Protocol, resolver: Ad
     const key = data_values[0].string;
     const value = data_values[1].string;
 
-    if (!try utils.resolveNamehash(self, &namehash, resolver, "TextChanged")) return;
+    if (!try utils.resolveNamehash(self, protocol, &namehash, resolver, "TextChanged")) return;
 
     // Subgraph parity: strip embedded NULs BEFORE validating — clients that
     // pass fixed-width padded strings emit keys like "com.twitter\x00", which
@@ -373,7 +373,7 @@ pub fn handleLegacyTextChanged(self: *Indexer, protocol: models.Protocol, resolv
     defer abi.freeValues(data_values, self.allocator);
     const value = data_values[0].string;
 
-    if (!try utils.resolveNamehash(self, &namehash, resolver, "TextChanged (legacy)")) return;
+    if (!try utils.resolveNamehash(self, protocol, &namehash, resolver, "TextChanged (legacy)")) return;
 
     // Use the hashed indexed key as the storage key (prefixed to mark it as
     // hashed-only — we don't have the plaintext from this event variant).
@@ -471,7 +471,7 @@ pub fn handleAuthorisationChanged(self: *Indexer, protocol: models.Protocol, res
         }
     }
 
-    if (!try utils.resolveNamehash(self, &namehash, resolver, "AuthorisationChanged")) return;
+    if (!try utils.resolveNamehash(self, protocol, &namehash, resolver, "AuthorisationChanged")) return;
 
     self.database.storeResolverAuthorisation(
         protocol,
@@ -534,7 +534,7 @@ pub fn handleApproved(self: *Indexer, protocol: models.Protocol, resolver: Addre
         @memcpy(&owner.bytes, log.data[12..32]);
     }
 
-    if (!try utils.resolveNamehash(self, &namehash, resolver, "Approved")) return;
+    if (!try utils.resolveNamehash(self, protocol, &namehash, resolver, "Approved")) return;
 
     self.database.upsertResolverApproval(
         protocol,
@@ -594,11 +594,14 @@ fn handleNamedResourceKind(
     var resource_buf: [66]u8 = undefined;
     const resource_hex = log.topics[1].toHexBuf(&resource_buf);
 
-    const name = (try dns.decodeDNSNameToString(self.allocator, name_bytes)) orelse {
-        std.log.warn("NamedResource({s}): failed to decode DNS-encoded name for resource {s}", .{ record_kind, resource_hex });
-        return;
-    };
-    defer self.allocator.free(name);
+    // `null` is the ROOT name (`0x00`), which is the default-record resource —
+    // not a decode failure. Treating it as one discarded legitimate records;
+    // `handleLinked` already reads the same null as the default binding. A
+    // genuinely malformed encoding now arrives as error.InvalidDNSEncoding and
+    // is skipped by the malformed-event path, with coordinates logged.
+    const decoded = try dns.decodeDNSNameToString(self.allocator, name_bytes);
+    defer if (decoded) |d| self.allocator.free(d);
+    const name: []const u8 = decoded orelse "";
 
     self.database.upsertNamedResource(
         protocol,
@@ -673,7 +676,7 @@ pub fn handleDnsRecordChanged(self: *Indexer, protocol: models.Protocol, resolve
     const resource: u16 = @truncate(data_values[1].uint256);
     const record_bytes = data_values[2].bytes;
 
-    if (!try utils.resolveNamehash(self, &namehash, resolver, "DNSRecordChanged")) return;
+    if (!try utils.resolveNamehash(self, protocol, &namehash, resolver, "DNSRecordChanged")) return;
 
     const dns_name_hex = try bytesToHexAlloc(self.allocator, dns_name_bytes);
     defer self.allocator.free(dns_name_hex);
@@ -721,7 +724,7 @@ pub fn handleDnsRecordDeleted(self: *Indexer, protocol: models.Protocol, resolve
     const dns_name_bytes = data_values[0].bytes;
     const resource: u16 = @truncate(data_values[1].uint256);
 
-    if (!try utils.resolveNamehash(self, &namehash, resolver, "DNSRecordDeleted")) return;
+    if (!try utils.resolveNamehash(self, protocol, &namehash, resolver, "DNSRecordDeleted")) return;
 
     const dns_name_hex = try bytesToHexAlloc(self.allocator, dns_name_bytes);
     defer self.allocator.free(dns_name_hex);
@@ -756,7 +759,7 @@ pub fn handleDnsZonehashChanged(self: *Indexer, protocol: models.Protocol, resol
     const last_zonehash_bytes = data_values[0].bytes;
     const zonehash_bytes = data_values[1].bytes;
 
-    if (!try utils.resolveNamehash(self, &namehash, resolver, "DNSZonehashChanged")) return;
+    if (!try utils.resolveNamehash(self, protocol, &namehash, resolver, "DNSZonehashChanged")) return;
 
     const last_hex = try bytesToHexAlloc(self.allocator, last_zonehash_bytes);
     defer self.allocator.free(last_hex);
@@ -802,7 +805,7 @@ pub fn handleABIChanged(self: *Indexer, protocol: models.Protocol, resolver: Add
     var namehash = log.topics[1];
     const content_type = try abi.ABI.decodeUint256(&log.topics[2].bytes, 0);
 
-    if (!try utils.resolveNamehash(self, &namehash, resolver, "ABIChanged")) return;
+    if (!try utils.resolveNamehash(self, protocol, &namehash, resolver, "ABIChanged")) return;
 
     const nh_hex_log = try namehash.toHex(self.allocator);
     defer self.allocator.free(nh_hex_log);
@@ -849,7 +852,7 @@ pub fn handlePubkeyChanged(self: *Indexer, protocol: models.Protocol, resolver: 
     // topics[1] = indexed node (namehash)
     var namehash = log.topics[1];
 
-    if (!try utils.resolveNamehash(self, &namehash, resolver, "PubkeyChanged")) return;
+    if (!try utils.resolveNamehash(self, protocol, &namehash, resolver, "PubkeyChanged")) return;
 
     // Non-indexed payload: (bytes32 x, bytes32 y)
     const data_values = try abi.decodeValues(log.data, &.{ .bytes32, .bytes32 }, self.allocator);
@@ -913,7 +916,7 @@ pub fn handleNameChanged(self: *Indexer, protocol: models.Protocol, resolver: Ad
     // topics[1] = indexed node (namehash)
     var namehash = log.topics[1];
 
-    if (!try utils.resolveNamehash(self, &namehash, resolver, "NameChanged")) return;
+    if (!try utils.resolveNamehash(self, protocol, &namehash, resolver, "NameChanged")) return;
 
     // Non-indexed payload: (string name)
     const data_values = try abi.decodeValues(log.data, &.{.string}, self.allocator);
@@ -977,7 +980,7 @@ pub fn handleInterfaceChanged(self: *Indexer, protocol: models.Protocol, resolve
     if (log.topics.len < 3) return error.InvalidTopicCount;
     var namehash = log.topics[1];
 
-    if (!try utils.resolveNamehash(self, &namehash, resolver, "InterfaceChanged")) return;
+    if (!try utils.resolveNamehash(self, protocol, &namehash, resolver, "InterfaceChanged")) return;
 
     // Interface ID is a bytes4, left-aligned (right-padded) in the 32-byte topic
     const interface_id_bytes = log.topics[2].bytes[0..4];
@@ -1048,7 +1051,7 @@ pub fn handleVersionChanged(self: *Indexer, protocol: models.Protocol, resolver:
     // data = newVersion (uint64, padded to 32 bytes)
     var namehash = log.topics[1];
 
-    if (!try utils.resolveNamehash(self, &namehash, resolver, "VersionChanged")) return;
+    if (!try utils.resolveNamehash(self, protocol, &namehash, resolver, "VersionChanged")) return;
 
     // Non-indexed payload: (uint64 newVersion)
     var new_version: u64 = 0;
@@ -1141,8 +1144,12 @@ pub fn handleAliasChanged(self: *Indexer, protocol: models.Protocol, resolver: A
     const to_dns_bytes = data_values[1].bytes;
 
     // Decode DNS wire format to human-readable names
+    // `null` is the root name, which is not an alias key this table can hold —
+    // the same convention the toName branch below already applies (root/empty
+    // means "no alias"). A malformed encoding is a different outcome and now
+    // propagates as error.InvalidDNSEncoding instead of landing here.
     const from_name = (try dns.decodeDNSNameToString(self.allocator, from_dns_bytes)) orelse {
-        std.log.warn("AliasChanged: failed to decode fromName DNS wire format", .{});
+        std.log.warn("AliasChanged: fromName is the root name — no alias key to record", .{});
         return;
     };
     defer self.allocator.free(from_name);
@@ -1162,7 +1169,7 @@ pub fn handleAliasChanged(self: *Indexer, protocol: models.Protocol, resolver: A
         };
     } else {
         const to_name = (try dns.decodeDNSNameToString(self.allocator, to_dns_bytes)) orelse {
-            std.log.warn("AliasChanged: failed to decode toName DNS wire format", .{});
+            std.log.warn("AliasChanged: toName is the root name — treating as no alias", .{});
             return;
         };
         defer self.allocator.free(to_name);
@@ -1213,8 +1220,9 @@ pub fn handleAliasChanged(self: *Indexer, protocol: models.Protocol, resolver: A
 
 /// Wrapper for EACRolesChanged from resolver contracts.
 /// Adapts ResolverEventConfig signature to the shared handler, flagging it as a
-/// resolver event so the indexed `resource` (keccak256(node, part), or ROOT 0) is
-/// stored verbatim rather than canonicalized like a registry token id (WEB-511).
+/// resolver event: the resource (keccak256(node, part), or ROOT 0) is stored
+/// verbatim like every EAC resource, and no name attribution by token id is
+/// attempted.
 pub fn handleResolverEACRolesChanged(self: *Indexer, protocol: models.Protocol, _resolver: Address, log: rpc.Log) !void {
     _ = _resolver;
     try Indexer.handleEACRolesChangedImpl(self, protocol, log, true);

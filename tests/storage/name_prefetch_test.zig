@@ -196,7 +196,7 @@ test "write-through: same-dispatch registrations become map hits" {
     try testing.expectEqual(Tag.unknown, std.meta.activeTag(try np.pairedLookup(CID_UNPREFETCHED, REG_1, allocator)));
 }
 
-test "non-projection writes invalidate conservatively; bulk writes clear" {
+test "non-projection writes invalidate conservatively; keyless projection writes clear" {
     const allocator = testing.allocator;
     const database = try helpers.createTestDatabase(allocator);
     defer helpers.destroyTestDatabase(allocator, database);
@@ -209,7 +209,7 @@ test "non-projection writes invalidate conservatively; bulk writes clear" {
     defer database.name_write_listener = null;
 
     // Namehash-keyed update (outside the projection) drops the touched entry.
-    try database.updateNameResolver(nthHash(3), REG_3);
+    try database.updateNameResolver(.v2, nthHash(3), REG_3);
     try testing.expectEqual(Tag.unknown, std.meta.activeTag(try np.pairedLookup(CID_SOLO, REG_1, allocator)));
     // Untouched entries keep serving.
     try testing.expectEqual(Tag.miss, std.meta.activeTag(try np.uniqueLookup(.v2, CID_AMBIG, allocator)));
@@ -219,15 +219,26 @@ test "non-projection writes invalidate conservatively; bulk writes clear" {
     try database.deleteNameByNamehash(nthHash(4));
     try testing.expectEqual(Tag.unknown, std.meta.activeTag(try np.uniqueLookup(.v1, CID_SPLIT, allocator)));
 
-    // Bulk write (reachability cascade) clears everything.
+    // The reachability cascade is a keyless multi-row write, but it touches
+    // only is_reachable / unreachable_since / updated_* — nothing in the
+    // projection — so the map stays intact and keeps answering exactly. (It
+    // used to clear everything, which turned the rest of a registration-heavy
+    // dispatch into per-event round trips after every repoint.)
     var np2 = NamePrefetch.init(allocator);
     defer np2.deinit();
     try np2.populate(database, &PREFETCH_TOKENS);
     database.name_write_listener = np2.listener();
     defer database.name_write_listener = null;
+    const entries_before = np2.by_cid.count();
     _ = try lib.storage.registry_entries.setRegistriesReachability(database, .v2, &[_]Address{REG_2}, false, 200, 1700000100);
-    try testing.expectEqual(Tag.unknown, std.meta.activeTag(try np2.pairedLookup(CID_AMBIG, REG_2, allocator)));
-    try testing.expectEqual(Tag.unknown, std.meta.activeTag(try np2.uniqueLookup(.v2, CID_SPLIT, allocator)));
+    try testing.expectEqual(entries_before, np2.by_cid.count());
+    try expectHitName(try np2.pairedLookup(CID_AMBIG, REG_2, allocator), "ambig-r2.eth", allocator);
+    const split = try np2.uniqueLookup(.v2, CID_SPLIT, allocator);
+    switch (split) {
+        .hit => |h| if (h.name) |nm| allocator.free(nm),
+        else => {},
+    }
+    try testing.expect(std.meta.activeTag(split) != Tag.unknown);
 
     // Placeholder-parent patch (names_registry) is keyless too — must clear,
     // but ONLY when it matched rows: it runs once per registration and almost
@@ -236,13 +247,28 @@ test "non-projection writes invalidate conservatively; bulk writes clear" {
     var child = fixtureName(41, .v2, REG_1, @as(u256, 41) << 32, "kid.canonicalId:12345");
     child.parent_name = "canonicalId:12345";
     try database.insertName(child);
+    // The production shape: the placeholder `registries` row is what links the placeholder
+    // string to a specific subregistry contract, and the patch is scoped through it — a
+    // `canonicalId:N` string alone is NOT unique across registries (same label, two parents),
+    // so an unscoped patch renamed other registries' rows. The child lives in REG_1, recorded
+    // under parent registry PARENT_REG.
+    const PARENT_REG = Address{ .bytes = [_]u8{0xCE} ** 20 };
+    try database.insertRegistry(.{
+        .address = REG_1,
+        .protocol = .v2,
+        .name = "canonicalId:12345",
+        .namehash = Hash.zero,
+        .parent_registry = PARENT_REG,
+        .created_block = 100,
+        .created_at = 1_700_000_000,
+    });
     var np3 = NamePrefetch.init(allocator);
     defer np3.deinit();
     try np3.populate(database, &[_]u256{CID_AMBIG});
     database.name_write_listener = np3.listener();
     defer database.name_write_listener = null;
-    _ = try lib.storage.names_registry.updateRegistryPlaceholderName(database, "canonicalId:99999", "no-match.eth", nthHash(42));
+    _ = try lib.storage.names_registry.updateRegistryPlaceholderName(database, PARENT_REG, "canonicalId:99999", "no-match.eth", nthHash(42));
     try expectHitName(try np3.pairedLookup(CID_AMBIG, REG_1, allocator), "ambig-r1.eth", allocator);
-    _ = try lib.storage.names_registry.updateRegistryPlaceholderName(database, "canonicalId:12345", "patched.eth", nthHash(40));
+    _ = try lib.storage.names_registry.updateRegistryPlaceholderName(database, PARENT_REG, "canonicalId:12345", "patched.eth", nthHash(40));
     try testing.expectEqual(Tag.unknown, std.meta.activeTag(try np3.pairedLookup(CID_AMBIG, REG_1, allocator)));
 }

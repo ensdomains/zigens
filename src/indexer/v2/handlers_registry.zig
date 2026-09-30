@@ -14,9 +14,11 @@ const Address = @import("../../types/address.zig").Address;
 const Indexer = @import("../indexer.zig").Indexer;
 const utils = @import("../utils.zig");
 const registry_entries = @import("../../storage/registry_entries.zig");
+const name_aliases = @import("../../storage/name_aliases.zig");
 const json_utils = @import("../../utils/json.zig");
 const unknown_labels_storage = @import("../../storage/unknown_labels.zig");
 const label_backfill = @import("../label_backfill.zig");
+const bulk_entities = @import("../../storage/bulk_entities.zig");
 
 // `handleSubregistryUpdate` (2-arg `SubregistryUpdate(uint256,address)`) was
 // removed in the post-audit cleanup — the fresh-Sepolia contracts only emit
@@ -97,11 +99,18 @@ pub fn processOrphanedRegistration(
     const escaped_label = try json_utils.escapeString(self.allocator, orphan.label);
     defer self.allocator.free(escaped_label);
 
-    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\",\"label\":\"{s}\",\"owner\":\"{s}\",\"expiry\":{d},\"registry\":\"{s}\",\"backfilled\":true}}", .{
+    // `tokenId` is in here so the row is REPLAYABLE. A name created from the orphan queue has no
+    // LabelRegistered event of its own — the originating log was consumed into
+    // orphaned_registrations, and this synthetic event is the only record of it — so without the
+    // token id a `--backfill` could not reconstruct the row and the name vanished on rebuild.
+    // `backfilled` is what lets replay recognise this shape and not confuse it with a registrar
+    // NameRegistered (which carries no registry and would write the wrong one).
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\",\"label\":\"{s}\",\"owner\":\"{s}\",\"expiry\":{d},\"tokenId\":{d},\"registry\":\"{s}\",\"backfilled\":true}}", .{
         escaped_name,
         escaped_label,
         owner_hex,
         orphan.expiry,
+        orphan.token_id,
         registry_hex,
     });
 
@@ -127,15 +136,20 @@ pub fn processOrphanedRegistration(
 /// Called after indexSubregistryEvents to handle orphans created during this batch
 pub fn processRemainingOrphans(self: *Indexer, protocol: models.Protocol) !void {
 
-    // Query all orphaned registrations that now have a valid parent
-    // A valid parent is one where the registry's created_block <= orphan's block_number
+    // Every queued orphan, oldest first. Deliberately NOT joined to `registries`:
+    // that table holds one row per (subregistry, parent) pair ever seen, so an
+    // INNER JOIN fanned one orphan out into a row per HISTORICAL parent — which
+    // wrote several primary `names` rows for one label, breaking the
+    // one-primary-per-(registry, canonical_id) invariant the indexer's mutation
+    // lookups depend on, and doing it for stale linkers as well as live ones.
+    // resolveSubregistryParent answers the same question the registration handlers
+    // ask, from the live pointer mirror, and v2/alias_sync derives the other
+    // fully-qualified names of the label as `is_alias = 1` rows.
     const sql =
         \\SELECT o.subregistry_address, o.token_id, o.label, o.expiry, o.owner,
-        \\       o.block_number, o.tx_hash, o.log_index,
-        \\       r.name as parent_name, r.namehash as parent_namehash, r.address as registry_addr
+        \\       o.block_number, o.tx_hash, o.log_index
         \\FROM orphaned_registrations o
-        \\INNER JOIN registries r ON r.protocol = o.protocol AND r.address = o.subregistry_address
-        \\WHERE o.protocol = ? AND r.created_block <= o.block_number
+        \\WHERE o.protocol = ?
         \\ORDER BY o.block_number ASC
     ;
 
@@ -160,25 +174,27 @@ pub fn processRemainingOrphans(self: *Indexer, protocol: models.Protocol) !void 
         const log_index: u32 = @intCast(oq.getInt(7));
 
         if (oq.isNull(0) or oq.isNull(1) or oq.isNull(2) or
-            oq.isNull(4) or oq.isNull(6) or oq.isNull(8) or
-            oq.isNull(9) or oq.isNull(10)) continue;
+            oq.isNull(4) or oq.isNull(6)) continue;
 
         const subregistry_addr_str = oq.getTextSlice(0).?;
         const token_id_str = oq.getTextSlice(1).?;
         const label = oq.getTextSlice(2).?;
         const owner_str = oq.getTextSlice(4).?;
         const tx_hash_str = oq.getTextSlice(6).?;
-        const parent_name = oq.getTextSlice(8).?;
-        const parent_namehash_str = oq.getTextSlice(9).?;
-        const registry_addr_str = oq.getTextSlice(10).?;
 
         // Parse values
         const token_id_clean = if (std.mem.startsWith(u8, token_id_str, "0x")) token_id_str[2..] else token_id_str;
         const token_id = std.fmt.parseInt(u256, token_id_clean, 16) catch continue;
         const owner = Address.fromHex(owner_str) catch continue;
         const tx_hash = Hash.fromHex(tx_hash_str) catch continue;
-        const parent_namehash = Hash.fromHex(parent_namehash_str) catch continue;
-        const subregistry_addr = Address.fromHex(registry_addr_str) catch continue;
+        const subregistry_addr = Address.fromHex(subregistry_addr_str) catch continue;
+
+        // Still unlinked at the orphan's block: leave it queued for a later pass,
+        // exactly as the previous INNER JOIN's non-match did.
+        const resolved = (try resolveSubregistryParent(self, protocol, subregistry_addr, block_number, @import("../../types/token_id.zig").getCanonicalId(token_id))) orelse continue;
+        defer self.allocator.free(resolved.name);
+        const parent_name = resolved.name;
+        const parent_namehash = resolved.namehash;
 
         // Create orphan struct and process
         const orphan = db.Database.OrphanedRegistration{
@@ -263,41 +279,15 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
     var parent_namehash: Hash = self.eth_namehash;
 
     if (!is_main_registry) {
-        // This is a subregistry - look up the parent name from registries table
-        // We query for the parent that was active at this event's block number
-        // (the most recent SubregistryUpdate before or at this block)
-        var registry_hex_buf: [42]u8 = undefined;
-        const registry_hex = log.address.toHexBuf(&registry_hex_buf);
-
-        // A subregistry contract can be re-pointed to a different parent via setSubregistry
-        // (the "one subregistry per name" invariant is only a VerifiableFactory deployment
-        // practice, not a protocol guarantee). Take the most recent assignment and warn if
-        // more than one exists — see handleLabelRegistered for the matching logic.
-        var rq = try Query.initCached(self.database,
-            \\SELECT name, namehash FROM registries
-            \\WHERE address = ? AND protocol = ? AND created_block <= ?
-            \\ORDER BY created_block DESC
-            \\LIMIT 2
-        );
-        defer rq.deinit();
-        try rq.bindText(registry_hex);
-        try rq.bindText(protocol.toString());
-        try rq.bindInt64(@intCast(log.block_number));
-
-        if (try rq.step()) {
-            if (rq.getTextSlice(0)) |name_span| {
-                parent_name = try self.allocator.dupe(u8, name_span);
-                parent_name_allocated = true;
-            }
-
-            if (rq.getTextSlice(1)) |namehash_hex| {
-                parent_namehash = try Hash.fromHex(namehash_hex);
-            }
-
-            if (try rq.step()) {
-                warnIfLiveMultiParent(self, protocol, registry_hex, log.block_number);
-            }
+        // Subregistry-emitted: the parent comes from the live subregistry pointer,
+        // with the historical lookup as fallback. See resolveSubregistryParent.
+        if (try resolveSubregistryParent(self, protocol, log.address, log.block_number, @import("../../types/token_id.zig").getCanonicalId(token_id))) |resolved| {
+            parent_name = resolved.name;
+            parent_name_allocated = true;
+            parent_namehash = resolved.namehash;
         } else {
+            var registry_hex_buf: [42]u8 = undefined;
+            const registry_hex = log.address.toHexBuf(&registry_hex_buf);
             // No parent found for this subregistry at this block
             // Store as orphaned registration - will be processed when parent claims subregistry
             std.log.debug("NameRegistered: orphaning {s} - no parent found for subregistry {s} at block {d}", .{
@@ -379,17 +369,7 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
     // name can be processed before LabelRegistered/NameRegistered (the on-protocol tx emits them
     // in that order). Those earlier handlers store placeholder rows keyed by canonicalId/tokenId;
     // now that the real name is known, patch them.
-    // Stack buffers — u256 max is 78 decimal digits, prefix is "canonicalId:"/"tokenId:".
-    var canonical_buf: [96]u8 = undefined;
-    const canonical_placeholder = try std.fmt.bufPrint(&canonical_buf, "canonicalId:{d}", .{canonical_id});
-    _ = self.database.updateRegistryPlaceholderName(canonical_placeholder, full_name, namehash) catch |err| {
-        std.log.warn("Failed to patch canonicalId placeholder: {}", .{err});
-    };
-    var tokenid_buf: [96]u8 = undefined;
-    const tokenid_placeholder = try std.fmt.bufPrint(&tokenid_buf, "tokenId:{d}", .{token_id});
-    _ = self.database.updatePlaceholderEventsByName(tokenid_placeholder, full_name, namehash) catch |err| {
-        std.log.warn("Failed to patch tokenId placeholder: {}", .{err});
-    };
+    patchPlaceholders(self, log.address, canonical_id, token_id, full_name, namehash);
 
     // Catch up names.resolver from any ResolverUpdated event that fired before
     // this LabelRegistered (chain emit order is ResolverUpdated → LabelRegistered
@@ -451,7 +431,8 @@ pub fn handleNameRenewed(self: *Indexer, protocol: models.Protocol, log: rpc.Log
     std.log.debug("NameRenewed: tokenId={d}, canonicalId={d}, newExpiration={d}, renewedBy={any}", .{ token_id, canonical_id, new_expiration, renewed_by });
 
     // Look up the name by token_id AND registry to avoid cross-registry collisions
-    const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
+    const maybe_name = try self.lookupPairedName(token_id, log.address);
+    defer if (maybe_name) |hit| if (hit.name) |n| self.allocator.free(n);
 
     var name_str: []const u8 = undefined;
     var namehash: Hash = Hash.zero;
@@ -459,10 +440,12 @@ pub fn handleNameRenewed(self: *Indexer, protocol: models.Protocol, log: rpc.Log
     if (maybe_name) |n| {
         // Update expiry using namehash (scoped to the correct name)
         try self.database.updateNameExpiry(n.namehash, @truncate(new_expiration));
+        // A renewal extends the edge's life, so a subtree hidden by this parent's expiry can come
+        // back. See reevaluateSubtreeAfterExpiryChange — gated on the label being a parent, so the
+        // 9,741 ordinary renewals on the reference dataset cost one indexed point read each.
+        reevaluateSubtreeAfterExpiryChange(self, protocol, log, token_id);
         name_str = try self.allocator.dupe(u8, n.name orelse "[unknown]");
         namehash = n.namehash;
-        var name_copy = n;
-        name_copy.deinit(self.allocator);
     } else {
         name_str = try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{token_id});
     }
@@ -503,26 +486,32 @@ pub fn handleTransfer(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !
     // Update name owner in database
     // Look up the name by token ID AND registry to avoid cross-registry tokenId collisions
     // (e.g., label "1" has the same tokenId in every registry)
-    const maybe_name = try self.database.getNameByTokenIdAndRegistry(id, log.address);
     var namehash_opt: ?Hash = null;
     var name_str_opt: ?[]const u8 = null;
 
-    if (maybe_name) |name| {
-        name_str_opt = try self.allocator.dupe(u8, name.name orelse "[unknown]");
-        namehash_opt = name.namehash;
+    if (try self.lookupPairedName(id, log.address)) |hit| {
+        defer if (hit.name) |n| self.allocator.free(n);
+        name_str_opt = try self.allocator.dupe(u8, hit.name orelse "[unknown]");
+        namehash_opt = hit.namehash;
 
-        // Clean up the name struct
-        var name_copy = name;
-        name_copy.deinit(self.allocator);
-
-        try self.database.updateNameOwner(namehash_opt.?, to);
+        try self.setNameOwner(namehash_opt.?, to);
     } else {
         // With log-index ordering (utils.dispatchOrdered) a Transfer always arrives after its
         // LabelRegistered/NameRegistered, so this branch should only fire on reorgs, backfill
         // gaps, or genuinely orphaned transfers (non-ENS ERC1155 tokens slipping through the
-        // topic-only filter). The event is still emitted for audit; ownership just can't be
-        // applied without a known name.
-        std.log.warn("  → Transfer for unknown tokenId={d} in registry {any}; ownership not updated", .{ id, log.address });
+        // topic-only filter). Ownership can't be applied without a known name.
+        //
+        // Record the token id as a placeholder name rather than leaving the row
+        // NULL/NULL. The event was emitted either way, but with no name and no
+        // namehash it was unreachable from the name it belongs to and nothing
+        // could ever repair it — a permanent hole in that name's history.
+        // `tokenId:<dec>` is the repair ledger's key (storage/events.zig
+        // repairPlaceholderEvents, and the names-side placeholder patch), so a
+        // later sighting of the same token heals the row to its real name and
+        // namehash, ambiguity-guarded. This is the same convention
+        // handleTokenRegenerated and the phase-1 datastore writers already use.
+        name_str_opt = try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{id});
+        std.log.warn("  → Transfer for unknown tokenId={d} in registry {any}; ownership not updated, event left for placeholder repair", .{ id, log.address });
     }
 
     defer if (name_str_opt) |n| self.allocator.free(n);
@@ -641,7 +630,18 @@ pub fn handleETHNameRegistered(self: *Indexer, protocol: models.Protocol, log: r
         .v1_label_hash = null,
     };
 
-    try self.insertName(name);
+    // The registry's LabelRegistered (same tx, lower log index) already
+    // inserted this row with identical values — the registrar's expiry is the
+    // same block.timestamp + duration the registry stored, owner and
+    // registrant are the same address. The only column this event adds is the
+    // resolver the registrar passed, so an existing row takes just that
+    // instead of a second full upsert. A missing row (a registrar event
+    // without its registry twin) still gets the full insert.
+    if (try self.registeredNameExists(token_id, self.getEthRegistry(protocol), namehash)) {
+        try self.setNameResolver(namehash, resolver);
+    } else {
+        try self.insertName(name);
+    }
 
     // If subregistry was deployed at registration, store it in the registries table
     if (!subregistry.isZero()) {
@@ -673,16 +673,22 @@ pub fn handleETHNameRegistered(self: *Indexer, protocol: models.Protocol, log: r
     // first-class on the Registration entity. Ordering caveat: if this
     // event happens to be processed before LabelRegistered in the chunk,
     // the UPDATE no-ops; updateRegistrationEconomics logs that at debug.
-    self.database.updateRegistrationEconomics(
-        protocol,
-        namehash,
-        label_str,
-        base_price,
-        premium,
-        referrer,
-    ) catch |err| {
-        std.log.debug("updateRegistrationEconomics failed: {} (row may not yet exist)", .{err});
-    };
+    if (self.bufferingEntities()) {
+        self.write_buffer.setEconomics(protocol, namehash, label_str, base_price, premium, referrer) catch |err| {
+            std.log.debug("buffering registration economics failed: {}", .{err});
+        };
+    } else {
+        self.database.updateRegistrationEconomics(
+            protocol,
+            namehash,
+            label_str,
+            base_price,
+            premium,
+            referrer,
+        ) catch |err| {
+            std.log.debug("updateRegistrationEconomics failed: {} (row may not yet exist)", .{err});
+        };
+    }
 
     // Store event with payment details
     var payment_token_hex_buf: [42]u8 = undefined;
@@ -746,7 +752,8 @@ pub fn handleETHNameRenewed(self: *Indexer, protocol: models.Protocol, log: rpc.
 
     // Look up the name by token_id AND the .eth registry (NOT log.address, which is the registrar)
     const eth_registry = self.getEthRegistry(protocol);
-    const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, eth_registry);
+    const maybe_name = try self.lookupPairedName(token_id, eth_registry);
+    defer if (maybe_name) |hit| if (hit.name) |n| self.allocator.free(n);
 
     // Update expiry using namehash (scoped to the correct name)
     if (maybe_name) |name| {
@@ -778,8 +785,6 @@ pub fn handleETHNameRenewed(self: *Indexer, protocol: models.Protocol, log: rpc.
     if (maybe_name) |n| {
         name_str = try self.allocator.dupe(u8, n.name orelse "[unknown]");
         namehash = n.namehash;
-        var name_copy = n;
-        name_copy.deinit(self.allocator);
     } else {
         name_str = try std.fmt.allocPrint(self.allocator, "{s}.eth", .{label_str});
     }
@@ -828,15 +833,15 @@ pub fn handleNameBurned(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
     std.log.debug("NameBurned: tokenId={d}, canonicalId={d}, burnedBy={any}", .{ token_id, canonical_id, burned_by });
 
     // Look up the name by token_id AND registry to avoid cross-registry collisions
-    const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
-    const name_str = if (maybe_name) |n| blk: {
-        var name_copy = n;
-        defer name_copy.deinit(self.allocator);
-        break :blk try self.allocator.dupe(u8, name_copy.name orelse "[unknown]");
-    } else try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{token_id});
+    const maybe_name = try self.lookupPairedName(token_id, log.address);
+    defer if (maybe_name) |hit| if (hit.name) |n| self.allocator.free(n);
+    const name_str = if (maybe_name) |hit|
+        try self.allocator.dupe(u8, hit.name orelse "[unknown]")
+    else
+        try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{token_id});
     defer self.allocator.free(name_str);
 
-    const namehash = if (maybe_name) |n| n.namehash else Hash.zero;
+    const namehash = if (maybe_name) |hit| hit.namehash else Hash.zero;
 
     // Store event
     var burned_by_hex_buf: [42]u8 = undefined;
@@ -860,6 +865,7 @@ pub fn handleNameBurned(self: *Indexer, protocol: models.Protocol, log: rpc.Log)
     // Cannot use canonical_id because it collides across registries (e.g., tester.eth and tester.calendars.eth)
     if (!namehash.eql(Hash.zero)) {
         try self.database.deleteNameByNamehash(namehash);
+        self.write_buffer.discardPendingName(.v2, namehash);
         std.log.debug("Deleted burned name from database: {s}", .{name_str});
     } else {
         std.log.warn("Cannot delete burned name - unknown namehash for tokenId={d}", .{token_id});
@@ -894,15 +900,15 @@ pub fn handleTokenRegenerated(self: *Indexer, protocol: models.Protocol, log: rp
     std.log.debug("TokenRegenerated: oldTokenId={d}, newTokenId={d}", .{ old_token_id, new_token_id });
 
     // Look up the name by old token ID and registry to avoid cross-registry collisions
-    const maybe_name = try self.database.getNameByTokenIdAndRegistry(old_token_id, log.address);
-    const name_str = if (maybe_name) |n| blk: {
-        var name_copy = n;
-        defer name_copy.deinit(self.allocator);
-        break :blk try self.allocator.dupe(u8, name_copy.name orelse "[unknown]");
-    } else try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{old_token_id});
+    const maybe_name = try self.lookupPairedName(old_token_id, log.address);
+    defer if (maybe_name) |hit| if (hit.name) |n| self.allocator.free(n);
+    const name_str = if (maybe_name) |hit|
+        try self.allocator.dupe(u8, hit.name orelse "[unknown]")
+    else
+        try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{old_token_id});
     defer self.allocator.free(name_str);
 
-    const namehash = if (maybe_name) |n| n.namehash else Hash.zero;
+    const namehash = if (maybe_name) |hit| hit.namehash else Hash.zero;
 
     // Store event
     // Escape name_str for safe JSON inclusion
@@ -919,26 +925,36 @@ pub fn handleTokenRegenerated(self: *Indexer, protocol: models.Protocol, log: rp
 
     try utils.emitEvent(self, protocol, log, .token_regenerated, event_name, namehash, event_data);
 
-    // Update token_id in database from old to new (registry-safe: only updates the exact name)
-    // Cannot use old_token_id alone because it collides across registries
+    // Two independent re-keyings. They were both gated on a known namehash, but
+    // only the first one needs it: approvals are keyed by (token_id, registry),
+    // which this log carries in full. When the name was not yet indexed the
+    // whole block was skipped, so the approval rows kept pointing at a token id
+    // the chain had already retired — and, because the name row is re-keyed on
+    // a later sighting but approvals are not, they stayed stale permanently.
+    // Each re-keying is now gated on exactly what it reads.
+
+    // Keyed by namehash: renaming the token on the name row.
+    // old_token_id alone will not do — it collides across registries.
     if (!namehash.eql(Hash.zero)) {
         try self.database.updateNameTokenIdByNamehash(namehash, new_token_id);
         std.log.debug("Updated token_id in database: {d} -> {d} for {s}", .{ old_token_id, new_token_id, name_str });
 
-        // Note: eac_roles.resource stores canonical_id (version-stripped), so it remains
-        // stable across TokenRegenerated events — no update needed.
-
-        // Update approvals.token_id from old to new (scoped by registry)
-        // Approvals are tied to specific token versions, so they must be updated.
-        const old_token_id_dec = try std.fmt.allocPrint(self.allocator, "{d}", .{old_token_id});
-        defer self.allocator.free(old_token_id_dec);
-        const new_token_id_dec = try std.fmt.allocPrint(self.allocator, "{d}", .{new_token_id});
-        defer self.allocator.free(new_token_id_dec);
-
-        try self.database.updateApprovalTokenId(old_token_id_dec, new_token_id_dec, log.address);
+        // Note: eac_roles.resource carries the EAC version (bumped on unregister /
+        // re-register), not the token version, so TokenRegenerated leaves it
+        // untouched — no update needed.
     } else {
-        std.log.warn("Cannot update token_id - unknown namehash for oldTokenId={d}", .{old_token_id});
+        std.log.warn("Cannot update names.token_id - unknown namehash for oldTokenId={d}", .{old_token_id});
     }
+
+    // Keyed by (token_id, registry), both of which this log supplies directly.
+    // Approvals are tied to a specific token version, so they must follow the
+    // regeneration whether or not the name itself is known yet.
+    const old_token_id_dec = try std.fmt.allocPrint(self.allocator, "{d}", .{old_token_id});
+    defer self.allocator.free(old_token_id_dec);
+    const new_token_id_dec = try std.fmt.allocPrint(self.allocator, "{d}", .{new_token_id});
+    defer self.allocator.free(new_token_id_dec);
+
+    try self.database.updateApprovalTokenId(old_token_id_dec, new_token_id_dec, log.address);
 }
 
 pub fn handleTransferBatch(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
@@ -985,12 +1001,9 @@ pub fn handleTransferBatch(self: *Indexer, protocol: models.Protocol, log: rpc.L
     for (token_ids) |token_id| {
         if (to.isZero()) continue; // burn: no owner update
 
-        const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
-        if (maybe_name) |name| {
-            const namehash = name.namehash;
-            var mutable_name = name;
-            mutable_name.deinit(self.allocator);
-            try self.database.updateNameOwner(namehash, to);
+        if (try self.lookupPairedName(token_id, log.address)) |hit| {
+            if (hit.name) |n| self.allocator.free(n);
+            try self.setNameOwner(hit.namehash, to);
         } else {
             std.log.debug("  → Skipping batch Transfer for unknown tokenId={d} in registry {any}", .{ token_id, log.address });
         }
@@ -1014,15 +1027,15 @@ pub fn handleApproval(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !
     utils.recordAccountObservation(self, protocol, approved, log);
 
     // Look up the name by tokenId and registry to avoid cross-registry collisions
-    const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
-    const name_str = if (maybe_name) |n| blk: {
-        var name_copy = n;
-        defer name_copy.deinit(self.allocator);
-        break :blk try self.allocator.dupe(u8, name_copy.name orelse "[unknown]");
-    } else try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{token_id});
+    const maybe_name = try self.lookupPairedName(token_id, log.address);
+    defer if (maybe_name) |hit| if (hit.name) |n| self.allocator.free(n);
+    const name_str = if (maybe_name) |hit|
+        try self.allocator.dupe(u8, hit.name orelse "[unknown]")
+    else
+        try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{token_id});
     defer self.allocator.free(name_str);
 
-    const namehash = if (maybe_name) |n| n.namehash else Hash.zero;
+    const namehash = if (maybe_name) |hit| hit.namehash else Hash.zero;
 
     // Store event
     var owner_hex_buf: [42]u8 = undefined;
@@ -1056,8 +1069,9 @@ pub fn handleApproval(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !
 
 /// Handle EACRolesChanged event from registry contracts.
 ///
-/// Registry resources are ENS token ids (canonical_id | 32-bit version), so we
-/// strip the version bits to a stable canonical_id. See `handleEACRolesChangedImpl`.
+/// Registry resources are `canonical_id | uint32(eacVersionId)`; they are stored
+/// verbatim and only the name lookup keys on the canonical id. See
+/// `handleEACRolesChangedImpl`.
 /// EACRolesChanged(uint256 indexed resource, address indexed account, uint256 oldRoleBitmap, uint256 newRoleBitmap)
 pub fn handleEACRolesChanged(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     try handleEACRolesChangedImpl(self, protocol, log, false);
@@ -1065,15 +1079,17 @@ pub fn handleEACRolesChanged(self: *Indexer, protocol: models.Protocol, log: rpc
 
 /// Handle EACRolesChanged event, branching on the emitting contract kind.
 ///
-/// `is_resolver` controls how the indexed `resource` is interpreted:
-///   - Registry (is_resolver = false): `resource` is a token id of the form
-///     `canonical_id | uint32(version)`. The lower 32 version bits are stripped
-///     to `canonical_id` so the resource stays stable across TokenRegenerated.
+/// The indexed `resource` is stored EXACTLY as emitted for both kinds:
+///   - Registry (is_resolver = false): `resource` is `canonical_id |
+///     uint32(eacVersionId)` (PermissionedRegistry._constructResource). The low
+///     32 bits are the EAC version, bumped on unregister and on re-registering an
+///     expired label — a re-registered name therefore gets a fresh resource and
+///     the previous owner's grants stop matching, which is what makes stale
+///     grants drop out on-chain. Keeping the bits preserves that; the canonical
+///     id is used only to attribute the event to a name.
 ///   - Resolver (is_resolver = true): `resource` is either ROOT_RESOURCE (0) or
 ///     `uint256(keccak256(abi.encode(node, part)))` (see PermissionedResolverLib
-///     in contracts-v2). This is a full-entropy hash with NO version bits, so it
-///     must be stored verbatim — stripping the low 32 bits would corrupt it into
-///     a value that exists nowhere on-chain (WEB-511 Bug A).
+///     in contracts-v2), a full-entropy hash with no version bits.
 pub fn handleEACRolesChangedImpl(self: *Indexer, protocol: models.Protocol, log: rpc.Log, is_resolver: bool) !void {
     // Event: EACRolesChanged(uint256 indexed resource, address indexed account, uint256 oldRoleBitmap, uint256 newRoleBitmap)
     // topics[0] = event signature
@@ -1098,14 +1114,11 @@ pub fn handleEACRolesChangedImpl(self: *Indexer, protocol: models.Protocol, log:
     const old_role_bitmap = data_values[0].uint256;
     const new_role_bitmap = data_values[1].uint256;
 
-    // Resolve the stored resource id: resolver = verbatim keccak256(node,part)/ROOT,
-    // registry = version-stripped token id (see token_id.resolveStoredResource).
     const token_id_utils = @import("../../types/token_id.zig");
-    const stored_resource: u256 = token_id_utils.resolveStoredResource(resource_uint, is_resolver);
 
-    // Convert resource to hex string for storage
+    // Convert resource to hex string for storage (verbatim, version bits included)
     var resource_bytes: [32]u8 = undefined;
-    std.mem.writeInt(u256, &resource_bytes, stored_resource, .big);
+    std.mem.writeInt(u256, &resource_bytes, resource_uint, .big);
     const resource_hex_chars = std.fmt.bytesToHex(resource_bytes, .lower);
     const resource_hex = try std.fmt.allocPrint(self.allocator, "0x{s}", .{resource_hex_chars});
     defer self.allocator.free(resource_hex);
@@ -1135,21 +1148,36 @@ pub fn handleEACRolesChangedImpl(self: *Indexer, protocol: models.Protocol, log:
 
     // Store or delete role in database
     // If newRoleBitmap is 0, all roles were revoked - delete the entry
-    // Otherwise, upsert with the new bitmap
+    // Otherwise, upsert with the new bitmap.
+    // Buffered (deduped, flushed as one multi-row upsert) only while the
+    // reorg cursor is DISARMED: eac_roles is a capture-protected table, and a
+    // flush-time capture would tag every undo row with the batch's last block
+    // instead of each event's — see WriteBuffer.roles. Armed (near-tip)
+    // batches keep the direct per-event write with correct capture tagging.
+    const buffer_roles = self.write_buffer.active and !self.reorg_arm;
     if (new_role_bitmap == 0) {
-        try self.database.deleteEACRole(protocol, resource_hex, account, log.address);
+        if (buffer_roles) {
+            try self.write_buffer.setRole(protocol, resource_hex, account, null, log.block_number, log.transaction_hash, log.log_index, log.address, try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp));
+        } else {
+            try self.database.deleteEACRole(protocol, resource_hex, account, log.address);
+        }
         std.log.debug("  → Deleted EAC role (all roles revoked)", .{});
     } else {
-        try self.database.upsertEACRole(
-            protocol,
-            resource_hex,
-            account,
-            new_bitmap_hex,
-            log.block_number,
-            log.transaction_hash,
-            log.log_index,
-            log.address,
-        );
+        if (buffer_roles) {
+            try self.write_buffer.setRole(protocol, resource_hex, account, new_bitmap_hex, log.block_number, log.transaction_hash, log.log_index, log.address, try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp));
+        } else {
+            try self.database.upsertEACRole(
+                protocol,
+                resource_hex,
+                account,
+                new_bitmap_hex,
+                log.block_number,
+                log.transaction_hash,
+                log.log_index,
+                log.address,
+                try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
+            );
+        }
         std.log.debug("  → Stored EAC role assignment", .{});
     }
 
@@ -1169,12 +1197,9 @@ pub fn handleEACRolesChangedImpl(self: *Indexer, protocol: models.Protocol, log:
     var namehash_opt: ?Hash = null;
 
     if (!is_resolver) {
-        const maybe_name = try self.database.getNameByTokenIdAndRegistry(stored_resource, log.address);
-        if (maybe_name) |name| {
-            name_str_opt = if (name.name) |n| try self.allocator.dupe(u8, n) else null;
-            namehash_opt = name.namehash;
-            var name_copy = name;
-            name_copy.deinit(self.allocator);
+        if (try self.lookupPairedName(token_id_utils.resourceCanonicalId(resource_uint), log.address)) |hit| {
+            name_str_opt = hit.name;
+            namehash_opt = hit.namehash;
         }
     }
 
@@ -1230,37 +1255,19 @@ pub fn handleLabelRegistered(self: *Indexer, protocol: models.Protocol, log: rpc
     var parent_namehash: Hash = self.eth_namehash;
 
     if (!is_main_registry) {
-        var registry_hex_buf: [42]u8 = undefined;
-        const registry_hex = log.address.toHexBuf(&registry_hex_buf);
-
-        // V2 invariant: each subregistry contract is deployed for a single parent position
-        // (VerifiableFactory deploys a fresh instance per name). If this invariant breaks
-        // in a future deployment, we'd need path-based parent resolution. The query below
-        // takes the most-recently-set parent, which is correct under the current invariant.
-        var rq = try Query.initCached(self.database,
-            \\SELECT name, namehash FROM registries
-            \\WHERE address = ? AND protocol = ? AND created_block <= ?
-            \\ORDER BY created_block DESC
-            \\LIMIT 2
-        );
-        defer rq.deinit();
-        try rq.bindText(registry_hex);
-        try rq.bindText(protocol.toString());
-        try rq.bindInt64(@intCast(log.block_number));
-
-        if (try rq.step()) {
-            if (rq.getTextSlice(0)) |name_span| {
-                parent_name = try self.allocator.dupe(u8, name_span);
-                parent_name_allocated = true;
-            }
-            if (rq.getTextSlice(1)) |namehash_hex| {
-                parent_namehash = try Hash.fromHex(namehash_hex);
-            }
-            // Warn if the V2 per-name-subregistry invariant is broken
-            if (try rq.step()) {
-                warnIfLiveMultiParent(self, protocol, registry_hex, log.block_number);
-            }
+        // A subregistry contract can back SEVERAL parent names at once — the
+        // one-instance-per-name shape is a VerifiableFactory deployment practice, not
+        // a protocol guarantee, and the portal offers adopting an existing registry.
+        // resolveSubregistryParent picks the parent the chain events attach to from
+        // the LIVE pointer mirror; v2/alias_sync derives the other fully-qualified
+        // names of the same label.
+        if (try resolveSubregistryParent(self, protocol, log.address, log.block_number, @import("../../types/token_id.zig").getCanonicalId(token_id))) |resolved| {
+            parent_name = resolved.name;
+            parent_name_allocated = true;
+            parent_namehash = resolved.namehash;
         } else {
+            var registry_hex_buf: [42]u8 = undefined;
+            const registry_hex = log.address.toHexBuf(&registry_hex_buf);
             std.log.debug("LabelRegistered: orphaning {s} - no parent found for subregistry {s} at block {d}", .{
                 label_str, registry_hex, log.block_number,
             });
@@ -1372,33 +1379,43 @@ pub fn handleLabelRegistered(self: *Indexer, protocol: models.Protocol, log: rpc
     // Log-index-ordered dispatch means SubregistryUpdated/ResolverUpdated for a newly-minted
     // name can fire before LabelRegistered in the same tx. Those handlers stored placeholder
     // rows keyed by canonicalId/tokenId; patch them now that the name is resolved.
-    const canonical_placeholder = try std.fmt.allocPrint(self.allocator, "canonicalId:{d}", .{canonical_id});
-    defer self.allocator.free(canonical_placeholder);
-    _ = self.database.updateRegistryPlaceholderName(canonical_placeholder, full_name, namehash_val) catch |err| {
-        std.log.warn("Failed to patch canonicalId placeholder: {}", .{err});
-    };
-    const tokenid_placeholder = try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{token_id});
-    defer self.allocator.free(tokenid_placeholder);
-    _ = self.database.updatePlaceholderEventsByName(tokenid_placeholder, full_name, namehash_val) catch |err| {
-        std.log.warn("Failed to patch tokenId placeholder: {}", .{err});
-    };
+    patchPlaceholders(self, log.address, canonical_id, token_id, full_name, namehash_val);
 
     // Best-effort; see handleETHNameRegistered for rationale.
-    self.database.insertRegistration(
-        protocol,
-        namehash_val,
-        label_str,
-        parent_name,
-        owner,
-        block_timestamp,
-        if (expiry == 0) null else expiry,
-        log.block_number,
-        log.transaction_hash,
-        log.log_index,
-        .label_registered,
-    ) catch |err| {
-        std.log.warn("insertRegistration failed for {s}: {}", .{ full_name, err });
+    const registration = bulk_entities.RegistrationRow{
+        .protocol = protocol,
+        .namehash = namehash_val,
+        .label = label_str,
+        .parent_name = parent_name,
+        .registrant = owner,
+        .registered_at = block_timestamp,
+        .expiry = if (expiry == 0) null else expiry,
+        .block_number = log.block_number,
+        .tx_hash = log.transaction_hash,
+        .log_index = log.log_index,
+        .event_type = .label_registered,
     };
+    if (self.bufferingEntities()) {
+        self.write_buffer.addRegistration(registration) catch |err| {
+            std.log.warn("buffering registration failed for {s}: {}", .{ full_name, err });
+        };
+    } else {
+        self.database.insertRegistration(
+            registration.protocol,
+            registration.namehash,
+            registration.label,
+            registration.parent_name,
+            registration.registrant,
+            registration.registered_at,
+            registration.expiry,
+            registration.block_number,
+            registration.tx_hash,
+            registration.log_index,
+            registration.event_type,
+        ) catch |err| {
+            std.log.warn("insertRegistration failed for {s}: {}", .{ full_name, err });
+        };
+    }
 
     var owner_hex_buf: [42]u8 = undefined;
     const owner_hex = owner.toHexBuf(&owner_hex_buf);
@@ -1461,33 +1478,43 @@ pub fn handleLabelReserved(self: *Indexer, protocol: models.Protocol, log: rpc.L
     var parent_namehash: Hash = self.eth_namehash;
 
     if (!is_main_registry) {
-        var registry_hex_buf: [42]u8 = undefined;
-        const registry_hex = log.address.toHexBuf(&registry_hex_buf);
-
-        // V2 invariant: each subregistry contract is deployed for a single parent position.
-        // Same LIMIT 2 + warning pattern as handleLabelRegistered.
-        var rq = try Query.initCached(self.database,
-            \\SELECT name, namehash FROM registries
-            \\WHERE address = ? AND protocol = ? AND created_block <= ?
-            \\ORDER BY created_block DESC
-            \\LIMIT 2
-        );
-        defer rq.deinit();
-        try rq.bindText(registry_hex);
-        try rq.bindText(protocol.toString());
-        try rq.bindInt64(@intCast(log.block_number));
-
-        if (try rq.step()) {
-            if (rq.getTextSlice(0)) |name_span| {
-                parent_name = try self.allocator.dupe(u8, name_span);
-                parent_name_allocated = true;
-            }
-            if (rq.getTextSlice(1)) |namehash_hex| {
-                parent_namehash = try Hash.fromHex(namehash_hex);
-            }
-            if (try rq.step()) {
-                warnIfLiveMultiParent(self, protocol, registry_hex, log.block_number);
-            }
+        // Same live-pointer-first resolution as handleLabelRegistered.
+        //
+        // The else branch is not optional here. `parent_name` is initialized to
+        // "eth" for the main-registry case, so falling through on an unresolved
+        // subregistry would name the reservation `<label>.eth` and give it the 2LD's
+        // namehash — and since the names upsert conflicts on (protocol, namehash)
+        // and overwrites every identity column, that row would CLOBBER the real
+        // `<label>.eth`: owner and registrant to zero, registry to this unknown
+        // subregistry, and is_reachable recomputed from it. Skip instead; the
+        // reservation is re-derivable from the event, and the two sibling handlers
+        // orphan for the same reason.
+        if (try resolveSubregistryParent(self, protocol, log.address, log.block_number, @import("../../types/token_id.zig").getCanonicalId(token_id))) |resolved| {
+            parent_name = resolved.name;
+            parent_name_allocated = true;
+            parent_namehash = resolved.namehash;
+        } else {
+            var registry_hex_buf: [42]u8 = undefined;
+            const registry_hex = log.address.toHexBuf(&registry_hex_buf);
+            std.log.warn("LabelReserved: no parent for subregistry {s} at block {d} — recording the reservation as an unnamed event instead of naming it {s}.eth", .{
+                registry_hex, log.block_number, label_str,
+            });
+            // The reservation itself is still worth keeping: emit it with no name and
+            // no namehash (like handleRegistryCreated) so nothing is silently lost and
+            // the event carries every field needed to name it later. Replay skips a
+            // null-namehash label_reserved, so live and replay agree.
+            const escaped = try json_utils.escapeString(self.allocator, label_str);
+            defer self.allocator.free(escaped);
+            var sender_hex_buf: [42]u8 = undefined;
+            const orphan_data = try std.fmt.allocPrint(self.allocator, "{{\"label\":\"{s}\",\"tokenId\":{d},\"expiry\":{d},\"sender\":\"{s}\",\"registry\":\"{s}\",\"reserved\":true,\"unparented\":true}}", .{
+                escaped,
+                token_id,
+                expiry,
+                sender.toHexBuf(&sender_hex_buf),
+                registry_hex,
+            });
+            try utils.emitEvent(self, protocol, log, .label_reserved, null, null, orphan_data);
+            return;
         }
     }
     defer if (parent_name_allocated) self.allocator.free(parent_name);
@@ -1577,38 +1604,21 @@ pub fn handleLabelUnregistered(self: *Indexer, protocol: models.Protocol, log: r
     const sender = try abi.ABI.decodeAddress(&log.topics[2].bytes, 0);
 
     std.log.debug("LabelUnregistered: tokenId={d}, sender={any}", .{ token_id, sender });
+    const token_id_utils_unreg = @import("../../types/token_id.zig");
 
     const block_timestamp = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
 
-    // Cascade-invalidate descendants of the entry's current subregistry.
+    // Cascade-invalidate descendants of the entry's current subregistry —
+    // multi-parent-guarded, and with the mirror cleared FIRST so the guard's
+    // root-walk sees post-change edges (on-chain the expiry guard makes
+    // getSubregistry return zero; our mirror reflects that before deciding
+    // whether the old subtree is genuinely orphaned).
     const prev_subregistry = try self.database.getRegistryEntrySubregistry(
         protocol,
         log.address,
         token_id,
     );
     if (!prev_subregistry.isZero()) {
-        const subtree = try self.database.collectSubregistrySubtree(
-            self.allocator,
-            protocol,
-            prev_subregistry,
-        );
-        defer self.allocator.free(subtree);
-        if (subtree.len > 0) {
-            const affected = try self.database.setRegistriesReachability(
-                protocol,
-                subtree,
-                false,
-                log.block_number,
-                block_timestamp,
-            );
-            std.log.info(
-                "LabelUnregistered: cleared {any} from {any}; invalidated {d} descendant name(s) across {d} subregistries",
-                .{ log.address, prev_subregistry, affected, subtree.len },
-            );
-        }
-        // Clear the entry's subregistry pointer in the mirror — on-chain the
-        // expiry guard makes getSubregistry return zero, our mirror should
-        // reflect that.
         _ = try self.database.upsertRegistryEntrySubregistry(
             protocol,
             log.address,
@@ -1617,9 +1627,26 @@ pub fn handleLabelUnregistered(self: *Indexer, protocol: models.Protocol, log: r
             log.block_number,
             block_timestamp,
         );
+        const roots = [_]Address{ self.config.v2_contracts.eth_registry, self.config.v2_contracts.root_registry };
+        const seeds = [_]Address{prev_subregistry};
+        const recompute = try self.database.recomputeSubtreeReachability(
+            self.allocator,
+            protocol,
+            &seeds,
+            &roots,
+            log.block_number,
+            block_timestamp,
+        );
+        if (recompute.names_marked_unreachable > 0 or recompute.names_marked_reachable > 0) {
+            std.log.info(
+                "LabelUnregistered: cleared {any} from {any}; {d} name(s) marked unreachable, {d} reachable across {d} checked subregistries",
+                .{ log.address, prev_subregistry, recompute.names_marked_unreachable, recompute.names_marked_reachable, recompute.registries_checked },
+            );
+        }
     }
 
-    const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
+    const maybe_name = try self.lookupPairedName(token_id, log.address);
+    defer if (maybe_name) |hit| if (hit.name) |n| self.allocator.free(n);
 
     var name_str: []const u8 = undefined;
     var namehash_opt: ?Hash = null;
@@ -1629,10 +1656,15 @@ pub fn handleLabelUnregistered(self: *Indexer, protocol: models.Protocol, log: r
         // reactivate this row instead of losing history. Hard-delete would
         // drop createdAt / registrationDate / events linkage.
         try self.database.markNameUnreachableByNamehash(protocol, n.namehash, log.block_number, block_timestamp);
+        // This label just stopped resolving, so any derived names hanging off it in a
+        // shared registry must go. A label item is enough: the delete half of the pass is
+        // scoped to the registry and removes them, and the plan half then finds nothing
+        // owed for an unreachable primary.
+        name_aliases.enqueueAliasLabelWork(self.database, protocol, log.address, token_id_utils_unreg.getCanonicalId(token_id), log.block_number) catch |err| {
+            std.log.warn("alias work enqueue failed for {any}: {} (healed by the next sweep)", .{ log.address, err });
+        };
         name_str = try self.allocator.dupe(u8, n.name orelse "[unknown]");
         namehash_opt = n.namehash;
-        var name_copy = n;
-        name_copy.deinit(self.allocator);
     } else {
         name_str = try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{token_id});
     }
@@ -1653,6 +1685,47 @@ pub fn handleLabelUnregistered(self: *Indexer, protocol: models.Protocol, log: r
 
 /// Handle ExpiryUpdated events from PermissionedRegistry (replaces NameRenewed)
 /// Event: ExpiryUpdated(uint256 indexed tokenId, uint64 indexed newExpiry, address indexed sender)
+/// An expiry change alters whether this label's pointer edge is LIVE, and therefore whether
+/// everything beneath it resolves — on-chain `getSubregistry` returns zero for an expired entry.
+///
+/// Nothing emits an event when an expiry merely PASSES, so the stored reachability bit cannot
+/// track that by itself; a renewal or an explicit update is the one moment the chain does tell us,
+/// and it is the moment to re-evaluate. A renewal extends (edge revives); an expiry cut shortens
+/// (edge may die) — `recomputeSubtreeReachability` evaluates the definition per node, so one call
+/// handles both directions.
+///
+/// Gated on the label actually HAVING a subregistry: that is one indexed point read, and it skips
+/// the recompute for the overwhelming majority of names (9,741 renewals on the reference dataset,
+/// almost none of them parents). Best-effort — a failure here self-heals on the next sweep or
+/// `--backfill`, so it must never abort the event.
+fn reevaluateSubtreeAfterExpiryChange(self: *Indexer, protocol: models.Protocol, log: rpc.Log, token_id: u256) void {
+    const subregistry = self.database.getRegistryEntrySubregistry(protocol, log.address, token_id) catch |err| {
+        std.log.debug("expiry re-evaluation: subregistry lookup failed: {}", .{err});
+        return;
+    };
+    if (subregistry.isZero()) return;
+
+    const block_timestamp = self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp) catch return;
+    const roots = [_]Address{ self.config.v2_contracts.eth_registry, self.config.v2_contracts.root_registry };
+    const seeds = [_]Address{subregistry};
+    if (self.database.recomputeSubtreeReachability(self.allocator, protocol, &seeds, &roots, log.block_number, block_timestamp)) |r| {
+        if (r.names_marked_reachable > 0 or r.names_marked_unreachable > 0) {
+            std.log.info(
+                "expiry change on {any} canonicalId={d}: {d} name(s) marked reachable, {d} unreachable beneath {any}",
+                .{ log.address, token_id, r.names_marked_reachable, r.names_marked_unreachable, subregistry },
+            );
+        }
+    } else |err| {
+        std.log.warn("expiry re-evaluation recompute failed: {} (healed by the next sweep)", .{err});
+    }
+
+    // The alias derivation's live-edge set is expiry-aware too, so the same change can add or
+    // remove derived names under this registry.
+    name_aliases.enqueueAliasWork(self.database, protocol, subregistry, log.block_number) catch |err| {
+        std.log.warn("alias work enqueue failed for {any}: {} (healed by the next sweep)", .{ subregistry, err });
+    };
+}
+
 pub fn handleExpiryUpdated(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     if (log.topics.len < 4) return error.InvalidTopicCount;
 
@@ -1666,17 +1739,17 @@ pub fn handleExpiryUpdated(self: *Indexer, protocol: models.Protocol, log: rpc.L
 
     std.log.debug("ExpiryUpdated: tokenId={d}, newExpiry={d}, sender={any}", .{ token_id, new_expiry, sender });
 
-    const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
+    const maybe_name = try self.lookupPairedName(token_id, log.address);
+    defer if (maybe_name) |hit| if (hit.name) |n| self.allocator.free(n);
 
     var name_str: []const u8 = undefined;
     var namehash_opt: ?Hash = null;
 
     if (maybe_name) |n| {
         try self.database.updateNameExpiry(n.namehash, new_expiry);
+        reevaluateSubtreeAfterExpiryChange(self, protocol, log, token_id);
         name_str = try self.allocator.dupe(u8, n.name orelse "[unknown]");
         namehash_opt = n.namehash;
-        var name_copy = n;
-        name_copy.deinit(self.allocator);
     } else {
         // Defensive: with log-index ordering this should not happen for in-batch events.
         // Reachable on reorg replay or orphaned subregistries not yet linked.
@@ -1731,6 +1804,17 @@ pub fn handleParentUpdated(self: *Indexer, protocol: models.Protocol, log: rpc.L
     const event_name = try self.allocator.dupe(u8, label_str);
 
     try utils.emitEvent(self, protocol, log, .parent_updated, event_name, null, event_data);
+}
+
+pub fn handleRegistryCreated(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
+    const created_at = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
+    try self.database.setSeededRootRegistryCreation(log.address, protocol, log.block_number, created_at);
+
+    var registry_hex_buf: [42]u8 = undefined;
+    const registry_hex = log.address.toHexBuf(&registry_hex_buf);
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"registry\":\"{s}\"}}", .{registry_hex});
+
+    try utils.emitEvent(self, protocol, log, .registry_created, null, null, event_data);
 }
 
 /// Handle SubregistryUpdated events from PermissionedRegistry (NEW signature)
@@ -1804,63 +1888,57 @@ fn processSubregistryPointerChange(
         block_timestamp,
     );
 
-    // Repoint or clear: invalidate the previous subtree. The initial-pointer
-    // case (prev=0, e.g. fired from `_register` paired with LabelRegistered)
-    // falls through silently.
-    if (!prev_subregistry.isZero() and !prev_subregistry.eql(new_subregistry)) {
-        const orphaned_tree = try self.database.collectSubregistrySubtree(
+    // Edge change: recompute reachability PER REGISTRY over both affected
+    // subtrees (the region under the previous pointer and under the new one).
+    // The mirror was updated above, so the per-node root-walks see post-change
+    // edges. No blanket cascades in either direction: the graph permits
+    // multi-parent edges (a user pointing their own entry at a shared
+    // registry — even the root — must never orphan it on repoint-away, and a
+    // re-link through an orphaned parent must never resurrect a subtree).
+    // The initial-pointer case (prev=0 from `_register`) still recomputes the
+    // new subtree — a no-op against already-correct rows.
+    if (!prev_subregistry.eql(new_subregistry)) {
+        const roots = [_]Address{ self.config.v2_contracts.eth_registry, self.config.v2_contracts.root_registry };
+        const seeds = [_]Address{ prev_subregistry, new_subregistry };
+        const recompute = try self.database.recomputeSubtreeReachability(
             self.allocator,
             protocol,
-            prev_subregistry,
+            &seeds,
+            &roots,
+            log.block_number,
+            block_timestamp,
         );
-        defer self.allocator.free(orphaned_tree);
-
-        if (orphaned_tree.len > 0) {
-            const affected = try self.database.setRegistriesReachability(
-                protocol,
-                orphaned_tree,
-                false,
-                log.block_number,
-                block_timestamp,
-            );
+        if (recompute.names_marked_reachable > 0 or recompute.names_marked_unreachable > 0) {
             std.log.info(
-                "SubregistryUpdated: repoint of {any} canonicalId={d} from {any} → {any} invalidated {d} descendant name(s) across {d} subregistries",
-                .{ log.address, canonical_id, prev_subregistry, new_subregistry, affected, orphaned_tree.len },
+                "SubregistryUpdated: repoint of {any} canonicalId={d} from {any} → {any}: {d} name(s) marked reachable, {d} unreachable across {d} checked subregistries",
+                .{ log.address, canonical_id, prev_subregistry, new_subregistry, recompute.names_marked_reachable, recompute.names_marked_unreachable, recompute.registries_checked },
             );
         }
     }
 
-    // Re-link: if `new_subregistry` was previously orphaned, restore it. For
-    // a brand-new pointer the subtree is just `[new_subregistry]` and this
-    // is a no-op against currently-reachable rows.
-    if (!new_subregistry.isZero()) {
-        const new_tree = try self.database.collectSubregistrySubtree(
-            self.allocator,
-            protocol,
-            new_subregistry,
-        );
-        defer self.allocator.free(new_tree);
-
-        if (new_tree.len > 0) {
-            _ = try self.database.setRegistriesReachability(
-                protocol,
-                new_tree,
-                true,
-                log.block_number,
-                block_timestamp,
-            );
-        }
+    // A pointer change alters which parents refer to the OLD and the NEW subregistry, so
+    // both owe a re-derivation of their shared-registry alias rows. Enqueueing here — the
+    // one place that knows both addresses — is what keeps the derivation change-driven:
+    // with an empty queue the per-batch pass costs one indexed lookup instead of a scan
+    // over `names`. A failure is logged, not propagated: the periodic sweep re-enqueues
+    // every candidate, so a missed enqueue degrades to "derived late", never "wrong".
+    for ([_]Address{ prev_subregistry, new_subregistry }) |affected| {
+        if (affected.isZero()) continue;
+        name_aliases.enqueueAliasWork(self.database, protocol, affected, log.block_number) catch |err| {
+            std.log.warn("alias work enqueue failed for {any}: {} (healed by the next sweep)", .{ affected, err });
+        };
     }
 
-    const maybe_name = try self.database.getNameByTokenIdAndRegistry(token_id, log.address);
-    const name_str = if (maybe_name) |n| blk: {
-        var name_copy = n;
-        defer name_copy.deinit(self.allocator);
-        break :blk try self.allocator.dupe(u8, name_copy.name orelse "[unknown]");
-    } else try std.fmt.allocPrint(self.allocator, "canonicalId:{d}", .{canonical_id});
+    const maybe_name = try self.lookupPairedName(token_id, log.address);
+    defer if (maybe_name) |hit| if (hit.name) |n| self.allocator.free(n);
+    const name_str = if (maybe_name) |hit|
+        try self.allocator.dupe(u8, hit.name orelse "[unknown]")
+    else
+        try std.fmt.allocPrint(self.allocator, "canonicalId:{d}", .{canonical_id});
     defer self.allocator.free(name_str);
+    if (maybe_name == null) self.placeholders.noteCanonicalId(canonical_id) catch {};
 
-    const namehash = if (maybe_name) |n| n.namehash else Hash.zero;
+    const namehash = if (maybe_name) |hit| hit.namehash else Hash.zero;
 
     if (!new_subregistry.isZero()) {
         const registry = models.Registry{
@@ -1873,6 +1951,7 @@ fn processSubregistryPointerChange(
             .created_at = block_timestamp,
         };
         try self.database.insertRegistry(registry);
+        try self.database.setSeededSubregistryCreation(new_subregistry, protocol, namehash, log.address, log.block_number, block_timestamp);
 
         // Process orphaned registrations waiting on this parent linkage.
         var subreg_hex_for_orphans_buf: [42]u8 = undefined;
@@ -1969,11 +2048,9 @@ pub fn handleResolverUpdated(self: *Indexer, protocol: models.Protocol, log: rpc
                 },
             }
         }
-        if (try self.database.getNameByTokenIdAndRegistry(token_id, log.address)) |n| {
-            var n_copy = n;
-            defer n_copy.deinit(self.allocator);
-            paired_namehash = n_copy.namehash;
-            if (n_copy.name) |nm| paired_name = try self.allocator.dupe(u8, nm);
+        if (try self.lookupPairedName(token_id, log.address)) |hit| {
+            paired_namehash = hit.namehash;
+            paired_name = hit.name;
         }
     }
 
@@ -1981,7 +2058,7 @@ pub fn handleResolverUpdated(self: *Indexer, protocol: models.Protocol, log: rpc
     var namehash_opt: ?Hash = null;
 
     if (paired_namehash) |paired_hash| {
-        try self.database.updateNameResolver(paired_hash, resolver_addr);
+        try self.setNameResolver(paired_hash, resolver_addr);
         name_str = try self.allocator.dupe(u8, paired_name orelse "[unknown]");
         namehash_opt = paired_hash;
         // Record the Resolver entity binding (subgraph parity). Only when we
@@ -1990,16 +2067,23 @@ pub fn handleResolverUpdated(self: *Indexer, protocol: models.Protocol, log: rpc
         if (!resolver_addr.isZero()) {
             var namehash_hex_buf: [66]u8 = undefined;
             const namehash_hex = namehash_opt.?.toHexBuf(&namehash_hex_buf);
-            self.database.upsertResolverEntity(
-                protocol,
-                resolver_hex,
-                namehash_hex,
-                name_str,
-                log.block_number,
-                try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
-            ) catch |err| {
-                std.log.debug("upsertResolverEntity failed: {}", .{err});
-            };
+            const set_at = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp);
+            if (self.bufferingEntities()) {
+                self.write_buffer.addResolverEntity(protocol, resolver_hex, namehash_hex, name_str, log.block_number, set_at) catch |err| {
+                    std.log.debug("buffering resolver entity failed: {}", .{err});
+                };
+            } else {
+                self.database.upsertResolverEntity(
+                    protocol,
+                    resolver_hex,
+                    namehash_hex,
+                    name_str,
+                    log.block_number,
+                    set_at,
+                ) catch |err| {
+                    std.log.debug("upsertResolverEntity failed: {}", .{err});
+                };
+            }
         }
     } else fallback: {
         // Event-enrichment fallback ONLY — the mutations above stay strictly
@@ -2067,6 +2151,109 @@ pub fn handleResolverUpdated(self: *Indexer, protocol: models.Protocol, log: rpc
 /// pointing at it is a true simultaneous multi-parent (a VerifiableFactory
 /// one-instance-per-name deployment-convention violation). Best-effort: a
 /// probe failure must not break event processing.
+/// One `names` row identity for the parent a child-registry label belongs under.
+/// `name` is allocator-owned.
+const ResolvedParent = struct {
+    name: []u8,
+    namehash: Hash,
+};
+
+/// Resolve the parent of a label minted in the subregistry `registry`, LIVE
+/// POINTER FIRST.
+///
+/// `LabelRegistered` / `NameRegistered` / `LabelReserved` are emitted by the child
+/// registry and name no parent, so the only handle is the registry address — and
+/// `registries` maps that address to every parent that has EVER pointed at it
+/// (UNIQUE(protocol, address, namehash), added precisely so a shared registry
+/// could hold several). Reading that history and taking the most recent row is
+/// "last linker wins": it hands the label to whichever name adopted the registry
+/// most recently, including a name that has since repointed away and no longer
+/// resolves it at all, while the name that actually does resolve it shows nothing.
+///
+/// `registry_entries` is the live mirror of the on-chain `Entry` mapping, so
+/// "which parents resolve this registry right now" is a fact we already keep —
+/// it was just never consulted for attribution, only to decide whether to log a
+/// warning. Preferring it removes the stale-linker class outright.
+///
+/// Where several parents are live at once the ambiguity is real and unresolvable
+/// from the log: on-chain the label resolves under ALL of them. This picks the
+/// oldest link as the row the chain events attach to (stable — a later adopter
+/// does not move it) and `v2/alias_sync.zig` derives the remaining
+/// fully-qualified names as `is_alias = 1` rows, so none of them is lost.
+///
+/// Falls back to the historical lookup when the live mirror yields nothing: a
+/// parent whose own `names` row has not landed yet (phase ordering), or a
+/// registry reached through an entry we never saw. Returns null when neither
+/// answers, which is the caller's signal to orphan the registration.
+fn resolveSubregistryParent(
+    self: *Indexer,
+    protocol: models.Protocol,
+    registry: Address,
+    block_number: u64,
+    /// The label being attributed, so a shared registry can enqueue exactly the work this
+    /// registration creates. Null from callers that are not registering a label.
+    canonical_id_for_work: ?u256,
+) !?ResolvedParent {
+    // Parent liveness is asked as of THIS label's block, for both halves of the question: which
+    // parents had linked by then (created_block) and which had not yet expired by then. An expired
+    // parent resolves nothing beneath it on-chain, so it cannot be the parent a label is attributed
+    // to either.
+    const block_ts = self.getBlockTimestamp(protocol, block_number, null) catch std.math.maxInt(i64);
+    const live = try name_aliases.getLiveParentNamesAsOf(
+        self.database,
+        self.allocator,
+        protocol,
+        registry,
+        @intCast(block_number),
+        block_ts,
+    );
+    defer name_aliases.freeLiveParents(self.allocator, live);
+    if (live.len > 0) {
+        if (live.len > 1) {
+            var registry_hex_buf: [42]u8 = undefined;
+            warnIfLiveMultiParent(self, protocol, registry.toHexBuf(&registry_hex_buf), block_number);
+            // A label minted into a registry that several parents refer to owes a derived
+            // name under each of the others. This is the free hook for it: we already hold
+            // the live parent set, so the condition costs nothing and only fires for the
+            // rare shared registry. Enqueued per LABEL — a whole-registry item would make
+            // one registration cost a pass over every label in the registry.
+            if (canonical_id_for_work) |cid| name_aliases.enqueueAliasLabelWork(self.database, protocol, registry, cid, block_number) catch |err| {
+                std.log.warn("alias work enqueue failed for {any}: {} (healed by the next sweep)", .{ registry, err });
+            };
+        }
+        return .{
+            .name = try self.allocator.dupe(u8, live[0].name),
+            .namehash = live[0].namehash,
+        };
+    }
+
+    var registry_hex_buf: [42]u8 = undefined;
+    const registry_hex = registry.toHexBuf(&registry_hex_buf);
+    // Tier 2, only when the live mirror answered nothing. Prefer the parent's own `names`
+    // row over `registries.name`: the latter is frozen at link time and can still hold an
+    // unhealed `[0x…]` placeholder, which would be baked into the child's stored name.
+    // Falls back to the frozen string when the parent has no row yet (phase ordering).
+    var rq = try Query.initCached(self.database,
+        \\SELECT COALESCE(pn.name, r.name) AS name, r.namehash FROM registries r
+        \\LEFT JOIN names pn ON pn.protocol = r.protocol AND pn.namehash = r.namehash AND pn.is_alias = 0
+        \\WHERE r.address = ? AND r.protocol = ? AND r.created_block <= ?
+        \\ORDER BY r.created_block DESC
+        \\LIMIT 2
+    );
+    defer rq.deinit();
+    try rq.bindText(registry_hex);
+    try rq.bindText(protocol.toString());
+    try rq.bindInt64(@intCast(block_number));
+
+    if (!try rq.step()) return null;
+    const name_span = rq.getTextSlice(0) orelse return null;
+    const name_copy = try self.allocator.dupe(u8, name_span);
+    errdefer self.allocator.free(name_copy);
+    const namehash = if (rq.getTextSlice(1)) |hex| try Hash.fromHex(hex) else self.eth_namehash;
+    if (try rq.step()) warnIfLiveMultiParent(self, protocol, registry_hex, block_number);
+    return .{ .name = name_copy, .namehash = namehash };
+}
+
 fn warnIfLiveMultiParent(self: *Indexer, protocol: models.Protocol, registry_hex: []const u8, block_number: u64) void {
     const parents = registry_entries.getLiveParents(self.database, self.allocator, protocol, registry_hex) catch |err| {
         std.log.debug("multi-parent live-mirror probe failed for {s}: {}", .{ registry_hex, err });
@@ -2120,4 +2307,35 @@ pub fn handleLabelStoreLabel(self: *Indexer, protocol: models.Protocol, log: rpc
         healed += 1;
     }
     if (healed > 0) std.log.debug("LabelStore: healed {d} label(s) as '{s}'", .{ healed, label });
+}
+
+/// Patch the placeholder rows a registration for (canonical_id, token_id) may
+/// have left behind — SubregistryUpdated / ResolverUpdated processed before
+/// the name existed. Only when the placeholder ledger says one was actually
+/// written: on the common path this used to be four zero-row statements per
+/// registration, one of them a full scan of `names`.
+/// `emitting_registry` is the contract whose event is being resolved — the registry the label
+/// lives in. Both placeholder strings (`canonicalId:N`, `tokenId:N`) are derived from a hash of
+/// the LABEL alone, so they are not unique across registries: the same label under two parents
+/// yields the same string. Passing the registry is what stops resolving one from renaming the
+/// other's rows. See storage/names_registry.updateRegistryPlaceholderName.
+fn patchPlaceholders(self: *Indexer, emitting_registry: Address, canonical_id: u256, token_id: u256, full_name: []const u8, namehash: Hash) void {
+    if (self.placeholders.owesCanonicalPatch(canonical_id)) {
+        var canonical_buf: [96]u8 = undefined;
+        const canonical_placeholder = std.fmt.bufPrint(&canonical_buf, "canonicalId:{d}", .{canonical_id}) catch unreachable;
+        if (self.database.updateRegistryPlaceholderName(emitting_registry, canonical_placeholder, full_name, namehash)) |_| {
+            self.placeholders.canonicalPatched(canonical_id);
+        } else |err| {
+            std.log.warn("Failed to patch canonicalId placeholder: {}", .{err});
+        }
+    }
+    if (self.placeholders.owesTokenPatch(token_id)) {
+        var tokenid_buf: [96]u8 = undefined;
+        const tokenid_placeholder = std.fmt.bufPrint(&tokenid_buf, "tokenId:{d}", .{token_id}) catch unreachable;
+        if (self.database.updatePlaceholderEventsByName(emitting_registry, tokenid_placeholder, full_name, namehash)) |_| {
+            self.placeholders.tokenPatched(token_id);
+        } else |err| {
+            std.log.warn("Failed to patch tokenId placeholder: {}", .{err});
+        }
+    }
 }

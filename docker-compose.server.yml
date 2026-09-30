@@ -18,6 +18,11 @@ services:
       - webhook-data:/app/webhooks
     environment:
       - DATABASE_PATH=/app/data/ens.db
+      # Postgres (e.g. Neon): set DATABASE_URL to a postgres:// string to switch off
+      # SQLite. Compose only forwards variables a service lists here, so without
+      # these two the container never sees them and silently falls back to SQLite.
+      - DATABASE_BACKEND=${DATABASE_BACKEND:-}
+      - DATABASE_URL=${DATABASE_URL:-}
       - RAINBOW_PATH=/app/data/ens_rainbow.db
       - DOWNLOAD_RAINBOW=true
       - RPC_URL=${RPC_URL}
@@ -59,11 +64,20 @@ services:
       - webhook-data:/app/webhooks
     environment:
       - DATABASE_PATH=/app/data/ens.db
+      # Postgres (e.g. Neon): set DATABASE_URL to a postgres:// string to switch off
+      # SQLite. Compose only forwards variables a service lists here, so without
+      # these two the container never sees them and silently falls back to SQLite.
+      - DATABASE_BACKEND=${DATABASE_BACKEND:-}
+      - DATABASE_URL=${DATABASE_URL:-}
       - RAINBOW_PATH=/app/data/ens_rainbow.db
       - DOWNLOAD_RAINBOW=false
       - API_PORT=5655
       - GRAPHQL_MAX_DEPTH=10
       - GRAPHQL_MAX_COST=${GRAPHQL_MAX_COST:-10000}
+      # Without finality data, report stale=true once a protocol has gone this long
+      # without committing a batch (see .env.example). Above the longest healthy
+      # batch; set 0 for a --backfill or an END_BLOCK-pinned deployment.
+      - COVERAGE_STALE_AFTER_SECONDS=${COVERAGE_STALE_AFTER_SECONDS:-3600}
       - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
       - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
       - WEBHOOK_ADMIN_USERNAME=${WEBHOOK_ADMIN_USERNAME:-}

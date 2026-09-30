@@ -296,6 +296,224 @@ fn drainIdleHttpConnections(http_client: *std.http.Client) void {
     }
 }
 
+/// Zig 0.16's std.http.Client stamps its certificate-validation timestamp
+/// (`client.now`) on the process's FIRST https request and never refreshes it
+/// (http/Client.zig: `if (client.now != null) break :tls;`), so a long-lived
+/// process validates every TLS handshake against a clock frozen at startup.
+/// When the RPC provider rotates to a freshly issued leaf certificate whose
+/// not_before postdates that frozen clock, EVERY new handshake fails as
+/// TlsInitializationFailed until the process restarts (2026-08-20 production
+/// stall: 7-day-old indexer, ~14h outage, instant recovery on restart).
+/// Nulling `now` makes the next request rescan the CA bundle and stamp a
+/// fresh timestamp. Same ownership caveat as drainIdleHttpConnections: only
+/// the thread issuing requests on this http.Client may call it (std's own
+/// rescan path has a documented race on `now`).
+///
+/// Remove once std.http.Client refreshes `now` (or re-validates) itself.
+fn refreshTlsValidationClock(http_client: *std.http.Client) void {
+    http_client.now = null;
+}
+
+/// Exponential backoff for retry `attempt` (1-based: the attempt that just
+/// failed): 1s, 2s, 4s, 8s, then flat, so no retry loop ever parks for minutes.
+pub fn retryBackoffMs(attempt: u32) u64 {
+    const shift: u6 = @intCast(@min(attempt -| 1, 3));
+    return @as(u64, 1000) << shift;
+}
+
+/// Attempts a single request gets once the provider answers with a rate-limit
+/// rejection. Three attempts spend at most retryBackoffMs(1) + retryBackoffMs(2)
+/// = 3s sleeping — the same budget executeHttpRequest already allows a transport
+/// failure, and two orders of magnitude inside SYNC_FAILURE_EXIT_MINUTES — so a
+/// throttled provider slows a request instead of stalling the sync past its own
+/// watchdog. Callers that want more patience retry the returned
+/// error.RpcRateLimited themselves (see the discovery anchor probe).
+const MAX_RATE_LIMIT_ATTEMPTS: u32 = 3;
+
+/// Phrasings providers use for rate-limit / compute-unit rejections, matched
+/// case-insensitively anywhere in the JSON-RPC error message.
+const RATE_LIMIT_PHRASES = [_][]const u8{
+    "compute unit",
+    "rate limit",
+    "rate-limit",
+    "ratelimit",
+    "too many request",
+    "throttl",
+    "capacity",
+    "quota",
+    "over limit",
+    "request limit",
+    "rps limit",
+};
+
+/// A bare "exceeded" counts as a rate limit only next to one of these: "the
+/// requested range exceeds the maximum" is a size complaint the caller answers
+/// by shrinking its request, not by waiting.
+const RATE_LIMIT_QUOTA_WORDS = [_][]const u8{
+    "per second",
+    "per minute",
+    "per day",
+    "daily",
+    "monthly",
+    "compute",
+    "quota",
+    "capacity",
+    "credit",
+    "throughput",
+    "allowance",
+};
+
+fn containsIgnoreCase(haystack: []const u8, needle_lower: []const u8) bool {
+    if (needle_lower.len == 0) return true;
+    if (haystack.len < needle_lower.len) return false;
+    var i: usize = 0;
+    while (i + needle_lower.len <= haystack.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle_lower.len and std.ascii.toLower(haystack[i + j]) == needle_lower[j]) : (j += 1) {}
+        if (j == needle_lower.len) return true;
+    }
+    return false;
+}
+
+/// "429" as its own token — not the tail of a balance or a hex blob, which is
+/// how it otherwise shows up in "insufficient funds ... have 42912..." errors.
+fn mentionsHttp429(message: []const u8) bool {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, message, from, "429")) |at| : (from = at + 1) {
+        const left_ok = at == 0 or !std.ascii.isAlphanumeric(message[at - 1]);
+        const right = at + 3;
+        const right_ok = right >= message.len or !std.ascii.isAlphanumeric(message[right]);
+        if (left_ok and right_ok) return true;
+    }
+    return false;
+}
+
+/// True when a JSON-RPC error message describes a transient rate-limit or
+/// compute-unit rejection, i.e. the provider will answer the very same request
+/// after a backoff. Providers return these with HTTP 200, so the 429/408 status
+/// retry in executeHttpRequest never sees them. An execution revert is never a
+/// rate limit, whatever digits its revert string carries.
+pub fn isRateLimitMessage(message: []const u8) bool {
+    if (containsIgnoreCase(message, "revert")) return false;
+    for (RATE_LIMIT_PHRASES) |phrase| {
+        if (containsIgnoreCase(message, phrase)) return true;
+    }
+    if (mentionsHttp429(message)) return true;
+    if (containsIgnoreCase(message, "exceed")) {
+        for (RATE_LIMIT_QUOTA_WORDS) |word| {
+            if (containsIgnoreCase(message, word)) return true;
+        }
+    }
+    return false;
+}
+
+/// JSON-RPC `error` member → its message, tolerating the non-conformant shapes
+/// providers have been seen to return (bare strings, message-less objects).
+fn rpcErrorMessage(err_value: std.json.Value) []const u8 {
+    if (err_value == .string) return err_value.string;
+    if (err_value != .object) return "(malformed error)";
+    const message = err_value.object.get("message") orelse return "(no message)";
+    return if (message == .string) message.string else "(non-string message)";
+}
+
+/// Classify a JSON-RPC `error` member, without logging: rate-limit rejections
+/// become error.RpcRateLimited (transient — retry the same request), everything
+/// else stays error.RpcError, which the indexer's adaptive chunking answers by
+/// shrinking its requests (the wrong answer to a throttle).
+fn rpcErrorOf(err_value: std.json.Value) anyerror {
+    return if (isRateLimitMessage(rpcErrorMessage(err_value))) error.RpcRateLimited else error.RpcError;
+}
+
+/// rpcErrorOf plus the log line: a rate limit is expected and recoverable, so
+/// it warns; a genuine provider error keeps error level.
+fn classifyRpcError(context: []const u8, err_value: std.json.Value) anyerror {
+    const message = rpcErrorMessage(err_value);
+    const err = rpcErrorOf(err_value);
+    if (err == error.RpcRateLimited) {
+        std.log.warn("{s} (rate limited): {s}", .{ context, message });
+    } else {
+        std.log.err("{s}: {s}", .{ context, message });
+    }
+    return err;
+}
+
+/// Whether a rate-limited `attempt` (1-based) may be retried, sleeping the
+/// shared backoff first when it may.
+fn awaitRateLimitRetry(context: []const u8, attempt: u32) bool {
+    if (attempt >= MAX_RATE_LIMIT_ATTEMPTS) return false;
+    const delay_ms = retryBackoffMs(attempt);
+    std.log.warn("{s} rate limited, retrying in {d}ms (attempt {d}/{d})", .{ context, delay_ms, attempt + 1, MAX_RATE_LIMIT_ATTEMPTS });
+    zsys.sleep(delay_ms * std.time.ns_per_ms);
+    return true;
+}
+
+test "isRateLimitMessage: provider throttles classify as rate limits" {
+    try std.testing.expect(isRateLimitMessage("Your app has exceeded its compute units per second capacity. If you have retries enabled, you can safely ignore this message. Contact support@alchemy.com to upgrade your plan and increase your rate limits."));
+    try std.testing.expect(isRateLimitMessage("Too Many Requests"));
+    try std.testing.expect(isRateLimitMessage("429 Too Many Requests"));
+    try std.testing.expect(isRateLimitMessage("429"));
+    try std.testing.expect(isRateLimitMessage("daily request count exceeded, request rate limited"));
+    try std.testing.expect(isRateLimitMessage("rate limit exceeded"));
+    try std.testing.expect(isRateLimitMessage("request throttled, please slow down"));
+    try std.testing.expect(isRateLimitMessage("You've exceeded the RPS limit"));
+    try std.testing.expect(isRateLimitMessage("monthly capacity exceeded"));
+}
+
+test "isRateLimitMessage: genuine provider errors are not rate limits" {
+    try std.testing.expect(!isRateLimitMessage("execution reverted"));
+    try std.testing.expect(!isRateLimitMessage("execution reverted: ERC721: invalid token ID"));
+    try std.testing.expect(!isRateLimitMessage("Log response size exceeded. this block range should work: [0x1, 0x2]"));
+    try std.testing.expect(!isRateLimitMessage("query returned more than 10000 results"));
+    try std.testing.expect(!isRateLimitMessage("requested range exceeds the maximum of 2000 blocks"));
+    try std.testing.expect(!isRateLimitMessage("invalid argument 0: hex string without 0x prefix"));
+    try std.testing.expect(!isRateLimitMessage("missing trie node"));
+    // A balance that merely contains the digits 429 is not an HTTP 429.
+    try std.testing.expect(!isRateLimitMessage("insufficient funds for gas * price + value: have 42912345 want 50000000"));
+    try std.testing.expect(!isRateLimitMessage("execution reverted: exceeded compute budget"));
+    try std.testing.expect(!isRateLimitMessage(""));
+}
+
+test "retryBackoffMs: doubles then flattens at 8s" {
+    try std.testing.expectEqual(@as(u64, 1000), retryBackoffMs(0));
+    try std.testing.expectEqual(@as(u64, 1000), retryBackoffMs(1));
+    try std.testing.expectEqual(@as(u64, 2000), retryBackoffMs(2));
+    try std.testing.expectEqual(@as(u64, 4000), retryBackoffMs(3));
+    try std.testing.expectEqual(@as(u64, 8000), retryBackoffMs(4));
+    try std.testing.expectEqual(@as(u64, 8000), retryBackoffMs(9));
+}
+
+test "rpcErrorOf: rate limits and genuine errors get distinct error values" {
+    const Case = struct { body: []const u8, want: anyerror };
+    // Real batch-response shapes, including the Alchemy compute-unit rejection
+    // that arrives with HTTP 200 and the non-conformant shapes providers send.
+    const cases = [_]Case{
+        .{ .body =
+        \\{"error":{"code":429,"message":"Your app has exceeded its compute units per second capacity. If you have retries enabled, you can safely ignore this message."}}
+        , .want = error.RpcRateLimited },
+        .{ .body =
+        \\{"error":{"code":-32005,"message":"daily request count exceeded, request rate limited"}}
+        , .want = error.RpcRateLimited },
+        .{ .body =
+        \\{"error":{"code":3,"message":"execution reverted"}}
+        , .want = error.RpcError },
+        .{ .body =
+        \\{"error":{"code":-32602,"message":"Log response size exceeded. this block range should work: [0x1, 0x2]"}}
+        , .want = error.RpcError },
+        .{ .body =
+        \\{"error":-32000}
+        , .want = error.RpcError },
+        .{ .body =
+        \\{"error":{"code":-32000}}
+        , .want = error.RpcError },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.body, .{});
+        defer parsed.deinit();
+        const err_value = parsed.value.object.get("error").?;
+        try std.testing.expectEqual(case.want, rpcErrorOf(err_value));
+    }
+}
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     rpc_url: []const u8,
@@ -306,6 +524,13 @@ pub const Client = struct {
     /// the number of requests per batch. 0 = unlimited. When set, oversized
     /// batches are split into sequential sub-batches and the responses merged.
     max_batch_requests: usize = 0,
+    /// Wall-clock of the last request through this client. A pooled
+    /// keep-alive socket that sat idle longer than IDLE_EVICT_MS (a long
+    /// database-only dispatch between fetches) is assumed closed by the
+    /// provider and evicted BEFORE the next request, instead of failing it
+    /// and — with every retry landing on the same stale pool — rolling the
+    /// whole batch back.
+    last_request_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
 
     pub fn initWithSharedHttpClient(allocator: std.mem.Allocator, rpc_url: []const u8, http_client: *std.http.Client) !*Client {
         const client = try allocator.create(Client);
@@ -391,7 +616,12 @@ pub const Client = struct {
         return .{ .status = @intFromEnum(response.head.status), .body = body };
     }
 
+    const IDLE_EVICT_MS: i64 = 30_000;
+
     fn executeHttpRequest(self: *Client, arena_allocator: std.mem.Allocator, request_body: []const u8) ![]const u8 {
+        const started_ms = zsys.milliTimestamp();
+        const last_ms = self.last_request_ms.swap(started_ms, .monotonic);
+        if (last_ms != 0 and started_ms - last_ms > IDLE_EVICT_MS) drainIdleHttpConnections(self.http_client);
         const max_retries: u32 = 3;
         const max_response_bytes: usize = 50 * 1024 * 1024;
         var attempt: u32 = 0;
@@ -399,7 +629,7 @@ pub const Client = struct {
 
         while (attempt < max_retries) : (attempt += 1) {
             if (attempt > 0) {
-                const delay_ms: u64 = @as(u64, 1000) * (@as(u64, 1) << @intCast(attempt - 1));
+                const delay_ms = retryBackoffMs(attempt);
                 std.log.warn("RPC request failed, retrying in {d}ms (attempt {d}/{d})", .{ delay_ms, attempt + 1, max_retries });
                 zsys.sleep(delay_ms * std.time.ns_per_ms);
             }
@@ -456,6 +686,20 @@ pub const Client = struct {
                     std.log.warn("http request {} (likely stale pooled connection); evicted free pool, retrying", .{err});
                     continue;
                 }
+                // TlsInitializationFailed on a fresh connection is the frozen
+                // validation-clock disease (see refreshTlsValidationClock) far
+                // more often than a genuinely bad peer; CertificateBundleLoadFailure
+                // is the same rescan path failing outright. Both heal by forcing
+                // a rescan + fresh timestamp, so the retry lands on a clean slate.
+                if (err == error.TlsInitializationFailed or
+                    err == error.CertificateBundleLoadFailure)
+                {
+                    refreshTlsValidationClock(self.http_client);
+                    drainIdleHttpConnections(self.http_client);
+                    last_error = err;
+                    std.log.warn("http request {}; reset frozen TLS validation clock + CA bundle, retrying", .{err});
+                    continue;
+                }
                 last_error = err;
                 std.log.warn("http request error: {}", .{err});
                 continue;
@@ -506,7 +750,21 @@ pub const Client = struct {
         return last_error orelse error.HttpError;
     }
 
+    /// Single JSON-RPC call, retrying provider rate-limit rejections (which
+    /// arrive as a JSON-RPC error over HTTP 200, invisible to the status-code
+    /// retry in executeHttpRequest) with the same exponential backoff.
     fn makeRpcCall(self: *Client, method: []const u8, params: anytype) !std.json.Parsed(std.json.Value) {
+        var attempt: u32 = 1;
+        while (true) : (attempt += 1) {
+            return self.makeRpcCallOnce(method, params) catch |err| {
+                if (err != error.RpcRateLimited) return err;
+                if (!awaitRateLimitRetry("RPC request", attempt)) return err;
+                continue;
+            };
+        }
+    }
+
+    fn makeRpcCallOnce(self: *Client, method: []const u8, params: anytype) !std.json.Parsed(std.json.Value) {
         const request_id = self.nextRequestId();
 
         // Use arena allocator for request/response buffers
@@ -566,14 +824,7 @@ pub const Client = struct {
         const response = parsed.value.object;
 
         // Check for errors
-        if (response.get("error")) |err| {
-            const error_message = if (err == .object)
-                (if (err.object.get("message")) |m| (if (m == .string) m.string else "(non-string message)") else "(no message)")
-            else
-                "(malformed error)";
-            std.log.err("RPC error: {s}", .{error_message});
-            return error.RpcError;
-        }
+        if (response.get("error")) |err| return classifyRpcError("RPC error", err);
 
         return parsed;
     }
@@ -612,14 +863,21 @@ pub const Client = struct {
     }
 
     fn makeRpcCallWithParams(self: *Client, method: []const u8, params: std.json.Value) !std.json.Parsed(std.json.Value) {
+        var attempt: u32 = 1;
+        while (true) : (attempt += 1) {
+            return self.makeRpcCallWithParamsOnce(method, params) catch |err| {
+                if (err != error.RpcRateLimited) return err;
+                if (!awaitRateLimitRetry("RPC request", attempt)) return err;
+                continue;
+            };
+        }
+    }
+
+    fn makeRpcCallWithParamsOnce(self: *Client, method: []const u8, params: std.json.Value) !std.json.Parsed(std.json.Value) {
         const parsed = try self.makeRpcCallRaw(method, params);
         errdefer parsed.deinit();
         // Check for errors
-        if (parsed.value.object.get("error")) |err| {
-            const error_message = err.object.get("message").?.string;
-            std.log.err("RPC error: {s}", .{error_message});
-            return error.RpcError;
-        }
+        if (parsed.value.object.get("error")) |err| return classifyRpcError("RPC error", err);
         return parsed;
     }
 
@@ -641,13 +899,27 @@ pub const Client = struct {
         try writer.writeAll("]");
     }
 
-    /// Make multiple RPC calls in a single HTTP request (JSON-RPC batch)
+    /// Make multiple RPC calls in a single HTTP request (JSON-RPC batch).
+    /// Rate-limit rejections come back as a JSON-RPC error with HTTP 200, so the
+    /// status-code retry never sees them; retry the whole batch with the shared
+    /// backoff before handing error.RpcRateLimited to the caller.
+    fn makeBatchRpcCall(self: *Client, requests: []const BatchRequest) !std.json.Parsed(std.json.Value) {
+        var attempt: u32 = 1;
+        while (true) : (attempt += 1) {
+            return self.makeBatchRpcCallOnce(requests) catch |err| {
+                if (err != error.RpcRateLimited) return err;
+                if (!awaitRateLimitRetry("RPC batch", attempt)) return err;
+                continue;
+            };
+        }
+    }
+
     /// Returns array of responses in the same order as requests. When the
     /// provider caps batch sizes (max_batch_requests > 0), oversized batches
     /// are transparently split into sequential sub-batches and the response
     /// arrays merged before parsing — ids are globally unique, so the id-sort
     /// below restores request order across sub-batches.
-    fn makeBatchRpcCall(self: *Client, requests: []const BatchRequest) !std.json.Parsed(std.json.Value) {
+    fn makeBatchRpcCallOnce(self: *Client, requests: []const BatchRequest) !std.json.Parsed(std.json.Value) {
         // Use arena allocator for request/response buffers
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -714,12 +986,7 @@ pub const Client = struct {
         // Check each response for errors
         for (parsed.value.array.items) |response_value| {
             const response = response_value.object;
-            if (response.get("error")) |err| {
-                const error_obj = err.object;
-                const error_message = error_obj.get("message").?.string;
-                std.log.err("RPC batch error: {s}", .{error_message});
-                return error.RpcError;
-            }
+            if (response.get("error")) |err| return classifyRpcError("RPC batch error", err);
         }
 
         return parsed;
@@ -733,6 +1000,80 @@ pub const Client = struct {
         const hex_str = result.string;
         const block_num = try std.fmt.parseInt(u64, hex_str[2..], 16);
         return block_num;
+    }
+
+    /// True when `address` has contract code at `block_number` (eth_getCode
+    /// returns more than "0x"). Historical blocks need an archive-capable
+    /// provider; a non-archive provider errors, which callers must treat as
+    /// "unknown" and fall back conservatively.
+    pub fn hasCodeAt(self: *Client, address: Address, block_number: u64) !bool {
+        var addr_buf: [42]u8 = undefined;
+        const addr_hex = address.toHexBuf(&addr_buf);
+        var block_buf: [20]u8 = undefined;
+        const block_hex = try std.fmt.bufPrint(&block_buf, "0x{x}", .{block_number});
+        const parsed = try self.makeRpcCall("eth_getCode", .{ addr_hex, block_hex });
+        defer parsed.deinit();
+        const result = parsed.value.object.get("result") orelse return error.RpcError;
+        if (result != .string) return error.RpcError;
+        return result.string.len > 2;
+    }
+
+    pub const CodeProbe = struct { address: Address, block: u64 };
+
+    /// eth_getCode for many (address, block) pairs in one JSON-RPC batch, in
+    /// request order. Entry i is null when the provider's answer for probe i
+    /// was missing or malformed, so a hostile or partial reply degrades that
+    /// probe alone instead of the whole batch.
+    pub fn getCodeBatch(self: *Client, probes: []const CodeProbe) ![]?bool {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var batch_requests = try a.alloc(BatchRequest, probes.len);
+        for (probes, 0..) |probe, i| {
+            var params = std.json.Array.init(a);
+            try params.append(.{ .string = try probe.address.toHex(a) });
+            try params.append(.{ .string = try std.fmt.allocPrint(a, "0x{x}", .{probe.block}) });
+            batch_requests[i] = .{ .method = "eth_getCode", .params = .{ .array = params } };
+        }
+
+        const parsed = try self.makeBatchRpcCall(batch_requests);
+        defer parsed.deinit();
+        if (parsed.value != .array) return error.RpcError;
+        const items = parsed.value.array.items;
+        if (items.len != probes.len) return error.RpcError;
+
+        const out = try self.allocator.alloc(?bool, probes.len);
+        for (items, 0..) |item, i| out[i] = parseCodeEntry(item);
+        return out;
+    }
+
+    fn parseCodeEntry(value: std.json.Value) ?bool {
+        if (value != .object) return null;
+        const result = value.object.get("result") orelse return null;
+        if (result != .string) return null;
+        const code = result.string;
+        if (!std.mem.startsWith(u8, code, "0x")) return null;
+        return code.len > 2;
+    }
+
+    test "parseCodeEntry degrades on malformed provider responses, never panics" {
+        const a = std.testing.allocator;
+        const Case = struct { json: []const u8, want: ?bool };
+        const cases = [_]Case{
+            .{ .json = "{\"result\":\"0x6080604052\"}", .want = true },
+            .{ .json = "{\"result\":\"0x\"}", .want = false },
+            .{ .json = "{\"result\":null}", .want = null },
+            .{ .json = "{\"error\":{\"code\":-32000}}", .want = null },
+            .{ .json = "{\"result\":42}", .want = null },
+            .{ .json = "{\"result\":\"6080\"}", .want = null },
+            .{ .json = "[]", .want = null },
+        };
+        for (cases) |c| {
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, c.json, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(c.want, parseCodeEntry(parsed.value));
+        }
     }
 
     /// Execute a read-only contract call (`eth_call`) against `to` with `data`,
@@ -1012,15 +1353,16 @@ pub const Client = struct {
         const responses = parsed.value.array;
 
         // Allocate array for results
-        var results = try self.allocator.alloc([]Log, requests.len);
+        const results = try self.allocator.alloc([]Log, requests.len);
+        // Count the filled prefix: entries past it are undefined memory. The old
+        // `if (i > 0)` guard was wrong twice over — it skipped a legitimately
+        // parsed index 0 (leaking that slice) and still walked the undefined tail
+        // above the failure point, calling deinit on garbage pointers.
+        var filled: usize = 0;
         errdefer {
-            for (results, 0..) |logs, i| {
-                if (i > 0) { // Only free already-processed results
-                    for (logs) |*log| {
-                        log.deinit(self.allocator);
-                    }
-                    self.allocator.free(logs);
-                }
+            for (results[0..filled]) |logs| {
+                for (logs) |*log| log.deinit(self.allocator);
+                self.allocator.free(logs);
             }
             self.allocator.free(results);
         }
@@ -1031,11 +1373,10 @@ pub const Client = struct {
             const result = response.get("result").?;
             const logs_array = result.array;
 
-            var logs = try self.allocator.alloc(Log, logs_array.items.len);
+            const logs = try self.allocator.alloc(Log, logs_array.items.len);
+            var parsed_logs: usize = 0;
             errdefer {
-                for (logs, 0..) |*log, j| {
-                    if (j > 0) log.deinit(self.allocator);
-                }
+                for (logs[0..parsed_logs]) |*log| log.deinit(self.allocator);
                 self.allocator.free(logs);
             }
 
@@ -1044,7 +1385,11 @@ pub const Client = struct {
 
                 // Parse topics
                 const topics_json = log_obj.get("topics").?.array;
-                var log_topics = try self.allocator.alloc(Hash, topics_json.items.len);
+                const log_topics = try self.allocator.alloc(Hash, topics_json.items.len);
+                // Owned by this iteration until the Log below takes them; not yet
+                // reachable from `logs`, so a malformed topic or a refused data
+                // allocation would otherwise leak both.
+                errdefer self.allocator.free(log_topics);
                 for (topics_json.items, 0..) |topic_val, k| {
                     log_topics[k] = try Hash.fromHex(topic_val.string);
                 }
@@ -1052,6 +1397,7 @@ pub const Client = struct {
                 // Parse data
                 const data_hex = log_obj.get("data").?.string;
                 const data_bytes = try self.hexToBytes(data_hex);
+                errdefer self.allocator.free(data_bytes);
 
                 logs[j] = Log{
                     .address = try Address.fromHex(log_obj.get("address").?.string),
@@ -1065,9 +1411,11 @@ pub const Client = struct {
                     .block_timestamp = if (log_obj.get("blockTimestamp")) |ts| std.fmt.parseInt(u64, ts.string[2..], 16) catch null else null,
                     .block_hash = if (log_obj.get("blockHash")) |bh| Hash.fromHex(bh.string) catch null else null,
                 };
+                parsed_logs = j + 1;
             }
 
             results[i] = logs;
+            filled = i + 1;
         }
 
         return results;
@@ -1141,11 +1489,14 @@ pub const Client = struct {
         const logs_array = result.array;
 
         // Allocate result logs
-        var logs = try self.allocator.alloc(Log, logs_array.items.len);
+        const logs = try self.allocator.alloc(Log, logs_array.items.len);
+        // Only the prefix parsed so far is initialized; the rest is undefined
+        // memory, and calling `deinit` on it frees garbage pointers. This
+        // errdefer runs precisely when a topic is malformed or an allocation is
+        // refused mid-loop, so it has to free the prefix and nothing more.
+        var parsed_logs: usize = 0;
         errdefer {
-            for (logs) |*log| {
-                log.deinit(self.allocator);
-            }
+            for (logs[0..parsed_logs]) |*log| log.deinit(self.allocator);
             self.allocator.free(logs);
         }
 
@@ -1156,7 +1507,11 @@ pub const Client = struct {
 
             // Parse topics
             const topics_json = log_obj.get("topics").?.array;
-            var log_topics = try self.allocator.alloc(Hash, topics_json.items.len);
+            const log_topics = try self.allocator.alloc(Hash, topics_json.items.len);
+            // Owned by this iteration until the Log below takes them; a
+            // malformed topic or a refused data allocation would otherwise
+            // leak both, and neither is reachable from `logs` yet.
+            errdefer self.allocator.free(log_topics);
             for (topics_json.items, 0..) |topic_val, k| {
                 log_topics[k] = try Hash.fromHex(topic_val.string);
             }
@@ -1164,6 +1519,7 @@ pub const Client = struct {
             // Parse data
             const data_hex = log_obj.get("data").?.string;
             const data_bytes = try self.hexToBytes(data_hex);
+            errdefer self.allocator.free(data_bytes);
 
             logs[i] = Log{
                 .address = try Address.fromHex(log_obj.get("address").?.string),
@@ -1177,6 +1533,7 @@ pub const Client = struct {
                 .block_timestamp = if (log_obj.get("blockTimestamp")) |ts| std.fmt.parseInt(u64, ts.string[2..], 16) catch null else null,
                 .block_hash = if (log_obj.get("blockHash")) |bh| Hash.fromHex(bh.string) catch null else null,
             };
+            parsed_logs = i + 1;
         }
         const parse_elapsed = zsys.milliTimestamp() - parse_start;
 
@@ -1256,15 +1613,16 @@ pub const Client = struct {
         const responses = parsed.value.array;
 
         // Allocate array for results
-        var results = try self.allocator.alloc([]Log, requests.len);
+        const results = try self.allocator.alloc([]Log, requests.len);
+        // Count the filled prefix: entries past it are undefined memory. The old
+        // `if (i > 0)` guard was wrong twice over — it skipped a legitimately
+        // parsed index 0 (leaking that slice) and still walked the undefined tail
+        // above the failure point, calling deinit on garbage pointers.
+        var filled: usize = 0;
         errdefer {
-            for (results, 0..) |logs, i| {
-                if (i > 0) {
-                    for (logs) |*log| {
-                        log.deinit(self.allocator);
-                    }
-                    self.allocator.free(logs);
-                }
+            for (results[0..filled]) |logs| {
+                for (logs) |*log| log.deinit(self.allocator);
+                self.allocator.free(logs);
             }
             self.allocator.free(results);
         }
@@ -1277,11 +1635,10 @@ pub const Client = struct {
             const result = response.get("result").?;
             const logs_array = result.array;
 
-            var logs = try self.allocator.alloc(Log, logs_array.items.len);
+            const logs = try self.allocator.alloc(Log, logs_array.items.len);
+            var parsed_logs: usize = 0;
             errdefer {
-                for (logs, 0..) |*log, j| {
-                    if (j > 0) log.deinit(self.allocator);
-                }
+                for (logs[0..parsed_logs]) |*log| log.deinit(self.allocator);
                 self.allocator.free(logs);
             }
 
@@ -1290,7 +1647,11 @@ pub const Client = struct {
 
                 // Parse topics
                 const topics_json = log_obj.get("topics").?.array;
-                var log_topics = try self.allocator.alloc(Hash, topics_json.items.len);
+                const log_topics = try self.allocator.alloc(Hash, topics_json.items.len);
+                // Owned by this iteration until the Log below takes them; not yet
+                // reachable from `logs`, so a malformed topic or a refused data
+                // allocation would otherwise leak both.
+                errdefer self.allocator.free(log_topics);
                 for (topics_json.items, 0..) |topic_val, k| {
                     log_topics[k] = try Hash.fromHex(topic_val.string);
                 }
@@ -1298,6 +1659,7 @@ pub const Client = struct {
                 // Parse data
                 const data_hex = log_obj.get("data").?.string;
                 const data_bytes = try self.hexToBytes(data_hex);
+                errdefer self.allocator.free(data_bytes);
 
                 logs[j] = Log{
                     .address = try Address.fromHex(log_obj.get("address").?.string),
@@ -1311,9 +1673,11 @@ pub const Client = struct {
                     .block_timestamp = if (log_obj.get("blockTimestamp")) |ts| std.fmt.parseInt(u64, ts.string[2..], 16) catch null else null,
                     .block_hash = if (log_obj.get("blockHash")) |bh| Hash.fromHex(bh.string) catch null else null,
                 };
+                parsed_logs = j + 1;
             }
 
             results[i] = logs;
+            filled = i + 1;
             total_logs += logs.len;
         }
         const parse_elapsed = zsys.milliTimestamp() - parse_start;

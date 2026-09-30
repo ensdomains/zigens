@@ -574,7 +574,9 @@ fn expectInPlaceOwnerReversed(protocol: models.Protocol) !void {
 
     // Block 200: owner changed to B (in-place UPDATE — captured, tagged block 200).
     try lib.storage.reorg_undo.setCursor(&database, protocol, 200);
-    try database.updateNameOwner(nh, owner_b);
+    // `protocol`, not a hardcoded `.v2`: this helper runs for both protocols and
+    // updateNameOwner is protocol-scoped, so the v1 pass silently matched no row.
+    try database.updateNameOwner(protocol, nh, owner_b);
     try testing.expectEqualSlices(u8, &owner_b.bytes, &(try ownerOf(allocator, &database, nh)).bytes);
 
     // Reorg to 150: the block-200 update is reversed; the name (created 100) survives.
@@ -638,7 +640,7 @@ test "reorg undo-log: uncaptured PCC materialize survives a later reorg" {
     // Re-arm and make a genuinely-captured mutation at block 200.
     const owner_b = try Address.fromHex("0x00000000000000000000000000000000000000bb");
     try lib.storage.reorg_undo.setCursor(&database, .v1, 200);
-    try database.updateNameOwner(nh, owner_b);
+    try database.updateNameOwner(.v2, nh, owner_b);
 
     // Reorg to 150: the owner update reverses (proves rollback ran), but the
     // materialized expiry is untouched (it was never captured).
@@ -874,7 +876,7 @@ test "reorg undo-log: created-after removed AND updated pre-reorg restored toget
     try database.insertName(ny);
 
     try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
-    try database.updateNameOwner(x, owner_b);
+    try database.updateNameOwner(.v2, x, owner_b);
 
     // Reorg to 150: X (created 100) restored to owner A; Y (created 300) deleted.
     try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
@@ -901,7 +903,7 @@ test "reorg undo-log: rollback is idempotent" {
     defer n.deinit(allocator);
     try database.insertName(n);
     try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
-    try database.updateNameOwner(nh, owner_b);
+    try database.updateNameOwner(.v2, nh, owner_b);
 
     try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
     try lib.storage.sync.rollbackToBlock(&database, .v2, 150); // second time = no-op
@@ -968,11 +970,11 @@ test "reorg undo-log restores exact state-as-of-N across multiple updates" {
 
     // owner A→B@200, B→C@250, C→D@300.
     try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
-    try database.updateNameOwner(nh, b);
+    try database.updateNameOwner(.v2, nh, b);
     try lib.storage.reorg_undo.setCursor(&database, .v2, 250);
-    try database.updateNameOwner(nh, c);
+    try database.updateNameOwner(.v2, nh, c);
     try lib.storage.reorg_undo.setCursor(&database, .v2, 300);
-    try database.updateNameOwner(nh, d);
+    try database.updateNameOwner(.v2, nh, d);
 
     // Reorg to 220: last update ≤ 220 was @200 (→B), so owner must be B (not A, not C/D).
     try lib.storage.sync.rollbackToBlock(&database, .v2, 220);
@@ -1004,9 +1006,11 @@ test "reorg undo-log: rolling back one protocol leaves the other untouched" {
     try database.insertName(nv2);
 
     try lib.storage.reorg_undo.setCursor(&database, .v1, 200);
-    try database.updateNameOwner(v1nh, b);
+    // v1nh is the v1 name, so the scoped writer needs `.v1` — the whole point of
+    // this test is that the two protocols stay independent.
+    try database.updateNameOwner(.v1, v1nh, b);
     try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
-    try database.updateNameOwner(v2nh, b);
+    try database.updateNameOwner(.v2, v2nh, b);
 
     // Reorg ONLY v2 to 150: v2 reverts to A; v1 stays at B.
     try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
@@ -1493,11 +1497,11 @@ test "reorg undo-log reverses an eac_roles overwrite (v2)" {
 
     // Block 100: grant a role (survives a rollback to 150).
     try lib.storage.reorg_undo.setCursor(&database, .v2, 100);
-    try database.upsertEACRole(.v2, resource, account, bitmap_v1, 100, tx, 0, contract);
+    try database.upsertEACRole(.v2, resource, account, bitmap_v1, 100, tx, 0, contract, 1_700_000_000);
 
     // Block 200: overwrite the bitmap (ON CONFLICT DO UPDATE — captured, tagged 200).
     try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
-    try database.upsertEACRole(.v2, resource, account, bitmap_v2, 200, tx, 1, contract);
+    try database.upsertEACRole(.v2, resource, account, bitmap_v2, 200, tx, 1, contract, 1_700_000_200);
     try expectSingleRoleBitmap(allocator, &database, resource, bitmap_v2);
 
     // Reorg to 150: the block-200 overwrite is reversed; the role (granted 100) is back at v1.
@@ -1518,7 +1522,7 @@ test "reorg undo-log reverses an eac_roles delete (v2)" {
 
     // Block 100: grant a role.
     try lib.storage.reorg_undo.setCursor(&database, .v2, 100);
-    try database.upsertEACRole(.v2, resource, account, bitmap, 100, tx, 0, contract);
+    try database.upsertEACRole(.v2, resource, account, bitmap, 100, tx, 0, contract, 1_700_000_000);
 
     // Block 200: revoke it (DELETE — captured, tagged 200).
     try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
@@ -1551,7 +1555,7 @@ const RECONCILE_TABLES = [_][]const u8{
     "resolver_interfaces",  "resolver_versions",       "resolver_metadata",       "resolver_approvals",
     "resolver_dns_records", "resolver_dns_zonehashes", "resolver_authorisations", "reverse_records",
     "approvals",            "eac_roles",               "accounts",                "v1_controllers",
-    "name_history",
+    "name_history",         "resolver_datas",          "resolver_links",          "resolver_named_resources",
 };
 
 // Volatile columns excluded from the content comparison: the autoincrement id (insertion
@@ -1653,7 +1657,7 @@ fn applyReconcileBaseline(allocator: std.mem.Allocator, db: *Database) !void {
     try lib.storage.v1_controllers.addController(db, c1, 110, txs);
 
     try lib.storage.reorg_undo.setCursor(db, .v2, 120);
-    try db.updateNameOwner(nh_foo, b); // in-place update, ≤ N
+    try db.updateNameOwner(.v2, nh_foo, b); // in-place update, ≤ N
 
     try lib.storage.reorg_undo.setCursor(db, .v2, 130);
     try db.upsertReverseRecord(.v2, a, nh_foo, 130, tx, 0, 1700000130);
@@ -1675,7 +1679,7 @@ fn applyReconcileReorged(allocator: std.mem.Allocator, db: *Database) !void {
     const acc_z = "0x00000000000000000000000000000000000000a2";
 
     try lib.storage.reorg_undo.setCursor(db, .v2, 200);
-    try db.updateNameOwner(nh_foo, cc_owner); // owner B→new (revert to B)
+    try db.updateNameOwner(.v2, nh_foo, cc_owner); // owner B→new (revert to B)
     try db.storeResolverText(nh_foo, resolver, "url", "b", .v2, 200, tx, 1700000200); // overwrite (revert to "a")
     try db.upsertAccount(.v2, acc_z, 200, 1700000200); // new account (remove)
     var bar = try makeReorgName(allocator, "bar.eth", .v2, a, 200); // new name (remove)
@@ -1725,7 +1729,7 @@ test "reorg undo-log: reconcile comparator detects planted drift" {
     try applyReconcileBaseline(allocator, &b);
     // Plant one extra in-place change in b only.
     try lib.storage.reorg_undo.setCursor(&b, .v2, 145);
-    try b.updateNameOwner(try namehash(allocator, "foo.eth"), try Address.fromHex("0x00000000000000000000000000000000000000ee"));
+    try b.updateNameOwner(.v2, try namehash(allocator, "foo.eth"), try Address.fromHex("0x00000000000000000000000000000000000000ee"));
 
     try testing.expect(!(try reconcileEqual(allocator, &a, &b, false)));
     std.debug.print("✓ reconcile comparator detects planted drift (negative control)\n", .{});
@@ -1927,4 +1931,47 @@ test "reorg undo-log: key-scoped resolver text delete and created_block lowering
     // The lowered name is GONE: replay restored created_block=180, then the
     // created-after delete removed it — rollback ≡ clean-sync-at-150.
     try testing.expect((try database.getNameByNamehash(n.namehash)) == null);
+}
+
+test "reorg undo-log: resolver_links re-link reversed and post-N link removed (record resolvers)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var database = try testDb(allocator);
+    defer database.deinit();
+
+    const carol = try namehash(allocator, "carol.eth");
+    const erin = try namehash(allocator, "erin.eth");
+    const resolver = try Address.fromHex("0x00000000000000000000000000000000000000dd");
+    const tx = try Hash.fromHex("0x0000000000000000000000000000000000000000000000000000000000000abc");
+    const record_model = lib.storage.resolver_records;
+
+    // Block 100: carol -> record 1 with url "one".
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 100);
+    try database.upsertResolverLink(.v2, resolver, carol, 1, "carol.eth", 100, tx, 0, 1700000100);
+    try database.storeResolverText(record_model.recordKey(1), resolver, "url", "one", .v2, 100, tx, 1700000100);
+
+    // Block 200: carol re-linked to record 2 (overwrite of a pre-N row), erin newly
+    // linked (post-N insert), record 2 gets url "two".
+    try lib.storage.reorg_undo.setCursor(&database, .v2, 200);
+    try database.upsertResolverLink(.v2, resolver, carol, 2, "carol.eth", 200, tx, 1, 1700000200);
+    try database.upsertResolverLink(.v2, resolver, erin, 1, "erin.eth", 200, tx, 2, 1700000200);
+    try database.storeResolverText(record_model.recordKey(2), resolver, "url", "two", .v2, 200, tx, 1700000200);
+    {
+        const cur = (try database.getTextRecord(resolver, carol, "url")).?;
+        defer allocator.free(cur);
+        try testing.expectEqualStrings("two", cur);
+        try testing.expectEqual(@as(?u256, 1), try database.getEffectiveRecordId(resolver, erin));
+    }
+
+    // Reorg to 150: carol's link is restored to record 1, erin's link and record 2's
+    // value are gone, and the read path follows the restored link.
+    try lib.storage.sync.rollbackToBlock(&database, .v2, 150);
+    try testing.expectEqual(@as(?u256, 1), try database.getEffectiveRecordId(resolver, carol));
+    try testing.expectEqual(@as(?u256, null), try database.getEffectiveRecordId(resolver, erin));
+    const restored = (try database.getTextRecord(resolver, carol, "url")) orelse return error.RecordVanished;
+    defer allocator.free(restored);
+    try testing.expectEqualStrings("one", restored);
+    std.debug.print("✓ resolver_links re-link reversed and post-N link removed on reorg\n", .{});
 }

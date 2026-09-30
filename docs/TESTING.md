@@ -219,7 +219,7 @@ type Domain {
   labelName: String
   labelhash: String
   parent: Domain
-  subdomains: [Domain!]!
+  subdomains(first: Int = 10, skip: Int = 0): [Domain!]!
   resolvedAddress: Account
   owner: Account!
   resolver: Resolver

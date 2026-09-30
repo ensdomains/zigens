@@ -4,16 +4,18 @@ const api = @import("api/server.zig");
 const db = @import("storage/database.zig");
 const pool_mod = @import("storage/pool.zig");
 const shutdown = @import("utils/shutdown.zig");
+const process_allocator = @import("utils/process_allocator.zig");
 const ens_normalize = @import("ens_normalize");
 
 pub fn main(init: std.process.Init) !void {
     // Configure SQLite for thread safety BEFORE any other operations
     db.configureSqliteThreadSafety();
 
-    // Use thread-safe allocator for concurrent request handling
-    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    // Thread-safe libc malloc for concurrent request handling. The API is as
+    // long-running as the indexer, so it must not be backed by
+    // `DebugAllocator` either — see utils/process_allocator.zig.
+    const allocator = process_allocator.init();
+    defer if (process_allocator.deinit()) std.log.warn("allocator reported leaks at shutdown", .{});
     const io = init.io;
 
     // Load configuration from .env
@@ -60,6 +62,7 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("Port: {d}", .{cfg.api_port});
     std.log.info("GraphQL Max Depth: {d}", .{cfg.graphql_max_depth});
     std.log.info("GraphQL Max Cost: {d}", .{cfg.graphql_max_cost});
+    std.log.info("GraphQL Slow Query Threshold: {d} ms", .{cfg.graphql_slow_query_ms});
 
     // Read-only session pool (skip schema loading — the indexer owns writes):
     // DATABASE_POOL_SIZE independent sessions acquired per request. Sessions are
@@ -72,6 +75,7 @@ pub fn main(init: std.process.Init) !void {
         .database_url = cfg.database_url,
         .size = cfg.database_pool_size,
         .chain_id = cfg.network.chainId(),
+        .stale_after_seconds = cfg.coverage_stale_after_seconds,
     });
     defer db_pool.deinit();
 
@@ -101,12 +105,26 @@ pub fn main(init: std.process.Init) !void {
     _ = ens_normalize.shared();
     std.log.info("ENS normalizer initialized", .{});
 
+    // State the effective limiter policy at boot. Both halves of it were wrong in a
+    // deployment and neither was observable: the rate limit sat on the indexer
+    // service instead of this one, so the API silently ran the code default, and
+    // TRUSTED_PROXY_HOPS was 0 behind a proxy, which collapses the per-IP buckets
+    // into one shared by every client. Printing the numbers makes a re-occurrence a
+    // glance rather than a load test.
+    std.log.info("Rate limit: {d} req/s per client, burst {d}; trusted proxy hops: {d}{s}", .{
+        cfg.rate_limit_per_second,
+        cfg.rate_limit_per_second * 2,
+        cfg.trusted_proxy_hops,
+        if (cfg.trusted_proxy_hops == 0) " (keying on the DIRECT TCP PEER — correct only when nothing proxies this service)" else "",
+    });
+
     // Start API server with complexity limits and metrics from config
     // Only pass webhook_db_path if webhooks are enabled
     const webhook_path: ?[]const u8 = if (cfg.webhooks_enabled) cfg.webhook_db_path else null;
     var server = try api.Server.init(allocator, io, &db_pool, webhook_path, cfg.api_port, cfg.graphql_max_depth, cfg.graphql_max_cost, cfg.metrics_enabled, cfg.rate_limit_per_second, cfg.webhook_admin_username, cfg.webhook_admin_password, cfg.trusted_proxy_hops, cfg.request_timeout_ms, cfg.max_concurrent_connections, cfg.internal_admin_token, cfg.internal_rate_limit_per_second, cfg.webhooks_allow_unauthenticated);
     defer server.deinit();
     server.mcp_enabled = cfg.mcp_enabled;
+    server.graphql_handler.slow_query_threshold_us = @as(u64, cfg.graphql_slow_query_ms) * std.time.us_per_ms;
 
     // Opt-in on-chain resolution (default off). Covers primary-name verification (05)
     // and/or live Universal Resolver record fallback (06); either flag creates the shared

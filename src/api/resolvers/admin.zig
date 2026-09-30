@@ -7,6 +7,7 @@
 /// - resolveApprovals: List resolver approvals
 const std = @import("std");
 const common = @import("common.zig");
+const loader_ctx = common.loaders;
 const db = common.db;
 const models = common.models;
 const Address = common.Address;
@@ -113,8 +114,11 @@ pub fn resolveRolesConnection(ctx: parser.ExecutionContext, field: *const parser
         1000, // max limit
     );
 
-    // Get optional filter arguments
-    const resource_arg = parser.getStringArg(field, "resource", null);
+    // Get optional filter arguments. The resource is normalized to the stored
+    // 66-char spelling so page and count agree with `roles` (which widens the
+    // spelling in SQL); non-hex input keeps exact-match semantics.
+    const raw_resource_arg = parser.getStringArg(field, "resource", null);
+    const resource_arg: ?[]const u8 = if (raw_resource_arg) |r| ((try common.normalizeResourceHex(allocator, r)) orelse r) else null;
     const account_arg = parser.getStringArg(field, "account", null);
 
     // Parse account address if provided.
@@ -286,6 +290,36 @@ fn mapResolverEntityOrderBy(order_by: ?[]const u8) db.ResolverEntitySortField {
     return .address;
 }
 
+/// Collect the entities page's (resolver, namehash) pairs and hand them to the
+/// shared Resolver-level record prefetch. Rows whose hex fails to parse are
+/// skipped here AND in the build loop below, so the pair arrays stay aligned
+/// with what actually renders. Best-effort: any failure just leaves the
+/// per-row handlers on their point-query fallback.
+fn prefetchResolverEntityPage(database: *db.Database, allocator: std.mem.Allocator, loaders_ptr: ?*anyopaque, entities: []const db.ResolverEntity, selections: []const parser.Field) void {
+    if (loaders_ptr == null or entities.len == 0) return;
+    var pair_resolvers: std.ArrayList(Address) = .empty;
+    defer pair_resolvers.deinit(allocator);
+    var pair_namehashes: std.ArrayList(Hash) = .empty;
+    defer pair_namehashes.deinit(allocator);
+    for (entities) |row| {
+        const r = Address.fromHex(row.address) catch continue;
+        const nh = Hash.fromHex(row.namehash) catch continue;
+        pair_resolvers.append(allocator, r) catch return;
+        pair_namehashes.append(allocator, nh) catch return;
+    }
+    domain_resolvers.prefetchRecordsForResolverPage(database, allocator, loaders_ptr, pair_resolvers.items, pair_namehashes.items, selections);
+
+    // `resolvers { domain { … } }`: one query for the page's canonical domains
+    // instead of one per row (the resolverDomainHandler fallback).
+    for (selections) |*sel| {
+        if (std.mem.eql(u8, sel.name, "domain")) {
+            const lc: *loader_ctx.LoaderContext = @ptrCast(@alignCast(loaders_ptr.?));
+            lc.populateDomainsByResolver(database, pair_resolvers.items);
+            break;
+        }
+    }
+}
+
 /// Resolver for the new subgraph-style `resolvers(first, skip, where, orderBy)`
 /// list query. Reads from the `resolvers` table (one row per (protocol, address,
 /// namehash) binding). IDs are emitted as `{protocol}-{address}-{namehash}` via
@@ -336,6 +370,11 @@ pub fn resolveResolverEntities(ctx: parser.ExecutionContext, field: *const parse
         }
         database.allocator.free(entities);
     }
+
+    // Page-batch the record fields (texts/coinTypes/addr/contentHash/text(key:))
+    // so buildResolverJson serves them from memory instead of point-querying
+    // per row (the domains-list treatment).
+    prefetchResolverEntityPage(database, allocator, ctx.loaders, entities, field.selections);
 
     var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);
@@ -722,16 +761,46 @@ fn buildResolverJson(
                     allocator.free(rows);
                 }
                 for (rows) |*row| {
-                    if (emitted > 0) try json.appendSlice(allocator, ",");
-                    emitted += 1;
-                    var fctx = NamedResourceFieldCtx{ .protocol = proto.toString(), .row = row };
-                    const handler = FieldHandler{
-                        .handleFn = handleNamedResourceField,
-                        .context = @ptrCast(&fctx),
-                    };
-                    const row_json = try buildJsonWithFields(allocator, sel.selections, handler);
-                    defer allocator.free(row_json);
-                    try json.appendSlice(allocator, row_json);
+                    // Record-model resolvers name resources per setter ARGUMENT
+                    // (ResourceArgument); which setter(s) the resource guards is
+                    // carried by the role bits granted on it, so emit one entry
+                    // per granted kind (or the raw "argument" before any grant).
+                    var kinds_buf: [5][]const u8 = undefined;
+                    var kinds_len: usize = 0;
+                    if (std.mem.eql(u8, row.record_kind, "argument")) {
+                        const bits = database.getResourceRoleUnion(proto, resolver_addr, row.resource) catch 0;
+                        const table = [_]struct { bit: u256, kind: []const u8 }{
+                            .{ .bit = 1 << 0, .kind = "addr" },
+                            .{ .bit = 1 << 4, .kind = "text" },
+                            .{ .bit = 1 << 12, .kind = "abi" },
+                            .{ .bit = 1 << 16, .kind = "interface" },
+                            .{ .bit = 1 << 24, .kind = "data" },
+                        };
+                        for (table) |entry| {
+                            if (bits & (entry.bit | (entry.bit << 128)) != 0) {
+                                kinds_buf[kinds_len] = entry.kind;
+                                kinds_len += 1;
+                            }
+                        }
+                    }
+                    if (kinds_len == 0) {
+                        kinds_buf[0] = row.record_kind;
+                        kinds_len = 1;
+                    }
+                    for (kinds_buf[0..kinds_len]) |kind| {
+                        if (emitted > 0) try json.appendSlice(allocator, ",");
+                        emitted += 1;
+                        var derived = row.*;
+                        derived.record_kind = @constCast(kind);
+                        var fctx = NamedResourceFieldCtx{ .protocol = proto.toString(), .row = &derived };
+                        const handler = FieldHandler{
+                            .handleFn = handleNamedResourceField,
+                            .context = @ptrCast(&fctx),
+                        };
+                        const row_json = try buildJsonWithFields(allocator, sel.selections, handler);
+                        defer allocator.free(row_json);
+                        try json.appendSlice(allocator, row_json);
+                    }
                 }
             }
             try json.appendSlice(allocator, "]");
@@ -1062,16 +1131,20 @@ fn writeRegistryField(
         return true;
     }
     if (std.mem.eql(u8, sel.name, "labels")) {
-        try writeRegistryNameList(allocator, database, sel, output_key, writer, ctx, .{ .registry = registry.address });
+        // exclude_aliases: these three are "labels minted in this registry", one row per
+        // mint — a label in a registry with several live parents has one Domain per
+        // parent, and counting those would multiply the label count.
+        try writeRegistryNameList(allocator, database, sel, output_key, writer, ctx, .{ .registry = registry.address, .exclude_aliases = true });
         return true;
     }
     if (std.mem.eql(u8, sel.name, "labelConnection")) {
-        try writeRegistryNameConnection(allocator, database, sel, output_key, writer, ctx, .{ .registry = registry.address });
+        try writeRegistryNameConnection(allocator, database, sel, output_key, writer, ctx, .{ .registry = registry.address, .exclude_aliases = true });
         return true;
     }
     if (std.mem.eql(u8, sel.name, "labelCount")) {
         const count = try database.getFilteredNameCount(.{
             .registry = registry.address,
+            .exclude_aliases = true,
         });
         try writer.print("\"{s}\":{d}", .{ output_key, count });
         return true;
@@ -2023,21 +2096,17 @@ pub fn resolveFinality(ctx: parser.ExecutionContext, field: *const parser.Field)
 
 /// `_coverage`: what this deployment indexes — chain id, per-protocol indexed head +
 /// freshness, and a staleness flag. Additive; does not touch the subgraph `_meta` shape.
-/// `stale` deliberately uses /ready's convention (false when finality data is absent)
-/// rather than `_finality.isStale`'s conservative true — a default deployment without
-/// FINALITY_ENABLED must not permanently declare itself stale on a coverage surface.
+/// `stale` is api/common.coverageStale, shared with /ready, /coverage and /metrics —
+/// not `_finality.isStale`, which is true whenever there is no safe data.
 pub fn resolveCoverage(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
     const allocator = ctx.allocator;
     const database: *db.Database = @ptrCast(@alignCast(ctx.database));
 
     const v1 = try database.getSyncStateFull(.v1);
     const v2 = try database.getSyncStateFull(.v2);
-    const v1_block: u64 = if (v1) |s| s.block else 0;
-    const v2_block: u64 = if (v2) |s| s.block else 0;
-    const head: u64 = if (v1_block > v2_block) v1_block else v2_block;
     // Same degrade-to-null as resolveFinality: absent finality_state = no signal.
     const safe = database.getFinality(database.chain_id, .safe) catch null;
-    const is_stale = if (safe) |snap| head < snap.number else false;
+    const is_stale = common.coverageStale(v1, v2, if (safe) |snap| snap.number else null, database.stale_after_seconds, common.zsys.timestamp());
 
     var json: std.Io.Writer.Allocating = .init(allocator);
     defer json.deinit();

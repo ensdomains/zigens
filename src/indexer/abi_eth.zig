@@ -104,9 +104,59 @@ pub const ABI = struct {
 // AbiValues in one call.
 // ----------------------------------------------------------------------------
 
+/// Reject a payload that does not match `types` BEFORE the dependency's codec
+/// sees it.
+///
+/// eth.zig reads a 32-byte length word, clamps an out-of-range u256 to
+/// `maxInt(usize)` on the stated assumption that "a later bounds check will
+/// catch it", and then performs that check as `data_start + length > data.len`
+/// (abi_decode.zig:183) — an unchecked add which overflows on exactly the value
+/// the clamp produces. In a safety build that panics; with checks off it wraps,
+/// the comparison passes, and the clamped length reaches `alloc(u8, len)` as a
+/// request for 16 EiB. Either way a single log takes down the whole batch.
+///
+/// Such a log is ordinary traffic, not an attack: sweeps and the resolver pass
+/// dispatch on topic0 alone, so any contract sharing a signature hash but not
+/// our assumed payload layout lands in a handler that decodes it against the
+/// wrong schema and reads a data word as a length.
+///
+/// So validate here, at the one point every handler decodes through, in
+/// subtraction form so no expression can overflow, and report a mismatch as a
+/// malformed event. `utils.isMalformedEventError` lists it, so the offending
+/// event is skipped with its coordinates logged and the batch continues.
+fn validateAgainstSchema(data: []const u8, types: []const eth.abi_types.AbiType) !void {
+    if (types.len == 0) return;
+    // The head is one 32-byte word per top-level parameter. `/` not `*` so a
+    // huge `types.len` cannot overflow the comparison.
+    if (data.len / 32 < types.len) return error.AbiPayloadMismatch;
+
+    for (types, 0..) |t, i| {
+        if (!t.isDynamic()) continue;
+        // Compare as u256 BEFORE narrowing: a tail offset wider than the
+        // payload is already invalid, and no cast can wrap if we reject first.
+        const head = eth.uint256.fromBigEndianBytes(data[i * 32 ..][0..32].*);
+        if (head > data.len) return error.AbiPayloadMismatch;
+        const offset: usize = @intCast(head);
+        // Subtraction form: `offset + 32` is what overflows upstream.
+        if (data.len - offset < 32) return error.AbiPayloadMismatch;
+        const declared = eth.uint256.fromBigEndianBytes(data[offset..][0..32].*);
+        const avail = data.len - offset - 32;
+        switch (t) {
+            // Byte-granular tails: the length counts bytes.
+            .bytes, .string => if (declared > avail) return error.AbiPayloadMismatch,
+            // Element-granular tails: each element occupies a 32-byte word.
+            .dynamic_array => if (declared > avail / 32) return error.AbiPayloadMismatch,
+            // Tuples carry no length word of their own and the codec refuses
+            // them outright; leave that to it rather than guess a layout.
+            else => {},
+        }
+    }
+}
+
 /// Decode the entire `data` against a list of types using eth.zig's tested
 /// codec. Caller owns the returned slice and must call `freeValues`.
 pub fn decodeValues(data: []const u8, types: []const eth.abi_types.AbiType, allocator: std.mem.Allocator) ![]eth.abi_encode.AbiValue {
+    try validateAgainstSchema(data, types);
     return eth.abi_decode.decodeValues(data, types, allocator);
 }
 
@@ -118,6 +168,58 @@ pub fn freeValues(values: []eth.abi_encode.AbiValue, allocator: std.mem.Allocato
 // ----------------------------------------------------------------------------
 // Tests — mirror abi.zig's tests so we know we match bit-for-bit.
 // ----------------------------------------------------------------------------
+
+test "decodeValues rejects a length word that overflows a usize instead of panicking" {
+    // The shape that stalled a production sync: head word 0 points at a tail
+    // whose length word is a full 32 bytes of 0xff. eth.zig clamps that to
+    // maxInt(usize) and then evaluates `data_start + length`, which overflows.
+    var data: [96]u8 = @splat(0);
+    data[31] = 64; // param 0 tail offset -> byte 64
+    @memset(data[64..96], 0xff); // declared length = 2^256-1
+    try std.testing.expectError(
+        error.AbiPayloadMismatch,
+        decodeValues(&data, &.{.bytes}, std.testing.allocator),
+    );
+}
+
+test "decodeValues rejects a length that merely overruns the payload" {
+    var data: [96]u8 = @splat(0);
+    data[31] = 64; // tail at byte 64
+    data[95] = 33; // 33 bytes declared, but only 0 remain after the length word
+    try std.testing.expectError(
+        error.AbiPayloadMismatch,
+        decodeValues(&data, &.{.bytes}, std.testing.allocator),
+    );
+}
+
+test "decodeValues rejects a tail offset past the end of the payload" {
+    var data: [64]u8 = @splat(0);
+    @memset(data[0..32], 0xff); // offset = 2^256-1
+    try std.testing.expectError(
+        error.AbiPayloadMismatch,
+        decodeValues(&data, &.{.string}, std.testing.allocator),
+    );
+}
+
+test "decodeValues rejects a head shorter than the schema" {
+    const data = [_]u8{0} ** 32;
+    try std.testing.expectError(
+        error.AbiPayloadMismatch,
+        decodeValues(&data, &.{ .bytes, .bytes }, std.testing.allocator),
+    );
+}
+
+test "decodeValues still accepts a well-formed dynamic payload" {
+    // offset 32, length 5, "hello" right-padded — must survive validation.
+    var data: [96]u8 = @splat(0);
+    data[31] = 32;
+    data[63] = 5;
+    @memcpy(data[64..69], "hello");
+    const values = try decodeValues(&data, &.{.string}, std.testing.allocator);
+    defer freeValues(values, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), values.len);
+    try std.testing.expectEqualStrings("hello", values[0].string);
+}
 
 test "decodeUint256 matches abi.zig" {
     const data = [_]u8{0} ** 31 ++ [_]u8{42};
@@ -254,4 +356,19 @@ test "decodeUint256Array handles two-array TransferBatch payload" {
     try std.testing.expectEqual(@as(usize, 2), values.len);
     try std.testing.expectEqual(@as(u256, 1), values[0]);
     try std.testing.expectEqual(@as(u256, 2), values[1]);
+}
+
+test "decodeValues keeps the raw bytes of a non-UTF-8 string: the contracts hash labels as bytes" {
+    const allocator = std.testing.allocator;
+    var data: [96]u8 = [_]u8{0} ** 96;
+    data[31] = 0x20;
+    data[63] = 4;
+    @memcpy(data[64..68], "k\xEF\x58\x17");
+    const values = try decodeValues(&data, &.{.string}, allocator);
+    defer freeValues(values, allocator);
+    try std.testing.expectEqualSlices(u8, "k\xEF\x58\x17", values[0].string);
+    const hash_mod = @import("../types/hash.zig");
+    const from_decoded = try hash_mod.keccak256(allocator, values[0].string);
+    const from_chain_bytes = try hash_mod.keccak256(allocator, "k\xEF\x58\x17");
+    try std.testing.expect(from_decoded.eql(from_chain_bytes));
 }

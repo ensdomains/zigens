@@ -43,36 +43,24 @@ pub fn isCanonicalId(token_id: u256) bool {
     return getTokenVersion(token_id) == 0;
 }
 
-/// Resolve the EAC `resource` value to store for an `EACRolesChanged` event (WEB-511).
-///
-/// Registry resources are token ids (`canonical_id | uint32(version)`) → strip the
-/// version bits via `getCanonicalId` so the resource stays stable across
-/// `TokenRegenerated`. Resolver resources are `keccak256(node, part)` (full entropy)
-/// or `ROOT_RESOURCE` (0), with no version bits → store verbatim; stripping the low
-/// 32 bits would corrupt the keccak hash into a value that exists nowhere on-chain.
-pub fn resolveStoredResource(resource_uint: u256, is_resolver: bool) u256 {
-    return if (is_resolver) resource_uint else getCanonicalId(resource_uint);
+/// EAC `resource` values are stored exactly as emitted (see
+/// `handleEACRolesChangedImpl`). For a registry the contract builds the
+/// resource as `canonical_id | uint32(eacVersionId)` — the low 32 bits are the
+/// EAC version (bumped on unregister / re-register), NOT the token version that
+/// `TokenRegenerated` bumps — so a re-registered label gets a fresh resource and
+/// the previous owner's grants stop matching, exactly as on-chain. Stripping
+/// those bits would merge both generations into one row. Name attribution still
+/// keys on `getCanonicalId(resource)`, which is what this helper documents.
+pub fn resourceCanonicalId(resource: u256) u256 {
+    return getCanonicalId(resource);
 }
 
-test "resolveStoredResource: resolver verbatim, registry strips version (WEB-511)" {
-    // Resolver EAC resource = keccak256(node, part): high-entropy with NONZERO low
-    // 32 bits. Must round-trip verbatim — stripping would corrupt it.
-    const keccak_resource: u256 = (@as(u256, 0x49313ff2c1a3b4d5e6f70819) << 32) | 0xbe492b0a;
-    try std.testing.expectEqual(keccak_resource, resolveStoredResource(keccak_resource, true));
-    // The registry interpretation strips the low 32 bits...
-    try std.testing.expectEqual(getCanonicalId(keccak_resource), resolveStoredResource(keccak_resource, false));
-    // ...and that result actually differs from verbatim (the low bits were nonzero).
-    try std.testing.expect(resolveStoredResource(keccak_resource, false) != keccak_resource);
-
-    // ROOT_RESOURCE (0): identical under both interpretations.
-    try std.testing.expectEqual(@as(u256, 0), resolveStoredResource(0, true));
-    try std.testing.expectEqual(@as(u256, 0), resolveStoredResource(0, false));
-
-    // A real token id (canonical | version): registry → canonical, resolver → verbatim.
-    const token_id: u256 = 0x53f632a801578489983227b234817273b09ffad9c79c50366f6ff4d600000007;
+test "resourceCanonicalId keys a versioned resource to its label" {
+    const resource_v3: u256 = 0x53f632a801578489983227b234817273b09ffad9c79c50366f6ff4d600000003;
     const canonical: u256 = 0x53f632a801578489983227b234817273b09ffad9c79c50366f6ff4d600000000;
-    try std.testing.expectEqual(canonical, resolveStoredResource(token_id, false));
-    try std.testing.expectEqual(token_id, resolveStoredResource(token_id, true));
+    try std.testing.expectEqual(canonical, resourceCanonicalId(resource_v3));
+    try std.testing.expectEqual(canonical, resourceCanonicalId(canonical));
+    try std.testing.expectEqual(@as(u256, 0), resourceCanonicalId(0));
 }
 
 test "getCanonicalId" {

@@ -24,6 +24,12 @@ pub const Config = struct {
     end_block: ?u64, // null means index continuously
     poll_interval: u64,
     batch_size: u64,
+    /// Fail-fast watchdog: exit(1) after this many minutes of continuous
+    /// sync-cycle failure while the network probe reports healthy, so the
+    /// container restart policy revives the process (restart is the proven
+    /// cure for process-local rot like a frozen TLS validation clock).
+    /// 0 disables. (SYNC_FAILURE_EXIT_MINUTES)
+    sync_failure_exit_minutes: u64 = 15,
     /// SQLite page-cache size (MB) during bulk sync. Plumbed to the Database so
     /// .env values work (schema.zig can't see the .env map, only process env).
     sync_cache_mb: u64 = 512,
@@ -44,6 +50,12 @@ pub const Config = struct {
     /// DB lookups.
     name_prefetch: bool = true,
     rate_limit_per_second: u32,
+    /// Outbound RPC throttle for the indexer, distinct from the API's inbound
+    /// per-IP limit above. They were one variable, so tuning the public API
+    /// limit silently re-throttled (or un-throttled) every RPC call the indexer
+    /// makes. Defaults to `rate_limit_per_second` so existing deployments keep
+    /// the behaviour they have today.
+    rpc_rate_limit_per_second: u32,
     /// Provider ceiling on JSON-RPC batch sizes (requests per HTTP batch);
     /// 0 = unlimited. Set when a provider rejects large batches.
     rpc_max_batch_requests: u32 = 0,
@@ -77,6 +89,9 @@ pub const Config = struct {
     checkpoint_interval: u64,
     graphql_max_depth: u32,
     graphql_max_cost: u32,
+    /// Executions (successful or failed) at or above this many ms are logged at
+    /// warn level with depth, cost, outcome and a query excerpt. (GRAPHQL_SLOW_QUERY_MS)
+    graphql_slow_query_ms: u32 = 2000,
     metrics_enabled: bool,
     rainbow_path: []const u8,
     v1_contracts: contracts.ContractAddresses,
@@ -110,6 +125,10 @@ pub const Config = struct {
     /// indexer poll loop (Task 09). Off by default. The additive `_finality` API field is
     /// always present but returns nulls until this is on and positions are fetched.
     finality_enabled: bool,
+    /// Seconds a protocol may go without committing a batch before the coverage
+    /// `stale` flag trips on a deployment with no finality data. 0 (the default)
+    /// disables the fallback; see parseStaleAfterSeconds.
+    coverage_stale_after_seconds: u32,
 
     pub fn fromEnv(allocator: std.mem.Allocator) !Config {
         var env_map = try env_mod.loadEnv(allocator, ".env");
@@ -174,12 +193,14 @@ pub const Config = struct {
             },
             .poll_interval = env_mod.getEnvInt(&env_map, u64, "POLL_INTERVAL", 12),
             .batch_size = env_mod.getEnvInt(&env_map, u64, "BATCH_SIZE", 2000),
+            .sync_failure_exit_minutes = env_mod.getEnvInt(&env_map, u64, "SYNC_FAILURE_EXIT_MINUTES", 15),
             .sync_cache_mb = env_mod.getEnvInt(&env_map, u64, "SYNC_CACHE_MB", 512),
             .api_integrity_check = env_mod.getEnvBool(&env_map, "API_INTEGRITY_CHECK", false),
             .v2_event_buffer = env_mod.getEnvBool(&env_map, "V2_EVENT_BUFFER", true),
             .name_prefetch = env_mod.getEnvBool(&env_map, "NAME_PREFETCH", true),
             .mcp_enabled = env_mod.getEnvBool(&env_map, "MCP_ENABLED", false),
             .rate_limit_per_second = env_mod.getEnvInt(&env_map, u32, "RATE_LIMIT_PER_SECOND", 15),
+            .rpc_rate_limit_per_second = env_mod.getEnvInt(&env_map, u32, "RPC_RATE_LIMIT_PER_SECOND", env_mod.getEnvInt(&env_map, u32, "RATE_LIMIT_PER_SECOND", 15)),
             .rpc_max_batch_requests = env_mod.getEnvInt(&env_map, u32, "RPC_MAX_BATCH_REQUESTS", 0),
             .trusted_proxy_hops = env_mod.getEnvInt(&env_map, u32, "TRUSTED_PROXY_HOPS", 0),
             .request_timeout_ms = env_mod.getEnvInt(&env_map, u32, "REQUEST_TIMEOUT_MS", 10000),
@@ -223,6 +244,7 @@ pub const Config = struct {
             .checkpoint_interval = env_mod.getEnvInt(&env_map, u64, "CHECKPOINT_INTERVAL", 100),
             .graphql_max_depth = env_mod.getEnvInt(&env_map, u32, "GRAPHQL_MAX_DEPTH", 10),
             .graphql_max_cost = env_mod.getEnvInt(&env_map, u32, "GRAPHQL_MAX_COST", 10000),
+            .graphql_slow_query_ms = env_mod.getEnvInt(&env_map, u32, "GRAPHQL_SLOW_QUERY_MS", 2000),
             .metrics_enabled = env_mod.getEnvBool(&env_map, "METRICS_ENABLED", false),
             .rainbow_path = try allocator.dupe(u8, env_mod.getEnv(&env_map, "RAINBOW_PATH", "./data/ens_rainbow.db")),
             // Falls back to RPC_URL (dupe'd independently so `deinit` can free it
@@ -244,6 +266,13 @@ pub const Config = struct {
             .ccip_gateway_timeout_ms = env_mod.getEnvInt(&env_map, u32, "CCIP_GATEWAY_TIMEOUT_MS", 5000),
             .ccip_max_redirects = env_mod.getEnvInt(&env_map, u32, "CCIP_MAX_REDIRECTS", 4),
             .finality_enabled = env_mod.getEnvBool(&env_map, "FINALITY_ENABLED", false),
+            .coverage_stale_after_seconds = blk: {
+                const raw = env_mod.getEnv(&env_map, "COVERAGE_STALE_AFTER_SECONDS", "");
+                break :blk parseStaleAfterSeconds(raw) orelse {
+                    std.log.warn("Invalid COVERAGE_STALE_AFTER_SECONDS '{s}' (want whole seconds, or 0/off to disable); the no-finality stale check is OFF", .{raw});
+                    break :blk 0;
+                };
+            },
         };
     }
 
@@ -281,6 +310,30 @@ pub const Config = struct {
         if (self.resolve_ccip_enabled and !self.resolve_live_enabled) return error.CcipRequiresLive;
     }
 };
+
+/// COVERAGE_STALE_AFTER_SECONDS: whole seconds, or empty / `0` / `off` /
+/// `false` / `no` to disable. Null for anything else, so a typo is reported
+/// instead of silently picking a threshold.
+pub fn parseStaleAfterSeconds(raw: []const u8) ?u32 {
+    const value = std.mem.trim(u8, raw, " \t");
+    if (value.len == 0) return 0;
+    for ([_][]const u8{ "off", "false", "no" }) |word| {
+        if (std.ascii.eqlIgnoreCase(value, word)) return 0;
+    }
+    return std.fmt.parseInt(u32, value, 10) catch null;
+}
+
+test "parseStaleAfterSeconds: unset and the off spellings disable, seconds pass through, junk is rejected" {
+    try std.testing.expectEqual(@as(?u32, 0), parseStaleAfterSeconds(""));
+    try std.testing.expectEqual(@as(?u32, 0), parseStaleAfterSeconds("0"));
+    try std.testing.expectEqual(@as(?u32, 0), parseStaleAfterSeconds("off"));
+    try std.testing.expectEqual(@as(?u32, 0), parseStaleAfterSeconds("OFF"));
+    try std.testing.expectEqual(@as(?u32, 0), parseStaleAfterSeconds("false"));
+    try std.testing.expectEqual(@as(?u32, 3600), parseStaleAfterSeconds("3600"));
+    try std.testing.expectEqual(@as(?u32, 3600), parseStaleAfterSeconds(" 3600 "));
+    try std.testing.expectEqual(@as(?u32, null), parseStaleAfterSeconds("1h"));
+    try std.testing.expectEqual(@as(?u32, null), parseStaleAfterSeconds("-5"));
+}
 
 test "validateResolution: CCIP without live is a hard error; both-off / both-on / live-only are OK" {
     var c: Config = undefined;

@@ -113,6 +113,10 @@ CREATE TABLE IF NOT EXISTS registries (
 CREATE INDEX IF NOT EXISTS idx_registries_protocol ON registries(protocol);
 CREATE INDEX IF NOT EXISTS idx_registries_namehash ON registries(namehash);
 CREATE INDEX IF NOT EXISTS idx_registries_address_block ON registries(protocol, address, created_block DESC);
+-- Placeholder-ledger seed; see idx_events_placeholder_name. Also serves the placeholder
+-- PATCH, which updates `registries` by this same unindexed name predicate.
+CREATE INDEX IF NOT EXISTS idx_registries_placeholder_name ON registries(name)
+  WHERE name LIKE 'canonicalId:%';
 
 
 -- ============================================================================
@@ -173,6 +177,45 @@ CREATE TABLE IF NOT EXISTS names (
   -- 0 = non-normalized or unknown label. Default-filtered out of GraphQL listings
   -- unless includeUnnormalized is passed (mirrors is_reachable).
   is_normalized BIGINT NOT NULL DEFAULT 1,
+  -- Shared-registry alias marker. A PermissionedRegistry contract may be the
+  -- subregistry of SEVERAL parent names at once (the portal's "use a
+  -- pre-existing registry contract" flow), and on-chain every label in it then
+  -- resolves under every one of those parents. Each of those fully-qualified
+  -- names is its own Domain, so one label becomes N rows sharing
+  -- (registry, canonical_id, token_id, label) and differing only in
+  -- name/namehash/parent_name/parent_namehash.
+  --
+  -- INVARIANT: exactly one row per (protocol, registry, canonical_id) carries
+  -- is_alias = 0 — the row the chain events were attributed to, and the one the
+  -- indexer mutates. The is_alias = 1 rows are derived from it by
+  -- storage/name_aliases.syncSharedRegistryAliases and are refreshed from it,
+  -- never written by a handler. Every (canonical_id, registry) lookup in the
+  -- indexer filters is_alias = 0 so it stays single-valued.
+  --
+  -- Read paths do NOT filter this: an alias is a real, resolvable name and must
+  -- appear in listings. Two kinds of read MUST filter it, though, and both are
+  -- mistakes waiting to be repeated:
+  --   * `Registry.labels`/`labelCount`, which count minted LABELS rather than names;
+  --   * any JOIN keyed on (canonical_id, registry) — that pair is no longer unique, so
+  --     an unguarded join multiplies its left-hand rows. eac_roles has two such joins
+  --     (storage/roles.zig, storage/resolver_entity.zig) and both carry is_alias = 0.
+  is_alias BIGINT NOT NULL DEFAULT 0,
+  -- Does the LABEL itself still exist on-chain? Zero after LabelUnregistered (whose on-chain
+  -- effect is to expire the entry) or a burn.
+  --
+  -- This exists because `is_reachable` was one bit carrying two INDEPENDENT causes, and they
+  -- have different shapes: tree-orphaning is per REGISTRY (an ancestor repointed, so every name
+  -- sourced through that contract stops resolving) while unregistration is per NAME. The
+  -- registry-wide flip is `UPDATE … SET is_reachable = 1 WHERE is_reachable = 0 AND registry IN
+  -- (…)`, so it used to RESURRECT individually unregistered names the moment their registry
+  -- became reachable again — 41 soft-deleted names on the reference mirror were one repoint away
+  -- from reappearing as live.
+  --
+  -- `is_reachable` stays the EFFECTIVE bit, so no read path changes: it is only ever set to 1
+  -- for a row whose label is still live. An INSERT always means the label exists (a
+  -- re-registration of a burned label legitimately revives it), which is why the upsert sets
+  -- this to 1 unconditionally rather than binding it.
+  label_live BIGINT NOT NULL DEFAULT 1,
   -- Grace-inclusive expiry (subgraph `Domain.expiryDate`): bare stored expiry
   -- plus the 90d (7776000s) registrar grace for UNWRAPPED V1 .eth 2LDs only
   -- (wrapped rows already store the grace-inclusive wrapper value). This is the
@@ -205,6 +248,16 @@ CREATE INDEX IF NOT EXISTS idx_names_expiry ON names(expiry);
 CREATE INDEX IF NOT EXISTS idx_names_expiry_effective ON names(expiry_effective);
 CREATE INDEX IF NOT EXISTS idx_names_registry ON names(protocol, registry);
 CREATE INDEX IF NOT EXISTS idx_names_resolver ON names(protocol, resolver);
+-- Resolver.domain picks the lowest namehash pointing at a resolver (ORDER BY
+-- namehash ASC LIMIT 1); this composite lets that pick (and its per-page batched
+-- form, one scalar subquery per resolver) stop at the first index entry instead
+-- of sorting every name on the resolver.
+CREATE INDEX IF NOT EXISTS idx_names_resolver_namehash ON names(resolver, namehash);
+-- Domain.subdomains pages read `parent_name = ? ORDER BY name, protocol LIMIT ? OFFSET ?`,
+-- per row and per page (one LATERAL page per parent on Postgres); this composite
+-- serves that order directly so a parent with millions of children costs one
+-- index range scan of the page, never a sort of every child.
+CREATE INDEX IF NOT EXISTS idx_names_parent_name_name ON names(parent_name, name, protocol);
 CREATE INDEX IF NOT EXISTS idx_names_created_block ON names(protocol, created_block);
 -- domains(first:N) defaults to ORDER BY created_at, namehash (keyset pagination
 -- tiebreak). The composite lets the planner stream the newest/oldest N rows
@@ -217,9 +270,28 @@ CREATE INDEX IF NOT EXISTS idx_names_v1_label_hash ON names(v1_label_hash);
 CREATE INDEX IF NOT EXISTS idx_names_wrapper_expiry ON names(wrapper_expiry);
 CREATE INDEX IF NOT EXISTS idx_names_registrant ON names(registrant);
 CREATE INDEX IF NOT EXISTS idx_names_parent_namehash ON names(parent_namehash);
+CREATE INDEX IF NOT EXISTS idx_names_parent_name ON names(parent_name);
+-- Placeholder-ledger seed; see idx_events_placeholder_name.
+CREATE INDEX IF NOT EXISTS idx_names_placeholder_parent ON names(parent_name)
+  WHERE parent_name LIKE 'canonicalId:%';
 CREATE INDEX IF NOT EXISTS idx_names_is_reachable ON names(protocol, is_reachable);
 CREATE INDEX IF NOT EXISTS idx_names_registry_reachable ON names(protocol, registry, is_reachable);
 CREATE INDEX IF NOT EXISTS idx_names_is_normalized ON names(is_normalized);
+-- syncSharedRegistryAliases resolves "the alias rows of this parent edge" when a
+-- parent repoints away, and refreshes them from their primary. Both are keyed on
+-- (parent_namehash, registry); the alias set is tiny, so a partial index keeps
+-- it off the hot single-parent path entirely.
+CREATE INDEX IF NOT EXISTS idx_names_alias_edge ON names(parent_namehash, registry) WHERE is_alias = 1;
+-- The shared-registry derivation pages through one registry's labels in canonical_id
+-- order, resuming from a persisted cursor. With this index that page is an index range
+-- scan starting AT the cursor, which is what makes the converged "anything left?" check
+-- an index seek (0.04ms measured on 200k labels) instead of a full re-scan (3.9s).
+CREATE INDEX IF NOT EXISTS idx_names_registry_canonical ON names(protocol, registry, canonical_id);
+-- The derivation asks, per candidate, "does an alias already exist for this
+-- (registry, label, parent)?". Without an index of exactly that shape Postgres answers it
+-- with a merge anti join over EVERY alias row (measured: 1,399,993 rows discarded, 3.2s
+-- per page); with it the probe is a single index lookup and the same page costs 0.9ms.
+CREATE INDEX IF NOT EXISTS idx_names_alias_probe ON names(registry, canonical_id, parent_namehash) WHERE is_alias = 1;
 
 -- Partial index targeting Domain.subdomainsCount / subdomainCount / hasDirectSubdomains
 -- / getSubdomains queries (see src/storage/names.zig:SUBDOMAIN_GC_FILTER for the matching
@@ -261,6 +333,46 @@ CREATE TABLE IF NOT EXISTS registry_entries (
 
 CREATE INDEX IF NOT EXISTS idx_registry_entries_subregistry ON registry_entries(protocol, subregistry);
 CREATE INDEX IF NOT EXISTS idx_registry_entries_parent ON registry_entries(protocol, parent_registry);
+
+
+-- ============================================================================
+-- ALIAS WORK QUEUE
+-- ============================================================================
+-- Scheduling state for the shared-registry alias derivation (storage/name_aliases.zig).
+-- NOT projection data: it records which registries still need their derived names
+-- recomputed, so a steady state costs one small query against `registry_entries`
+-- instead of re-deriving the fixpoint over every row. Losing it costs latency, never
+-- correctness — the startup/periodic sweep re-enqueues every multi-parent registry, and
+-- `--backfill` ignores the queue entirely and converges by enumeration.
+--
+-- One row per registry awaiting work. The cursor is where the last bounded pass
+-- stopped, so a large registry materialises across batches without rescanning what it
+-- already did. `restart` is set when a registry is re-enqueued while a pass is midway
+-- through it: the current sweep finishes, then one more runs from the start, so a
+-- change that lands behind the cursor cannot be missed and a steady stream of changes
+-- cannot starve the scan either.
+CREATE TABLE IF NOT EXISTS alias_work (
+  protocol TEXT NOT NULL,
+  registry TEXT NOT NULL,
+  -- '' means "every label in this registry" — what an edge change enqueues, since every
+  -- label then owes a name under a parent it did not have before. A canonical_id scopes
+  -- the item to ONE label, which is what a registration enqueues: that is O(parents)
+  -- instead of a pass over the registry, and it is the difference between a 0.9ms item
+  -- and a 12.2s one on a registry holding 200k labels (both measured).
+  canonical_id TEXT NOT NULL DEFAULT '',
+  cursor_canonical_id TEXT,
+  cursor_parent_namehash TEXT,
+  -- Whole-registry rows are kept after they converge, with done = 1, so the periodic
+  -- sweep can re-assert them without rewinding: re-deriving a converged 200k-label
+  -- registry from the start costs a full pass, while re-checking from its persisted
+  -- cursor costs 0.9ms. Only an actual change clears `done` and rewinds the cursor.
+  done BIGINT NOT NULL DEFAULT 0,
+  restart BIGINT NOT NULL DEFAULT 0,
+  enqueued_block BIGINT NOT NULL DEFAULT 0,
+  PRIMARY KEY (protocol, registry, canonical_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_alias_work_pending ON alias_work(protocol, registry, canonical_id) WHERE done = 0;
 
 
 -- ============================================================================
@@ -542,6 +654,55 @@ CREATE TABLE IF NOT EXISTS resolver_named_resources (
 
 CREATE INDEX IF NOT EXISTS idx_named_resources_resolver ON resolver_named_resources(protocol, resolver);
 
+-- Record-model resolvers (contracts-v2 IRecordResolver): Linked(recordId, node, name)
+-- binds a name's node to a record id (0 = unlinked); node 0x0 holds the resolver-wide
+-- default record. record_key is the synthetic namehash-column key the record's values
+-- are stored under in the resolver_* tables (see storage/resolver_records.zig).
+CREATE TABLE IF NOT EXISTS resolver_links (
+  protocol TEXT NOT NULL,
+  resolver TEXT NOT NULL,
+  namehash TEXT NOT NULL,
+  record_id TEXT NOT NULL,
+  record_key TEXT NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  block_number BIGINT NOT NULL,
+  transaction_hash TEXT NOT NULL,
+  log_index BIGINT NOT NULL,
+  timestamp BIGINT NOT NULL,
+  UNIQUE(protocol, resolver, namehash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_resolver_links_record ON resolver_links(resolver, record_id);
+CREATE INDEX IF NOT EXISTS idx_resolver_links_namehash ON resolver_links(namehash);
+
+-- ENSIP-24 data(key) records (DataUpdated on record resolvers, DataChanged on legacy).
+CREATE TABLE IF NOT EXISTS resolver_datas (
+  namehash TEXT NOT NULL,
+  resolver TEXT NOT NULL,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL,
+  protocol TEXT NOT NULL,
+  block_number BIGINT NOT NULL,
+  transaction_hash TEXT NOT NULL,
+  timestamp BIGINT NOT NULL,
+  UNIQUE(protocol, resolver, namehash, key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_resolver_datas_namehash ON resolver_datas(namehash);
+CREATE INDEX IF NOT EXISTS idx_resolver_datas_resolver ON resolver_datas(resolver);
+
+-- ResolverCreated(): marks a resolver as record-model ('record').
+CREATE TABLE IF NOT EXISTS resolver_kinds (
+  protocol TEXT NOT NULL,
+  resolver TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  block_number BIGINT NOT NULL,
+  transaction_hash TEXT NOT NULL,
+  log_index BIGINT NOT NULL,
+  timestamp BIGINT NOT NULL,
+  UNIQUE(protocol, resolver)
+);
+
 
 -- ============================================================================
 -- EVENTS
@@ -575,6 +736,14 @@ CREATE INDEX IF NOT EXISTS idx_events_block_log ON events(block_number, log_inde
 CREATE INDEX IF NOT EXISTS idx_events_owner_extracted ON events (LOWER((data::jsonb ->> 'owner')));
 CREATE INDEX IF NOT EXISTS idx_events_to_extracted ON events (LOWER((data::jsonb ->> 'to')));
 CREATE INDEX IF NOT EXISTS idx_events_from_extracted ON events (LOWER((data::jsonb ->> 'from')));
+CREATE INDEX IF NOT EXISTS idx_events_resource_extracted ON events ((data::jsonb ->> 'resource'));
+-- The placeholder ledger recovers un-named rows by prefix at startup and after a reorg
+-- rollback. Unindexed, those four `LIKE 'canonicalId:%'` / `'tokenId:%'` scans measured 970ms
+-- COMBINED on the reference mirror (170k names / 1.1M events) to find 22 rows, and they grow
+-- with the tables. Partial indexes hold only the placeholder rows — a handful — so the same
+-- seeds cost 0.8ms and stay flat. See indexer/placeholders.zig.
+CREATE INDEX IF NOT EXISTS idx_events_placeholder_name ON events(name)
+  WHERE name LIKE 'canonicalId:%' OR name LIKE 'tokenId:%';
 
 
 -- ============================================================================
@@ -625,6 +794,7 @@ CREATE INDEX IF NOT EXISTS idx_eac_roles_resource ON eac_roles(protocol, resourc
 CREATE INDEX IF NOT EXISTS idx_eac_roles_account ON eac_roles(protocol, account);
 CREATE INDEX IF NOT EXISTS idx_eac_roles_block ON eac_roles(protocol, block_number);
 CREATE INDEX IF NOT EXISTS idx_eac_roles_contract ON eac_roles(protocol, contract_address);
+CREATE INDEX IF NOT EXISTS idx_eac_roles_contract_resource ON eac_roles(protocol, contract_address, resource);
 
 
 -- ============================================================================

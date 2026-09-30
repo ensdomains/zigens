@@ -268,14 +268,12 @@ class Parser:
         name = self.eat("NAME").value
         self.eat("PUNCT", ":")
         field_type = self.parse_type()
-        # Skip default value if present — introspection captures it as defaultValue
-        # (we don't emit it currently because the executor doesn't read it).
-        if self.accept("PUNCT", "="):
-            self.consume_default_value()
+        default_value = self.parse_default_value() if self.accept("PUNCT", "=") else None
         return {
             "name": name,
             "description": desc_value,
             "type": field_type,
+            "defaultValue": default_value,
         }
 
     def parse_arg(self) -> dict[str, Any]:
@@ -283,12 +281,12 @@ class Parser:
         name = self.eat("NAME").value
         self.eat("PUNCT", ":")
         arg_type = self.parse_type()
-        if self.accept("PUNCT", "="):
-            self.consume_default_value()
+        default_value = self.parse_default_value() if self.accept("PUNCT", "=") else None
         return {
             "name": name,
             "description": desc_value,
             "type": arg_type,
+            "defaultValue": default_value,
         }
 
     def parse_type(self) -> dict[str, Any]:
@@ -304,30 +302,23 @@ class Parser:
             return {"kind": "NON_NULL", "ofType": wrapped}
         return wrapped
 
-    def consume_default_value(self) -> None:
-        """Eat exactly one default-value token (literal, name, list, or string)."""
+    def parse_default_value(self) -> str:
+        """Parse one default-value literal and return it as GraphQL source text,
+        the form `__InputValue.defaultValue` carries (e.g. `10`, `"x"`, `[1, 2]`)."""
         tok = self.peek()
-        if tok.kind in ("NUM", "STR"):
+        if tok.kind == "STR":
             self.pos += 1
-            return
-        if tok.kind == "NAME":
+            return f'"{tok.value}"'
+        if tok.kind in ("NUM", "NAME"):
             self.pos += 1
-            return
-        if tok.kind == "PUNCT" and tok.value == "[":
-            depth = 0
-            while True:
-                t = self.peek()
-                if t.kind == "PUNCT" and t.value == "[":
-                    depth += 1
-                elif t.kind == "PUNCT" and t.value == "]":
-                    depth -= 1
-                    self.pos += 1
-                    if depth == 0:
-                        return
-                    continue
-                self.pos += 1
-        else:
-            raise SyntaxError(f"Unexpected default-value token {tok.kind}({tok.value!r}) at line {tok.line}")
+            return tok.value
+        if self.accept("PUNCT", "["):
+            items = []
+            while not self.accept("PUNCT", "]"):
+                items.append(self.parse_default_value())
+                self.accept("PUNCT", ",")
+            return "[" + ", ".join(items) + "]"
+        raise SyntaxError(f"Unexpected default-value token {tok.kind}({tok.value!r}) at line {tok.line}")
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +351,7 @@ def emit_introspection(types: list[dict[str, Any]]) -> dict[str, Any]:
                 "name": a["name"],
                 "description": a.get("description"),
                 "type": resolve(a["type"]),
+                "defaultValue": a.get("defaultValue"),
             })
         return out
 
@@ -393,6 +385,7 @@ def emit_introspection(types: list[dict[str, Any]]) -> dict[str, Any]:
                         "name": f["name"],
                         "description": f.get("description"),
                         "type": resolve(f["type"]),
+                        "defaultValue": f.get("defaultValue"),
                     }
                     for f in t["inputFields"]
                 ],
@@ -490,6 +483,18 @@ class IntrospectionTests(unittest.TestCase):
         '''
         names = self.names_of(schema)
         self.assertEqual(names, {"Pagination", "Q", "Boolean", "Float", "ID", "Int", "String"})
+
+    def test_default_values_are_emitted_as_source_text(self) -> None:
+        schema = '''
+            input Pagination { first: Int = 100 order: String = "asc" plain: Int }
+            type Q { items(first: Int = 10, names: [String!] = ["a", "b"], dir: Order = ASC, skip: Int): String }
+        '''
+        types = parse_graphql_schema(schema)["data"]["__schema"]["types"]
+        pagination = next(t for t in types if t["name"] == "Pagination")
+        self.assertEqual([f["defaultValue"] for f in pagination["inputFields"]], ["100", '"asc"', None])
+        q = next(t for t in types if t["name"] == "Q")
+        args = q["fields"][0]["args"]
+        self.assertEqual([a["defaultValue"] for a in args], ["10", '["a", "b"]', "ASC", None])
 
     def test_list_and_nonnull_combinations(self) -> None:
         schema = "type T { a: String b: String! c: [String] d: [String!]! }"

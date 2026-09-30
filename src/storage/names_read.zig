@@ -11,6 +11,7 @@ const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
 const names_common = @import("names_common.zig");
+const unicode = @import("../utils/unicode.zig");
 const parseU256Hex = names_common.parseU256Hex;
 const formatU256HexBuf = names_common.formatU256HexBuf;
 
@@ -28,20 +29,54 @@ const SQL_SELECT_NAMES =
     \\       owner, registrant, resolver, token_id, canonical_id, token_version, namehash, expiry,
     \\       registry_locked, migrated, created_block, created_at, registered_at, updated_block, updated_at,
     \\       is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash,
-    \\       is_reachable, unreachable_since, ttl, is_legacy, resolved_address, is_normalized
+    \\       is_reachable, unreachable_since, ttl, is_legacy, resolved_address, is_normalized, is_alias
     \\FROM names
 ;
 
-/// Shorter SELECT for queries that don't need wrapper fields (27 columns).
+/// Shorter SELECT for the hot paths, wrapper fields last (34 columns).
 /// Still includes is_reachable/unreachable_since/ttl so callers can honor
 /// reachability filtering and serialize the flag.
 const SQL_SELECT_NAMES_SHORT =
     \\SELECT name, label, label_hash, parent_name, parent_namehash, protocol, registry,
     \\       owner, registrant, resolver, token_id, canonical_id, token_version, namehash, expiry,
     \\       registry_locked, migrated, created_block, created_at, registered_at, updated_block, updated_at,
-    \\       is_reachable, unreachable_since, ttl, is_legacy, resolved_address, is_normalized, is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash
+    \\       is_reachable, unreachable_since, ttl, is_legacy, resolved_address, is_normalized, is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash, is_alias
     \\FROM names
 ;
+
+/// SQL_SELECT_NAMES_SHORT's column list plus a per-parent rank (name ASC, the
+/// getSubdomains order) as a trailing column, derived at comptime so the two
+/// lists cannot drift: a `SELECT * FROM (…) t` over it still parses with
+/// parseNameRowShort (indices 0..33). Backs the batched getSubdomains mirror.
+const SQL_SELECT_NAMES_FROM = "\nFROM names";
+const SQL_SELECT_NAMES_SHORT_RANKED_BY_PARENT = blk: {
+    std.debug.assert(std.mem.endsWith(u8, SQL_SELECT_NAMES_SHORT, SQL_SELECT_NAMES_FROM));
+    break :blk SQL_SELECT_NAMES_SHORT[0 .. SQL_SELECT_NAMES_SHORT.len - SQL_SELECT_NAMES_FROM.len] ++
+        ",\n       ROW_NUMBER() OVER (PARTITION BY parent_name ORDER BY name, protocol) AS rn" ++
+        SQL_SELECT_NAMES_FROM;
+};
+
+const ROOT_NAMEHASH_HEX: []const u8 = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+/// IN-list / VALUES width per statement for the batched page readers.
+const BATCH_CHUNK = 200;
+
+/// Arena-owned copy of a caller string in the exact form bindText would send
+/// (UTF-8-sanitized), for a static bind: long key lists must bypass the
+/// per-statement tracked-copy cap.
+fn arenaBindCopy(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    const clean = try unicode.sanitizeUtf8(arena, s);
+    return if (clean.ptr == s.ptr) try arena.dupe(u8, s) else clean;
+}
+
+/// Append `n` comma-separated `?` placeholders wrapped as `(?),(?),…` VALUES rows
+/// (`row_values = true`) or a bare `?,?,…` IN-list (`row_values = false`).
+fn appendPlaceholders(sql: *std.ArrayList(u8), arena: std.mem.Allocator, n: usize, row_values: bool) !void {
+    for (0..n) |i| {
+        if (i != 0) try sql.append(arena, ',');
+        try sql.appendSlice(arena, if (row_values) "(?)" else "?");
+    }
+}
 
 /// Format a u256 as hex string with 0x prefix
 fn formatU256Hex(allocator: std.mem.Allocator, value: u256) ![]u8 {
@@ -132,6 +167,7 @@ fn parseNameRow(q: *Query, allocator: std.mem.Allocator) !models.Name {
         else
             null,
         .is_normalized = q.getBool(32),
+        .is_alias = q.getBool(33),
     };
 }
 
@@ -214,6 +250,7 @@ fn parseNameRowShort(q: *Query, allocator: std.mem.Allocator) !models.Name {
         else
             null,
         .is_normalized = q.getBool(27),
+        .is_alias = q.getBool(33),
     };
 }
 
@@ -221,8 +258,23 @@ fn parseNameRowShort(q: *Query, allocator: std.mem.Allocator) !models.Name {
 // NAME QUERY OPERATIONS
 // ============================================================================
 
+/// A namehash identifies a node, and `names` is UNIQUE(protocol, namehash) — so a name
+/// MIGRATED from V1 to V2 has a row in each protocol and this lookup has two candidates.
+///
+/// It used to have no `ORDER BY` at all, so which twin a caller got was decided by the
+/// storage engine: SQLite returned rowid order, Postgres heap order, and the two could
+/// disagree about a migrated name's owner, expiry and resolver. The tiebreak below makes the
+/// answer deterministic AND consistent with the list queries, which suppress the V1 row
+/// whenever a V2 twin exists (`names_filter`'s twin-suppression predicate) — so the point
+/// read and the listing can no longer disagree about the same node.
+///
+/// Callers that mean one specific protocol should say so: `getNameByNamehashAndProtocol`
+/// binds the full unique key. Every V1 indexer handler uses that one.
+const TWIN_PREFERENCE = " ORDER BY CASE WHEN protocol = 'v2' THEN 0 ELSE 1 END, protocol ASC LIMIT 1";
+
 pub fn getNameByNamehash(db: *Database, namehash: Hash) !?models.Name {
-    var q = try Query.initCached(db, SQL_SELECT_NAMES ++ " WHERE namehash = ?");
+    try db.namesBarrier();
+    var q = try Query.initCached(db, SQL_SELECT_NAMES ++ " WHERE namehash = ?" ++ TWIN_PREFERENCE);
     defer q.deinit();
 
     try q.bindHash(namehash);
@@ -237,7 +289,9 @@ pub fn getNameByNamehash(db: *Database, namehash: Hash) !?models.Name {
 /// Avoids the cost of fetching + duping a full 21-column Name row when callers only
 /// need the human-readable name string (reverse-resolution hot path in the indexer).
 pub fn getNameStringByNamehash(db: *Database, namehash: Hash, allocator: std.mem.Allocator) !?[]u8 {
-    var q = try Query.initCached(db, "SELECT name FROM names WHERE namehash = ? LIMIT 1");
+    try db.namesBarrier();
+    // Same twin preference as getNameByNamehash — see TWIN_PREFERENCE.
+    var q = try Query.initCached(db, "SELECT name FROM names WHERE namehash = ?" ++ TWIN_PREFERENCE);
     defer q.deinit();
 
     try q.bindHash(namehash);
@@ -254,6 +308,7 @@ pub fn getNameStringByNamehash(db: *Database, namehash: Hash, allocator: std.mem
 /// path lookups where we need to find the V1 row by the same namehash a V2
 /// LabelRegistered event just produced.
 pub fn getNameByNamehashAndProtocol(db: *Database, namehash: Hash, protocol: models.Protocol) !?models.Name {
+    try db.namesBarrier();
     var q = try Query.initCached(db, SQL_SELECT_NAMES ++ " WHERE namehash = ? AND protocol = ?");
     defer q.deinit();
 
@@ -267,24 +322,57 @@ pub fn getNameByNamehashAndProtocol(db: *Database, namehash: Hash, protocol: mod
 }
 
 /// Get namehash by resolver address
-pub fn getNamehashByResolver(db: *Database, resolver: Address) !?Hash {
-    var q = try Query.initCached(db, "SELECT namehash FROM names WHERE resolver = ? LIMIT 1");
+/// The name a resolver belongs to, or null when that question has no single answer.
+///
+/// This backs the zero-namehash fallback for resolver events: ENSv2 deploys a dedicated
+/// resolver per name, so an event whose node is zero can be attributed to that resolver's one
+/// name. The premise fails for a SHARED resolver, and it fails hard — on the reference mirror
+/// 1,002 resolvers serve more than one name and the most-used serves **159,143**. With
+/// `LIMIT 1` and no ORDER BY this returned an arbitrary one of them, so a record would be
+/// attributed to a name picked effectively at random (and differently on SQLite vs Postgres).
+///
+/// So it refuses to guess: `LIMIT 2` and null when a second row exists, the same
+/// count-must-be-1 guard `getUniqueNameByCanonicalId` uses. The caller's existing
+/// "unknown resolver" branch then skips the event, which loses one event's attribution instead
+/// of writing it to the wrong name. Protocol-scoped for the usual reason — `names` is
+/// UNIQUE(protocol, namehash) and nothing stops the two protocols sharing a resolver address.
+pub fn getNamehashByResolver(db: *Database, protocol: models.Protocol, resolver: Address) !?Hash {
+    try db.namesBarrier();
+    var q = try Query.initCached(db, "SELECT namehash FROM names WHERE protocol = ? AND resolver = ? LIMIT 2");
     defer q.deinit();
 
+    try q.bindTextStatic(protocol.toString());
     try q.bindAddress(resolver);
 
-    if (try q.step()) {
-        const namehash_str = q.getTextSlice(0) orelse return null;
-        return try Hash.fromHex(namehash_str);
-    }
-    return null;
+    if (!try q.step()) return null;
+    const namehash_str = q.getTextSlice(0) orelse return null;
+    const first = try Hash.fromHex(namehash_str);
+    // A second row means the resolver is shared and the question is unanswerable.
+    if (try q.step()) return null;
+    return first;
 }
 
 /// Get name by token ID and registry address (avoids cross-registry tokenId collisions).
 /// Strips to canonical_id (version-independent) for lookup, so this works with any
 /// version of the token_id and is resilient to TokenRegenerated events.
 pub fn getNameByTokenIdAndRegistry(db: *Database, token_id: u256, registry: Address) !?models.Name {
-    var q = try Query.initCached(db, SQL_SELECT_NAMES ++ " WHERE canonical_id = ? AND registry = ? LIMIT 1");
+    try db.namesBarrier();
+    // `is_alias = 0` is what keeps this single-valued. A registry pointed at by
+    // several live parents holds one row per (label, parent) — all sharing this
+    // (canonical_id, registry) pair — and the unfiltered `LIMIT 1` would pick an
+    // arbitrary one, backend-defined, sending every ownership / expiry / resolver
+    // write to a random FQDN of the label. Exactly one row per pair is the
+    // attributed primary; the alias rows are derived from it (storage/name_aliases).
+    // ORDER BY is belt-and-braces on top of `is_alias = 0`. The invariant says one
+    // primary per (canonical_id, registry), but it is maintained across events rather
+    // than enforced by a constraint: re-registering a label in a shared registry whose
+    // original parent has since un-pointed makes the handler derive a different FQDN,
+    // and the upsert writes `is_alias = 0` there while the old primary keeps its flag.
+    // A bare LIMIT 1 would then pick backend-defined garbage; oldest-first makes the
+    // degraded case pick the same row every time, on both backends, so ownership and
+    // expiry writes stay on one FQDN instead of alternating.
+    var q = try Query.initCached(db, SQL_SELECT_NAMES ++
+        " WHERE canonical_id = ? AND registry = ? AND is_alias = 0 ORDER BY created_block ASC, namehash ASC LIMIT 1");
     defer q.deinit();
 
     const token_id_utils = @import("../types/token_id.zig");
@@ -308,7 +396,13 @@ pub fn getNameByTokenIdAndRegistry(db: *Database, token_id: u256, registry: Addr
 /// this registry-less lookup (the write-buffer's placeholder-event repair)
 /// must skip rather than guess in that case.
 pub fn getUniqueNameByCanonicalId(db: *Database, protocol: models.Protocol, token_id: u256) !?models.Name {
-    var q = try Query.initCached(db, SQL_SELECT_NAMES ++ " WHERE canonical_id = ? AND protocol = ? LIMIT 2");
+    try db.namesBarrier();
+    // Alias rows are excluded before the uniqueness guard runs: they share the
+    // canonical id of their primary by construction, so counting them would make
+    // this return null for every shared-registry label and degrade event naming to
+    // the `tokenId:N` placeholder. The guard still fires for the genuine
+    // cross-registry collision it exists for.
+    var q = try Query.initCached(db, SQL_SELECT_NAMES ++ " WHERE canonical_id = ? AND protocol = ? AND is_alias = 0 LIMIT 2");
     defer q.deinit();
 
     const token_id_utils = @import("../types/token_id.zig");
@@ -337,7 +431,14 @@ pub fn getUniqueNameByCanonicalId(db: *Database, protocol: models.Protocol, toke
 /// prefetch) holds the COMPLETE row set per id and can mirror both point
 /// lookups above exactly, authoritative misses included. Rows and the
 /// returned slice are allocated with `allocator`.
+///
+/// `is_alias = 0` matches the two point lookups: both exclude the derived
+/// shared-registry alias rows, and both of this function's callers reduce their
+/// result with a count-must-be-1 uniqueness guard, which alias rows (sharing
+/// their primary's canonical id by construction) would trip on every
+/// shared-registry label.
 pub fn getNamesByCanonicalIds(db: *Database, canonical_ids: []const u256, allocator: std.mem.Allocator) ![]models.Name {
+    try db.namesBarrier();
     var out: std.ArrayList(models.Name) = .empty;
     errdefer {
         for (out.items) |*n| n.deinit(allocator);
@@ -354,7 +455,7 @@ pub fn getNamesByCanonicalIds(db: *Database, canonical_ids: []const u256, alloca
         defer scratch.deinit();
 
         var sql: std.ArrayList(u8) = .empty;
-        try sql.appendSlice(scratch.allocator(), SQL_SELECT_NAMES ++ " WHERE canonical_id IN (");
+        try sql.appendSlice(scratch.allocator(), SQL_SELECT_NAMES ++ " WHERE is_alias = 0 AND canonical_id IN (");
         for (chunk, 0..) |_, i| {
             if (i != 0) try sql.append(scratch.allocator(), ',');
             try sql.append(scratch.allocator(), '?');
@@ -377,6 +478,40 @@ pub fn getNamesByCanonicalIds(db: *Database, canonical_ids: []const u256, alloca
     return try out.toOwnedSlice(allocator);
 }
 
+/// The `is_alias = 0` rows of one registry contract: the labels that registry has
+/// minted, one row each. Backs the shared-registry alias derivation
+/// (storage/name_aliases.zig), which copies each of these into one row per extra
+/// live referring parent, so the alias rows themselves must stay out — including
+/// them would make the derivation copy its own output. Ordered by namehash so a
+/// pass emits its rows in the same sequence on every run and under replay. Rows
+/// and the returned slice are allocated with `allocator`.
+pub fn getNamesInRegistry(
+    db: *Database,
+    allocator: std.mem.Allocator,
+    protocol: models.Protocol,
+    registry: Address,
+) ![]models.Name {
+    try db.namesBarrier();
+    var out: std.ArrayList(models.Name) = .empty;
+    errdefer {
+        for (out.items) |*n| n.deinit(allocator);
+        out.deinit(allocator);
+    }
+
+    var q = try Query.initCached(db, SQL_SELECT_NAMES ++
+        " WHERE protocol = ? AND registry = ? AND is_alias = 0 ORDER BY namehash ASC");
+    defer q.deinit();
+    try q.bindTextStatic(protocol.toString());
+    try q.bindAddress(registry);
+
+    while (try q.step()) {
+        var row = try parseNameRow(&q, allocator);
+        errdefer row.deinit(allocator);
+        try out.append(allocator, row);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// Every row whose namehash is in `namehashes` — no protocol filter, no
 /// LIMIT, exactly the row universe getNameByNamehash steps over. The API-page
 /// domain loader groups these per namehash and only serves namehashes with a
@@ -384,6 +519,7 @@ pub fn getNamesByCanonicalIds(db: *Database, canonical_ids: []const u256, alloca
 /// unordered first-row pick only SQL can reproduce). Rows and the returned
 /// slice are allocated with `allocator`.
 pub fn getNamesByNamehashes(db: *Database, namehashes: []const Hash, allocator: std.mem.Allocator) ![]models.Name {
+    try db.namesBarrier();
     var out: std.ArrayList(models.Name) = .empty;
     errdefer {
         for (out.items) |*n| n.deinit(allocator);
@@ -438,6 +574,7 @@ pub const CanonicalNameResolution = struct {
 /// passes write events only). Names are duped with `allocator`; release via
 /// freeCanonicalNameResolutions.
 pub fn resolveUniqueNamesByCanonicalIds(db: *Database, protocol: models.Protocol, token_ids: []const u256, allocator: std.mem.Allocator) !std.AutoHashMap(u256, CanonicalNameResolution) {
+    try db.namesBarrier();
     var out = std.AutoHashMap(u256, CanonicalNameResolution).init(allocator);
     errdefer freeCanonicalNameResolutions(&out, allocator);
 
@@ -493,6 +630,7 @@ pub fn freeCanonicalNameResolutions(map: *std.AutoHashMap(u256, CanonicalNameRes
 /// Get all names owned by an address. Unreachable rows (orphaned by a
 /// subregistry repoint or LabelUnregistered) are filtered out.
 pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Name {
+    try db.namesBarrier();
     const sql = if (limit) |l|
         try std.fmt.allocPrint(db.allocator, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND owner = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' LIMIT {d}", .{l})
     else
@@ -521,6 +659,7 @@ pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Nam
 
 /// Get names by resolver address. Unreachable rows are filtered out.
 pub fn getNamesByResolver(db: *Database, resolver: Address, limit: u32) ![]models.Name {
+    try db.namesBarrier();
     var q = try Query.init(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND resolver = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY created_at DESC LIMIT ?");
     defer q.deinit();
 
@@ -558,6 +697,7 @@ pub fn getWrappedDomains(
     skip: u32,
     limit: u32,
 ) ![]models.Name {
+    try db.namesBarrier();
     var sql_buf: std.ArrayList(u8) = .empty;
     defer sql_buf.deinit(db.allocator);
     try sql_buf.appendSlice(db.allocator, SQL_SELECT_NAMES);
@@ -594,6 +734,7 @@ pub fn getWrappedDomains(
 /// null when no name currently points at this resolver. Unreachable rows
 /// are filtered out to match the rest of the API contract.
 pub fn getDomainByResolver(db: *Database, resolver: Address) !?models.Name {
+    try db.namesBarrier();
     var q = try Query.initCached(
         db,
         SQL_SELECT_NAMES ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND resolver = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' ORDER BY namehash ASC LIMIT 1",
@@ -606,6 +747,62 @@ pub fn getDomainByResolver(db: *Database, resolver: Address) !?models.Name {
         return try parseNameRow(&q, db.allocator);
     }
     return null;
+}
+
+/// Batched mirror of getDomainByResolver over many resolvers: for each resolver
+/// address, the single row the point query would return (reachable, normalized,
+/// non-root, first by namehash ASC). The resolver list is a VALUES CTE and each
+/// resolver's pick is a scalar subquery over the same WHERE — on the
+/// (resolver, namehash) index that stops at its first entry — whose result
+/// keys the outer row-value IN probe. Resolvers with no such row contribute
+/// nothing. Chunks of 200 with arena-static address binds (no tracked-copy
+/// cap). Rows and the returned slice are allocated with `allocator`.
+pub fn getDomainsByResolvers(db: *Database, resolvers: []const Address, allocator: std.mem.Allocator) ![]models.Name {
+    try db.namesBarrier();
+    var out: std.ArrayList(models.Name) = .empty;
+    errdefer {
+        for (out.items) |*n| n.deinit(allocator);
+        out.deinit(allocator);
+    }
+
+    // Duplicates yield one row: dedupe before chunking so a resolver repeated
+    // across chunk boundaries is not picked (and returned) once per chunk.
+    var seen = std.AutoHashMap([20]u8, void).init(db.allocator);
+    defer seen.deinit();
+    var unique: std.ArrayList(Address) = .empty;
+    defer unique.deinit(db.allocator);
+    for (resolvers) |r| {
+        const gop = try seen.getOrPut(r.bytes);
+        if (!gop.found_existing) try unique.append(db.allocator, r);
+    }
+
+    var start: usize = 0;
+    while (start < unique.items.len) {
+        const chunk = unique.items[start..@min(start + BATCH_CHUNK, unique.items.len)];
+        start += chunk.len;
+
+        var scratch = std.heap.ArenaAllocator.init(db.allocator);
+        defer scratch.deinit();
+
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.appendSlice(scratch.allocator(), "WITH v(addr) AS (VALUES ");
+        try appendPlaceholders(&sql, scratch.allocator(), chunk.len, true);
+        try sql.appendSlice(scratch.allocator(), ") " ++ SQL_SELECT_NAMES ++ " n WHERE n.is_reachable = 1 AND n.is_normalized = 1 AND (n.resolver, n.namehash) IN (SELECT v.addr, (SELECT m.namehash FROM names m WHERE m.resolver = v.addr AND m.is_reachable = 1 AND m.is_normalized = 1 AND m.namehash != '" ++ ROOT_NAMEHASH_HEX ++ "' ORDER BY m.namehash ASC LIMIT 1) FROM v)");
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        for (chunk) |resolver| {
+            const buf = try scratch.allocator().create([42]u8);
+            try q.bindTextStatic(resolver.toHexBuf(buf));
+        }
+        while (try q.step()) {
+            var row = try parseNameRow(&q, allocator);
+            errdefer row.deinit(allocator);
+            try out.append(allocator, row);
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
 }
 
 // ============================================================================
@@ -626,6 +823,7 @@ const ZERO_ADDR_HEX: []const u8 = "0x0000000000000000000000000000000000000000";
 const SUBDOMAIN_GC_FILTER: []const u8 = " AND NOT (owner = '" ++ ZERO_ADDR_HEX ++ "' AND resolver = '" ++ ZERO_ADDR_HEX ++ "')";
 
 pub fn countDirectSubdomains(db: *Database, parent_name: []const u8) !u32 {
+    try db.namesBarrier();
     var q = try Query.initCached(db, "SELECT COUNT(*) FROM names WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER);
     defer q.deinit();
 
@@ -637,8 +835,71 @@ pub fn countDirectSubdomains(db: *Database, parent_name: []const u8) !u32 {
     return 0;
 }
 
+pub const ParentCountRow = struct { parent_name: []u8, count: u32 };
+
+pub fn freeParentCountRows(allocator: std.mem.Allocator, rows: []ParentCountRow) void {
+    for (rows) |row| allocator.free(row.parent_name);
+    allocator.free(rows);
+}
+
+/// Batched mirror of countDirectSubdomains over many parents: one GROUP BY
+/// statement per chunk of 200 (deduped) parent names, same WHERE as the point
+/// query, rows ordered by parent_name. Parents with no counted child are
+/// absent (the caller reads absent as 0). Names are bound statically from an
+/// arena copy so long lists escape the tracked-copy cap. Rows (and each
+/// parent_name) are allocated with `allocator`; release via freeParentCountRows.
+pub fn countDirectSubdomainsForParents(db: *Database, parent_names: []const []const u8, allocator: std.mem.Allocator) ![]ParentCountRow {
+    try db.namesBarrier();
+    var out: std.ArrayList(ParentCountRow) = .empty;
+    errdefer {
+        for (out.items) |row| allocator.free(row.parent_name);
+        out.deinit(allocator);
+    }
+
+    var unique: std.ArrayList([]const u8) = .empty;
+    defer unique.deinit(db.allocator);
+    try dedupeStrings(db.allocator, parent_names, &unique);
+
+    var start: usize = 0;
+    while (start < unique.items.len) {
+        const chunk = unique.items[start..@min(start + BATCH_CHUNK, unique.items.len)];
+        start += chunk.len;
+
+        var scratch = std.heap.ArenaAllocator.init(db.allocator);
+        defer scratch.deinit();
+
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.appendSlice(scratch.allocator(), "SELECT parent_name, COUNT(*) FROM names WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name IN (");
+        try appendPlaceholders(&sql, scratch.allocator(), chunk.len, false);
+        try sql.appendSlice(scratch.allocator(), ")" ++ SUBDOMAIN_GC_FILTER ++ " GROUP BY parent_name ORDER BY parent_name");
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        for (chunk) |parent| try q.bindTextStatic(try arenaBindCopy(scratch.allocator(), parent));
+        while (try q.step()) {
+            const parent_name = try allocator.dupe(u8, q.getTextSlice(0) orelse "");
+            errdefer allocator.free(parent_name);
+            try out.append(allocator, .{ .parent_name = parent_name, .count = @intCast(q.getInt64(1)) });
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+/// First occurrence of each distinct string in `input`, in input order (the
+/// slices are borrowed, not copied).
+fn dedupeStrings(allocator: std.mem.Allocator, input: []const []const u8, unique: *std.ArrayList([]const u8)) !void {
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+    for (input) |s| {
+        const gop = try seen.getOrPut(s);
+        if (!gop.found_existing) try unique.append(allocator, s);
+    }
+}
+
 /// Check if a name has any direct subdomains (reachable + non-burned).
 pub fn hasDirectSubdomains(db: *Database, parent_name: []const u8) !bool {
+    try db.namesBarrier();
     var q = try Query.initCached(db, "SELECT 1 FROM names WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER ++ " LIMIT 1");
     defer q.deinit();
 
@@ -653,7 +914,8 @@ pub fn hasDirectSubdomains(db: *Database, parent_name: []const u8) !bool {
 /// `include_unreachable` (which still applies the GC filter; resurrection
 /// requires direct namehash lookup).
 pub fn getSubdomains(db: *Database, parent_name_arg: []const u8, skip: u32, limit: u32) ![]models.Name {
-    var q = try Query.initCached(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER ++ " ORDER BY name LIMIT ? OFFSET ?");
+    try db.namesBarrier();
+    var q = try Query.initCached(db, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name = ?" ++ SUBDOMAIN_GC_FILTER ++ " ORDER BY name, protocol LIMIT ? OFFSET ?");
     defer q.deinit();
 
     try q.bindText(parent_name_arg);
@@ -673,4 +935,75 @@ pub fn getSubdomains(db: *Database, parent_name_arg: []const u8, skip: u32, limi
     }
 
     return names.toOwnedSlice(db.allocator);
+}
+
+/// Batched mirror of getSubdomains over many parents: per parent, the window
+/// `skip < rank <= skip + first` of its direct subdomains ranked by name (the
+/// point query's ORDER BY name LIMIT first OFFSET skip), same WHERE and GC
+/// filter, one statement per chunk of 200 (deduped) parent names. Rows arrive
+/// ordered by parent_name then rank, so each parent's page is one contiguous
+/// run in page order; parents with no subdomains contribute nothing. Names
+/// are bound statically from an arena copy. Rows and the returned slice are
+/// allocated with `allocator`.
+pub fn getSubdomainsForParentsPage(db: *Database, parent_names: []const []const u8, skip: u32, first: u32, allocator: std.mem.Allocator) ![]models.Name {
+    try db.namesBarrier();
+    var out: std.ArrayList(models.Name) = .empty;
+    errdefer {
+        for (out.items) |*n| n.deinit(allocator);
+        out.deinit(allocator);
+    }
+
+    var unique: std.ArrayList([]const u8) = .empty;
+    defer unique.deinit(db.allocator);
+    try dedupeStrings(db.allocator, parent_names, &unique);
+
+    const rank_lo: i64 = skip;
+    const rank_hi: i64 = @as(i64, skip) + first;
+
+    var start: usize = 0;
+    while (start < unique.items.len) {
+        const chunk = unique.items[start..@min(start + BATCH_CHUNK, unique.items.len)];
+        start += chunk.len;
+
+        var scratch = std.heap.ArenaAllocator.init(db.allocator);
+        defer scratch.deinit();
+
+        var sql: std.ArrayList(u8) = .empty;
+        var q: Query = undefined;
+        if (db.isPostgres()) {
+            // One LATERAL page per parent: Postgres plans each exactly like
+            // the point query (name index, LIMIT pushdown), so a parent with
+            // millions of children costs what getSubdomains costs, not a
+            // sort of every child. Rows arrive grouped per parent in page
+            // order, like the windowed form below.
+            try sql.appendSlice(scratch.allocator(), "WITH v(p) AS (VALUES ");
+            for (chunk, 0..) |_, i| {
+                if (i != 0) try sql.append(scratch.allocator(), ',');
+                try sql.appendSlice(scratch.allocator(), "(?)");
+            }
+            try sql.appendSlice(scratch.allocator(), ") SELECT n.* FROM v CROSS JOIN LATERAL (" ++ SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name = v.p" ++ SUBDOMAIN_GC_FILTER ++ " ORDER BY name, protocol LIMIT ? OFFSET ?) n");
+            q = try Query.init(db, sql.items);
+            errdefer q.deinit();
+            for (chunk) |parent| try q.bindTextStatic(try arenaBindCopy(scratch.allocator(), parent));
+            try q.bindInt64(@intCast(first));
+            try q.bindInt64(@intCast(skip));
+        } else {
+            try sql.appendSlice(scratch.allocator(), "SELECT * FROM (" ++ SQL_SELECT_NAMES_SHORT_RANKED_BY_PARENT ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND parent_name IN (");
+            try appendPlaceholders(&sql, scratch.allocator(), chunk.len, false);
+            try sql.appendSlice(scratch.allocator(), ")" ++ SUBDOMAIN_GC_FILTER ++ ") t WHERE rn > ? AND rn <= ? ORDER BY parent_name, rn");
+            q = try Query.init(db, sql.items);
+            errdefer q.deinit();
+            for (chunk) |parent| try q.bindTextStatic(try arenaBindCopy(scratch.allocator(), parent));
+            try q.bindInt64(rank_lo);
+            try q.bindInt64(rank_hi);
+        }
+        defer q.deinit();
+        while (try q.step()) {
+            var row = try parseNameRowShort(&q, allocator);
+            errdefer row.deinit(allocator);
+            try out.append(allocator, row);
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
 }

@@ -8,6 +8,7 @@ const models = common.models;
 const Address = common.Address;
 const parser = common.parser;
 const builders = @import("../builders/builders.zig");
+const domain_resolvers = @import("domain.zig");
 
 /// Resolver for account query
 pub fn resolveAccount(ctx: parser.ExecutionContext, field: *const parser.Field) !parser.FieldResult {
@@ -91,6 +92,11 @@ pub fn resolveAccounts(ctx: parser.ExecutionContext, field: *const parser.Field)
         }
         database.allocator.free(accounts);
     }
+
+    // Page-batch the nested `domains` pages + their resolver records/texts:
+    // one windowed query for the whole accounts page instead of one point
+    // query per account (the N+1 behind multi-second accounts lists).
+    domain_resolvers.prefetchDomainsForAccountsPage(database, allocator, ctx.loaders, accounts, field.selections);
 
     var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);

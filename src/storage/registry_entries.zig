@@ -22,6 +22,37 @@ fn formatU256HexBuf(buf: *[66]u8, value: u256) []const u8 {
     return std.fmt.bufPrint(buf, "0x{x:0>64}", .{value}) catch unreachable;
 }
 
+/// Is a pointer edge dead because the PARENT LABEL has expired?
+///
+/// On-chain, `PermissionedRegistry.getSubregistry(label)` returns `address(0)` for an expired
+/// entry, so an expired parent resolves nothing beneath it — but nothing EMITS an event when an
+/// expiry merely passes, and the mirror has no expiry column of its own. It does not need one:
+/// `registry_entries` is keyed (protocol, parent_registry, canonical_id), which is exactly the
+/// `names` key (protocol, registry, canonical_id) of the parent label, so the expiry is one join
+/// away and cannot drift out of sync with the row that owns it.
+///
+/// Two conventions to keep straight, and they disagree:
+///   * ON-CHAIN, `_isExpired` is inclusive and treats 0 as EXPIRED.
+///   * HERE, a stored `expiry` of 0 (or NULL) means NEVER EXPIRES — that is what
+///     `safeU64ToI64` produces for a clamped maximum and what every reader already assumes
+///     (`models.Name.isExpired`, `names_common`). Reinterpreting 0 as expired would mark the
+///     root, `eth`, and every reserved label as dead.
+///
+/// Phrased as NOT-EXISTS-an-expired-parent rather than EXISTS-a-live-one, so it FAILS OPEN: a
+/// parent whose `names` row has not landed yet (phase ordering) leaves the edge alone instead of
+/// hiding a subtree. Hiding a name that resolves is the worse error, and it is the direction the
+/// rest of this module fails in too.
+///
+/// One bind: the evaluation time, in chain seconds — never a wall clock.
+const EDGE_NOT_EXPIRED =
+    \\NOT EXISTS (
+    \\  SELECT 1 FROM names pl
+    \\  WHERE pl.protocol = re.protocol AND pl.registry = re.parent_registry
+    \\    AND pl.canonical_id = re.canonical_id
+    \\    AND pl.expiry IS NOT NULL AND pl.expiry <> 0 AND pl.expiry <= ?
+    \\)
+;
+
 /// One live (parent_registry, canonical_id) entry currently pointing at a
 /// subregistry. Strings are allocator-owned; free via `freeLiveParents`.
 pub const LiveParent = struct {
@@ -99,6 +130,10 @@ pub fn isRegistryReachable(
     protocol: models.Protocol,
     registry: Address,
     roots: []const Address,
+    /// Chain time the walk is evaluated at. An edge whose parent label had expired by then does
+    /// not count — see EDGE_NOT_EXPIRED. Pass the block timestamp of whatever is triggering the
+    /// evaluation, never a wall clock, or the stored flag stops being reproducible.
+    now: i64,
 ) !bool {
     for (roots) |r| if (registry.eql(r)) return true;
 
@@ -115,12 +150,13 @@ pub fn isRegistryReachable(
         const cur_hex = cur.toHexBuf(&cur_buf);
 
         var q = try Query.initCached(db,
-            \\SELECT DISTINCT parent_registry FROM registry_entries
-            \\WHERE protocol = ? AND subregistry = ?
-        );
+            \\SELECT DISTINCT re.parent_registry FROM registry_entries re
+            \\WHERE re.protocol = ? AND re.subregistry = ?
+        ++ "\n  AND " ++ EDGE_NOT_EXPIRED);
         defer q.deinit();
         try q.bindTextStatic(protocol.toString());
         try q.bindText(cur_hex);
+        try q.bindInt64(now);
 
         while (try q.step()) {
             const parent_str = q.getTextSlice(0) orelse continue;
@@ -205,6 +241,119 @@ pub fn getSubregistry(
     return Address.zero;
 }
 
+/// One live `(parent_registry, canonical_id) -> subregistry` row from a batch
+/// read. All fields are 0x-hex text owned by the allocator the read was given;
+/// free via `freeSubregistryRows`.
+pub const SubregistryRow = struct {
+    parent_registry: []u8,
+    canonical_id: []u8,
+    subregistry: []u8,
+};
+
+pub fn freeSubregistryRows(allocator: std.mem.Allocator, rows: []SubregistryRow) void {
+    for (rows) |r| {
+        allocator.free(r.parent_registry);
+        allocator.free(r.canonical_id);
+        allocator.free(r.subregistry);
+    }
+    allocator.free(rows);
+}
+
+/// Pairs per IN-list statement of the batch read. The pair binds are
+/// arena-static (no tracked-copy cap), so the chunk is sized for statement
+/// length: 200 pairs = 400 placeholders, under the legacy SQLite
+/// 999-parameter floor.
+const ENTRY_BATCH_CHUNK: usize = 200;
+
+/// Batched mirror of `getSubregistry` over many `(parent_registry,
+/// canonical_id)` pairs: `parent_registries[i]` pairs with `canonical_ids[i]`
+/// (both the same length). Unlike the point read, which derives the canonical
+/// id from a token id via `token_id_utils.getCanonicalId`, this takes
+/// canonical ids the caller has ALREADY derived; each is formatted to the
+/// stored `0x` + 64-hex form. Same predicate as the point read over the pair
+/// list, one statement per chunk of ENTRY_BATCH_CHUNK pairs, ordered by
+/// (parent_registry, canonical_id). The table is UNIQUE on (protocol,
+/// parent_registry, canonical_id), so a pair yields at most one row; pairs
+/// without an entry are absent (the point read answers Address.zero for
+/// them). Duplicate pairs are collapsed before chunking. Rows and the returned
+/// slice are allocated with `allocator`; free via `freeSubregistryRows`.
+pub fn getSubregistriesForPairs(
+    db: *Database,
+    protocol: models.Protocol,
+    parent_registries: []const Address,
+    canonical_ids: []const u256,
+    allocator: std.mem.Allocator,
+) ![]SubregistryRow {
+    std.debug.assert(parent_registries.len == canonical_ids.len);
+    var rows: std.ArrayList(SubregistryRow) = .empty;
+    errdefer {
+        for (rows.items) |r| {
+            allocator.free(r.parent_registry);
+            allocator.free(r.canonical_id);
+            allocator.free(r.subregistry);
+        }
+        rows.deinit(allocator);
+    }
+    if (parent_registries.len == 0) return try rows.toOwnedSlice(allocator);
+
+    const PairKey = struct { parent: [20]u8, canonical_id: u256 };
+    var seen = std.AutoHashMap(PairKey, void).init(db.allocator);
+    defer seen.deinit();
+    var unique_parents: std.ArrayList(Address) = .empty;
+    defer unique_parents.deinit(db.allocator);
+    var unique_ids: std.ArrayList(u256) = .empty;
+    defer unique_ids.deinit(db.allocator);
+    for (parent_registries, canonical_ids) |parent, canonical_id| {
+        const gop = try seen.getOrPut(.{ .parent = parent.bytes, .canonical_id = canonical_id });
+        if (gop.found_existing) continue;
+        try unique_parents.append(db.allocator, parent);
+        try unique_ids.append(db.allocator, canonical_id);
+    }
+
+    var off: usize = 0;
+    while (off < unique_parents.items.len) : (off += ENTRY_BATCH_CHUNK) {
+        const end = @min(off + ENTRY_BATCH_CHUNK, unique_parents.items.len);
+        const n = end - off;
+
+        // Declared before the Query so the hex binds outlive step (LIFO defers).
+        var scratch = std.heap.ArenaAllocator.init(db.allocator);
+        defer scratch.deinit();
+        const scratch_alloc = scratch.allocator();
+
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.appendSlice(scratch_alloc, "SELECT parent_registry, canonical_id, subregistry FROM registry_entries " ++
+            "WHERE protocol = ? AND (parent_registry, canonical_id) IN (");
+        for (0..n) |i| {
+            if (i > 0) try sql.appendSlice(scratch_alloc, ", ");
+            try sql.appendSlice(scratch_alloc, "(?, ?)");
+        }
+        try sql.appendSlice(scratch_alloc, ") ORDER BY parent_registry, canonical_id");
+
+        var q = try Query.init(db, sql.items);
+        defer q.deinit();
+        try q.bindTextStatic(protocol.toString());
+        for (unique_parents.items[off..end], unique_ids.items[off..end]) |parent, canonical_id| {
+            const parent_buf = try scratch_alloc.create([42]u8);
+            try q.bindTextStatic(parent.toHexBuf(parent_buf));
+            const canonical_buf = try scratch_alloc.create([66]u8);
+            try q.bindTextStatic(formatU256HexBuf(canonical_buf, canonical_id));
+        }
+        while (try q.step()) {
+            const parent_str = q.getTextSlice(0) orelse continue;
+            const canonical_str = q.getTextSlice(1) orelse continue;
+            const subregistry_str = q.getTextSlice(2) orelse continue;
+            const parent = try allocator.dupe(u8, parent_str);
+            errdefer allocator.free(parent);
+            const canonical = try allocator.dupe(u8, canonical_str);
+            errdefer allocator.free(canonical);
+            const subregistry = try allocator.dupe(u8, subregistry_str);
+            errdefer allocator.free(subregistry);
+            try rows.append(allocator, .{ .parent_registry = parent, .canonical_id = canonical, .subregistry = subregistry });
+        }
+    }
+    return try rows.toOwnedSlice(allocator);
+}
+
 /// BFS the descendant tree under `root` to produce the complete set of
 /// subregistry contract addresses transitively reachable from `root` via
 /// `registry_entries.subregistry` edges, including `root` itself.
@@ -218,6 +367,91 @@ pub fn getSubregistry(
 /// entry for label `foo` points at C, then `collectSubtreeRooted(A)` returns
 /// `[A, B, C]`. This is the set of `names.registry` values that were sourced
 /// through A's subtree.
+pub const ReachabilityRecompute = struct {
+    /// Names flipped unreachable→reachable / reachable→unreachable.
+    names_marked_reachable: u64,
+    names_marked_unreachable: u64,
+    /// Registries whose reachability was evaluated (the affected region).
+    registries_checked: usize,
+};
+
+/// Recompute `is_reachable` PER REGISTRY over the region affected by a
+/// subregistry edge change: the union of the subtrees under every seed
+/// (typically the previous and the new pointer targets). Each registry gets
+/// the definition evaluated directly — `isRegistryReachable` root-walks the
+/// live mirror — rather than a blanket subtree cascade.
+///
+/// Why per-node and not a cascade: the registry graph permits MULTI-PARENT
+/// edges (nothing stops a user pointing their own entry at a shared registry
+/// — even the root itself; 2026-08-12 staging incident), and any blanket
+/// true/false over a subtree is wrong somewhere in that graph: a repoint-away
+/// cascade takes down descendants that other parents still reach (at ANY
+/// depth, not just the subtree root), and an unconditional re-link cascade
+/// resurrects a subtree through a parent that is itself orphaned. Evaluating
+/// the definition per node is exact for every ordering and every shape, and
+/// matches the insert chokepoint (persistence.insertName) and the replay
+/// sweep, which already evaluate per node.
+///
+/// Call with the live mirror ALREADY updated for the triggering change, so
+/// the walks see post-change edges. Fail-safe: a registry whose probe errors
+/// keeps its current state (skipped) — stale state heals on a later event or
+/// `--backfill`, while a wrong write is the incident class.
+pub fn recomputeSubtreeReachability(
+    db: *Database,
+    allocator: std.mem.Allocator,
+    protocol: models.Protocol,
+    seeds: []const Address,
+    roots: []const Address,
+    block_number: u64,
+    block_timestamp: i64,
+) !ReachabilityRecompute {
+    var region = std.AutoHashMap(Address, void).init(allocator);
+    defer region.deinit();
+    var ordered: std.ArrayList(Address) = .empty;
+    defer ordered.deinit(allocator);
+    for (seeds) |seed| {
+        if (seed.isZero()) continue;
+        const subtree = try collectSubtreeRooted(db, allocator, protocol, seed);
+        defer allocator.free(subtree);
+        for (subtree) |r| {
+            const gop = try region.getOrPut(r);
+            if (gop.found_existing) continue;
+            try ordered.append(allocator, r);
+        }
+    }
+
+    var to_reachable: std.ArrayList(Address) = .empty;
+    defer to_reachable.deinit(allocator);
+    var to_unreachable: std.ArrayList(Address) = .empty;
+    defer to_unreachable.deinit(allocator);
+    for (ordered.items) |r| {
+        const reachable = isRegistryReachable(db, allocator, protocol, r, roots, block_timestamp) catch |err| {
+            std.log.warn("reachability probe failed for {any}: {} — keeping its current state (fail-safe)", .{ r, err });
+            continue;
+        };
+        if (reachable) {
+            try to_reachable.append(allocator, r);
+        } else {
+            try to_unreachable.append(allocator, r);
+        }
+    }
+
+    // setRegistriesReachability only touches rows currently in the OPPOSITE
+    // state, so both directions are idempotent and capture-minimal.
+    var result = ReachabilityRecompute{
+        .names_marked_reachable = 0,
+        .names_marked_unreachable = 0,
+        .registries_checked = ordered.items.len,
+    };
+    if (to_reachable.items.len > 0) {
+        result.names_marked_reachable = try setRegistriesReachability(db, protocol, to_reachable.items, true, block_number, block_timestamp);
+    }
+    if (to_unreachable.items.len > 0) {
+        result.names_marked_unreachable = try setRegistriesReachability(db, protocol, to_unreachable.items, false, block_number, block_timestamp);
+    }
+    return result;
+}
+
 pub fn collectSubtreeRooted(
     db: *Database,
     allocator: std.mem.Allocator,
@@ -274,12 +508,14 @@ pub fn setRegistriesReachability(
     block_number: u64,
     block_timestamp: i64,
 ) !u64 {
+    try db.namesBarrier();
     if (registries.len == 0) return 0;
 
-    // Multi-row names write without per-row keys: conservatively clear the
-    // whole dispatch-scoped name prefetch (rare — one cascade per
-    // SubregistryUpdated) rather than track which rows the IN-list touched.
-    db.noteNamesBulkWrite();
+    // No name-prefetch notify: this touches is_reachable / unreachable_since /
+    // updated_* only, none of which is in the prefetch projection (protocol,
+    // registry, canonical_id, namehash, name). The former on_bulk clear here
+    // dropped the whole map mid-dispatch on every repoint cascade and turned
+    // the rest of the batch's lookups into per-event round trips.
 
     // Chunked: each registry address is a tracked text bind, and Statement caps
     // tracked binds at 32 (error.TooManyBoundParams beyond that) — large
@@ -294,7 +530,11 @@ pub fn setRegistriesReachability(
         var where_buf: std.ArrayList(u8) = .empty;
         defer where_buf.deinit(db.allocator);
         try where_buf.appendSlice(db.allocator, if (reachable)
-            "protocol = ? AND is_reachable = 0 AND registry IN ("
+            // `label_live = 1` is the whole point of that column: a registry-wide revive must not
+            // resurrect a name whose LABEL was unregistered or burned. Without it, the moment an
+            // ancestor repointed back, every individually soft-deleted name in the registry
+            // reappeared as live.
+            "protocol = ? AND is_reachable = 0 AND label_live = 1 AND registry IN ("
         else
             "protocol = ? AND is_reachable = 1 AND registry IN (");
         for (chunk, 0..) |_, i| {
@@ -356,6 +596,7 @@ pub fn reconcileV2Reachability(
     block_number: u64,
     block_timestamp: i64,
 ) !u64 {
+    try db.namesBarrier();
     var regs: std.ArrayList(Address) = .empty;
     defer regs.deinit(allocator);
     {
@@ -371,7 +612,7 @@ pub fn reconcileV2Reachability(
     var orphaned: std.ArrayList(Address) = .empty;
     defer orphaned.deinit(allocator);
     for (regs.items) |r| {
-        const reachable = isRegistryReachable(db, allocator, .v2, r, roots) catch true;
+        const reachable = isRegistryReachable(db, allocator, .v2, r, roots, block_timestamp) catch true;
         if (!reachable) try orphaned.append(allocator, r);
     }
 
@@ -382,6 +623,14 @@ pub fn reconcileV2Reachability(
 /// Soft-delete a single name by namehash (sets is_reachable = 0). Used by
 /// LabelUnregistered so re-registration can reactivate via the UPSERT
 /// instead of losing history.
+/// The PER-NAME soft delete: this label stopped existing on-chain (LabelUnregistered expires the
+/// entry; a burn removes it). Distinct from the per-REGISTRY tree-orphan marking, which is what
+/// `setRegistriesReachability` does.
+///
+/// Clearing `label_live` alongside `is_reachable` is what makes the two causes separable. Before
+/// that column existed, the next registry-wide revive resurrected this row as live, because the
+/// revive could not tell "hidden because its registry was orphaned" from "hidden because the user
+/// unregistered it".
 pub fn markNameUnreachableByNamehash(
     db: *Database,
     protocol: models.Protocol,
@@ -389,9 +638,10 @@ pub fn markNameUnreachableByNamehash(
     block_number: u64,
     block_timestamp: i64,
 ) !void {
+    try db.namesBarrier();
     try reorg_undo.captureWhere(db, "names", "U", "protocol = ? AND namehash = ?", .{ protocol, namehash });
     var q = try Query.initCached(db,
-        \\UPDATE names SET is_reachable = 0, unreachable_since = ?, updated_block = ?, updated_at = ?
+        \\UPDATE names SET is_reachable = 0, label_live = 0, unreachable_since = ?, updated_block = ?, updated_at = ?
         \\WHERE protocol = ? AND namehash = ?
     );
     defer q.deinit();

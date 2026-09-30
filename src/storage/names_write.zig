@@ -29,14 +29,27 @@ const NAMES_UPSERT_HEAD =
     \\ registry, owner, registrant, resolver, token_id, canonical_id, token_version, expiry,
     \\ registry_locked, migrated, created_block, created_at, registered_at, updated_block, updated_at,
     \\ is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash,
-    \\ is_reachable, unreachable_since, ttl, is_legacy, resolved_address, is_normalized)
+    \\ is_reachable, unreachable_since, ttl, is_legacy, resolved_address, is_normalized, is_alias,
+    \\ label_live)
     \\VALUES
 ;
 
-const NAMES_UPSERT_TUPLE = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+// The trailing literal `1` is `label_live`: an INSERT always means the label exists on-chain,
+// and a re-registration of a previously burned label legitimately revives it. Keeping it a
+// literal rather than a bind is what lets the column exist without touching models.Name, the
+// 34-value bind sequence, the SELECT lists or the row parsers.
+const NAMES_UPSERT_TUPLE = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)";
 
-/// 33 bound columns per row.
-const NAMES_UPSERT_PARAMS = 33;
+/// 34 bound columns per row. Asserted against the tuple's placeholder count so
+/// adding a column to the head without widening the tuple fails to compile.
+const NAMES_UPSERT_PARAMS = 34;
+comptime {
+    var placeholders: usize = 0;
+    for (NAMES_UPSERT_TUPLE) |c| {
+        if (c == '?') placeholders += 1;
+    }
+    if (placeholders != NAMES_UPSERT_PARAMS) @compileError("NAMES_UPSERT_TUPLE placeholder count != NAMES_UPSERT_PARAMS");
+}
 
 const NAMES_UPSERT_TAIL =
     \\ON CONFLICT(protocol, namehash) DO UPDATE SET
@@ -68,10 +81,13 @@ const NAMES_UPSERT_TAIL =
     \\ ttl = excluded.ttl,
     \\ is_legacy = excluded.is_legacy,
     \\ resolved_address = COALESCE(excluded.resolved_address, names.resolved_address),
-    \\ is_normalized = excluded.is_normalized
+    \\ is_normalized = excluded.is_normalized,
+    \\ is_alias = excluded.is_alias,
+    \\ label_live = 1
 ;
 
 pub fn insertName(db: *Database, name: models.Name) !void {
+    try db.namesBarrier();
     try reorg_undo.captureUpsert(db, "names", .{ name.protocol, name.namehash });
 
     // Arena declared before the statement so bound SQLITE_STATIC pointers
@@ -84,7 +100,12 @@ pub fn insertName(db: *Database, name: models.Name) !void {
 
     try bindNameValues(&q, name, arena.allocator());
     try q.exec();
-    db.noteNameUpsert(name.protocol, name.registry, name.canonical_id, name.namehash, name.name);
+    // Alias rows are deliberately not written through to the dispatch prefetch:
+    // it mirrors the `is_alias = 0` point lookups, and a second row under one
+    // (canonical_id, registry) would make it punt to the DB for every later event
+    // on that label. The derivation that writes them runs between dispatches
+    // (listener unset) anyway — this keeps that a rule rather than a coincidence.
+    if (!name.is_alias) db.noteNameUpsert(name.protocol, name.registry, name.canonical_id, name.namehash, name.name);
 }
 
 /// Bind one name's 33 upsert values in NAMES_UPSERT_HEAD column order. Shared
@@ -145,11 +166,13 @@ fn bindNameValues(q: *Query, name: models.Name, scratch: std.mem.Allocator) !voi
         try q.bindNull();
     }
     try q.bindInt(if (name.is_normalized) 1 else 0);
+    try q.bindInt(if (name.is_alias) 1 else 0);
 }
 
-/// Rows per multi-row names upsert: 33 params each → 990 params, under even
-/// the pre-3.32 SQLite SQLITE_MAX_VARIABLE_NUMBER floor of 999.
-const NAMES_BATCH_ROWS = 30;
+/// Rows per multi-row names upsert: NAMES_UPSERT_PARAMS (34) params each, so
+/// 5,100 bound parameters per statement — well under SQLite's modern
+/// SQLITE_MAX_VARIABLE_NUMBER of 32,766 and under Postgres's 65,535.
+const NAMES_BATCH_ROWS = 150;
 
 /// Bulk-flush insert path: multi-row upserts instead of one round trip per
 /// name — same SQL head/tail as `insertName`, so semantics are identical row
@@ -167,14 +190,21 @@ pub fn insertNamesBatch(db: *Database, names_slice: []const models.Name) !void {
 
     // Reverse scan keep-first == forward keep-last. Order among distinct keys
     // is irrelevant: independent rows, one statement.
+    // Last occurrence per conflict key wins (upsert semantics), emitted in the
+    // caller's order so serial ids follow chain order like per-row inserts.
+    var last_index = std.AutoHashMap(DedupKey, usize).init(db.allocator);
+    defer last_index.deinit();
+    try last_index.ensureTotalCapacity(@intCast(names_slice.len));
+    for (names_slice, 0..) |*name, idx| {
+        last_index.putAssumeCapacity(.{ .protocol = name.protocol, .namehash = name.namehash.bytes }, idx);
+    }
     var deduped: std.ArrayList(*const models.Name) = .empty;
     defer deduped.deinit(db.allocator);
     try deduped.ensureTotalCapacity(db.allocator, names_slice.len);
-    var i: usize = names_slice.len;
-    while (i > 0) {
-        i -= 1;
-        const name = &names_slice[i];
-        const gop = seen.getOrPutAssumeCapacity(.{ .protocol = name.protocol, .namehash = name.namehash.bytes });
+    for (names_slice, 0..) |*name, idx| {
+        const key = DedupKey{ .protocol = name.protocol, .namehash = name.namehash.bytes };
+        if (last_index.get(key).? != idx) continue;
+        const gop = seen.getOrPutAssumeCapacity(key);
         if (gop.found_existing) continue;
         deduped.appendAssumeCapacity(name);
     }
@@ -213,6 +243,8 @@ pub fn insertNamesBatch(db: *Database, names_slice: []const models.Name) !void {
     }
 
     for (deduped.items) |name| {
+        // Same alias exclusion as the single-row path above.
+        if (name.is_alias) continue;
         db.noteNameUpsert(name.protocol, name.registry, name.canonical_id, name.namehash, name.name);
     }
 }
@@ -222,8 +254,9 @@ pub fn insertNamesBatch(db: *Database, names_slice: []const models.Name) !void {
 /// pre-2020 Registry (0x314159…) or the canonical post-2020 Registry.
 /// No-op when no row exists for `namehash`.
 pub fn updateNameIsLegacy(db: *Database, namehash: Hash, is_legacy: bool) !void {
+    try db.namesBarrier();
     try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
-    var q = try Query.initCached(db, "UPDATE names SET is_legacy = ?, updated_at = ? WHERE namehash = ?");
+    var q = try Query.initCached(db, "UPDATE names SET is_legacy = ?, updated_at = ? WHERE namehash = ? AND protocol = 'v1'");
     defer q.deinit();
     try q.bindInt(if (is_legacy) 1 else 0);
     try q.bindInt64(zsys.timestamp());
@@ -234,8 +267,9 @@ pub fn updateNameIsLegacy(db: *Database, namehash: Hash, is_legacy: bool) !void 
 
 /// Update name expiry (for renewals)
 pub fn updateNameExpiry(db: *Database, namehash: Hash, expiry: u64) !void {
+    try db.namesBarrier();
     try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
-    var q = try Query.initCached(db, "UPDATE names SET expiry = ?, updated_at = ? WHERE namehash = ?");
+    var q = try Query.initCached(db, "UPDATE names SET expiry = ?, updated_at = ? WHERE namehash = ? AND protocol = 'v2'");
     defer q.deinit();
 
     try q.bindInt64(safeU64ToI64(expiry));
@@ -253,6 +287,7 @@ pub fn updateNameExpiry(db: *Database, namehash: Hash, expiry: u64) !void {
 /// must not turn it into a 1970 expiry. The protocol predicate keeps a
 /// same-namehash V2 row from being stomped (names is UNIQUE(protocol, namehash)).
 pub fn updateV1RenewalExpiry(db: *Database, namehash: Hash, expires: u64) !void {
+    try db.namesBarrier();
     try reorg_undo.captureWhere(db, "names", "U", "namehash = ? AND protocol = 'v1'", .{namehash});
     var q = try Query.initCached(db, "UPDATE names SET expiry = CASE WHEN is_wrapped = 1 AND ? > 0 THEN ? + 7776000 ELSE ? END, updated_at = ? WHERE namehash = ? AND protocol = 'v1'");
     defer q.deinit();
@@ -271,14 +306,21 @@ pub fn updateV1RenewalExpiry(db: *Database, namehash: Hash, expires: u64) !void 
 }
 
 /// Update name owner (for transfers)
-pub fn updateNameOwner(db: *Database, namehash: Hash, new_owner: Address) !void {
-    try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
-    var q = try Query.initCached(db, "UPDATE names SET owner = ?, updated_at = ? WHERE namehash = ?");
+/// Update `owner` for ONE protocol's row.
+///
+/// `names` is UNIQUE(protocol, namehash) and a migrated name has a row in each, while both the
+/// V1 handlers and the V2 ones reach this writer. Unscoped, a V1 NewOwner rewrote the V2 twin's
+/// owner and vice versa — so the parameter is not optional, and there is no sensible default.
+pub fn updateNameOwner(db: *Database, protocol: models.Protocol, namehash: Hash, new_owner: Address) !void {
+    try db.namesBarrier();
+    try reorg_undo.captureWhere(db, "names", "U", "namehash = ? AND protocol = ?", .{ namehash, protocol });
+    var q = try Query.initCached(db, "UPDATE names SET owner = ?, updated_at = ? WHERE namehash = ? AND protocol = ?");
     defer q.deinit();
 
     try q.bindAddressBuf(new_owner);
     try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
+    try q.bindTextStatic(protocol.toString());
     try q.exec();
     db.noteNameWriteByNamehash(namehash);
 }
@@ -288,8 +330,9 @@ pub fn updateNameOwner(db: *Database, namehash: Hash, new_owner: Address) !void 
 /// have been transferred to a V1→V2 migration controller (which is functionally
 /// "no longer ownable on V1").
 pub fn markNameMigrated(db: *Database, namehash: Hash, controller: Address) !void {
+    try db.namesBarrier();
     try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
-    var q = try Query.initCached(db, "UPDATE names SET owner = ?, migrated = 1, updated_at = ? WHERE namehash = ?");
+    var q = try Query.initCached(db, "UPDATE names SET owner = ?, migrated = 1, updated_at = ? WHERE namehash = ? AND protocol = 'v1'");
     defer q.deinit();
 
     try q.bindAddressBuf(controller);
@@ -300,14 +343,21 @@ pub fn markNameMigrated(db: *Database, namehash: Hash, controller: Address) !voi
 }
 
 /// Update name resolver
-pub fn updateNameResolver(db: *Database, namehash: Hash, resolver: Address) !void {
-    try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
-    var q = try Query.initCached(db, "UPDATE names SET resolver = ?, updated_at = ? WHERE namehash = ?");
+/// Update `resolver` for ONE protocol's row.
+///
+/// `names` is UNIQUE(protocol, namehash) and a migrated name has a row in each, while both the
+/// V1 handlers and the V2 ones reach this writer. Unscoped, a V1 NewOwner rewrote the V2 twin's
+/// resolver and vice versa — so the parameter is not optional, and there is no sensible default.
+pub fn updateNameResolver(db: *Database, protocol: models.Protocol, namehash: Hash, resolver: Address) !void {
+    try db.namesBarrier();
+    try reorg_undo.captureWhere(db, "names", "U", "namehash = ? AND protocol = ?", .{ namehash, protocol });
+    var q = try Query.initCached(db, "UPDATE names SET resolver = ?, updated_at = ? WHERE namehash = ? AND protocol = ?");
     defer q.deinit();
 
     try q.bindAddressBuf(resolver);
     try q.bindInt64(zsys.timestamp());
     try q.bindHashBuf(namehash);
+    try q.bindTextStatic(protocol.toString());
     try q.exec();
     db.noteNameWriteByNamehash(namehash);
 }
@@ -317,8 +367,9 @@ pub fn updateNameResolver(db: *Database, namehash: Hash, resolver: Address) !voi
 /// — both indicate "no resolution available right now". No-op if the row
 /// doesn't exist.
 pub fn updateResolvedAddressToNull(db: *Database, namehash: Hash) !void {
+    try db.namesBarrier();
     try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
-    var q = try Query.initCached(db, "UPDATE names SET resolved_address = NULL, updated_at = ? WHERE namehash = ?");
+    var q = try Query.initCached(db, "UPDATE names SET resolved_address = NULL, updated_at = ? WHERE namehash = ? AND protocol = 'v1'");
     defer q.deinit();
 
     try q.bindInt64(zsys.timestamp());
@@ -333,8 +384,9 @@ pub fn updateResolvedAddressToNull(db: *Database, namehash: Hash) !void {
 /// arbitrary caller-set u64 on-chain; values beyond i64 collapse to the 0
 /// sentinel like expiry does.
 pub fn updateNameTTL(db: *Database, namehash: Hash, ttl: u64) !void {
+    try db.namesBarrier();
     try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
-    var q = try Query.initCached(db, "UPDATE names SET ttl = ?, updated_at = ? WHERE namehash = ?");
+    var q = try Query.initCached(db, "UPDATE names SET ttl = ?, updated_at = ? WHERE namehash = ? AND protocol = 'v1'");
     defer q.deinit();
 
     try q.bindInt64(safeU64ToI64(ttl));
@@ -345,7 +397,25 @@ pub fn updateNameTTL(db: *Database, namehash: Hash, ttl: u64) !void {
 }
 
 /// Delete a name by its namehash (registry-safe: only deletes the exact name)
+/// `deleteNameByNamehash` restricted to one protocol.
+///
+/// `names` is UNIQUE(protocol, namehash) and a migrated name exists in both, so the
+/// unscoped delete removes the twin as well. Any caller that means "this protocol's row"
+/// — the V1 GC walk does — has to say so.
+pub fn deleteNameByNamehashScoped(db: *Database, protocol: models.Protocol, namehash: Hash) !void {
+    try db.namesBarrier();
+    try reorg_undo.captureActiveWhere(db, "unknown_labels", "D", "name_id IN (SELECT id FROM names WHERE protocol = ? AND namehash = ?)", .{ protocol, namehash });
+    try reorg_undo.captureWhere(db, "names", "D", "protocol = ? AND namehash = ?", .{ protocol, namehash });
+    var q = try Query.initCached(db, "DELETE FROM names WHERE protocol = ? AND namehash = ?");
+    defer q.deinit();
+    try q.bindTextStatic(protocol.toString());
+    try q.bindHashBuf(namehash);
+    try q.exec();
+    db.noteNameWriteByNamehash(namehash);
+}
+
 pub fn deleteNameByNamehash(db: *Database, namehash: Hash) !void {
+    try db.namesBarrier();
     try reorg_undo.captureActiveWhere(db, "unknown_labels", "D", "name_id IN (SELECT id FROM names WHERE namehash = ?)", .{namehash});
     try reorg_undo.captureWhere(db, "names", "D", "namehash = ?", .{namehash});
     var q = try Query.initCached(db, "DELETE FROM names WHERE namehash = ?");
@@ -366,7 +436,8 @@ pub fn deleteNameByNamehash(db: *Database, namehash: Hash) !void {
 /// reconciliation is only meaningful for V1 ENS Registry `NewOwner`/`Transfer`
 /// events that set `owner = 0x0`. The walker is iterative (stack-driven) to
 /// avoid recursion in Zig and to keep the parent chain check explicit.
-pub fn recursivelyGcEmptyDomain(db: *Database, namehash: Hash) !u32 {
+pub fn recursivelyGcEmptyDomain(db: *Database, protocol: models.Protocol, namehash: Hash) !u32 {
+    try db.namesBarrier();
     var deleted: u32 = 0;
     var current = namehash;
 
@@ -382,10 +453,19 @@ pub fn recursivelyGcEmptyDomain(db: *Database, namehash: Hash) !u32 {
         // Fetch the row's owner/resolver/expiry/parent_namehash. We must read
         // the row before deciding to delete: the GC criteria require checking
         // owner=0 AND resolver=0 AND no children AND no expiry.
+        //
+        // `protocol` is not optional here. `names` is UNIQUE(protocol, namehash) and a
+        // migrated name exists in BOTH protocols, so an unscoped read of the criteria could
+        // pick the V2 twin (backend-defined which) and authorise a delete from the V1
+        // handler that owns this path — deciding to destroy one row by reading another's
+        // owner, resolver and expiry. The delete below is scoped for the same reason:
+        // unscoped, it took the twin with it.
         var q = try Query.initCached(db,
-            \\SELECT owner, resolver, expiry, parent_namehash FROM names WHERE namehash = ? LIMIT 1
+            \\SELECT owner, resolver, expiry, parent_namehash FROM names
+            \\WHERE protocol = ? AND namehash = ? LIMIT 1
         );
         defer q.deinit();
+        try q.bindTextStatic(protocol.toString());
         try q.bindHashBuf(current);
         if (!try q.step()) break; // Row already gone, nothing to do.
 
@@ -405,6 +485,10 @@ pub fn recursivelyGcEmptyDomain(db: *Database, namehash: Hash) !u32 {
 
         // Children check: stop if this row has any descendant pointing at it
         // via parent_namehash. NOT EXISTS is a single-row probe — cheap.
+        //
+        // Deliberately NOT protocol-scoped, and that asymmetry is the safe direction: a
+        // child in EITHER protocol means the name is still referenced, so GC stops. Scoping
+        // it would let a V1 GC delete a node that a V2 subname still points at.
         var child_q = try Query.initCached(db,
             \\SELECT 1 FROM names WHERE parent_namehash = ? LIMIT 1
         );
@@ -414,7 +498,7 @@ pub fn recursivelyGcEmptyDomain(db: *Database, namehash: Hash) !u32 {
         if (has_child) break;
 
         // All gates passed — delete this row and walk up to parent.
-        try deleteNameByNamehash(db, current);
+        try deleteNameByNamehashScoped(db, protocol, current);
         deleted += 1;
         current = parent_hash;
     }
@@ -425,11 +509,12 @@ pub fn recursivelyGcEmptyDomain(db: *Database, namehash: Hash) !u32 {
 /// Update token_id for a specific name by namehash (registry-safe: only updates the exact name).
 /// Only updates token_id and token_version — canonical_id is unchanged across regeneration.
 pub fn updateNameTokenIdByNamehash(db: *Database, namehash: Hash, new_token_id: u256) !void {
+    try db.namesBarrier();
     const token_id_utils = @import("../types/token_id.zig");
     const token_version = token_id_utils.getTokenVersion(new_token_id);
 
     try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
-    var q = try Query.initCached(db, "UPDATE names SET token_id = ?, token_version = ?, updated_at = ? WHERE namehash = ?");
+    var q = try Query.initCached(db, "UPDATE names SET token_id = ?, token_version = ?, updated_at = ? WHERE namehash = ? AND protocol = 'v2'");
     defer q.deinit();
 
     var new_token_id_buf: [66]u8 = undefined;
@@ -445,10 +530,11 @@ pub fn updateNameTokenIdByNamehash(db: *Database, namehash: Hash, new_token_id: 
 
 /// Update wrapper state for a name
 pub fn updateNameWrapperState(db: *Database, namehash: Hash, fuses: u32, expiry: u64) !void {
+    try db.namesBarrier();
     try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     var q = try Query.initCached(db,
         \\UPDATE names SET is_wrapped = 1, wrapper_fuses = ?, wrapper_expiry = ?,
-        \\updated_at = ? WHERE namehash = ?
+        \\updated_at = ? WHERE namehash = ? AND protocol = 'v1'
     );
     defer q.deinit();
 
@@ -470,9 +556,10 @@ pub fn updateNameWrapperState(db: *Database, namehash: Hash, fuses: u32, expiry:
 /// unless the parent is the .eth registrar (in which case the registration's
 /// expiry remains canonical).
 pub fn clearNameExpiry(db: *Database, namehash: Hash) !void {
+    try db.namesBarrier();
     try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     var q = try Query.initCached(db,
-        \\UPDATE names SET expiry = NULL, updated_at = ? WHERE namehash = ?
+        \\UPDATE names SET expiry = NULL, updated_at = ? WHERE namehash = ? AND protocol = 'v1'
     );
     defer q.deinit();
 
@@ -484,6 +571,7 @@ pub fn clearNameExpiry(db: *Database, namehash: Hash) !void {
 
 /// Clear wrapper state for a name (unwrap)
 pub fn updateNameUnwrapperState(db: *Database, namehash: Hash) !void {
+    try db.namesBarrier();
     try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     // Re-base .eth 2LD expiry to the bare registrar value on unwrap: while
     // wrapped, names.expiry may hold the grace-inclusive wrapper value (PCC
@@ -504,7 +592,7 @@ pub fn updateNameUnwrapperState(db: *Database, namehash: Hash) !void {
         \\expiry = CASE WHEN protocol = 'v1' AND parent_name = 'eth'
         \\  THEN COALESCE((SELECT MAX(r.expiry + 0) FROM registrations r WHERE r.protocol = names.protocol AND r.namehash = names.namehash), expiry)
         \\  ELSE expiry END,
-        \\updated_at = ? WHERE namehash = ?
+        \\updated_at = ? WHERE namehash = ? AND protocol = 'v1'
     );
     defer q.deinit();
 
@@ -516,9 +604,10 @@ pub fn updateNameUnwrapperState(db: *Database, namehash: Hash) !void {
 
 /// Update wrapper fuses only
 pub fn updateNameWrapperFuses(db: *Database, namehash: Hash, fuses: u32) !void {
+    try db.namesBarrier();
     try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     var q = try Query.initCached(db,
-        \\UPDATE names SET wrapper_fuses = ?, updated_at = ? WHERE namehash = ?
+        \\UPDATE names SET wrapper_fuses = ?, updated_at = ? WHERE namehash = ? AND protocol = 'v1'
     );
     defer q.deinit();
 
@@ -534,9 +623,10 @@ pub fn updateNameWrapperFuses(db: *Database, namehash: Hash, fuses: u32) !void {
 
 /// Update wrapper expiry only
 pub fn updateNameWrapperExpiry(db: *Database, namehash: Hash, expiry: u64) !void {
+    try db.namesBarrier();
     try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     var q = try Query.initCached(db,
-        \\UPDATE names SET wrapper_expiry = ?, updated_at = ? WHERE namehash = ?
+        \\UPDATE names SET wrapper_expiry = ?, updated_at = ? WHERE namehash = ? AND protocol = 'v1'
     );
     defer q.deinit();
 
@@ -558,6 +648,7 @@ pub fn updateNameWrapperExpiry(db: *Database, namehash: Hash, expiry: u64) !void
 /// That edge case is fine: `NameWrapped` on a name we never saw via Registry
 /// will simply skip the mirror until the Registry row materializes.
 pub fn updateDomainExpiryIfGreater(db: *Database, namehash: Hash, new_expiry: i64) !void {
+    try db.namesBarrier();
     try reorg_undo.captureWhere(db, "names", "U", "namehash = ?", .{namehash});
     const sql = try std.fmt.allocPrint(db.allocator,
         \\UPDATE names
@@ -595,6 +686,7 @@ pub fn updateDomainExpiryIfGreater(db: *Database, namehash: Hash, new_expiry: i6
 /// - `wrapper_expiry > COALESCE(expiry, 0)` ensures we never lower Domain.expiry.
 /// Returns the number of rows updated.
 pub fn materializePccDomainExpiry(db: *Database) !u32 {
+    try db.namesBarrier();
     const PARENT_CANNOT_CONTROL: i64 = 0x10000;
     try reorg_undo.captureWhere(db, "names", "U", "is_wrapped = 1 AND wrapper_expiry IS NOT NULL AND wrapper_fuses IS NOT NULL AND wrapper_fuses != '' AND (CAST(wrapper_fuses AS INTEGER) & ?) != 0 AND wrapper_expiry > COALESCE(expiry, 0)", .{PARENT_CANNOT_CONTROL});
     var q = try Query.init(db,
@@ -622,6 +714,7 @@ pub fn materializePccDomainExpiry(db: *Database) !u32 {
 /// `is_normalized` is recomputed by the caller (indexer layer, which has the
 /// ENSIP-15 lib) now that the plaintext label/name is known.
 pub fn updateNameLabel(database: *Database, protocol: models.Protocol, namehash: Hash, label: []const u8, name: []const u8, is_normalized: bool) !void {
+    try database.namesBarrier();
     try reorg_undo.captureWhere(database, "names", "U", "namehash = ? AND protocol = ?", .{ namehash, protocol });
     var q = try Query.initCached(database,
         \\UPDATE names SET label = ?, name = ?, is_normalized = ?
@@ -640,6 +733,7 @@ pub fn updateNameLabel(database: *Database, protocol: models.Protocol, namehash:
 
 /// Update creation date if the new block is earlier (for backfill scenarios)
 pub fn updateNameCreationDateIfEarlier(db: *Database, namehash: Hash, block_number: u64, created_at: i64) !void {
+    try db.namesBarrier();
     try reorg_undo.captureWhere(db, "names", "U", "namehash = ? AND created_block > ?", .{ namehash, block_number });
     var q = try Query.initCached(db,
         \\UPDATE names SET created_block = ?, created_at = ?

@@ -1,0 +1,1 @@
+{"errors":[{"message":"Invalid fragment: a fragment on `Account` cannot be spread where `Domain` is expected.","locations":[{"line":1,"column":21}],"extensions":{"code":"VALIDATION_ERROR"}}],"data":null}

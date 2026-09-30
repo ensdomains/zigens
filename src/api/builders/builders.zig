@@ -21,3 +21,5 @@ pub const buildAccountJson = impl.buildAccountJson;
 pub const buildResolverJson = impl.buildResolverJson;
 pub const buildWrappedDomainJson = impl.buildWrappedDomainJson;
 pub const effectiveResolver = impl.effectiveResolver;
+pub const effectiveResolverWith = impl.effectiveResolverWith;
+pub const parseDomainEventsFilter = impl.parseDomainEventsFilter;

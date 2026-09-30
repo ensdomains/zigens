@@ -29,10 +29,17 @@ pub fn recordAccountObservation(self: *Indexer, protocol: models.Protocol, addr:
         std.log.debug("observeAccount timestamp fetch failed: {}", .{err});
         return; // best-effort — retried on the next observation of this address
     };
-    self.database.upsertAccount(protocol, addr_hex, log.block_number, ts) catch |err| {
-        std.log.debug("upsertAccount failed: {}", .{err});
-        return; // don't cache on failure — retry on the next observation
-    };
+    if (self.bufferingEntities()) {
+        self.write_buffer.observeAccount(protocol, addr_hex, log.block_number, ts) catch |err| {
+            std.log.debug("buffering account observation failed: {}", .{err});
+            return;
+        };
+    } else {
+        self.database.upsertAccount(protocol, addr_hex, log.block_number, ts) catch |err| {
+            std.log.debug("upsertAccount failed: {}", .{err});
+            return; // don't cache on failure — retry on the next observation
+        };
+    }
     const key_copy = self.allocator.dupe(u8, key) catch return;
     self.account_obs_cache.put(key_copy, {}) catch self.allocator.free(key_copy);
 }
@@ -63,15 +70,19 @@ pub fn emitEvent(
         .data = data,
         .timestamp = try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp),
     };
+    if (name) |n| self.placeholders.noteName(n) catch {};
     try Indexer.insertEventAndNotify(self, event);
 }
 
 /// Resolve a zero namehash by looking up the actual namehash from the resolver address.
 /// In ENSv2, each name has its own dedicated resolver, so events may emit a zeroed namehash.
 /// Returns true if the namehash is valid (non-zero or resolved), false if it should be skipped.
-pub fn resolveNamehash(self: *Indexer, namehash: *Hash, resolver: Address, event_name: []const u8) !bool {
+pub fn resolveNamehash(self: *Indexer, protocol: models.Protocol, namehash: *Hash, resolver: Address, event_name: []const u8) !bool {
     if (!namehash.isZero()) return true;
-    if (try self.database.getNamehashByResolver(resolver)) |actual| {
+    // Null covers two cases and both must skip: the resolver is unknown, or it is SHARED by
+    // several names so the attribution is unanswerable. Skipping loses one event's record;
+    // guessing wrote it to a name chosen arbitrarily out of as many as 159k.
+    if (try self.database.getNamehashByResolver(protocol, resolver)) |actual| {
         namehash.* = actual;
         return true;
     }
@@ -118,7 +129,16 @@ fn dispatchEntryLessThan(_: void, a: DispatchEntry, b: DispatchEntry) bool {
 /// Database and I/O errors still propagate: skipping those would drop valid data.
 pub fn isMalformedEventError(err: anyerror) bool {
     return switch (err) {
-        error.DataTooShort, error.ArrayDataTooShort => true,
+        error.DataTooShort, error.ArrayDataTooShort, error.InvalidTopicCount => true,
+        // The payload did not match the schema the handler decodes it against —
+        // a contract sharing a signature hash but not our layout. Skipping costs
+        // one event; letting it through reached an unchecked add in the codec
+        // that either panicked or requested 16 EiB, taking the batch with it.
+        error.AbiPayloadMismatch => true,
+        // A DNS-wire name whose label length runs past the payload. Now that
+        // dns.decodeDNSNameToString reports this separately from the root name,
+        // it reaches here instead of being silently folded into "no name".
+        error.InvalidDNSEncoding => true,
         // Decoded fine but a numeric field exceeds what the schema can hold
         // (e.g. a hostile uint256 coinType) — same skip-with-coordinates
         // treatment as an undecodable payload.
@@ -170,16 +190,23 @@ pub fn dispatchOrdered(
     }
 }
 
-/// Collect the tokenIds of every ResolverUpdated entry and load their names
-/// rows. Best-effort: any failure (or an undecodable topic) just leaves the
-/// map unbuilt/incomplete and lookups fall back to the DB — the prefetch is
-/// never allowed to abort dispatch.
+/// Collect the token id of every entry — topics[1] for the registry and
+/// registrar events, the data-encoded id for TransferSingle — and load their
+/// names rows, so every handler's (token id, registry) lookup and every
+/// same-dispatch write-through has an entry to land in. Non-token topics
+/// only add empty entries. Best-effort: any failure (or an undecodable
+/// topic) just leaves the map unbuilt/incomplete and lookups fall back to
+/// the DB — the prefetch is never allowed to abort dispatch.
 fn buildNamePrefetch(self: *Indexer, entries: []const DispatchEntry, out: *?name_prefetch_mod.NamePrefetch) void {
     var tokens: std.ArrayList(u256) = .empty;
     defer tokens.deinit(self.allocator);
     for (entries) |entry| {
-        if (entry.handler != @as(@TypeOf(entry.handler), Indexer.handleResolverUpdated)) continue;
-        if (entry.log.topics.len < 4) continue;
+        if (entry.handler == @as(@TypeOf(entry.handler), Indexer.handleTransfer)) {
+            if (entry.log.data.len < 32) continue;
+            tokens.append(self.allocator, std.mem.readInt(u256, entry.log.data[0..32], .big)) catch return;
+            continue;
+        }
+        if (entry.log.topics.len < 2) continue;
         const tok = std.mem.readInt(u256, &entry.log.topics[1].bytes, .big);
         tokens.append(self.allocator, tok) catch return;
     }

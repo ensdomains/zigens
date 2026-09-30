@@ -69,14 +69,20 @@ fn parseArgs(process_args: std.process.Args, cfg: *config.Config) !CliArgs {
     return .{ .mode = mode, .from_block = from_block };
 }
 
+const process_allocator = @import("utils/process_allocator.zig");
+
 pub fn main(init: std.process.Init) !void {
     // Configure SQLite for thread safety BEFORE any other operations
     db.configureSqliteThreadSafety();
 
-    // Use thread-safe GPA configuration
-    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    // libc malloc, thread-safe and shared with sqlite3. `DebugAllocator`
+    // cannot back a sync of any length: it pins a whole 128 KiB bucket per
+    // surviving small allocation, so RSS grows linearly per batch with no
+    // leak present while `total_requested_bytes` reports single-digit MB.
+    // See utils/process_allocator.zig for the measurements. `ALLOCATOR=debug`
+    // opts back into it for a bounded leak-hunting run.
+    const allocator = process_allocator.init();
+    defer if (process_allocator.deinit()) std.log.warn("allocator reported leaks at shutdown", .{});
     const io = init.io;
 
     // Load configuration from .env
@@ -135,7 +141,7 @@ pub fn main(init: std.process.Init) !void {
                 std.log.info("End block: continuous (will index indefinitely)", .{});
             }
             std.log.info("Batch size: {d}", .{cfg.batch_size});
-            std.log.info("Rate limit: {d} req/s", .{cfg.rate_limit_per_second});
+            std.log.info("RPC rate limit: {d} req/s (outbound)", .{cfg.rpc_rate_limit_per_second});
 
             std.log.info("V1 Indexer started - indexing blocks...", .{});
             try idx.startSingleProtocol(.v1);

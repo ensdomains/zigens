@@ -4,6 +4,7 @@ const config = @import("../config.zig");
 const constants = @import("../constants.zig");
 const db = @import("../storage/database.zig");
 const name_prefetch_mod = @import("../storage/name_prefetch.zig");
+const placeholders_mod = @import("placeholders.zig");
 const rpc = @import("../rpc/client.zig");
 const models = @import("../types/models.zig");
 // EventSignatures consumed via the eth.zig-backed shim (re-exports them).
@@ -18,7 +19,9 @@ const NetworkHealth = @import("../utils/network_health.zig").NetworkHealth;
 const status_mod = @import("../server/status.zig");
 const IndexerStatus = status_mod.IndexerStatus;
 const handlers_v2_registry = @import("v2/handlers_registry.zig");
+const alias_sync = @import("v2/alias_sync.zig");
 const handlers_v2_resolver = @import("v2/handlers_resolver.zig");
+const handlers_v2_records = @import("v2/handlers_resolver_records.zig");
 const event_fetchers = @import("event_fetchers.zig");
 const v1_indexing = @import("v1/indexing.zig");
 const handlers_v1 = @import("v1/handlers.zig");
@@ -63,6 +66,10 @@ pub const Indexer = struct {
     // apply). Without these the fetcher re-learns from scratch every batch.
     v1_events_per_block: f64 = 0,
     v1_rpc_chunk_ceiling: u64 = 0,
+    // Largest eth_getLogs block span the provider has accepted for a discovery
+    // sweep (0 = unlimited, nothing learned yet). Lowered by the first rejection
+    // and kept for the rest of the run so every later sweep starts right-sized.
+    backfill_chunk_ceiling: u64 = 0,
     // Memoized rainbow-table lookups (hit AND miss — the empty-string sentinel).
     // A cold probe into the multi-GB rainbow DB is disk-latency-priced; the same
     // labelhash recurs on every event touching that node, so memoization collapses
@@ -88,6 +95,12 @@ pub const Indexer = struct {
     // In-memory dedup of registered resolvers (membership-only — known_resolvers'
     // last_indexed_block is never read), so the same resolver isn't re-upserted on
     // every ResolverUpdated/NewResolver. See registerResolverOnce.
+    /// Deployment block per contract, memoised for the process lifetime so a
+    /// contract handed to `backfillDiscovered` more than once is bisected only
+    /// once. Keyed on the address alone: the search floor is
+    /// `config.start_block`, constant for the run, and a FOUND anchor does not
+    /// move when the ceiling rises. See discovery_backfill.anchorCacheGet.
+    anchor_cache: std.AutoHashMap([20]u8, u64),
     known_resolver_cache: std.StringHashMap(void),
     // In-memory dedup of account observations per (protocol,address) this run: accounts'
     // first_seen is a MIN and seen_v1/seen_v2 are MAX, and the indexer processes forward,
@@ -113,8 +126,15 @@ pub const Indexer = struct {
     // there makes the AFTER UPDATE/DELETE triggers skip capture — eliminating the reorg_undo
     // writes + trigger work for the millions of old blocks in a backfill.
     reorg_arm: bool = true,
+    /// Batches since the shared-registry alias candidates were last re-enqueued. Zero
+    /// means "never this process", which triggers a sweep on the first batch so a dropped
+    /// queue (or a database that predates the queue) heals at startup.
+    alias_batches_since_sweep: u64 = 0,
     // Write buffer for batching DB operations during chunk processing
     write_buffer: WriteBuffer,
+    /// Which canonical/token ids have placeholder rows on disk — gates the
+    /// per-registration placeholder patches (see placeholders.zig).
+    placeholders: placeholders_mod.PlaceholderLedger,
     // Rainbow table for resolving labelhashes to labels (optional)
     rainbow: ?Rainbow = null,
     // Cached namehash("eth") — constant value used by every V2 LabelRegistered/
@@ -204,7 +224,7 @@ pub const Indexer = struct {
             .shared_http_client = http_client,
             .webhook_manager = webhook_manager,
             .should_stop = std.atomic.Value(bool).init(false),
-            .rate_limiter = RateLimiter.init(cfg.rate_limit_per_second, cfg.rate_limit_per_second),
+            .rate_limiter = RateLimiter.init(cfg.rpc_rate_limit_per_second, cfg.rpc_rate_limit_per_second),
             .blocks_since_checkpoint = 0,
             .initial_sync_complete = std.atomic.Value(bool).init(false),
             .v1_network_health = NetworkHealth.init(allocator, cfg.rpc_url, constants.Timing.network_check_interval_ms),
@@ -214,10 +234,12 @@ pub const Indexer = struct {
             .block_timestamp_cache = std.AutoHashMap(u64, i64).init(allocator),
             .v1_label_cache = std.StringHashMap([]const u8).init(allocator),
             .rainbow_cache = std.AutoHashMap([32]u8, []const u8).init(allocator),
+            .anchor_cache = std.AutoHashMap([20]u8, u64).init(allocator),
             .known_resolver_cache = std.StringHashMap(void).init(allocator),
             .account_obs_cache = std.StringHashMap(void).init(allocator),
             .name_by_namehash_cache = std.AutoHashMap(Hash, []const u8).init(allocator),
             .write_buffer = WriteBuffer.init(allocator),
+            .placeholders = placeholders_mod.PlaceholderLedger.init(allocator),
             .rainbow = rainbow,
             .eth_namehash = try @import("../types/hash.zig").namehash(allocator, "eth"),
             .root_name = cfg.network.rootName(),
@@ -306,7 +328,7 @@ pub const Indexer = struct {
             .shared_http_client = http_client,
             .webhook_manager = webhook_manager,
             .should_stop = std.atomic.Value(bool).init(false),
-            .rate_limiter = RateLimiter.init(cfg.rate_limit_per_second, cfg.rate_limit_per_second),
+            .rate_limiter = RateLimiter.init(cfg.rpc_rate_limit_per_second, cfg.rpc_rate_limit_per_second),
             .blocks_since_checkpoint = 0,
             .initial_sync_complete = std.atomic.Value(bool).init(false),
             .v1_network_health = NetworkHealth.init(allocator, cfg.rpc_url, constants.Timing.network_check_interval_ms),
@@ -316,10 +338,12 @@ pub const Indexer = struct {
             .block_timestamp_cache = std.AutoHashMap(u64, i64).init(allocator),
             .v1_label_cache = std.StringHashMap([]const u8).init(allocator),
             .rainbow_cache = std.AutoHashMap([32]u8, []const u8).init(allocator),
+            .anchor_cache = std.AutoHashMap([20]u8, u64).init(allocator),
             .known_resolver_cache = std.StringHashMap(void).init(allocator),
             .account_obs_cache = std.StringHashMap(void).init(allocator),
             .name_by_namehash_cache = std.AutoHashMap(Hash, []const u8).init(allocator),
             .write_buffer = WriteBuffer.init(allocator),
+            .placeholders = placeholders_mod.PlaceholderLedger.init(allocator),
             .rainbow = rainbow,
             .eth_namehash = try @import("../types/hash.zig").namehash(allocator, "eth"),
             .root_name = cfg.network.rootName(),
@@ -350,6 +374,7 @@ pub const Indexer = struct {
         }
         self.block_timestamp_cache.deinit();
         self.write_buffer.deinit();
+        self.placeholders.deinit();
         self.pending_resolver_backfills.deinit(self.allocator);
         if (self.rainbow) |*r| r.deinit();
 
@@ -373,6 +398,7 @@ pub const Indexer = struct {
         // Free cached resolver-dedup keys
         var rk_it = self.known_resolver_cache.keyIterator();
         while (rk_it.next()) |k| self.allocator.free(k.*);
+        self.anchor_cache.deinit();
         self.known_resolver_cache.deinit();
 
         // Free cached account-dedup keys
@@ -389,6 +415,12 @@ pub const Indexer = struct {
     // In-memory cache / dedup accessors — implementations in caches.zig.
     pub const registerResolverOnce = caches.registerResolverOnce;
     pub const registerResolverOnceIfNew = caches.registerResolverOnceIfNew;
+    pub const lookupPairedName = caches.lookupPairedName;
+    pub const namesBarrierFlush = caches.namesBarrierFlush;
+    pub const bufferingEntities = caches.bufferingEntities;
+    pub const setNameOwner = caches.setNameOwner;
+    pub const setNameResolver = caches.setNameResolver;
+    pub const registeredNameExists = caches.registeredNameExists;
     pub const clearKnownResolverCache = caches.clearKnownResolverCache;
     pub const clearAccountObsCache = caches.clearAccountObsCache;
     pub const invalidateControllerCache = caches.invalidateControllerCache;
@@ -413,6 +445,7 @@ pub const Indexer = struct {
     pub const replayAccountsCore = replay_mod.replayAccountsCore;
     /// Rebuild the V2 registries + registry_entries projections (bootstrap + pointer changes).
     pub const replayV2RegistriesCore = replay_mod.replayV2RegistriesCore;
+    pub const replayV2AliasesCore = replay_mod.replayV2AliasesCore;
     pub const trackBlockHash = caches.trackBlockHash;
     pub const resetBlockHashTracking = caches.resetBlockHashTracking;
     pub const getBlockTimestamp = caches.getBlockTimestamp;
@@ -504,6 +537,7 @@ pub const Indexer = struct {
     // V2 registry handlers (extracted to handlers_v2_registry.zig)
     pub const processOrphanedRegistration = handlers_v2_registry.processOrphanedRegistration;
     pub const processRemainingOrphans = handlers_v2_registry.processRemainingOrphans;
+    pub const syncSharedRegistryAliases = alias_sync.syncSharedRegistryAliases;
     pub const handleNameRegistered = handlers_v2_registry.handleNameRegistered;
     pub const handleNameRenewed = handlers_v2_registry.handleNameRenewed;
     pub const handleTransfer = handlers_v2_registry.handleTransfer;
@@ -522,6 +556,7 @@ pub const Indexer = struct {
     pub const handleLabelUnregistered = handlers_v2_registry.handleLabelUnregistered;
     pub const handleExpiryUpdated = handlers_v2_registry.handleExpiryUpdated;
     pub const handleParentUpdated = handlers_v2_registry.handleParentUpdated;
+    pub const handleRegistryCreated = handlers_v2_registry.handleRegistryCreated;
     pub const handleSubregistryUpdated = handlers_v2_registry.handleSubregistryUpdated;
     pub const handleResolverUpdated = handlers_v2_registry.handleResolverUpdated;
 
@@ -548,6 +583,21 @@ pub const Indexer = struct {
     pub const handleVersionChanged = handlers_v2_resolver.handleVersionChanged;
     pub const handleAliasChanged = handlers_v2_resolver.handleAliasChanged;
     pub const handleResolverEACRolesChanged = handlers_v2_resolver.handleResolverEACRolesChanged;
+
+    // V2 record-model resolver handlers (handlers_resolver_records.zig)
+    pub const handleDataChanged = handlers_v2_records.handleDataChanged;
+    pub const handleResolverCreated = handlers_v2_records.handleResolverCreated;
+    pub const handleLinked = handlers_v2_records.handleLinked;
+    pub const handleCleared = handlers_v2_records.handleCleared;
+    pub const handleAddressUpdated = handlers_v2_records.handleAddressUpdated;
+    pub const handleTextUpdated = handlers_v2_records.handleTextUpdated;
+    pub const handleDataUpdated = handlers_v2_records.handleDataUpdated;
+    pub const handleContenthashUpdated = handlers_v2_records.handleContenthashUpdated;
+    pub const handleABIUpdated = handlers_v2_records.handleABIUpdated;
+    pub const handleInterfaceUpdated = handlers_v2_records.handleInterfaceUpdated;
+    pub const handleNameUpdated = handlers_v2_records.handleNameUpdated;
+    pub const handleResourceArgument = handlers_v2_records.handleResourceArgument;
+    pub const handleApprovalUpdated = handlers_v2_records.handleApprovalUpdated;
 
     // V1 event handlers (extracted to handlers_v1.zig)
     pub const handleV1NewOwner = handlers_v1.handleV1NewOwner;

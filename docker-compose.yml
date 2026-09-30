@@ -7,6 +7,17 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: ensv2-indexer-v2
+    # Hard memory ceiling. Without one, a single service can consume the whole
+    # host and take its neighbour down with it — an indexer growing unbounded is
+    # what crash-looped the API previously. Docker kills the container on
+    # breach and `restart: unless-stopped` brings it back, turning a host-wide
+    # stall into one restarted service. Sized for a 4 GB host; raise both
+    # values together via the environment on a larger box.
+    deploy:
+      resources:
+        limits:
+          memory: ${INDEXER_MEMORY_LIMIT:-2g}
+    mem_swappiness: 0
     restart: unless-stopped
     command: ["/app/ensv2-indexer-v2"]
     ulimits:
@@ -18,6 +29,11 @@ services:
       - webhook-data:/app/webhooks
     environment:
       - DATABASE_PATH=/app/data/ens.db
+      # Postgres (e.g. Neon): set DATABASE_URL to a postgres:// string to switch off
+      # SQLite. Compose only forwards variables a service lists here, so without
+      # these two the container never sees them and silently falls back to SQLite.
+      - DATABASE_BACKEND=${DATABASE_BACKEND:-}
+      - DATABASE_URL=${DATABASE_URL:-}
       - RAINBOW_PATH=/app/data/ens_rainbow.db
       - DOWNLOAD_RAINBOW=true
       - RPC_URL=${RPC_URL}
@@ -49,6 +65,11 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: ensv2-api
+    deploy:
+      resources:
+        limits:
+          memory: ${API_MEMORY_LIMIT:-1g}
+    mem_swappiness: 0
     restart: unless-stopped
     command: ["/app/api-entrypoint.sh"]
     ulimits:
@@ -62,9 +83,28 @@ services:
       - webhook-data:/app/webhooks
     environment:
       - DATABASE_PATH=/app/data/ens.db
+      # Postgres (e.g. Neon): set DATABASE_URL to a postgres:// string to switch off
+      # SQLite. Compose only forwards variables a service lists here, so without
+      # these two the container never sees them and silently falls back to SQLite.
+      - DATABASE_BACKEND=${DATABASE_BACKEND:-}
+      - DATABASE_URL=${DATABASE_URL:-}
       - RAINBOW_PATH=/app/data/ens_rainbow.db
       - DOWNLOAD_RAINBOW=false
       - API_PORT=5655
+      # Inbound per-IP HTTP limiting for the API. This has to live on THIS service:
+      # the indexer also reads RATE_LIMIT_PER_SECOND, but for its own OUTBOUND RPC
+      # throttle, so setting it only there left the API on the code default (15/s)
+      # and capped the public surface without anyone choosing that number.
+      - RATE_LIMIT_PER_SECOND=${API_RATE_LIMIT_PER_SECOND:-25}
+      # Without finality data, report stale=true once a protocol has gone this long
+      # without committing a batch (see .env.example). Above the longest healthy
+      # batch; set 0 for a --backfill or an END_BLOCK-pinned deployment.
+      - COVERAGE_STALE_AFTER_SECONDS=${COVERAGE_STALE_AFTER_SECONDS:-3600}
+      # Number of trusted reverse-proxy hops. MUST be non-zero behind a proxy:
+      # at 0 the limiter keys on the direct TCP peer, which is the proxy, so every
+      # client on earth shares one bucket. Count the real chain (CDN -> ingress ->
+      # api) and set it exactly — too high and X-Forwarded-For becomes spoofable.
+      - TRUSTED_PROXY_HOPS=${TRUSTED_PROXY_HOPS:-1}
       - GRAPHQL_MAX_DEPTH=10
       - GRAPHQL_MAX_COST=${GRAPHQL_MAX_COST:-10000}
       - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}

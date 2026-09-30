@@ -13,6 +13,7 @@ const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
 const graphql = @import("handler.zig");
+const api_common = @import("common.zig");
 const parser = @import("../lib/graphql/parser.zig");
 const json_utils = @import("../utils/json.zig");
 const url_utils = @import("../utils/url.zig");
@@ -467,32 +468,32 @@ pub fn handleHealthCheck(self: *Server, conn: http_util.Conn) !void {
 
 /// Readiness: can this node actually serve queries? Acquires a pool session and does a
 /// trivial read; returns 503 when the DB is unreachable so a load balancer routes traffic
-/// away. Staleness (indexed head behind the safe head) is surfaced as a `stale` flag, not
-/// a 503, so a node that is merely a little behind keeps serving instead of flapping out
-/// of rotation.
+/// away. Staleness is surfaced as a `stale` flag (api/common.coverageStale), not a 503,
+/// so a node that is merely a little behind keeps serving instead of flapping out of
+/// rotation.
 pub fn handleReadiness(self: *Server, conn: http_util.Conn) !void {
     const database = self.pool.acquire() catch
         return self.sendJsonResponse(conn, 503, "{\"status\":\"not_ready\",\"reason\":\"db_unavailable\"}");
     defer self.pool.release(database);
 
-    const v1 = (database.getSyncState(.v1) catch
-        return self.sendJsonResponse(conn, 503, "{\"status\":\"not_ready\",\"reason\":\"db_unreachable\"}")) orelse 0;
-    const v2 = (database.getSyncState(.v2) catch
-        return self.sendJsonResponse(conn, 503, "{\"status\":\"not_ready\",\"reason\":\"db_unreachable\"}")) orelse 0;
-    const head: u64 = if (v1 > v2) v1 else v2;
+    const v1 = database.getSyncStateFull(.v1) catch
+        return self.sendJsonResponse(conn, 503, "{\"status\":\"not_ready\",\"reason\":\"db_unreachable\"}");
+    const v2 = database.getSyncStateFull(.v2) catch
+        return self.sendJsonResponse(conn, 503, "{\"status\":\"not_ready\",\"reason\":\"db_unreachable\"}");
+    const head = api_common.indexedHead(v1, v2);
 
     const safe = database.getFinality(database.chain_id, .safe) catch null;
-    const safe_num: u64 = if (safe) |sp| sp.number else 0;
-    const stale = safe != null and head < safe_num;
+    const safe_num: ?u64 = if (safe) |sp| sp.number else null;
+    const stale = api_common.coverageStale(v1, v2, safe_num, database.stale_after_seconds, zsys.timestamp());
 
-    const body = try std.fmt.allocPrint(self.allocator, "{{\"status\":\"ready\",\"indexed_head\":{d},\"safe\":{d},\"stale\":{s}}}", .{ head, safe_num, if (stale) "true" else "false" });
+    const body = try std.fmt.allocPrint(self.allocator, "{{\"status\":\"ready\",\"indexed_head\":{d},\"safe\":{d},\"stale\":{s}}}", .{ head, safe_num orelse 0, if (stale) "true" else "false" });
     defer self.allocator.free(body);
     try self.sendJsonResponse(conn, 200, body);
 }
 
 /// Coverage declaration: chain id, per-protocol indexed head + last-sync time, and a
-/// staleness flag (same semantics as /ready's `stale`: false when no finality data).
-/// The GraphQL `_coverage` field serves the same data with field selection.
+/// staleness flag (api/common.coverageStale, the same flag /ready reports). The
+/// GraphQL `_coverage` field serves the same data with field selection.
 pub fn handleCoverage(self: *Server, conn: http_util.Conn) !void {
     const database = self.pool.acquire() catch
         return self.sendJsonResponse(conn, 503, "{\"status\":\"unavailable\",\"reason\":\"db_unavailable\"}");
@@ -500,16 +501,13 @@ pub fn handleCoverage(self: *Server, conn: http_util.Conn) !void {
 
     const v1 = database.getSyncStateFull(.v1) catch null;
     const v2 = database.getSyncStateFull(.v2) catch null;
-    const v1_block: u64 = if (v1) |s| s.block else 0;
-    const v2_block: u64 = if (v2) |s| s.block else 0;
-    const head: u64 = if (v1_block > v2_block) v1_block else v2_block;
     const safe = database.getFinality(database.chain_id, .safe) catch null;
-    const stale = if (safe) |sp| head < sp.number else false;
+    const stale = api_common.coverageStale(v1, v2, if (safe) |sp| sp.number else null, database.stale_after_seconds, zsys.timestamp());
 
     const body = try std.fmt.allocPrint(
         self.allocator,
         "{{\"chainId\":{d},\"stale\":{s},\"protocols\":[{{\"protocol\":\"v1\",\"indexedHead\":{d},\"lastSyncedAt\":{?d}}},{{\"protocol\":\"v2\",\"indexedHead\":{d},\"lastSyncedAt\":{?d}}}]}}",
-        .{ database.chain_id, if (stale) "true" else "false", v1_block, if (v1) |s| s.at else null, v2_block, if (v2) |s| s.at else null },
+        .{ database.chain_id, if (stale) "true" else "false", if (v1) |s| s.block else 0, if (v1) |s| s.at else null, if (v2) |s| s.block else 0, if (v2) |s| s.at else null },
     );
     defer self.allocator.free(body);
     try self.sendJsonResponse(conn, 200, body);
@@ -532,6 +530,7 @@ pub fn handleMetrics(self: *Server, conn: http_util.Conn) !void {
     const writer = &response.writer;
     try writer.print(
         "HTTP/1.1 200 OK\r\n" ++
+            "Connection: close\r\n" ++
             "Content-Type: text/plain; version=0.0.4\r\n" ++
             "Content-Length: {d}\r\n" ++
             "\r\n" ++
@@ -543,22 +542,27 @@ pub fn handleMetrics(self: *Server, conn: http_util.Conn) !void {
 }
 
 /// Append Prometheus finality gauges (Task 09): indexed head, safe/finalized positions,
-/// safe lag, and a stale flag. Reads a pool session; 0/stale when finality is unpopulated.
+/// safe lag, and both stale flags. Reads a pool session; 0/stale when finality is unpopulated.
 fn appendFinalityMetrics(self: *Server, out: *std.Io.Writer.Allocating) !void {
     const database = try self.pool.acquire();
     defer self.pool.release(database);
-    const v1 = (try database.getSyncState(.v1)) orelse 0;
-    const v2 = (try database.getSyncState(.v2)) orelse 0;
-    const head: u64 = if (v1 > v2) v1 else v2;
-    const safe = try database.getFinality(database.chain_id, .safe);
+    const v1 = try database.getSyncStateFull(.v1);
+    const v2 = try database.getSyncStateFull(.v2);
+    const safe: ?u64 = if (try database.getFinality(database.chain_id, .safe)) |s| s.number else null;
     const finalized = try database.getFinality(database.chain_id, .finalized);
-    try writeFinalityGauges(&out.writer, head, if (safe) |s| s.number else null, if (finalized) |f| f.number else null);
+    const coverage_stale = api_common.coverageStale(v1, v2, safe, database.stale_after_seconds, zsys.timestamp());
+    try writeFinalityGauges(&out.writer, api_common.indexedHead(v1, v2), safe, if (finalized) |f| f.number else null, coverage_stale);
 }
 
 /// Pure Prometheus-gauge formatter for the finality metrics (Task 09). Split out of the
 /// DB-coupled fetch so the gauge SET and the lag math are unit-testable. `safe`/`finalized`
 /// are the block numbers of the chain's safe/finalized heads (null = not yet observed).
-fn writeFinalityGauges(w: *std.Io.Writer, head: u64, safe: ?u64, finalized: ?u64) !void {
+///
+/// Two stale gauges, deliberately different: `ensv2_indexing_stale` is the conservative
+/// `_finality.isStale` (1 whenever there is no safe head to trust);
+/// `ensv2_coverage_stale` is the `stale` flag /ready, /coverage and `_coverage` report,
+/// including the COVERAGE_STALE_AFTER_SECONDS fallback.
+fn writeFinalityGauges(w: *std.Io.Writer, head: u64, safe: ?u64, finalized: ?u64, coverage_stale: bool) !void {
     try w.print("# TYPE ensv2_indexed_head gauge\nensv2_indexed_head {d}\n", .{head});
     try w.print("# TYPE ensv2_finality_safe gauge\nensv2_finality_safe {d}\n", .{safe orelse 0});
     try w.print("# TYPE ensv2_finality_finalized gauge\nensv2_finality_finalized {d}\n", .{finalized orelse 0});
@@ -569,6 +573,7 @@ fn writeFinalityGauges(w: *std.Io.Writer, head: u64, safe: ?u64, finalized: ?u64
     try w.print("# TYPE ensv2_finality_finalized_lag gauge\nensv2_finality_finalized_lag {d}\n", .{finalized_lag});
     const stale: u8 = if (safe) |s| (if (head < s) @as(u8, 1) else 0) else 1;
     try w.print("# TYPE ensv2_indexing_stale gauge\nensv2_indexing_stale {d}\n", .{stale});
+    try w.print("# TYPE ensv2_coverage_stale gauge\nensv2_coverage_stale {d}\n", .{@intFromBool(coverage_stale)});
 }
 
 test "writeFinalityGauges: emits the full finality gauge set with correct lag" {
@@ -576,7 +581,7 @@ test "writeFinalityGauges: emits the full finality gauge set with correct lag" {
     {
         var buf: std.Io.Writer.Allocating = .init(a);
         defer buf.deinit();
-        try writeFinalityGauges(&buf.writer, 200, 190, 180); // head=200, safe=190, finalized=180
+        try writeFinalityGauges(&buf.writer, 200, 190, 180, false); // head=200, safe=190, finalized=180
         const o = buf.written();
         try std.testing.expect(std.mem.indexOf(u8, o, "ensv2_indexed_head 200\n") != null);
         try std.testing.expect(std.mem.indexOf(u8, o, "ensv2_finality_safe 190\n") != null);
@@ -584,16 +589,25 @@ test "writeFinalityGauges: emits the full finality gauge set with correct lag" {
         try std.testing.expect(std.mem.indexOf(u8, o, "ensv2_finality_safe_lag 10\n") != null);
         try std.testing.expect(std.mem.indexOf(u8, o, "ensv2_finality_finalized_lag 20\n") != null);
         try std.testing.expect(std.mem.indexOf(u8, o, "ensv2_indexing_stale 0\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, o, "ensv2_coverage_stale 0\n") != null);
     }
     {
         // No finality observed yet -> zeros, and stale=1 (we have no safe head to trust).
         var buf: std.Io.Writer.Allocating = .init(a);
         defer buf.deinit();
-        try writeFinalityGauges(&buf.writer, 200, null, null);
+        try writeFinalityGauges(&buf.writer, 200, null, null, false);
         const o = buf.written();
         try std.testing.expect(std.mem.indexOf(u8, o, "ensv2_finality_safe 0\n") != null);
         try std.testing.expect(std.mem.indexOf(u8, o, "ensv2_finality_safe_lag 0\n") != null);
         try std.testing.expect(std.mem.indexOf(u8, o, "ensv2_indexing_stale 1\n") != null);
+        // The coverage flag is whatever /coverage computed, not the conservative one.
+        try std.testing.expect(std.mem.indexOf(u8, o, "ensv2_coverage_stale 0\n") != null);
+    }
+    {
+        var buf: std.Io.Writer.Allocating = .init(a);
+        defer buf.deinit();
+        try writeFinalityGauges(&buf.writer, 200, null, null, true);
+        try std.testing.expect(std.mem.indexOf(u8, buf.written(), "ensv2_coverage_stale 1\n") != null);
     }
 }
 
@@ -867,6 +881,7 @@ pub fn handleGraphQLPlayground(self: *Server, conn: http_util.Conn) !void {
     const writer = &response.writer;
     try writer.print(
         "HTTP/1.1 200 OK\r\n" ++
+            "Connection: close\r\n" ++
             "Content-Type: text/html\r\n" ++
             "Content-Length: {d}\r\n" ++
             "Access-Control-Allow-Origin: *\r\n" ++

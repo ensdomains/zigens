@@ -98,6 +98,8 @@ pub const Server = struct {
     max_concurrent_connections: u32,
     /// Per-request wall-clock read budget (ms); backstops the per-socket timeout.
     request_timeout_ms: u32,
+    /// One-shot latch for the proxy-attribution warning below.
+    warned_proxy_attribution: bool,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, pool: *pool_mod.Pool, webhook_db_path: ?[]const u8, port: u16, complexity_max_depth: u32, complexity_max_cost: u32, metrics_enabled: bool, rate_limit_per_second: u32, webhook_admin_username: ?[]const u8, webhook_admin_password: ?[]const u8, trusted_proxy_hops: u32, request_timeout_ms: u32, max_concurrent_connections: u32, internal_admin_token: ?[]const u8, internal_rate_limit_per_second: u32, allow_unauth_webhooks: bool) !Server {
         // Only open webhook database if path is provided (webhooks enabled)
@@ -131,6 +133,7 @@ pub const Server = struct {
             .active_conns = std.atomic.Value(u32).init(0),
             .max_concurrent_connections = max_concurrent_connections,
             .request_timeout_ms = request_timeout_ms,
+            .warned_proxy_attribution = false,
         };
     }
 
@@ -312,8 +315,20 @@ pub const Server = struct {
             const is_metrics_scrape = std.mem.eql(u8, rl_method, "GET") and std.mem.startsWith(u8, rl_path, "/metrics");
             const client_addr = if (self.trusted_proxy_hops > 0)
                 resolveClientAddress(conn.address(), header_data, self.trusted_proxy_hops)
-            else
-                conn.address();
+            else blk: {
+                // A request carrying X-Forwarded-For while we trust zero hops is
+                // positive proof that something proxies this service, so keying on
+                // the peer lumps every client into one bucket. Warn once — the
+                // condition is per-deployment, not per-request, so repeating it
+                // would only flood the log.
+                if (!self.warned_proxy_attribution and
+                    std.ascii.indexOfIgnoreCase(header_data, "x-forwarded-for:") != null)
+                {
+                    self.warned_proxy_attribution = true;
+                    std.log.warn("TRUSTED_PROXY_HOPS is 0 but requests carry X-Forwarded-For: per-IP rate limiting is keyed on the proxy, so ALL clients share one bucket. Set it to the number of proxies in front of this service.", .{});
+                }
+                break :blk conn.address();
+            };
             const limiter = if (is_metrics_scrape) &self.metrics_rate_limiter else &self.rate_limiter;
             if (!limiter.tryAcquireFor(client_addr)) {
                 try self.sendRateLimited(conn);

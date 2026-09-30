@@ -125,11 +125,30 @@ pub fn insertName(self: *Indexer, name: models.Name) !void {
     // rather than block the insert.
     if (n.protocol == .v2) {
         const roots = [_]Address{ self.config.v2_contracts.eth_registry, self.config.v2_contracts.root_registry };
-        n.is_reachable = self.database.isRegistryReachable(self.allocator, n.protocol, n.registry, &roots) catch |err| blk: {
+        // `created_at` is the BLOCK timestamp on every V2 insert path, so the ancestor-expiry
+        // question is asked as of the block this name was created at — which is exactly the right
+        // question ("did its ancestors resolve when it appeared?") and is reproducible by a
+        // replay, unlike a wall clock.
+        n.is_reachable = self.database.isRegistryReachable(self.allocator, n.protocol, n.registry, &roots, n.created_at) catch |err| blk: {
             std.log.warn("isRegistryReachable failed for {any}: {} (assuming reachable)", .{ n.registry, err });
             break :blk n.is_reachable;
         };
     }
+    if (n.protocol == .v2 and self.bufferingEntities()) {
+        // Buffered like every other V2 entity write: the row lands in one
+        // multi-row upsert at flush (chain order), or earlier if any storage
+        // names accessor runs first (Database.names_barrier). A buffered
+        // insert supersedes pending field updates exactly as the upsert did.
+        // The prefetch learns the row now, as the direct insert's listener
+        // notify would have told it.
+        try self.write_buffer.insertName(n);
+        // Alias rows stay out of the dispatch prefetch — see names_write.insertName.
+        if (!n.is_alias) self.database.noteNameUpsert(n.protocol, n.registry, n.canonical_id, n.namehash, n.name);
+        return;
+    }
+    // A direct upsert supersedes any owner/resolver update still buffered
+    // for this row (burn + re-register within one batch).
+    self.write_buffer.discardPendingName(n.protocol, n.namehash);
     try self.database.insertName(n);
 }
 

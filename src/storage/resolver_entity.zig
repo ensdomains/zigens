@@ -167,6 +167,7 @@ pub fn getFilteredResolverEntities(
 // (INSERT OR IGNORE preserves any previously inserted rows). Used once after
 // the writer is added to event handlers, so historical data isn't lost.
 pub fn backfillResolverEntitiesFromNames(db: *Database) !u64 {
+    try db.namesBarrier();
     const seed_block_sql = "SELECT COALESCE(MIN(last_synced_block), 0) FROM sync_state";
     var seed_q = try Query.init(db, seed_block_sql);
     defer seed_q.deinit();
@@ -190,6 +191,7 @@ pub fn backfillResolverEntitiesFromNames(db: *Database) !u64 {
 
 /// Uses cache table for O(1) lookup, falls back to full scan on first run
 pub fn getResolversToIndex(db: *Database, protocol: models.Protocol, from_block: u64, to_block: u64) ![][]u8 {
+    try db.namesBarrier();
     // First, discover any NEW resolvers from names table (only those set in this block range)
     const discover_sql =
         \\SELECT DISTINCT n.resolver
@@ -265,6 +267,7 @@ pub const ResolverDiscoveryResult = struct {
 /// Get resolvers to index, also returning which ones were newly discovered in this block range.
 /// Newly discovered resolvers need their historical events backfilled.
 pub fn discoverAndGetResolvers(db: *Database, protocol: models.Protocol, from_block: u64, to_block: u64) !ResolverDiscoveryResult {
+    try db.namesBarrier();
     const discover_sql =
         \\SELECT DISTINCT n.resolver
         \\FROM names n
@@ -333,6 +336,7 @@ pub fn discoverAndGetResolvers(db: *Database, protocol: models.Protocol, from_bl
 
 /// Get all distinct resolver addresses set on domains owned by an account
 pub fn getResolversByOwner(db: *Database, protocol: models.Protocol, owner: Address) ![]models.Resolver {
+    try db.namesBarrier();
     const sql =
         \\SELECT DISTINCT n.resolver, n.name, n.namehash, n.created_block, n.created_at
         \\FROM names n
@@ -380,6 +384,7 @@ pub fn getResolversByOwner(db: *Database, protocol: models.Protocol, owner: Addr
 
 /// Count the number of domains (nodes) that use a specific resolver address
 pub fn getResolverNodeCount(db: *Database, resolver: Address) !usize {
+    try db.namesBarrier();
     const sql = "SELECT COUNT(*) FROM names WHERE resolver = ?";
 
     var q = try Query.init(db, sql);
@@ -425,12 +430,14 @@ pub fn getResolverRoleHolderCount(db: *Database, resolver: Address) !usize {
 
 /// Get all EAC role assignments for a resolver contract address
 pub fn getResolverRoles(db: *Database, resolver: Address) ![]models.EACRoleAssignment {
+    try db.namesBarrier();
     const sql =
         \\SELECT r.id, r.protocol, r.resource, r.account, r.role_bitmap, r.block_number, r.transaction_hash, r.log_index, r.timestamp, n.name
         \\FROM eac_roles r
-        \\LEFT JOIN names n ON r.resource = n.canonical_id AND r.contract_address = n.registry
+        \\LEFT JOIN names n ON n.canonical_id = (substr(r.resource, 1, 58) || '00000000')
+        \\                   AND r.contract_address = n.registry AND n.is_alias = 0
         \\WHERE r.contract_address = ?
-        \\ORDER BY r.timestamp DESC
+        \\ORDER BY r.timestamp DESC, r.block_number DESC, r.log_index DESC, r.id DESC
     ;
 
     var q = try Query.init(db, sql);
