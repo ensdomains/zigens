@@ -533,7 +533,7 @@ pub fn indexResolverEvents(self: *Indexer, protocol: models.Protocol, client: *r
     }
     if (owed.items.len > 0) {
         std.log.info("Backfilling {d} resolver(s) first sighted this batch (up to block {d})", .{ owed.items.len, from_block - 1 });
-        _ = discovery_backfill.backfillDiscovered(self, protocol, client, .resolver, owed.items, from_block - 1);
+        _ = discovery_backfill.backfillDiscovered(self, protocol, client, .resolver, owed.items, from_block - 1, null, null);
     }
 
     if (discovery.all.len == 0) {
@@ -650,6 +650,15 @@ const HEAL_MAX_ATTEMPTS = discovery_backfill.HEAL_MAX_ATTEMPTS;
 /// Minimum seconds between attempts on one target, so a multi-hour RPC outage
 /// cannot burn the whole attempt budget in a few poll cycles.
 const HEAL_RETRY_SPACING_SECS: i64 = 600;
+/// Per-poll-cycle heal budget. The drain runs inside the sync loop, so whatever
+/// it spends is time the indexer is NOT following the chain head: an unbounded
+/// pass once blocked head-following for 54 minutes after a single 1-block reorg
+/// re-armed the whole ledger. Two bounds, because the pass has two cost drivers:
+/// anchor bisection scales with the number of targets, sweeping with blocks and
+/// events. Neither bound risks correctness — an unswept target simply stays owed
+/// in the ledger, which is already how a failed sweep is resumed.
+const HEAL_TARGETS_PER_CYCLE: usize = 200;
+const HEAL_BUDGET_MS: i64 = 20_000;
 
 /// Seed the ledger with every already-known resolver and subregistry. Runs at
 /// initial-sync completion; enqueue is INSERT OR IGNORE, so completed targets
@@ -682,25 +691,51 @@ pub fn hasDueInitGapHeals(self: *Indexer, protocol: models.Protocol) bool {
 pub fn drainInitGapHeals(self: *Indexer, protocol: models.Protocol, client: *rpc.Client) void {
     if (protocol != .v2) return;
     const retry_before = zsys.timestamp() - HEAL_RETRY_SPACING_SECS;
-    drainHealTask(self, .resolver, protocol, client, retry_before);
-    drainHealTask(self, .subregistry, protocol, client, retry_before);
+    // One deadline shared by both tasks, so a cycle's total heal cost is bounded
+    // rather than doubled. Whatever the resolver pass leaves is what the
+    // subregistry pass gets; on the next cycle the order is the same but the
+    // completed targets are gone, so both drain over successive cycles.
+    const deadline = zsys.milliTimestamp() + HEAL_BUDGET_MS;
+    drainHealTask(self, .resolver, protocol, client, retry_before, deadline);
+    drainHealTask(self, .subregistry, protocol, client, retry_before, deadline);
 }
 
-fn drainHealTask(self: *Indexer, kind: discovery_backfill.Kind, protocol: models.Protocol, client: *rpc.Client, retry_before: i64) void {
+fn drainHealTask(self: *Indexer, kind: discovery_backfill.Kind, protocol: models.Protocol, client: *rpc.Client, retry_before: i64, deadline_ms: i64) void {
     const task = switch (kind) {
         .resolver => RESOLVER_HEAL_TASK,
         .subregistry => SUBREGISTRY_HEAL_TASK,
     };
-    var targets = self.database.pendingHealTargets(self.allocator, task, protocol, HEAL_MAX_ATTEMPTS, retry_before) catch |err| {
+    var targets = self.database.pendingHealTargets(self.allocator, task, protocol, HEAL_MAX_ATTEMPTS, retry_before, HEAL_TARGETS_PER_CYCLE) catch |err| {
         std.log.warn("init-gap heal: failed to list {s} targets: {}", .{ task, err });
         return;
     };
     defer targets.deinit(self.allocator);
     if (targets.items.len == 0) return;
 
+    // Split the rows into the two parallel slices backfillDiscovered wants. The
+    // ceiling is each contract's first-seen block: the sweep owes only the
+    // events emitted before the indexer knew the contract existed. Sweeping to
+    // the head instead re-scanned ~9x more blocks and re-dispatched tens of
+    // thousands of already-stored events on every pass.
+    var addrs: std.ArrayList(Address) = .empty;
+    defer addrs.deinit(self.allocator);
+    var ceils: std.ArrayList(u64) = .empty;
+    defer ceils.deinit(self.allocator);
+    for (targets.items) |t| {
+        addrs.append(self.allocator, t.addr) catch break;
+        // first_seen_block is the first block the ordinary path covered, so the
+        // gap ends one block earlier. 0 means unknown and stays 0, which
+        // backfillDiscovered reads as "fall back to the head".
+        ceils.append(self.allocator, if (t.first_seen_block > 0) t.first_seen_block - 1 else 0) catch break;
+    }
+    if (addrs.items.len != targets.items.len or ceils.items.len != targets.items.len) {
+        std.log.warn("init-gap heal: out of memory listing {s} targets; leaving all {d} owed", .{ task, targets.items.len });
+        return;
+    }
+
     const to_block = (self.database.getSyncState(protocol) catch null) orelse 0;
     std.log.info("init-gap heal: {d} pending {s} target(s), sweeping up to block {d}", .{ targets.items.len, task, to_block });
-    const outcome = discovery_backfill.backfillDiscovered(self, protocol, client, kind, targets.items, to_block);
+    const outcome = discovery_backfill.backfillDiscovered(self, protocol, client, kind, addrs.items, to_block, ceils.items, deadline_ms);
     std.log.info("init-gap heal: {s} pass complete, {d}/{d} swept", .{ task, outcome.swept + outcome.no_history, targets.items.len });
 }
 
@@ -711,7 +746,7 @@ fn backfillAddressStrings(self: *Indexer, protocol: models.Protocol, client: *rp
         const addr = Address.fromHex(hex) catch continue;
         addrs.append(self.allocator, addr) catch continue;
     }
-    _ = discovery_backfill.backfillDiscovered(self, protocol, client, kind, addrs.items, to_block);
+    _ = discovery_backfill.backfillDiscovered(self, protocol, client, kind, addrs.items, to_block, null, null);
 }
 
 /// Combined Phase 1 fetch: EthRegistry + ETHRegistrar + Datastore events in a single batch RPC call.
