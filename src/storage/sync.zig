@@ -308,10 +308,13 @@ pub fn rollbackToBlock(db: *Database, protocol: models.Protocol, block_number: u
     // Re-arm the init-gap heal ledger: heal sweeps write with undo capture
     // deliberately disarmed, so the created-after deletes above may have
     // removed healed rows — a surviving `completed` marker would make that
-    // loss permanent. Re-opening every target costs one idempotent full
-    // re-sweep that converges projections to the surviving chain; attempts
-    // reset too, since prior failures say nothing about this chain.
-    try heal_targets.resetHealTargets(db, protocol);
+    // loss permanent. Scoped to the targets that could actually have written
+    // above `block_number`: a sweep stops at the contract's first-seen block, so
+    // one below the rollback point wrote nothing the deletes reached. Re-arming
+    // every target instead cost a full re-sweep per reorg — on staging one
+    // 1-block Sepolia reorg re-opened 2,406 targets and blocked head-following
+    // for 54 minutes. Attempts still reset for every row.
+    try heal_targets.resetHealTargets(db, protocol, block_number);
 
     // Update sync state
     try db.setSyncState(protocol, block_number);

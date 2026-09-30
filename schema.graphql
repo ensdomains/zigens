@@ -680,10 +680,10 @@ type Resolver {
   """Every name bound to the same record as this name (record sharing replaces aliasing). Empty on legacy resolvers."""
   linkedNames: [LinkedName!]
 
-  """ENSIP-24 data(key) record as 0x-hex bytes (null if unset). From DataUpdated (record resolvers) and DataChanged (legacy)."""
+  """ENSIP-24 data(key) record as 0x-hex bytes. From DataUpdated (record resolvers) and DataChanged (legacy). Null means one of two things: no such record, OR a record whose value never existed on chain in plaintext — a resolver may declare `value` as indexed, in which case the log carries only keccak256(value). Distinguish them with events(where: {type: "DataChanged"}): those changes are recorded there and their `data` carries a `valueHash` instead of a `value`."""
   data(key: String!): String
 
-  """All data(key) keys set on this resolver/name — a scalar list of keys, like `texts`; read values with `data(key:)`."""
+  """The data(key) keys whose value this indexer can serve — a scalar list of keys, like `texts`; read values with `data(key:)`. Deliberately NOT every key ever set: a record whose resolver declared `value` as indexed is omitted, because only keccak256(value) was ever on chain and there is no value to return. Find those via events(where: {type: "DataChanged"}) and the `valueHash` in their `data`."""
   dataKeys: [String!]
 }
 

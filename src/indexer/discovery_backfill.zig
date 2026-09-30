@@ -111,6 +111,10 @@ pub const Outcome = struct {
     groups: usize = 0,
     calls: usize = 0,
     events: usize = 0,
+    /// Targets left unswept because the cycle's time budget ran out. They keep
+    /// `completed = 0` in the ledger, so the next cycle picks them up — the
+    /// ledger IS the resume state, no extra bookkeeping needed.
+    deferred: usize = 0,
 };
 
 const Interval = struct {
@@ -322,9 +326,37 @@ const RpcProber = struct {
 const Target = struct {
     addr: Address,
     anchor: u64,
+    /// Highest block this target's sweep may touch. The init gap is exactly the
+    /// events a contract emitted BEFORE the indexer knew it existed, so
+    /// everything from its first-seen block onward was already indexed by the
+    /// ordinary path — re-sweeping it costs provider scan time and re-dispatches
+    /// events that are already stored.
+    ceil: u64,
 };
 
+/// The sweep window for one target: `null` means nothing is owed.
+///
+/// Two rules, and the asymmetry between them is deliberate:
+///   - an UNKNOWN ceiling (0) falls back to `to_block`, i.e. the pre-existing
+///     full-history sweep. Reading 0 as a literal ceiling would sweep nothing
+///     and leave the init gap forever — a silent permanent hole, which is far
+///     worse than the redundant scan it replaces.
+///   - a known ceiling is clamped to `to_block`, because no sweep may run past
+///     the block the indexer has actually reached.
+/// A ceiling below the anchor means the contract was already known at its own
+/// deployment block, so no unseen events exist.
+fn sweepWindow(anchor: u64, raw_ceil: u64, to_block: u64) ?u64 {
+    const ceil = if (raw_ceil == 0) to_block else @min(raw_ceil, to_block);
+    if (ceil < anchor) return null;
+    return ceil;
+}
+
+/// Sort by ceiling first so a group is ceiling-homogeneous: the group sweeps to
+/// its highest member's ceiling, and clustering equal ceilings keeps the
+/// over-sweep above a member's own ceiling near zero. Anchor breaks ties, which
+/// preserves the anchor clustering that keeps a group's block span tight.
 fn targetLessThan(_: void, a: Target, b: Target) bool {
+    if (a.ceil != b.ceil) return a.ceil < b.ceil;
     return a.anchor < b.anchor;
 }
 
@@ -332,7 +364,15 @@ fn targetLessThan(_: void, a: Target, b: Target) bool {
 /// and record each one's outcome in the init-gap heal ledger (v2 only, the
 /// ledger's authoritative protocol). Never fails: a failed group is logged
 /// and its targets stay owed in the ledger.
-pub fn backfillDiscovered(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, kind: Kind, addrs: []const Address, to_block: u64) Outcome {
+/// `ceils`, when given, is aligned with `addrs` and caps each target's sweep
+/// individually; 0 means "unknown, use `to_block`". Pass null to sweep every
+/// address to `to_block` (the discovery-time path already knows its own ceiling
+/// and passes `from_block - 1` as `to_block`).
+/// `deadline_ms`, when given, stops the pass between groups once the wall clock
+/// passes it. The first group always runs, so a budget smaller than one group's
+/// cost degrades to slow progress rather than to none at all.
+pub fn backfillDiscovered(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, kind: Kind, addrs: []const Address, to_block: u64, ceils: ?[]const u64, deadline_ms: ?i64) Outcome {
+    std.debug.assert(ceils == null or ceils.?.len == addrs.len);
     var outcome: Outcome = .{ .total = addrs.len };
     if (addrs.len == 0) return outcome;
     const started = zsys.milliTimestamp();
@@ -403,12 +443,18 @@ pub fn backfillDiscovered(self: *Indexer, protocol: models.Protocol, client: *rp
 
     var targets: std.ArrayList(Target) = .empty;
     defer targets.deinit(self.allocator);
-    for (addrs, anchors) |addr, anchor| {
+    for (addrs, anchors, 0..) |addr, anchor, i| {
         if (anchor) |a| {
-            targets.append(self.allocator, .{ .addr = addr, .anchor = a }) catch {
-                recordOutcome(self, kind, protocol, addr, error.OutOfMemory);
-                outcome.failed += 1;
-            };
+            if (sweepWindow(a, if (ceils) |cs| cs[i] else 0, to_block)) |ceil| {
+                targets.append(self.allocator, .{ .addr = addr, .anchor = a, .ceil = ceil }) catch {
+                    recordOutcome(self, kind, protocol, addr, error.OutOfMemory);
+                    outcome.failed += 1;
+                };
+            } else {
+                // Nothing owed — same outcome as "no history".
+                recordOutcome(self, kind, protocol, addr, null);
+                outcome.no_history += 1;
+            }
         } else {
             recordOutcome(self, kind, protocol, addr, null);
             outcome.no_history += 1;
@@ -416,23 +462,52 @@ pub fn backfillDiscovered(self: *Indexer, protocol: models.Protocol, client: *rp
     }
     std.mem.sort(Target, targets.items, {}, targetLessThan);
     if (targets.items.len > 0) {
-        std.log.info("  Discovery anchors: floor {d}, ceil {d}, {d} target(s) spanning {d}..{d}", .{ floor, to_block, targets.items.len, targets.items[0].anchor, targets.items[targets.items.len - 1].anchor });
+        // Report the ceiling range the sweeps will actually use, not the head:
+        // with per-target ceilings these differ by ~100k blocks on a real heal,
+        // and the old line made a capped sweep look like a full-history one.
+        std.log.info("  Discovery anchors: floor {d}, ceil {d}..{d} (head {d}), {d} target(s) spanning {d}..{d}", .{
+            floor,
+            targets.items[0].ceil,
+            targets.items[targets.items.len - 1].ceil,
+            to_block,
+            targets.items.len,
+            targets.items[0].anchor,
+            targets.items[targets.items.len - 1].anchor,
+        });
     }
 
     var start: usize = 0;
+    var swept_groups: usize = 0;
     while (start < targets.items.len) {
+        // Between groups only, and never before the first one. Stopping mid-group
+        // would be the dangerous version: sweepTargets records each member's
+        // outcome, so a half-swept group could mark members complete for a range
+        // it never read. Guaranteeing one group per cycle rules out the livelock
+        // where a budget below one group's cost makes no progress forever.
+        if (swept_groups > 0 and deadline_ms != null and zsys.milliTimestamp() >= deadline_ms.?) {
+            outcome.deferred = targets.items.len - start;
+            std.log.info("  Discovery backfill: time budget reached after {d} group(s); {d} target(s) stay owed for the next cycle", .{ swept_groups, outcome.deferred });
+            break;
+        }
         const end = @min(start + GROUP_MAX_ADDRESSES, targets.items.len);
-        sweepTargets(self, protocol, client, kind, targets.items[start..end], to_block, &outcome);
+        const group = targets.items[start..end];
+        // Sorted by ceiling, so the last member's is the group's maximum. Using
+        // the max over-sweeps the lower-ceiling members (harmless: those blocks
+        // are already indexed and the inserts conflict-ignore) whereas using the
+        // min would under-sweep the higher ones, which is a permanent gap.
+        sweepTargets(self, protocol, client, kind, group, group[group.len - 1].ceil, &outcome);
+        swept_groups += 1;
         start = end;
     }
 
-    std.log.info("Discovery backfill: {d} {s}(s) — {d} without history, {d} swept in {d} group(s), {d} failed; {d} anchors cached, {d} events, {d} RPC calls, {d}ms", .{
+    std.log.info("Discovery backfill: {d} {s}(s) — {d} without history, {d} swept in {d} group(s), {d} failed, {d} deferred; {d} anchors cached, {d} events, {d} RPC calls, {d}ms", .{
         outcome.total,
         kind.label(),
         outcome.no_history,
         outcome.swept,
         outcome.groups,
         outcome.failed,
+        outcome.deferred,
         outcome.anchors_cached,
         outcome.events,
         outcome.calls,
@@ -917,4 +992,47 @@ test "searchAnchors resolves exact anchors despite a rate-limited probe round" {
     try testing.expect(cooldowns >= 1);
     // The retry answered, so nothing fell back to the floor.
     try testing.expect(anchors[0].? > 11_708_980);
+}
+
+test "sweepWindow: an unknown ceiling falls back to the head, never to nothing" {
+    // 0 is "the join found no known_* row". It MUST widen to the head, because
+    // treating it as a literal ceiling would skip the sweep and leave the init
+    // gap permanently unhealed.
+    try std.testing.expectEqual(@as(?u64, 11_813_278), sweepWindow(11_700_000, 0, 11_813_278));
+    try std.testing.expectEqual(@as(?u64, 500), sweepWindow(500, 0, 500));
+}
+
+test "sweepWindow: a known ceiling caps the sweep and is clamped to the head" {
+    // The ordinary case: sweep only the pre-discovery window.
+    try std.testing.expectEqual(@as(?u64, 11_750_000), sweepWindow(11_708_980, 11_750_000, 11_813_278));
+    // Never past the block the indexer has reached, even if first_seen is ahead
+    // (possible right after a rollback moved the head backwards).
+    try std.testing.expectEqual(@as(?u64, 11_813_278), sweepWindow(11_708_980, 11_900_000, 11_813_278));
+}
+
+test "sweepWindow: a ceiling below the anchor owes nothing" {
+    // Known at (or before) its own deployment block: no window of unseen events.
+    try std.testing.expectEqual(@as(?u64, null), sweepWindow(11_800_000, 11_700_000, 11_813_278));
+    // Boundary: equal is a one-block window and IS owed.
+    try std.testing.expectEqual(@as(?u64, 11_800_000), sweepWindow(11_800_000, 11_800_000, 11_813_278));
+    // A head behind the anchor also owes nothing.
+    try std.testing.expectEqual(@as(?u64, null), sweepWindow(11_800_000, 0, 11_700_000));
+}
+
+test "targetLessThan groups by ceiling first so a group sweeps to its own max" {
+    var ts = [_]Target{
+        .{ .addr = testAddress(1), .anchor = 100, .ceil = 900 },
+        .{ .addr = testAddress(2), .anchor = 500, .ceil = 200 },
+        .{ .addr = testAddress(3), .anchor = 300, .ceil = 200 },
+    };
+    std.mem.sort(Target, &ts, {}, targetLessThan);
+    // Ceiling ascending, anchor breaking ties.
+    try std.testing.expectEqual(@as(u64, 200), ts[0].ceil);
+    try std.testing.expectEqual(@as(u64, 300), ts[0].anchor);
+    try std.testing.expectEqual(@as(u64, 200), ts[1].ceil);
+    try std.testing.expectEqual(@as(u64, 500), ts[1].anchor);
+    try std.testing.expectEqual(@as(u64, 900), ts[2].ceil);
+    // The last member's ceiling is the group maximum, which is what the group
+    // loop sweeps to — using the minimum would under-sweep the others.
+    try std.testing.expectEqual(@as(u64, 900), ts[ts.len - 1].ceil);
 }

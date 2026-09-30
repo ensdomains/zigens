@@ -25,6 +25,27 @@ const unicode = @import("../../utils/unicode.zig");
 const json_utils = @import("../../utils/json.zig");
 const dns = @import("../../utils/dns.zig");
 const record_model = @import("../../storage/resolver_records.zig");
+const keccak = @import("../../utils/keccak.zig");
+
+/// keccak256 of the empty byte string — what an `indexed bytes` topic carries
+/// when the value is empty. It is the one hashed value whose preimage IS known,
+/// and it means the record was cleared.
+const KECCAK_EMPTY = Hash{ .bytes = keccak.keccak256("") };
+
+/// What a single log lets us assert about a record's value.
+///
+/// `indexed` is not part of an event signature hash, so two contracts can emit
+/// the same topic0 while disagreeing on which parameters reach `data`. For
+/// DataChanged both shapes occur in the wild, and this is exactly what they
+/// differ in: whether the value arrives verbatim or only as its keccak256.
+const RecordValue = union(enum) {
+    /// The value arrived verbatim in the payload. Empty means "cleared".
+    plain: []const u8,
+    /// The emitter declared `value` as `indexed`, so the log carries only
+    /// keccak256(value). No preimage is derivable from the log, so the record's
+    /// value cannot be asserted — see storeDataRecord for what is written.
+    hashed: Hash,
+};
 
 const RecordRef = struct {
     id: u256,
@@ -238,27 +259,54 @@ pub fn handleDataUpdated(self: *Indexer, protocol: models.Protocol, resolver: Ad
     const rec = recordFromTopic(log) orelse return;
     const data_values = try abi.decodeValues(log.data, &.{ .string, .bytes }, self.allocator);
     defer abi.freeValues(data_values, self.allocator);
-    try storeDataRecord(self, protocol, resolver, log, rec.key, data_values[0].string, data_values[1].bytes, "DataUpdated", .data_updated, rec.id);
+    try storeDataRecord(self, protocol, resolver, log, rec.key, data_values[0].string, .{ .plain = data_values[1].bytes }, "DataUpdated", .data_updated, rec.id);
 }
 
 /// DataChanged(bytes32 indexed node, string indexed indexedKey, string key, bytes value)
 /// Legacy node-keyed `data(key)` record (PublicResolverV2, older PermissionedResolver).
+///
+/// `indexed` is NOT part of the signature hash, so this one topic0 is emitted by
+/// contracts that disagree on how many of those four parameters reach `data`.
+/// Both live shapes are handled, dispatched on the observable topic count:
+///
+///   3 topics — `node` and `indexedKey` indexed: `data` = (string key, bytes value).
+///   4 topics — `value` indexed as well: `data` = (string key) alone, and
+///              topics[3] = keccak256(value).
+///
+/// Every log this signature has produced on Sepolia (79 logs, 26 distinct
+/// emitters, blocks 9.5M–11.8M) is the 4-topic shape, and all 79 satisfy
+/// keccak256(key) == topics[2]. So a `topics.len != 3` guard rejected every one
+/// of them, while decoding a 4-topic payload against the two-parameter schema
+/// read the key's length word as the value's tail offset, landed mid-word and
+/// took a payload byte as a length — which is how one such log reached an
+/// unchecked add in the codec and stalled a sync.
+///
+/// The 4-topic arm does not assume its layout, it proves it: the key it decodes
+/// must hash to topics[2], the indexed copy. A contract that indexed some other
+/// parameter fails that check and is skipped rather than written under a wrong
+/// key. The 3-topic arm needs no such proof — both key and value are in `data`,
+/// so nothing there is inferred from a topic.
 pub fn handleDataChanged(self: *Indexer, protocol: models.Protocol, resolver: Address, log: rpc.Log) !void {
-    // Exactly 3 topics, not "at least 2". `indexed` is NOT part of the signature
-    // hash, so a contract declaring the same `DataChanged(bytes32,string,string,bytes)`
-    // with THREE indexed parameters emits an identical topic0 while leaving only
-    // one parameter in `data`. Decoding that against the two-parameter schema
-    // below reads the first value's length word as the second value's tail
-    // offset, lands mid-word and takes a payload byte as a length — which is how
-    // one such log reached an unchecked add in the codec and stalled a sync.
-    // The layout of the extra indexed parameter is unknowable from the hash, so
-    // skip rather than guess: a wrong key/value pair is worse than a missing one.
-    if (log.topics.len != 3) return error.InvalidTopicCount;
+    if (log.topics.len != 3 and log.topics.len != 4) return error.InvalidTopicCount;
+    const value_is_indexed = log.topics.len == 4;
     var namehash = log.topics[1];
-    const data_values = try abi.decodeValues(log.data, &.{ .string, .bytes }, self.allocator);
+
+    const data_values = try abi.decodeValues(
+        log.data,
+        if (value_is_indexed) &.{.string} else &.{ .string, .bytes },
+        self.allocator,
+    );
     defer abi.freeValues(data_values, self.allocator);
+    const key = data_values[0].string;
+
+    const value: RecordValue = if (value_is_indexed) blk: {
+        const key_hash = try hash_mod.keccak256(self.allocator, key);
+        if (!key_hash.eql(log.topics[2])) return error.AbiPayloadMismatch;
+        break :blk .{ .hashed = log.topics[3] };
+    } else .{ .plain = data_values[1].bytes };
+
     if (!try utils.resolveNamehash(self, protocol, &namehash, resolver, "DataChanged")) return;
-    try storeDataRecord(self, protocol, resolver, log, namehash, data_values[0].string, data_values[1].bytes, "DataChanged", .data_changed, null);
+    try storeDataRecord(self, protocol, resolver, log, namehash, key, value, "DataChanged", .data_changed, null);
 }
 
 fn storeDataRecord(
@@ -268,7 +316,7 @@ fn storeDataRecord(
     log: rpc.Log,
     row_key: Hash,
     key: []const u8,
-    value: []const u8,
+    value: RecordValue,
     event_name: []const u8,
     event_type: models.EventType,
     record_id: ?u256,
@@ -280,13 +328,48 @@ fn storeDataRecord(
         std.log.warn("{s} key rejected ({any}) at block {d} tx {s} log_index {d} — event skipped", .{ event_name, err, log.block_number, log.transaction_hash.toHexBuf(&tx_buf), log.log_index });
         return;
     };
-    const value_hex = try bytesToHexAlloc(self.allocator, value);
+    const value_hex = switch (value) {
+        .plain => |bytes| try bytesToHexAlloc(self.allocator, bytes),
+        .hashed => |h| try h.toHex(self.allocator),
+    };
     defer self.allocator.free(value_hex);
 
-    if (value.len == 0) {
+    // Three outcomes, and the middle one is why RecordValue exists.
+    //
+    //  - a verbatim value → the row asserts it;
+    //  - cleared, either a verbatim empty value or the indexed keccak256("") →
+    //    delete, the record has no value;
+    //  - an indexed value that is NOT the empty one → the plaintext is not
+    //    derivable from the log. `resolver_datas.value` holds the record's
+    //    current plaintext (TEXT NOT NULL, one row per protocol/resolver/
+    //    namehash/key), so there is nothing truthful to put in it: "" already
+    //    means cleared, and the keccak would read back as a 32-byte value the
+    //    record does not have. Keeping a pre-existing row is worse still — the
+    //    chain says the value changed, so a stored one is now known to be
+    //    stale. The row goes, and the change is kept in event history where the
+    //    hash travels under its own name (`valueHash`, never `value`).
+    const cleared = switch (value) {
+        .plain => |bytes| bytes.len == 0,
+        .hashed => |h| h.eql(KECCAK_EMPTY),
+    };
+    const can_assert_value = value == .plain;
+    if (cleared) {
+        // House convention for a clear, shared with every other record kind in this
+        // file: warn and carry on. The stored value was correct at some block, so a
+        // failed delete leaves stale-but-once-true data that a resync heals.
         self.database.deleteResolverData(protocol, row_key, resolver, clean_key) catch |err| {
             std.log.warn("Failed to delete cleared resolver data: {}", .{err});
         };
+    } else if (!can_assert_value) {
+        var tx_buf: [66]u8 = undefined;
+        std.log.warn("{s}: `value` is indexed on this emitter, so only keccak256(value) is on chain — key '{s}' keeps no stored value (block {d} tx {s} log_index {d}); the change is recorded in event history", .{ event_name, clean_key, log.block_number, log.transaction_hash.toHexBuf(&tx_buf), log.log_index });
+        // Deliberately NOT best-effort, unlike the clear above. This delete is the
+        // only thing between a reader and a value the chain has explicitly
+        // superseded, and "no row is the truthful representation" is only true if it
+        // actually happened. Swallowing the error would commit the batch and advance
+        // the sync cursor past the log, serving a known-wrong value as current until
+        // a full resync. Failing here retries it, exactly as a failed store does.
+        try self.database.deleteResolverData(protocol, row_key, resolver, clean_key);
     } else {
         try self.database.storeResolverData(row_key, resolver, clean_key, value_hex, protocol, log.block_number, log.transaction_hash, try self.getBlockTimestamp(protocol, log.block_number, log.block_timestamp));
     }
@@ -297,10 +380,18 @@ fn storeDataRecord(
     defer self.allocator.free(key_hex);
     const escaped_key = try json_utils.escapeString(self.allocator, clean_key);
     defer self.allocator.free(escaped_key);
+    // A hash is published under `valueHash`, never `value`: every reader of
+    // these rows (the API's event value field, replay, at-block reconstruction)
+    // treats `value` as the record's plaintext, and a keccak sitting in that
+    // field would be served as if it were one.
+    const value_field = switch (value) {
+        .plain => "value",
+        .hashed => "valueHash",
+    };
     const event_data = if (record_id) |id|
-        try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\",\"key\":\"{s}\",\"value\":\"{s}\"}}", .{ resolver_hex, id, escaped_key, value_hex })
+        try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\",\"key\":\"{s}\",\"{s}\":\"{s}\"}}", .{ resolver_hex, id, escaped_key, value_field, value_hex })
     else
-        try std.fmt.allocPrint(self.allocator, "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"key\":\"{s}\",\"value\":\"{s}\"}}", .{ key_hex, resolver_hex, escaped_key, value_hex });
+        try std.fmt.allocPrint(self.allocator, "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"key\":\"{s}\",\"{s}\":\"{s}\"}}", .{ key_hex, resolver_hex, escaped_key, value_field, value_hex });
     const domain_name = if (record_id == null) self.getNameFromNamehash(row_key) else null;
     try utils.emitEvent(self, protocol, log, event_type, domain_name, row_key, event_data);
 }
@@ -732,27 +823,98 @@ test "record handlers: ResourceArgument and legacy DataChanged" {
     defer db.allocator.free(v);
     try testing.expectEqualStrings("0x01", v);
 
-    // The production shape that stalled a sync. The SAME DataChanged signature
-    // hash, emitted by a contract that marks three parameters `indexed` — so a
-    // single value sits in `data` instead of two. `indexed` is not part of the
-    // topic0 hash, so it lands in this handler regardless, and decoding it as two
-    // parameters read the first value's length word as the second's tail offset.
-    // Skipped, not guessed: the extra indexed parameter's identity is not
-    // recoverable, and a wrong key/value pair is worse than a missing one.
-    const three_indexed = try rig.log(
+    // The production shape that stalled a sync: the SAME DataChanged signature
+    // hash from a contract that marks `value` indexed too, so ONE value sits in
+    // `data` instead of two and topics[3] carries keccak256(value). `indexed` is
+    // not part of topic0, so it lands in this handler regardless, and decoding it
+    // as two parameters read the key's length word as the value's tail offset.
+    // This is the ONLY shape this signature has produced on Sepolia (79 logs,
+    // 26 emitters), so it must be indexed, not rejected.
+    const pkey = "knowledge.proposal.acme-dev.eth";
+    const pkey_hash = try hash_mod.keccak256(a, pkey);
+    var value_hash: [32]u8 = undefined;
+    std.crypto.hash.sha3.Keccak256.hash(&[_]u8{ 0x07, 0x07 }, &value_hash, .{});
+    try handleDataChanged(idx, .v2, TEST_LEGACY, try rig.log(
         TEST_LEGACY,
-        &.{ wordHash(0), node, wordHash(0), wordHash(0) },
-        try abiEncode(a, &.{.{ .dyn = "knowledge.proposal.acme-dev.eth" }}),
-    );
-    try testing.expectError(error.InvalidTopicCount, handleDataChanged(idx, .v2, TEST_LEGACY, three_indexed));
-    // ...and the error must be on the skip list, or dispatch aborts the batch
-    // instead of dropping the single event.
+        &.{ wordHash(0), node, pkey_hash, Hash{ .bytes = value_hash } },
+        try abiEncode(a, &.{.{ .dyn = pkey }}),
+    ));
+    // No value is stored: only keccak256(value) was ever on chain, and
+    // resolver_datas.value is the record's plaintext. Writing the hash there
+    // would be served as the value; writing "" would read back as "cleared".
+    try testing.expectEqual(@as(?[]u8, null), try db.getDataRecord(TEST_LEGACY, node, pkey));
+    // The change is not lost, though — it is in event history, with the hash
+    // under its own field name so no reader mistakes it for a value.
+    {
+        const nh_hex = try node.toHex(a);
+        const events = try db.getEventsByNamehash(nh_hex, 100);
+        defer {
+            for (events) |*e| e.deinit(db.allocator);
+            db.allocator.free(events);
+        }
+        var saw = false;
+        for (events) |e| {
+            if (e.event_type != .data_changed) continue;
+            if (std.mem.indexOf(u8, e.data, pkey) == null) continue;
+            saw = true;
+            try testing.expect(std.mem.indexOf(u8, e.data, "\"valueHash\":") != null);
+            try testing.expect(std.mem.indexOf(u8, e.data, "\"value\":") == null);
+        }
+        try testing.expect(saw);
+    }
+
+    // A value change we cannot read must not leave a previous value standing:
+    // the chain says the record changed, so a stored plaintext is now known to be
+    // stale. "blob" was written verbatim above; re-emitting it with an indexed
+    // value drops the row rather than keeping the old 0x01.
+    var blob_key_hash: [32]u8 = undefined;
+    std.crypto.hash.sha3.Keccak256.hash("blob", &blob_key_hash, .{});
+    try handleDataChanged(idx, .v2, TEST_LEGACY, try rig.log(
+        TEST_LEGACY,
+        &.{ wordHash(0), node, Hash{ .bytes = blob_key_hash }, Hash{ .bytes = value_hash } },
+        try abiEncode(a, &.{.{ .dyn = "blob" }}),
+    ));
+    try testing.expectEqual(@as(?[]u8, null), try db.getDataRecord(TEST_LEGACY, node, "blob"));
+
+    // keccak256("") is the one hashed value whose preimage IS known: it means
+    // cleared, and takes the ordinary delete path.
+    try handleDataChanged(idx, .v2, TEST_LEGACY, try rig.log(
+        TEST_LEGACY,
+        &.{ wordHash(0), node, Hash{ .bytes = blob_key_hash }, KECCAK_EMPTY },
+        try abiEncode(a, &.{.{ .dyn = "blob" }}),
+    ));
+    try testing.expectEqual(@as(?[]u8, null), try db.getDataRecord(TEST_LEGACY, node, "blob"));
+
+    // The 4-topic arm PROVES its layout instead of assuming it: the decoded key
+    // must hash to topics[2], the indexed copy. A contract that indexed some
+    // other parameter fails here and is skipped, never written under a wrong key.
+    try testing.expectError(error.AbiPayloadMismatch, handleDataChanged(idx, .v2, TEST_LEGACY, try rig.log(
+        TEST_LEGACY,
+        &.{ wordHash(0), node, wordHash(0xdeadbeef), Hash{ .bytes = value_hash } },
+        try abiEncode(a, &.{.{ .dyn = pkey }}),
+    )));
+    // Neither shape is 2 or 5 topics; those stay rejected outright.
+    try testing.expectError(error.InvalidTopicCount, handleDataChanged(idx, .v2, TEST_LEGACY, try rig.log(
+        TEST_LEGACY,
+        &.{ wordHash(0), node },
+        try abiEncode(a, &.{.{ .dyn = pkey }}),
+    )));
+    try testing.expectError(error.InvalidTopicCount, handleDataChanged(idx, .v2, TEST_LEGACY, try rig.log(
+        TEST_LEGACY,
+        &.{ wordHash(0), node, pkey_hash, Hash{ .bytes = value_hash }, wordHash(1) },
+        try abiEncode(a, &.{.{ .dyn = pkey }}),
+    )));
+    // ...and every rejection must be on the skip list, or dispatch aborts the
+    // whole batch instead of dropping the single event.
     try testing.expect(utils.isMalformedEventError(error.InvalidTopicCount));
     try testing.expect(utils.isMalformedEventError(error.AbiPayloadMismatch));
+
+    // "blob" was stored then dropped, and the indexed-value key never stored a
+    // value, so no data row survives on this node.
     const keys = try db.getDataKeys(TEST_LEGACY, node);
     defer {
         for (keys) |k| db.allocator.free(k);
         db.allocator.free(keys);
     }
-    try testing.expectEqual(@as(usize, 1), keys.len);
+    try testing.expectEqual(@as(usize, 0), keys.len);
 }

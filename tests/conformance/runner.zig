@@ -129,7 +129,10 @@ fn seedFixture(db: *Database, a: std.mem.Allocator) !void {
         .{ .et = .label_registered, .blk = 200, .li = 9000, .contract = ab_registry, .data = "{\"name\":\"alice.eth\",\"tokenId\":4242,\"owner\":\"0x1111111111111111111111111111111111111111\",\"expiry\":1950000000,\"registry\":\"0x7777777777777777777777777777777777777777\"}" },
         .{ .et = .resolver_updated, .blk = 210, .li = 9001, .contract = ab_registry, .data = "{\"tokenId\":4242,\"resolver\":\"0xcccccccccccccccccccccccccccccccccccccccc\"}" },
         .{ .et = .address_changed, .blk = 220, .li = 9002, .contract = resolver, .data = "{\"resolver\":\"0xcccccccccccccccccccccccccccccccccccccccc\",\"coinType\":60,\"address\":\"0xdddddddddddddddddddddddddddddddddddddddd\"}" },
-        .{ .et = .transfer, .blk = 230, .li = 9003, .contract = ab_registry, .data = "{\"to\":\"0x2222222222222222222222222222222222222222\"}" },
+        // Live's Transfer payload always carries the token id, and ownership is keyed
+        // on (id, emitting registry) — same as the ResolverUpdated above. Without the
+        // id this was a shape the indexer never emits.
+        .{ .et = .transfer, .blk = 230, .li = 9003, .contract = ab_registry, .data = "{\"to\":\"0x2222222222222222222222222222222222222222\",\"id\":4242,\"value\":1}" },
     };
     for (ab_events) |e| {
         try db.insertEvent(.{
