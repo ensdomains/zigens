@@ -224,7 +224,11 @@ pub const Indexer = struct {
             .shared_http_client = http_client,
             .webhook_manager = webhook_manager,
             .should_stop = std.atomic.Value(bool).init(false),
-            .rate_limiter = RateLimiter.init(cfg.rpc_rate_limit_per_second, cfg.rpc_rate_limit_per_second),
+            .rate_limiter = blk_rl: {
+                var rl = RateLimiter.init(cfg.rpc_rate_limit_per_second, cfg.rpc_rate_limit_per_second);
+                rl.backpressure_enabled = cfg.rpc_backpressure_enabled;
+                break :blk_rl rl;
+            },
             .blocks_since_checkpoint = 0,
             .initial_sync_complete = std.atomic.Value(bool).init(false),
             .v1_network_health = NetworkHealth.init(allocator, cfg.rpc_url, constants.Timing.network_check_interval_ms),
@@ -328,7 +332,11 @@ pub const Indexer = struct {
             .shared_http_client = http_client,
             .webhook_manager = webhook_manager,
             .should_stop = std.atomic.Value(bool).init(false),
-            .rate_limiter = RateLimiter.init(cfg.rpc_rate_limit_per_second, cfg.rpc_rate_limit_per_second),
+            .rate_limiter = blk_rl: {
+                var rl = RateLimiter.init(cfg.rpc_rate_limit_per_second, cfg.rpc_rate_limit_per_second);
+                rl.backpressure_enabled = cfg.rpc_backpressure_enabled;
+                break :blk_rl rl;
+            },
             .blocks_since_checkpoint = 0,
             .initial_sync_complete = std.atomic.Value(bool).init(false),
             .v1_network_health = NetworkHealth.init(allocator, cfg.rpc_url, constants.Timing.network_check_interval_ms),
