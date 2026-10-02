@@ -17,6 +17,7 @@ const heal_targets = @import("heal_targets.zig");
 /// Deleted by `(protocol, block_number > N)` — insert-only logs + derived tables alike.
 pub const reorg_rollback_by_block_number = [_][]const u8{
     "events",
+    "event_attributions",
     "block_hashes",
     "orphaned_registrations",
     "resolver_addresses",
@@ -67,6 +68,7 @@ const reorg_capture_waived = [_][]const u8{
     // pre-N event row keeps the resolved value in those two derived columns. See
     // [[events-placeholder-patch-reorg-waiver]].
     "events",
+    "event_attributions", // insert-only companion rows of `events` (one per name a shared event belongs to)
     "block_hashes", // append-only block-hash chain (insert + retention-prune only)
     "name_history", // append-only change log (INSERT only; no in-place mutation)
     "resolvers", // resolver entity table: insert-only (set_block, INSERT OR IGNORE keeps first); attribute records live in the PROTECTED resolver_* tables
@@ -660,6 +662,7 @@ pub fn deleteDataAfterBlock(db: *Database, block_number: u64) !void {
         .{ .name = "names", .block_col = "created_block" },
         .{ .name = "registries", .block_col = "created_block" },
         .{ .name = "events", .block_col = "block_number" },
+        .{ .name = "event_attributions", .block_col = "block_number" },
         .{ .name = "block_hashes", .block_col = "block_number" },
         .{ .name = "orphaned_registrations", .block_col = "block_number" },
         .{ .name = "approvals", .block_col = "block_number" },

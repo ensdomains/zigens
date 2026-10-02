@@ -25,6 +25,7 @@ const unicode = @import("../../utils/unicode.zig");
 const json_utils = @import("../../utils/json.zig");
 const dns = @import("../../utils/dns.zig");
 const record_model = @import("../../storage/resolver_records.zig");
+const events_storage = @import("../../storage/events.zig");
 const keccak = @import("../../utils/keccak.zig");
 
 /// keccak256 of the empty byte string — what an `indexed bytes` topic carries
@@ -114,7 +115,9 @@ fn recordAttributions(self: *Indexer, protocol: models.Protocol, resolver: Addre
 
 /// Emit a record-model event under the name it belongs to. A record linked to
 /// exactly one eligible name carries that name; a record with no eligible name
-/// carries none. Takes ownership of `event_data`.
+/// carries none. A record shared by several is one nameless event row plus an
+/// event_attributions row per name, so it keeps a single identity and still
+/// appears in each name's history. Takes ownership of `event_data`.
 fn emitRecordEvent(
     self: *Indexer,
     protocol: models.Protocol,
@@ -136,6 +139,25 @@ fn emitRecordEvent(
         return utils.emitEvent(self, protocol, log, event_type, name, attributed[0].namehash, event_data);
     }
     try utils.emitEvent(self, protocol, log, event_type, null, null, event_data);
+    if (attributed.len > 1) try storeEventAttributions(self, protocol, log, attributed);
+}
+
+fn storeEventAttributions(self: *Indexer, protocol: models.Protocol, log: rpc.Log, attributed: []const AttributedName) !void {
+    const rows = try self.allocator.alloc(events_storage.EventAttribution, attributed.len);
+    defer self.allocator.free(rows);
+    for (attributed, rows) |a, *row| row.* = .{
+        .protocol = protocol,
+        .tx_hash = log.transaction_hash,
+        .log_index = log.log_index,
+        .block_number = log.block_number,
+        .namehash = a.namehash,
+        .name = a.name,
+    };
+    if (self.write_buffer.active) {
+        for (rows) |row| try self.write_buffer.addEventAttribution(row);
+    } else {
+        try self.database.insertEventAttributions(rows);
+    }
 }
 
 /// Emit an event that addresses a name by its node (`Linked`, `ApprovalUpdated`)
@@ -1196,4 +1218,115 @@ test "getLatestNameByNamehash ignores another resolver's record with the same id
     const primary = (try db.getLatestNameByNamehash(carol)).?;
     defer db.allocator.free(primary);
     try testing.expectEqualStrings("carol.eth", primary);
+}
+
+fn countRows(db: *db_module.Database, sql: []const u8) !i64 {
+    var q = try db_module.Query.init(db, sql);
+    defer q.deinit();
+    try testing.expect(try q.step());
+    return q.getInt64(0);
+}
+
+fn findEvent(events: []const models.Event, event_type: models.EventType) ?models.Event {
+    for (events) |e| if (e.event_type == event_type) return e;
+    return null;
+}
+
+test "record events: a record shared by several names is in each name's history" {
+    const rig = (try TestRig.init()) orelse return;
+    defer rig.deinit();
+    const a = rig.alloc();
+    const idx = &rig.idx;
+    const db = rig.database;
+    const carol = try hash_mod.namehash(a, "carol.eth");
+    const erin = try hash_mod.namehash(a, "erin.eth");
+    try idx.insertName(testName("carol.eth", "carol", carol, TEST_RESOLVER));
+    try idx.insertName(testName("erin.eth", "erin", erin, TEST_RESOLVER));
+
+    try handleLinked(idx, .v2, TEST_RESOLVER, try linkLog(rig, TEST_RESOLVER, 1, carol, "carol.eth"));
+    const carol_link = rig.log_index;
+    try handleLinked(idx, .v2, TEST_RESOLVER, try linkLog(rig, TEST_RESOLVER, 1, erin, "erin.eth"));
+    try handleTextUpdated(idx, .v2, TEST_RESOLVER, try textLog(rig, TEST_RESOLVER, 1, "avatar", "https://shared"));
+    const shared = rig.log_index;
+
+    // One event row, owned by no single name, plus one attribution per name.
+    try expectUnattributed(rig, shared);
+    try testing.expectEqual(@as(i64, 2), try countRows(db, "SELECT COUNT(*) FROM event_attributions"));
+
+    // Each name's history has it, under that name.
+    for ([_]struct { nh: Hash, name: []const u8 }{ .{ .nh = carol, .name = "carol.eth" }, .{ .nh = erin, .name = "erin.eth" } }) |n| {
+        const nh_hex = try n.nh.toHex(a);
+        const history = try db.getEventsByNamehash(nh_hex, 100);
+        defer {
+            for (history) |*e| e.deinit(db.allocator);
+            db.allocator.free(history);
+        }
+        try testing.expectEqual(@as(usize, 2), history.len);
+        const text = findEvent(history, .text_updated) orelse return error.TestExpectedEvent;
+        try testing.expect(text.namehash.?.eql(n.nh));
+        try testing.expectEqualStrings(n.name, text.name.?);
+        try testing.expectEqual(@as(usize, 2), try db.getEventCount(.{ .namehash = nh_hex }));
+        try testing.expectEqual(@as(usize, 2), try db.countEventsByNamehash(n.nh));
+        try testing.expectEqual(@as(usize, 1), try db.getEventCount(.{ .namehash = nh_hex, .event_type = "TextUpdated" }));
+        const by_name = try db.getEventsByDomain(n.name, 100);
+        defer {
+            for (by_name) |*e| e.deinit(db.allocator);
+            db.allocator.free(by_name);
+        }
+        try testing.expect(findEvent(by_name, .text_updated) != null);
+    }
+
+    // Reads that do not pin a name see the event once.
+    try testing.expectEqual(@as(usize, 1), try db.getEventCount(.{ .event_type = "TextUpdated" }));
+
+    // Cursor pagination over a name's history counts the shared row once.
+    const carol_hex = try carol.toHex(a);
+    const tx_hex = try (Hash{ .bytes = [_]u8{0xAB} ** 32 }).toHex(a);
+    try testing.expectEqual(@as(u32, 1), try db.countEventsBeforeCursor(tx_hex, carol_link, .desc, .{ .namehash = carol_hex }));
+
+    // The batched per-domain loaders agree with the point reads.
+    const page = try db.getEventsForNamehashesPage(&.{ carol, erin }, .{}, a);
+    var shared_rows: usize = 0;
+    for (page) |e| {
+        if (e.event_type != .text_updated) continue;
+        shared_rows += 1;
+        try testing.expect(e.namehash.?.eql(carol) or e.namehash.?.eql(erin));
+    }
+    try testing.expectEqual(@as(usize, 2), shared_rows);
+    const counts = try events_storage.countEventsForNamehashes(db, &.{ carol, erin }, a);
+    try testing.expectEqual(@as(usize, 2), counts.len);
+    for (counts) |c| try testing.expectEqual(@as(u64, 2), c.count);
+
+    // A reorg below the write drops the attributions with the event.
+    try db.rollbackToBlock(.v2, 499);
+    try testing.expectEqual(@as(i64, 0), try countRows(db, "SELECT COUNT(*) FROM event_attributions"));
+}
+
+test "record events: shared attributions survive a buffered bulk-sync batch" {
+    const rig = (try TestRig.init()) orelse return;
+    defer rig.deinit();
+    const a = rig.alloc();
+    const idx = &rig.idx;
+    const db = rig.database;
+    const dora = try hash_mod.namehash(a, "dora.eth");
+    const finn = try hash_mod.namehash(a, "finn.eth");
+
+    idx.write_buffer.active = true;
+    idx.reorg_arm = false;
+    db.names_barrier = .{ .ctx = idx, .flush = Indexer.namesBarrierFlush };
+    defer db.names_barrier = null;
+
+    try idx.insertName(testName("dora.eth", "dora", dora, TEST_RESOLVER));
+    try idx.insertName(testName("finn.eth", "finn", finn, TEST_RESOLVER));
+    try handleLinked(idx, .v2, TEST_RESOLVER, try linkLog(rig, TEST_RESOLVER, 1, dora, "dora.eth"));
+    try handleLinked(idx, .v2, TEST_RESOLVER, try linkLog(rig, TEST_RESOLVER, 1, finn, "finn.eth"));
+    try handleTextUpdated(idx, .v2, TEST_RESOLVER, try textLog(rig, TEST_RESOLVER, 1, "avatar", "https://shared"));
+    try testing.expectEqual(@as(i64, 0), try countRows(db, "SELECT COUNT(*) FROM event_attributions"));
+
+    idx.write_buffer.active = false;
+    try idx.write_buffer.flush(db);
+    try expectUnattributed(rig, rig.log_index);
+    try testing.expectEqual(@as(i64, 2), try countRows(db, "SELECT COUNT(*) FROM event_attributions"));
+    const dora_hex = try dora.toHex(a);
+    try testing.expectEqual(@as(usize, 1), try db.getEventCount(.{ .namehash = dora_hex, .event_type = "TextUpdated" }));
 }

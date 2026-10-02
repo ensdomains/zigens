@@ -1556,6 +1556,7 @@ const RECONCILE_TABLES = [_][]const u8{
     "resolver_dns_records", "resolver_dns_zonehashes", "resolver_authorisations", "reverse_records",
     "approvals",            "eac_roles",               "accounts",                "v1_controllers",
     "name_history",         "resolver_datas",          "resolver_links",          "resolver_named_resources",
+    "event_attributions",
 };
 
 // Volatile columns excluded from the content comparison: the autoincrement id (insertion

@@ -608,6 +608,8 @@ pub const Database = struct {
     // Events module
     pub const insertEvent = events.insertEvent;
     pub const insertEventsBatch = events.insertEventsBatch;
+    pub const EventAttribution = events.EventAttribution;
+    pub const insertEventAttributions = events.insertEventAttributions;
     pub const repairPlaceholderEvents = events.repairPlaceholderEvents;
     pub const insertEventIfNew = events.insertEventIfNew;
     pub const getRecentEvents = events.getRecentEvents;
