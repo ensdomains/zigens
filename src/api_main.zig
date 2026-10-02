@@ -124,6 +124,15 @@ pub fn main(init: std.process.Init) !void {
     var server = try api.Server.init(allocator, io, &db_pool, webhook_path, cfg.api_port, cfg.graphql_max_depth, cfg.graphql_max_cost, cfg.metrics_enabled, cfg.rate_limit_per_second, cfg.webhook_admin_username, cfg.webhook_admin_password, cfg.trusted_proxy_hops, cfg.request_timeout_ms, cfg.max_concurrent_connections, cfg.internal_admin_token, cfg.internal_rate_limit_per_second, cfg.webhooks_allow_unauthenticated);
     defer server.deinit();
     server.mcp_enabled = cfg.mcp_enabled;
+    server.mcp_allowed_origins = cfg.mcp_allowed_origins;
+    // Say so at boot. An unauthenticated endpoint that can be switched on by one
+    // env var should be visible in the startup log of the process serving it —
+    // otherwise the only way to learn it is live is to probe for it.
+    if (cfg.mcp_enabled) {
+        std.log.info("MCP agent endpoint ENABLED at POST /mcp (unauthenticated, read-only). Browser origins: {s}", .{
+            cfg.mcp_allowed_origins orelse "none allowed (set MCP_ALLOWED_ORIGINS; non-browser clients are unaffected)",
+        });
+    }
     server.graphql_handler.slow_query_threshold_us = @as(u64, cfg.graphql_slow_query_ms) * std.time.us_per_ms;
 
     // Opt-in on-chain resolution (default off). Covers primary-name verification (05)

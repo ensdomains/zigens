@@ -110,7 +110,9 @@ Set via a `.env` file (see [`.env.example`](.env.example) for the full list). Co
 | `WEBHOOKS_ALLOW_UNAUTHENTICATED` | Allow the webhook admin API with no credentials (local dev) | `false` |
 | `FINALITY_ENABLED` | Track chain safe/finalized blocks + expose finality | `false` |
 | `RESOLVE_LIVE_ENABLED` / `RESOLVE_CCIP_ENABLED` | Opt-in live on-chain resolution / CCIP-Read (CCIP requires live) | `false` |
-| `MCP_ENABLED` | MCP agent endpoint at `POST /mcp` (read-only, same limits as GraphQL) | `false` |
+| `MCP_ENABLED` | MCP agent endpoint at `POST /mcp` (read-only, unauthenticated, same limits as GraphQL) | `false` |
+| `MCP_ALLOWED_ORIGINS` | Browser origins allowed to call `POST /mcp` (CLI/agent clients send no `Origin` and are unaffected) | _none_ |
+| `RPC_BACKPRESSURE_ENABLED` | Back off outbound RPC while the provider throttles | `true` |
 | `PRIMARY_VERIFY_ENABLED` | ENSIP-3 primary-name verification field + `/internal/verify-primary` | `false` |
 
 **Authentication is fail-closed.** The webhook admin API (`/api/webhooks/*`) requires

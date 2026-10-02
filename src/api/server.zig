@@ -89,6 +89,7 @@ pub const Server = struct {
     /// MCP agent endpoint gate (MCP_ENABLED). Set by api_main after init;
     /// default off so nothing changes unless explicitly opted in.
     mcp_enabled: bool = false,
+    mcp_allowed_origins: ?[]const u8 = null,
     /// On-chain resolution state; null unless primary-name verification is enabled
     /// via `enableResolution`. When null the server behaves exactly as before.
     resolve: ?ResolveState,
@@ -336,13 +337,13 @@ pub const Server = struct {
             }
         }
 
-        // Find end of headers
-        const header_end_crlf = std.mem.indexOf(u8, header_data, "\r\n\r\n");
-        const header_end_lf = std.mem.indexOf(u8, header_data, "\n\n");
-        const header_end = if (header_end_crlf) |pos| pos else if (header_end_lf) |pos| pos else {
-            return; // No complete headers found
-        };
-        const body_offset: usize = if (header_end_crlf != null) 4 else 2;
+        // Find end of headers. Shared with every handler that extracts a body
+        // (http_util.requestBody) so the two cannot compute different offsets —
+        // they once did, and the handlers' hard-coded +4 aborted the process on
+        // an LF-framed request.
+        const he = http_util.headerEnd(header_data) orelse return; // No complete headers found
+        const header_end = he.end;
+        const body_offset: usize = he.body_start - he.end;
 
         // Determine the body length from the parsed headers, rejecting framing we
         // do not safely support (chunked, Content-Length + Transfer-Encoding,
@@ -425,13 +426,14 @@ pub const Server = struct {
 
         // Route request
         if (std.mem.startsWith(u8, path, "/mcp")) {
-            // MCP agent endpoint (see docs/mcp-agent-endpoint-design.md).
-            if (!self.mcp_enabled) {
-                try self.sendNotFound(conn);
-            } else if (std.mem.eql(u8, method, "POST")) {
-                try self.handleMcp(conn, request);
-            } else {
-                try self.sendBadRequest(conn, "MCP is POST-only (stateless Streamable HTTP)");
+            // MCP agent endpoint: stateless Streamable HTTP, POST-only (no SSE
+            // stream here, so every other method answers 405 per the spec).
+            switch (mcp_mod.route(self.mcp_enabled, method, request, self.mcp_allowed_origins)) {
+                .disabled => try self.sendNotFound(conn),
+                .origin_rejected => try self.sendForbidden(conn, "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"origin not allowed; a browser origin must be listed in MCP_ALLOWED_ORIGINS (non-browser clients send no Origin and are unaffected)\"}}"),
+                .method_not_allowed => try self.sendMethodNotAllowed(conn, "POST, OPTIONS", "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"MCP is POST-only (stateless Streamable HTTP; no SSE stream at this endpoint)\"}}"),
+                .bad_protocol_version => try self.sendJsonResponse(conn, 400, "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"unsupported MCP-Protocol-Version; this server speaks 2025-06-18, 2025-03-26 and 2024-11-05\"}}"),
+                .handle => try self.handleMcp(conn, request),
             }
         } else if (std.mem.startsWith(u8, path, "/graphql")) {
             // Handle GraphQL queries (both GET and POST)
@@ -550,6 +552,8 @@ pub const Server = struct {
     pub const sendRequestError = api_responses.sendRequestError;
     pub const sendRateLimited = api_responses.sendRateLimited;
     pub const sendServiceUnavailable = api_responses.sendServiceUnavailable;
+    pub const sendForbidden = api_responses.sendForbidden;
+    pub const sendMethodNotAllowed = api_responses.sendMethodNotAllowed;
     pub const sendCorsPreflightResponse = api_responses.sendCorsPreflightResponse;
     pub const sendUnauthorized = api_responses.sendUnauthorized;
 

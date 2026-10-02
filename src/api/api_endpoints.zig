@@ -675,11 +675,9 @@ pub fn handleGraphQLQuery(self: *Server, conn: http_util.Conn, request: []const 
 
     // Extract GraphQL query from POST body
     // Find the body after double newline
-    const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse std.mem.indexOf(u8, request, "\n\n") orelse {
+    const body = http_util.requestBody(request) orelse {
         return try self.sendRequestError(conn, "Invalid request format", strict);
     };
-
-    const body = request[body_start + 4 ..];
 
     // Parse JSON body to extract query and variables
     const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {

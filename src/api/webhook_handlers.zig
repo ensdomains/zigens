@@ -207,10 +207,9 @@ pub fn handleCreateWebhook(self: *Server, conn: http_util.Conn, request: []const
     }
 
     // Extract JSON body
-    const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse std.mem.indexOf(u8, request, "\n\n") orelse {
+    const body = http_util.requestBody(request) orelse {
         return try self.sendBadRequest(conn, "Invalid request format");
     };
-    const body = request[body_start + 4 ..];
 
     // Parse JSON body
     const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {
@@ -321,10 +320,9 @@ pub fn handleUpdateWebhook(self: *Server, conn: http_util.Conn, webhook_id: u64,
     }
 
     // Extract JSON body
-    const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse std.mem.indexOf(u8, request, "\n\n") orelse {
+    const body = http_util.requestBody(request) orelse {
         return try self.sendBadRequest(conn, "Invalid request format");
     };
-    const body = request[body_start + 4 ..];
 
     // Parse JSON body
     const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {

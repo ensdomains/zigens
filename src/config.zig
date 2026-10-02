@@ -42,8 +42,18 @@ pub const Config = struct {
     /// direct writes.
     v2_event_buffer: bool = true,
     /// MCP agent endpoint on the API server (MCP_ENABLED, default off).
-    /// POST /mcp — stateless Streamable HTTP; see docs/mcp-agent-endpoint-design.md.
+    /// POST /mcp — stateless Streamable HTTP, read-only, off unless set.
     mcp_enabled: bool = false,
+    /// Comma-separated `Origin` allow-list for POST /mcp. Unset means NO
+    /// restriction — enabling the endpoint must not silently start rejecting a
+    /// deployment's existing callers. A request with no `Origin` header is always
+    /// allowed, since only browsers send one; the list exists to blunt DNS
+    /// rebinding from a hostile page, not to authenticate clients.
+    mcp_allowed_origins: ?[]const u8 = null,
+    /// Halve the RPC rate when the provider throttles, recovering once it goes
+    /// quiet (RPC_BACKPRESSURE_ENABLED, default on). Off restores the previous
+    /// behaviour exactly: the configured rate is the only input.
+    rpc_backpressure_enabled: bool = true,
     /// Prefetch names rows per ordered dispatch so the ResolverUpdated storm
     /// is served from memory instead of per-event point lookups
     /// (NAME_PREFETCH, default on). Ops escape hatch: 0 restores per-event
@@ -199,8 +209,13 @@ pub const Config = struct {
             .v2_event_buffer = env_mod.getEnvBool(&env_map, "V2_EVENT_BUFFER", true),
             .name_prefetch = env_mod.getEnvBool(&env_map, "NAME_PREFETCH", true),
             .mcp_enabled = env_mod.getEnvBool(&env_map, "MCP_ENABLED", false),
+            .mcp_allowed_origins = blk: {
+                const v = env_mod.getEnv(&env_map, "MCP_ALLOWED_ORIGINS", "");
+                if (v.len == 0) break :blk null else break :blk try allocator.dupe(u8, v);
+            },
             .rate_limit_per_second = env_mod.getEnvInt(&env_map, u32, "RATE_LIMIT_PER_SECOND", 15),
             .rpc_rate_limit_per_second = env_mod.getEnvInt(&env_map, u32, "RPC_RATE_LIMIT_PER_SECOND", env_mod.getEnvInt(&env_map, u32, "RATE_LIMIT_PER_SECOND", 15)),
+            .rpc_backpressure_enabled = env_mod.getEnvBool(&env_map, "RPC_BACKPRESSURE_ENABLED", true),
             .rpc_max_batch_requests = env_mod.getEnvInt(&env_map, u32, "RPC_MAX_BATCH_REQUESTS", 0),
             .trusted_proxy_hops = env_mod.getEnvInt(&env_map, u32, "TRUSTED_PROXY_HOPS", 0),
             .request_timeout_ms = env_mod.getEnvInt(&env_map, u32, "REQUEST_TIMEOUT_MS", 10000),
@@ -291,6 +306,9 @@ pub const Config = struct {
         }
         if (self.internal_admin_token) |tok| {
             self.allocator.free(tok);
+        }
+        if (self.mcp_allowed_origins) |origins| {
+            self.allocator.free(origins);
         }
     }
 
