@@ -153,26 +153,26 @@ fn sepoliaAddresses() ContractAddresses {
         .name_wrapper = Address.fromHex("0x0635513f179D50A207757E05759CbD106d7dFcE8") catch unreachable,
 
         // V2 Sepolia Contracts (ENSv2 deployment)
-        .root_registry = Address.fromHex("0x9703DBD26dAB89504490994138cF2c575251a9cE") catch unreachable,
-        .eth_renewer_v1 = Address.fromHex("0xd06e726e9bD8ac0f33A2a45F4Cc28fe10d656a36") catch unreachable,
-        .eth_label_store = Address.fromHex("0x375C082021E677a40eA2AE094D050602dba90992") catch unreachable,
-        .eth_registry = Address.fromHex("0x657eA849311d3D5823348ddEd7C2AaAFb3EDE09E") catch unreachable,
-        .eth_registrar_v2 = Address.fromHex("0xAbe76F6C8DFcEd81AA5A2bB8034202A7136b94ca") catch unreachable,
+        .root_registry = Address.fromHex("0xb458d6a3a77919449d03e7a6903c26827c1ec43f") catch unreachable,
+        .eth_renewer_v1 = Address.fromHex("0xf2ece44980778966b8a0fccb3a9e339440f6e045") catch unreachable,
+        .eth_label_store = Address.fromHex("0xed8246ff02203a4d4cb262bd78beaa7408a57cae") catch unreachable,
+        .eth_registry = Address.fromHex("0xd4ebcbbdf463c9c45784603db0ddd499bc44a8b4") catch unreachable,
+        .eth_registrar_v2 = Address.fromHex("0xf633e7fc17e2bbe0d0965d18ec1821dcb754a3d3") catch unreachable,
         .eth_reverse_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable, // TBD
-        .batch_registrar = Address.fromHex("0xBe68Ff9aFc7D5A1864ffef5C82DE0A1C13E6B529") catch unreachable,
+        .batch_registrar = Address.fromHex("0x4a4c8b7cdab6b19dc2cdb417cdb53a2ccbaf5322") catch unreachable,
         .premigration_registrar = Address.fromHex("0x0000000000000000000000000000000000000000") catch unreachable,
 
         // Migration Contracts (V1→V2, Sepolia deployment)
-        .migration_helper = Address.fromHex("0x58d12d60471b98F191856e4C2d56886e9c3eA573") catch unreachable,
-        .locked_migration_controller = Address.fromHex("0xab1B57C6eE5E91e6090595c0AF14CB9B8bc7773f") catch unreachable,
-        .unlocked_migration_controller = Address.fromHex("0x7ed171bb143a905F56105e4eA146543Ecb122F55") catch unreachable,
+        .migration_helper = Address.fromHex("0xa8f86ee5cdd28703bd876f3a8c10b1de70f36899") catch unreachable,
+        .locked_migration_controller = Address.fromHex("0x6029a063d69b09d23c52a754a90e4fe43adac3a8") catch unreachable,
+        .unlocked_migration_controller = Address.fromHex("0x2a35b94df22cc7354570be2284655e2cdc0e64a2") catch unreachable,
 
         // Deployment blocks (verified on-chain via eth_getCode bisection)
         // Both sides start at this deployment: the V1 contracts above are the
         // long-lived canonical Sepolia ones, but only V1 state from this
         // deployment onwards is relevant to the V2 migration fixtures.
-        .v1_deployment_block = 11708980,
-        .v2_deployment_block = 11708980,
+        .v1_deployment_block = 11820289,
+        .v2_deployment_block = 11820289,
 
         // Historical markers (not applicable for testnets)
         .temp_registrar_start_block = 0,
