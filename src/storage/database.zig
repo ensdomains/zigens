@@ -468,6 +468,7 @@ pub const Database = struct {
     pub const getNameStringByNamehash = names.getNameStringByNamehash;
     pub const getNameByNamehashAndProtocol = names.getNameByNamehashAndProtocol;
     pub const getNamehashByResolver = names.getNamehashByResolver;
+    pub const getNameResolver = names.getNameResolver;
     pub const updateNameExpiry = names.updateNameExpiry;
     pub const updateDomainExpiryIfGreater = names.updateDomainExpiryIfGreater;
     pub const materializePccDomainExpiry = names.materializePccDomainExpiry;

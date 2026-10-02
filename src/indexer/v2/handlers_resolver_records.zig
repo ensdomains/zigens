@@ -61,6 +61,103 @@ fn recordFromTopic(log: rpc.Log) ?RecordRef {
     return .{ .id = id, .key = record_model.recordKey(id) };
 }
 
+/// A name a record write is attributed to. `name` is allocator-owned.
+const AttributedName = struct {
+    namehash: Hash,
+    name: ?[]const u8,
+};
+
+fn freeAttributions(allocator: std.mem.Allocator, attributed: []AttributedName) void {
+    for (attributed) |a| if (a.name) |n| allocator.free(n);
+    allocator.free(attributed);
+}
+
+/// Whether `namehash`'s name currently resolves through `resolver`. Anyone can
+/// deploy a record resolver, point one of their own names at it (which makes it
+/// a known resolver) and then emit `Linked(id, victimNode)` followed by writes
+/// to that record. Requiring the name's own resolver keeps those writes out of
+/// the victim's history.
+fn nameUsesResolver(self: *Indexer, protocol: models.Protocol, namehash: Hash, resolver: Address) !bool {
+    if (namehash.isZero()) return false;
+    const current = (try self.database.getNameResolver(protocol, namehash)) orelse return false;
+    return current.eql(resolver);
+}
+
+/// The names a write to record `record_id` on `resolver` belongs to: those
+/// linked to the record at this log whose own resolver is `resolver`.
+///
+/// Resolver logs are dispatched in chain order and `Linked` writes
+/// `resolver_links` directly, so the links read here are exactly the ones in
+/// force when the write happened — a later relink or unlink never moves an
+/// already-attributed write. The default record (node `0x0`) is left
+/// unattributed: it serves every name on the resolver without a link of its own,
+/// and naming all of them would claim writes for names that never chose it.
+fn recordAttributions(self: *Indexer, protocol: models.Protocol, resolver: Address, record_id: u256) ![]AttributedName {
+    var out: std.ArrayList(AttributedName) = .empty;
+    errdefer {
+        for (out.items) |a| if (a.name) |n| self.allocator.free(n);
+        out.deinit(self.allocator);
+    }
+    if (record_id == 0) return out.toOwnedSlice(self.allocator);
+
+    const links = try self.database.getLinkedNames(self.allocator, resolver, record_id);
+    defer {
+        for (links) |*l| l.deinit(self.allocator);
+        self.allocator.free(links);
+    }
+    for (links) |link| {
+        if (!try nameUsesResolver(self, protocol, link.namehash, resolver)) continue;
+        try out.append(self.allocator, .{ .namehash = link.namehash, .name = self.getNameFromNamehash(link.namehash) });
+    }
+    return out.toOwnedSlice(self.allocator);
+}
+
+/// Emit a record-model event under the name it belongs to. A record linked to
+/// exactly one eligible name carries that name; a record with no eligible name
+/// carries none. Takes ownership of `event_data`.
+fn emitRecordEvent(
+    self: *Indexer,
+    protocol: models.Protocol,
+    resolver: Address,
+    log: rpc.Log,
+    record_id: u256,
+    event_type: models.EventType,
+    event_data: []u8,
+) !void {
+    const attributed = recordAttributions(self, protocol, resolver, record_id) catch |err| {
+        self.allocator.free(event_data);
+        return err;
+    };
+    defer freeAttributions(self.allocator, attributed);
+
+    if (attributed.len == 1) {
+        const name = attributed[0].name;
+        attributed[0].name = null;
+        return utils.emitEvent(self, protocol, log, event_type, name, attributed[0].namehash, event_data);
+    }
+    try utils.emitEvent(self, protocol, log, event_type, null, null, event_data);
+}
+
+/// Emit an event that addresses a name by its node (`Linked`, `ApprovalUpdated`)
+/// under that name only while the name resolves through the emitting resolver —
+/// the same guard `recordAttributions` applies. Takes ownership of `event_data`.
+fn emitNodeEvent(
+    self: *Indexer,
+    protocol: models.Protocol,
+    resolver: Address,
+    log: rpc.Log,
+    node: Hash,
+    event_type: models.EventType,
+    event_data: []u8,
+) !void {
+    const owned = nameUsesResolver(self, protocol, node, resolver) catch |err| {
+        self.allocator.free(event_data);
+        return err;
+    };
+    if (!owned) return utils.emitEvent(self, protocol, log, event_type, null, null, event_data);
+    try utils.emitEvent(self, protocol, log, event_type, self.getNameFromNamehash(node), node, event_data);
+}
+
 fn bytesToHexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     const hex = try allocator.alloc(u8, 2 + bytes.len * 2);
     hex[0] = '0';
@@ -177,8 +274,7 @@ pub fn handleLinked(self: *Indexer, protocol: models.Protocol, resolver: Address
     const escaped_name = try json_utils.escapeString(self.allocator, name);
     defer self.allocator.free(escaped_name);
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\",\"node\":\"{s}\",\"name\":\"{s}\"}}", .{ resolver_hex, rec.id, node_hex, escaped_name });
-    const domain_name = self.getNameFromNamehash(node);
-    try utils.emitEvent(self, protocol, log, .linked, domain_name, node, event_data);
+    try emitNodeEvent(self, protocol, resolver, log, node, .linked, event_data);
 }
 
 /// Cleared(uint256 indexed recordId) — declared by IRecordResolver, emitted by
@@ -197,7 +293,7 @@ pub fn handleCleared(self: *Indexer, protocol: models.Protocol, resolver: Addres
     const resolver_hex = try resolver.toHex(self.allocator);
     defer self.allocator.free(resolver_hex);
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\"}}", .{ resolver_hex, rec.id });
-    try utils.emitEvent(self, protocol, log, .cleared, null, rec.key, event_data);
+    try emitRecordEvent(self, protocol, resolver, log, rec.id, .cleared, event_data);
 }
 
 /// AddressUpdated(uint256 indexed recordId, uint256 coinType, bytes addressBytes)
@@ -224,7 +320,7 @@ pub fn handleAddressUpdated(self: *Indexer, protocol: models.Protocol, resolver:
     const resolver_hex = try resolver.toHex(self.allocator);
     defer self.allocator.free(resolver_hex);
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\",\"coinType\":{d},\"address\":\"{s}\"}}", .{ resolver_hex, rec.id, coin_type, address_hex });
-    try utils.emitEvent(self, protocol, log, .address_updated, null, rec.key, event_data);
+    try emitRecordEvent(self, protocol, resolver, log, rec.id, .address_updated, event_data);
 }
 
 /// TextUpdated(uint256 indexed recordId, string indexed keyHash, string key, string value)
@@ -251,7 +347,7 @@ pub fn handleTextUpdated(self: *Indexer, protocol: models.Protocol, resolver: Ad
     const escaped_value = try json_utils.escapeString(self.allocator, effective_value);
     defer self.allocator.free(escaped_value);
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\",\"key\":\"{s}\",\"value\":\"{s}\"}}", .{ resolver_hex, rec.id, escaped_key, escaped_value });
-    try utils.emitEvent(self, protocol, log, .text_updated, null, rec.key, event_data);
+    try emitRecordEvent(self, protocol, resolver, log, rec.id, .text_updated, event_data);
 }
 
 /// DataUpdated(uint256 indexed recordId, string indexed keyHash, string key, bytes value)
@@ -388,11 +484,12 @@ fn storeDataRecord(
         .plain => "value",
         .hashed => "valueHash",
     };
-    const event_data = if (record_id) |id|
-        try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\",\"key\":\"{s}\",\"{s}\":\"{s}\"}}", .{ resolver_hex, id, escaped_key, value_field, value_hex })
-    else
-        try std.fmt.allocPrint(self.allocator, "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"key\":\"{s}\",\"{s}\":\"{s}\"}}", .{ key_hex, resolver_hex, escaped_key, value_field, value_hex });
-    const domain_name = if (record_id == null) self.getNameFromNamehash(row_key) else null;
+    if (record_id) |id| {
+        const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\",\"key\":\"{s}\",\"{s}\":\"{s}\"}}", .{ resolver_hex, id, escaped_key, value_field, value_hex });
+        return emitRecordEvent(self, protocol, resolver, log, id, event_type, event_data);
+    }
+    const event_data = try std.fmt.allocPrint(self.allocator, "{{\"namehash\":\"{s}\",\"resolver\":\"{s}\",\"key\":\"{s}\",\"{s}\":\"{s}\"}}", .{ key_hex, resolver_hex, escaped_key, value_field, value_hex });
+    const domain_name = self.getNameFromNamehash(row_key);
     try utils.emitEvent(self, protocol, log, event_type, domain_name, row_key, event_data);
 }
 
@@ -416,7 +513,7 @@ pub fn handleContenthashUpdated(self: *Indexer, protocol: models.Protocol, resol
     const resolver_hex = try resolver.toHex(self.allocator);
     defer self.allocator.free(resolver_hex);
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\",\"contentHash\":\"{s}\"}}", .{ resolver_hex, rec.id, hash_hex });
-    try utils.emitEvent(self, protocol, log, .contenthash_updated, null, rec.key, event_data);
+    try emitRecordEvent(self, protocol, resolver, log, rec.id, .contenthash_updated, event_data);
 }
 
 /// ABIUpdated(uint256 indexed recordId, uint256 indexed contentType) — no payload.
@@ -430,7 +527,7 @@ pub fn handleABIUpdated(self: *Indexer, protocol: models.Protocol, resolver: Add
     const resolver_hex = try resolver.toHex(self.allocator);
     defer self.allocator.free(resolver_hex);
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\",\"contentType\":{d}}}", .{ resolver_hex, rec.id, content_type });
-    try utils.emitEvent(self, protocol, log, .abi_updated, null, rec.key, event_data);
+    try emitRecordEvent(self, protocol, resolver, log, rec.id, .abi_updated, event_data);
 }
 
 /// InterfaceUpdated(uint256 indexed recordId, bytes4 indexed interfaceId, address implementer)
@@ -452,7 +549,7 @@ pub fn handleInterfaceUpdated(self: *Indexer, protocol: models.Protocol, resolve
     const resolver_hex = try resolver.toHex(self.allocator);
     defer self.allocator.free(resolver_hex);
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\",\"interfaceID\":\"{s}\",\"implementer\":\"{s}\"}}", .{ resolver_hex, rec.id, interface_id_hex, implementer_hex });
-    try utils.emitEvent(self, protocol, log, .interface_updated, null, rec.key, event_data);
+    try emitRecordEvent(self, protocol, resolver, log, rec.id, .interface_updated, event_data);
 }
 
 /// NameUpdated(uint256 indexed recordId, string primaryName) — the record's
@@ -475,7 +572,7 @@ pub fn handleNameUpdated(self: *Indexer, protocol: models.Protocol, resolver: Ad
     const escaped_name = try json_utils.escapeString(self.allocator, name);
     defer self.allocator.free(escaped_name);
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\",\"name\":\"{s}\"}}", .{ resolver_hex, rec.id, escaped_name });
-    try utils.emitEvent(self, protocol, log, .name_updated, null, rec.key, event_data);
+    try emitRecordEvent(self, protocol, resolver, log, rec.id, .name_updated, event_data);
 }
 
 /// Whether `arg` is a printable UTF-8 setter argument (a text/data key).
@@ -559,8 +656,7 @@ pub fn handleApprovalUpdated(self: *Indexer, protocol: models.Protocol, resolver
     const operator_hex = try operator.toHex(self.allocator);
     defer self.allocator.free(operator_hex);
     const event_data = try std.fmt.allocPrint(self.allocator, "{{\"resolver\":\"{s}\",\"recordId\":\"{d}\",\"owner\":\"{s}\",\"operator\":\"{s}\",\"approved\":{s}}}", .{ resolver_hex, rec.id, owner_hex, operator_hex, if (approved) "true" else "false" });
-    const domain_name = self.getNameFromNamehash(node);
-    try utils.emitEvent(self, protocol, log, .approval_updated, domain_name, node, event_data);
+    try emitNodeEvent(self, protocol, resolver, log, node, .approval_updated, event_data);
 }
 
 fn abiEncode(allocator: std.mem.Allocator, parts: []const AbiPart) ![]u8 {
@@ -917,4 +1013,187 @@ test "record handlers: ResourceArgument and legacy DataChanged" {
         db.allocator.free(keys);
     }
     try testing.expectEqual(@as(usize, 0), keys.len);
+}
+
+const OTHER_RESOLVER = Address{ .bytes = [_]u8{0xFF} ** 20 };
+
+fn testName(full: []const u8, label: []const u8, namehash: Hash, resolver: Address) models.Name {
+    return .{ .name = full, .label = label, .parent_name = "eth", .namehash = namehash, .protocol = .v2, .label_hash = Hash.zero, .parent_namehash = Hash.zero, .registry = Address.zero, .owner = Address.zero, .registrant = Address.zero, .resolver = resolver, .token_id = 0, .canonical_id = 0, .token_version = 0, .expiry = 0, .registry_locked = false, .migrated = false, .created_block = 400, .created_at = 100, .registered_at = 100, .updated_block = 400, .updated_at = 100, .is_wrapped = false, .wrapper_fuses = null, .wrapper_expiry = null, .is_v1_name = false, .v1_label_hash = null };
+}
+
+const EventAttribution = struct {
+    name: ?[]const u8,
+    namehash: ?Hash,
+};
+
+/// The (name, namehash) an event row was stored under, by its log index.
+fn eventAttribution(rig: *TestRig, log_index: u32) !EventAttribution {
+    var q = try db_module.Query.init(rig.database, "SELECT name, namehash FROM events WHERE log_index = ?");
+    defer q.deinit();
+    try q.bindInt(@intCast(log_index));
+    if (!try q.step()) return error.EventNotFound;
+    return .{
+        .name = if (q.getTextSlice(0)) |n| try rig.alloc().dupe(u8, n) else null,
+        .namehash = if (q.getTextSlice(1)) |h| try Hash.fromHex(h) else null,
+    };
+}
+
+fn expectAttributedTo(rig: *TestRig, log_index: u32, name: []const u8, namehash: Hash) !void {
+    const got = try eventAttribution(rig, log_index);
+    try testing.expect(got.namehash != null);
+    try testing.expect(got.namehash.?.eql(namehash));
+    try testing.expectEqualStrings(name, got.name orelse "");
+}
+
+fn expectUnattributed(rig: *TestRig, log_index: u32) !void {
+    const got = try eventAttribution(rig, log_index);
+    try testing.expectEqual(@as(?[]const u8, null), got.name);
+    try testing.expectEqual(@as(?Hash, null), got.namehash);
+}
+
+fn textLog(rig: *TestRig, resolver: Address, record_id: u256, key: []const u8, value: []const u8) !rpc.Log {
+    const a = rig.alloc();
+    return rig.log(resolver, &.{ wordHash(0), wordHash(record_id), wordHash(0) }, try abiEncode(a, &.{ .{ .dyn = key }, .{ .dyn = value } }));
+}
+
+fn linkLog(rig: *TestRig, resolver: Address, record_id: u256, node: Hash, name: []const u8) !rpc.Log {
+    const a = rig.alloc();
+    const encoded = if (name.len == 0) try a.dupe(u8, "\x00") else try dnsName(a, name);
+    return rig.log(resolver, &.{ wordHash(0), wordHash(record_id), node }, try abiEncode(a, &.{.{ .dyn = encoded }}));
+}
+
+test "record events: attributed to the names linked to the record at that log" {
+    const rig = (try TestRig.init()) orelse return;
+    defer rig.deinit();
+    const a = rig.alloc();
+    const idx = &rig.idx;
+    const db = rig.database;
+    const carol = try hash_mod.namehash(a, "carol.eth");
+    const victim = try hash_mod.namehash(a, "victim.eth");
+    try idx.insertName(testName("carol.eth", "carol", carol, TEST_RESOLVER));
+    try idx.insertName(testName("victim.eth", "victim", victim, OTHER_RESOLVER));
+
+    // A write to a record nothing links yet belongs to no name.
+    try handleTextUpdated(idx, .v2, TEST_RESOLVER, try textLog(rig, TEST_RESOLVER, 1, "early", "x"));
+    try expectUnattributed(rig, rig.log_index);
+
+    // Linked(1, carol) then writes: the registration shape.
+    try handleLinked(idx, .v2, TEST_RESOLVER, try linkLog(rig, TEST_RESOLVER, 1, carol, "carol.eth"));
+    try expectAttributedTo(rig, rig.log_index, "carol.eth", carol);
+    try handleTextUpdated(idx, .v2, TEST_RESOLVER, try textLog(rig, TEST_RESOLVER, 1, "avatar", "https://a"));
+    try expectAttributedTo(rig, rig.log_index, "carol.eth", carol);
+    const first_write = rig.log_index;
+    try handleAddressUpdated(idx, .v2, TEST_RESOLVER, try rig.log(TEST_RESOLVER, &.{ wordHash(0), wordHash(1) }, try abiEncode(a, &.{ .{ .word = 60 }, .{ .dyn = &[_]u8{0x11} ** 20 } })));
+    try expectAttributedTo(rig, rig.log_index, "carol.eth", carol);
+    try handleContenthashUpdated(idx, .v2, TEST_RESOLVER, try rig.log(TEST_RESOLVER, &.{ wordHash(0), wordHash(1) }, try abiEncode(a, &.{.{ .dyn = &[_]u8{ 0xe3, 0x01 } }})));
+    try expectAttributedTo(rig, rig.log_index, "carol.eth", carol);
+    try handleDataUpdated(idx, .v2, TEST_RESOLVER, try rig.log(TEST_RESOLVER, &.{ wordHash(0), wordHash(1), wordHash(0) }, try abiEncode(a, &.{ .{ .dyn = "blob" }, .{ .dyn = &[_]u8{0xde} } })));
+    try expectAttributedTo(rig, rig.log_index, "carol.eth", carol);
+    try handleNameUpdated(idx, .v2, TEST_RESOLVER, try rig.log(TEST_RESOLVER, &.{ wordHash(0), wordHash(1) }, try abiEncode(a, &.{.{ .dyn = "carol.eth" }})));
+    try expectAttributedTo(rig, rig.log_index, "carol.eth", carol);
+    try handleABIUpdated(idx, .v2, TEST_RESOLVER, try rig.log(TEST_RESOLVER, &.{ wordHash(0), wordHash(1), wordHash(1) }, try a.dupe(u8, "")));
+    try expectAttributedTo(rig, rig.log_index, "carol.eth", carol);
+    try handleInterfaceUpdated(idx, .v2, TEST_RESOLVER, try rig.log(TEST_RESOLVER, &.{ wordHash(0), wordHash(1), wordHash(0x01ffc9a7 << 224) }, try abiEncode(a, &.{.{ .word = 0x2222 }})));
+    try expectAttributedTo(rig, rig.log_index, "carol.eth", carol);
+
+    // A resolver victim.eth does not use links victim's node to its record 1 and
+    // writes to it. Neither the link nor the write reaches victim.eth's history,
+    // and the write still belongs to carol, who does use this resolver.
+    try handleLinked(idx, .v2, TEST_RESOLVER, try linkLog(rig, TEST_RESOLVER, 1, victim, "victim.eth"));
+    try expectUnattributed(rig, rig.log_index);
+    try handleTextUpdated(idx, .v2, TEST_RESOLVER, try textLog(rig, TEST_RESOLVER, 1, "url", "https://phish"));
+    try expectAttributedTo(rig, rig.log_index, "carol.eth", carol);
+    try handleApprovalUpdated(idx, .v2, TEST_RESOLVER, try rig.log(TEST_RESOLVER, &.{ wordHash(0), victim, wordHash(0x11), wordHash(0x22) }, try abiEncode(a, &.{.{ .word = 1 }})));
+    try expectUnattributed(rig, rig.log_index);
+    try handleApprovalUpdated(idx, .v2, TEST_RESOLVER, try rig.log(TEST_RESOLVER, &.{ wordHash(0), carol, wordHash(0x11), wordHash(0x22) }, try abiEncode(a, &.{.{ .word = 1 }})));
+    try expectAttributedTo(rig, rig.log_index, "carol.eth", carol);
+
+    // carol moves to record 2. Earlier writes keep their name; later writes to
+    // record 1 have no eligible name left, and record 2's writes are carol's.
+    try handleLinked(idx, .v2, TEST_RESOLVER, try linkLog(rig, TEST_RESOLVER, 2, carol, "carol.eth"));
+    try handleTextUpdated(idx, .v2, TEST_RESOLVER, try textLog(rig, TEST_RESOLVER, 1, "avatar", "https://b"));
+    try expectUnattributed(rig, rig.log_index);
+    try handleTextUpdated(idx, .v2, TEST_RESOLVER, try textLog(rig, TEST_RESOLVER, 2, "avatar", "https://c"));
+    try expectAttributedTo(rig, rig.log_index, "carol.eth", carol);
+    try expectAttributedTo(rig, first_write, "carol.eth", carol);
+
+    // The resolver-wide default record serves every unlinked name; its writes
+    // are not claimed for any one of them.
+    try handleLinked(idx, .v2, TEST_RESOLVER, try linkLog(rig, TEST_RESOLVER, 3, Hash.zero, ""));
+    try expectUnattributed(rig, rig.log_index);
+    try handleTextUpdated(idx, .v2, TEST_RESOLVER, try textLog(rig, TEST_RESOLVER, 3, "url", "https://default"));
+    try expectUnattributed(rig, rig.log_index);
+
+    // Unlinking (record 0) leaves later writes to the old record nameless too.
+    try handleLinked(idx, .v2, TEST_RESOLVER, try linkLog(rig, TEST_RESOLVER, 0, carol, "carol.eth"));
+    try expectAttributedTo(rig, rig.log_index, "carol.eth", carol);
+    try handleCleared(idx, .v2, TEST_RESOLVER, try rig.log(TEST_RESOLVER, &.{ wordHash(0), wordHash(2) }, try a.dupe(u8, "")));
+    try expectUnattributed(rig, rig.log_index);
+
+    // No record event is filed under the synthetic record key any more.
+    var q = try db_module.Query.init(db, "SELECT COUNT(*) FROM events WHERE namehash IN (?, ?, ?)");
+    defer q.deinit();
+    try q.bindHash(record_model.recordKey(1));
+    try q.bindHash(record_model.recordKey(2));
+    try q.bindHash(record_model.recordKey(3));
+    try testing.expect(try q.step());
+    try testing.expectEqual(@as(i64, 0), q.getInt64(0));
+
+    // The name's history query returns its record events.
+    const carol_hex = try carol.toHex(a);
+    const history = try db.getEventsByNamehash(carol_hex, 100);
+    defer {
+        for (history) |*e| e.deinit(db.allocator);
+        db.allocator.free(history);
+    }
+    var saw_address = false;
+    for (history) |e| {
+        if (e.event_type == .address_updated) saw_address = true;
+    }
+    try testing.expect(saw_address);
+}
+
+test "record events: attributed during a buffered bulk-sync batch" {
+    const rig = (try TestRig.init()) orelse return;
+    defer rig.deinit();
+    const a = rig.alloc();
+    const idx = &rig.idx;
+    const db = rig.database;
+    const dora = try hash_mod.namehash(a, "dora.eth");
+
+    // The registration lands in one batch: the name row and its resolver are
+    // still in the write buffer when the resolver pass handles the record writes.
+    idx.write_buffer.active = true;
+    idx.reorg_arm = false;
+    db.names_barrier = .{ .ctx = idx, .flush = Indexer.namesBarrierFlush };
+    defer db.names_barrier = null;
+
+    try idx.insertName(testName("dora.eth", "dora", dora, Address.zero));
+    try idx.setNameResolver(dora, TEST_RESOLVER);
+    try handleLinked(idx, .v2, TEST_RESOLVER, try linkLog(rig, TEST_RESOLVER, 1, dora, "dora.eth"));
+    try handleAddressUpdated(idx, .v2, TEST_RESOLVER, try rig.log(TEST_RESOLVER, &.{ wordHash(0), wordHash(1) }, try abiEncode(a, &.{ .{ .word = 60 }, .{ .dyn = &[_]u8{0x33} ** 20 } })));
+    const write_index = rig.log_index;
+
+    idx.write_buffer.active = false;
+    try idx.write_buffer.flush(db);
+    try expectAttributedTo(rig, write_index, "dora.eth", dora);
+}
+
+test "getLatestNameByNamehash ignores another resolver's record with the same id" {
+    const rig = (try TestRig.init()) orelse return;
+    defer rig.deinit();
+    const a = rig.alloc();
+    const idx = &rig.idx;
+    const db = rig.database;
+    const carol = try hash_mod.namehash(a, "carol.eth");
+
+    try handleLinked(idx, .v2, TEST_RESOLVER, try linkLog(rig, TEST_RESOLVER, 1, carol, "carol.eth"));
+    try handleNameUpdated(idx, .v2, TEST_RESOLVER, try rig.log(TEST_RESOLVER, &.{ wordHash(0), wordHash(1) }, try abiEncode(a, &.{.{ .dyn = "carol.eth" }})));
+    // An unrelated resolver's record 1 — never linked to carol.eth — sorts first
+    // on the resolver tiebreak, so a key-only match would pick it.
+    try handleNameUpdated(idx, .v2, OTHER_RESOLVER, try rig.log(OTHER_RESOLVER, &.{ wordHash(0), wordHash(1) }, try abiEncode(a, &.{.{ .dyn = "mallory.eth" }})));
+
+    const primary = (try db.getLatestNameByNamehash(carol)).?;
+    defer db.allocator.free(primary);
+    try testing.expectEqualStrings("carol.eth", primary);
 }

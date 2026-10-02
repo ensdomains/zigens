@@ -352,6 +352,22 @@ pub fn getNamehashByResolver(db: *Database, protocol: models.Protocol, resolver:
     return first;
 }
 
+/// The resolver a name's row currently points at, or null when the name is
+/// unknown or has never had one set (an unset resolver is the zero address).
+pub fn getNameResolver(db: *Database, protocol: models.Protocol, namehash: Hash) !?Address {
+    try db.namesBarrier();
+    var q = try Query.initCached(db, "SELECT resolver FROM names WHERE protocol = ? AND namehash = ?");
+    defer q.deinit();
+
+    try q.bindTextStatic(protocol.toString());
+    try q.bindHash(namehash);
+
+    if (!try q.step()) return null;
+    const resolver = Address.fromHex(q.getTextSlice(0) orelse return null) catch return null;
+    if (resolver.isZero()) return null;
+    return resolver;
+}
+
 /// Get name by token ID and registry address (avoids cross-registry tokenId collisions).
 /// Strips to canonical_id (version-independent) for lookup, so this works with any
 /// version of the token_id and is resilient to TokenRegenerated events.

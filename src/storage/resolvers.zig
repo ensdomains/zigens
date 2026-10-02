@@ -1596,8 +1596,11 @@ pub fn getAbiContentTypes(db: *Database, resolver: Address, namehash_val: Hash) 
 ///     `--backfill` replay, so breaking the tie on `id` alone made a user's primary name
 ///     depend on which of the two produced the database. `id` stays last only to make the
 ///     order total.
-///   * The `resolver_links` arm is unchanged: a record-model resolver stores the name under a
-///     synthetic record key, so both the direct node and its linked key have to be considered.
+///   * The `resolver_links` arm: a record-model resolver stores the name under a synthetic
+///     record key, so both the direct node and its linked key have to be considered. The key
+///     is matched together with the resolver that holds the link — `recordKey(id)` depends
+///     on the id alone, and every PermissionedResolver numbers its records from 1, so a bare
+///     key match picked up a `NameUpdated` written by any unrelated resolver's record 1.
 ///
 /// Measured on the reference mirror: 0 within-block ties, 0 nodes with rows from more than one
 /// resolver, 0 nodes spanning both protocols — so this is latent today, and the ordering is
@@ -1610,7 +1613,7 @@ pub fn getLatestNameByNamehash(db: *Database, namehash_val: Hash) !?[]u8 {
     const sql =
         \\SELECT name FROM resolver_names
         \\WHERE namehash = ?
-        \\   OR namehash IN (SELECT record_key FROM resolver_links WHERE namehash = ? AND record_id <> '0x0000000000000000000000000000000000000000000000000000000000000000')
+        \\   OR (resolver, namehash) IN (SELECT resolver, record_key FROM resolver_links WHERE namehash = ? AND record_id <> '0x0000000000000000000000000000000000000000000000000000000000000000')
         \\ORDER BY CASE WHEN protocol = 'v2' THEN 0 ELSE 1 END ASC, block_number DESC, resolver DESC, id DESC
         \\LIMIT 1
     ;
