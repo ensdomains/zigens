@@ -70,6 +70,7 @@ fn pgTestConfig() !config.Config {
         .ccip_gateway_timeout_ms = 5000,
         .ccip_max_redirects = 4,
         .finality_enabled = false,
+        .coverage_stale_after_seconds = 0,
     };
 }
 

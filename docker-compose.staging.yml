@@ -137,6 +137,10 @@ services:
       # throttle, so setting it only there left the API on the code default (15/s)
       # and capped the public surface without anyone choosing that number.
       - RATE_LIMIT_PER_SECOND=${API_RATE_LIMIT_PER_SECOND:-25}
+      # Without finality data, report stale=true once a protocol has gone this long
+      # without committing a batch (see .env.example). Above the longest healthy
+      # batch; set 0 for a --backfill or an END_BLOCK-pinned deployment.
+      - COVERAGE_STALE_AFTER_SECONDS=${COVERAGE_STALE_AFTER_SECONDS:-3600}
       - GRAPHQL_MAX_DEPTH=10
       - GRAPHQL_MAX_COST=${GRAPHQL_MAX_COST:-10000}
       # Live resolution (ENSIP-10 Universal Resolver fallback) for single-name

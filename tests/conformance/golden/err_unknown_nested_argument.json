@@ -1,0 +1,1 @@
+{"errors":[{"message":"Unknown argument: `Domain.subdomains` has no argument `bogus`.","locations":[{"line":1,"column":32}],"extensions":{"code":"VALIDATION_ERROR"}}],"data":null}

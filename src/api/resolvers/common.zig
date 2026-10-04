@@ -16,12 +16,14 @@ pub const pagination = @import("../../lib/graphql/pagination.zig");
 // builders/builders.zig. Files needing the builder layer (or `builders.NestedContext`)
 // should import `../builders/builders.zig` directly.
 pub const loaders = @import("../loaders.zig");
+pub const zsys = @import("../../utils/system.zig");
 
 // Re-export shared helpers/constants from the neutral api/common.zig so resolver
 // files can access them via the same `common.*` namespace.
 const api_common = @import("../common.zig");
 pub const parsePagination = api_common.parsePagination;
 pub const parseOrderDirection = api_common.parseOrderDirection;
+pub const coverageStale = api_common.coverageStale;
 pub const parseEventOrderBy = api_common.parseEventOrderBy;
 pub const getObjectArg = api_common.getObjectArg;
 pub const matchStringArg = api_common.matchStringArg;
@@ -30,6 +32,7 @@ pub const matchBoolArg = api_common.matchBoolArg;
 pub const matchAddressArg = api_common.matchAddressArg;
 pub const parseStringListArg = api_common.parseStringListArg;
 pub const parseAddressListArg = api_common.parseAddressListArg;
+pub const NESTED_DEFAULT_FIRST = api_common.NESTED_DEFAULT_FIRST;
 
 /// Normalize a client-supplied EAC resource to the fixed 66-char lowercase hex
 /// the indexer stores (zero-trimmed `0x1`, padded and upper-case spellings all

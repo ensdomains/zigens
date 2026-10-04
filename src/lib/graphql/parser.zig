@@ -365,6 +365,8 @@ pub const Field = struct {
     fragment_spread: ?[]const u8, // If this is a fragment spread (...FragmentName), this is the fragment name
     directives: []Directive, // Field directives (e.g., @skip, @include)
     pos: usize = 0, // Byte offset of the field's first token in the source (alias when aliased)
+    /// `... on T { … }`: `name` holds the type condition, `selections` the body.
+    inline_fragment: bool = false,
 
     pub fn deinit(self: *Field, allocator: std.mem.Allocator) void {
         for (self.arguments) |*arg| {
@@ -937,6 +939,7 @@ pub const Parser = struct {
                 .fragment_spread = null, // Not a named fragment spread
                 .directives = directives,
                 .pos = start_pos,
+                .inline_fragment = true,
             };
         }
 
@@ -1538,26 +1541,37 @@ pub const Executor = struct {
         };
     }
 
-    /// Free expanded fields recursively (frees nested selections that were allocated by expandSelections)
-    /// Note: expandSelections ALWAYS creates new allocations for any non-empty selections,
-    /// so all non-empty selections in the returned fields are safe to free.
+    /// Free fields returned by expandSelections: each field's resolved
+    /// arguments and expanded selections, then the array itself.
     fn freeExpandedFields(self: *Executor, fields: []Field) void {
-        for (fields) |*field| {
-            if (field.selections.len > 0) {
-                // Recursively free nested selections
-                // Note: the recursive call will free field.selections via its final free(fields) call
-                self.freeExpandedFields(@constCast(field.selections));
-            }
-        }
-        // Free this level's array (this also frees what was passed as field.selections to recursive calls)
+        self.freeExpandedFieldContents(fields);
         self.allocator.free(fields);
+    }
+
+    fn freeExpandedFieldContents(self: *Executor, fields: []Field) void {
+        for (fields) |*field| {
+            self.freeResolvedArguments(field.arguments);
+            if (field.selections.len > 0) self.freeExpandedFields(field.selections);
+        }
+    }
+
+    fn freeResolvedArguments(self: *Executor, args: []Argument) void {
+        for (args) |arg| self.freeResolvedValue(arg.value);
+        self.allocator.free(args);
     }
 
     /// Expand selections, replacing fragment spreads with actual fragment fields
     /// Also filters out fields that should be skipped due to directives (@skip, @include)
+    ///
+    /// Arguments are resolved against the request variables at every depth, not
+    /// just on root fields: nested handlers read their arguments with getIntArg
+    /// and friends, which treat an unresolved `$var` as absent.
     pub fn expandSelections(self: *Executor, selections: []const Field) ![]Field {
         var expanded: std.ArrayList(Field) = .empty;
-        errdefer expanded.deinit(self.allocator);
+        errdefer {
+            self.freeExpandedFieldContents(expanded.items);
+            expanded.deinit(self.allocator);
+        }
 
         for (selections) |*field| {
             // Check directives (@skip, @include) - skip this field if directive says so
@@ -1565,31 +1579,34 @@ pub const Executor = struct {
                 continue;
             }
 
-            if (field.fragment_spread) |frag_name| {
-                // This is a fragment spread - expand it
-                if (self.getFragment(frag_name)) |frag| {
-                    // Recursively expand the fragment's selections
-                    const frag_fields = try self.expandSelections(frag.selections);
-                    // Note: we don't free frag_fields here because we're transferring ownership
-                    // of the nested selections to our result. The caller will free via freeExpandedFields.
-
-                    for (frag_fields) |frag_field| {
-                        try expanded.append(self.allocator, frag_field);
-                    }
-                    // Free just the array, not the contents (ownership transferred)
-                    self.allocator.free(frag_fields);
-                } else {
-                    std.log.warn("Unknown fragment: {s}", .{frag_name});
-                }
-            } else if (field.selections.len > 0) {
-                // This field has nested selections - expand them recursively
-                var expanded_field = field.*;
-                expanded_field.selections = try self.expandSelections(field.selections);
-                try expanded.append(self.allocator, expanded_field);
-            } else {
-                // Regular field - just copy it
-                try expanded.append(self.allocator, field.*);
+            if (field.inline_fragment or field.fragment_spread != null) {
+                // Schema validation has already checked that the type condition
+                // is the enclosing type (the schema has no interfaces or unions),
+                // so the fragment's fields always apply here.
+                const frag_selections = if (field.fragment_spread) |frag_name|
+                    (self.getFragment(frag_name) orelse {
+                        std.log.warn("Unknown fragment: {s}", .{frag_name});
+                        continue;
+                    }).selections
+                else
+                    field.selections;
+                const frag_fields = try self.expandSelections(frag_selections);
+                defer self.allocator.free(frag_fields);
+                expanded.appendSlice(self.allocator, frag_fields) catch |err| {
+                    self.freeExpandedFieldContents(frag_fields);
+                    return err;
+                };
+                continue;
             }
+
+            try expanded.ensureUnusedCapacity(self.allocator, 1);
+            var expanded_field = field.*;
+            expanded_field.arguments = try self.resolveFieldArguments(field);
+            errdefer self.freeResolvedArguments(expanded_field.arguments);
+            if (field.selections.len > 0) {
+                expanded_field.selections = try self.expandSelections(field.selections);
+            }
+            expanded.appendAssumeCapacity(expanded_field);
         }
 
         return try expanded.toOwnedSlice(self.allocator);

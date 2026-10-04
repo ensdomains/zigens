@@ -135,6 +135,10 @@ pub fn isMalformedEventError(err: anyerror) bool {
         // one event; letting it through reached an unchecked add in the codec
         // that either panicked or requested 16 EiB, taking the batch with it.
         error.AbiPayloadMismatch => true,
+        // A DNS-wire name whose label length runs past the payload. Now that
+        // dns.decodeDNSNameToString reports this separately from the root name,
+        // it reaches here instead of being silently folded into "no name".
+        error.InvalidDNSEncoding => true,
         // Decoded fine but a numeric field exceeds what the schema can hold
         // (e.g. a hostile uint256 coinType) — same skip-with-coordinates
         // treatment as an undecodable payload.

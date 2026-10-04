@@ -23,6 +23,7 @@ comptime {
 
 const dns = @import("utils/dns.zig");
 const token_id = @import("types/token_id.zig");
+const models_mod = @import("types/models.zig");
 
 fn expectDns(a: std.mem.Allocator, wire: []const u8, want: []const u8) !void {
     const got = (try dns.decodeDNSNameToString(a, wire)) orelse return error.TestUnexpectedResult;
@@ -32,9 +33,13 @@ fn expectDns(a: std.mem.Allocator, wire: []const u8, want: []const u8) !void {
 
 // Pins the semantics the V2 resolver handlers rely on after the duplicate
 // decoder was folded into utils/dns.zig: identical dotted-name output on valid
-// (and tolerated-malformed) input, and null — never a decode error — on
-// rejected input, which the call sites turn into warn/skip via `orelse`.
-test "decodeDNSNameToString: DNS wire-format → dotted name; failures fold to null" {
+// input, `null` for THE ROOT NAME and nothing else, and a propagated
+// `error.InvalidDNSEncoding` for a malformed encoding.
+//
+// This test previously asserted that malformed input and the root name BOTH
+// produced null. That is what let handleNamedResourceKind discard three real
+// root-name records as undecodable, so the two outcomes are now pinned apart.
+test "decodeDNSNameToString: dotted name; null means root; malformed errors" {
     const a = std.testing.allocator;
     try expectDns(a, "\x03eth\x00", "eth");
     try expectDns(a, "\x05alice\x03eth\x00", "alice.eth");
@@ -43,11 +48,13 @@ test "decodeDNSNameToString: DNS wire-format → dotted name; failures fold to n
     try expectDns(a, "\x03eth", "eth");
     // Bytes after the root terminator are ignored, not an error.
     try expectDns(a, "\x03eth\x00junk", "eth");
-    // Rejected inputs fold to null: empty, label running past the buffer,
-    // and a bare root terminator (no labels).
-    try std.testing.expectEqual(@as(?[]const u8, null), try dns.decodeDNSNameToString(a, ""));
-    try std.testing.expectEqual(@as(?[]const u8, null), try dns.decodeDNSNameToString(a, "\x05ab"));
+    // Zero labels is the root name — reported as null, and NOT as a failure.
     try std.testing.expectEqual(@as(?[]const u8, null), try dns.decodeDNSNameToString(a, "\x00"));
+    try std.testing.expectEqual(@as(?[]const u8, null), try dns.decodeDNSNameToString(a, ""));
+    // A label length that runs past the payload is malformed. It must surface as
+    // an error so utils.isMalformedEventError can skip that one event with its
+    // coordinates, instead of masquerading as the root name.
+    try std.testing.expectError(error.InvalidDNSEncoding, dns.decodeDNSNameToString(a, "\x05ab"));
 }
 
 test "getCanonicalId: clears the low 32 version bits (EAC/token-id stability)" {
@@ -496,4 +503,166 @@ test "buffered V2 name inserts are landed by the names barrier before any direct
     try idx.write_buffer.flush(&database);
     try std.testing.expectEqual(base + 1, try countNames.run(&database));
     try std.testing.expect((try database.getNameByNamehash(nh_b)) == null);
+}
+
+// Both of the following pinned nothing before: sabotaging either fix left the
+// whole suite green, which is how the defects survived in the first place.
+
+test "Transfer for an unknown tokenId records a repairable placeholder, not a nameless event" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cfg = @import("config.zig").Config.fromEnv(allocator) catch return;
+    cfg.status_port = null;
+    cfg.webhooks_enabled = false;
+    defer cfg.deinit();
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+
+    const db_mod = @import("storage/database.zig");
+    var database = try db_mod.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    const Indexer = @import("indexer/indexer.zig").Indexer;
+    var idx = try Indexer.init(allocator, threaded.io(), cfg, &database, null);
+    defer idx.deinit();
+
+    const hash_mod = @import("types/hash.zig");
+    const Hash = hash_mod.Hash;
+    const Address = @import("types/address.zig").Address;
+    const abi = @import("indexer/abi.zig");
+    const v1_names = @import("utils/v1_names.zig");
+
+    // A registry of our own, not cfg.v2_contracts: both handlers key only off
+    // `log.address`, and the configured registry is the zero address whenever the
+    // deployment env is absent — which silently skipped this test.
+    const eth_registry = try Address.fromHex("0x7777777777777777777777777777777777777777");
+
+    // Canonical (low 32 version bits zero) so the repair's canonical-id lookup is exact.
+    const tok: u256 = @as(u256, 0x5EED) << 32;
+    const to = try Address.fromHex("0x2222222222222222222222222222222222222222");
+    var to_topic = Hash.zero;
+    @memcpy(to_topic.bytes[12..32], &to.bytes);
+
+    // TransferSingle(operator, from, to, id, value) — arriving BEFORE the name is
+    // known (a reorg, a backfill gap, or an orphaned transfer).
+    var topics = [_]Hash{ abi.EventSignatures.transfer_single_hash, Hash.zero, Hash.zero, to_topic };
+    var data = [_]u8{0} ** 64;
+    std.mem.writeInt(u256, data[0..32], tok, .big);
+    std.mem.writeInt(u256, data[32..64], 1, .big);
+    try Indexer.handleTransfer(&idx, .v2, syntheticLog(eth_registry, topics[0..], data[0..], 300, 1_700_000_300));
+
+    // The event must be addressable by its token id. Written with a null name and
+    // null namehash it was unreachable from the name it belongs to and nothing
+    // could ever repair it — a permanent hole in that name's history.
+    const placeholder = try std.fmt.allocPrint(allocator, "tokenId:{d}", .{tok});
+    {
+        const evs = try database.getEventsByDomain(placeholder, 10);
+        defer {
+            for (evs) |*e| e.deinit(database.allocator);
+            database.allocator.free(evs);
+        }
+        try std.testing.expectEqual(@as(usize, 1), evs.len);
+        try std.testing.expectEqual(models_mod.EventType.transfer, evs[0].event_type);
+    }
+
+    // Once the name is known, the existing placeholder ledger heals the row —
+    // which is the whole reason the placeholder name is the right thing to write.
+    const nh = try hash_mod.namehash(allocator, "xfer.eth");
+    try idx.insertName(.{
+        .name = "xfer.eth",
+        .label = "xfer",
+        .label_hash = v1_names.computeLabelHash("xfer"),
+        .parent_name = "eth",
+        .parent_namehash = idx.eth_namehash,
+        .protocol = .v2,
+        .registry = eth_registry,
+        .owner = to,
+        .registrant = to,
+        .resolver = Address.zero,
+        .token_id = tok,
+        .canonical_id = tok,
+        .token_version = 0,
+        .namehash = nh,
+        .expiry = 1_900_000_000,
+        .registry_locked = false,
+        .migrated = false,
+        .created_block = 299,
+        .created_at = 1_700_000_299,
+        .registered_at = 1_700_000_299,
+        .updated_block = 299,
+        .updated_at = 1_700_000_299,
+        .is_wrapped = false,
+        .wrapper_fuses = null,
+        .wrapper_expiry = null,
+        .is_v1_name = false,
+        .v1_label_hash = null,
+    });
+    try std.testing.expectEqual(@as(usize, 1), try database.repairPlaceholderEvents(.v2, 0, 1000));
+    {
+        const evs = try database.getEventsByDomain("xfer.eth", 10);
+        defer {
+            for (evs) |*e| e.deinit(database.allocator);
+            database.allocator.free(evs);
+        }
+        try std.testing.expectEqual(@as(usize, 1), evs.len);
+        try std.testing.expect(evs[0].namehash.?.eql(nh));
+    }
+}
+
+test "TokenRegenerated re-keys approvals even when the name is not indexed yet" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cfg = @import("config.zig").Config.fromEnv(allocator) catch return;
+    cfg.status_port = null;
+    cfg.webhooks_enabled = false;
+    defer cfg.deinit();
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+
+    const db_mod = @import("storage/database.zig");
+    var database = try db_mod.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    const Indexer = @import("indexer/indexer.zig").Indexer;
+    var idx = try Indexer.init(allocator, threaded.io(), cfg, &database, null);
+    defer idx.deinit();
+
+    const hash_mod = @import("types/hash.zig");
+    const Hash = hash_mod.Hash;
+    const Address = @import("types/address.zig").Address;
+    const abi = @import("indexer/abi.zig");
+
+    // A registry of our own, not cfg.v2_contracts: both handlers key only off
+    // `log.address`, and the configured registry is the zero address whenever the
+    // deployment env is absent — which silently skipped this test.
+    const eth_registry = try Address.fromHex("0x7777777777777777777777777777777777777777");
+
+    const old_token_id: u256 = 900;
+    const new_token_id: u256 = 901;
+    const owner = try Address.fromHex("0x1111111111111111111111111111111111111111");
+    const operator = try Address.fromHex("0x3333333333333333333333333333333333333333");
+    try database.insertApproval(.v2, old_token_id, owner, operator, 100, Hash.zero, eth_registry);
+
+    // TokenRegenerated(oldTokenId, newTokenId), both indexed, for a token whose
+    // name this indexer has never seen. Approvals are keyed by (token_id,
+    // registry) — both of which this log supplies — so the re-key must happen
+    // regardless. It used to sit inside the "namehash is known" branch, which
+    // left the approval pointing at a token id the chain had already retired,
+    // permanently: a later sighting re-keys the name row but never the approval.
+    var old_topic = Hash.zero;
+    std.mem.writeInt(u256, &old_topic.bytes, old_token_id, .big);
+    var new_topic = Hash.zero;
+    std.mem.writeInt(u256, &new_topic.bytes, new_token_id, .big);
+    var topics = [_]Hash{ abi.EventSignatures.token_regenerated_hash, old_topic, new_topic };
+    var empty: [0]u8 = .{};
+    try Indexer.handleTokenRegenerated(&idx, .v2, syntheticLog(eth_registry, topics[0..], empty[0..], 400, 1_700_000_400));
+
+    const Query = db_mod.Query;
+    var q = try Query.init(&database, "SELECT token_id FROM approvals WHERE registry = ? AND protocol = ?");
+    defer q.deinit();
+    try q.bindAddress(eth_registry);
+    try q.bindTextStatic("v2");
+    try std.testing.expect(try q.step());
+    try std.testing.expectEqualStrings("901", q.getTextSlice(0).?);
+    try std.testing.expect(!try q.step());
 }

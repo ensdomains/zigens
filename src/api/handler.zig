@@ -118,16 +118,14 @@ pub const GraphQLHandler = struct {
         self.introspection_parsed.deinit();
     }
 
-    /// Walk the parsed operations and validate each root field against the
-    /// schema. The validator skips meta fields (`__typename`, `__schema`, …)
-    /// and unknown root field names (those are surfaced separately by the
-    /// executor as `UnknownRootField`).
-    fn validateDocumentArgs(self: *GraphQLHandler, document: *const parser.Document) schema_validator_mod.SchemaValidator.Error!void {
+    /// Validate every operation's selection set against the schema. The
+    /// validator skips meta fields (`__typename`, `__schema`, …) and unknown
+    /// root field names (those are surfaced separately by the executor as
+    /// `UnknownRootField`).
+    fn validateDocument(self: *GraphQLHandler, allocator: std.mem.Allocator, document: *const parser.Document) schema_validator_mod.SchemaValidator.Error!void {
         schema_validator_mod.clearDiag();
-        for (document.operations) |op| {
-            for (op.fields) |*field| {
-                try self.schema_validator.validateRootField(field);
-            }
+        for (document.operations) |*op| {
+            try self.schema_validator.validateOperation(allocator, op, document.fragments);
         }
     }
 
@@ -287,12 +285,13 @@ pub const GraphQLHandler = struct {
         std.log.debug("Query complexity: depth={d}, cost={d}", .{ analysis.depth, analysis.cost });
 
         // Schema validation pass — runs against the parsed document before any
-        // resolver runs. Catches missing required args, unknown args, and
-        // unknown fields inside input objects. Replaces per-resolver manual
+        // resolver runs. Catches missing required args, unknown args, unknown
+        // fields in selection sets and input objects, and fragments on the
+        // wrong type, at every depth. Replaces per-resolver manual
         // checks for the generic-cases (specific InvalidAddress / TooManyNames
         // / etc. type errors stay in the resolvers — they need value-level
         // context that schema validation can't see).
-        if (self.validateDocumentArgs(&document)) {} else |val_err| {
+        if (self.validateDocument(request_alloc, &document)) {} else |val_err| {
             self.metrics.recordError();
             // Stable message-family prefixes (external detectors match on them and
             // on extensions.code); the tail names the offending field/argument and
@@ -302,6 +301,8 @@ pub const GraphQLHandler = struct {
                 error.MissingRequiredArg => "Missing required argument",
                 error.UnknownArgument => "Unknown argument",
                 error.UnknownInputObjectField => "Unknown field in input object",
+                error.UnknownField => "Unknown field",
+                error.InvalidFragmentType => "Invalid fragment",
                 else => "Query validation failed",
             };
             var msg_buf: [280]u8 = undefined;
@@ -342,6 +343,8 @@ pub const GraphQLHandler = struct {
                 return try self.buildErrorResponseWithCode("Invalid protocol: must be 'v1' or 'v2'", ErrorCode.INVALID_ARGUMENT);
             } else if (err == error.TooManyNames) {
                 return try self.buildErrorResponseWithCode("name_in: too many names (cap is 1000 per query)", ErrorCode.INVALID_ARGUMENT);
+            } else if (err == error.UndefinedVariable) {
+                return try self.buildErrorResponseWithCode("Undefined variable: an argument references a `$variable` the operation does not declare, or a required one that was not provided", ErrorCode.VALIDATION_ERROR);
             } else if (err == error.UnknownRootField) {
                 return try self.buildErrorResponseWithCode("Unknown root field: query references a Query field that does not exist in the schema. Check the schema or run an introspection query.", ErrorCode.VALIDATION_ERROR);
             } else if (err == error.SubSelectionOnScalar) {

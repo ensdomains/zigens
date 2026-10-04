@@ -594,11 +594,14 @@ fn handleNamedResourceKind(
     var resource_buf: [66]u8 = undefined;
     const resource_hex = log.topics[1].toHexBuf(&resource_buf);
 
-    const name = (try dns.decodeDNSNameToString(self.allocator, name_bytes)) orelse {
-        std.log.warn("NamedResource({s}): failed to decode DNS-encoded name for resource {s}", .{ record_kind, resource_hex });
-        return;
-    };
-    defer self.allocator.free(name);
+    // `null` is the ROOT name (`0x00`), which is the default-record resource —
+    // not a decode failure. Treating it as one discarded legitimate records;
+    // `handleLinked` already reads the same null as the default binding. A
+    // genuinely malformed encoding now arrives as error.InvalidDNSEncoding and
+    // is skipped by the malformed-event path, with coordinates logged.
+    const decoded = try dns.decodeDNSNameToString(self.allocator, name_bytes);
+    defer if (decoded) |d| self.allocator.free(d);
+    const name: []const u8 = decoded orelse "";
 
     self.database.upsertNamedResource(
         protocol,
@@ -1141,8 +1144,12 @@ pub fn handleAliasChanged(self: *Indexer, protocol: models.Protocol, resolver: A
     const to_dns_bytes = data_values[1].bytes;
 
     // Decode DNS wire format to human-readable names
+    // `null` is the root name, which is not an alias key this table can hold —
+    // the same convention the toName branch below already applies (root/empty
+    // means "no alias"). A malformed encoding is a different outcome and now
+    // propagates as error.InvalidDNSEncoding instead of landing here.
     const from_name = (try dns.decodeDNSNameToString(self.allocator, from_dns_bytes)) orelse {
-        std.log.warn("AliasChanged: failed to decode fromName DNS wire format", .{});
+        std.log.warn("AliasChanged: fromName is the root name — no alias key to record", .{});
         return;
     };
     defer self.allocator.free(from_name);
@@ -1162,7 +1169,7 @@ pub fn handleAliasChanged(self: *Indexer, protocol: models.Protocol, resolver: A
         };
     } else {
         const to_name = (try dns.decodeDNSNameToString(self.allocator, to_dns_bytes)) orelse {
-            std.log.warn("AliasChanged: failed to decode toName DNS wire format", .{});
+            std.log.warn("AliasChanged: toName is the root name — treating as no alias", .{});
             return;
         };
         defer self.allocator.free(to_name);

@@ -75,6 +75,7 @@ pub fn main(init: std.process.Init) !void {
         .database_url = cfg.database_url,
         .size = cfg.database_pool_size,
         .chain_id = cfg.network.chainId(),
+        .stale_after_seconds = cfg.coverage_stale_after_seconds,
     });
     defer db_pool.deinit();
 

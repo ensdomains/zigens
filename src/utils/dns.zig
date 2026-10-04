@@ -61,8 +61,20 @@ pub fn decodeDNSName(allocator: std.mem.Allocator, data: []const u8) ![][]const 
 /// Decode a DNS wire-format name and return the full dot-separated name string.
 /// Example: \x07vitalik\x03eth\x00 → "vitalik.eth"
 /// Caller owns the returned string.
+/// `null` means THE ROOT NAME and nothing else. A malformed encoding propagates
+/// `error.InvalidDNSEncoding`.
+///
+/// These were folded together — `decodeDNSName` already distinguishes them
+/// (it errors on a truncated label and returns zero labels for `0x00`) and this
+/// wrapper threw that away with `catch return null`. A caller then could not
+/// tell "the default record" from "garbage", so `handleNamedResourceKind`
+/// discarded three legitimate root-name records as undecodable while
+/// `handleLinked`, reading the same null, correctly treated it as the default
+/// binding. Keeping the two outcomes distinct is what lets each caller choose,
+/// and `utils.isMalformedEventError` lists the error so a genuinely malformed
+/// payload skips one event with its coordinates instead of aborting the batch.
 pub fn decodeDNSNameToString(allocator: std.mem.Allocator, data: []const u8) !?[]const u8 {
-    const labels = decodeDNSName(allocator, data) catch return null;
+    const labels = try decodeDNSName(allocator, data);
     defer {
         for (labels) |l| allocator.free(l);
         allocator.free(labels);
@@ -158,12 +170,16 @@ test "decode first label" {
     try std.testing.expectEqualStrings("vitalik", label.?);
 }
 
-test "empty DNS name" {
+test "root name decodes to null; a malformed encoding errors instead" {
     const allocator = std.testing.allocator;
 
-    const data = "\x00"; // root
-    const name = try decodeDNSNameToString(allocator, data);
-    try std.testing.expect(name == null);
+    // `0x00` is zero labels — the root — and must be reported as such.
+    try std.testing.expectEqual(@as(?[]const u8, null), try decodeDNSNameToString(allocator, "\x00"));
+    try std.testing.expectEqual(@as(?[]const u8, null), try decodeDNSNameToString(allocator, ""));
+
+    // A label length that runs past the buffer is malformed, and must NOT be
+    // reported as the root: that conflation dropped real records.
+    try std.testing.expectError(error.InvalidDNSEncoding, decodeDNSNameToString(allocator, "\x05ab"));
 }
 
 test "decodeDNSNameToString keeps the raw label bytes: DNS labels are not required to be UTF-8" {

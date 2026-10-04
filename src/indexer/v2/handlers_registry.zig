@@ -499,9 +499,19 @@ pub fn handleTransfer(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !
         // With log-index ordering (utils.dispatchOrdered) a Transfer always arrives after its
         // LabelRegistered/NameRegistered, so this branch should only fire on reorgs, backfill
         // gaps, or genuinely orphaned transfers (non-ENS ERC1155 tokens slipping through the
-        // topic-only filter). The event is still emitted for audit; ownership just can't be
-        // applied without a known name.
-        std.log.warn("  → Transfer for unknown tokenId={d} in registry {any}; ownership not updated", .{ id, log.address });
+        // topic-only filter). Ownership can't be applied without a known name.
+        //
+        // Record the token id as a placeholder name rather than leaving the row
+        // NULL/NULL. The event was emitted either way, but with no name and no
+        // namehash it was unreachable from the name it belongs to and nothing
+        // could ever repair it — a permanent hole in that name's history.
+        // `tokenId:<dec>` is the repair ledger's key (storage/events.zig
+        // repairPlaceholderEvents, and the names-side placeholder patch), so a
+        // later sighting of the same token heals the row to its real name and
+        // namehash, ambiguity-guarded. This is the same convention
+        // handleTokenRegenerated and the phase-1 datastore writers already use.
+        name_str_opt = try std.fmt.allocPrint(self.allocator, "tokenId:{d}", .{id});
+        std.log.warn("  → Transfer for unknown tokenId={d} in registry {any}; ownership not updated, event left for placeholder repair", .{ id, log.address });
     }
 
     defer if (name_str_opt) |n| self.allocator.free(n);
@@ -915,8 +925,16 @@ pub fn handleTokenRegenerated(self: *Indexer, protocol: models.Protocol, log: rp
 
     try utils.emitEvent(self, protocol, log, .token_regenerated, event_name, namehash, event_data);
 
-    // Update token_id in database from old to new (registry-safe: only updates the exact name)
-    // Cannot use old_token_id alone because it collides across registries
+    // Two independent re-keyings. They were both gated on a known namehash, but
+    // only the first one needs it: approvals are keyed by (token_id, registry),
+    // which this log carries in full. When the name was not yet indexed the
+    // whole block was skipped, so the approval rows kept pointing at a token id
+    // the chain had already retired — and, because the name row is re-keyed on
+    // a later sighting but approvals are not, they stayed stale permanently.
+    // Each re-keying is now gated on exactly what it reads.
+
+    // Keyed by namehash: renaming the token on the name row.
+    // old_token_id alone will not do — it collides across registries.
     if (!namehash.eql(Hash.zero)) {
         try self.database.updateNameTokenIdByNamehash(namehash, new_token_id);
         std.log.debug("Updated token_id in database: {d} -> {d} for {s}", .{ old_token_id, new_token_id, name_str });
@@ -924,18 +942,19 @@ pub fn handleTokenRegenerated(self: *Indexer, protocol: models.Protocol, log: rp
         // Note: eac_roles.resource carries the EAC version (bumped on unregister /
         // re-register), not the token version, so TokenRegenerated leaves it
         // untouched — no update needed.
-
-        // Update approvals.token_id from old to new (scoped by registry)
-        // Approvals are tied to specific token versions, so they must be updated.
-        const old_token_id_dec = try std.fmt.allocPrint(self.allocator, "{d}", .{old_token_id});
-        defer self.allocator.free(old_token_id_dec);
-        const new_token_id_dec = try std.fmt.allocPrint(self.allocator, "{d}", .{new_token_id});
-        defer self.allocator.free(new_token_id_dec);
-
-        try self.database.updateApprovalTokenId(old_token_id_dec, new_token_id_dec, log.address);
     } else {
-        std.log.warn("Cannot update token_id - unknown namehash for oldTokenId={d}", .{old_token_id});
+        std.log.warn("Cannot update names.token_id - unknown namehash for oldTokenId={d}", .{old_token_id});
     }
+
+    // Keyed by (token_id, registry), both of which this log supplies directly.
+    // Approvals are tied to a specific token version, so they must follow the
+    // regeneration whether or not the name itself is known yet.
+    const old_token_id_dec = try std.fmt.allocPrint(self.allocator, "{d}", .{old_token_id});
+    defer self.allocator.free(old_token_id_dec);
+    const new_token_id_dec = try std.fmt.allocPrint(self.allocator, "{d}", .{new_token_id});
+    defer self.allocator.free(new_token_id_dec);
+
+    try self.database.updateApprovalTokenId(old_token_id_dec, new_token_id_dec, log.address);
 }
 
 pub fn handleTransferBatch(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
