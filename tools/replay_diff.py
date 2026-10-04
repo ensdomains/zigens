@@ -42,7 +42,13 @@ import subprocess
 import sys
 from collections import OrderedDict
 
-# Projection tables a replay rebuilds. Mirrors RECONCILE_TABLES in tests/integration.zig.
+# Projection tables a replay rebuilds. Mirrors RECONCILE_TABLES in tests/integration.zig,
+# with ONE deliberate omission: `event_attributions`. A replay cannot rebuild it — which
+# names a record write belonged to depends on each name's resolver as of that log, and the
+# records pass only ever sees the final resolver (see replayV2RecordsCore). The table is
+# therefore left untouched by --backfill, so a rebuilt copy keeps the live rows and compares
+# equal anyway. Do NOT "fix the mirror" by adding it here and a DELETE in replay: that
+# combination deletes accurate rows and re-derives wrong ones.
 TABLES = [
     "names", "registries", "registrations", "registry_entries",
     "resolvers", "resolver_addresses", "resolver_contenthashes", "resolver_texts",

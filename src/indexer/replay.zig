@@ -1067,6 +1067,20 @@ pub fn replayV2RecordsCore(self: *Indexer) !void {
     try database.exec("DELETE FROM resolver_datas WHERE protocol = 'v2'");
     try database.exec("DELETE FROM resolver_links WHERE protocol = 'v2'");
     try database.exec("DELETE FROM resolver_kinds WHERE protocol = 'v2'");
+    // `event_attributions` is DELIBERATELY not cleared or rebuilt here, and must not be.
+    //
+    // Which names a record write belonged to depends on each name's resolver AS OF THAT
+    // LOG. This pass does not have that: `.resolver_updated` is handled by the names pass
+    // (it carries a tokenId, so resolving it needs the registry projection), and by the
+    // time a combined --backfill reaches this pass the `names` rows hold each name's FINAL
+    // resolver. Re-deriving from those would attribute every write as if the last resolver
+    // had always been in force — silently wrong rows, which is worse than none.
+    //
+    // Leaving the table alone is correct instead of merely safe: the live indexer wrote
+    // those rows with the per-log state this pass cannot recover, so a backfill preserving
+    // them preserves the only accurate answer. Adding a DELETE without a correct rebuild
+    // would destroy it. Repairing attributions written before the attribution rule existed
+    // needs a resync, not a backfill.
 
     try database.beginTransaction();
     {
