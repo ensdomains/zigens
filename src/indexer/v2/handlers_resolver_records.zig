@@ -90,9 +90,17 @@ fn nameUsesResolver(self: *Indexer, protocol: models.Protocol, namehash: Hash, r
 /// Resolver logs are dispatched in chain order and `Linked` writes
 /// `resolver_links` directly, so the links read here are exactly the ones in
 /// force when the write happened — a later relink or unlink never moves an
-/// already-attributed write. The default record (node `0x0`) is left
-/// unattributed: it serves every name on the resolver without a link of its own,
-/// and naming all of them would claim writes for names that never chose it.
+/// already-attributed write.
+///
+/// `record_id == 0` is the unbound record (`Linked(0, node)` unbinds a name), so
+/// nothing is linked to it and there is nothing to attribute. The resolver-wide
+/// DEFAULT record — the one bound to node `bytes32(0)` — is skipped inside the
+/// query: it serves every name on the resolver that has no link of its own, and
+/// naming all of them would claim writes for names that never chose it.
+///
+/// One query does the whole thing, including the "does this name still use this
+/// resolver" test. A record write is the hottest event class here, so a
+/// per-link round-trip multiplied the cost of every one of them.
 fn recordAttributions(self: *Indexer, protocol: models.Protocol, resolver: Address, record_id: u256) ![]AttributedName {
     var out: std.ArrayList(AttributedName) = .empty;
     errdefer {
@@ -101,14 +109,10 @@ fn recordAttributions(self: *Indexer, protocol: models.Protocol, resolver: Addre
     }
     if (record_id == 0) return out.toOwnedSlice(self.allocator);
 
-    const links = try self.database.getLinkedNames(self.allocator, resolver, record_id);
-    defer {
-        for (links) |*l| l.deinit(self.allocator);
-        self.allocator.free(links);
-    }
-    for (links) |link| {
-        if (!try nameUsesResolver(self, protocol, link.namehash, resolver)) continue;
-        try out.append(self.allocator, .{ .namehash = link.namehash, .name = self.getNameFromNamehash(link.namehash) });
+    const namehashes = try self.database.getLinkedNamesUsingResolver(self.allocator, protocol, resolver, record_id);
+    defer self.allocator.free(namehashes);
+    for (namehashes) |namehash| {
+        try out.append(self.allocator, .{ .namehash = namehash, .name = self.getNameFromNamehash(namehash) });
     }
     return out.toOwnedSlice(self.allocator);
 }
@@ -1329,4 +1333,28 @@ test "record events: shared attributions survive a buffered bulk-sync batch" {
     try testing.expectEqual(@as(i64, 2), try countRows(db, "SELECT COUNT(*) FROM event_attributions"));
     const dora_hex = try dora.toHex(a);
     try testing.expectEqual(@as(usize, 1), try db.getEventCount(.{ .namehash = dora_hex, .event_type = "TextUpdated" }));
+}
+
+test "the default record is never attributed, even to the root node" {
+    const rig = (try TestRig.init()) orelse return;
+    defer rig.deinit();
+    const a = rig.alloc();
+    const idx = &rig.idx;
+
+    // The resolver-wide default record is the one linked to node `bytes32(0)` —
+    // and in ENS that namehash is the ROOT. So a root `names` row pointing at this
+    // resolver would satisfy an attribution join on (namehash, resolver) and claim
+    // every default-record write for the root name. The default record serves every
+    // name on the resolver that has no link of its own; it belongs to none of them.
+    try idx.insertName(testName("", "", Hash.zero, TEST_RESOLVER));
+
+    try handleLinked(idx, .v2, TEST_RESOLVER, try linkLog(rig, TEST_RESOLVER, 5, Hash.zero, ""));
+    try expectUnattributed(rig, rig.log_index);
+    try handleTextUpdated(idx, .v2, TEST_RESOLVER, try textLog(rig, TEST_RESOLVER, 5, "url", "https://default"));
+    try expectUnattributed(rig, rig.log_index);
+    try handleAddressUpdated(idx, .v2, TEST_RESOLVER, try rig.log(TEST_RESOLVER, &.{ wordHash(0), wordHash(5) }, try abiEncode(a, &.{ .{ .word = 60 }, .{ .dyn = &[_]u8{0x44} ** 20 } })));
+    try expectUnattributed(rig, rig.log_index);
+
+    // And no attribution rows were filed for it either.
+    try testing.expectEqual(@as(i64, 0), try countRows(rig.database, "SELECT COUNT(*) FROM event_attributions"));
 }

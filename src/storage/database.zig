@@ -523,6 +523,7 @@ pub const Database = struct {
     pub const resolveRecordKeys = resolver_records.resolveRecordKeys;
     pub const getEffectiveRecordId = resolver_records.getEffectiveRecordId;
     pub const getLinkedNames = resolver_records.getLinkedNames;
+    pub const getLinkedNamesUsingResolver = resolver_records.getLinkedNamesUsingResolver;
     pub const storeResolverData = resolver_records.storeResolverData;
     pub const deleteResolverData = resolver_records.deleteResolverData;
     pub const deleteResolverDatas = resolver_records.deleteResolverDatas;
