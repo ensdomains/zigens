@@ -466,6 +466,15 @@ const EVENTS_BY_NAME =
     " UNION ALL SELECT e.id, e.event_type, e.protocol, e.block_number, e.tx_hash, e.log_index, e.contract_address, a.name, a.namehash, e.data, e.timestamp" ++
     " FROM event_attributions a JOIN events e ON e.protocol = a.protocol AND e.tx_hash = a.tx_hash AND e.log_index = a.log_index) AS events";
 
+/// Name-key-only twin of `EVENTS_BY_NAME`, for COUNT reads whose ONLY predicate is
+/// the namehash. Projecting all eleven columns costs a table fetch per matching row,
+/// where the count was previously answered from the index alone; with just the key,
+/// both arms stay COVERING index scans. Valid only while the caller's WHERE touches
+/// no other column — the two per-domain count loaders below.
+const EVENTS_BY_NAME_KEYS =
+    "(SELECT namehash FROM events" ++
+    " UNION ALL SELECT a.namehash FROM event_attributions a) AS events";
+
 /// The relation a filtered read selects from: `EVENTS_BY_NAME` when the filter
 /// pins a name at its top level, the bare table otherwise.
 fn eventSource(filter: EventFilterOptions) []const u8 {
@@ -1144,7 +1153,7 @@ pub fn getEventCount(db: *Database, filter: EventFilterOptions) !usize {
 
 /// Count events for a specific domain (by namehash)
 pub fn countEventsByNamehash(db: *Database, namehash: Hash) !usize {
-    var q = try Query.init(db, "SELECT COUNT(*) FROM " ++ EVENTS_BY_NAME ++ " WHERE namehash = ?");
+    var q = try Query.init(db, "SELECT COUNT(*) FROM " ++ EVENTS_BY_NAME_KEYS ++ " WHERE namehash = ?");
     defer q.deinit();
 
     try q.bindHash(namehash);
@@ -1193,7 +1202,7 @@ pub fn countEventsForNamehashes(db: *Database, namehashes: []const Hash, allocat
         const scratch_alloc = scratch.allocator();
 
         var sql: std.ArrayList(u8) = .empty;
-        try sql.appendSlice(scratch_alloc, "SELECT namehash, COUNT(*) FROM " ++ EVENTS_BY_NAME ++ " WHERE namehash IN (");
+        try sql.appendSlice(scratch_alloc, "SELECT namehash, COUNT(*) FROM " ++ EVENTS_BY_NAME_KEYS ++ " WHERE namehash IN (");
         for (chunk, 0..) |_, i| {
             if (i != 0) try sql.append(scratch_alloc, ',');
             try sql.append(scratch_alloc, '?');
@@ -1785,5 +1794,47 @@ test "connection pagination reproduces the full ordered result with no drops/dup
                 try std.testing.expectEqual(f.log_index, c.log);
             }
         }
+    }
+}
+
+test "per-name counts include a shared record write, under the key-only union" {
+    const allocator = std.testing.allocator;
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const nh_a = try Hash.fromHex("0x1111111111111111111111111111111111111111111111111111111111111111");
+    const nh_b = try Hash.fromHex("0x2222222222222222222222222222222222222222222222222222222222222222");
+    const tx = try Hash.fromHex("0x00000000000000000000000000000000000000000000000000000000000000ab");
+
+    // One own-name event for A, plus one shared write (nameless `events` row) that
+    // belongs to both A and B.
+    var owned = try createTestEvent(allocator, .transfer, "a.eth", "0x00000000000000000000000000000000000000000000000000000000000000cd", 100, 1000);
+    defer owned.deinit(allocator);
+    owned.namehash = nh_a;
+    try insertEvent(&database, owned);
+
+    var shared = try createTestEvent(allocator, .text_updated, "", "0x00000000000000000000000000000000000000000000000000000000000000ab", 101, 1001);
+    defer shared.deinit(allocator);
+    shared.name = null;
+    shared.namehash = null;
+    shared.log_index = 4;
+    try insertEvent(&database, shared);
+    try insertEventAttributions(&database, &.{
+        .{ .protocol = shared.protocol, .tx_hash = tx, .log_index = 4, .block_number = 101, .namehash = nh_a, .name = "a.eth" },
+        .{ .protocol = shared.protocol, .tx_hash = tx, .log_index = 4, .block_number = 101, .namehash = nh_b, .name = "b.eth" },
+    });
+
+    // The counts select from a projection narrowed to the key so the index stays
+    // covering; narrowing must not drop the attribution arm.
+    try std.testing.expectEqual(@as(usize, 2), try countEventsByNamehash(&database, nh_a));
+    try std.testing.expectEqual(@as(usize, 1), try countEventsByNamehash(&database, nh_b));
+
+    const counts = try countEventsForNamehashes(&database, &.{ nh_a, nh_b }, allocator);
+    defer allocator.free(counts);
+    try std.testing.expectEqual(@as(usize, 2), counts.len);
+    for (counts) |c| {
+        const want: usize = if (c.namehash.eql(nh_a)) 2 else 1;
+        try std.testing.expectEqual(want, c.count);
     }
 }
