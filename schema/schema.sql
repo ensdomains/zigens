@@ -742,6 +742,25 @@ CREATE INDEX IF NOT EXISTS idx_events_resource_extracted ON events (json_extract
 CREATE INDEX IF NOT EXISTS idx_events_placeholder_name ON events(name)
   WHERE name LIKE 'canonicalId:%' OR name LIKE 'tokenId:%';
 
+-- Names an event belongs to when it belongs to more than one. A write to a
+-- record-model resolver record linked to several names is one `events` row with
+-- no name (one log, one identity); each name it was linked to at that log gets a
+-- row here, keyed by the event's (protocol, tx_hash, log_index). Name-scoped event
+-- reads union these in (storage/events.zig EVENTS_BY_NAME). Insert-only.
+CREATE TABLE IF NOT EXISTS event_attributions (
+  protocol TEXT NOT NULL,
+  tx_hash TEXT NOT NULL,
+  log_index INTEGER NOT NULL,
+  block_number INTEGER NOT NULL,
+  namehash TEXT NOT NULL,
+  name TEXT,
+  UNIQUE(protocol, tx_hash, log_index, namehash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_attributions_namehash ON event_attributions(namehash);
+CREATE INDEX IF NOT EXISTS idx_event_attributions_name ON event_attributions(name);
+CREATE INDEX IF NOT EXISTS idx_event_attributions_block ON event_attributions(protocol, block_number);
+
 
 -- ============================================================================
 -- APPROVALS

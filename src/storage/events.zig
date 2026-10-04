@@ -167,6 +167,68 @@ pub fn insertEventsBatch(db: *Database, events_slice: []const models.Event) !voi
     }
 }
 
+/// One name an event belongs to beyond its own `events` row (see the
+/// event_attributions table). `name` is borrowed.
+pub const EventAttribution = struct {
+    protocol: models.Protocol,
+    tx_hash: Hash,
+    log_index: u32,
+    block_number: u64,
+    namehash: Hash,
+    name: ?[]const u8,
+};
+
+const ATTRIBUTION_COLS = [_][]const u8{ "protocol", "tx_hash", "log_index", "block_number", "namehash", "name" };
+
+/// Rows per multi-row INSERT: 6 params each, under the 999-parameter floor.
+const ATTRIBUTION_BATCH_ROWS = 150;
+
+/// Conflict-ignoring multi-row insert of event attributions, with the same
+/// keep-first in-slice dedup as `insertEventsBatch`.
+pub fn insertEventAttributions(db: *Database, rows: []const EventAttribution) !void {
+    if (rows.len == 0) return;
+
+    const DedupKey = struct { protocol: models.Protocol, tx_hash: [32]u8, log_index: u32, namehash: [32]u8 };
+    var seen = std.AutoHashMap(DedupKey, void).init(db.allocator);
+    defer seen.deinit();
+    var deduped: std.ArrayList(*const EventAttribution) = .empty;
+    defer deduped.deinit(db.allocator);
+    for (rows) |*row| {
+        const gop = try seen.getOrPut(.{ .protocol = row.protocol, .tx_hash = row.tx_hash.bytes, .log_index = row.log_index, .namehash = row.namehash.bytes });
+        if (gop.found_existing) continue;
+        try deduped.append(db.allocator, row);
+    }
+
+    var start: usize = 0;
+    while (start < deduped.items.len) {
+        const count = @min(ATTRIBUTION_BATCH_ROWS, deduped.items.len - start);
+        const chunk = deduped.items[start .. start + count];
+
+        const sql = try db.upsertMultiSql(db.allocator, "event_attributions", &ATTRIBUTION_COLS, count, .ignore);
+        defer db.allocator.free(sql);
+
+        // Declared before the Query so its hex strings outlive exec (LIFO defers).
+        var arena = std.heap.ArenaAllocator.init(db.allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+
+        var q = try Query.initCached(db, sql);
+        defer q.deinit();
+        for (chunk) |row| {
+            try q.bindTextStatic(row.protocol.toString());
+            const tx_buf = try scratch.create([66]u8);
+            try q.bindTextStatic(row.tx_hash.toHexBuf(tx_buf));
+            try q.bindInt(@intCast(row.log_index));
+            try q.bindInt64(@intCast(row.block_number));
+            const nh_buf = try scratch.create([66]u8);
+            try q.bindTextStatic(row.namehash.toHexBuf(nh_buf));
+            if (row.name) |n| try q.bindTextStatic(n) else try q.bindNull();
+        }
+        try q.exec();
+        start += count;
+    }
+}
+
 /// Direct-mode twin of the write-buffer flush repair: re-resolve
 /// placeholder-named events written in [from_block, to_block]. Phase 1 writes
 /// datastore events (ResolverUpdated) BEFORE phase 2 creates the
@@ -388,6 +450,35 @@ pub fn getRecentEventsWithOrder(db: *Database, protocol: ?models.Protocol, event
     }
 
     return events.toOwnedSlice(db.allocator);
+}
+
+/// The events table as seen by a name: every event once under its own
+/// name/namehash, plus once per event_attributions row under that row's name.
+/// Aliased `events` so the filter, sort and cursor SQL apply unchanged.
+///
+/// Only for reads that pin a single name (an equality on `namehash` or `name`):
+/// an attributed event's own row carries no name, so under such a predicate each
+/// event matches at most once. Any other read would see a shared event once per
+/// name it belongs to. Both engines push the name predicate into each arm, so
+/// each arm is an index probe.
+const EVENTS_BY_NAME =
+    "(SELECT id, event_type, protocol, block_number, tx_hash, log_index, contract_address, name, namehash, data, timestamp FROM events" ++
+    " UNION ALL SELECT e.id, e.event_type, e.protocol, e.block_number, e.tx_hash, e.log_index, e.contract_address, a.name, a.namehash, e.data, e.timestamp" ++
+    " FROM event_attributions a JOIN events e ON e.protocol = a.protocol AND e.tx_hash = a.tx_hash AND e.log_index = a.log_index) AS events";
+
+/// Name-key-only twin of `EVENTS_BY_NAME`, for COUNT reads whose ONLY predicate is
+/// the namehash. Projecting all eleven columns costs a table fetch per matching row,
+/// where the count was previously answered from the index alone; with just the key,
+/// both arms stay COVERING index scans. Valid only while the caller's WHERE touches
+/// no other column — the two per-domain count loaders below.
+const EVENTS_BY_NAME_KEYS =
+    "(SELECT namehash FROM events" ++
+    " UNION ALL SELECT a.namehash FROM event_attributions a) AS events";
+
+/// The relation a filtered read selects from: `EVENTS_BY_NAME` when the filter
+/// pins a name at its top level, the bare table otherwise.
+fn eventSource(filter: EventFilterOptions) []const u8 {
+    return if (filter.namehash != null or filter.domain != null) EVENTS_BY_NAME else "events";
 }
 
 /// Event filter options for flexible querying
@@ -680,13 +771,23 @@ pub fn countEventsBeforeCursor(
     defer db.allocator.free(sort_expr);
     const is_text_sort = filter.sort_field == .name;
 
+    const source = eventSource(filter);
+
     // Resolve the cursor row's full sort tuple (sort_value, block_number, log_index).
-    const lookup_sql = try std.fmt.allocPrint(db.allocator, "SELECT {s}, block_number, log_index FROM events WHERE tx_hash = ? AND log_index = ? LIMIT 1", .{sort_expr});
-    defer db.allocator.free(lookup_sql);
-    var lookup = try Query.init(db, lookup_sql);
+    // Under a name-pinned filter the row is looked up as that name sees it: an
+    // attributed event's own row has no name, which would sort differently.
+    var lookup_buf: std.ArrayList(u8) = .empty;
+    defer lookup_buf.deinit(db.allocator);
+    try lookup_buf.print(db.allocator, "SELECT {s}, block_number, log_index FROM {s} WHERE tx_hash = ? AND log_index = ?", .{ sort_expr, source });
+    if (filter.namehash != null) try lookup_buf.appendSlice(db.allocator, " AND namehash = ?");
+    if (filter.domain != null) try lookup_buf.appendSlice(db.allocator, " AND name = ?");
+    try lookup_buf.appendSlice(db.allocator, " LIMIT 1");
+    var lookup = try Query.init(db, lookup_buf.items);
     defer lookup.deinit();
     try lookup.bindText(tx_hash);
     try lookup.bindInt(@intCast(log_index));
+    if (filter.namehash) |nh| try lookup.bindText(nh);
+    if (filter.domain) |d| try lookup.bindText(d);
     if (!try lookup.step()) return 0;
     const cursor_sort_int: i64 = if (is_text_sort) 0 else lookup.getInt64(0);
     const cursor_sort_text: []const u8 = try db.allocator.dupe(u8, if (is_text_sort) (lookup.getTextSlice(0) orelse "") else "");
@@ -699,7 +800,7 @@ pub fn countEventsBeforeCursor(
     const op: []const u8 = if (order_dir == .desc) ">" else "<";
     var sql_buf: std.ArrayList(u8) = .empty;
     defer sql_buf.deinit(db.allocator);
-    const pred = try std.fmt.allocPrint(db.allocator, "SELECT COUNT(*) FROM events WHERE ({s} {s} ? OR ({s} = ? AND (block_number {s} ? OR (block_number = ? AND log_index {s} ?))))", .{ sort_expr, op, sort_expr, op, op });
+    const pred = try std.fmt.allocPrint(db.allocator, "SELECT COUNT(*) FROM {s} WHERE ({s} {s} ? OR ({s} = ? AND (block_number {s} ? OR (block_number = ? AND log_index {s} ?))))", .{ source, sort_expr, op, sort_expr, op, op });
     defer db.allocator.free(pred);
     try sql_buf.appendSlice(db.allocator, pred);
 
@@ -735,11 +836,10 @@ pub fn countEventsBeforeCursor(
 
 /// Get events with flexible filtering
 pub fn getEventsFiltered(db: *Database, filter: EventFilterOptions) ![]models.Event {
-    var sql_buf: [2048]u8 = undefined;
+    var sql_buf: [4096]u8 = undefined;
     var sql_len: usize = 0;
 
-    const base_sql = "SELECT event_type, protocol, block_number, tx_hash, log_index, contract_address, name, namehash, data, timestamp FROM events";
-    @memcpy(sql_buf[sql_len..][0..base_sql.len], base_sql);
+    const base_sql = try std.fmt.bufPrint(&sql_buf, "SELECT " ++ EVENT_SELECT_COLS ++ " FROM {s}", .{eventSource(filter)});
     sql_len += base_sql.len;
 
     var conditions: std.ArrayList([]const u8) = .empty;
@@ -917,7 +1017,7 @@ pub fn getEventsForNamehashesPage(db: *Database, namehashes: []const Hash, page_
         try sql.appendSlice(scratch_alloc, sort_col);
         try sql.appendSlice(scratch_alloc, dir_str);
         try sql.appendSlice(scratch_alloc, tiebreak);
-        try sql.appendSlice(scratch_alloc, ") AS rn FROM events WHERE namehash IN (");
+        try sql.appendSlice(scratch_alloc, ") AS rn FROM " ++ EVENTS_BY_NAME ++ " WHERE namehash IN (");
         for (chunk, 0..) |_, i| {
             if (i != 0) try sql.append(scratch_alloc, ',');
             try sql.append(scratch_alloc, '?');
@@ -1005,11 +1105,10 @@ pub fn insertApproval(db: *Database, protocol: models.Protocol, token_id: u256, 
 /// Get count of events with optional filters.
 /// Builds the same WHERE clause as getEventsFiltered but uses SELECT COUNT(*).
 pub fn getEventCount(db: *Database, filter: EventFilterOptions) !usize {
-    var sql_buf: [2048]u8 = undefined;
+    var sql_buf: [4096]u8 = undefined;
     var sql_len: usize = 0;
 
-    const base_sql = "SELECT COUNT(*) FROM events";
-    @memcpy(sql_buf[sql_len..][0..base_sql.len], base_sql);
+    const base_sql = try std.fmt.bufPrint(&sql_buf, "SELECT COUNT(*) FROM {s}", .{eventSource(filter)});
     sql_len += base_sql.len;
 
     var conditions: std.ArrayList([]const u8) = .empty;
@@ -1054,7 +1153,7 @@ pub fn getEventCount(db: *Database, filter: EventFilterOptions) !usize {
 
 /// Count events for a specific domain (by namehash)
 pub fn countEventsByNamehash(db: *Database, namehash: Hash) !usize {
-    var q = try Query.init(db, "SELECT COUNT(*) FROM events WHERE namehash = ?");
+    var q = try Query.init(db, "SELECT COUNT(*) FROM " ++ EVENTS_BY_NAME_KEYS ++ " WHERE namehash = ?");
     defer q.deinit();
 
     try q.bindHash(namehash);
@@ -1103,7 +1202,7 @@ pub fn countEventsForNamehashes(db: *Database, namehashes: []const Hash, allocat
         const scratch_alloc = scratch.allocator();
 
         var sql: std.ArrayList(u8) = .empty;
-        try sql.appendSlice(scratch_alloc, "SELECT namehash, COUNT(*) FROM events WHERE namehash IN (");
+        try sql.appendSlice(scratch_alloc, "SELECT namehash, COUNT(*) FROM " ++ EVENTS_BY_NAME_KEYS ++ " WHERE namehash IN (");
         for (chunk, 0..) |_, i| {
             if (i != 0) try sql.append(scratch_alloc, ',');
             try sql.append(scratch_alloc, '?');
@@ -1695,5 +1794,47 @@ test "connection pagination reproduces the full ordered result with no drops/dup
                 try std.testing.expectEqual(f.log_index, c.log);
             }
         }
+    }
+}
+
+test "per-name counts include a shared record write, under the key-only union" {
+    const allocator = std.testing.allocator;
+
+    var database = try Database.init(allocator, ":memory:");
+    defer database.deinit();
+
+    const nh_a = try Hash.fromHex("0x1111111111111111111111111111111111111111111111111111111111111111");
+    const nh_b = try Hash.fromHex("0x2222222222222222222222222222222222222222222222222222222222222222");
+    const tx = try Hash.fromHex("0x00000000000000000000000000000000000000000000000000000000000000ab");
+
+    // One own-name event for A, plus one shared write (nameless `events` row) that
+    // belongs to both A and B.
+    var owned = try createTestEvent(allocator, .transfer, "a.eth", "0x00000000000000000000000000000000000000000000000000000000000000cd", 100, 1000);
+    defer owned.deinit(allocator);
+    owned.namehash = nh_a;
+    try insertEvent(&database, owned);
+
+    var shared = try createTestEvent(allocator, .text_updated, "", "0x00000000000000000000000000000000000000000000000000000000000000ab", 101, 1001);
+    defer shared.deinit(allocator);
+    shared.name = null;
+    shared.namehash = null;
+    shared.log_index = 4;
+    try insertEvent(&database, shared);
+    try insertEventAttributions(&database, &.{
+        .{ .protocol = shared.protocol, .tx_hash = tx, .log_index = 4, .block_number = 101, .namehash = nh_a, .name = "a.eth" },
+        .{ .protocol = shared.protocol, .tx_hash = tx, .log_index = 4, .block_number = 101, .namehash = nh_b, .name = "b.eth" },
+    });
+
+    // The counts select from a projection narrowed to the key so the index stays
+    // covering; narrowing must not drop the attribution arm.
+    try std.testing.expectEqual(@as(usize, 2), try countEventsByNamehash(&database, nh_a));
+    try std.testing.expectEqual(@as(usize, 1), try countEventsByNamehash(&database, nh_b));
+
+    const counts = try countEventsForNamehashes(&database, &.{ nh_a, nh_b }, allocator);
+    defer allocator.free(counts);
+    try std.testing.expectEqual(@as(usize, 2), counts.len);
+    for (counts) |c| {
+        const want: usize = if (c.namehash.eql(nh_a)) 2 else 1;
+        try std.testing.expectEqual(want, c.count);
     }
 }
