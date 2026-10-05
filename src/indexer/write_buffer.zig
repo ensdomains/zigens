@@ -45,6 +45,9 @@ pub const WriteBuffer = struct {
 
     /// Buffered events (append-only, no deduplication needed).
     events: std.ArrayList(models.Event),
+    /// Extra names of buffered events that belong to several (see the
+    /// event_attributions table). `name` strings are owned.
+    attributions: std.ArrayList(events_storage.EventAttribution),
 
     /// Buffered EAC role assignments, keyed by the table's conflict key
     /// (protocol, resource, account, contract) — last write wins, mirroring the
@@ -192,6 +195,7 @@ pub const WriteBuffer = struct {
             .allocator = allocator,
             .names = std.AutoHashMap(NameKey, BufferedName).init(allocator),
             .events = .empty,
+            .attributions = .empty,
             .roles = std.StringHashMap(BufferedRole).init(allocator),
             .registrations = .empty,
             .registration_keys = std.StringHashMap(void).init(allocator),
@@ -208,6 +212,7 @@ pub const WriteBuffer = struct {
         self.freeAll();
         self.names.deinit();
         self.events.deinit(self.allocator);
+        self.attributions.deinit(self.allocator);
         self.roles.deinit();
         self.registrations.deinit(self.allocator);
         self.registration_keys.deinit();
@@ -222,6 +227,7 @@ pub const WriteBuffer = struct {
         self.freeAll();
         self.names.clearRetainingCapacity();
         self.events.clearRetainingCapacity();
+        self.attributions.clearRetainingCapacity();
         self.roles.clearRetainingCapacity();
         self.registrations.clearRetainingCapacity();
         self.registration_keys.clearRetainingCapacity();
@@ -244,6 +250,9 @@ pub const WriteBuffer = struct {
         for (self.events.items) |*event| {
             if (event.name) |n| self.allocator.free(n);
             self.allocator.free(event.data);
+        }
+        for (self.attributions.items) |a| {
+            if (a.name) |n| self.allocator.free(n);
         }
         // Free role keys and owned role strings
         var rit = self.roles.iterator();
@@ -502,6 +511,14 @@ pub const WriteBuffer = struct {
     /// Caller must NOT free these strings after calling addEvent.
     pub fn addEvent(self: *WriteBuffer, event: models.Event) !void {
         try self.events.append(self.allocator, event);
+    }
+
+    /// Buffer an event attribution. Dupes `attribution.name`.
+    pub fn addEventAttribution(self: *WriteBuffer, attribution: events_storage.EventAttribution) !void {
+        var owned = attribution;
+        owned.name = if (attribution.name) |n| try self.allocator.dupe(u8, n) else null;
+        errdefer if (owned.name) |n| self.allocator.free(n);
+        try self.attributions.append(self.allocator, owned);
     }
 
     // ========================================================================
@@ -1048,6 +1065,7 @@ pub const WriteBuffer = struct {
         // 3. Flush events — one multi-row conflict-ignoring INSERT per chunk.
         const events_timer = zsys.milliTimestamp();
         try events_storage.insertEventsBatch(db, self.events.items);
+        try events_storage.insertEventAttributions(db, self.attributions.items);
         const events_ms = zsys.milliTimestamp() - events_timer;
         const wal_after = db.walFileSize() orelse wal_before;
 

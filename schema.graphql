@@ -925,10 +925,10 @@ type Event {
   """Contract address that emitted the event"""
   contractAddress: String!
 
-  """Name affected by this event"""
+  """Name affected by this event. Record-resolver writes carry the name linked to the record when they were made, and only while that name used the resolver. A write to a record linked to several names has no name here, but appears under each of them when events are filtered by `namehash` or `domain`, and carries that name there."""
   name: String
 
-  """Namehash of the name"""
+  """Namehash of the name. Follows the same rules as `name`."""
   namehash: String
 
   """Domain associated with this event (if applicable)"""
@@ -1207,7 +1207,7 @@ input EventFilter {
   """
   involved: String
 
-  """Filter by namehash"""
+  """Filter by namehash. Includes record-resolver writes shared with other names."""
   namehash: String
 
   """Filter by block number greater than"""

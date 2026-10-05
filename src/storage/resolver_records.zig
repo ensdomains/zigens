@@ -318,6 +318,49 @@ pub const LinkedName = struct {
 
 /// Every name currently bound to `record_id` on `resolver` (the sharing view;
 /// the default-record binding to node 0x0 is included with its empty name).
+/// The namehashes linked to `record_id` on `resolver` whose own `names` row still
+/// points at that same resolver — exactly the set a write to that record belongs to.
+///
+/// ONE query, rather than `getLinkedNames` followed by a resolver lookup per link.
+/// The eligibility test *is* `names.resolver = resolver_links.resolver`, so the join
+/// expresses it directly and both sides stay index probes
+/// (`idx_resolver_links_record`, and `names` UNIQUE(protocol, namehash)). A record
+/// write is the hottest event class on a record-model deployment, so the per-link
+/// round-trip it replaces was multiplying the cost of every one of them.
+///
+/// A NULL or zero `names.resolver` simply fails the join, which is the same answer
+/// the per-link check gave. `bytes32(0)` is skipped: that is the resolver-wide
+/// default record's node, which belongs to no single name.
+pub fn getLinkedNamesUsingResolver(
+    db: *Database,
+    allocator: std.mem.Allocator,
+    protocol: models.Protocol,
+    resolver: Address,
+    record_id: u256,
+) ![]Hash {
+    try db.namesBarrier();
+    var q = try Query.initCached(db,
+        \\SELECT l.namehash FROM resolver_links l
+        \\JOIN names n ON n.protocol = ? AND n.namehash = l.namehash AND n.resolver = l.resolver
+        \\WHERE l.resolver = ? AND l.record_id = ?
+        \\ORDER BY l.block_number ASC, l.log_index ASC
+    );
+    defer q.deinit();
+    try q.bindTextStatic(protocol.toString());
+    try q.bindAddress(resolver);
+    var id_buf: [66]u8 = undefined;
+    try q.bindText(recordIdHex(record_id, &id_buf));
+
+    var out: std.ArrayList(Hash) = .empty;
+    errdefer out.deinit(allocator);
+    while (try q.step()) {
+        const nh = Hash.fromHex(q.getTextSlice(0) orelse continue) catch continue;
+        if (nh.isZero()) continue;
+        try out.append(allocator, nh);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 pub fn getLinkedNames(db: *Database, allocator: std.mem.Allocator, resolver: Address, record_id: u256) ![]LinkedName {
     var q = try Query.initCached(db,
         \\SELECT name, namehash, record_id, block_number FROM resolver_links

@@ -1556,6 +1556,7 @@ const RECONCILE_TABLES = [_][]const u8{
     "resolver_dns_records", "resolver_dns_zonehashes", "resolver_authorisations", "reverse_records",
     "approvals",            "eac_roles",               "accounts",                "v1_controllers",
     "name_history",         "resolver_datas",          "resolver_links",          "resolver_named_resources",
+    "event_attributions",
 };
 
 // Volatile columns excluded from the content comparison: the autoincrement id (insertion
@@ -1664,6 +1665,16 @@ fn applyReconcileBaseline(allocator: std.mem.Allocator, db: *Database) !void {
 
     try lib.storage.reorg_undo.setCursor(db, .v2, 140);
     try db.insertRegistration(.v2, nh_foo, "foo", "eth", a, 1700000140, 0, 140, tx, 0, .name_registered);
+
+    // A shared record write at ≤ N: one `events` row with no name of its own plus an
+    // event_attributions row per name it belonged to. Without a row on BOTH sides of N
+    // this table was in RECONCILE_TABLES while being empty in both databases, so its
+    // rollback was listed rather than tested.
+    try lib.storage.reorg_undo.setCursor(db, .v2, 145);
+    try db.insertEventAttributions(&.{
+        .{ .protocol = .v2, .tx_hash = tx, .log_index = 7, .block_number = 145, .namehash = nh_foo, .name = "foo.eth" },
+        .{ .protocol = .v2, .tx_hash = tx, .log_index = 7, .block_number = 145, .namehash = try namehash(allocator, "kept.eth"), .name = "kept.eth" },
+    });
 }
 
 // Mutations after N=150 — must be fully reversed by the rollback.
@@ -1687,6 +1698,13 @@ fn applyReconcileReorged(allocator: std.mem.Allocator, db: *Database) !void {
     try db.insertName(bar);
     try db.insertRegistration(.v2, nh_bar, "bar", "eth", a, 1700000200, 0, 200, tx, 1, .name_registered); // new reg (remove)
     try db.upsertReverseRecord(.v2, a, nh_bar, 200, tx, 0, 1700000200); // reverse overwrite (revert to foo)
+
+    // A shared record write after N: insert-only, so the by-block delete must remove
+    // both of its rows and leave the ≤ N pair from the baseline untouched.
+    try db.insertEventAttributions(&.{
+        .{ .protocol = .v2, .tx_hash = tx, .log_index = 9, .block_number = 200, .namehash = nh_foo, .name = "foo.eth" },
+        .{ .protocol = .v2, .tx_hash = tx, .log_index = 9, .block_number = 200, .namehash = nh_bar, .name = "bar.eth" },
+    });
 
     try lib.storage.reorg_undo.setCursor(db, .v1, 210);
     try lib.storage.v1_controllers.removeController(db, c1, 210, txs); // remove (revert to active)

@@ -59,6 +59,7 @@ pub const getNameByNamehash = names_read.getNameByNamehash;
 pub const getNameStringByNamehash = names_read.getNameStringByNamehash;
 pub const getNameByNamehashAndProtocol = names_read.getNameByNamehashAndProtocol;
 pub const getNamehashByResolver = names_read.getNamehashByResolver;
+pub const getNameResolver = names_read.getNameResolver;
 pub const getNameByTokenIdAndRegistry = names_read.getNameByTokenIdAndRegistry;
 pub const getUniqueNameByCanonicalId = names_read.getUniqueNameByCanonicalId;
 pub const getNamesByCanonicalIds = names_read.getNamesByCanonicalIds;
