@@ -455,8 +455,8 @@ pub const Indexer = struct {
 
     // Helper methods to eliminate protocol-specific conditionals
     pub inline fn getEthRegistry(self: *Indexer, protocol: models.Protocol) Address {
-        // Both V1 and V2 indexers use the same V2 ETH registry address (Sepolia aliases
-        // L1-side and L2-side to one deployment; mainnet has no V2 yet — zero address).
+        // Both V1 and V2 indexers use the same V2 ETH registry address (Sepolia and
+        // mainnet each alias L1-side and L2-side to one deployment).
         _ = protocol;
         return self.config.v2_contracts.eth_registry;
     }

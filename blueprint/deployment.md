@@ -63,10 +63,8 @@ identical projections on both.
 
 ## Network notes
 
-- **Sepolia** indexes ENS V1 and V2.
-- **Mainnet** is V1-only today: ENS V2 is not deployed there, so the V2
-  contract addresses are zero and V2 indexing is inert until a mainnet
-  deployment is added to the manifest.
+- **Sepolia** and **mainnet** both index ENS V1 and V2. Mainnet V2 indexing
+  starts at the October 2026 deployment (block 26105294).
 - Label healing uses a rainbow table (~6 GB). Containers running the combined
   or V1 indexer download it on first start (`DOWNLOAD_RAINBOW=true`) or reuse a
   copy via `RAINBOW_PATH`; the V2-only indexer (what
