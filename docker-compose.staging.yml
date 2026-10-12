@@ -45,7 +45,14 @@ services:
       # SQLite. Backend is inferred from the URL scheme; the image is built with
       # -Dpg-tls=true so a `?sslmode=require` Neon URL negotiates TLS.
       - DATABASE_BACKEND=${DATABASE_BACKEND:-}
-      - DATABASE_URL=${DATABASE_URL:-}
+      # The WRITER keeps a DIRECT (session-mode) connection. The unnamed-statement
+      # hazard that forced this is gone (see the reader below — the driver names every
+      # statement now), but the indexer's full workload has not been validated behind a
+      # pooler, so this stays direct until it is. Multi-statement transactions are fine
+      # either way — a transaction-mode pooler pins one backend for the transaction —
+      # and session state is pooler-dependent: pgbouncer drops a connection-scoped SET,
+      # PgDog virtualises it. INDEXER_DATABASE_URL overrides DATABASE_URL here.
+      - DATABASE_URL=${INDEXER_DATABASE_URL:-${DATABASE_URL:-}}
       - DATABASE_POOL_SIZE=${DATABASE_POOL_SIZE:-8}
       # Postgres only: bound per-statement runtime (seconds) so a stuck query fails
       # loudly instead of hanging forever; 0 disables. Raise for heavy bulk reindexes.
@@ -56,7 +63,6 @@ services:
       - DATABASE_SYNCHRONOUS_COMMIT=${DATABASE_SYNCHRONOUS_COMMIT:-}
       # Postgres only: reuse server-side prepared statements (big win on remote DBs);
       # set to 0 to disable if it ever misbehaves.
-      - DATABASE_STMT_CACHE=${DATABASE_STMT_CACHE:-1}
       - RAINBOW_PATH=/app/data/ens_rainbow.db
       - DOWNLOAD_RAINBOW=true
       - RPC_URL=${RPC_URL}
@@ -117,7 +123,17 @@ services:
       # SQLite. Backend is inferred from the URL scheme; the image is built with
       # -Dpg-tls=true so a `?sslmode=require` Neon URL negotiates TLS.
       - DATABASE_BACKEND=${DATABASE_BACKEND:-}
-      - DATABASE_URL=${DATABASE_URL:-}
+      # The READER may be POOLED on stock pooler settings. Every statement the driver
+      # prepares is now named; it never uses the unnamed slot, whose Parse and Bind a
+      # transaction-mode pooler could serve from different backends (SQLSTATE
+      # 08P01/26000 — and silently WRONG ROWS when the two statements took the same
+      # number of parameters). MEASURED with this service's binary, 320 concurrent
+      # requests through PgDog 0.1.26 in transaction mode with no pooler tuning:
+      # 176 failed before the change, 0 after. The requirement that remains is that the
+      # pooler track NAMED prepared statements — PgDog does by default; pgbouncer needs
+      # max_prepared_statements > 0 (its default is 0).
+      # API_DATABASE_URL overrides DATABASE_URL for this service.
+      - DATABASE_URL=${API_DATABASE_URL:-${DATABASE_URL:-}}
       - DATABASE_POOL_SIZE=${DATABASE_POOL_SIZE:-8}
       # Postgres only: bound per-statement runtime (seconds) so a stuck query fails
       # loudly instead of hanging forever; 0 disables. Raise for heavy bulk reindexes.
@@ -128,7 +144,6 @@ services:
       - DATABASE_SYNCHRONOUS_COMMIT=${DATABASE_SYNCHRONOUS_COMMIT:-}
       # Postgres only: reuse server-side prepared statements (big win on remote DBs);
       # set to 0 to disable if it ever misbehaves.
-      - DATABASE_STMT_CACHE=${DATABASE_STMT_CACHE:-1}
       - RAINBOW_PATH=/app/data/ens_rainbow.db
       - DOWNLOAD_RAINBOW=false
       - API_PORT=5656

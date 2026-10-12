@@ -44,6 +44,7 @@ full surface. The ones that matter first:
 | `NETWORK` | `sepolia` or `mainnet` |
 | `DATABASE_PATH` | SQLite file (default backend) |
 | `DATABASE_URL` | `postgres://…` — switches the backend to PostgreSQL |
+| `INDEXER_DATABASE_URL` / `API_DATABASE_URL` | Per-service override of `DATABASE_URL`; both default to it |
 | `START_BLOCK` | First block on a *fresh* database (default: the network's V1 deployment block; ignored once sync state exists — use `--from-block` to re-index) |
 | `API_PORT` | API listen port (default 8080) |
 | `RATE_LIMIT_PER_SECOND` | Indexer's outbound RPC budget, and the API's per-IP request limit (default 15) |
@@ -55,8 +56,23 @@ full surface. The ones that matter first:
 - **SQLite** (default): zero dependencies, one file, ideal for single-node
   deployments. Use `SQLITE_JOURNAL_MODE=DELETE` on network/FUSE filesystems.
 - **PostgreSQL**: for managed infrastructure. TLS is built into the image
-  (`sslmode=require` in the URL); connect the indexer to the **direct**
-  endpoint of pooled providers, not the transaction-mode pooler.
+  (`sslmode=require` in the URL). The **API can run pooled** on stock pooler settings:
+  the driver names every prepared statement, so it no longer depends on the unnamed slot
+  whose Parse and Bind a transaction-mode pooler could serve from different backends.
+  Measured with the API binary, 320 concurrent requests through PgDog 0.1.26 in
+  transaction mode with no tuning: **176 failed before that change, 0 after**. The
+  failure mode was SQLSTATE 08P01/26000 — and, when two colliding statements took the
+  same parameter count, silently wrong rows rather than an error. What still matters is
+  that the pooler track **named** prepared statements: PgDog does by default, pgbouncer
+  needs `max_prepared_statements > 0` (default 0). Keep the **indexer** on the direct
+  endpoint for now — the hazard that forced it is gone, but its full workload has not
+  been validated behind a pooler. Whether a connection-scoped `SET` (e.g.
+  `statement_timeout`) survives is a separate, pooler-specific question: pgbouncer drops
+  it, PgDog virtualises it. Put the timeout where neither can lose it — on the role, or
+  enforced by the pooler per user. `INDEXER_DATABASE_URL` and `API_DATABASE_URL` override
+  `DATABASE_URL` per service if you need them to differ. There is a best-effort startup
+  probe, but it only sees the session-state half and stays quiet on poolers that
+  virtualise session parameters (PgDog does) — so silence is not a clean bill of health.
 
 Whichever you pick, the data is equivalent — the rebuild command produces
 identical projections on both.
