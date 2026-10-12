@@ -20,7 +20,9 @@ pub fn backfillPreMigrationNames(self: *Indexer) !void {
             return;
         };
         defer check_q.deinit();
-        if (try check_q.step()) {
+        // Best effort, like the init above: on Postgres a missing/!readable table
+        // surfaces when the statement runs (Parse travels with Execute), not at init.
+        if (check_q.step() catch false) {
             if (check_q.getInt(0) == 1) {
                 std.log.info("Pre-migration names backfill already completed, skipping", .{});
                 return;

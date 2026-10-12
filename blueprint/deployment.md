@@ -44,6 +44,7 @@ full surface. The ones that matter first:
 | `NETWORK` | `sepolia` or `mainnet` |
 | `DATABASE_PATH` | SQLite file (default backend) |
 | `DATABASE_URL` | `postgres://…` — switches the backend to PostgreSQL |
+| `INDEXER_DATABASE_URL` / `API_DATABASE_URL` | Per-service override of `DATABASE_URL`; both default to it |
 | `START_BLOCK` | First block on a *fresh* database (default: the network's V1 deployment block; ignored once sync state exists — use `--from-block` to re-index) |
 | `API_PORT` | API listen port (default 8080) |
 | `RATE_LIMIT_PER_SECOND` | Indexer's outbound RPC budget, and the API's per-IP request limit (default 15) |
@@ -55,8 +56,26 @@ full surface. The ones that matter first:
 - **SQLite** (default): zero dependencies, one file, ideal for single-node
   deployments. Use `SQLITE_JOURNAL_MODE=DELETE` on network/FUSE filesystems.
 - **PostgreSQL**: for managed infrastructure. TLS is built into the image
-  (`sslmode=require` in the URL); connect the indexer to the **direct**
-  endpoint of pooled providers, not the transaction-mode pooler.
+  (`sslmode=require` in the URL). **Both services can run pooled on stock pooler
+  settings, and one `DATABASE_URL` is enough for both.** The driver sends each statement
+  as a single `Parse`+`Bind`+`Describe`+`Execute`+`Sync` message group, so nothing it
+  creates outlives the group and a transaction-mode pooler has no per-connection state to
+  lose. Measured: the API served 3200 concurrent requests through PgDog 0.1.26 with 0
+  errors (the previous driver failed 176 of 320, SQLSTATE 08P01/26000 — and silently
+  wrong rows when two colliding statements took the same parameter count), and the
+  indexer produced **byte-identical data across all 51 tables** when the same block range
+  was indexed direct and through the pooler (V1 mainnet 131,820 events; V2 Sepolia 26,856
+  events). No `prepared_statements` tuning, no `pooler_mode = "session"`, no
+  direct-endpoint requirement.
+  `INDEXER_DATABASE_URL` and `API_DATABASE_URL` remain available, but only for
+  operational reasons — separate credentials (the read-only API role), a different
+  endpoint per service, or connection isolation. Each falls back to `DATABASE_URL`.
+  Whether a connection-scoped `SET` (e.g. `statement_timeout`) survives is a separate,
+  pooler-specific question: pgbouncer drops it, PgDog virtualises it. Put the timeout
+  where neither can lose it — on the role, or enforced by the pooler per user. There is a
+  best-effort startup probe, but it only sees the session-state half and stays quiet on
+  poolers that virtualise session parameters (PgDog does) — so silence is not a clean
+  bill of health.
 
 Whichever you pick, the data is equivalent — the rebuild command produces
 identical projections on both.

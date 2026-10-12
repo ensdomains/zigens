@@ -1702,13 +1702,20 @@ test "migrate adds the generated expiry_effective column to a legacy names table
     try seedExpiryShapes(allocator, database);
     try stripExpiryEffective(database);
 
-    // The column is named in LIVE query SQL, so a pre-migration database fails
-    // every expiryDate filter outright — not just the index rebuild.
-    if (database.getFilteredNames(.{ .expiry_date_gt = 0 }, 0, 100, .asc, .name)) |rows| {
-        for (rows) |*n| n.deinit(allocator);
-        allocator.free(rows);
-        return error.ExpectedMissingColumnBeforeMigrate;
-    } else |_| {}
+    // The column is named in LIVE query SQL, so a pre-migration database fails every
+    // expiryDate filter outright — not just the index rebuild. Asserted on the column
+    // reference itself through the RAW vtable, which reports failure as a value: routing
+    // it through getFilteredNames would emit the err-level "Failed to step query" log
+    // that the default test runner counts as a test failure. SQLite rejects the SQL in
+    // prepare; Postgres sends Parse with Execute, so it fails on the first step.
+    {
+        const be = database.backend;
+        if (be.vtable.prepare(be.ptr, "SELECT expiry_effective FROM names LIMIT 1", false)) |stmt| {
+            var st = stmt;
+            defer st.deinit();
+            try testing.expectEqual(lib.storage.backend.StepOutcome.failed, st.vtable.step(st.ctx));
+        } else |_| {}
+    }
 
     try database.migrate();
     try testing.expect(database.columnExistsIncludingGenerated("names", "expiry_effective"));
