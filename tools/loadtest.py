@@ -333,7 +333,7 @@ def build_shapes(c: Corpus):
         q = """query($id:String!){ domain(id:$id){
             name eventsCount
             events(first:20, orderBy:blockNumber, orderDirection:desc){
-                id type blockNumber timestamp transactionID } } }"""
+                id type blockNumber timestamp transactionHash } } }"""
         return q, {"id": name()}
 
     # "Recently registered" feed.
