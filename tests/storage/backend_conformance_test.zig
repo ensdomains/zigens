@@ -622,10 +622,21 @@ test "prepare of invalid SQL fails with an error, not a crash" {
     const database = try helpers.createTestDatabase(allocator);
     defer helpers.destroyTestDatabase(allocator, database);
 
-    if (database.prepare("SELECT FROM WHERE !!")) |stmt| {
-        var q = stmt;
-        q.deinit();
-        return error.TestUnexpectedResult;
+    // Backends may reject invalid SQL at either point: SQLite parses in prepare, while
+    // the Postgres driver sends Parse in the same message group as Bind and Execute (so
+    // nothing it creates outlives the group — the property that makes it safe behind a
+    // transaction pooler), which puts the syntax error on the first step. What both must
+    // guarantee is an error rather than a crash, and a still-usable connection after it.
+    //
+    // Driven through the RAW vtable, which reports failure as a value and leaves logging
+    // to the Statement wrapper: an expected failure must not emit the err-level log that
+    // the default test runner counts as a test failure (the same reason the driver's
+    // prepare path logs at warn).
+    const be = database.backend;
+    if (be.vtable.prepare(be.ptr, "SELECT FROM WHERE !!", false)) |stmt| {
+        var st = stmt;
+        defer st.deinit();
+        try testing.expectEqual(backend_mod.StepOutcome.failed, st.vtable.step(st.ctx));
     } else |_| {}
 
     // The connection must remain usable after a failed prepare.

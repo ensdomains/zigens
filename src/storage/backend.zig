@@ -151,6 +151,10 @@ pub fn freeColumnInfo(allocator: std.mem.Allocator, cols: []ColumnInfo) void {
 pub const VTable = struct {
     close: *const fn (ctx: *anyopaque) void,
     execRaw: *const fn (ctx: *anyopaque, sql: []const u8) anyerror!void,
+    /// Prepare a statement. A backend MAY defer SQL validation to the first
+    /// step/exec: the Postgres driver sends Parse together with Bind and Execute in one
+    /// message group, so a syntax or missing-relation error surfaces there rather than
+    /// here. Callers that tolerate a failed prepare must tolerate a failed first step.
     prepare: *const fn (ctx: *anyopaque, sql: []const u8, cached: bool) anyerror!Statement,
     begin: *const fn (ctx: *anyopaque, mode: TxMode) anyerror!void,
     commit: *const fn (ctx: *anyopaque) anyerror!void,
