@@ -33,13 +33,16 @@ services:
       # SQLite. Compose only forwards variables a service lists here, so without
       # these two the container never sees them and silently falls back to SQLite.
       - DATABASE_BACKEND=${DATABASE_BACKEND:-}
-      # The WRITER keeps a DIRECT (session-mode) connection. The unnamed-statement
-      # hazard that forced this is gone (see the reader below — the driver names every
-      # statement now), but the indexer's full workload has not been validated behind a
-      # pooler, so this stays direct until it is. Multi-statement transactions are fine
-      # either way — a transaction-mode pooler pins one backend for the transaction —
-      # and session state is pooler-dependent: pgbouncer drops a connection-scoped SET,
-      # PgDog virtualises it. INDEXER_DATABASE_URL overrides DATABASE_URL here.
+      # Pooled or direct — both work. The driver sends each statement as one
+      # Parse+Bind+Describe+Execute+Sync group, so nothing it creates outlives the group
+      # and a transaction-mode pooler has no per-connection state to lose. MEASURED:
+      # indexing the same block range direct and through PgDog 0.1.26 on stock settings
+      # produced byte-identical data across all 51 tables (V1 mainnet 131,820 events;
+      # V2 sepolia 26,856 events). Session state is still pooler-dependent (pgbouncer
+      # drops a connection-scoped SET, PgDog virtualises it), so put a statement_timeout
+      # on the role or in the pooler rather than relying on SET. INDEXER_DATABASE_URL
+      # overrides DATABASE_URL here, and is only needed to give this service its own
+      # credentials or endpoint — one shared DATABASE_URL is enough.
       - DATABASE_URL=${INDEXER_DATABASE_URL:-${DATABASE_URL:-}}
       - RAINBOW_PATH=/app/data/ens_rainbow.db
       - DOWNLOAD_RAINBOW=true
@@ -95,16 +98,14 @@ services:
       # SQLite. Compose only forwards variables a service lists here, so without
       # these two the container never sees them and silently falls back to SQLite.
       - DATABASE_BACKEND=${DATABASE_BACKEND:-}
-      # The READER may be POOLED on stock pooler settings. Every statement the driver
-      # prepares is now named; it never uses the unnamed slot, whose Parse and Bind a
-      # transaction-mode pooler could serve from different backends (SQLSTATE
-      # 08P01/26000 — and silently WRONG ROWS when the two statements took the same
-      # number of parameters). MEASURED with this service's binary, 320 concurrent
-      # requests through PgDog 0.1.26 in transaction mode with no pooler tuning:
-      # 176 failed before the change, 0 after. The requirement that remains is that the
-      # pooler track NAMED prepared statements — PgDog does by default; pgbouncer needs
-      # max_prepared_statements > 0 (its default is 0).
-      # API_DATABASE_URL overrides DATABASE_URL for this service.
+      # Pooled or direct — same single message group as the writer above, so no
+      # prepared statement or portal outlives it. MEASURED with this service's binary:
+      # 3200 concurrent requests through PgDog 0.1.26 in transaction mode, stock
+      # settings, 0 errors — where the previous split-round-trip driver failed 176 of
+      # 320 with SQLSTATE 08P01/26000 (and silently wrong rows whenever two colliding
+      # statements took the same parameter count). API_DATABASE_URL overrides
+      # DATABASE_URL here, and is only needed for separate credentials (e.g. the
+      # read-only role in .env.example), not for correctness.
       - DATABASE_URL=${API_DATABASE_URL:-${DATABASE_URL:-}}
       - RAINBOW_PATH=/app/data/ens_rainbow.db
       - DOWNLOAD_RAINBOW=false
