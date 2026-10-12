@@ -92,7 +92,6 @@ const PgConn = struct {
     threaded: *std.Io.Threaded,
     pool: *pg.Pool,
     conn: *pg.Conn, // single writer connection, pinned for this Backend's lifetime
-    stmt_cache: bool, // reuse server-side prepared statements (DATABASE_STMT_CACHE)
 };
 
 /// Parse `postgres://[user[:password]@]host[:port]/database[?...]` into ConnectOpts.
@@ -166,24 +165,80 @@ fn statementTimeoutSecs(allocator: std.mem.Allocator) u32 {
     return std.fmt.parseInt(u32, std.mem.trim(u8, v, " \t\r\n"), 10) catch 120;
 }
 
-// Server-side prepared-statement reuse (see preparePossiblyCached). On by default; set
-// DATABASE_STMT_CACHE=0/false/off to disable (kill-switch — it reaches into pinned
-// pg.zig internals). Caps the per-connection cache so dynamically-built cached SQL can't
-// grow it unbounded; beyond the cap, statements fall back to one-shot prepares.
-const MAX_CACHED_STMTS: usize = 1024;
-
-fn stmtCacheEnabled(allocator: std.mem.Allocator) bool {
-    const v = zsys.getEnvOwned(allocator, "DATABASE_STMT_CACHE") catch return true;
-    defer allocator.free(v);
-    const t = std.mem.trim(u8, v, " \t\r\n");
-    return !(std.ascii.eqlIgnoreCase(t, "0") or std.ascii.eqlIgnoreCase(t, "false") or std.ascii.eqlIgnoreCase(t, "off"));
-}
-
 // synchronous_commit knob: bulk indexing can trade per-commit WAL durability for speed on
 // a remote/managed PG. DATABASE_SYNCHRONOUS_COMMIT = on|off|local|remote_write|remote_apply;
 // unset/blank leaves the server default (on). Safe for an indexer — it re-syncs from the
 // chain on restart, so a lost just-committed batch is simply re-indexed. Returns a static
 // (canonical) slice so it needs no ownership; null = don't touch the setting.
+/// Whether a statement timeout is actually in force on this connection.
+///
+/// `applySessionSettings` issues `SET statement_timeout` ONCE per connection. A pooler
+/// that does not carry connection-scoped settings across its multiplexing loses that SET,
+/// and then no timeout is in force at all. Reading the value back in a SEPARATE statement
+/// detects exactly that — and ONLY that; see `warnIfSessionStateIsLost` for why it is not
+/// a general "am I pooled" test.
+///
+/// Tests "in effect at all" rather than the exact value: `SHOW` normalises units
+/// (30000 -> "30s"), so comparing the number back would be brittle. Null means the probe
+/// itself could not run — it never decides anything on its own.
+///
+/// NOTE the interaction with either recommended fix. Both ways of making the timeout
+/// pooler-proof — setting it on the role (`ALTER ROLE ... SET statement_timeout`, applied
+/// by the server at connection time) or having the pooler enforce it (PgDog's per-user
+/// `statement_timeout` in users.toml) — leave a timeout in force regardless of whether the
+/// connection-scoped SET survived. This probe then stays quiet. That is the correct answer
+/// to the question it asks, so the fix RETIRES the probe rather than complementing it; it
+/// is only informative while the timeout still rides on `applySessionSettings`.
+fn statementTimeoutInEffect(self: *PgConn) ?bool {
+    // Runs through the same single-group path as everything else, so the probe cannot be
+    // the thing that leaves this pinned connection mid-response. Best effort: any failure
+    // (a pooler that intercepts or rejects `SHOW`, for instance) reports "unknown".
+    var affected: i64 = 0;
+    const rows = runStatementGroup(self, self.allocator, "SHOW statement_timeout", &.{}, "", &affected) catch return null;
+    defer freeRows(self.allocator, rows);
+    if (rows.len == 0 or rows[0].len == 0) return null;
+    const got = switch (rows[0][0]) {
+        .text => |t| t,
+        else => return null,
+    };
+    const t = std.mem.trim(u8, got, " \t");
+    return !(t.len == 0 or std.mem.eql(u8, t, "0"));
+}
+
+/// Say so, loudly, when session state does not survive between statements.
+///
+/// BEST EFFORT, AND SILENCE PROVES NOTHING. Measured against PgDog 0.1.60 in
+/// `pooler_mode = "transaction"`: six concurrent clients multiplexed onto ONE server
+/// connection each saw their own `SET statement_timeout` persist, so PgDog virtualises
+/// session parameters and this probe stays quiet on it. It fires for a pooler that does
+/// NOT track them (pgbouncer in transaction mode without `track_extra_parameters`), which
+/// is worth catching but is not the dangerous case here.
+///
+/// It says nothing about prepared statements, which is the OTHER pooling hazard and the
+/// one that actually bites. MEASURED end to end with this binary, 320 concurrent
+/// requests per configuration: direct Postgres 320 ok / 0 errors; PgDog 0.1.26 in
+/// transaction mode on its default `prepared_statements` (extended) 207 failed with
+/// SQLSTATE 08P01 ("bind message supplies N parameters, but prepared statement \"\"
+/// requires M") and 26000; `extended_anonymous` 320 ok; `full` 289 failed; session mode
+/// 320 ok. That was the UNNAMED statement, and `preparePossiblyCached` no longer uses it
+/// — every statement is named, which took the same workload to 0 failures on the pooler's
+/// default settings. Kept in this comment because no boot probe can see any of it, and
+/// because one requirement survives: the pooler must track NAMED statements (PgDog does
+/// by default; pgbouncer needs max_prepared_statements > 0).
+/// Separately, that slot also dies on a DIRECT connection if a simple query runs between
+/// a prepare and its bind (begin/commit/rollback, exec with no parameters, SET, SHOW).
+/// Non-fatal by design: a diagnostic must not be the reason a service cannot boot.
+fn warnIfSessionStateIsLost(allocator: std.mem.Allocator, self: *PgConn) void {
+    if (statementTimeoutSecs(allocator) == 0) return; // nothing was set; nothing to verify
+    const in_effect = statementTimeoutInEffect(self) orelse return;
+    if (in_effect) return;
+    std.log.err("postgres: `SET statement_timeout` did not survive to the next statement — " ++
+        "this connection is behind a pooler that does not carry session state across " ++
+        "statements. NO statement timeout is in force. Set it where the connection cannot " ++
+        "lose it: on the role (ALTER ROLE <user> SET statement_timeout), or enforced by the " ++
+        "pooler per user, or point this service at the DIRECT / session-mode endpoint.", .{});
+}
+
 fn synchronousCommitSetting(allocator: std.mem.Allocator) ?[]const u8 {
     const v = zsys.getEnvOwned(allocator, "DATABASE_SYNCHRONOUS_COMMIT") catch return null;
     defer allocator.free(v);
@@ -247,8 +302,11 @@ pub fn open(allocator: std.mem.Allocator, opts: ConnectOpts) !backend.Backend {
         .threaded = threaded,
         .pool = pool,
         .conn = conn,
-        .stmt_cache = stmtCacheEnabled(allocator),
     };
+
+    // After the Backend exists: the probe runs its query through the same single-group
+    // path as everything else, which needs the connection wrapper, not the raw handle.
+    warnIfSessionStateIsLost(allocator, self);
 
     return backend.Backend{ .ptr = self, .vtable = &vtable, .dialect = &pg_dialect_mod.pg_dialect, .caps = capabilities };
 }
@@ -318,6 +376,13 @@ fn isConnectionDead(err: anyerror) bool {
 fn reviveConnection(self: *PgConn, err: anyerror) void {
     if (!isConnectionDead(err)) return;
     std.log.warn("postgres: pinned connection lost ({}); reconnecting", .{err});
+    replaceConnection(self);
+}
+
+/// Replace the pinned connection unconditionally. Used both for a dead socket and for a
+/// connection whose PROTOCOL state is unknown — one whose reply was not fully consumed is
+/// unusable, because the next statement would read this one's tail as its own result.
+fn replaceConnection(self: *PgConn) void {
     // Mark the corpse failed so pool.release destroys it and provisions a
     // replacement instead of returning it to the free list. Release BEFORE
     // acquire: the pool is size 1 (single pinned writer), so acquiring while
@@ -440,8 +505,10 @@ fn introspectColumns(ctx: *anyopaque, allocator: std.mem.Allocator, table: []con
         \\WHERE c.table_name = $1 AND c.table_schema = COALESCE(current_schema(), 'public')
         \\ORDER BY c.ordinal_position
     ;
-    var result = try self.conn.query(sql, .{table});
-    defer result.deinit();
+    var affected: i64 = 0;
+    const lens = [_]i32{@intCast(table.len)};
+    const rows = try runStatementGroup(self, allocator, sql, &lens, table, &affected);
+    defer freeRows(allocator, rows);
 
     var list: std.ArrayList(ColumnInfo) = .empty;
     errdefer {
@@ -451,83 +518,248 @@ fn introspectColumns(ctx: *anyopaque, allocator: std.mem.Allocator, table: []con
         }
         list.deinit(allocator);
     }
-    while (try result.next()) |row| {
-        const name = try allocator.dupe(u8, try row.get([]const u8, 0));
+    for (rows) |row| {
+        if (row.len < 4) return error.InvalidMessageFormat;
+        const name = try allocator.dupe(u8, textOf(row[0]) orelse return error.InvalidMessageFormat);
         errdefer allocator.free(name);
-        const sql_type = try allocator.dupe(u8, try row.get([]const u8, 1));
+        const sql_type = try allocator.dupe(u8, textOf(row[1]) orelse return error.InvalidMessageFormat);
         errdefer allocator.free(sql_type);
         // information_schema.columns.is_generated is 'ALWAYS' for GENERATED columns,
         // 'NEVER' otherwise. (SQLite's table_info omits generated columns entirely.)
-        const is_generated = std.mem.eql(u8, try row.get([]const u8, 3), "ALWAYS");
-        try list.append(allocator, .{ .name = name, .sql_type = sql_type, .pk_pos = try row.get(i64, 2), .is_generated = is_generated });
+        const is_generated = std.mem.eql(u8, textOf(row[3]) orelse "", "ALWAYS");
+        try list.append(allocator, .{
+            .name = name,
+            .sql_type = sql_type,
+            .pk_pos = switch (row[2]) {
+                .int => |i| i,
+                else => 0,
+            },
+            .is_generated = is_generated,
+        });
     }
     return list.toOwnedSlice(allocator);
 }
 
-// Reuse server-side prepared statements for `cached` queries, keyed by a hash of the
-// (already `?`→`$N` renumbered) SQL in pg.zig's per-connection cache. A cache HIT skips
-// the Parse+Describe round-trip and the server re-plan, ~halving round-trips per
-// statement — the dominant cost against a remote DB. pg.zig only wires this caching into
-// its inline-values API (queryOpts); our incremental-bind path replicates that exact flow
-// here. Gated by DATABASE_STMT_CACHE; the cache is bounded by MAX_CACHED_STMTS and freed
-// with the connection (pg.Conn.deinit frees _prepared_statements).
-fn preparePossiblyCached(self: *PgConn, sql: []const u8, cached: bool) !pg.Stmt {
-    const conn = self.conn;
-    if (!cached or !self.stmt_cache) return conn.prepare(sql);
+/// The bytes of a text-decoded column, or null when it was NULL or an integer.
+fn textOf(v: MatValue) ?[]const u8 {
+    return switch (v) {
+        .text => |t| t,
+        else => null,
+    };
+}
 
-    var name_buf: [18]u8 = undefined; // 'z' + up to 16 hex digits
-    const name = std.fmt.bufPrint(&name_buf, "z{x}", .{std.hash.Wyhash.hash(0, sql)}) catch
-        return conn.prepare(sql);
+// ── One statement, one message group ─────────────────────────────────────────
+//
+// Every statement goes out as a single extended-protocol message group:
+//
+//     Parse("")  Bind(portal "")  Describe(portal "")  Execute("")  Sync
+//
+// which is what libpq's PQexecParams sends. Two properties follow, and both are the
+// reason this is written by hand instead of using pg.zig's Stmt:
+//
+//  1. NOTHING THE STATEMENT CREATES OUTLIVES THE GROUP. The unnamed statement and the
+//     unnamed portal are gone by the time Sync is answered, so there is no server-side
+//     state for a connection pooler to lose, mis-route, or hand to another client. This
+//     is correct on a direct connection and behind any pooler in any mode, with no
+//     pooler configuration and no named-statement tracking. The previous design split
+//     Parse+Describe+Sync from Bind+Execute+Sync, so a transaction-mode pooler could
+//     serve the two halves from different backends (SQLSTATE 08P01/26000 — and silently
+//     wrong rows when two colliding statements took the same parameter count).
+//  2. IT IS ONE ROUND TRIP INSTEAD OF TWO. The old path had to read the parameter
+//     description before it could encode binds. We know our own parameter types (the
+//     bind* calls say so), so we skip Describe-on-statement entirely.
+//
+// Parameters are sent in TEXT format with their types unspecified — exactly what the old
+// Parse did (it also declared zero parameter types), so server-side type inference is
+// unchanged. Results come back in TEXT format too: a single group cannot pick per-column
+// binary formats, because RowDescription only arrives in the reply. Every column in the
+// generated schema is TEXT, BIGINT or SMALLINT, all of which decode losslessly from
+// text; a BYTEA column would need binary handling and the schema has none.
 
-    if (conn._prepared_statements.getEntry(name)) |entry| {
-        // HIT: re-execute the already-prepared statement (no Parse). `entry.key_ptr` is
-        // the cache-owned name (lives with the entry) so the Stmt's `.name` won't dangle.
-        var stmt = try pg.Stmt.fromDescribe(conn, entry.value_ptr, .{ .cache_name = entry.key_ptr.* });
-        errdefer stmt.deinit();
-        try conn._reader.startFlow(stmt.arena.allocator(), null);
-        try conn.write(&.{ 'S', 0, 0, 0, 4 }); // Sync
-        stmt.buf.reset();
-        try stmt.prepareForBind(@intCast(entry.value_ptr.param_oids.len));
-        return stmt;
+fn msgStart(b: *std.ArrayList(u8), a: std.mem.Allocator, tag: u8) !usize {
+    try b.append(a, tag);
+    const at = b.items.len;
+    try b.appendSlice(a, &.{ 0, 0, 0, 0 }); // length, back-filled by msgEnd
+    return at;
+}
+
+fn msgEnd(b: *std.ArrayList(u8), at: usize) void {
+    // The length covers itself and the payload, but not the type byte.
+    std.mem.writeInt(u32, b.items[at..][0..4], @intCast(b.items.len - at), .big);
+}
+
+fn appendI16(b: *std.ArrayList(u8), a: std.mem.Allocator, v: i16) !void {
+    var tmp: [2]u8 = undefined;
+    std.mem.writeInt(i16, &tmp, v, .big);
+    try b.appendSlice(a, &tmp);
+}
+
+fn appendI32(b: *std.ArrayList(u8), a: std.mem.Allocator, v: i32) !void {
+    var tmp: [4]u8 = undefined;
+    std.mem.writeInt(i32, &tmp, v, .big);
+    try b.appendSlice(a, &tmp);
+}
+
+/// Build the whole group. `lens` holds one entry per parameter — a byte count into
+/// `bytes`, or PARAM_NULL for SQL NULL — in bind order.
+fn writeStatementGroup(
+    b: *std.ArrayList(u8),
+    a: std.mem.Allocator,
+    sql: []const u8,
+    lens: []const i32,
+    bytes: []const u8,
+) !void {
+    { // Parse: unnamed statement, zero parameter type OIDs (the server infers them)
+        const at = try msgStart(b, a, 'P');
+        try b.append(a, 0);
+        try b.appendSlice(a, sql);
+        try b.append(a, 0);
+        try appendI16(b, a, 0);
+        msgEnd(b, at);
     }
+    { // Bind: unnamed portal from the unnamed statement
+        const at = try msgStart(b, a, 'B');
+        try b.append(a, 0); // portal name
+        try b.append(a, 0); // statement name
+        try appendI16(b, a, 0); // 0 parameter format codes = every parameter is text
+        try appendI16(b, a, @intCast(lens.len));
+        var off: usize = 0;
+        for (lens) |len| {
+            try appendI32(b, a, len);
+            if (len > 0) {
+                const n: usize = @intCast(len);
+                try b.appendSlice(a, bytes[off..][0..n]);
+                off += n;
+            }
+        }
+        try appendI16(b, a, 0); // 0 result format codes = every column is text
+        msgEnd(b, at);
+    }
+    { // Describe the PORTAL, so RowDescription arrives in this same reply
+        const at = try msgStart(b, a, 'D');
+        try b.append(a, 'P');
+        try b.append(a, 0);
+        msgEnd(b, at);
+    }
+    { // Execute with no row limit
+        const at = try msgStart(b, a, 'E');
+        try b.append(a, 0);
+        try appendI32(b, a, 0);
+        msgEnd(b, at);
+    }
+    try b.appendSlice(a, &.{ 'S', 0, 0, 0, 4 }); // Sync
+}
 
-    // MISS: keep the cache bounded; beyond the cap fall back to a one-shot prepare.
-    if (conn._prepared_statements.count() >= MAX_CACHED_STMTS) return conn.prepare(sql);
-    var stmt = try pg.Stmt.init(conn, .{ .cache_name = name });
-    errdefer stmt.deinit();
-    var describe_arena = std.heap.ArenaAllocator.init(conn._allocator);
-    errdefer describe_arena.deinit();
-    try stmt.prepare(sql, describe_arena.allocator());
-    const owned_name = try describe_arena.allocator().dupe(u8, name);
-    try conn._prepared_statements.put(conn._allocator, owned_name, .{
-        .param_oids = stmt.param_oids,
-        .arena = describe_arena,
-        .result_state = stmt.result_state,
-    });
-    stmt.name = owned_name; // re-point off the stack buffer to the cache-owned copy
-    return stmt;
+/// Consume messages until ReadyForQuery, discarding them. An ErrorResponse mid-drain is
+/// expected (the server reports it, then still sends ReadyForQuery), so it does not stop
+/// the drain. Bounded so a misbehaving peer cannot spin here forever.
+fn drainToReadyForQuery(conn: *pg.Conn) !void {
+    var guard: usize = 0;
+    while (guard < 1_000_000) : (guard += 1) {
+        const msg = conn.read() catch |err| {
+            if (err == error.PG) continue; // ErrorResponse; ReadyForQuery still follows
+            return err;
+        };
+        if (msg.type == 'Z') return;
+    }
+    return error.DrainLimitExceeded;
+}
+
+/// Column type OIDs from a RowDescription payload. Only the type OID of each field is
+/// kept — it is all the text decoder needs.
+fn parseRowDescription(a: std.mem.Allocator, data: []const u8) ![]i32 {
+    if (data.len < 2) return error.InvalidMessageFormat;
+    const n = std.mem.readInt(u16, data[0..2], .big);
+    const out = try a.alloc(i32, n);
+    errdefer a.free(out);
+    var off: usize = 2;
+    for (out) |*oid| {
+        const name_end = std.mem.indexOfScalarPos(u8, data, off, 0) orelse return error.InvalidMessageFormat;
+        off = name_end + 1 + 4 + 2; // name, table OID, column attribute number
+        if (off + 4 > data.len) return error.InvalidMessageFormat;
+        oid.* = std.mem.readInt(i32, data[off..][0..4], .big);
+        off += 4 + 2 + 4 + 2; // type OID, type size, type modifier, format code
+    }
+    return out;
+}
+
+/// Decode one text-format column value. Integer and boolean columns become `.int` so the
+/// getters stay integer-typed; everything else keeps its bytes. In text format `json` and
+/// `jsonb` both arrive as plain JSON (no binary version header), which is exactly what
+/// columnText should return.
+fn decodeTextValue(a: std.mem.Allocator, oid: i32, bytes: []const u8) !MatValue {
+    return switch (oid) {
+        OID.int2, OID.int4, OID.int8 => .{ .int = std.fmt.parseInt(i64, bytes, 10) catch 0 },
+        OID.bool_ => .{ .int = @intFromBool(bytes.len > 0 and (bytes[0] == 't' or bytes[0] == 'T' or bytes[0] == '1')) },
+        OID.bytea => decodeBytea(a, bytes),
+        else => .{ .text = try a.dupe(u8, bytes) },
+    };
+}
+
+/// bytea in TEXT format is the hex escape `\x<pairs>`; decode it to the raw bytes the
+/// binary format used to deliver, so a caller reading a bytea column sees its content and
+/// not the escape sequence. The generated schema has no bytea column today — this keeps
+/// adding one from silently changing what columnText returns. Anything that is not a
+/// well-formed hex escape is passed through verbatim (PG's older `escape` output format,
+/// which a server could be configured for).
+fn decodeBytea(a: std.mem.Allocator, bytes: []const u8) !MatValue {
+    if (bytes.len < 2 or bytes[0] != '\\' or bytes[1] != 'x' or (bytes.len - 2) % 2 != 0) {
+        return .{ .text = try a.dupe(u8, bytes) };
+    }
+    const hex = bytes[2..];
+    const out = try a.alloc(u8, hex.len / 2);
+    errdefer a.free(out);
+    _ = std.fmt.hexToBytes(out, hex) catch return .{ .text = try a.dupe(u8, bytes) };
+    return .{ .text = out };
+}
+
+/// Materialize one DataRow. Values are copied out of the reader's buffer immediately —
+/// the next read may reuse it.
+fn parseDataRow(a: std.mem.Allocator, data: []const u8, oids: []const i32) !MatRow {
+    if (data.len < 2) return error.InvalidMessageFormat;
+    const n = std.mem.readInt(u16, data[0..2], .big);
+    const out = try a.alloc(MatValue, n);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |v| switch (v) {
+            .text => |t| a.free(t),
+            else => {},
+        };
+        a.free(out);
+    }
+    var off: usize = 2;
+    while (filled < n) : (filled += 1) {
+        if (off + 4 > data.len) return error.InvalidMessageFormat;
+        const len = std.mem.readInt(i32, data[off..][0..4], .big);
+        off += 4;
+        if (len == PARAM_NULL) {
+            out[filled] = .null;
+            continue;
+        }
+        const size: usize = @intCast(len);
+        if (off + size > data.len) return error.InvalidMessageFormat;
+        const oid: i32 = if (filled < oids.len) oids[filled] else OID.text;
+        out[filled] = try decodeTextValue(a, oid, data[off..][0..size]);
+        off += size;
+    }
+    return out;
 }
 
 fn prepare(ctx: *anyopaque, sql: []const u8, cached: bool) anyerror!Statement {
     const self = asConn(ctx);
+    // `cached` is accepted for the SPI (SQLite uses it) and deliberately ignored: a
+    // statement that outlives its message group is exactly what this driver no longer
+    // creates. Reuse would mean a named server-side statement, which is the thing a
+    // transaction-mode pooler cannot be relied on to carry.
+    _ = cached;
 
+    // No wire traffic here. The SQL is renumbered and kept; Parse travels with Bind and
+    // Execute in one group at first step()/exec(), once the parameters are known.
     const renumbered = try pg_dialect_mod.renumberPlaceholders(self.allocator, sql);
     errdefer self.allocator.free(renumbered);
 
-    var stmt = preparePossiblyCached(self, renumbered, cached) catch |err| {
-        // warn, not err: the caller receives error.PrepareFailed and reports with
-        // its own context (and the conformance suite exercises this path — the
-        // default test runner fails any test that emits an err-level log).
-        std.log.warn("postgres prepare failed: {}\nSQL: {s}", .{ err, renumbered });
-        // A dead socket/TLS session is replaced before failing, so the batch
-        // retry runs on a live connection instead of the corpse forever.
-        reviveConnection(self, err);
-        return error.PrepareFailed;
-    };
-    errdefer stmt.deinit();
-
     const ps = try self.allocator.create(PgStmt);
-    ps.* = .{ .allocator = self.allocator, .conn = self.conn, .sql = renumbered, .stmt = stmt };
+    ps.* = .{ .allocator = self.allocator, .owner = self, .sql = renumbered };
     return Statement{ .ctx = ps, .vtable = &stmt_vtable, .allocator = self.allocator };
 }
 
@@ -558,19 +790,24 @@ const MatValue = union(enum) {
 };
 const MatRow = []MatValue;
 
+/// A parameter is a byte count into `param_bytes`, in bind order; PARAM_NULL means SQL
+/// NULL and consumes no bytes.
+const PARAM_NULL: i32 = -1;
+
 const PgStmt = struct {
     allocator: std.mem.Allocator,
-    conn: *pg.Conn, // borrowed (the pinned connection) — used by exec()'s affected-row drain
+    owner: *PgConn, // borrowed; owns the connection this statement runs on
     sql: []u8, // owned (renumbered)
-    stmt: pg.Stmt,
+    // Parameters, accumulated by the bind* calls and sent with Parse in one group.
+    param_bytes: std.ArrayList(u8) = .empty,
+    param_lens: std.ArrayList(i32) = .empty,
     executed: bool = false,
     // Materialized rows (owned). `cursor` is the next row step() will return; `cur` is
     // the row most recently returned (what the column getters read from).
     rows: []MatRow = &.{},
     cursor: usize = 0,
     cur: ?MatRow = null,
-    // Affected-row count from the last exec()'s CommandComplete (changes()). 0 for the
-    // step()/read path, which never feeds changes() in the storage layer.
+    // Affected-row count from the CommandComplete tag (changes()).
     affected: i64 = 0,
     last_err: [256]u8 = undefined,
     last_err_len: usize = 0,
@@ -588,14 +825,16 @@ fn affectedFromCommandTag(data: []const u8) i64 {
     return std.fmt.parseInt(i64, data[start..end], 10) catch 0;
 }
 
+fn freeRow(allocator: std.mem.Allocator, row: MatRow) void {
+    for (row) |v| switch (v) {
+        .text => |t| allocator.free(t),
+        else => {},
+    };
+    allocator.free(row);
+}
+
 fn freeRows(allocator: std.mem.Allocator, rows: []MatRow) void {
-    for (rows) |row| {
-        for (row) |v| switch (v) {
-            .text => |t| allocator.free(t),
-            else => {},
-        };
-        allocator.free(row);
-    }
+    for (rows) |row| freeRow(allocator, row);
     allocator.free(rows);
 }
 
@@ -618,7 +857,7 @@ fn recordErr(self: *PgStmt, comptime fmt: []const u8, args: anytype) void {
 // wrappers do the logging. Non-PG errors (bind/protocol/io) fall back to the Zig tag.
 fn recordPgErr(self: *PgStmt, comptime op: []const u8, err: anyerror) void {
     if (err == error.PG) {
-        if (self.conn.err) |e| {
+        if (self.owner.conn.err) |e| {
             if (e.constraint) |c|
                 recordErr(self, op ++ ": {s} (SQLSTATE {s}, constraint {s})", .{ e.message, e.code, c })
             else if (e.detail) |d|
@@ -631,148 +870,161 @@ fn recordPgErr(self: *PgStmt, comptime op: []const u8, err: anyerror) void {
     recordErr(self, op ++ ": {}", .{err});
 }
 
-fn bindText(ctx: *anyopaque, idx: c_int, ptr: [*]const u8, len: usize) bool {
-    _ = idx; // pg.Stmt binds sequentially; our Statement binds in order
-    const self = asStmt(ctx);
-    self.stmt.bind(ptr[0..len]) catch |err| {
-        recordErr(self, "bindText: {}", .{err});
+/// Record one text-format parameter. Binds never touch the socket — they fill the buffer
+/// that Bind is built from at execute time.
+fn pushParam(self: *PgStmt, bytes: []const u8) bool {
+    self.param_bytes.appendSlice(self.allocator, bytes) catch |err| {
+        recordErr(self, "bind: {}", .{err});
+        return false;
+    };
+    self.param_lens.append(self.allocator, @intCast(bytes.len)) catch |err| {
+        recordErr(self, "bind: {}", .{err});
         return false;
     };
     return true;
+}
+
+fn bindText(ctx: *anyopaque, idx: c_int, ptr: [*]const u8, len: usize) bool {
+    _ = idx; // parameters are positional, in bind order
+    return pushParam(asStmt(ctx), ptr[0..len]);
 }
 
 fn bindInt64(ctx: *anyopaque, idx: c_int, value: i64) bool {
     _ = idx;
     const self = asStmt(ctx);
-    self.stmt.bind(value) catch |err| {
-        recordErr(self, "bindInt64: {}", .{err});
-        return false;
-    };
-    return true;
+    var buf: [24]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "{d}", .{value}) catch unreachable; // i64 fits
+    return pushParam(self, text);
 }
 
 fn bindInt(ctx: *anyopaque, idx: c_int, value: i32) bool {
     _ = idx;
     const self = asStmt(ctx);
-    self.stmt.bind(value) catch |err| {
-        recordErr(self, "bindInt: {}", .{err});
-        return false;
-    };
-    return true;
+    var buf: [12]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "{d}", .{value}) catch unreachable; // i32 fits
+    return pushParam(self, text);
 }
 
 fn bindNull(ctx: *anyopaque, idx: c_int) bool {
     _ = idx;
     const self = asStmt(ctx);
-    self.stmt.bind(null) catch |err| {
+    self.param_lens.append(self.allocator, PARAM_NULL) catch |err| {
         recordErr(self, "bindNull: {}", .{err});
         return false;
     };
     return true;
 }
 
-fn materializeValue(allocator: std.mem.Allocator, row: pg.Row, c: usize) !MatValue {
-    if (row.values[c].is_null) return .null;
-    // Integer-class OIDs decode through pg.zig's own getters (no binary-format
-    // re-implementation); everything else (text/varchar/bpchar/name/json/bytea) is the
-    // raw bytes, which for text formats is exactly the string we want.
-    return switch (row.oids[c]) {
-        OID.int2 => .{ .int = @intCast(row.get(i16, c) catch 0) },
-        OID.int4 => .{ .int = @intCast(row.get(i32, c) catch 0) },
-        OID.int8 => .{ .int = row.get(i64, c) catch 0 },
-        OID.bool_ => .{ .int = @intFromBool(row.get(bool, c) catch false) },
-        OID.jsonb => {
-            // jsonb binary format = 1-byte version header (currently 1) + JSON
-            // text. Strip the header so columnText yields parseable JSON, like
-            // SQLite's json_object and PG's plain `json` type (OID 114) do.
-            const data = row.values[c].data;
-            const body = if (data.len > 0 and data[0] == 1) data[1..] else data;
-            return .{ .text = try allocator.dupe(u8, body) };
-        },
-        else => .{ .text = try allocator.dupe(u8, row.values[c].data) },
+/// Send one statement as a single message group and materialize everything it returns.
+/// This is the ONLY place the driver issues a parameterized statement — the Statement
+/// path and the driver's own internal queries both come through here, so nothing can
+/// quietly take a different, pooler-unsafe route.
+///
+/// Rows are copied out as they arrive and the connection is idle again the moment
+/// ReadyForQuery lands, which is what lets the storage layer iterate one query while
+/// issuing others on the same pinned connection.
+fn runStatementGroup(
+    owner: *PgConn,
+    allocator: std.mem.Allocator,
+    sql: []const u8,
+    lens: []const i32,
+    bytes: []const u8,
+    affected: *i64,
+) ![]MatRow {
+    const conn = owner.conn;
+
+    var batch: std.ArrayList(u8) = .empty;
+    defer batch.deinit(allocator);
+    try writeStatementGroup(&batch, allocator, sql, lens, bytes);
+
+    // Give the reader an allocator for the exchange, so a row wider than its static
+    // buffer can be read (and the dynamic buffer reused across rows).
+    try conn._reader.startFlow(allocator, null);
+    defer conn._reader.endFlow() catch {
+        conn._state = .fail; // only affects the next statement; the pool recovers
+    };
+
+    conn.write(batch.items) catch |err| {
+        reviveConnection(owner, err);
+        return err;
+    };
+
+    return readStatementReply(owner, allocator, affected) catch |err| {
+        // Whatever went wrong — a server ErrorResponse, a malformed message, or running
+        // out of memory while materializing — the REST OF THE REPLY IS STILL IN THE
+        // SOCKET. Consume it, or retire the connection. Reading one statement's tail as
+        // the next statement's result is exactly the corruption this design exists to
+        // prevent, so there is no path here that leaves the connection half-read.
+        drainToReadyForQuery(conn) catch |drain_err| {
+            // The reply could not be consumed — in practice because the session is gone
+            // (an admin termination or a dead socket ends the drain with EndOfStream).
+            // Either way this connection's protocol position is unknown, so retire it.
+            std.log.warn("postgres: statement reply not drainable ({}); replacing the connection", .{drain_err});
+            replaceConnection(owner);
+        };
+        return err;
     };
 }
 
-fn materializeRow(allocator: std.mem.Allocator, row: pg.Row) !MatRow {
-    const n = row.values.len;
-    const out = try allocator.alloc(MatValue, n);
-    errdefer allocator.free(out);
-    var i: usize = 0;
-    errdefer for (out[0..i]) |v| switch (v) {
-        .text => |t| allocator.free(t),
-        else => {},
-    };
-    while (i < n) : (i += 1) out[i] = try materializeValue(allocator, row, i);
-    return out;
+/// Read one statement group's reply, materializing its rows.
+fn readStatementReply(owner: *PgConn, allocator: std.mem.Allocator, affected: *i64) ![]MatRow {
+    const conn = owner.conn;
+    var oids: []i32 = &.{};
+    defer allocator.free(oids);
+    var list: std.ArrayList(MatRow) = .empty;
+    errdefer {
+        for (list.items) |row| freeRow(allocator, row);
+        list.deinit(allocator);
+    }
+
+    while (true) {
+        const msg = conn.read() catch |err| {
+            // read() turns ErrorResponse into error.PG after recording it. The caller
+            // drains whatever follows (the server still owes us a ReadyForQuery).
+            reviveConnection(owner, err);
+            return err;
+        };
+        switch (msg.type) {
+            '1', '2', 'n' => {}, // ParseComplete, BindComplete, NoData
+            'T' => { // RowDescription, from the portal Describe in our group
+                allocator.free(oids);
+                oids = try parseRowDescription(allocator, msg.data);
+            },
+            'D' => { // DataRow
+                const row = try parseDataRow(allocator, msg.data, oids);
+                errdefer freeRow(allocator, row);
+                try list.append(allocator, row);
+            },
+            'C' => affected.* = affectedFromCommandTag(msg.data), // CommandComplete
+            'Z' => break, // ReadyForQuery — read() has restored the connection state
+            // Unreachable against a conformant server. Mark the connection failed
+            // (parity with pg.zig) so a desynced one is replaced rather than reused.
+            else => return conn.unexpectedDBMessage(),
+        }
+    }
+
+    return list.toOwnedSlice(allocator);
 }
 
 fn doExecute(self: *PgStmt) !void {
     if (self.executed) return;
-    // Mark executed only AFTER a successful execute(): on error the Stmt arena is NOT
-    // transferred to a Result (pg.zig contract), so it must be freed via stmt.deinit() in
-    // finalize — which only happens on the executed==false branch. Setting the flag first
-    // would route a failed execute into the freeRows branch and leak the arena.
-    const result = try self.stmt.execute();
+    // Set before sending: a statement whose group failed must not re-send on what may be
+    // a replaced connection. The caller surfaces the error; a retry re-prepares.
     self.executed = true;
-    // Copy every row into owned memory, then release the result — which returns the
-    // pinned connection to idle so the next statement can run. This is what makes the
-    // "iterate query A while issuing query B per row" pattern (pervasive in the storage
-    // layer, e.g. backfillFromExistingData) work on a single-connection PG backend.
-    defer result.deinit();
-    var list: std.ArrayList(MatRow) = .empty;
-    errdefer {
-        for (list.items) |row| {
-            for (row) |v| switch (v) {
-                .text => |t| self.allocator.free(t),
-                else => {},
-            };
-            self.allocator.free(row);
-        }
-        list.deinit(self.allocator);
-    }
-    while (try result.next()) |row| {
-        const mr = try materializeRow(self.allocator, row);
-        errdefer {
-            for (mr) |v| switch (v) {
-                .text => |t| self.allocator.free(t),
-                else => {},
-            };
-            self.allocator.free(mr);
-        }
-        try list.append(self.allocator, mr);
-    }
-    self.rows = try list.toOwnedSlice(self.allocator);
+    self.rows = try runStatementGroup(
+        self.owner,
+        self.allocator,
+        self.sql,
+        self.param_lens.items,
+        self.param_bytes.items,
+        &self.affected,
+    );
 }
 
-// Execute a write (INSERT/UPDATE/DELETE/DDL) and capture its affected-row count. Unlike
-// the materializing step() path, this drains the response directly off the connection so
-// the CommandComplete tag's row count survives (pg.zig's Result.next() consumes and
-// discards it). Writes return no DataRows, so there is nothing to decode — any 'D' is just
-// counted, mirroring pg.zig's own conn.exec drain. Reads-then-deinit (the natural order):
-// all messages are consumed in-flow, then result.deinit() ends the reader flow.
 fn doExec(self: *PgStmt) !void {
-    if (self.executed) return;
-    const result = try self.stmt.execute(); // leak-safe: flag set only after success
-    self.executed = true;
-    defer result.deinit();
-
-    var affected: i64 = 0;
-    while (true) {
-        const msg = self.conn.read() catch |err| {
-            if (err == error.PG) self.conn.readyForQuery() catch {}; // drain to ReadyForQuery
-            return err;
-        };
-        switch (msg.type) {
-            'C' => affected = affectedFromCommandTag(msg.data), // CommandComplete
-            'D' => affected += 1, // DataRow (only with RETURNING; we don't keep them)
-            'T' => affected = 0, // RowDescription resets, like conn.exec
-            'Z' => break, // ReadyForQuery — read() set the conn back to idle
-            // Unreachable against a conformant server; mark the conn failed (parity with
-            // pg.zig's unexpectedDBMessage) so a desynced connection isn't reused.
-            else => return self.conn.unexpectedDBMessage(),
-        }
-    }
-    self.affected = affected;
+    // Writes travel the same group as reads; the CommandComplete tag carries the
+    // affected-row count and a write returns no DataRows to keep.
+    return doExecute(self);
 }
 
 fn exec(ctx: *anyopaque) bool {
@@ -854,13 +1106,11 @@ fn reset(ctx: *anyopaque) void {
 
 fn finalize(ctx: *anyopaque) void {
     const self = asStmt(ctx);
-    if (self.executed) {
-        // The result set was materialized + the pg.Result (and its arena) released back
-        // in doExecute; only the owned row buffers remain to free here.
-        freeRows(self.allocator, self.rows);
-    } else {
-        self.stmt.deinit(); // never executed (e.g. bind error) — free the prepared stmt
-    }
+    // Nothing is held on the server: the unnamed statement and portal died with the
+    // group's Sync, so teardown is purely local memory.
+    freeRows(self.allocator, self.rows);
+    self.param_bytes.deinit(self.allocator);
+    self.param_lens.deinit(self.allocator);
     self.allocator.free(self.sql);
     self.allocator.destroy(self);
 }

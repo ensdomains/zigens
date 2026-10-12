@@ -683,9 +683,15 @@ test "postgres driver: parseUrl extracts sslmode, host, port (Neon-style + local
     try testing.expectEqualStrings("127.0.0.1", local.host);
 }
 
-// ── #3 prepared-statement caching: a `cached` prepare must create ONE reusable
-// server-side prepared statement (visible in pg_prepared_statements) and reuse it on
-// repeat. Assumes the default (DATABASE_STMT_CACHE on). ──
+// ── #3 server-side statement lifetime: the driver sends each statement as one
+// Parse+Bind+Describe+Execute+Sync group, so pg_prepared_statements must stay EMPTY no
+// matter how many statements run, or which `cached` flag the caller passes. ──
+// Count the server-side prepared statements THIS session holds. pg_prepared_statements is
+// session-scoped, so this sees exactly what the driver left behind on its own connection.
+// The driver sends every statement as one Parse+Bind+Describe+Execute+Sync group over the
+// UNNAMED statement, so the answer must always be zero: nothing it creates outlives the
+// group, which is why it is correct behind a transaction-mode pooler without any pooler
+// configuration.
 fn countPreparedStmts(be: lib.storage.backend.Backend) !i64 {
     var st = try be.vtable.prepare(be.ptr, "SELECT count(*) FROM pg_prepared_statements", false);
     defer st.deinit();
@@ -693,7 +699,7 @@ fn countPreparedStmts(be: lib.storage.backend.Backend) !i64 {
     return st.getInt64(0);
 }
 
-test "postgres driver: cached prepares reuse one server-side prepared statement" {
+test "postgres driver: no server-side statement outlives a query" {
     var be = openBe() catch return error.SkipZigTest;
     defer be.vtable.close(be.ptr);
     try be.vtable.execRaw(be.ptr, "DROP TABLE IF EXISTS cache_probe");
@@ -701,32 +707,32 @@ test "postgres driver: cached prepares reuse one server-side prepared statement"
     try be.vtable.execRaw(be.ptr, "INSERT INTO cache_probe (id, v) VALUES (1, 'a')");
     try be.vtable.execRaw(be.ptr, "INSERT INTO cache_probe (id, v) VALUES (2, 'b')");
 
-    const before = try countPreparedStmts(be);
+    try testing.expectEqual(@as(i64, 0), try countPreparedStmts(be));
     const sel = "SELECT v FROM cache_probe WHERE id = ?";
 
-    // First cached prepare → one named server-side prepared statement is created.
-    {
-        var st = try be.vtable.prepare(be.ptr, sel, true);
-        defer st.deinit();
-        try st.bindInt64(1);
-        try testing.expect(try st.step());
-        try testing.expectEqualStrings("a", st.getTextSlice(0).?);
+    // Run the same SQL repeatedly, both prepare flavours. Correct rows every time, and
+    // never a server-side statement left behind — with the old named-statement cache this
+    // count grew, and behind a pooler those names were what broke.
+    for (0..40) |i| {
+        const cached = i % 2 == 0;
+        {
+            var st = try be.vtable.prepare(be.ptr, sel, cached);
+            defer st.deinit();
+            try st.bindInt64(1);
+            try testing.expect(try st.step());
+            try testing.expectEqualStrings("a", st.getTextSlice(0).?);
+        }
+        {
+            var st = try be.vtable.prepare(be.ptr, sel, cached);
+            defer st.deinit();
+            try st.bindInt64(2);
+            try testing.expect(try st.step());
+            try testing.expectEqualStrings("b", st.getTextSlice(0).?);
+        }
     }
-    const after_first = try countPreparedStmts(be);
-    try testing.expectEqual(before + 1, after_first);
+    try testing.expectEqual(@as(i64, 0), try countPreparedStmts(be));
 
-    // Second cached prepare of the SAME sql → REUSE (no new prepared statement), result
-    // still correct (proves the cache-hit bind+execute path).
-    {
-        var st = try be.vtable.prepare(be.ptr, sel, true);
-        defer st.deinit();
-        try st.bindInt64(2);
-        try testing.expect(try st.step());
-        try testing.expectEqualStrings("b", st.getTextSlice(0).?);
-    }
-    try testing.expectEqual(after_first, try countPreparedStmts(be));
-
-    // Connection stays healthy for a subsequent uncached statement.
+    // Connection still healthy for a parameterless statement.
     {
         var st = try be.vtable.prepare(be.ptr, "SELECT 1", false);
         defer st.deinit();
@@ -775,4 +781,264 @@ test "postgres driver: pinned connection revives after server-side termination" 
         }
     }
     try testing.expect(recovered);
+}
+
+// NOTE on what is NOT tested here: two statements prepared and left UNEXECUTED on one
+// connection at the same time. That cannot work in this driver whatever the statements are
+// named, because pg.Stmt borrows connection-level scratch (`conn._buf`, `conn._param_oids`,
+// `conn._result_state`), so the second Parse overwrites the first's describe state. The
+// production failure this naming change fixes was never that: it was the same collision
+// ACROSS clients sharing one backend through a transaction-mode pooler, where those
+// per-connection buffers are not shared. That is covered by a measured load run (176 of
+// 320 concurrent API requests failed before, 0 after), not by a unit test — a single
+// connection cannot reproduce it.
+
+// A statement's whole lifecycle — Parse, Bind, Describe, Execute — rides in one message
+// group over the unnamed statement, so running many of them must not accumulate anything
+// on the server. This is the property that makes the driver pooler-agnostic; if someone
+// reintroduces a named/cached statement, this count stops being zero.
+test "postgres driver: many statements leave nothing on the server" {
+    var be = openBe() catch return error.SkipZigTest;
+    defer be.vtable.close(be.ptr);
+
+    for (0..200) |i| {
+        var st = try be.vtable.prepare(be.ptr, "SELECT ?::bigint AS v", false);
+        defer st.deinit();
+        try st.bindInt64(@intCast(i));
+        try testing.expect(try st.step());
+        try testing.expectEqual(@as(i64, @intCast(i)), st.getInt64(0));
+    }
+
+    try testing.expectEqual(@as(i64, 0), try countPreparedStmts(be));
+}
+
+// Two statements open at once on ONE connection, with different parameter counts. This
+// could not work before: a statement held pg.Stmt state borrowed from the connection
+// (its buffer, parameter OIDs and result state), so preparing the second clobbered the
+// first's describe data. Now prepare() touches neither the socket nor any shared state —
+// the whole lifecycle travels in one group at step() — so independent statements simply
+// do not interact. Guards the property that made the old design fragile.
+test "postgres driver: two statements can be open at once" {
+    var be = openBe() catch return error.SkipZigTest;
+    defer be.vtable.close(be.ptr);
+
+    var a = try be.vtable.prepare(be.ptr, "SELECT ?::bigint AS v", false);
+    defer a.deinit();
+    var b = try be.vtable.prepare(be.ptr, "SELECT ?::bigint + ?::bigint + ?::bigint AS v", false);
+    defer b.deinit();
+
+    // Execute the SECOND one first, then the first: interleaved in both directions.
+    try b.bindInt64(1);
+    try b.bindInt64(2);
+    try b.bindInt64(4);
+    try testing.expect(try b.step());
+    try testing.expectEqual(@as(i64, 7), b.getInt64(0));
+
+    try a.bindInt64(42);
+    try testing.expect(try a.step());
+    try testing.expectEqual(@as(i64, 42), a.getInt64(0));
+
+    try testing.expectEqual(@as(i64, 0), try countPreparedStmts(be));
+}
+
+// changes() comes from the CommandComplete tag. The affected-row count has to survive a
+// RETURNING clause (where the reply also carries a RowDescription and DataRows) and an
+// ON CONFLICT DO NOTHING that writes nothing — the storage layer branches on both.
+test "postgres driver: changes() is exact for RETURNING and for a no-op upsert" {
+    var be = openBe() catch return error.SkipZigTest;
+    defer be.vtable.close(be.ptr);
+
+    try be.vtable.execRaw(be.ptr, "DROP TABLE IF EXISTS chg_probe");
+    try be.vtable.execRaw(be.ptr, "CREATE TABLE chg_probe (id BIGINT PRIMARY KEY, v TEXT)");
+
+    { // INSERT ... RETURNING: one row written, one row returned
+        var st = try be.vtable.prepare(be.ptr, "INSERT INTO chg_probe (id, v) VALUES (?, ?) RETURNING id", false);
+        defer st.deinit();
+        try st.bindInt64(1);
+        try st.bindText("a");
+        try st.exec();
+        try testing.expectEqual(@as(u32, 1), st.changes());
+    }
+    { // ON CONFLICT DO NOTHING on an existing key: nothing written
+        var st = try be.vtable.prepare(be.ptr, "INSERT INTO chg_probe (id, v) VALUES (?, ?) ON CONFLICT (id) DO NOTHING", false);
+        defer st.deinit();
+        try st.bindInt64(1);
+        try st.bindText("dup");
+        try st.exec();
+        try testing.expectEqual(@as(u32, 0), st.changes());
+    }
+    { // UPDATE touching two rows
+        try be.vtable.execRaw(be.ptr, "INSERT INTO chg_probe (id, v) VALUES (2, 'b')");
+        var st = try be.vtable.prepare(be.ptr, "UPDATE chg_probe SET v = ? WHERE id >= ?", false);
+        defer st.deinit();
+        try st.bindText("z");
+        try st.bindInt64(1);
+        try st.exec();
+        try testing.expectEqual(@as(u32, 2), st.changes());
+    }
+
+    try be.vtable.execRaw(be.ptr, "DROP TABLE chg_probe");
+}
+
+// Results come back in TEXT format (a single message group cannot choose per-column
+// binary formats), so every type has to decode losslessly from text. bytea is the one
+// that does not do so naively: text format renders it as the hex escape `\x…`. The
+// generated schema has no bytea column, but a future one must not silently start
+// returning escape sequences where it used to return bytes.
+test "postgres driver: bytea round-trips as raw bytes, not a hex escape" {
+    var be = openBe() catch return error.SkipZigTest;
+    defer be.vtable.close(be.ptr);
+
+    try be.vtable.execRaw(be.ptr, "DROP TABLE IF EXISTS bytea_probe");
+    try be.vtable.execRaw(be.ptr, "CREATE TABLE bytea_probe (id BIGINT, blob BYTEA)");
+    try be.vtable.execRaw(be.ptr, "INSERT INTO bytea_probe VALUES (1, '\\x00486921ff'::bytea)");
+    try be.vtable.execRaw(be.ptr, "INSERT INTO bytea_probe VALUES (2, ''::bytea)");
+
+    var st = try be.vtable.prepare(be.ptr, "SELECT blob FROM bytea_probe WHERE id = ?", false);
+    defer st.deinit();
+    try st.bindInt64(1);
+    try testing.expect(try st.step());
+    // Raw bytes, including the NUL and the high byte — not the 12-character escape text.
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x48, 0x69, 0x21, 0xff }, st.getTextSlice(0).?);
+
+    var empty = try be.vtable.prepare(be.ptr, "SELECT blob FROM bytea_probe WHERE id = ?", false);
+    defer empty.deinit();
+    try empty.bindInt64(2);
+    try testing.expect(try empty.step());
+    try testing.expectEqual(@as(usize, 0), empty.getTextSlice(0).?.len);
+
+    try be.vtable.execRaw(be.ptr, "DROP TABLE bytea_probe");
+}
+
+// The reader has a 4 KB static buffer and allocates a dynamic one for anything larger,
+// reusing it across rows within a statement's flow (the driver opens that flow around the
+// message group). Both dimensions need exercising: one value far wider than the static
+// buffer, and enough rows that the dynamic buffer is reused rather than grown per row.
+test "postgres driver: wide values and many rows materialize exactly" {
+    var be = openBe() catch return error.SkipZigTest;
+    defer be.vtable.close(be.ptr);
+
+    try be.vtable.execRaw(be.ptr, "DROP TABLE IF EXISTS wide_probe");
+    try be.vtable.execRaw(be.ptr, "CREATE TABLE wide_probe (id BIGINT, body TEXT)");
+    // One 1 MiB value (256x the static buffer) and one just over the boundary.
+    try be.vtable.execRaw(be.ptr, "INSERT INTO wide_probe VALUES (1, repeat('ab', 524288))");
+    try be.vtable.execRaw(be.ptr, "INSERT INTO wide_probe VALUES (2, repeat('z', 4097))");
+
+    {
+        var st = try be.vtable.prepare(be.ptr, "SELECT body FROM wide_probe WHERE id = ?", false);
+        defer st.deinit();
+        try st.bindInt64(1);
+        try testing.expect(try st.step());
+        const body = st.getTextSlice(0).?;
+        try testing.expectEqual(@as(usize, 1024 * 1024), body.len);
+        try testing.expectEqualStrings("ab", body[0..2]);
+        try testing.expectEqualStrings("ab", body[body.len - 2 ..]);
+        // No byte may have been dropped or duplicated across buffer boundaries.
+        var a_count: usize = 0;
+        for (body) |c| {
+            if (c == 'a') a_count += 1;
+        }
+        try testing.expectEqual(@as(usize, 512 * 1024), a_count);
+    }
+    {
+        var st = try be.vtable.prepare(be.ptr, "SELECT body FROM wide_probe WHERE id = ?", false);
+        defer st.deinit();
+        try st.bindInt64(2);
+        try testing.expect(try st.step());
+        try testing.expectEqual(@as(usize, 4097), st.getTextSlice(0).?.len);
+    }
+
+    // Many rows in ONE statement: every row read through the same reused buffer, each
+    // with a value wider than the static buffer so the dynamic path is hit repeatedly.
+    try be.vtable.execRaw(be.ptr,
+        \\INSERT INTO wide_probe SELECT 100 + g, repeat('q', 5000) FROM generate_series(1, 2000) g
+    );
+    {
+        var st = try be.vtable.prepare(be.ptr, "SELECT id, body FROM wide_probe WHERE id >= ? ORDER BY id", false);
+        defer st.deinit();
+        try st.bindInt64(100);
+        var seen: usize = 0;
+        var expect_id: i64 = 101;
+        while (try st.step()) : (seen += 1) {
+            try testing.expectEqual(expect_id, st.getInt64(0));
+            try testing.expectEqual(@as(usize, 5000), st.getTextSlice(1).?.len);
+            expect_id += 1;
+        }
+        try testing.expectEqual(@as(usize, 2000), seen);
+    }
+
+    try be.vtable.execRaw(be.ptr, "DROP TABLE wide_probe");
+}
+
+// A statement that fails PART WAY THROUGH its result: Postgres streams DataRows as it
+// computes them, so rows arrive and THEN an ErrorResponse. The rest of the reply (the
+// ErrorResponse and the ReadyForQuery that follows it) must be consumed before the
+// connection is handed back, or the next statement reads this one's tail as its own
+// result — silently wrong rows, which is the failure mode this driver exists to prevent.
+// The same path covers a local failure while materializing (allocation) and a statement
+// timeout firing mid-result.
+test "postgres driver: a mid-result error leaves the connection usable" {
+    var be = openBe() catch return error.SkipZigTest;
+    defer be.vtable.close(be.ptr);
+
+    // Rows 1..9 compute fine; row 10 divides by zero.
+    {
+        var st = try be.vtable.prepare(be.ptr, "SELECT 100 / (10 - i) AS v FROM generate_series(?::bigint, ?::bigint) i", false);
+        defer st.deinit();
+        try st.bindInt64(1);
+        try st.bindInt64(20);
+        try testing.expectEqual(lib.storage.backend.StepOutcome.failed, st.vtable.step(st.ctx));
+    }
+
+    // The very next statement must be correct — not the tail of the failed one.
+    {
+        var st = try be.vtable.prepare(be.ptr, "SELECT ?::bigint AS a, ?::text AS b", false);
+        defer st.deinit();
+        try st.bindInt64(4242);
+        try st.bindText("after-error");
+        try testing.expect(try st.step());
+        try testing.expectEqual(@as(i64, 4242), st.getInt64(0));
+        try testing.expectEqualStrings("after-error", st.getTextSlice(1).?);
+        try testing.expect(!try st.step()); // exactly one row, nothing left over
+    }
+
+    // And a multi-row read still lines up row-for-row.
+    {
+        var st = try be.vtable.prepare(be.ptr, "SELECT i FROM generate_series(?::bigint, ?::bigint) i ORDER BY i", false);
+        defer st.deinit();
+        try st.bindInt64(1);
+        try st.bindInt64(50);
+        var expect: i64 = 1;
+        while (try st.step()) : (expect += 1) try testing.expectEqual(expect, st.getInt64(0));
+        try testing.expectEqual(@as(i64, 51), expect);
+    }
+
+    try testing.expectEqual(@as(i64, 0), try countPreparedStmts(be));
+}
+
+// Parameters are buffered client-side and sent with Bind, so the old 32-bound on copied
+// binds is gone. The protocol's own limit is an int16 count; the storage layer chunks IN
+// lists well below that, but a few hundred parameters must work and bind in order.
+test "postgres driver: hundreds of parameters bind in order" {
+    const allocator = testing.allocator;
+    var be = openBe() catch return error.SkipZigTest;
+    defer be.vtable.close(be.ptr);
+
+    const n = 400;
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(allocator);
+    try sql.appendSlice(allocator, "SELECT count(*)::bigint, min(x)::bigint, max(x)::bigint FROM (VALUES ");
+    for (0..n) |i| {
+        if (i > 0) try sql.appendSlice(allocator, ",");
+        try sql.appendSlice(allocator, "(?::bigint)");
+    }
+    try sql.appendSlice(allocator, ") AS v(x)");
+
+    var st = try be.vtable.prepare(be.ptr, sql.items, false);
+    defer st.deinit();
+    for (0..n) |i| try st.bindInt64(@intCast(i * 3));
+    try testing.expect(try st.step());
+    try testing.expectEqual(@as(i64, n), st.getInt64(0));
+    try testing.expectEqual(@as(i64, 0), st.getInt64(1));
+    try testing.expectEqual(@as(i64, (n - 1) * 3), st.getInt64(2));
 }
