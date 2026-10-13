@@ -3,11 +3,11 @@
 # Health check script for ENSv2 Indexer
 # Returns healthy if:
 # 1. Rainbow download is in progress (marker file exists), OR
-# 2. Status server is responding on port 3001
+# 2. Status server is responding on $STATUS_PORT
 #
 
 RAINBOW_DOWNLOADING_MARKER="/app/data/.rainbow_downloading"
-STATUS_URL="http://localhost:3001/status"
+STATUS_URL="http://127.0.0.1:${STATUS_PORT:-3001}/status"
 
 # If rainbow is downloading, consider healthy (still initializing)
 if [ -f "$RAINBOW_DOWNLOADING_MARKER" ]; then
@@ -16,7 +16,7 @@ if [ -f "$RAINBOW_DOWNLOADING_MARKER" ]; then
 fi
 
 # Otherwise, check if status server is responding
-if wget --no-verbose --tries=1 --spider "$STATUS_URL" 2>/dev/null; then
+if wget --no-verbose --tries=1 --spider "$STATUS_URL"; then
     exit 0
 else
     exit 1
