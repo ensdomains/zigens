@@ -50,7 +50,7 @@ pub const Network = enum {
 
 pub const ContractAddresses = struct {
     // ═══════════════════════════════════════════════════════════════════════
-    //  V1 Protocol (Legacy ENS — currently the only ENS on mainnet)
+    //  V1 Protocol (Legacy ENS)
     // ═══════════════════════════════════════════════════════════════════════
     // Pre-V1 Temporary Registrar (Auction System, 2017-2019)
     temporary_registrar: Address,
@@ -72,7 +72,7 @@ pub const ContractAddresses = struct {
     universal_resolver: Address,
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  V2 Protocol (ENSv2 — Sepolia only today; mainnet not deployed yet)
+    //  V2 Protocol (ENSv2 — Sepolia and mainnet)
     // ═══════════════════════════════════════════════════════════════════════
     root_registry: Address,
     eth_registry: Address,
@@ -198,33 +198,35 @@ fn mainnetAddresses() ContractAddresses {
         .reverse_registrar = Address.fromHex("0xa58E81fe9b61B5c3fE2AFD33CF304c454AbFc7Cb") catch unreachable,
         .name_wrapper = Address.fromHex("0xD4416b13d2b3a9aBae7AcD5D6C2BbDBE25686401") catch unreachable,
 
-        // V2 Mainnet Contracts (ENSv2 — not yet deployed; zero placeholders)
-        .root_registry = Address.zero,
-        .eth_registry = Address.zero,
-        .eth_registrar_v2 = Address.zero,
-        .eth_renewer_v1 = Address.zero,
-        .eth_label_store = Address.zero,
+        // V2 Mainnet Contracts (ENSv2 deployment, October 2026)
+        .root_registry = Address.fromHex("0x51bbc58b3dae7d45b14fba8cf31b7c8f7904a750") catch unreachable,
+        .eth_registry = Address.fromHex("0xf60aba43e1f7f3dab1186ff03b561401c9df85e2") catch unreachable,
+        .eth_registrar_v2 = Address.fromHex("0xdd86aea86697e9c6d4e50fa210242dd5ef5b02e8") catch unreachable,
+        .eth_renewer_v1 = Address.fromHex("0xe038b778b1fbf47a84018820626afc908c9c62b1") catch unreachable,
+        .eth_label_store = Address.fromHex("0x31e5e081fe38d15b3e8214ba5cb08dc4708b70ba") catch unreachable,
         .eth_reverse_registrar = Address.zero,
-        .batch_registrar = Address.zero,
+        .batch_registrar = Address.fromHex("0xf0ccfbf6dba1e01ccb833ced6d551a8f000e9721") catch unreachable,
         .premigration_registrar = Address.zero,
 
-        // Migration Contracts (Not yet deployed on mainnet)
-        .migration_helper = Address.zero,
-        .locked_migration_controller = Address.zero,
-        .unlocked_migration_controller = Address.zero,
+        // Migration Contracts (V1→V2, mainnet deployment)
+        .migration_helper = Address.fromHex("0x985252a593484f87098bdecd45f926c49e9f50e2") catch unreachable,
+        .locked_migration_controller = Address.fromHex("0x4d5179122a3b811766a409c93466a37704792e17") catch unreachable,
+        .unlocked_migration_controller = Address.fromHex("0xab821ca676cf2e0790fa273526a165cfa86aeb64") catch unreachable,
 
         // Deployment blocks
         // ENS Registry + Temporary Registrar deployed in block 3327417 (May 2017)
         // V1 Permanent Registrar (Base Registrar) deployed in block 9380410 (May 2019 migration)
         // Name Wrapper deployed in block 15628465 (September 2022)
+        // ENSv2 first indexed contract (LabelStore) deployed in block 26105294 (October 2026,
+        // verified on-chain via eth_getCode)
         .v1_deployment_block = 9380410, // V1 Permanent Registrar deployment (migration from temporary)
-        .v2_deployment_block = 0, // V2 not deployed on mainnet yet
+        .v2_deployment_block = 26105294, // ENSv2 deployment
 
         // Historical block markers (mainnet specific)
         .temp_registrar_start_block = 3327417, // Temporary Registrar deployment (May 2017)
         .v1_migration_block = 9380410, // V1 Permanent Registrar deployment (May 2019)
         .name_wrapper_deployment_block = 15628465, // Name Wrapper deployment (September 2022)
 
-        .universal_resolver = Address.zero, // no canonical mainnet UR wired as a default yet; supply via manifest or RESOLVE_UNIVERSAL_RESOLVER
+        .universal_resolver = Address.fromHex("0xcffd2ae680cd110d28739a70922636b5937b022b") catch unreachable, // ManagedUniversalResolverProxy; 0xeEeE…EeEe forwards here after the DAO switch
     };
 }
