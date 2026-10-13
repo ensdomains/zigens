@@ -199,18 +199,18 @@ fn mainnetAddresses() ContractAddresses {
         .name_wrapper = Address.fromHex("0xD4416b13d2b3a9aBae7AcD5D6C2BbDBE25686401") catch unreachable,
 
         // V2 Mainnet Contracts (ENSv2 deployment, October 2026)
-        .root_registry = Address.fromHex("0x51bbc58b3dae7d45b14fba8cf31b7c8f7904a750") catch unreachable,
+        .root_registry = Address.fromHex("0x2553c09be6447beffdb86fa622ad41fb8f77a91e") catch unreachable,
         .eth_registry = Address.fromHex("0xf60aba43e1f7f3dab1186ff03b561401c9df85e2") catch unreachable,
-        .eth_registrar_v2 = Address.fromHex("0xdd86aea86697e9c6d4e50fa210242dd5ef5b02e8") catch unreachable,
-        .eth_renewer_v1 = Address.fromHex("0xe038b778b1fbf47a84018820626afc908c9c62b1") catch unreachable,
+        .eth_registrar_v2 = Address.fromHex("0xd6d8369e55c94ae8afa714e6cf7ab5be54d5cc81") catch unreachable,
+        .eth_renewer_v1 = Address.fromHex("0x56c447f308f463a01121c41e72b0e7e7557fcb68") catch unreachable,
         .eth_label_store = Address.fromHex("0x31e5e081fe38d15b3e8214ba5cb08dc4708b70ba") catch unreachable,
         .eth_reverse_registrar = Address.zero,
         .batch_registrar = Address.fromHex("0xf0ccfbf6dba1e01ccb833ced6d551a8f000e9721") catch unreachable,
         .premigration_registrar = Address.zero,
 
         // Migration Contracts (V1→V2, mainnet deployment)
-        .migration_helper = Address.fromHex("0x985252a593484f87098bdecd45f926c49e9f50e2") catch unreachable,
-        .locked_migration_controller = Address.fromHex("0x4d5179122a3b811766a409c93466a37704792e17") catch unreachable,
+        .migration_helper = Address.fromHex("0x3760c796fd928d54afaee61174a0f8f37649fbd4") catch unreachable,
+        .locked_migration_controller = Address.fromHex("0xa19d4d49230200b3e81290a87dd12ea916af7be6") catch unreachable,
         .unlocked_migration_controller = Address.fromHex("0xab821ca676cf2e0790fa273526a165cfa86aeb64") catch unreachable,
 
         // Deployment blocks
