@@ -59,6 +59,10 @@ services:
       - POLL_INTERVAL=12
       - RATE_LIMIT_PER_SECOND=25
       - STATUS_PORT=3003
+      # Track the chain's safe/finalized heads each poll. Feeds the
+      # ensv2_finality_* metrics and the API's freshness signal; two extra RPC
+      # calls per poll.
+      - FINALITY_ENABLED=${FINALITY_ENABLED:-true}
       - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
       - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
       - WEBHOOK_MAX_RETRIES=${WEBHOOK_MAX_RETRIES:-3}
@@ -133,11 +137,23 @@ services:
       - TRUSTED_PROXY_HOPS=${TRUSTED_PROXY_HOPS:-1}
       - GRAPHQL_MAX_DEPTH=10
       - GRAPHQL_MAX_COST=${GRAPHQL_MAX_COST:-10000}
+      # Live resolution (ENSIP-10 Universal Resolver fallback) for single-name
+      # queries; needs an RPC the API can call — RESOLVE_RPC_URL falls back to
+      # the indexer's RPC_URL value from the environment. Without either, the
+      # code default is localhost:8545 and every live lookup fails.
+      - RESOLVE_LIVE_ENABLED=${RESOLVE_LIVE_ENABLED:-true}
+      - RESOLVE_RPC_URL=${RESOLVE_RPC_URL:-${RPC_URL}}
+      # ENSIP-3 forward verification of primary names (claimed vs verified);
+      # exposes Account.primaryNameVerification and the verify-primary endpoint.
+      - PRIMARY_VERIFY_ENABLED=${PRIMARY_VERIFY_ENABLED:-true}
+      # CCIP-Read offchain lookups ride on live resolution; startup fails fast
+      # if enabled without RESOLVE_LIVE_ENABLED.
+      - RESOLVE_CCIP_ENABLED=${RESOLVE_CCIP_ENABLED:-false}
       - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
       - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
       - WEBHOOK_ADMIN_USERNAME=${WEBHOOK_ADMIN_USERNAME:-}
       - WEBHOOK_ADMIN_PASSWORD=${WEBHOOK_ADMIN_PASSWORD:-}
-      - METRICS_ENABLED=false
+      - METRICS_ENABLED=${METRICS_ENABLED:-false}
     depends_on:
       - indexer-v2-mainnet
     healthcheck:
