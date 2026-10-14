@@ -157,6 +157,10 @@ services:
       # without committing a batch (see .env.example). Above the longest healthy
       # batch; set 0 for a --backfill or an END_BLOCK-pinned deployment.
       - COVERAGE_STALE_AFTER_SECONDS=${COVERAGE_STALE_AFTER_SECONDS:-3600}
+      # Selects the contract address set the API uses for live resolution and
+      # the chainId it reports. The code default is sepolia, so a mainnet API
+      # without this resolves against Sepolia addresses over a mainnet RPC.
+      - NETWORK=${NETWORK:-sepolia}
       - GRAPHQL_MAX_DEPTH=10
       - GRAPHQL_MAX_COST=${GRAPHQL_MAX_COST:-10000}
       # Live resolution (ENSIP-10 Universal Resolver fallback) for single-name

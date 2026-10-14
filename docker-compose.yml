@@ -124,6 +124,10 @@ services:
       # client on earth shares one bucket. Count the real chain (CDN -> ingress ->
       # api) and set it exactly — too high and X-Forwarded-For becomes spoofable.
       - TRUSTED_PROXY_HOPS=${TRUSTED_PROXY_HOPS:-1}
+      # Selects the contract address set the API uses for live resolution and
+      # the chainId it reports. The code default is sepolia, so a mainnet API
+      # without this resolves against Sepolia addresses over a mainnet RPC.
+      - NETWORK=${NETWORK:-sepolia}
       - GRAPHQL_MAX_DEPTH=10
       - GRAPHQL_MAX_COST=${GRAPHQL_MAX_COST:-10000}
       - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
