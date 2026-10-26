@@ -102,11 +102,16 @@ fn syncGapWantsIndexDrop(self: *Indexer, protocols: []const models.Protocol, cli
 }
 
 /// Open or close the GraphQL sync gate (storage/sync_readiness.zig) for `protocols`.
-fn markSyncReady(self: *Indexer, protocols: []const models.Protocol, ready: bool) void {
+/// Returns false if any write failed, so the caller can retry on a later iteration.
+fn markSyncReady(self: *Indexer, protocols: []const models.Protocol, ready: bool) bool {
+    var ok = true;
     for (protocols) |protocol| {
-        self.database.setSyncReady(protocol, ready) catch |err|
+        self.database.setSyncReady(protocol, ready) catch |err| {
             std.log.err("Failed to mark {s} sync readiness={}: {}", .{ protocol.toString(), ready, err });
+            ok = false;
+        };
     }
+    return ok;
 }
 
 pub fn start(self: *Indexer) !void {
@@ -120,7 +125,7 @@ pub fn start(self: *Indexer) !void {
     if (!self.initial_sync_complete.load(.acquire) and
         syncGapWantsIndexDrop(self, &.{ .v1, .v2 }, self.v1_client))
     {
-        markSyncReady(self, &.{ .v1, .v2 }, false);
+        _ = markSyncReady(self, &.{ .v1, .v2 }, false);
         self.database.dropSyncIndexes() catch |err| {
             std.log.warn("Failed to drop sync indexes (non-fatal): {}", .{err});
         };
@@ -130,6 +135,7 @@ pub fn start(self: *Indexer) !void {
     }
 
     var watchdog: SyncFailureWatchdog = .init(self.config.sync_failure_exit_minutes);
+    var sync_ready_owed = false;
 
     while (!self.should_stop.load(.acquire) and !shutdown.isRequested()) {
         // Index V1 first (SQLite doesn't support concurrent writes from different threads)
@@ -145,6 +151,7 @@ pub fn start(self: *Indexer) !void {
         };
 
         watchdog.recordSuccess();
+        if (sync_ready_owed) sync_ready_owed = !markSyncReady(self, &.{ .v1, .v2 }, true);
 
         // After first successful sync of both chains, recreate indexes and start webhook workers
         if (!self.initial_sync_complete.load(.acquire)) {
@@ -210,6 +217,9 @@ pub fn start(self: *Indexer) !void {
                 std.log.err("Failed to seed init-gap heal targets: {}", .{err});
             };
             self.drainInitGapHeals(.v2, self.v1_client);
+            // Open GraphQL before the unknown-labels backfill: it drains a
+            // persistent backlog on every start and can run long.
+            sync_ready_owed = !markSyncReady(self, &.{ .v1, .v2 }, true);
             std.log.info("Running unknown labels backfill...", .{});
             self.backfillUnknownLabels() catch |err| {
                 std.log.err("Failed to backfill unknown labels: {}", .{err});
@@ -219,8 +229,6 @@ pub fn start(self: *Indexer) !void {
                 std.log.info("Initial sync complete - starting 8 webhook workers", .{});
                 wm.startWorkers(8) catch |err| std.log.err("webhook workers failed to start: {}", .{err});
             }
-
-            markSyncReady(self, &.{ .v1, .v2 }, true);
         }
 
         // Best-effort finality signalling (Task 09); no-op unless FINALITY_ENABLED.
@@ -305,7 +313,7 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
     if (!self.initial_sync_complete.load(.acquire) and
         syncGapWantsIndexDrop(self, &.{protocol}, client))
     {
-        markSyncReady(self, &.{protocol}, false);
+        _ = markSyncReady(self, &.{protocol}, false);
         self.database.dropSyncIndexes() catch |err| {
             std.log.warn("Failed to drop sync indexes (non-fatal): {}", .{err});
         };
@@ -315,10 +323,12 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
     }
 
     var watchdog: SyncFailureWatchdog = .init(self.config.sync_failure_exit_minutes);
+    var sync_ready_owed = false;
 
     while (!self.should_stop.load(.acquire) and !shutdown.isRequested()) {
         if (self.indexProtocol(protocol, client)) |_| {
             watchdog.recordSuccess();
+            if (sync_ready_owed) sync_ready_owed = !markSyncReady(self, &.{protocol}, true);
             // Success - after first successful sync, recreate indexes and start webhook workers
             if (!self.initial_sync_complete.load(.acquire)) {
                 // Only pay the rebuild + ANALYZE when this process dropped
@@ -377,14 +387,18 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
                 // so these one-shot backfills (which UPDATE/DELETE protected & reorg_active
                 // tables, incl. unknown_labels) do NOT self-capture into the undo-log, per the
                 // backfill-doesn't-capture rule. Keep any new backfill inside this disarmed block.
-                if (protocol == .v1) {
-                    if (self.sync_indexes_dropped) {
-                        std.log.info("Running pre-migration names backfill...", .{});
-                        self.backfillPreMigrationNames() catch |err| {
-                            std.log.err("Failed to backfill pre-migration names: {}", .{err});
-                        };
-                    }
+                if (protocol == .v1 and self.sync_indexes_dropped) {
+                    std.log.info("Running pre-migration names backfill...", .{});
+                    self.backfillPreMigrationNames() catch |err| {
+                        std.log.err("Failed to backfill pre-migration names: {}", .{err});
+                    };
+                }
 
+                // Open GraphQL before the unknown-labels backfill: it drains a
+                // persistent backlog on every start and can run long.
+                sync_ready_owed = !markSyncReady(self, &.{protocol}, true);
+
+                if (protocol == .v1) {
                     // Backfill unknown subdomain labels from transaction calldata.
                     // Unconditional: drains a persistent backlog and is
                     // self-limiting (attempts capped, partial-index probe).
@@ -402,8 +416,6 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
                         };
                     }
                 }
-
-                markSyncReady(self, &.{protocol}, true);
             }
         } else |err| {
             handleSyncError(self, &watchdog, protocol, err);
