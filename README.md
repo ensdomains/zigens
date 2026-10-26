@@ -193,7 +193,7 @@ zigens/
 ├── src/
 │   ├── indexer/   # event indexing (abi, V1/V2 handlers, discovery)
 │   ├── rpc/       # JSON-RPC client (batching, multi-address log queries)
-│   ├── storage/   # SQLite layer (names, resolvers, events, sync, reorg undo-log)
+│   ├── storage/   # storage layer (SQLite + Postgres drivers, reorg undo-log)
 │   ├── api/       # GraphQL server, handler, resolvers
 │   ├── lib/graphql/  # GraphQL parser, executor, complexity, pagination
 │   ├── webhooks/  # signed async delivery
@@ -201,7 +201,7 @@ zigens/
 │   ├── types/ utils/  # core types, ENSIP-15 normalization, helpers
 │   └── *_main.zig # indexer / API entry points
 ├── schema.graphql       # GraphQL schema (source of truth)
-├── schema/              # SQLite schema
+├── schema/              # SQLite + PostgreSQL schema and migrations
 ├── tools/conformance/   # GraphQL spec conformance checks
 └── Dockerfile, docker-compose*.yml
 ```
@@ -209,7 +209,9 @@ zigens/
 ## Testing & conformance
 
 ```bash
-zig build test                    # full suite (storage, GraphQL, indexer, integration, …)
+zig build test                    # unit tests
+zig build test-all                # full suite (adds integration + conformance)
+zig build test-storage-pg         # Postgres lanes (needs DATABASE_URL)
 cd tools/conformance && npm install
 node schemacheck.mjs              # schema vs the graphql-js reference
 node audit.mjs http://localhost:8080/graphql   # GraphQL-over-HTTP transport audit
@@ -224,4 +226,4 @@ PostgreSQL; reorg rollback covers a 1000-block window.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). ENS and ENS v2 design by ENS Labs; built with [Zig](https://ziglang.org/).
+Not yet licensed — all rights reserved for now. ENS and ENS v2 design by ENS Labs; built with [Zig](https://ziglang.org/).

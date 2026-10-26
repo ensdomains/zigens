@@ -345,7 +345,7 @@ type Domain {
   """Label only (e.g., 'vitalik' for 'vitalik.eth')"""
   labelName: String
 
-  """Keccak256 hash of the label. Non-null: this indexer only materializes a Domain once its label is known (it never creates tokenId-only rows like the subgraph/ENSNode), so clients need no null guard."""
+  """Keccak256 hash of the label. Non-null: this indexer only materializes a Domain once its label is known (it never creates tokenId-only rows like the subgraph), so clients need no null guard."""
   labelhash: String!
 
   """Parent domain"""
