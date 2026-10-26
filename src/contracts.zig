@@ -209,8 +209,8 @@ fn mainnetAddresses() ContractAddresses {
         .premigration_registrar = Address.zero,
 
         // Migration Contracts (V1→V2, mainnet deployment)
-        .migration_helper = Address.fromHex("0xf1aa81ae63a04aebd6c257a3f2c490aad8b4b136") catch unreachable,
-        .locked_migration_controller = Address.fromHex("0x811814c098378488f916afa89f43b36baa5425ad") catch unreachable,
+        .migration_helper = Address.fromHex("0x6c8452afc6043b5af32eb345a8135108906f07ee") catch unreachable,
+        .locked_migration_controller = Address.fromHex("0x3cea18620883a69ed349b23328a3b6302598e51a") catch unreachable,
         .unlocked_migration_controller = Address.fromHex("0xab821ca676cf2e0790fa273526a165cfa86aeb64") catch unreachable,
 
         // Deployment blocks

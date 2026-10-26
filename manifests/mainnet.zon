@@ -22,8 +22,8 @@
         .{ .name = "eth_reverse_registrar", .address = "0x0000000000000000000000000000000000000000" },
         .{ .name = "batch_registrar", .address = "0xf0ccfbf6dba1e01ccb833ced6d551a8f000e9721" },
         .{ .name = "premigration_registrar", .address = "0x0000000000000000000000000000000000000000" },
-        .{ .name = "migration_helper", .address = "0xf1aa81ae63a04aebd6c257a3f2c490aad8b4b136" },
-        .{ .name = "locked_migration_controller", .address = "0x811814c098378488f916afa89f43b36baa5425ad" },
+        .{ .name = "migration_helper", .address = "0x6c8452afc6043b5af32eb345a8135108906f07ee" },
+        .{ .name = "locked_migration_controller", .address = "0x3cea18620883a69ed349b23328a3b6302598e51a" },
         .{ .name = "unlocked_migration_controller", .address = "0xab821ca676cf2e0790fa273526a165cfa86aeb64" },
     },
     .blocks = .{
