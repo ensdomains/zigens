@@ -101,6 +101,14 @@ fn syncGapWantsIndexDrop(self: *Indexer, protocols: []const models.Protocol, cli
     return false;
 }
 
+/// Open or close the GraphQL sync gate (storage/sync_readiness.zig) for `protocols`.
+fn markSyncReady(self: *Indexer, protocols: []const models.Protocol, ready: bool) void {
+    for (protocols) |protocol| {
+        self.database.setSyncReady(protocol, ready) catch |err|
+            std.log.err("Failed to mark {s} sync readiness={}: {}", .{ protocol.toString(), ready, err });
+    }
+}
+
 pub fn start(self: *Indexer) !void {
     std.log.info("Indexer starting...", .{});
 
@@ -112,6 +120,7 @@ pub fn start(self: *Indexer) !void {
     if (!self.initial_sync_complete.load(.acquire) and
         syncGapWantsIndexDrop(self, &.{ .v1, .v2 }, self.v1_client))
     {
+        markSyncReady(self, &.{ .v1, .v2 }, false);
         self.database.dropSyncIndexes() catch |err| {
             std.log.warn("Failed to drop sync indexes (non-fatal): {}", .{err});
         };
@@ -210,6 +219,8 @@ pub fn start(self: *Indexer) !void {
                 std.log.info("Initial sync complete - starting 8 webhook workers", .{});
                 wm.startWorkers(8) catch |err| std.log.err("webhook workers failed to start: {}", .{err});
             }
+
+            markSyncReady(self, &.{ .v1, .v2 }, true);
         }
 
         // Best-effort finality signalling (Task 09); no-op unless FINALITY_ENABLED.
@@ -294,6 +305,7 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
     if (!self.initial_sync_complete.load(.acquire) and
         syncGapWantsIndexDrop(self, &.{protocol}, client))
     {
+        markSyncReady(self, &.{protocol}, false);
         self.database.dropSyncIndexes() catch |err| {
             std.log.warn("Failed to drop sync indexes (non-fatal): {}", .{err});
         };
@@ -390,6 +402,8 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
                         };
                     }
                 }
+
+                markSyncReady(self, &.{protocol}, true);
             }
         } else |err| {
             handleSyncError(self, &watchdog, protocol, err);

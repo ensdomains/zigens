@@ -67,6 +67,8 @@ const conflict_keys = std.StaticStringMap([]const []const u8).initComptime(.{
     // Finality tiers — created via storage/finality.zig `ensureSchema` (also not in the
     // base schema); one row per (chain_id, tier) with tier in ('safe','finalized').
     .{ "finality_state", &[_][]const u8{ "chain_id", "tier" } },
+    // GraphQL sync gate — created via storage/sync_readiness.zig `ensureSchema`.
+    .{ "sync_readiness", &[_][]const u8{"protocol"} },
 });
 
 /// The conflict-key columns for `table`, or null if the table is not a known
@@ -118,6 +120,7 @@ test "conflictColsFor matches every schema-derived key" {
         .{ "unknown_labels", &[_][]const u8{ "labelhash", "parent_node" } },
         .{ "resolution_cache", &[_][]const u8{ "chain_id", "target", "selector_key", "arg_hash", "block_dep_hash" } },
         .{ "finality_state", &[_][]const u8{ "chain_id", "tier" } },
+        .{ "sync_readiness", &[_][]const u8{"protocol"} },
     };
     inline for (expected) |e| {
         try std.testing.expectEqualDeep(@as(?[]const []const u8, e[1]), conflictColsFor(e[0]));

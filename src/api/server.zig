@@ -16,6 +16,8 @@ const PerIpRateLimiter = @import("../rate_limiter.zig").PerIpRateLimiter;
 /// enough that real scraping (well under 1/s) is never limited, while still bounding a
 /// /metrics flood (each hit does a DB pool acquire + finality reads).
 const METRICS_RATE_LIMIT_PER_SECOND: u32 = 60;
+/// How long a GraphQL sync-gate verdict is reused before `sync_readiness` is re-read.
+const SYNC_READY_TTL_MS: i64 = 5_000;
 const webhook_manager = @import("../webhooks/manager.zig");
 const rpc = @import("../rpc/client.zig");
 const resolve_client = @import("../resolve/client.zig");
@@ -96,6 +98,9 @@ pub const Server = struct {
     request_timeout_ms: u32,
     /// One-shot latch for the proxy-attribution warning below.
     warned_proxy_attribution: bool,
+    /// Last observed `sync_readiness` verdict and when it was read (ms); see syncReady.
+    sync_ready: std.atomic.Value(bool),
+    sync_ready_checked_ms: std.atomic.Value(i64),
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, pool: *pool_mod.Pool, webhook_db_path: ?[]const u8, port: u16, complexity_max_depth: u32, complexity_max_cost: u32, metrics_enabled: bool, rate_limit_per_second: u32, webhook_admin_username: ?[]const u8, webhook_admin_password: ?[]const u8, trusted_proxy_hops: u32, request_timeout_ms: u32, max_concurrent_connections: u32, internal_admin_token: ?[]const u8, internal_rate_limit_per_second: u32, allow_unauth_webhooks: bool) !Server {
         // Only open webhook database if path is provided (webhooks enabled)
@@ -130,6 +135,8 @@ pub const Server = struct {
             .max_concurrent_connections = max_concurrent_connections,
             .request_timeout_ms = request_timeout_ms,
             .warned_proxy_attribution = false,
+            .sync_ready = std.atomic.Value(bool).init(false),
+            .sync_ready_checked_ms = std.atomic.Value(i64).init(0),
         };
     }
 
@@ -421,6 +428,10 @@ pub const Server = struct {
 
         // Route request
         if (std.mem.startsWith(u8, path, "/graphql")) {
+            if (!self.syncReady()) {
+                try self.sendSyncInProgress(conn);
+                return;
+            }
             // Handle GraphQL queries (both GET and POST)
             if (std.mem.eql(u8, method, "POST")) {
                 try self.handleGraphQLQuery(conn, request);
@@ -514,6 +525,23 @@ pub const Server = struct {
     pub const handleGraphQLGet = api_endpoints.handleGraphQLGet;
     pub const handleGraphQLPlayground = api_endpoints.handleGraphQLPlayground;
 
+    /// Whether the indexer has finished its initial sync (storage/sync_readiness.zig).
+    /// The verdict is re-read at most every SYNC_READY_TTL_MS so GraphQL traffic does
+    /// not pay an extra DB round trip per request; an unreadable DB counts as not ready.
+    fn syncReady(self: *Server) bool {
+        const now = zsys.milliTimestamp();
+        if (now - self.sync_ready_checked_ms.load(.acquire) < SYNC_READY_TTL_MS) return self.sync_ready.load(.acquire);
+
+        const ready = blk: {
+            const database = self.pool.acquire() catch break :blk false;
+            defer self.pool.release(database);
+            break :blk database.isSyncReady() catch false;
+        };
+        self.sync_ready.store(ready, .release);
+        self.sync_ready_checked_ms.store(now, .release);
+        return ready;
+    }
+
     // Response writers — implementations in api_responses.zig.
     /// Gate a webhook admin route. Returns true to proceed; on failure it has
     /// already sent 401 and the caller must return. Fail-closed: with no credential
@@ -535,6 +563,7 @@ pub const Server = struct {
     pub const sendRequestError = api_responses.sendRequestError;
     pub const sendRateLimited = api_responses.sendRateLimited;
     pub const sendServiceUnavailable = api_responses.sendServiceUnavailable;
+    pub const sendSyncInProgress = api_responses.sendSyncInProgress;
     pub const sendCorsPreflightResponse = api_responses.sendCorsPreflightResponse;
     pub const sendUnauthorized = api_responses.sendUnauthorized;
 
@@ -564,4 +593,35 @@ test "Server init" {
 
     try std.testing.expect(server.port == 8080);
     try std.testing.expectEqual(@as(u32, 0), server.active_conns.load(.monotonic));
+}
+
+test "syncReady stays closed until the indexer marks its initial sync complete" {
+    const allocator = std.testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+
+    var pool = try pool_mod.Pool.open(allocator, .{ .kind = .sqlite, .sqlite_path = ":memory:" });
+    defer pool.deinit();
+
+    var server = try Server.init(allocator, threaded.io(), &pool, null, 8080, 10, 1000, false, 100, null, null, 0, 10000, 512, null, 2, true);
+    defer server.deinit();
+
+    try std.testing.expect(!server.syncReady());
+
+    const database = try pool.acquire();
+    try @import("../storage/sync_readiness.zig").ensureSchema(database);
+    try database.setSyncReady(.v2, false);
+    pool.release(database);
+
+    server.sync_ready_checked_ms.store(0, .release);
+    try std.testing.expect(!server.syncReady());
+
+    const again = try pool.acquire();
+    try again.setSyncReady(.v2, true);
+    pool.release(again);
+
+    try std.testing.expect(!server.syncReady());
+    server.sync_ready_checked_ms.store(0, .release);
+    try std.testing.expect(server.syncReady());
 }
