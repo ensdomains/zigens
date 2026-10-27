@@ -157,6 +157,10 @@ services:
       # without committing a batch (see .env.example). Above the longest healthy
       # batch; set 0 for a --backfill or an END_BLOCK-pinned deployment.
       - COVERAGE_STALE_AFTER_SECONDS=${COVERAGE_STALE_AFTER_SECONDS:-3600}
+      # Selects the contract address set the API uses for live resolution and
+      # the chainId it reports. The code default is sepolia, so a mainnet API
+      # without this resolves against Sepolia addresses over a mainnet RPC.
+      - NETWORK=${NETWORK:-sepolia}
       - GRAPHQL_MAX_DEPTH=10
       - GRAPHQL_MAX_COST=${GRAPHQL_MAX_COST:-10000}
       # While an EMPTY database runs its first bulk sync, /graphql answers 503
@@ -185,7 +189,7 @@ services:
     depends_on:
       - indexer-v2
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:5656/health"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:5656/health"]
       interval: 30s
       timeout: 10s
       retries: 3
