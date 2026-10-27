@@ -533,6 +533,7 @@ pub fn indexResolverEvents(self: *Indexer, protocol: models.Protocol, client: *r
     }
     if (owed.items.len > 0) {
         std.log.info("Backfilling {d} resolver(s) first sighted this batch (up to block {d})", .{ owed.items.len, from_block - 1 });
+        oweDiscoverySweep(self, .resolver, protocol, owed.items);
         _ = discovery_backfill.backfillDiscovered(self, protocol, client, .resolver, owed.items, from_block - 1, null, null);
     }
 
@@ -739,6 +740,28 @@ fn drainHealTask(self: *Indexer, kind: discovery_backfill.Kind, protocol: models
     std.log.info("init-gap heal: {s} pass complete, {d}/{d} swept", .{ task, outcome.swept + outcome.no_history, targets.items.len });
 }
 
+/// Record a discovery sweep as owed BEFORE it runs. Nothing else enqueues a
+/// newly sighted contract: it is in known_resolvers/known_subregistries from the
+/// moment it is registered, so it is never "newly discovered" again, and
+/// seedInitGapHealTargets runs only at initial-sync completion. Without this, a
+/// restart or crash mid-sweep drops the sweep silently and permanently.
+/// recordOutcome clears the row when the sweep lands.
+fn oweDiscoverySweep(self: *Indexer, kind: discovery_backfill.Kind, protocol: models.Protocol, addrs: []const Address) void {
+    // The ledger — like recordOutcome — is v2-only.
+    if (protocol != .v2) return;
+    const task = switch (kind) {
+        .resolver => RESOLVER_HEAL_TASK,
+        .subregistry => SUBREGISTRY_HEAL_TASK,
+    };
+    for (addrs) |addr| {
+        var buf: [42]u8 = undefined;
+        const hex = addr.toHexBuf(&buf);
+        self.database.enqueueHealTarget(task, protocol, hex) catch |err| {
+            std.log.warn("could not record the owed {s} sweep for {s}: {}", .{ task, hex, err });
+        };
+    }
+}
+
 fn backfillAddressStrings(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, kind: discovery_backfill.Kind, hexes: []const []const u8, to_block: u64) void {
     var addrs: std.ArrayList(Address) = .empty;
     defer addrs.deinit(self.allocator);
@@ -746,6 +769,7 @@ fn backfillAddressStrings(self: *Indexer, protocol: models.Protocol, client: *rp
         const addr = Address.fromHex(hex) catch continue;
         addrs.append(self.allocator, addr) catch continue;
     }
+    oweDiscoverySweep(self, kind, protocol, addrs.items);
     _ = discovery_backfill.backfillDiscovered(self, protocol, client, kind, addrs.items, to_block, null, null);
 }
 
