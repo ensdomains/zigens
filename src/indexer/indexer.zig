@@ -68,8 +68,10 @@ pub const Indexer = struct {
     v1_rpc_chunk_ceiling: u64 = 0,
     // Largest eth_getLogs block span the provider has accepted for a discovery
     // sweep (0 = unlimited, nothing learned yet). Lowered by the first rejection
-    // and kept for the rest of the run so every later sweep starts right-sized.
+    // so every later sweep starts right-sized, and raised again after a run of
+    // clean chunks so one dense range cannot cap the rest of the process.
     backfill_chunk_ceiling: u64 = 0,
+    backfill_chunk_successes: u32 = 0,
     // Memoized rainbow-table lookups (hit AND miss — the empty-string sentinel).
     // A cold probe into the multi-GB rainbow DB is disk-latency-priced; the same
     // labelhash recurs on every event touching that node, so memoization collapses

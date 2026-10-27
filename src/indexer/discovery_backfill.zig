@@ -101,6 +101,9 @@ const PROBE_COOLDOWN_BUDGET: u32 = 6;
 const GROUP_MAX_ADDRESSES: usize = 100;
 const SWEEP_MIN_CHUNK: u64 = 500;
 
+/// Clean chunks required before the learned ceiling is raised again.
+const CHUNK_CEILING_RECOVERY_RUN: u32 = 25;
+
 pub const Outcome = struct {
     total: usize = 0,
     no_history: usize = 0,
@@ -334,6 +337,20 @@ const Target = struct {
     ceil: u64,
 };
 
+/// Lower bound for a sweep, per protocol. `config.start_block` is a single
+/// process-wide value defaulting to the V1 registry deployment, so a V2 pass that
+/// first sights a legacy shared resolver would otherwise sweep that contract's
+/// whole pre-V2 history — 16.9M blocks on mainnet, hours of eth_getLogs inside the
+/// head-following loop, for events no V2 name can possibly have emitted.
+///
+/// The anchor SEARCH keeps the unclamped floor: anchors are memoised per address
+/// and the V1 pass sweeps through here too, so caching a V2-floored anchor for a
+/// legacy contract would silently under-sweep V1 later.
+fn sweepFloor(start_block: u64, v2_deployment_block: u64, protocol: models.Protocol) u64 {
+    if (protocol != .v2) return start_block;
+    return @max(start_block, v2_deployment_block);
+}
+
 /// The sweep window for one target: `null` means nothing is owed.
 ///
 /// Two rules, and the asymmetry between them is deliberate:
@@ -377,8 +394,9 @@ pub fn backfillDiscovered(self: *Indexer, protocol: models.Protocol, client: *rp
     if (addrs.len == 0) return outcome;
     const started = zsys.milliTimestamp();
     const floor = self.config.start_block;
+    const sweep_floor = sweepFloor(floor, self.config.v2_contracts.v2_deployment_block, protocol);
 
-    if (to_block < floor) {
+    if (to_block < sweep_floor) {
         for (addrs) |addr| recordOutcome(self, kind, protocol, addr, null);
         outcome.no_history = addrs.len;
         return outcome;
@@ -445,8 +463,9 @@ pub fn backfillDiscovered(self: *Indexer, protocol: models.Protocol, client: *rp
     defer targets.deinit(self.allocator);
     for (addrs, anchors, 0..) |addr, anchor, i| {
         if (anchor) |a| {
-            if (sweepWindow(a, if (ceils) |cs| cs[i] else 0, to_block)) |ceil| {
-                targets.append(self.allocator, .{ .addr = addr, .anchor = a, .ceil = ceil }) catch {
+            const from = @max(a, sweep_floor);
+            if (sweepWindow(from, if (ceils) |cs| cs[i] else 0, to_block)) |ceil| {
+                targets.append(self.allocator, .{ .addr = addr, .anchor = from, .ceil = ceil }) catch {
                     recordOutcome(self, kind, protocol, addr, error.OutOfMemory);
                     outcome.failed += 1;
                 };
@@ -466,7 +485,7 @@ pub fn backfillDiscovered(self: *Indexer, protocol: models.Protocol, client: *rp
         // with per-target ceilings these differ by ~100k blocks on a real heal,
         // and the old line made a capped sweep look like a full-history one.
         std.log.info("  Discovery anchors: floor {d}, ceil {d}..{d} (head {d}), {d} target(s) spanning {d}..{d}", .{
-            floor,
+            sweep_floor,
             targets.items[0].ceil,
             targets.items[targets.items.len - 1].ceil,
             to_block,
@@ -612,6 +631,7 @@ fn sweepGroup(self: *Indexer, protocol: models.Protocol, client: *rpc.Client, ki
             };
             transient_failures = 0;
             chunk_size = retry_size;
+            noteChunkSuccess(self);
             break fetched;
         } else null;
 
@@ -696,6 +716,19 @@ fn startChunk(self: *Indexer, remaining: u64) u64 {
 fn lowerChunkCeiling(self: *Indexer, size: u64) void {
     const floor = @max(size, SWEEP_MIN_CHUNK);
     if (self.backfill_chunk_ceiling == 0 or self.backfill_chunk_ceiling > floor) self.backfill_chunk_ceiling = floor;
+    self.backfill_chunk_successes = 0;
+}
+
+/// Raise the learned ceiling again after a run of clean chunks. `lowerChunkCeiling`
+/// only ever lowers it, so without this one dense range caps every later sweep in
+/// the process at the worst range's limit. Multiplicative both ways, and a
+/// rejection resets the run, so a provider that keeps saying no keeps its ceiling.
+fn noteChunkSuccess(self: *Indexer) void {
+    if (self.backfill_chunk_ceiling == 0) return;
+    self.backfill_chunk_successes += 1;
+    if (self.backfill_chunk_successes < CHUNK_CEILING_RECOVERY_RUN) return;
+    self.backfill_chunk_successes = 0;
+    self.backfill_chunk_ceiling *|= 2;
 }
 
 fn growChunk(self: *Indexer, size: u64) u64 {
@@ -992,6 +1025,19 @@ test "searchAnchors resolves exact anchors despite a rate-limited probe round" {
     try testing.expect(cooldowns >= 1);
     // The retry answered, so nothing fell back to the floor.
     try testing.expect(anchors[0].? > 11_708_980);
+}
+
+test "sweepFloor: a V2 sweep never reaches below the V2 deployment" {
+    // Mainnet's real values: START_BLOCK defaults to the V1 registry deployment,
+    // 16.7M blocks below the V2 deployment, and a legacy shared resolver's own
+    // anchor sits down there with it.
+    try std.testing.expectEqual(@as(u64, 26_105_294), sweepFloor(9_380_410, 26_105_294, .v2));
+    // V1 keeps the configured floor.
+    try std.testing.expectEqual(@as(u64, 9_380_410), sweepFloor(9_380_410, 26_105_294, .v1));
+    // A network with no V2 deployment (0) is unaffected.
+    try std.testing.expectEqual(@as(u64, 9_380_410), sweepFloor(9_380_410, 0, .v2));
+    // An explicit START_BLOCK above the V2 deployment still wins.
+    try std.testing.expectEqual(@as(u64, 26_200_000), sweepFloor(26_200_000, 26_105_294, .v2));
 }
 
 test "sweepWindow: an unknown ceiling falls back to the head, never to nothing" {
