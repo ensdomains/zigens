@@ -101,6 +101,10 @@ pub const Server = struct {
     /// Last observed `sync_readiness` verdict and when it was read (ms); see syncReady.
     sync_ready: std.atomic.Value(bool),
     sync_ready_checked_ms: std.atomic.Value(i64),
+    /// GRAPHQL_SYNC_GATE_ENABLED. Off switch for the sync gate: a deployment that
+    /// would rather serve a half-built database than 503 can turn it off without a
+    /// rebuild. Set from config in api_main (like slow_query_threshold_us).
+    sync_gate_enabled: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, pool: *pool_mod.Pool, webhook_db_path: ?[]const u8, port: u16, complexity_max_depth: u32, complexity_max_cost: u32, metrics_enabled: bool, rate_limit_per_second: u32, webhook_admin_username: ?[]const u8, webhook_admin_password: ?[]const u8, trusted_proxy_hops: u32, request_timeout_ms: u32, max_concurrent_connections: u32, internal_admin_token: ?[]const u8, internal_rate_limit_per_second: u32, allow_unauth_webhooks: bool) !Server {
         // Only open webhook database if path is provided (webhooks enabled)
@@ -528,7 +532,9 @@ pub const Server = struct {
     /// Whether the indexer has finished its initial sync (storage/sync_readiness.zig).
     /// The verdict is re-read at most every SYNC_READY_TTL_MS so GraphQL traffic does
     /// not pay an extra DB round trip per request; an unreadable DB counts as not ready.
-    fn syncReady(self: *Server) bool {
+    /// Also reported by /ready and /metrics, so a closed gate is never silent.
+    pub fn syncReady(self: *Server) bool {
+        if (!self.sync_gate_enabled) return true;
         const now = zsys.milliTimestamp();
         if (now - self.sync_ready_checked_ms.load(.acquire) < SYNC_READY_TTL_MS) return self.sync_ready.load(.acquire);
 
@@ -621,7 +627,17 @@ test "syncReady stays closed until the indexer marks its initial sync complete" 
     try again.setSyncReady(.v2, true);
     pool.release(again);
 
+    // Cached: the previous verdict is reused until the TTL expires. Stamp the
+    // read time rather than relying on how long the lines above took to run.
+    server.sync_ready_checked_ms.store(zsys.milliTimestamp(), .release);
     try std.testing.expect(!server.syncReady());
+
     server.sync_ready_checked_ms.store(0, .release);
+    try std.testing.expect(server.syncReady());
+
+    // The off switch opens the gate without consulting the database.
+    server.sync_ready.store(false, .release);
+    server.sync_ready_checked_ms.store(zsys.milliTimestamp(), .release);
+    server.sync_gate_enabled = false;
     try std.testing.expect(server.syncReady());
 }

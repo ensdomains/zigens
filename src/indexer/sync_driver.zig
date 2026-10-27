@@ -114,6 +114,35 @@ fn markSyncReady(self: *Indexer, protocols: []const models.Protocol, ready: bool
     return ok;
 }
 
+/// Whether this database has nothing worth serving yet — no protocol has ever
+/// committed a block. Only then does a bulk start close the GraphQL gate: closing it
+/// for a re-sync of an already-indexed database would take a complete API offline for
+/// the whole drop/sync/rebuild cycle, and `syncGapWantsIndexDrop` counts an RPC error
+/// at boot as a large gap, so one failed eth_blockNumber would be enough to do it.
+fn databaseNeverSynced(self: *Indexer, protocols: []const models.Protocol) !bool {
+    for (protocols) |protocol| {
+        if (((try self.database.getSyncState(protocol)) orelse 0) > 0) return false;
+    }
+    return true;
+}
+
+/// Close the GraphQL gate iff this database has never indexed anything. Returns false
+/// while the close is still owed, for the caller to retry before the next batch lands:
+/// either the read or the write failed. A failed read decides NOTHING — taking it for
+/// "never synced" is how a transient database error would gate a complete API behind a
+/// whole re-sync. `memo` keeps the answer once it arrives, so a retry that runs after
+/// sync_state has advanced cannot abandon a close this run still owes.
+fn closeSyncGateIfUnindexed(self: *Indexer, protocols: []const models.Protocol, memo: *?bool) bool {
+    if (memo.* == null) {
+        memo.* = databaseNeverSynced(self, protocols) catch |err| {
+            std.log.warn("Cannot tell whether this database has ever synced ({}); leaving the GraphQL gate as it is for now", .{err});
+            return false;
+        };
+    }
+    if (!memo.*.?) return true;
+    return markSyncReady(self, protocols, false);
+}
+
 pub fn start(self: *Indexer) !void {
     std.log.info("Indexer starting...", .{});
 
@@ -122,10 +151,12 @@ pub fn start(self: *Indexer) !void {
     };
 
     // Drop non-essential indexes for faster bulk inserts during initial sync
+    var sync_gate_never_synced: ?bool = null;
+    var sync_gate_close_owed = false;
     if (!self.initial_sync_complete.load(.acquire) and
         syncGapWantsIndexDrop(self, &.{ .v1, .v2 }, self.v1_client))
     {
-        _ = markSyncReady(self, &.{ .v1, .v2 }, false);
+        sync_gate_close_owed = !closeSyncGateIfUnindexed(self, &.{ .v1, .v2 }, &sync_gate_never_synced);
         self.database.dropSyncIndexes() catch |err| {
             std.log.warn("Failed to drop sync indexes (non-fatal): {}", .{err});
         };
@@ -138,6 +169,12 @@ pub fn start(self: *Indexer) !void {
     var sync_ready_owed = false;
 
     while (!self.should_stop.load(.acquire) and !shutdown.isRequested()) {
+        // Retry a failed close before this iteration's first batch lands: an advancing
+        // sync_state is what the fallback in storage/sync_readiness.zig reads, so an
+        // unwritten "not ready" row would open the gate mid-bulk-sync.
+        if (sync_gate_close_owed and !self.initial_sync_complete.load(.acquire))
+            sync_gate_close_owed = !closeSyncGateIfUnindexed(self, &.{ .v1, .v2 }, &sync_gate_never_synced);
+
         // Index V1 first (SQLite doesn't support concurrent writes from different threads)
         self.indexProtocol(.v1, self.v1_client) catch |err| {
             handleSyncError(self, &watchdog, .v1, err);
@@ -310,10 +347,12 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
     const client = self.getClient(protocol);
 
     // Drop non-essential indexes for faster bulk inserts during initial sync
+    var sync_gate_never_synced: ?bool = null;
+    var sync_gate_close_owed = false;
     if (!self.initial_sync_complete.load(.acquire) and
         syncGapWantsIndexDrop(self, &.{protocol}, client))
     {
-        _ = markSyncReady(self, &.{protocol}, false);
+        sync_gate_close_owed = !closeSyncGateIfUnindexed(self, &.{protocol}, &sync_gate_never_synced);
         self.database.dropSyncIndexes() catch |err| {
             std.log.warn("Failed to drop sync indexes (non-fatal): {}", .{err});
         };
@@ -326,6 +365,11 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
     var sync_ready_owed = false;
 
     while (!self.should_stop.load(.acquire) and !shutdown.isRequested()) {
+        // See the combined loop: an unwritten "not ready" row would open the gate
+        // mid-bulk-sync once sync_state advances.
+        if (sync_gate_close_owed and !self.initial_sync_complete.load(.acquire))
+            sync_gate_close_owed = !closeSyncGateIfUnindexed(self, &.{protocol}, &sync_gate_never_synced);
+
         if (self.indexProtocol(protocol, client)) |_| {
             watchdog.recordSuccess();
             if (sync_ready_owed) sync_ready_owed = !markSyncReady(self, &.{protocol}, true);
