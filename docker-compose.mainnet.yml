@@ -141,6 +141,10 @@ services:
       - NETWORK=${NETWORK:-mainnet}
       - GRAPHQL_MAX_DEPTH=10
       - GRAPHQL_MAX_COST=${GRAPHQL_MAX_COST:-10000}
+      # While an EMPTY database runs its first bulk sync, /graphql answers 503
+      # rather than serving a half-built index; an already-indexed database is
+      # never gated. Set false to serve regardless.
+      - GRAPHQL_SYNC_GATE_ENABLED=${GRAPHQL_SYNC_GATE_ENABLED:-true}
       # Live resolution (ENSIP-10 Universal Resolver fallback) for single-name
       # queries; needs an RPC the API can call — RESOLVE_RPC_URL falls back to
       # the indexer's RPC_URL value from the environment. Without either, the
