@@ -921,6 +921,29 @@ pub fn build(b: *std.Build) void {
     run_conformance_tests.setCwd(b.path("."));
     const conformance_test_step = b.step("test-conformance", "Run GraphQL conformance golden harness");
     conformance_test_step.dependOn(&run_conformance_tests.step);
+
+    // MCP protocol tests: JSON-RPC framing + tool dispatch over a seeded DB
+    // (transport-free core). Depends on generate_schema: mcp.zig embeds the
+    // generator-copied src/api/schema.graphql.
+    const mcp_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/graphql/mcp_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "helpers", .module = helpers_mod },
+                .{ .name = "lib", .module = lib_mod },
+            },
+        }),
+    });
+    mcp_tests.root_module.link_libc = true;
+    mcp_tests.root_module.linkSystemLibrary("sqlite3", .{});
+    mcp_tests.step.dependOn(&generate_schema.step);
+    const run_mcp_tests = b.addRunArtifact(mcp_tests);
+    run_mcp_tests.setCwd(b.path("."));
+    const mcp_test_step = b.step("test-mcp", "Run MCP agent endpoint tests");
+    mcp_test_step.dependOn(&run_mcp_tests.step);
+    test_step.dependOn(&run_mcp_tests.step);
     // Manifest-driven config (Task 08). Uses the quiet runner because the validation tests
     // deliberately trigger std.log.err on bad-address/wrong-chain/unknown-contract paths;
     // setCwd(.) so it reads the committed manifests/ reference files.

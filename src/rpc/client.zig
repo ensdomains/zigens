@@ -25,6 +25,7 @@
 //! receive path; see drainIdleHttpConnections). Until then this file is
 //! deliberate.
 const std = @import("std");
+const rate_limiter = @import("../rate_limiter.zig");
 const zsys = @import("../utils/system.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
@@ -430,6 +431,10 @@ fn classifyRpcError(context: []const u8, err_value: std.json.Value) anyerror {
     const message = rpcErrorMessage(err_value);
     const err = rpcErrorOf(err_value);
     if (err == error.RpcRateLimited) {
+        // Tell the outbound limiter to back off. This is the only chokepoint
+        // that sees EVERY throttle, including the ones the retry loop below
+        // absorbs successfully — which is all of them in practice.
+        rate_limiter.noteProviderThrottle();
         std.log.warn("{s} (rate limited): {s}", .{ context, message });
     } else {
         std.log.err("{s}: {s}", .{ context, message });
@@ -723,6 +728,12 @@ pub const Client = struct {
                     std.log.warn("HTTP {d} from RPC (permanent; not retrying). Body: {s}", .{ status_code, body_preview });
                     return error.RpcError;
                 }
+
+                // A real HTTP 429 is a throttle and must feed backpressure. It never
+                // reaches classifyRpcError — that only sees JSON-RPC errors arriving
+                // over HTTP 200 — so hooking only there left the commonest throttle
+                // shape invisible to the limiter.
+                if (status_code == 429) rate_limiter.noteProviderThrottle();
 
                 // 5xx, 408, 429, and other transient: retry with backoff
                 last_error = error.HttpError;

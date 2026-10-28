@@ -37,6 +37,9 @@ pub const api = struct {
     // Exposed so the conformance harness reaches GraphQLHandler through the SAME
     // module graph as `lib.Database` (one Database type across the test).
     pub const handler = @import("api/handler.zig");
+    // MCP protocol core — transport-free (processMcp + Executor), so the
+    // test lane drives the full JSON-RPC surface over a seeded database.
+    pub const mcp = @import("api/mcp.zig");
 };
 
 /// Resolution layer (Tasks 04-06). Exposed so tests can build a LiveContext / Resolver

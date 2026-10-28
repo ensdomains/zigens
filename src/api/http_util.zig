@@ -59,7 +59,7 @@ pub const Conn = struct {
 
 /// Find a header value (case-insensitive name) in a raw HTTP header block. Returns the
 /// trimmed value or null. Handles CRLF and LF line endings.
-fn findHeaderValue(header_data: []const u8, name_lower: []const u8) ?[]const u8 {
+pub fn findHeaderValue(header_data: []const u8, name_lower: []const u8) ?[]const u8 {
     var lines = std.mem.splitScalar(u8, header_data, '\n');
     while (lines.next()) |line0| {
         const line = std.mem.trimEnd(u8, line0, "\r");
@@ -161,6 +161,168 @@ pub fn resolveClientAddress(direct_peer: std.Io.net.IpAddress, header_data: []co
 /// else — `application/json`, `*/*`, `text/html`, or no Accept header — keeps the legacy
 /// "always 200 + application/json, errors in body" contract that ensjs / subgraph clients
 /// rely on. No change is gated on anything but this opt-in header.
+/// Is this request's `Origin` acceptable for a browser-reachable endpoint?
+///
+/// Two deliberate "yes" cases, and both matter more than they look:
+///   - an UNCONFIGURED or empty allow-list means no restriction, so enabling the
+///     check cannot silently break a deployment that is already working;
+///   - a request with NO `Origin` header is allowed, because `Origin` is set and
+///     enforced by browsers. Its absence is not a signal — every CLI and agent
+///     client omits it, and those are the normal MCP callers. Rejecting on
+///     absence would block exactly the clients the endpoint exists for while
+///     doing nothing about the browser threat it is meant to address (DNS
+///     rebinding, where a hostile page makes the victim's browser query a
+///     server only their network can reach).
+/// `*` as an entry means allow any origin, for an operator who wants the check
+/// visibly disabled rather than merely unset.
+pub fn originAllowed(header_data: []const u8, allow_list: ?[]const u8) bool {
+    // Scan the HEADER region only. This predicate is a security gate and it used
+    // to be handed the whole request, so it was looking for its header inside
+    // attacker-controlled body bytes.
+    const scan = if (headerEnd(header_data)) |he| header_data[0..he.end] else header_data;
+
+    // No Origin header: not a browser. Every CLI and agent MCP client omits it,
+    // and they are what this endpoint is for, so they are never restricted.
+    const origin = findHeaderValue(scan, "origin") orelse return true;
+
+    // An Origin IS present, so this is a browser. Streamable HTTP states it as a
+    // MUST: "Servers MUST validate the Origin header on all incoming connections
+    // to prevent DNS rebinding attacks." With nothing allow-listed there is
+    // nothing to validate against, so the answer is no — an operator who wants
+    // browser access names the origins (or "*") in MCP_ALLOWED_ORIGINS. Defaulting
+    // to allow-all would have left the MUST unmet for the only client class it
+    // protects.
+    const list = allow_list orelse return false;
+    if (std.mem.trim(u8, list, " \t").len == 0) return false;
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |raw| {
+        const entry = std.mem.trim(u8, raw, " \t");
+        if (entry.len == 0) continue;
+        if (std.mem.eql(u8, entry, "*")) return true;
+        // Scheme and host are case-insensitive per RFC 6454.
+        if (std.ascii.eqlIgnoreCase(entry, origin)) return true;
+    }
+    return false;
+}
+
+test "originAllowed: a browser is validated even with no allow-list; a non-browser never is" {
+    const req = "POST /mcp HTTP/1.1\r\nOrigin: https://evil.test\r\n\r\n{}";
+    // An Origin header means a browser, and the spec MUST applies. Unconfigured
+    // is not a licence to skip it — there is simply nothing on the list.
+    try std.testing.expect(!originAllowed(req, null));
+    try std.testing.expect(!originAllowed(req, ""));
+    try std.testing.expect(!originAllowed(req, "   "));
+    // "*" is how an operator opts out explicitly, rather than by omission.
+    try std.testing.expect(originAllowed(req, "*"));
+
+    // No Origin header: a CLI/agent client, which is the normal MCP caller, and
+    // is unaffected by the list either way.
+    const no_origin = "POST /mcp HTTP/1.1\r\nHost: x\r\n\r\n{}";
+    try std.testing.expect(originAllowed(no_origin, "https://app.test"));
+    try std.testing.expect(originAllowed(no_origin, null));
+    try std.testing.expect(originAllowed(no_origin, ""));
+}
+
+test "originAllowed reads the header block, never the body" {
+    // A body line shaped like a header must not be able to supply the Origin —
+    // or to supply one that passes the list.
+    const spoof = "POST /mcp HTTP/1.1\r\nHost: x\r\n\r\norigin: https://app.test\n";
+    try std.testing.expect(originAllowed(spoof, "https://app.test"));
+    try std.testing.expect(originAllowed(spoof, "https://other.test"));
+
+    // And a real header still wins over a body that tries to override it.
+    const both = "POST /mcp HTTP/1.1\r\nOrigin: https://evil.test\r\n\r\norigin: https://app.test\n";
+    try std.testing.expect(!originAllowed(both, "https://app.test"));
+}
+
+test "originAllowed: matches an entry exactly, case-insensitively, and rejects the rest" {
+    const app = "POST /mcp HTTP/1.1\r\nOrigin: https://app.test\r\n\r\n{}";
+    const evil = "POST /mcp HTTP/1.1\r\nOrigin: https://evil.test\r\n\r\n{}";
+    try std.testing.expect(originAllowed(app, "https://app.test"));
+    try std.testing.expect(originAllowed(app, "https://other.test, https://app.test"));
+    try std.testing.expect(originAllowed(app, "  https://app.test  ,  "));
+    try std.testing.expect(originAllowed("POST / HTTP/1.1\r\nOrigin: HTTPS://APP.TEST\r\n\r\n{}", "https://app.test"));
+    try std.testing.expect(!originAllowed(evil, "https://app.test"));
+    try std.testing.expect(!originAllowed(evil, "https://a.test,https://b.test"));
+    // An explicit wildcard disables the check visibly.
+    try std.testing.expect(originAllowed(evil, "*"));
+}
+
+/// Where the header block ends: `end` is the index of the blank line, `body_start`
+/// the first byte after its terminator.
+///
+/// ONE implementation, shared by the accept loop and every body-extracting
+/// handler. Two independent copies of this arithmetic is precisely what put a
+/// hard-coded `+ 4` on a 2-byte separator and turned an LF-framed request into a
+/// slice-bounds abort.
+pub const HeaderEnd = struct {
+    end: usize,
+    body_start: usize,
+};
+
+/// The blank line that comes FIRST positionally ends the headers — not whichever
+/// terminator we would rather have seen. Preferring CRLF meant an LF-framed
+/// request whose *body* contained a CRLF blank line computed a body start past
+/// the bytes the client actually sent, and the read loop then waited out the
+/// whole request timeout with a pinned thread and no response.
+///
+/// The body_start length MUST follow the separator that actually matched. Four
+/// handlers independently wrote `indexOf("\r\n\r\n") orelse indexOf("\n\n")` and
+/// then advanced by a hard-coded 4 — so an LF-only request (curl --http1.0 through
+/// some proxies, hand-written clients, anything that normalises line endings)
+/// overshot the buffer end by 2. On a body shorter than that overshoot the slice
+/// is out of bounds, which in Zig is a panic, and a slice-bounds panic is abort():
+/// no `catch` up the stack contains it, so a 20-byte unauthenticated request
+/// killed the whole API process.
+pub fn headerEnd(request: []const u8) ?HeaderEnd {
+    const lf = std.mem.indexOf(u8, request, "\n\n");
+    if (std.mem.indexOf(u8, request, "\r\n\r\n")) |crlf| {
+        if (lf) |l| {
+            if (l < crlf) return .{ .end = l, .body_start = l + 2 };
+        }
+        return .{ .end = crlf, .body_start = crlf + 4 };
+    }
+    if (lf) |l| return .{ .end = l, .body_start = l + 2 };
+    return null;
+}
+
+/// The request body: everything after the header terminator. The accept loop
+/// sizes the buffer at exactly `header + terminator + Content-Length` and rejects
+/// a pipelined tail, so "the rest of the buffer" IS the body.
+pub fn requestBody(request: []const u8) ?[]const u8 {
+    const he = headerEnd(request) orelse return null;
+    return request[he.body_start..];
+}
+
+test "requestBody follows the separator that matched, and never slices past the end" {
+    // CRLF framing: the ordinary case.
+    try std.testing.expectEqualStrings("{\"a\":1}", requestBody("POST / HTTP/1.1\r\nHost: x\r\n\r\n{\"a\":1}").?);
+    // LF-only framing: used to advance 4 past a 2-byte separator.
+    try std.testing.expectEqualStrings("{\"a\":1}", requestBody("POST / HTTP/1.1\nHost: x\n\n{\"a\":1}").?);
+    // The exact shape that aborted the process: LF-only, empty body, nothing after
+    // the separator for the old +4 to land on.
+    try std.testing.expectEqualStrings("", requestBody("POST /mcp HTTP/1.1\n\n").?);
+    try std.testing.expectEqualStrings("", requestBody("POST /mcp HTTP/1.1\r\n\r\n").?);
+    // A one-byte body under an LF separator: the old code overshot by one.
+    try std.testing.expectEqualStrings("x", requestBody("POST / HTTP/1.1\n\nx").?);
+    // Whichever blank line comes first wins. An LF-framed request whose BODY
+    // contains a CRLF blank line must not have its body start pushed past the
+    // bytes that were sent — that shape used to hang a handler thread for the
+    // full request timeout because the accept loop and this function disagreed.
+    try std.testing.expectEqualStrings("{}\r\n\r\ntail", requestBody("POST /mcp HTTP/1.1\nHost: x\n\n{}\r\n\r\ntail").?);
+    // And a CRLF-framed request is unaffected: "\n\n" cannot occur inside
+    // "\r\n\r\n", so the only LF blank line is in the body, i.e. later.
+    try std.testing.expectEqualStrings("a\n\nb", requestBody("POST / HTTP/1.1\r\nHost: x\r\n\r\na\n\nb").?);
+
+    // headerEnd is what the accept loop uses, so the two can no longer diverge.
+    try std.testing.expectEqual(@as(usize, 2), headerEnd("POST /mcp HTTP/1.1\nHost: x\n\n{}").?.body_start - headerEnd("POST /mcp HTTP/1.1\nHost: x\n\n{}").?.end);
+    try std.testing.expectEqual(@as(usize, 4), headerEnd("POST /mcp HTTP/1.1\r\nHost: x\r\n\r\n{}").?.body_start - headerEnd("POST /mcp HTTP/1.1\r\nHost: x\r\n\r\n{}").?.end);
+    try std.testing.expectEqual(@as(?HeaderEnd, null), headerEnd("POST / HTTP/1.1\r\nHost: x"));
+    // Unterminated header block: no body at all.
+    try std.testing.expectEqual(@as(?[]const u8, null), requestBody("POST / HTTP/1.1\r\nHost: x"));
+    try std.testing.expectEqual(@as(?[]const u8, null), requestBody(""));
+}
+
 pub fn acceptsResponseJson(request: []const u8) bool {
     const accept = findHeaderValue(request, "accept") orelse return false;
     return std.mem.indexOf(u8, accept, "application/graphql-response+json") != null;

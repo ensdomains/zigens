@@ -53,6 +53,7 @@ const http_util = @import("http_util.zig");
 const api_responses = @import("api_responses.zig");
 const webhook_handlers = @import("webhook_handlers.zig");
 const api_endpoints = @import("api_endpoints.zig");
+const mcp_mod = @import("mcp.zig");
 const resolveClientAddress = http_util.resolveClientAddress;
 const acceptsResponseJson = http_util.acceptsResponseJson;
 const graphqlContentType = http_util.graphqlContentType;
@@ -85,6 +86,10 @@ pub const Server = struct {
     /// peer. > 0 = trust X-Forwarded-For from this many hops and rate-limit on the real
     /// client IP (see handleConnection / resolveClientAddress).
     trusted_proxy_hops: u32,
+    /// MCP agent endpoint gate (MCP_ENABLED). Set by api_main after init;
+    /// default off so nothing changes unless explicitly opted in.
+    mcp_enabled: bool = false,
+    mcp_allowed_origins: ?[]const u8 = null,
     /// On-chain resolution state; null unless primary-name verification is enabled
     /// via `enableResolution`. When null the server behaves exactly as before.
     resolve: ?ResolveState,
@@ -332,13 +337,13 @@ pub const Server = struct {
             }
         }
 
-        // Find end of headers
-        const header_end_crlf = std.mem.indexOf(u8, header_data, "\r\n\r\n");
-        const header_end_lf = std.mem.indexOf(u8, header_data, "\n\n");
-        const header_end = if (header_end_crlf) |pos| pos else if (header_end_lf) |pos| pos else {
-            return; // No complete headers found
-        };
-        const body_offset: usize = if (header_end_crlf != null) 4 else 2;
+        // Find end of headers. Shared with every handler that extracts a body
+        // (http_util.requestBody) so the two cannot compute different offsets —
+        // they once did, and the handlers' hard-coded +4 aborted the process on
+        // an LF-framed request.
+        const he = http_util.headerEnd(header_data) orelse return; // No complete headers found
+        const header_end = he.end;
+        const body_offset: usize = he.body_start - he.end;
 
         // Determine the body length from the parsed headers, rejecting framing we
         // do not safely support (chunked, Content-Length + Transfer-Encoding,
@@ -420,7 +425,17 @@ pub const Server = struct {
         }
 
         // Route request
-        if (std.mem.startsWith(u8, path, "/graphql")) {
+        if (std.mem.startsWith(u8, path, "/mcp")) {
+            // MCP agent endpoint: stateless Streamable HTTP, POST-only (no SSE
+            // stream here, so every other method answers 405 per the spec).
+            switch (mcp_mod.route(self.mcp_enabled, method, request, self.mcp_allowed_origins)) {
+                .disabled => try self.sendNotFound(conn),
+                .origin_rejected => try self.sendForbidden(conn, "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"origin not allowed; a browser origin must be listed in MCP_ALLOWED_ORIGINS (non-browser clients send no Origin and are unaffected)\"}}"),
+                .method_not_allowed => try self.sendMethodNotAllowed(conn, "POST, OPTIONS", "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"MCP is POST-only (stateless Streamable HTTP; no SSE stream at this endpoint)\"}}"),
+                .bad_protocol_version => try self.sendJsonResponse(conn, 400, "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"unsupported MCP-Protocol-Version; this server speaks 2025-06-18, 2025-03-26 and 2024-11-05\"}}"),
+                .handle => try self.handleMcp(conn, request),
+            }
+        } else if (std.mem.startsWith(u8, path, "/graphql")) {
             // Handle GraphQL queries (both GET and POST)
             if (std.mem.eql(u8, method, "POST")) {
                 try self.handleGraphQLQuery(conn, request);
@@ -511,6 +526,8 @@ pub const Server = struct {
     pub const handleExplain = api_endpoints.handleExplain;
     pub const handleMetrics = api_endpoints.handleMetrics;
     pub const handleGraphQLQuery = api_endpoints.handleGraphQLQuery;
+    pub const executeQuery = api_endpoints.executeQuery;
+    pub const handleMcp = mcp_mod.handleMcp;
     pub const handleGraphQLGet = api_endpoints.handleGraphQLGet;
     pub const handleGraphQLPlayground = api_endpoints.handleGraphQLPlayground;
 
@@ -535,6 +552,8 @@ pub const Server = struct {
     pub const sendRequestError = api_responses.sendRequestError;
     pub const sendRateLimited = api_responses.sendRateLimited;
     pub const sendServiceUnavailable = api_responses.sendServiceUnavailable;
+    pub const sendForbidden = api_responses.sendForbidden;
+    pub const sendMethodNotAllowed = api_responses.sendMethodNotAllowed;
     pub const sendCorsPreflightResponse = api_responses.sendCorsPreflightResponse;
     pub const sendUnauthorized = api_responses.sendUnauthorized;
 

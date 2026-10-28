@@ -191,7 +191,7 @@ pub fn processRemainingOrphans(self: *Indexer, protocol: models.Protocol) !void 
 
         // Still unlinked at the orphan's block: leave it queued for a later pass,
         // exactly as the previous INNER JOIN's non-match did.
-        const resolved = (try resolveSubregistryParent(self, protocol, subregistry_addr, block_number, @import("../../types/token_id.zig").getCanonicalId(token_id))) orelse continue;
+        const resolved = (try resolveSubregistryParent(self, protocol, subregistry_addr, block_number, null, @import("../../types/token_id.zig").getCanonicalId(token_id))) orelse continue;
         defer self.allocator.free(resolved.name);
         const parent_name = resolved.name;
         const parent_namehash = resolved.namehash;
@@ -281,7 +281,7 @@ pub fn handleNameRegistered(self: *Indexer, protocol: models.Protocol, log: rpc.
     if (!is_main_registry) {
         // Subregistry-emitted: the parent comes from the live subregistry pointer,
         // with the historical lookup as fallback. See resolveSubregistryParent.
-        if (try resolveSubregistryParent(self, protocol, log.address, log.block_number, @import("../../types/token_id.zig").getCanonicalId(token_id))) |resolved| {
+        if (try resolveSubregistryParent(self, protocol, log.address, log.block_number, log.block_timestamp, @import("../../types/token_id.zig").getCanonicalId(token_id))) |resolved| {
             parent_name = resolved.name;
             parent_name_allocated = true;
             parent_namehash = resolved.namehash;
@@ -1261,7 +1261,7 @@ pub fn handleLabelRegistered(self: *Indexer, protocol: models.Protocol, log: rpc
         // resolveSubregistryParent picks the parent the chain events attach to from
         // the LIVE pointer mirror; v2/alias_sync derives the other fully-qualified
         // names of the same label.
-        if (try resolveSubregistryParent(self, protocol, log.address, log.block_number, @import("../../types/token_id.zig").getCanonicalId(token_id))) |resolved| {
+        if (try resolveSubregistryParent(self, protocol, log.address, log.block_number, log.block_timestamp, @import("../../types/token_id.zig").getCanonicalId(token_id))) |resolved| {
             parent_name = resolved.name;
             parent_name_allocated = true;
             parent_namehash = resolved.namehash;
@@ -1489,7 +1489,7 @@ pub fn handleLabelReserved(self: *Indexer, protocol: models.Protocol, log: rpc.L
         // subregistry, and is_reachable recomputed from it. Skip instead; the
         // reservation is re-derivable from the event, and the two sibling handlers
         // orphan for the same reason.
-        if (try resolveSubregistryParent(self, protocol, log.address, log.block_number, @import("../../types/token_id.zig").getCanonicalId(token_id))) |resolved| {
+        if (try resolveSubregistryParent(self, protocol, log.address, log.block_number, log.block_timestamp, @import("../../types/token_id.zig").getCanonicalId(token_id))) |resolved| {
             parent_name = resolved.name;
             parent_name_allocated = true;
             parent_namehash = resolved.namehash;
@@ -2190,6 +2190,14 @@ fn resolveSubregistryParent(
     protocol: models.Protocol,
     registry: Address,
     block_number: u64,
+    /// The block's timestamp when the caller already has it — every log the provider
+    /// stamps carries one. Passing it skips an `eth_getBlockByNumber` that is
+    /// UNPACED (no rate-limiter token) and UNCOUNTED (absent from every RPC
+    /// counter), and which fires on essentially every registration because
+    /// `warmBlockTimestampCache` returns early for provider-stamped logs, leaving
+    /// the cache empty exactly where this lookup needs it. Null only from callers
+    /// with no log in hand.
+    block_timestamp: ?u64,
     /// The label being attributed, so a shared registry can enqueue exactly the work this
     /// registration creates. Null from callers that are not registering a label.
     canonical_id_for_work: ?u256,
@@ -2198,7 +2206,7 @@ fn resolveSubregistryParent(
     // parents had linked by then (created_block) and which had not yet expired by then. An expired
     // parent resolves nothing beneath it on-chain, so it cannot be the parent a label is attributed
     // to either.
-    const block_ts = self.getBlockTimestamp(protocol, block_number, null) catch std.math.maxInt(i64);
+    const block_ts = self.getBlockTimestamp(protocol, block_number, block_timestamp) catch std.math.maxInt(i64);
     const live = try name_aliases.getLiveParentNamesAsOf(
         self.database,
         self.allocator,

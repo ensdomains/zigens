@@ -50,6 +50,9 @@ full surface. The ones that matter first:
 | `RATE_LIMIT_PER_SECOND` | Indexer's outbound RPC budget, and the API's per-IP request limit (default 15) |
 | `MANIFEST_PATH` | Optional `.zon` contract manifest (redeploys without recompiling) |
 | `FINALITY_ENABLED` | Track safe/finalized tiers (recommended in production) |
+| `MCP_ENABLED` | Agent endpoint at `POST /mcp` — see [API](api.md#mcp-agents) (default off) |
+| `MCP_ALLOWED_ORIGINS` | Browser origins allowed to call `POST /mcp`; non-browser clients unaffected (default: none) |
+| `RPC_BACKPRESSURE_ENABLED` | Halve the outbound RPC rate while the provider throttles, recovering when it goes quiet (default on) |
 
 ## Choosing a backend
 

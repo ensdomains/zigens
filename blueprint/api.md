@@ -89,3 +89,36 @@ Register a URL and event types; deliveries are HMAC-SHA256-signed —
 `X-Webhook-Signature: sha256=<hex>` over `{timestamp}.{payload}` with the
 timestamp in `X-Webhook-Timestamp` — retried with backoff, and carry a stable
 `X-Webhook-Id` for deduplication.
+
+## MCP (agents)
+
+`POST /mcp` — the same data over the
+[Model Context Protocol](https://modelcontextprotocol.io), so AI agents
+(Claude, IDE assistants, anything MCP-capable) discover and query ENSv2
+without custom integration. **Off by default**; enable with `MCP_ENABLED=1`
+(see [Deployment](deployment.md)).
+
+Stateless Streamable HTTP: plain JSON-RPC over POST, no sessions, no SSE.
+`GET` answers 405, as the spec requires of an endpoint offering no stream.
+Protocol revisions 2025-06-18, 2025-03-26 and 2024-11-05 are negotiated at
+`initialize`, and JSON-RPC batches are accepted (capped, since one HTTP
+request costs one rate-limit token).
+
+Read-only and **unauthenticated**, exactly like `POST /graphql`: the
+`graphql-query` tool executes through the same pipeline, so cost limits,
+per-IP rate limiting, the body cap and live resolution behave identically on
+both surfaces — and non-query operations are refused outright. Put it behind
+whatever fronts `/graphql`.
+
+Browser callers are the one exception to "same as /graphql": Streamable HTTP
+requires `Origin` validation, so a request **carrying** an `Origin` header is
+served only if that origin is listed in `MCP_ALLOWED_ORIGINS` (`*` allows
+any). Requests with no `Origin` — every CLI and agent client — are unaffected.
+
+| Tool / resource | What it does |
+|---|---|
+| `graphql-query` tool | Runs any GraphQL query; its description teaches agents the entry points, filter conventions and pitfalls, and errors carry line/column locations for self-correction |
+| `get-graphql-schema` tool | Compact type index, or one type's full SDL on demand |
+| `resolve-name` tool | One-call name resolution (address, resolver, chosen text records) over the live-capable single-name path |
+| `examples` resource | Known-good queries with intents, each executed by the test suite |
+| `coverage` resource | Live indexing coverage / freshness snapshot |

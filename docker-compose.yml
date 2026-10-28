@@ -51,6 +51,9 @@ services:
       - BATCH_SIZE=${BATCH_SIZE:-2000}
       - POLL_INTERVAL=12
       - RATE_LIMIT_PER_SECOND=25
+      # Provider-feedback backpressure on outbound RPC. Listed so it can be
+      # turned off without a rebuild; an unlisted var never reaches the container.
+      - RPC_BACKPRESSURE_ENABLED=${RPC_BACKPRESSURE_ENABLED:-1}
       - STATUS_PORT=3001
       - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
       - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
@@ -119,6 +122,12 @@ services:
       # without committing a batch (see .env.example). Above the longest healthy
       # batch; set 0 for a --backfill or an END_BLOCK-pinned deployment.
       - COVERAGE_STALE_AFTER_SECONDS=${COVERAGE_STALE_AFTER_SECONDS:-3600}
+      # Read-only MCP endpoint at POST /mcp for agent clients. OFF unless set:
+      # it is unauthenticated, so only enable it where the API itself is already
+      # reachable only by trusted callers.
+      - MCP_ENABLED=${MCP_ENABLED:-false}
+      # Comma-separated Origin allow-list; unset = no restriction (no Origin header = allowed).
+      - MCP_ALLOWED_ORIGINS=${MCP_ALLOWED_ORIGINS:-}
       # Number of trusted reverse-proxy hops. MUST be non-zero behind a proxy:
       # at 0 the limiter keys on the direct TCP peer, which is the proxy, so every
       # client on earth shares one bucket. Count the real chain (CDN -> ingress ->
