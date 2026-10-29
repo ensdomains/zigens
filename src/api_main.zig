@@ -124,6 +124,7 @@ pub fn main(init: std.process.Init) !void {
     var server = try api.Server.init(allocator, io, &db_pool, webhook_path, cfg.api_port, cfg.graphql_max_depth, cfg.graphql_max_cost, cfg.metrics_enabled, cfg.rate_limit_per_second, cfg.webhook_admin_username, cfg.webhook_admin_password, cfg.trusted_proxy_hops, cfg.request_timeout_ms, cfg.max_concurrent_connections, cfg.internal_admin_token, cfg.internal_rate_limit_per_second, cfg.webhooks_allow_unauthenticated);
     defer server.deinit();
     server.graphql_handler.slow_query_threshold_us = @as(u64, cfg.graphql_slow_query_ms) * std.time.us_per_ms;
+    server.sync_gate_enabled = cfg.graphql_sync_gate_enabled;
 
     // Opt-in on-chain resolution (default off). Covers primary-name verification (05)
     // and/or live Universal Resolver record fallback (06); either flag creates the shared

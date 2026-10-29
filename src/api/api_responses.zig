@@ -98,6 +98,22 @@ pub fn sendServiceUnavailable(self: *Server, conn: http_util.Conn) !void {
     try self.sendJsonResponse(conn, 503, response);
 }
 
+/// GraphQL is closed until the indexer finishes its initial sync (Server.syncReady).
+/// 503 + Retry-After marks it as a temporary condition, so clients and load
+/// balancers retry rather than treating the endpoint as broken.
+pub fn sendSyncInProgress(_: *Server, conn: http_util.Conn) !void {
+    const body = "{\"errors\":[{\"message\":\"Indexer initial sync in progress; GraphQL is unavailable until it completes\",\"extensions\":{\"code\":\"SYNC_IN_PROGRESS\"}}]}";
+    const header = "HTTP/1.1 503 Service Unavailable\r\n" ++
+        "Connection: close\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "Retry-After: 60\r\n" ++
+        "Access-Control-Allow-Origin: *\r\n" ++
+        "Content-Length: " ++ std.fmt.comptimePrint("{d}", .{body.len}) ++ "\r\n" ++
+        "\r\n";
+
+    try conn.writeAll(header ++ body);
+}
+
 pub fn sendCorsPreflightResponse(_: *Server, conn: http_util.Conn) !void {
     const response =
         "HTTP/1.1 204 No Content\r\n" ++

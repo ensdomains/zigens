@@ -19,6 +19,7 @@ const name_aliases = @import("name_aliases.zig");
 const reorg_undo = @import("reorg_undo.zig");
 const resolve_cache = @import("../resolve/cache.zig");
 const finality = @import("finality.zig");
+const sync_readiness = @import("sync_readiness.zig");
 const schema = @import("schema.zig");
 
 // Re-export types for use by other modules
@@ -203,6 +204,7 @@ pub const Database = struct {
         try resolve_cache.ensureSchema(&database);
         // Finality tiers (Task 09): idempotent CREATE, same rationale.
         try finality.ensureSchema(&database);
+        try sync_readiness.ensureSchema(&database);
 
         return database;
     }
@@ -586,6 +588,8 @@ pub const Database = struct {
     pub const getBlockHash = sync.getBlockHash;
     pub const setFinality = finality.setFinality;
     pub const getFinality = finality.getFinality;
+    pub const setSyncReady = sync_readiness.setSyncReady;
+    pub const isSyncReady = sync_readiness.isSyncReady;
     pub const rollbackToBlock = sync.rollbackToBlock;
     pub const pruneOldBlockHashes = sync.pruneOldBlockHashes;
     pub const checkIntegrity = sync.checkIntegrity;
