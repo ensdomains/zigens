@@ -1,0 +1,191 @@
+# Mainnet green slot. A copy of docker-compose.mainnet.yml (blue) with every name
+# shared across the host or dokploy-network suffixed -green, so both slots run side
+# by side on their own database. Traefik's dynamic config decides which slot
+# mainnet-graphql.ens.dev reaches; a cutover flips that service URL between
+# ensv2-api-mainnet:5657 and ensv2-api-mainnet-green:5658. Host port 5658 and
+# status port 3004 follow blue (5657/3003). Run with WEBHOOKS_ENABLED=false so
+# only the slot that owns the webhooks delivers them.
+
+services:
+  # V2 Indexer
+  indexer-v2-mainnet-green:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ensv2-indexer-v2-mainnet-green
+    # Hard memory ceiling. Without one, a single service can consume the whole
+    # host and take its neighbour down with it — an indexer growing unbounded is
+    # what crash-looped the API previously. Docker kills the container on
+    # breach and `restart: unless-stopped` brings it back, turning a host-wide
+    # stall into one restarted service. Sized for a 4 GB host; raise both
+    # values together via the environment on a larger box.
+    deploy:
+      resources:
+        limits:
+          memory: ${INDEXER_MEMORY_LIMIT:-2g}
+    mem_swappiness: 0
+    restart: unless-stopped
+    command: ["/app/ensv2-indexer-v2"]
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - ens-data-mainnet-green:/app/data
+      - webhook-data-mainnet-green:/app/webhooks
+    environment:
+      - DATABASE_PATH=/app/data/ens.db
+      # Postgres (e.g. Neon): set DATABASE_URL to a postgres:// string to switch off
+      # SQLite. Compose only forwards variables a service lists here, so without
+      # these two the container never sees them and silently falls back to SQLite.
+      - DATABASE_BACKEND=${DATABASE_BACKEND:-}
+      # Pooled or direct — both work. The driver sends each statement as one
+      # Parse+Bind+Describe+Execute+Sync group, so nothing it creates outlives the group
+      # and a transaction-mode pooler has no per-connection state to lose. MEASURED:
+      # indexing the same block range direct and through PgDog 0.1.26 on stock settings
+      # produced byte-identical data across all 51 tables (V1 mainnet 131,820 events;
+      # V2 sepolia 26,856 events). Session state is still pooler-dependent (pgbouncer
+      # drops a connection-scoped SET, PgDog virtualises it), so put a statement_timeout
+      # on the role or in the pooler rather than relying on SET. INDEXER_DATABASE_URL
+      # overrides DATABASE_URL here, and is only needed to give this service its own
+      # credentials or endpoint — one shared DATABASE_URL is enough.
+      - DATABASE_URL=${INDEXER_DATABASE_URL:-${DATABASE_URL:-}}
+      - RAINBOW_PATH=/app/data/ens_rainbow.db
+      - DOWNLOAD_RAINBOW=false
+      - RPC_URL=${RPC_URL}
+      - NETWORK=${NETWORK:-mainnet}
+      - BATCH_SIZE=${BATCH_SIZE:-2000}
+      - POLL_INTERVAL=12
+      - RATE_LIMIT_PER_SECOND=25
+      - STATUS_PORT=3004
+      # Track the chain's safe/finalized heads each poll. Feeds the
+      # ensv2_finality_* metrics and the API's freshness signal; two extra RPC
+      # calls per poll.
+      - FINALITY_ENABLED=${FINALITY_ENABLED:-true}
+      - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
+      - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
+      - WEBHOOK_MAX_RETRIES=${WEBHOOK_MAX_RETRIES:-3}
+    healthcheck:
+      test: ["CMD", "/app/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - ens-network-mainnet-green
+      - dokploy-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # GraphQL API Server
+  api-mainnet-green:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ensv2-api-mainnet-green
+    deploy:
+      resources:
+        limits:
+          memory: ${API_MEMORY_LIMIT:-1g}
+    mem_swappiness: 0
+    restart: unless-stopped
+    command: ["/app/api-entrypoint.sh"]
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "5658:5658"
+    volumes:
+      - ens-data-mainnet-green:/app/data:ro
+      - webhook-data-mainnet-green:/app/webhooks
+    environment:
+      - DATABASE_PATH=/app/data/ens.db
+      # Postgres (e.g. Neon): set DATABASE_URL to a postgres:// string to switch off
+      # SQLite. Compose only forwards variables a service lists here, so without
+      # these two the container never sees them and silently falls back to SQLite.
+      - DATABASE_BACKEND=${DATABASE_BACKEND:-}
+      # Pooled or direct — same single message group as the writer above, so no
+      # prepared statement or portal outlives it. MEASURED with this service's binary:
+      # 3200 concurrent requests through PgDog 0.1.26 in transaction mode, stock
+      # settings, 0 errors — where the previous split-round-trip driver failed 176 of
+      # 320 with SQLSTATE 08P01/26000 (and silently wrong rows whenever two colliding
+      # statements took the same parameter count). API_DATABASE_URL overrides
+      # DATABASE_URL here, and is only needed for separate credentials (e.g. the
+      # read-only role in .env.example), not for correctness.
+      - DATABASE_URL=${API_DATABASE_URL:-${DATABASE_URL:-}}
+      - RAINBOW_PATH=/app/data/ens_rainbow.db
+      - DOWNLOAD_RAINBOW=false
+      - API_PORT=5658
+      # Inbound per-IP HTTP limiting for the API. This has to live on THIS service:
+      # the indexer also reads RATE_LIMIT_PER_SECOND, but for its own OUTBOUND RPC
+      # throttle, so setting it only there left the API on the code default (15/s)
+      # and capped the public surface without anyone choosing that number.
+      - RATE_LIMIT_PER_SECOND=${API_RATE_LIMIT_PER_SECOND:-25}
+      # Without finality data, report stale=true once a protocol has gone this long
+      # without committing a batch (see .env.example). Above the longest healthy
+      # batch; set 0 for a --backfill or an END_BLOCK-pinned deployment.
+      - COVERAGE_STALE_AFTER_SECONDS=${COVERAGE_STALE_AFTER_SECONDS:-3600}
+      # Number of trusted reverse-proxy hops. MUST be non-zero behind a proxy:
+      # at 0 the limiter keys on the direct TCP peer, which is the proxy, so every
+      # client on earth shares one bucket. Count the real chain (CDN -> ingress ->
+      # api) and set it exactly — too high and X-Forwarded-For becomes spoofable.
+      - TRUSTED_PROXY_HOPS=${TRUSTED_PROXY_HOPS:-1}
+      # Selects the contract address set the API uses for live resolution and
+      # the chainId it reports. The code default is sepolia, so a mainnet API
+      # without this resolves against Sepolia addresses over a mainnet RPC.
+      - NETWORK=${NETWORK:-mainnet}
+      - GRAPHQL_MAX_DEPTH=10
+      - GRAPHQL_MAX_COST=${GRAPHQL_MAX_COST:-10000}
+      # Live resolution (ENSIP-10 Universal Resolver fallback) for single-name
+      # queries; needs an RPC the API can call — RESOLVE_RPC_URL falls back to
+      # the indexer's RPC_URL value from the environment. Without either, the
+      # code default is localhost:8545 and every live lookup fails.
+      - RESOLVE_LIVE_ENABLED=${RESOLVE_LIVE_ENABLED:-true}
+      - RESOLVE_RPC_URL=${RESOLVE_RPC_URL:-${RPC_URL}}
+      # ENSIP-3 forward verification of primary names (claimed vs verified);
+      # exposes Account.primaryNameVerification and the verify-primary endpoint.
+      - PRIMARY_VERIFY_ENABLED=${PRIMARY_VERIFY_ENABLED:-true}
+      # CCIP-Read offchain lookups ride on live resolution; startup fails fast
+      # if enabled without RESOLVE_LIVE_ENABLED.
+      - RESOLVE_CCIP_ENABLED=${RESOLVE_CCIP_ENABLED:-false}
+      - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
+      - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
+      - WEBHOOK_ADMIN_USERNAME=${WEBHOOK_ADMIN_USERNAME:-}
+      - WEBHOOK_ADMIN_PASSWORD=${WEBHOOK_ADMIN_PASSWORD:-}
+      - METRICS_ENABLED=${METRICS_ENABLED:-false}
+    depends_on:
+      - indexer-v2-mainnet-green
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:5658/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - ens-network-mainnet-green
+      - dokploy-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  # Internal indexer<->api traffic.
+  ens-network-mainnet-green:
+    driver: bridge
+  # Dokploy's shared network, where the managed Postgres/pgdog services live.
+  # External: Dokploy owns it, so compose must join rather than create it —
+  # declaring it per-project would make a second, isolated network instead.
+  dokploy-network:
+    external: true
+
+volumes:
+  ens-data-mainnet-green:
+    driver: local
+  webhook-data-mainnet-green:
+    driver: local
