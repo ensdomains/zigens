@@ -1429,7 +1429,7 @@ pub fn handleV1ETHControllerNameRegistered6Arg(self: *Indexer, protocol: models.
 /// Handle V1 ETH Registrar Controller NameRegistered event (7-arg unwrapped)
 /// NameRegistered(string label, bytes32 indexed labelhash, address indexed owner, uint256 baseCost, uint256 premium, uint256 expires, bytes32 referrer)
 /// UnwrappedEthRegistrarController. `referrer` is NOT indexed — sits at the
-/// data tail per the ensnode handler signature.
+/// data tail, per the event signature above.
 pub fn handleV1ETHControllerNameRegistered7Arg(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     if (log.topics.len < 3) {
         std.log.warn("V1 ETH Controller NameRegistered (7-arg) event has unexpected topic count: {d}, skipping", .{log.topics.len});
