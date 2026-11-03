@@ -285,8 +285,3 @@ node audit.mjs http://localhost:8080/graphql   # GraphQL-over-HTTP transport aud
   reference; the **execution engine** implements the subset of the GraphQL language spec that ENS
   clients actually use.
 - Reorg rollback covers a **1000-block** window.
-
-## License
-
-Not yet licensed — all rights reserved for now. ENS and ENS v2 design by ENS Labs; built with
-[Zig](https://ziglang.org/).
