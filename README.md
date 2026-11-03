@@ -32,7 +32,7 @@ runs on SQLite or PostgreSQL.
 
 ## Quick start
 
-Requires **Zig 0.16.0+** and an Ethereum / L2 JSON-RPC endpoint.
+Requires **Zig 0.16.0+** and an Ethereum JSON-RPC endpoint.
 
 ```bash
 git clone https://github.com/mdtanrikulu/zigens.git && cd zigens
@@ -216,7 +216,7 @@ Set via a `.env` file — see [`.env.example`](.env.example) for the full list. 
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `RPC_URL` | Ethereum / L2 JSON-RPC endpoint | `http://localhost:8545` |
+| `RPC_URL` | Ethereum JSON-RPC endpoint | `http://localhost:8545` |
 | `NETWORK` | `sepolia` or `mainnet` | `sepolia` |
 | `DATABASE_BACKEND` | `sqlite` or `postgres` | `sqlite` |
 | `DATABASE_URL` | Postgres connection URL; a `postgres://` URL infers the backend | _unset_ |
