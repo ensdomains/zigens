@@ -914,3 +914,30 @@ test "wrapped-controller renewal of an unwrapped name writes nothing and records
     try std.testing.expect(try q.step());
     try std.testing.expectEqual(@as(i64, 0), q.getInt64(0));
 }
+
+test "near-tip wrapper renewal is undone at its own block, not the last dispatched one" {
+    const F = WrapperRenewalFixture;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    var database = try F.db_mod.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var idx = try wrapperRenewalIndexer(allocator, threaded.io(), &database);
+    defer idx.deinit();
+
+    const nh = try F.seedWrapped(&idx, allocator, "test", F.STALE_WRAPPER_EXPIRY);
+    const log = try F.renewedLog(allocator, try F.Address.fromHex(F.WRAPPED_CONTROLLER), "test", F.LEASE_EXPIRES);
+    idx.markEventBlock(.v1, log.block_number);
+    try F.Indexer.handleV1ETHControllerNameRenewed(&idx, .v1, log);
+    // A later log of the chunk's NameWrapper group moves the cursor before the drain.
+    idx.markEventBlock(.v1, log.block_number + 5);
+    try idx.applyPendingWrapperRenewals();
+    try std.testing.expectEqual(@as(?i64, F.RENEWED_WRAPPER_EXPIRY), try F.wrapperExpiry(&database, nh));
+
+    try @import("storage/reorg_undo.zig").replayUndo(&database, .v1, log.block_number + 2);
+    try std.testing.expectEqual(@as(?i64, F.RENEWED_WRAPPER_EXPIRY), try F.wrapperExpiry(&database, nh));
+    try @import("storage/reorg_undo.zig").replayUndo(&database, .v1, log.block_number - 1);
+    try std.testing.expectEqual(@as(?i64, F.STALE_WRAPPER_EXPIRY), try F.wrapperExpiry(&database, nh));
+}

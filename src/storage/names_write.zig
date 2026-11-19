@@ -704,7 +704,7 @@ pub fn updateDomainExpiryIfGreater(db: *Database, namehash: Hash, new_expiry: i6
 ///   handles updates directly (write_buffer is inactive).
 ///
 /// SQL safety:
-/// - `CAST(wrapper_fuses AS INTEGER)` returns 0 for null/non-numeric strings, so
+/// - `CAST(wrapper_fuses AS BIGINT)` returns 0 for null/non-numeric strings, so
 ///   the AND check naturally short-circuits. Combined with the explicit IS NOT
 ///   NULL guards, this avoids touching unrelated rows.
 /// - `wrapper_expiry > COALESCE(expiry, 0)` ensures we never lower Domain.expiry.
@@ -712,7 +712,7 @@ pub fn updateDomainExpiryIfGreater(db: *Database, namehash: Hash, new_expiry: i6
 pub fn materializePccDomainExpiry(db: *Database) !u32 {
     try db.namesBarrier();
     const PARENT_CANNOT_CONTROL: i64 = 0x10000;
-    try reorg_undo.captureWhere(db, "names", "U", "is_wrapped = 1 AND wrapper_expiry IS NOT NULL AND wrapper_fuses IS NOT NULL AND wrapper_fuses != '' AND (CAST(wrapper_fuses AS INTEGER) & ?) != 0 AND wrapper_expiry > COALESCE(expiry, 0)", .{PARENT_CANNOT_CONTROL});
+    try reorg_undo.captureWhere(db, "names", "U", "is_wrapped = 1 AND wrapper_expiry IS NOT NULL AND wrapper_fuses IS NOT NULL AND wrapper_fuses != '' AND (CAST(wrapper_fuses AS BIGINT) & ?) != 0 AND wrapper_expiry > COALESCE(expiry, 0)", .{PARENT_CANNOT_CONTROL});
     var q = try Query.init(db,
         \\UPDATE names
         \\SET expiry = wrapper_expiry,
@@ -721,7 +721,7 @@ pub fn materializePccDomainExpiry(db: *Database) !u32 {
         \\  AND wrapper_expiry IS NOT NULL
         \\  AND wrapper_fuses IS NOT NULL
         \\  AND wrapper_fuses != ''
-        \\  AND (CAST(wrapper_fuses AS INTEGER) & ?) != 0
+        \\  AND (CAST(wrapper_fuses AS BIGINT) & ?) != 0
         \\  AND wrapper_expiry > COALESCE(expiry, 0)
     );
     defer q.deinit();

@@ -285,6 +285,7 @@ pub fn handleProfileQuery(self: *Server, conn: http_util.Conn, path: []const u8)
     // when the name has no resolver of its own.
     const impl = @import("builders/impl.zig");
     const resolver = impl.effectiveResolver(database, &row) catch row.resolver;
+    const owner = ens_fields.effectiveOwner(row, zsys.timestamp());
 
     var out: std.Io.Writer.Allocating = .init(self.allocator);
     defer out.deinit();
@@ -297,7 +298,7 @@ pub fn handleProfileQuery(self: *Server, conn: http_util.Conn, path: []const u8)
     try w.print("{{\"name\":\"{s}\",\"namehash\":\"{s}\",\"owner\":\"{s}\",\"protocol\":\"{s}\",\"expiry\":{d}", .{
         name_escaped,
         row.namehash.toHexBuf(&nh_buf),
-        ens_fields.effectiveOwner(row, zsys.timestamp()).toHexBuf(&owner_buf),
+        owner.toHexBuf(&owner_buf),
         row.protocol.toString(),
         row.expiry,
     });
@@ -349,8 +350,9 @@ pub fn handleProfileQuery(self: *Server, conn: http_util.Conn, path: []const u8)
 
     // The OWNER's primary (reverse) name, preferring V2 claims like GraphQL.
     const primary_nh = blk: {
-        if (database.getReverseRecordNamehash(.v2, row.owner) catch null) |p| break :blk p;
-        if (database.getReverseRecordNamehash(.v1, row.owner) catch null) |p| break :blk p;
+        if (owner.isZero()) break :blk null;
+        if (database.getReverseRecordNamehash(.v2, owner) catch null) |p| break :blk p;
+        if (database.getReverseRecordNamehash(.v1, owner) catch null) |p| break :blk p;
         break :blk null;
     };
     if (primary_nh) |pnh| {

@@ -50,6 +50,7 @@ pub fn applyPendingWrapperRenewals(self: *Indexer) !void {
             try names_storage.isV1NameWrapped(self.database, r.namehash);
         if (!wrapped) continue;
 
+        self.markEventBlock(r.protocol, r.log.block_number);
         if (self.write_buffer.active) {
             try self.write_buffer.updateV1WrapperRenewal(r.namehash, r.wrapper_expiry);
         } else {
