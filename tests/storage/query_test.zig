@@ -393,3 +393,57 @@ test "Database.introspectColumns: names, declared types, and PK position" {
     try testing.expectEqualStrings("count", cols[2].name);
     try testing.expectEqual(@as(i64, 0), cols[2].pk_pos);
 }
+
+test "Query: bindText copies, so the caller may reuse its buffer before exec" {
+    const allocator = testing.allocator;
+    const database = try createTestDb(allocator);
+    defer destroyTestDb(allocator, database);
+
+    try database.exec("CREATE TABLE copied (name TEXT)");
+
+    var insert_q = try Query.init(database, "INSERT INTO copied (name) VALUES (?)");
+    defer insert_q.deinit();
+    const buf = try allocator.dupe(u8, "hello");
+    try insert_q.bindText(buf);
+    @memcpy(buf, "XXXXX");
+    allocator.free(buf);
+    try insert_q.exec();
+
+    var select_q = try Query.init(database, "SELECT name FROM copied");
+    defer select_q.deinit();
+    try testing.expect(try select_q.step());
+    try testing.expectEqualStrings("hello", select_q.getTextSlice(0).?);
+}
+
+test "Query: a statement takes hundreds of copied text binds" {
+    const allocator = testing.allocator;
+    const database = try createTestDb(allocator);
+    defer destroyTestDb(allocator, database);
+
+    try database.exec("CREATE TABLE many (name TEXT, owner TEXT)");
+    try database.exec("INSERT INTO many (name, owner) VALUES ('n7', '0x0000000000000000000000000000000000000007'), ('n499', '0x0000000000000000000000000000000000000001'), ('miss', '0x0000000000000000000000000000000000000002')");
+
+    const text_binds = 500;
+    const address_binds = 100;
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(allocator);
+    try sql.appendSlice(allocator, "SELECT count(*) FROM many WHERE name IN (");
+    for (0..text_binds) |i| try sql.appendSlice(allocator, if (i == 0) "?" else ", ?");
+    try sql.appendSlice(allocator, ") AND owner IN (");
+    for (0..address_binds) |i| try sql.appendSlice(allocator, if (i == 0) "?" else ", ?");
+    try sql.appendSlice(allocator, ")");
+
+    var q = try Query.init(database, sql.items);
+    defer q.deinit();
+    for (0..text_binds) |i| {
+        var buf: [16]u8 = undefined;
+        try q.bindText(try std.fmt.bufPrint(&buf, "n{d}", .{i}));
+    }
+    for (0..address_binds) |i| {
+        var addr = Address.zero;
+        addr.bytes[19] = @intCast(i);
+        try q.bindAddress(addr);
+    }
+    try testing.expect(try q.step());
+    try testing.expectEqual(@as(i64, 2), q.getInt64(0));
+}

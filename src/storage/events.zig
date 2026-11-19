@@ -109,8 +109,7 @@ const EVENT_BATCH_ROWS = 400;
 ///
 /// All text is bound with static lifetime (the caller's event slice must stay
 /// alive through this call — the write buffer guarantees it): the SQLite
-/// driver binds SQLITE_STATIC, and per-row tracked copies would blow the
-/// statement's MAX_BOUND_STRINGS cap. Derived hex strings live in a per-chunk
+/// driver binds SQLITE_STATIC, sparing a copy per value. Derived hex strings live in a per-chunk
 /// arena that outlives the statement (LIFO defers).
 pub fn insertEventsBatch(db: *Database, events_slice: []const models.Event) !void {
     if (events_slice.len == 0) return;

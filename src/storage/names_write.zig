@@ -113,8 +113,8 @@ pub fn insertName(db: *Database, name: models.Name) !void {
 /// `name` strings must stay alive through exec (they do at every call site —
 /// live handlers exec before returning, the flush batch execs while the write
 /// buffer still owns them), and derived hex goes into `scratch`, which the
-/// caller keeps alive past exec. Static binds keep the batch path clear of
-/// the statement's MAX_BOUND_STRINGS tracked-copy cap.
+/// caller keeps alive past exec. Static binds spare the batch path a copy
+/// per value.
 fn bindNameValues(q: *Query, name: models.Name, scratch: std.mem.Allocator) !void {
     const namehash_buf = try scratch.create([66]u8);
     try q.bindTextStatic(name.namehash.toHexBuf(namehash_buf));

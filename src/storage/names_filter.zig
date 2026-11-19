@@ -784,7 +784,7 @@ pub fn getNamesByOwnersPage(db: *Database, owners: []const Address, skip: u32, l
         out.deinit(allocator);
     }
 
-    const CHUNK = 24; // tracked address binds are capped at 32 per statement
+    const CHUNK = 200;
     var off: usize = 0;
     while (off < owners.len) : (off += CHUNK) {
         const chunk = owners[off..@min(off + CHUNK, owners.len)];

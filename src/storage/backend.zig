@@ -8,19 +8,15 @@
 //! phases (see docs/postgresql-migration-plan.md).
 //!
 //! `Statement` is a drop-in for the old `Query`: same sequential 1-based bind
-//! cursor, same index-based column reads, same `SQLITE_STATIC` + tracked-copy
-//! bind lifetime — so the storage modules change only their import.
+//! cursor, same index-based column reads — so the storage modules change only
+//! their import. Text binds are copied by the driver, so a statement takes any
+//! number of them; `bindTextStatic` is the zero-copy opt-out.
 
 const std = @import("std");
 const Database = @import("database.zig").Database;
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
 const unicode = @import("../utils/unicode.zig");
-
-/// Max number of bound strings tracked per statement (preserves the old
-/// `Query` bound-string lifetime model: copies bound `SQLITE_STATIC` and freed
-/// on reset/deinit).
-const MAX_BOUND_STRINGS = 32;
 
 /// Outcome of stepping a statement, mapped from the backend's native result.
 pub const StepOutcome = enum { row, done, failed };
@@ -207,11 +203,13 @@ pub const Tx = struct {
 
 /// The primitive statement operations a backend must provide. The SQLite impl
 /// is `drivers/sqlite.zig`. `ctx` is the backend's opaque per-statement handle
-/// (for SQLite, the `sqlite3_stmt`). Text binds are `SQLITE_STATIC`-style: the
-/// pointer must remain valid until `step`/`exec`; `Statement` owns that via its
-/// tracked-copy buffer.
+/// (for SQLite, the `sqlite3_stmt`).
 pub const StmtVTable = struct {
+    /// The driver copies the value before returning; the caller may free it.
     bindText: *const fn (ctx: *anyopaque, idx: c_int, ptr: [*]const u8, len: usize) bool,
+    /// The driver MAY keep the pointer instead of copying, so the value must
+    /// stay valid until the statement's last `step`/`exec`.
+    bindTextBorrowed: *const fn (ctx: *anyopaque, idx: c_int, ptr: [*]const u8, len: usize) bool,
     bindInt64: *const fn (ctx: *anyopaque, idx: c_int, value: i64) bool,
     bindInt: *const fn (ctx: *anyopaque, idx: c_int, value: i32) bool,
     bindNull: *const fn (ctx: *anyopaque, idx: c_int) bool,
@@ -240,9 +238,6 @@ pub const Statement = struct {
     /// Value-copied SQL prefix so execution failures can name their query.
     sql_prefix: [160]u8 = undefined,
     sql_prefix_len: u8 = 0,
-    /// Tracked bound-string copies, freed on reset/deinit (SQLITE_STATIC model).
-    bound_strings: [MAX_BOUND_STRINGS]?[]u8 = [_]?[]u8{null} ** MAX_BOUND_STRINGS,
-    bound_string_count: usize = 0,
 
     pub fn init(database: *Database, sql: []const u8) !Statement {
         var stmt = try database.prepare(sql);
@@ -270,7 +265,6 @@ pub const Statement = struct {
     }
 
     pub fn deinit(self: *Statement) void {
-        self.freeBoundStrings();
         if (self.is_cached) {
             self.vtable.reset(self.ctx);
         } else {
@@ -279,29 +273,8 @@ pub const Statement = struct {
     }
 
     pub fn reset(self: *Statement) void {
-        self.freeBoundStrings();
         self.vtable.reset(self.ctx);
         self.param_idx = 1;
-    }
-
-    fn freeBoundStrings(self: *Statement) void {
-        for (self.bound_strings[0..self.bound_string_count]) |maybe_str| {
-            if (maybe_str) |str| self.allocator.free(str);
-        }
-        self.bound_string_count = 0;
-        self.bound_strings = [_]?[]u8{null} ** MAX_BOUND_STRINGS;
-    }
-
-    fn trackBoundString(self: *Statement, str: []u8) !void {
-        // Fail loudly: the old behavior freed the copy and bound the dangling
-        // pointer (use-after-free at step/exec). Callers with legitimately
-        // large parameter lists must chunk (see setRegistriesReachability).
-        if (self.bound_string_count >= MAX_BOUND_STRINGS) {
-            self.allocator.free(str);
-            return error.TooManyBoundParams;
-        }
-        self.bound_strings[self.bound_string_count] = str;
-        self.bound_string_count += 1;
     }
 
     // ── Parameter binding ──────────────────────────────────────────────────
@@ -315,37 +288,29 @@ pub const Statement = struct {
     /// until rollback — the indexer then retries the same bytes forever.
     /// Invalid bytes become U+FFFD so the row is stored, identically on both
     /// backends, instead of rejected or poisoning the transaction.
-    fn sanitizedCopy(self: *Statement, value: []const u8) ![]u8 {
-        const out = try unicode.sanitizeUtf8(self.allocator, value);
-        if (out.ptr == value.ptr) return try self.allocator.dupe(u8, value);
-        std.log.warn("storage: sanitized invalid UTF-8 in a text bind ({d} bytes)", .{value.len});
-        return @constCast(out);
-    }
-
     pub fn bindText(self: *Statement, value: []const u8) !void {
-        const copy = try self.sanitizedCopy(value);
-        try self.trackBoundString(copy);
-        try self.bindTrackedText(copy);
+        const text = try unicode.sanitizeUtf8(self.allocator, value);
+        defer if (text.ptr != value.ptr) self.allocator.free(text);
+        if (text.ptr != value.ptr) {
+            std.log.warn("storage: sanitized invalid UTF-8 in a text bind ({d} bytes)", .{value.len});
+        }
+        try self.bindCopied(text);
     }
 
     /// Bind text with caller-guaranteed static lifetime (no copy). Invalid
-    /// UTF-8 falls back to a tracked sanitized copy.
+    /// UTF-8 falls back to a sanitized copy.
     pub fn bindTextStatic(self: *Statement, value: []const u8) !void {
-        if (!std.unicode.utf8ValidateSlice(value)) {
-            const fixed = try self.sanitizedCopy(value);
-            try self.trackBoundString(fixed);
-            return self.bindTrackedText(fixed);
-        }
-        if (!self.vtable.bindText(self.ctx, self.param_idx, value.ptr, value.len)) {
+        if (!std.unicode.utf8ValidateSlice(value)) return self.bindText(value);
+        if (!self.vtable.bindTextBorrowed(self.ctx, self.param_idx, value.ptr, value.len)) {
             std.log.err("Failed to bind static text parameter: {s}", .{self.vtable.lastError(self.ctx)});
             return error.BindFailed;
         }
         self.param_idx += 1;
     }
 
-    fn bindTrackedText(self: *Statement, value: []u8) !void {
+    fn bindCopied(self: *Statement, value: []const u8) !void {
         if (!self.vtable.bindText(self.ctx, self.param_idx, value.ptr, value.len)) {
-            std.log.err("Failed to bind tracked text parameter: {s}", .{self.vtable.lastError(self.ctx)});
+            std.log.err("Failed to bind text parameter: {s}", .{self.vtable.lastError(self.ctx)});
             return error.BindFailed;
         }
         self.param_idx += 1;
@@ -376,31 +341,21 @@ pub const Statement = struct {
     }
 
     pub fn bindAddress(self: *Statement, addr: Address) !void {
-        const hex = try addr.toHex(self.allocator);
-        try self.trackBoundString(hex);
-        try self.bindTrackedText(hex);
+        var buf: [42]u8 = undefined;
+        try self.bindCopied(addr.toHexBuf(&buf));
     }
 
     pub fn bindHash(self: *Statement, hash: Hash) !void {
-        const hex = try hash.toHex(self.allocator);
-        try self.trackBoundString(hex);
-        try self.bindTrackedText(hex);
+        var buf: [66]u8 = undefined;
+        try self.bindCopied(hash.toHexBuf(&buf));
     }
 
     pub fn bindAddressBuf(self: *Statement, addr: Address) !void {
-        var buf: [42]u8 = undefined;
-        _ = addr.toHexBuf(&buf);
-        const copy = try self.allocator.dupe(u8, &buf);
-        try self.trackBoundString(copy);
-        try self.bindTrackedText(copy);
+        try self.bindAddress(addr);
     }
 
     pub fn bindHashBuf(self: *Statement, hash: Hash) !void {
-        var buf: [66]u8 = undefined;
-        _ = hash.toHexBuf(&buf);
-        const copy = try self.allocator.dupe(u8, &buf);
-        try self.trackBoundString(copy);
-        try self.bindTrackedText(copy);
+        try self.bindHash(hash);
     }
 
     pub fn bindOptionalText(self: *Statement, value: ?[]const u8) !void {

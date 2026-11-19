@@ -860,6 +860,68 @@ test "getFilteredNames: or_group matches any sub-filter" {
     try testing.expectEqual(@as(usize, 2), try database.getFilteredNameCount(.{ .or_group = &or_children }));
 }
 
+fn fillerNames(arena: std.mem.Allocator, count: usize, real: []const []const u8) ![]const []const u8 {
+    const out = try arena.alloc([]const u8, count);
+    for (out, 0..) |*slot, i| {
+        slot.* = if (i < real.len) real[i] else try std.fmt.allocPrint(arena, "filler{d}.eth", .{i});
+    }
+    return out;
+}
+
+test "getFilteredNames: name_in takes the API's 1000-name cap in one statement" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try helpers.createTestName(allocator, database, "alpha.eth", helpers.TEST_OWNER_1);
+    _ = try helpers.createTestName(allocator, database, "beta.eth", helpers.TEST_OWNER_1);
+    _ = try helpers.createTestName(allocator, database, "gamma.eth", helpers.TEST_OWNER_2);
+
+    const name_in = try fillerNames(arena, 1000, &.{ "alpha.eth", "gamma.eth" });
+    const label_name_not_in = try fillerNames(arena, 100, &.{"gamma"});
+    const filters: Database.NameFilters = .{ .name_in = name_in, .label_name_not_in = label_name_not_in };
+
+    const names = try database.getFilteredNames(filters, 0, 100, .asc, .name);
+    defer {
+        for (names) |*n| n.deinit(allocator);
+        allocator.free(names);
+    }
+
+    try testing.expectEqual(@as(usize, 1), names.len);
+    try testing.expectEqualStrings("alpha.eth", names[0].name.?);
+    try testing.expectEqual(@as(usize, 1), try database.getFilteredNameCount(filters));
+}
+
+test "getFilteredNames: or_group of large name_in terms" {
+    const allocator = testing.allocator;
+    const database = try helpers.createTestDatabase(allocator);
+    defer helpers.destroyTestDatabase(allocator, database);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try helpers.createTestName(allocator, database, "alpha.eth", helpers.TEST_OWNER_1);
+    _ = try helpers.createTestName(allocator, database, "beta.eth", helpers.TEST_OWNER_1);
+    _ = try helpers.createTestName(allocator, database, "gamma.eth", helpers.TEST_OWNER_2);
+
+    const or_children = [_]Database.NameFilters{
+        .{ .name_in = try fillerNames(arena, 500, &.{"alpha.eth"}) },
+        .{ .name_in = try fillerNames(arena, 500, &.{"gamma.eth"}) },
+    };
+    const names = try database.getFilteredNames(.{ .or_group = &or_children }, 0, 100, .asc, .name);
+    defer {
+        for (names) |*n| n.deinit(allocator);
+        allocator.free(names);
+    }
+
+    try testing.expectEqual(@as(usize, 2), names.len);
+    try testing.expectEqualStrings("alpha.eth", names[0].name.?);
+    try testing.expectEqualStrings("gamma.eth", names[1].name.?);
+}
+
 test "getFilteredNames: scalar AND or_group  ->  owner AND (a OR b)" {
     const allocator = testing.allocator;
     const database = try helpers.createTestDatabase(allocator);
