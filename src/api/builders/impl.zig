@@ -15,6 +15,7 @@ const models = @import("../../types/models.zig");
 const Hash = @import("../../types/hash.zig").Hash;
 const Address = @import("../../types/address.zig").Address;
 const json_utils = @import("../../utils/json.zig");
+const zsys = @import("../../utils/system.zig");
 const ens_normalize = @import("ens_normalize");
 
 // Import generic GraphQL library
@@ -1682,7 +1683,7 @@ pub fn buildResolverJson(
 fn domainOwnerHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
     const domain: *const models.Name = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
-    return try buildAccountJson(domain.owner, field.selections, .{
+    return try buildAccountJson(fields.effectiveOwner(domain.*, zsys.timestamp()), field.selections, .{
         .database = database,
         .depth = nested_ctx.depth + 1,
         .allocator = nested_ctx.allocator,
@@ -2119,6 +2120,7 @@ pub fn buildWrappedDomainJson(
 ) anyerror![]u8 {
     const allocator = nested_ctx.allocator;
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
+    const now = zsys.timestamp();
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -2160,16 +2162,17 @@ pub fn buildWrappedDomainJson(
                 try out.print(allocator, "\"{s}\":null", .{key});
             }
         } else if (std.mem.eql(u8, sel.name, "fuses")) {
-            if (domain.wrapper_fuses) |fs| {
-                if (std.fmt.parseInt(u64, fs, 10)) |parsed| {
-                    try out.print(allocator, "\"{s}\":{d}", .{ key, parsed });
-                } else |_| {
-                    try out.print(allocator, "\"{s}\":null", .{key});
-                }
+            if (fields.effectiveWrapperFuses(domain.*, now)) |fuses| {
+                try out.print(allocator, "\"{s}\":{d}", .{ key, fuses });
             } else {
                 try out.print(allocator, "\"{s}\":null", .{key});
             }
         } else if (std.mem.eql(u8, sel.name, "owner")) {
+            if (fields.wrappedOwnerCleared(domain.*, now)) {
+                try out.print(allocator, "\"{s}\":null", .{key});
+                first = false;
+                continue;
+            }
             const aj = try buildAccountJson(domain.owner, sel.selections, .{
                 .database = database,
                 .depth = nested_ctx.depth + 1,
@@ -2222,7 +2225,7 @@ fn domainWrappedDomainHandler(ctx: *anyopaque, field: *const parser.Field, neste
 fn domainWrappedOwnerHandler(ctx: *anyopaque, field: *const parser.Field, nested_ctx: json_builder.NestedContext) anyerror!?[]u8 {
     const domain: *const models.Name = @ptrCast(@alignCast(ctx));
     const database: *db.Database = @ptrCast(@alignCast(nested_ctx.database));
-    if (!domain.is_wrapped) return try nested_ctx.allocator.dupe(u8, "null");
+    if (!domain.is_wrapped or fields.wrappedOwnerCleared(domain.*, zsys.timestamp())) return try nested_ctx.allocator.dupe(u8, "null");
     return try buildAccountJson(domain.owner, field.selections, .{
         .database = database,
         .depth = nested_ctx.depth + 1,

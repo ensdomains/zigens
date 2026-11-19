@@ -12,6 +12,12 @@ pub fn safeU64ToI64(val: u64) i64 {
     return @intCast(val);
 }
 
+/// Rows whose stored owner NameWrapper.ownerOf no longer reports: emancipated
+/// (PARENT_CANNOT_CONTROL = 0x10000) wrapped names past their wrapper expiry. Binds one
+/// `?`, the current timestamp. Mirrors api/ens_fields.zig wrappedOwnerCleared.
+pub const SQL_OWNER_LAPSED =
+    "(is_wrapped = 1 AND wrapper_expiry IS NOT NULL AND wrapper_expiry < ? AND wrapper_fuses IS NOT NULL AND wrapper_fuses != '' AND (CAST(wrapper_fuses AS BIGINT) & 65536) != 0)";
+
 /// Parse a u256 from hex string (handles 0x prefix).
 pub fn parseU256Hex(hex_str: []const u8) !u256 {
     const clean = if (std.mem.startsWith(u8, hex_str, "0x")) hex_str[2..] else hex_str;

@@ -64,6 +64,12 @@ pub const ContractAddresses = struct {
     public_resolver: Address,
     reverse_registrar: Address,
     name_wrapper: Address,
+    // ETHRegistrarControllers that renew through NameWrapper.renew. That call moves the
+    // wrapper expiry to registrar expiry + 90d without a NameWrapper event, so their
+    // NameRenewed is the only signal. They are NameWrapper controllers, not BaseRegistrar
+    // ones, so ControllerAdded discovery never finds them. Zero when not deployed.
+    wrapped_eth_registrar_controller: Address,
+    wrapped_eth_registrar_controller_alt: Address,
 
     // Query-time ENSIP-10 Universal Resolver (Task 06 live-resolution fallback).
     // Manifest data (Task 08): declared per-network in the code default AND the
@@ -151,6 +157,8 @@ fn sepoliaAddresses() ContractAddresses {
         .public_resolver = Address.fromHex("0x5239A812ec9A62F46dbb5de8f346C8eFe7553A9f") catch unreachable,
         .reverse_registrar = Address.fromHex("0xA0a1AbcDAe1a2a4A2EF8e9113Ff0e02DD81DC0C6") catch unreachable,
         .name_wrapper = Address.fromHex("0x0635513f179D50A207757E05759CbD106d7dFcE8") catch unreachable,
+        .wrapped_eth_registrar_controller = Address.fromHex("0xFED6a969AaA60E4961FCD3EBF1A2e8913ac65B72") catch unreachable,
+        .wrapped_eth_registrar_controller_alt = Address.fromHex("0x4477cAc137F3353Ca35060E01E5aEb777a1Ca01B") catch unreachable,
 
         // V2 Sepolia Contracts (ENSv2 deployment)
         .root_registry = Address.fromHex("0xb458d6a3a77919449d03e7a6903c26827c1ec43f") catch unreachable,
@@ -197,6 +205,8 @@ fn mainnetAddresses() ContractAddresses {
         .public_resolver = Address.fromHex("0xF29100983E058B709F3D539b0c765937B804AC15") catch unreachable,
         .reverse_registrar = Address.fromHex("0xa58E81fe9b61B5c3fE2AFD33CF304c454AbFc7Cb") catch unreachable,
         .name_wrapper = Address.fromHex("0xD4416b13d2b3a9aBae7AcD5D6C2BbDBE25686401") catch unreachable,
+        .wrapped_eth_registrar_controller = Address.fromHex("0x253553366Da8546fC250F225fe3d25d0C782303b") catch unreachable,
+        .wrapped_eth_registrar_controller_alt = Address.zero,
 
         // V2 Mainnet Contracts (ENSv2 deployment, October 2026)
         .root_registry = Address.fromHex("0x2553c09be6447beffdb86fa622ad41fb8f77a91e") catch unreachable,
