@@ -34,7 +34,17 @@ inline fn asStmt(ctx: *anyopaque) *c.sqlite3_stmt {
 
 // ── Per-statement vtable (ctx = the sqlite3_stmt) ───────────────────────────
 
+// The C macro SQLITE_TRANSIENT is `(sqlite3_destructor_type)-1`, which Zig
+// rejects as a misaligned function pointer, so the destructor is declared as
+// a plain integer here.
+const SQLITE_TRANSIENT: usize = std.math.maxInt(usize);
+extern "c" fn sqlite3_bind_text64(stmt: *c.sqlite3_stmt, idx: c_int, ptr: [*]const u8, len: u64, destructor: usize, encoding: u8) c_int;
+
 fn bindText(ctx: *anyopaque, idx: c_int, ptr: [*]const u8, len: usize) bool {
+    return sqlite3_bind_text64(asStmt(ctx), idx, ptr, len, SQLITE_TRANSIENT, c.SQLITE_UTF8) == c.SQLITE_OK;
+}
+
+fn bindTextBorrowed(ctx: *anyopaque, idx: c_int, ptr: [*]const u8, len: usize) bool {
     return c.sqlite3_bind_text(asStmt(ctx), idx, ptr, @intCast(len), c.SQLITE_STATIC) == c.SQLITE_OK;
 }
 
@@ -102,6 +112,7 @@ fn stmtFinalize(ctx: *anyopaque) void {
 
 pub const stmt_vtable = backend.StmtVTable{
     .bindText = bindText,
+    .bindTextBorrowed = bindTextBorrowed,
     .bindInt64 = bindInt64,
     .bindInt = bindInt,
     .bindNull = bindNull,

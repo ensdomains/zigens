@@ -329,9 +329,8 @@ fn freeRecordRows(allocator: std.mem.Allocator, rows: *std.ArrayList(ResolverRec
     rows.deinit(allocator);
 }
 
-// Pair binds go through bindTextStatic with arena-scratch hex (no tracked-
-// string cap), so the chunk is sized for statement length and planner sanity,
-// not MAX_BOUND_STRINGS. 200 pairs = 400 placeholders — under even the
+// The chunk is sized for statement length and planner sanity. 200 pairs =
+// 400 placeholders — under even the
 // legacy SQLite 999-parameter limit; a 1000-row page batches in 5 statements.
 const RECORD_BATCH_CHUNK: usize = 200;
 

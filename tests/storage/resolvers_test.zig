@@ -1161,14 +1161,12 @@ test "named resources: upsert per (resolver,resource) updates in place; reader o
 // PAIR BATCH READERS — CHUNK BOUNDARY
 // ============================================================================
 
-test "pair batch readers cross the chunk boundary and the tracked-bind cap" {
+test "pair batch readers cross the chunk boundary" {
     const allocator = testing.allocator;
     const database = try helpers.createTestDatabase(allocator);
     defer helpers.destroyTestDatabase(allocator, database);
 
-    // 210 pairs: two chunks at RECORD_BATCH_CHUNK=200, and far past the
-    // 32-tracked-string bind cap that the static-bind path must avoid — a
-    // regression to copied binds fails this test with TooManyBoundParams.
+    // 210 pairs: two chunks at RECORD_BATCH_CHUNK=200.
     const total = 210;
     const resolver = helpers.TEST_RESOLVER;
     const tx = helpers.randomHash();
@@ -1906,7 +1904,7 @@ test "pair batch point-query mirrors cross the chunk boundary" {
     defer helpers.destroyTestDatabase(allocator, database);
 
     // 250 distinct pairs (and 250 distinct alias resolvers): two chunks at
-    // RECORD_BATCH_CHUNK=200 and far past the 32-tracked-string bind cap.
+    // RECORD_BATCH_CHUNK=200.
     const total = 250;
     const resolver = helpers.TEST_RESOLVER;
     const tx = helpers.randomHash();
