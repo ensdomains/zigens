@@ -208,9 +208,9 @@ type WrappedDomain {
   domain: Domain!
   """Wrapper expiry timestamp."""
   expiryDate: Int
-  """Fuse bitmap (CANNOT_UNWRAP, PARENT_CANNOT_CONTROL, etc.)."""
+  """Fuse bitmap (CANNOT_UNWRAP, PARENT_CANNOT_CONTROL, etc.). 0 once the wrapper expiry has passed, as NameWrapper.getData reports it."""
   fuses: Int
-  """Wrapped-token owner (EOA)."""
+  """Wrapped-token owner (EOA). Null when PARENT_CANNOT_CONTROL is burned and the wrapper expiry has passed, as NameWrapper.ownerOf reports it."""
   owner: Account
   """Name string."""
   name: String
@@ -375,10 +375,10 @@ type Domain {
   """Whether this domain has been migrated to V2"""
   isMigrated: Boolean!
 
-  """Whether this name is currently wrapped in V1 NameWrapper. When true, the `owner` field returns the wrapped-token owner (EOA), NOT the NameWrapper contract address — this is a deliberate divergence from the ENS subgraph for client convenience. Subgraph clients that need the NameWrapper-as-owner shape should query the on-chain `ownerOf()` directly."""
+  """Whether this name is currently wrapped in V1 NameWrapper. When true, the `owner` field returns the wrapped-token owner (EOA), NOT the NameWrapper contract address — this is a deliberate divergence from the ENS subgraph for client convenience. Subgraph clients that need the NameWrapper-as-owner shape should query the on-chain `ownerOf()` directly. An emancipated (PARENT_CANNOT_CONTROL) name whose wrapper expiry has passed has no owner: `owner` is the zero address and owner filters skip it."""
   isWrapped: Boolean!
 
-  """Fuse bitmap from V1 NameWrapper (CANNOT_UNWRAP, PARENT_CANNOT_CONTROL, etc.). Null when not wrapped."""
+  """Fuse bitmap from V1 NameWrapper (CANNOT_UNWRAP, PARENT_CANNOT_CONTROL, etc.). Null when not wrapped. 0 once the wrapper expiry has passed."""
   fuses: Int
 
   """Wrapper expiry timestamp from V1 NameWrapper. Null when not wrapped."""
@@ -457,7 +457,7 @@ type Domain {
   """V1 NameWrapper wrapped-domain record. Null for V2 or unwrapped domains."""
   wrappedDomain: WrappedDomain
 
-  """Wrapped owner (V1 NameWrapper EOA). Null when not wrapped."""
+  """Wrapped owner (V1 NameWrapper EOA). Null when not wrapped, or when the name is emancipated and its wrapper expiry has passed."""
   wrappedOwner: Account
 
   """The namehash (ERC-137 node) of this domain; the same value as `id`."""
@@ -867,7 +867,7 @@ type EACRolesChangedData {
   newRoleBitmap: String!
 }
 
-"""Typed payload for `ExpiryUpdated` events (V1 NameWrapper ExpiryExtended + V2 registry expiry updates)."""
+"""Typed payload for `ExpiryUpdated` events (V1 NameWrapper ExpiryExtended, V1 wrapped-controller renewals + V2 registry expiry updates)."""
 type ExpiryUpdatedData {
   """Namehash of the affected node (V1 NameWrapper variant)."""
   node: String

@@ -322,6 +322,16 @@ pub fn getNameByNamehashAndProtocol(db: *Database, namehash: Hash, protocol: mod
     return null;
 }
 
+/// Whether the V1 row for `namehash` is wrapped. False when there is no row.
+pub fn isV1NameWrapped(db: *Database, namehash: Hash) !bool {
+    try db.namesBarrier();
+    var q = try Query.initCached(db, "SELECT is_wrapped FROM names WHERE namehash = ? AND protocol = 'v1'");
+    defer q.deinit();
+    try q.bindHash(namehash);
+    if (try q.step()) return q.getInt64(0) != 0;
+    return false;
+}
+
 /// Get namehash by resolver address
 /// The name a resolver belongs to, or null when that question has no single answer.
 ///

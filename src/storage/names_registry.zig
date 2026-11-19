@@ -9,6 +9,8 @@
 const std = @import("std");
 const db_module = @import("database.zig");
 const reorg_undo = @import("reorg_undo.zig");
+const names_common = @import("names_common.zig");
+const zsys = @import("../utils/system.zig");
 const Database = db_module.Database;
 const Query = db_module.Query;
 const models = @import("../types/models.zig");
@@ -189,7 +191,9 @@ pub fn getRegistriesByOwner(db: *Database, protocol: models.Protocol, owner: Add
         \\SELECT r.address, r.protocol, r.name, r.namehash, r.parent_registry, r.created_block, r.created_at
         \\FROM registries r
         \\JOIN names n ON r.namehash = n.namehash AND r.protocol = n.protocol
-        \\WHERE r.protocol = ? AND n.owner = ?
+        \\WHERE r.protocol = ? AND n.owner = ? AND NOT 
+    ++ names_common.SQL_OWNER_LAPSED ++
+        \\
         \\AND r.created_block = (
         \\    SELECT MAX(r2.created_block)
         \\    FROM registries r2
@@ -200,6 +204,7 @@ pub fn getRegistriesByOwner(db: *Database, protocol: models.Protocol, owner: Add
 
     try q.bindTextStatic(protocol.toString());
     try q.bindAddress(owner);
+    try q.bindInt64(zsys.timestamp());
 
     var registries: std.ArrayList(models.Registry) = .empty;
     errdefer {

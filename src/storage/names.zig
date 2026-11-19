@@ -59,6 +59,7 @@ pub const getFilteredNameCount = names_filter.getFilteredNameCount;
 pub const getNameByNamehash = names_read.getNameByNamehash;
 pub const getNameStringByNamehash = names_read.getNameStringByNamehash;
 pub const getNameByNamehashAndProtocol = names_read.getNameByNamehashAndProtocol;
+pub const isV1NameWrapped = names_read.isV1NameWrapped;
 pub const getNamehashByResolver = names_read.getNamehashByResolver;
 pub const getNameResolver = names_read.getNameResolver;
 pub const getNameByTokenIdAndRegistry = names_read.getNameByTokenIdAndRegistry;

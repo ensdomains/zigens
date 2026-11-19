@@ -506,6 +506,16 @@ pub const WriteBuffer = struct {
         }
     }
 
+    /// Wrapped state of a V1 name as the buffered updates leave it; null when this
+    /// chunk has not touched it, so the DB row is current.
+    pub fn bufferedWrapped(self: *const WriteBuffer, namehash: Hash) ?bool {
+        const bn = self.names.getPtr(nameKey(.v1, namehash)) orelse return null;
+        if (bn.is_new) return bn.record.?.is_wrapped;
+        if (bn.unwrap) return false;
+        if (bn.wrapper_state != null) return true;
+        return null;
+    }
+
     /// Buffer a NameWrapper.renew wrapper expiry. Same guard as
     /// names_storage.updateV1WrapperRenewal: wrapped rows only, never lowered.
     pub fn updateV1WrapperRenewal(self: *WriteBuffer, namehash: Hash, wrapper_expiry: u64) !void {

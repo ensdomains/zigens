@@ -877,3 +877,40 @@ test "owner filters skip an emancipated name whose wrapper lapsed" {
     try std.testing.expectEqual(@as(usize, 1), wrapped.len);
     try std.testing.expect(wrapped[0].namehash.eql(live));
 }
+
+test "wrapped-controller renewal of an unwrapped name writes nothing and records no event" {
+    const F = WrapperRenewalFixture;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    var database = try F.db_mod.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var idx = try wrapperRenewalIndexer(allocator, threaded.io(), &database);
+    defer idx.deinit();
+
+    const controller = try F.Address.fromHex(F.WRAPPED_CONTROLLER);
+    const direct = try F.seedWrapped(&idx, allocator, "plain", F.STALE_WRAPPER_EXPIRY);
+    try @import("storage/names.zig").updateNameUnwrapperState(&database, direct);
+    const buffered = try F.seedWrapped(&idx, allocator, "gone", F.STALE_WRAPPER_EXPIRY);
+
+    try F.Indexer.handleV1ETHControllerNameRenewed(&idx, .v1, try F.renewedLog(allocator, controller, "plain", F.LEASE_EXPIRES));
+    try idx.applyPendingWrapperRenewals();
+
+    // Unwrapped in the same buffered chunk, before the renewal is applied.
+    idx.write_buffer.active = true;
+    idx.reorg_arm = false;
+    try F.Indexer.handleV1ETHControllerNameRenewed(&idx, .v1, try F.renewedLog(allocator, controller, "gone", F.LEASE_EXPIRES));
+    try idx.write_buffer.clearNameWrapperState(buffered);
+    try idx.applyPendingWrapperRenewals();
+    idx.write_buffer.active = false;
+    try idx.write_buffer.flush(&database);
+
+    try std.testing.expectEqual(@as(?i64, null), try F.wrapperExpiry(&database, direct));
+    try std.testing.expectEqual(@as(?i64, null), try F.wrapperExpiry(&database, buffered));
+    var q = try F.db_mod.Query.init(&database, "SELECT COUNT(*) FROM events WHERE event_type = 'ExpiryUpdated'");
+    defer q.deinit();
+    try std.testing.expect(try q.step());
+    try std.testing.expectEqual(@as(i64, 0), q.getInt64(0));
+}

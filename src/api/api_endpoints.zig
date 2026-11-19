@@ -16,6 +16,7 @@ const graphql = @import("handler.zig");
 const api_common = @import("common.zig");
 const parser = @import("../lib/graphql/parser.zig");
 const json_utils = @import("../utils/json.zig");
+const ens_fields = @import("ens_fields.zig");
 const url_utils = @import("../utils/url.zig");
 const validation = @import("../utils/validation.zig");
 const resolve_client = @import("../resolve/client.zig");
@@ -214,7 +215,7 @@ pub fn handleNameQuery(self: *Server, conn: http_util.Conn, path: []const u8) !v
         var response_buf: std.Io.Writer.Allocating = .init(self.allocator);
         defer response_buf.deinit();
 
-        const owner_hex = try record_copy.owner.toHex(self.allocator);
+        const owner_hex = try ens_fields.effectiveOwner(record_copy, zsys.timestamp()).toHex(self.allocator);
         defer self.allocator.free(owner_hex);
 
         const resolver_hex = try record_copy.resolver.toHex(self.allocator);
@@ -296,7 +297,7 @@ pub fn handleProfileQuery(self: *Server, conn: http_util.Conn, path: []const u8)
     try w.print("{{\"name\":\"{s}\",\"namehash\":\"{s}\",\"owner\":\"{s}\",\"protocol\":\"{s}\",\"expiry\":{d}", .{
         name_escaped,
         row.namehash.toHexBuf(&nh_buf),
-        row.owner.toHexBuf(&owner_buf),
+        ens_fields.effectiveOwner(row, zsys.timestamp()).toHexBuf(&owner_buf),
         row.protocol.toString(),
         row.expiry,
     });
