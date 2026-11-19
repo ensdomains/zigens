@@ -342,7 +342,7 @@ pub const GraphQLHandler = struct {
             } else if (err == error.InvalidProtocol) {
                 return try self.buildErrorResponseWithCode("Invalid protocol: must be 'v1' or 'v2'", ErrorCode.INVALID_ARGUMENT);
             } else if (err == error.TooManyNames) {
-                return try self.buildErrorResponseWithCode("name_in: too many names (cap is 1000 per query)", ErrorCode.INVALID_ARGUMENT);
+                return try self.buildErrorResponseWithCode("Too many values in list filters such as name_in and owner_in (cap is 1000 per query, summed across and/or)", ErrorCode.INVALID_ARGUMENT);
             } else if (err == error.UndefinedVariable) {
                 return try self.buildErrorResponseWithCode("Undefined variable: an argument references a `$variable` the operation does not declare, or a required one that was not provided", ErrorCode.VALIDATION_ERROR);
             } else if (err == error.UnknownRootField) {
@@ -664,6 +664,50 @@ test "handleQuery: __schema inside a string argument is data, not introspection"
 
 test "handleQuery: operation named IntrospectionQuery still executes its data fields" {
     try expectQueryReturnsData("query IntrospectionQuery { domains(first:1){ id } }", "IntrospectionQuery");
+}
+
+fn runListFilterQuery(allocator: std.mem.Allocator, names_per_term: usize, owners: usize) ![]u8 {
+    var database = try db.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var handler = try GraphQLHandler.init(allocator, 10, 10000, false);
+    defer handler.deinit();
+
+    var vars_json: std.Io.Writer.Allocating = .init(allocator);
+    defer vars_json.deinit();
+    const w = &vars_json.writer;
+    for ([_][]const u8{ "a", "b" }, 0..) |key, term| {
+        try w.print("{s}\"{s}\":[", .{ if (term == 0) "{" else ",", key });
+        for (0..names_per_term) |i| try w.print("{s}\"n{d}-{d}.eth\"", .{ if (i == 0) "" else ",", term, i });
+        try w.writeAll("]");
+    }
+    try w.writeAll(",\"owners\":[");
+    for (0..owners) |i| try w.print("{s}\"0x{x:0>40}\"", .{ if (i == 0) "" else ",", i + 1 });
+    try w.writeAll("]}");
+
+    const vars = try std.json.parseFromSlice(std.json.Value, allocator, vars_json.written(), .{});
+    defer vars.deinit();
+    return try handler.handleQuery(
+        &database,
+        "query Q($a: [String!], $b: [String!], $owners: [String!]) { domainConnection(where: { owner_in: $owners, or: [{ name_in: $a }, { name_in: $b }] }) { totalCount } }",
+        vars.value,
+        null,
+        false,
+    );
+}
+
+test "handleQuery: list filters past 32 values run in one statement" {
+    const allocator = testing.allocator;
+    const result = try runListFilterQuery(allocator, 450, 100);
+    defer allocator.free(result);
+    try testing.expectEqualStrings("{\"data\":{\"domainConnection\":{\"totalCount\":0}}}", result);
+}
+
+test "handleQuery: list filters are capped at 1000 values summed across and/or" {
+    const allocator = testing.allocator;
+    const result = try runListFilterQuery(allocator, 450, 101);
+    defer allocator.free(result);
+    try testing.expect(std.mem.indexOf(u8, result, "\"code\":\"INVALID_ARGUMENT\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "cap is 1000 per query") != null);
 }
 
 fn introspect(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
