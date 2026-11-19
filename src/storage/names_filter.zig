@@ -12,6 +12,7 @@ const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
 const names_common = @import("names_common.zig");
+const zsys = @import("../utils/system.zig");
 const parseU256Hex = names_common.parseU256Hex;
 
 /// Order direction for queries
@@ -96,21 +97,25 @@ fn appendNameScalarConditions(
     allocated_strings: *std.ArrayList([]const u8),
 ) !void {
     if (filters.owner != null) {
-        try conditions.append(db.allocator, "owner = ?");
+        try conditions.append(db.allocator, "(owner = ? AND NOT " ++ names_common.SQL_OWNER_LAPSED ++ ")");
     }
     if (filters.owner_not != null) {
-        try conditions.append(db.allocator, "owner != ?");
+        try conditions.append(db.allocator, "(owner != ? OR " ++ names_common.SQL_OWNER_LAPSED ++ ")");
     }
     if (filters.owner_in) |owners| {
         if (owners.len > 0) {
-            const clause = try db_module.query.buildInClause(db.allocator, "owner", "IN", owners.len);
+            const in_clause = try db_module.query.buildInClause(db.allocator, "owner", "IN", owners.len);
+            defer db.allocator.free(in_clause);
+            const clause = try std.fmt.allocPrint(db.allocator, "({s} AND NOT {s})", .{ in_clause, names_common.SQL_OWNER_LAPSED });
             try allocated_strings.append(db.allocator, clause);
             try conditions.append(db.allocator, clause);
         }
     }
     if (filters.owner_not_in) |owners| {
         if (owners.len > 0) {
-            const clause = try db_module.query.buildInClause(db.allocator, "owner", "NOT IN", owners.len);
+            const in_clause = try db_module.query.buildInClause(db.allocator, "owner", "NOT IN", owners.len);
+            defer db.allocator.free(in_clause);
+            const clause = try std.fmt.allocPrint(db.allocator, "({s} OR {s})", .{ in_clause, names_common.SQL_OWNER_LAPSED });
             try allocated_strings.append(db.allocator, clause);
             try conditions.append(db.allocator, clause);
         }
@@ -262,13 +267,22 @@ fn bindNameFilters(q: *Query, filters: NameFilters) anyerror!void {
 
 /// Bind one node's scalar values in the same order `appendNameScalarConditions` appends.
 fn bindNameScalars(q: *Query, filters: NameFilters) !void {
-    if (filters.owner) |o| try q.bindAddress(o);
-    if (filters.owner_not) |o| try q.bindAddress(o);
+    const now = zsys.timestamp();
+    if (filters.owner) |o| {
+        try q.bindAddress(o);
+        try q.bindInt64(now);
+    }
+    if (filters.owner_not) |o| {
+        try q.bindAddress(o);
+        try q.bindInt64(now);
+    }
     if (filters.owner_in) |owners| {
         for (owners) |o| try q.bindAddress(o);
+        if (owners.len > 0) try q.bindInt64(now);
     }
     if (filters.owner_not_in) |owners| {
         for (owners) |o| try q.bindAddress(o);
+        if (owners.len > 0) try q.bindInt64(now);
     }
     if (filters.name) |n| try q.bindText(n);
     if (filters.name_not) |n| try q.bindText(n);
@@ -744,8 +758,8 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
             \\       token_id, canonical_id, token_version, expiry, registry_locked, migrated,
             \\       created_at, registered_at, created_block, updated_at, updated_block,
             \\       is_reachable, unreachable_since, ttl, is_legacy, is_normalized, is_wrapped, wrapper_fuses, wrapper_expiry, is_v1_name, v1_label_hash
-            \\FROM names WHERE is_reachable = 1 AND is_normalized = 1 AND owner = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' AND NOT (names.protocol = 'v1' AND EXISTS (SELECT 1 FROM names v2twin WHERE v2twin.namehash = names.namehash AND v2twin.protocol = 'v2')) ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
-        , .{ sort_field.toSql(), order_str, order_str })
+            \\FROM names WHERE is_reachable = 1 AND is_normalized = 1 AND owner = ? AND NOT {s} AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' AND NOT (names.protocol = 'v1' AND EXISTS (SELECT 1 FROM names v2twin WHERE v2twin.namehash = names.namehash AND v2twin.protocol = 'v2')) ORDER BY {s} {s}, namehash {s} LIMIT ? OFFSET ?
+        , .{ names_common.SQL_OWNER_LAPSED, sort_field.toSql(), order_str, order_str })
     else
         try std.fmt.allocPrint(db.allocator,
             \\SELECT name, namehash, label, label_hash, parent_name, parent_namehash, owner, resolver, registry, protocol,
@@ -761,6 +775,7 @@ pub fn getAllNamesWithOrder(db: *Database, owner: ?Address, skip: u32, limit: u3
 
     if (owner) |o| {
         try q.bindAddress(o);
+        try q.bindInt64(zsys.timestamp());
     }
     try q.bindInt(@intCast(limit));
     try q.bindInt(@intCast(skip));
@@ -802,6 +817,9 @@ pub fn getNamesByOwnersPage(db: *Database, owners: []const Address, skip: u32, l
             \\  WHERE is_reachable = 1 AND is_normalized = 1
             \\    AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000'
             \\    AND NOT (names.protocol = 'v1' AND EXISTS (SELECT 1 FROM names v2twin WHERE v2twin.namehash = names.namehash AND v2twin.protocol = 'v2'))
+            \\    AND NOT 
+        ++ names_common.SQL_OWNER_LAPSED ++
+            \\
             \\    AND owner IN (
         );
         for (chunk, 0..) |_, i| {
@@ -812,6 +830,7 @@ pub fn getNamesByOwnersPage(db: *Database, owners: []const Address, skip: u32, l
 
         var q = try Query.init(db, sql.items);
         defer q.deinit();
+        try q.bindInt64(zsys.timestamp());
         for (chunk) |o| try q.bindAddress(o);
         try q.bindInt(@intCast(skip));
         try q.bindInt(@intCast(skip + limit));

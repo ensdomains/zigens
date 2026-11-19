@@ -666,3 +666,214 @@ test "TokenRegenerated re-keys approvals even when the name is not indexed yet" 
     try std.testing.expectEqualStrings("901", q.getTextSlice(0).?);
     try std.testing.expect(!try q.step());
 }
+
+// NameWrapper.renew (reached through a wrapped ETHRegistrarController) moves the wrapper
+// expiry without emitting a NameWrapper event. Numbers are Sepolia's test.eth (renewed
+// through the wrapped controller) and furyan.eth (renewed through the legacy controller,
+// which calls BaseRegistrar.renew directly and leaves the wrapper lapsed).
+const WrapperRenewalFixture = struct {
+    const Address = @import("types/address.zig").Address;
+    const Hash = @import("types/hash.zig").Hash;
+    const Indexer = @import("indexer/indexer.zig").Indexer;
+    const db_mod = @import("storage/database.zig");
+
+    const OWNER = "0x179A862703a4adfb29896552DF9e307980D19285";
+    const FUSES = "196608"; // PARENT_CANNOT_CONTROL | IS_DOT_ETH
+    const STALE_WRAPPER_EXPIRY: i64 = 1_761_294_960;
+    const LEASE_EXPIRES: u64 = 2_007_950_758;
+    const RENEWED_WRAPPER_EXPIRY: i64 = 2_015_726_758;
+    const WRAPPED_CONTROLLER = "0xFED6a969AaA60E4961FCD3EBF1A2e8913ac65B72";
+    const LEGACY_CONTROLLER = "0x7e02892cfc2Bfd53a75275451d73cF620e793fc0";
+
+    fn seedWrapped(idx: *Indexer, a: std.mem.Allocator, label: []const u8, wrapper_expiry: i64) !Hash {
+        const hash_mod = @import("types/hash.zig");
+        const v1_names = @import("utils/v1_names.zig");
+        const full = try std.fmt.allocPrint(a, "{s}.eth", .{label});
+        const nh = try hash_mod.namehash(a, full);
+        const owner = try Address.fromHex(OWNER);
+        try idx.insertName(.{
+            .name = full,
+            .label = label,
+            .label_hash = v1_names.computeLabelHash(label),
+            .parent_name = "eth",
+            .parent_namehash = idx.eth_namehash,
+            .protocol = .v1,
+            .registry = Address.zero,
+            .owner = owner,
+            .registrant = owner,
+            .resolver = Address.zero,
+            .token_id = 0,
+            .canonical_id = 0,
+            .token_version = 0,
+            .namehash = nh,
+            .expiry = 1_753_518_960,
+            .registry_locked = false,
+            .migrated = false,
+            .created_block = 100,
+            .created_at = 1_690_405_056,
+            .registered_at = 1_690_405_056,
+            .updated_block = 100,
+            .updated_at = 1_690_405_056,
+            .is_wrapped = true,
+            .wrapper_fuses = FUSES,
+            .wrapper_expiry = wrapper_expiry,
+            .is_v1_name = true,
+            .v1_label_hash = null,
+        });
+        return nh;
+    }
+
+    /// 4-arg controller NameRenewed(string name, bytes32 indexed label, uint256 cost, uint256 expires).
+    fn renewedLog(a: std.mem.Allocator, controller: Address, label: []const u8, expires: u64) !@import("rpc/client.zig").Log {
+        const abi = @import("indexer/abi.zig");
+        const v1_names = @import("utils/v1_names.zig");
+        const topics = try a.alloc(Hash, 2);
+        topics[0] = abi.EventSignatures.controller_name_renewed_hash;
+        topics[1] = v1_names.computeLabelHash(label);
+        const data = try a.alloc(u8, 160);
+        @memset(data, 0);
+        std.mem.writeInt(u256, data[0..32], 0x60, .big);
+        std.mem.writeInt(u256, data[32..64], 1, .big);
+        std.mem.writeInt(u256, data[64..96], expires, .big);
+        std.mem.writeInt(u256, data[96..128], label.len, .big);
+        @memcpy(data[128 .. 128 + label.len], label);
+        return syntheticLog(controller, topics, data, 11_900_000, 1_780_000_000);
+    }
+
+    fn wrapperExpiry(database: *db_mod.Database, nh: Hash) !?i64 {
+        var row = (try database.getNameByNamehashAndProtocol(nh, .v1)).?;
+        defer row.deinit(database.allocator);
+        return row.wrapper_expiry;
+    }
+};
+
+fn wrapperRenewalIndexer(allocator: std.mem.Allocator, io: std.Io, database: *WrapperRenewalFixture.db_mod.Database) !WrapperRenewalFixture.Indexer {
+    var cfg = try @import("config.zig").Config.fromEnv(allocator);
+    cfg.status_port = null;
+    cfg.webhooks_enabled = false;
+    cfg.network = .sepolia;
+    cfg.v1_contracts = try @import("contracts.zig").getContractAddresses(.sepolia);
+    return WrapperRenewalFixture.Indexer.init(allocator, io, cfg, database, null);
+}
+
+test "wrapped-controller renewal moves the wrapper expiry to expires + 90d and keeps the owner" {
+    const F = WrapperRenewalFixture;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    var database = try F.db_mod.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var idx = try wrapperRenewalIndexer(allocator, threaded.io(), &database);
+    defer idx.deinit();
+
+    const nh = try F.seedWrapped(&idx, allocator, "test", F.STALE_WRAPPER_EXPIRY);
+    try F.Indexer.handleV1ETHControllerNameRenewed(&idx, .v1, try F.renewedLog(allocator, try F.Address.fromHex(F.WRAPPED_CONTROLLER), "test", F.LEASE_EXPIRES));
+
+    // Queued, not applied: the chunk's NameWrapper events have not been dispatched yet.
+    try std.testing.expectEqual(@as(?i64, F.STALE_WRAPPER_EXPIRY), try F.wrapperExpiry(&database, nh));
+    try idx.applyPendingWrapperRenewals();
+    try std.testing.expectEqual(@as(?i64, F.RENEWED_WRAPPER_EXPIRY), try F.wrapperExpiry(&database, nh));
+    try std.testing.expectEqual(@as(usize, 0), idx.pending_wrapper_renewals.items.len);
+
+    var row = (try database.getNameByNamehashAndProtocol(nh, .v1)).?;
+    defer row.deinit(database.allocator);
+    try std.testing.expect(row.owner.eql(try F.Address.fromHex(F.OWNER)));
+    try std.testing.expectEqualStrings(F.FUSES, row.wrapper_fuses.?);
+
+    // Recorded so a replay of the events table rebuilds it.
+    var q = try F.db_mod.Query.init(&database, "SELECT contract_address, data FROM events WHERE event_type = 'ExpiryUpdated'");
+    defer q.deinit();
+    try std.testing.expect(try q.step());
+    try std.testing.expect((try F.Address.fromHex(q.getTextSlice(0).?)).eql(try F.Address.fromHex(F.WRAPPED_CONTROLLER)));
+    try std.testing.expect(std.mem.indexOf(u8, q.getTextSlice(1).?, "\"expiry\":2015726758") != null);
+}
+
+test "legacy-controller renewal leaves the wrapper expiry alone" {
+    const F = WrapperRenewalFixture;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    var database = try F.db_mod.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var idx = try wrapperRenewalIndexer(allocator, threaded.io(), &database);
+    defer idx.deinit();
+
+    const lapsed: i64 = 1_765_291_236;
+    const nh = try F.seedWrapped(&idx, allocator, "furyan", lapsed);
+    try F.Indexer.handleV1ETHControllerNameRenewed(&idx, .v1, try F.renewedLog(allocator, try F.Address.fromHex(F.LEGACY_CONTROLLER), "furyan", 1_789_051_236));
+    try std.testing.expectEqual(@as(usize, 0), idx.pending_wrapper_renewals.items.len);
+    try idx.applyPendingWrapperRenewals();
+    try std.testing.expectEqual(@as(?i64, lapsed), try F.wrapperExpiry(&database, nh));
+}
+
+test "wrapper renewal: an older NameWrapped in the same chunk does not win, an unwrap clears it" {
+    const F = WrapperRenewalFixture;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    var database = try F.db_mod.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var idx = try wrapperRenewalIndexer(allocator, threaded.io(), &database);
+    defer idx.deinit();
+
+    const controller = try F.Address.fromHex(F.WRAPPED_CONTROLLER);
+    const nh = try F.seedWrapped(&idx, allocator, "test", F.STALE_WRAPPER_EXPIRY);
+    const other = try F.seedWrapped(&idx, allocator, "other", F.STALE_WRAPPER_EXPIRY);
+
+    // Buffered chunk, dispatched in group order: controller logs first, NameWrapper after.
+    idx.write_buffer.active = true;
+    idx.reorg_arm = false;
+    try F.Indexer.handleV1ETHControllerNameRenewed(&idx, .v1, try F.renewedLog(allocator, controller, "test", F.LEASE_EXPIRES));
+    try F.Indexer.handleV1ETHControllerNameRenewed(&idx, .v1, try F.renewedLog(allocator, controller, "other", F.LEASE_EXPIRES));
+    try idx.write_buffer.updateNameWrapperState(nh, 196608, @intCast(F.STALE_WRAPPER_EXPIRY));
+    try idx.write_buffer.clearNameWrapperState(other);
+    try idx.applyPendingWrapperRenewals();
+    idx.write_buffer.active = false;
+    try idx.write_buffer.flush(&database);
+
+    try std.testing.expectEqual(@as(?i64, F.RENEWED_WRAPPER_EXPIRY), try F.wrapperExpiry(&database, nh));
+    try std.testing.expectEqual(@as(?i64, null), try F.wrapperExpiry(&database, other));
+}
+
+test "owner filters skip an emancipated name whose wrapper lapsed" {
+    const F = WrapperRenewalFixture;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    var database = try F.db_mod.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var idx = try wrapperRenewalIndexer(allocator, threaded.io(), &database);
+    defer idx.deinit();
+
+    const live = try F.seedWrapped(&idx, allocator, "test", F.RENEWED_WRAPPER_EXPIRY);
+    const lapsed = try F.seedWrapped(&idx, allocator, "furyan", 1_765_291_236);
+    const owner = try F.Address.fromHex(F.OWNER);
+
+    const owned = try database.getNamesByOwner(owner, null);
+    try std.testing.expectEqual(@as(usize, 1), owned.len);
+    try std.testing.expect(owned[0].namehash.eql(live));
+
+    const filtered = try database.getFilteredNames(.{ .owner = owner }, 0, 10, .desc, .created_at);
+    try std.testing.expectEqual(@as(usize, 1), filtered.len);
+    try std.testing.expect(filtered[0].namehash.eql(live));
+
+    const not_owned = try database.getFilteredNames(.{ .owner_not = owner, .name_ends_with = ".eth" }, 0, 10, .desc, .created_at);
+    var found_lapsed = false;
+    for (not_owned) |n| {
+        try std.testing.expect(!n.namehash.eql(live));
+        if (n.namehash.eql(lapsed)) found_lapsed = true;
+    }
+    try std.testing.expect(found_lapsed);
+
+    const wrapped = try database.getWrappedDomains(.{ .owner = owner }, 0, 10);
+    try std.testing.expectEqual(@as(usize, 1), wrapped.len);
+    try std.testing.expect(wrapped[0].namehash.eql(live));
+}

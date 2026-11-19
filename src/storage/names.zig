@@ -37,6 +37,7 @@ pub const clearNameExpiry = names_write.clearNameExpiry;
 pub const updateNameUnwrapperState = names_write.updateNameUnwrapperState;
 pub const updateNameWrapperFuses = names_write.updateNameWrapperFuses;
 pub const updateNameWrapperExpiry = names_write.updateNameWrapperExpiry;
+pub const updateV1WrapperRenewal = names_write.updateV1WrapperRenewal;
 pub const updateDomainExpiryIfGreater = names_write.updateDomainExpiryIfGreater;
 pub const materializePccDomainExpiry = names_write.materializePccDomainExpiry;
 pub const updateNameLabel = names_write.updateNameLabel;

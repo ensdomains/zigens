@@ -14,6 +14,7 @@ const models = @import("../types/models.zig");
 const names_storage = @import("../storage/names.zig");
 const v1_names = @import("../utils/v1_names.zig");
 const Indexer = @import("indexer.zig").Indexer;
+const handlers_v1 = @import("v1/handlers.zig");
 const utils = @import("utils.zig");
 const reorg_undo = @import("../storage/reorg_undo.zig");
 const alias_sync = @import("v2/alias_sync.zig");
@@ -271,6 +272,16 @@ fn replayOneEvent(self: *Indexer, q: *Query) !void {
             if (jsonRawValue(data, "node") != null) {
                 try replayExpiryExtended(self, q);
             }
+        }
+        return;
+    }
+
+    // ── Wrapped controller: NameWrapper.renew wrapper expiry ──
+    if (handlers_v1.isWrappedController(self, contract)) {
+        if (models.EventType.fromString(event_type_str) == .expiry_updated) {
+            const node = try Hash.fromHex(jsonString(data, "node") orelse return);
+            const expiry = jsonU64(data, "expiry") orelse return;
+            names_storage.updateV1WrapperRenewal(self.database, node, expiry) catch {};
         }
         return;
     }

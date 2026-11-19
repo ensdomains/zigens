@@ -86,6 +86,11 @@ pub const Indexer = struct {
     /// the resolver becomes known). Cleared alongside clearKnownResolverCache on
     /// batch rollback (the registrations were reverted with the transaction).
     pending_resolver_backfills: std.ArrayList(Address) = .empty,
+    /// Wrapper expiries from wrapped-controller renewals (NameWrapper.renew emits no event).
+    /// Filled by handleV1ETHControllerNameRenewed and drained by applyPendingWrapperRenewals
+    /// once the chunk's NameWrapper events are in: controller logs are dispatched first,
+    /// so applying immediately would let an older NameWrapped in the same chunk win.
+    pending_wrapper_renewals: std.ArrayList(handlers_v1.PendingWrapperRenewal) = .empty,
     /// Whether this process actually dropped the bulk-sync indexes. The
     /// completion path only pays the index rebuild + ANALYZE when a drop
     /// happened — a caught-up restart (gap below SYNC_INDEX_MIN_GAP_BLOCKS)
@@ -378,6 +383,7 @@ pub const Indexer = struct {
         self.write_buffer.deinit();
         self.placeholders.deinit();
         self.pending_resolver_backfills.deinit(self.allocator);
+        self.pending_wrapper_renewals.deinit(self.allocator);
         if (self.rainbow) |*r| r.deinit();
 
         // Free cached controllers
@@ -622,6 +628,7 @@ pub const Indexer = struct {
     pub const handleV1ETHControllerNameRegistered7Arg = handlers_v1.handleV1ETHControllerNameRegistered7Arg;
     pub const handleV1ETHControllerNameRenewed = handlers_v1.handleV1ETHControllerNameRenewed;
     pub const handleV1ETHControllerNameRenewedWithReferrer = handlers_v1.handleV1ETHControllerNameRenewedWithReferrer;
+    pub const applyPendingWrapperRenewals = handlers_v1.applyPendingWrapperRenewals;
     pub const handleBasenamesControllerNameRegistered = handlers_v1.handleBasenamesControllerNameRegistered;
     pub const handleBasenamesControllerNameRenewed = handlers_v1.handleBasenamesControllerNameRenewed;
     pub const handleBasenamesRegistrarNameRegisteredWithRecord = handlers_v1.handleBasenamesRegistrarNameRegisteredWithRecord;

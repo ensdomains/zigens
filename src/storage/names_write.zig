@@ -637,6 +637,30 @@ pub fn updateNameWrapperExpiry(db: *Database, namehash: Hash, expiry: u64) !void
     db.noteNameWriteByNamehash(namehash);
 }
 
+/// Wrapper expiry from NameWrapper.renew, which a wrapped ETHRegistrarController calls and
+/// which emits no NameWrapper event. On chain it is a no-op for unwrapped names, and a .eth
+/// 2LD's wrapper expiry never decreases while wrapped, so only wrapped rows are touched and
+/// the value only moves up. That also keeps it correct when applied after a NameWrapped
+/// that came earlier in the same chunk.
+pub fn updateV1WrapperRenewal(db: *Database, namehash: Hash, wrapper_expiry: u64) !void {
+    try db.namesBarrier();
+    try reorg_undo.captureWhere(db, "names", "U", "namehash = ? AND protocol = 'v1'", .{namehash});
+    var q = try Query.initCached(db,
+        \\UPDATE names SET wrapper_expiry = ?, updated_at = ?
+        \\WHERE namehash = ? AND protocol = 'v1' AND is_wrapped = 1
+        \\  AND (wrapper_expiry IS NULL OR wrapper_expiry < ?)
+    );
+    defer q.deinit();
+
+    const v = safeU64ToI64(wrapper_expiry);
+    try q.bindInt64(v);
+    try q.bindInt64(zsys.timestamp());
+    try q.bindHash(namehash);
+    try q.bindInt64(v);
+    try q.exec();
+    db.noteNameWriteByNamehash(namehash);
+}
+
 /// PCC-aware Domain expiry mirror. Subgraph parity: when the wrapped name's
 /// PARENT_CANNOT_CONTROL fuse is burned, the wrapper expiry IS the canonical
 /// Domain expiry — mirror it (max with existing) so `Domain.expiryDate` returns

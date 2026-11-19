@@ -11,6 +11,7 @@ const models = @import("../types/models.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
 const names_common = @import("names_common.zig");
+const zsys = @import("../utils/system.zig");
 const unicode = @import("../utils/unicode.zig");
 const parseU256Hex = names_common.parseU256Hex;
 const formatU256HexBuf = names_common.formatU256HexBuf;
@@ -647,16 +648,18 @@ pub fn freeCanonicalNameResolutions(map: *std.AutoHashMap(u256, CanonicalNameRes
 /// subregistry repoint or LabelUnregistered) are filtered out.
 pub fn getNamesByOwner(db: *Database, owner: Address, limit: ?u32) ![]models.Name {
     try db.namesBarrier();
+    const where = " WHERE is_reachable = 1 AND is_normalized = 1 AND owner = ? AND NOT " ++ names_common.SQL_OWNER_LAPSED ++ " AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000'";
     const sql = if (limit) |l|
-        try std.fmt.allocPrint(db.allocator, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND owner = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000' LIMIT {d}", .{l})
+        try std.fmt.allocPrint(db.allocator, SQL_SELECT_NAMES_SHORT ++ where ++ " LIMIT {d}", .{l})
     else
-        try db.allocator.dupe(u8, SQL_SELECT_NAMES_SHORT ++ " WHERE is_reachable = 1 AND is_normalized = 1 AND owner = ? AND namehash != '0x0000000000000000000000000000000000000000000000000000000000000000'");
+        try db.allocator.dupe(u8, SQL_SELECT_NAMES_SHORT ++ where);
     defer db.allocator.free(sql);
 
     var q = try Query.initCached(db, sql);
     defer q.deinit();
 
     try q.bindAddress(owner);
+    try q.bindInt64(zsys.timestamp());
 
     var names: std.ArrayList(models.Name) = .empty;
     errdefer {
@@ -718,7 +721,7 @@ pub fn getWrappedDomains(
     defer sql_buf.deinit(db.allocator);
     try sql_buf.appendSlice(db.allocator, SQL_SELECT_NAMES);
     try sql_buf.appendSlice(db.allocator, " WHERE is_reachable = 1 AND is_normalized = 1 AND is_wrapped = 1");
-    if (filters.owner != null) try sql_buf.appendSlice(db.allocator, " AND owner = ?");
+    if (filters.owner != null) try sql_buf.appendSlice(db.allocator, " AND owner = ? AND NOT " ++ names_common.SQL_OWNER_LAPSED);
     if (filters.name != null) try sql_buf.appendSlice(db.allocator, " AND name = ?");
     if (filters.expiry_gt != null) try sql_buf.appendSlice(db.allocator, " AND wrapper_expiry > ?");
     if (filters.expiry_lt != null) try sql_buf.appendSlice(db.allocator, " AND wrapper_expiry < ?");
@@ -727,7 +730,10 @@ pub fn getWrappedDomains(
     var q = try Query.init(db, sql_buf.items);
     defer q.deinit();
 
-    if (filters.owner) |o| try q.bindAddress(o);
+    if (filters.owner) |o| {
+        try q.bindAddress(o);
+        try q.bindInt64(zsys.timestamp());
+    }
     if (filters.name) |n| try q.bindText(n);
     if (filters.expiry_gt) |v| try q.bindInt64(v);
     if (filters.expiry_lt) |v| try q.bindInt64(v);
