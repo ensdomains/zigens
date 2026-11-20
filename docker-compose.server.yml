@@ -92,6 +92,10 @@ services:
       - API_PORT=5655
       - GRAPHQL_MAX_DEPTH=10
       - GRAPHQL_MAX_COST=${GRAPHQL_MAX_COST:-10000}
+      # While an EMPTY database runs its first bulk sync, /graphql answers 503
+      # rather than serving a half-built index; an already-indexed database is
+      # never gated. Set false to serve regardless.
+      - GRAPHQL_SYNC_GATE_ENABLED=${GRAPHQL_SYNC_GATE_ENABLED:-true}
       # Without finality data, report stale=true once a protocol has gone this long
       # without committing a batch (see .env.example). Above the longest healthy
       # batch; set 0 for a --backfill or an END_BLOCK-pinned deployment.
@@ -104,7 +108,7 @@ services:
     depends_on:
       - indexer-v2
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:5655/health"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:5655/health"]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -472,6 +472,11 @@ pub fn handleHealthCheck(self: *Server, conn: http_util.Conn) !void {
 /// so a node that is merely a little behind keeps serving instead of flapping out of
 /// rotation.
 pub fn handleReadiness(self: *Server, conn: http_util.Conn) !void {
+    // BEFORE the acquire below: syncReady may itself check out a session, and a
+    // one-session pool (DATABASE_POOL_SIZE=1, or SQLite `:memory:`) would park it
+    // forever on the session this function is holding.
+    const sync_ready = self.syncReady();
+
     const database = self.pool.acquire() catch
         return self.sendJsonResponse(conn, 503, "{\"status\":\"not_ready\",\"reason\":\"db_unavailable\"}");
     defer self.pool.release(database);
@@ -486,7 +491,9 @@ pub fn handleReadiness(self: *Server, conn: http_util.Conn) !void {
     const safe_num: ?u64 = if (safe) |sp| sp.number else null;
     const stale = api_common.coverageStale(v1, v2, safe_num, database.stale_after_seconds, zsys.timestamp());
 
-    const body = try std.fmt.allocPrint(self.allocator, "{{\"status\":\"ready\",\"indexed_head\":{d},\"safe\":{d},\"stale\":{s}}}", .{ head, safe_num orelse 0, if (stale) "true" else "false" });
+    // sync_ready is the GraphQL gate (storage/sync_readiness.zig): false means
+    // /graphql answers 503 even though this endpoint and /health are fine.
+    const body = try std.fmt.allocPrint(self.allocator, "{{\"status\":\"ready\",\"indexed_head\":{d},\"safe\":{d},\"stale\":{s},\"sync_ready\":{s}}}", .{ head, safe_num orelse 0, if (stale) "true" else "false", if (sync_ready) "true" else "false" });
     defer self.allocator.free(body);
     try self.sendJsonResponse(conn, 200, body);
 }
@@ -523,6 +530,9 @@ pub fn handleMetrics(self: *Server, conn: http_util.Conn) !void {
     var fin: std.Io.Writer.Allocating = .init(self.allocator);
     defer fin.deinit();
     appendFinalityMetrics(self, &fin) catch {};
+    // Gate state, independent of the best-effort finality read above: 0 means
+    // /graphql is answering 503 (storage/sync_readiness.zig).
+    fin.writer.print("# TYPE ensv2_graphql_sync_gate_open gauge\nensv2_graphql_sync_gate_open {d}\n", .{@intFromBool(self.syncReady())}) catch {};
 
     var response: std.Io.Writer.Allocating = .init(self.allocator);
     defer response.deinit();

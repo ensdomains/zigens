@@ -124,8 +124,16 @@ services:
       # client on earth shares one bucket. Count the real chain (CDN -> ingress ->
       # api) and set it exactly — too high and X-Forwarded-For becomes spoofable.
       - TRUSTED_PROXY_HOPS=${TRUSTED_PROXY_HOPS:-1}
+      # Selects the contract address set the API uses for live resolution and
+      # the chainId it reports. The code default is sepolia, so a mainnet API
+      # without this resolves against Sepolia addresses over a mainnet RPC.
+      - NETWORK=${NETWORK:-sepolia}
       - GRAPHQL_MAX_DEPTH=10
       - GRAPHQL_MAX_COST=${GRAPHQL_MAX_COST:-10000}
+      # While an EMPTY database runs its first bulk sync, /graphql answers 503
+      # rather than serving a half-built index; an already-indexed database is
+      # never gated. Set false to serve regardless.
+      - GRAPHQL_SYNC_GATE_ENABLED=${GRAPHQL_SYNC_GATE_ENABLED:-true}
       - WEBHOOKS_ENABLED=${WEBHOOKS_ENABLED:-false}
       - WEBHOOK_DB_PATH=/app/webhooks/webhooks.db
       - WEBHOOK_ADMIN_USERNAME=${WEBHOOK_ADMIN_USERNAME:-}
@@ -134,7 +142,7 @@ services:
     depends_on:
       - indexer-v2
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:5655/health"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:5655/health"]
       interval: 30s
       timeout: 10s
       retries: 3

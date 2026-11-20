@@ -89,6 +89,8 @@ pub const Config = struct {
     /// Executions (successful or failed) at or above this many ms are logged at
     /// warn level with depth, cost, outcome and a query excerpt. (GRAPHQL_SLOW_QUERY_MS)
     graphql_slow_query_ms: u32 = 2000,
+    /// Off switch for the GraphQL initial-sync gate (storage/sync_readiness.zig).
+    graphql_sync_gate_enabled: bool = true,
     metrics_enabled: bool,
     rainbow_path: []const u8,
     v1_contracts: contracts.ContractAddresses,
@@ -241,6 +243,7 @@ pub const Config = struct {
             .graphql_max_depth = env_mod.getEnvInt(&env_map, u32, "GRAPHQL_MAX_DEPTH", 10),
             .graphql_max_cost = env_mod.getEnvInt(&env_map, u32, "GRAPHQL_MAX_COST", 10000),
             .graphql_slow_query_ms = env_mod.getEnvInt(&env_map, u32, "GRAPHQL_SLOW_QUERY_MS", 2000),
+            .graphql_sync_gate_enabled = env_mod.getEnvBool(&env_map, "GRAPHQL_SYNC_GATE_ENABLED", true),
             .metrics_enabled = env_mod.getEnvBool(&env_map, "METRICS_ENABLED", false),
             .rainbow_path = try allocator.dupe(u8, env_mod.getEnv(&env_map, "RAINBOW_PATH", "./data/ens_rainbow.db")),
             // Falls back to RPC_URL (dupe'd independently so `deinit` can free it

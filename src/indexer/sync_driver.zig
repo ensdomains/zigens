@@ -101,6 +101,48 @@ fn syncGapWantsIndexDrop(self: *Indexer, protocols: []const models.Protocol, cli
     return false;
 }
 
+/// Open or close the GraphQL sync gate (storage/sync_readiness.zig) for `protocols`.
+/// Returns false if any write failed, so the caller can retry on a later iteration.
+fn markSyncReady(self: *Indexer, protocols: []const models.Protocol, ready: bool) bool {
+    var ok = true;
+    for (protocols) |protocol| {
+        self.database.setSyncReady(protocol, ready) catch |err| {
+            std.log.err("Failed to mark {s} sync readiness={}: {}", .{ protocol.toString(), ready, err });
+            ok = false;
+        };
+    }
+    return ok;
+}
+
+/// Whether this database has nothing worth serving yet — no protocol has ever
+/// committed a block. Only then does a bulk start close the GraphQL gate: closing it
+/// for a re-sync of an already-indexed database would take a complete API offline for
+/// the whole drop/sync/rebuild cycle, and `syncGapWantsIndexDrop` counts an RPC error
+/// at boot as a large gap, so one failed eth_blockNumber would be enough to do it.
+fn databaseNeverSynced(self: *Indexer, protocols: []const models.Protocol) !bool {
+    for (protocols) |protocol| {
+        if (((try self.database.getSyncState(protocol)) orelse 0) > 0) return false;
+    }
+    return true;
+}
+
+/// Close the GraphQL gate iff this database has never indexed anything. Returns false
+/// while the close is still owed, for the caller to retry before the next batch lands:
+/// either the read or the write failed. A failed read decides NOTHING — taking it for
+/// "never synced" is how a transient database error would gate a complete API behind a
+/// whole re-sync. `memo` keeps the answer once it arrives, so a retry that runs after
+/// sync_state has advanced cannot abandon a close this run still owes.
+fn closeSyncGateIfUnindexed(self: *Indexer, protocols: []const models.Protocol, memo: *?bool) bool {
+    if (memo.* == null) {
+        memo.* = databaseNeverSynced(self, protocols) catch |err| {
+            std.log.warn("Cannot tell whether this database has ever synced ({}); leaving the GraphQL gate as it is for now", .{err});
+            return false;
+        };
+    }
+    if (!memo.*.?) return true;
+    return markSyncReady(self, protocols, false);
+}
+
 pub fn start(self: *Indexer) !void {
     std.log.info("Indexer starting...", .{});
 
@@ -109,9 +151,12 @@ pub fn start(self: *Indexer) !void {
     };
 
     // Drop non-essential indexes for faster bulk inserts during initial sync
+    var sync_gate_never_synced: ?bool = null;
+    var sync_gate_close_owed = false;
     if (!self.initial_sync_complete.load(.acquire) and
         syncGapWantsIndexDrop(self, &.{ .v1, .v2 }, self.v1_client))
     {
+        sync_gate_close_owed = !closeSyncGateIfUnindexed(self, &.{ .v1, .v2 }, &sync_gate_never_synced);
         self.database.dropSyncIndexes() catch |err| {
             std.log.warn("Failed to drop sync indexes (non-fatal): {}", .{err});
         };
@@ -121,8 +166,15 @@ pub fn start(self: *Indexer) !void {
     }
 
     var watchdog: SyncFailureWatchdog = .init(self.config.sync_failure_exit_minutes);
+    var sync_ready_owed = false;
 
     while (!self.should_stop.load(.acquire) and !shutdown.isRequested()) {
+        // Retry a failed close before this iteration's first batch lands: an advancing
+        // sync_state is what the fallback in storage/sync_readiness.zig reads, so an
+        // unwritten "not ready" row would open the gate mid-bulk-sync.
+        if (sync_gate_close_owed and !self.initial_sync_complete.load(.acquire))
+            sync_gate_close_owed = !closeSyncGateIfUnindexed(self, &.{ .v1, .v2 }, &sync_gate_never_synced);
+
         // Index V1 first (SQLite doesn't support concurrent writes from different threads)
         self.indexProtocol(.v1, self.v1_client) catch |err| {
             handleSyncError(self, &watchdog, .v1, err);
@@ -136,6 +188,7 @@ pub fn start(self: *Indexer) !void {
         };
 
         watchdog.recordSuccess();
+        if (sync_ready_owed) sync_ready_owed = !markSyncReady(self, &.{ .v1, .v2 }, true);
 
         // After first successful sync of both chains, recreate indexes and start webhook workers
         if (!self.initial_sync_complete.load(.acquire)) {
@@ -201,6 +254,9 @@ pub fn start(self: *Indexer) !void {
                 std.log.err("Failed to seed init-gap heal targets: {}", .{err});
             };
             self.drainInitGapHeals(.v2, self.v1_client);
+            // Open GraphQL before the unknown-labels backfill: it drains a
+            // persistent backlog on every start and can run long.
+            sync_ready_owed = !markSyncReady(self, &.{ .v1, .v2 }, true);
             std.log.info("Running unknown labels backfill...", .{});
             self.backfillUnknownLabels() catch |err| {
                 std.log.err("Failed to backfill unknown labels: {}", .{err});
@@ -291,9 +347,12 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
     const client = self.getClient(protocol);
 
     // Drop non-essential indexes for faster bulk inserts during initial sync
+    var sync_gate_never_synced: ?bool = null;
+    var sync_gate_close_owed = false;
     if (!self.initial_sync_complete.load(.acquire) and
         syncGapWantsIndexDrop(self, &.{protocol}, client))
     {
+        sync_gate_close_owed = !closeSyncGateIfUnindexed(self, &.{protocol}, &sync_gate_never_synced);
         self.database.dropSyncIndexes() catch |err| {
             std.log.warn("Failed to drop sync indexes (non-fatal): {}", .{err});
         };
@@ -303,10 +362,17 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
     }
 
     var watchdog: SyncFailureWatchdog = .init(self.config.sync_failure_exit_minutes);
+    var sync_ready_owed = false;
 
     while (!self.should_stop.load(.acquire) and !shutdown.isRequested()) {
+        // See the combined loop: an unwritten "not ready" row would open the gate
+        // mid-bulk-sync once sync_state advances.
+        if (sync_gate_close_owed and !self.initial_sync_complete.load(.acquire))
+            sync_gate_close_owed = !closeSyncGateIfUnindexed(self, &.{protocol}, &sync_gate_never_synced);
+
         if (self.indexProtocol(protocol, client)) |_| {
             watchdog.recordSuccess();
+            if (sync_ready_owed) sync_ready_owed = !markSyncReady(self, &.{protocol}, true);
             // Success - after first successful sync, recreate indexes and start webhook workers
             if (!self.initial_sync_complete.load(.acquire)) {
                 // Only pay the rebuild + ANALYZE when this process dropped
@@ -365,14 +431,18 @@ pub fn startSingleProtocol(self: *Indexer, protocol: models.Protocol) !void {
                 // so these one-shot backfills (which UPDATE/DELETE protected & reorg_active
                 // tables, incl. unknown_labels) do NOT self-capture into the undo-log, per the
                 // backfill-doesn't-capture rule. Keep any new backfill inside this disarmed block.
-                if (protocol == .v1) {
-                    if (self.sync_indexes_dropped) {
-                        std.log.info("Running pre-migration names backfill...", .{});
-                        self.backfillPreMigrationNames() catch |err| {
-                            std.log.err("Failed to backfill pre-migration names: {}", .{err});
-                        };
-                    }
+                if (protocol == .v1 and self.sync_indexes_dropped) {
+                    std.log.info("Running pre-migration names backfill...", .{});
+                    self.backfillPreMigrationNames() catch |err| {
+                        std.log.err("Failed to backfill pre-migration names: {}", .{err});
+                    };
+                }
 
+                // Open GraphQL before the unknown-labels backfill: it drains a
+                // persistent backlog on every start and can run long.
+                sync_ready_owed = !markSyncReady(self, &.{protocol}, true);
+
+                if (protocol == .v1) {
                     // Backfill unknown subdomain labels from transaction calldata.
                     // Unconditional: drains a persistent backlog and is
                     // self-limiting (attempts capped, partial-index probe).
