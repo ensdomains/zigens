@@ -517,11 +517,9 @@ pub fn setRegistriesReachability(
     // dropped the whole map mid-dispatch on every repoint cascade and turned
     // the rest of the batch's lookups into per-event round trips.
 
-    // Chunked: each registry address is a tracked text bind, and Statement caps
-    // tracked binds at 32 (error.TooManyBoundParams beyond that) — large
-    // collectSubtreeRooted subtrees must therefore split the IN-list. The
-    // write-path undo capture mirrors each chunk's exact predicate.
-    const CHUNK: usize = 24;
+    // Chunked so large collectSubtreeRooted subtrees keep the IN-list bounded.
+    // The write-path undo capture mirrors each chunk's exact predicate.
+    const CHUNK: usize = 200;
     var total: u64 = 0;
     var off: usize = 0;
     while (off < registries.len) : (off += CHUNK) {

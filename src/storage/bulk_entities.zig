@@ -25,7 +25,7 @@ const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
 
 /// Rows per statement. Every text bind is static (scratch-arena or
-/// buffer-owned), so the driver's copied-bind cap does not apply.
+/// buffer-owned), so no value is copied.
 const BATCH_ROWS: usize = 200;
 
 /// One portable statement that updates `set_cols` on every `table` row whose

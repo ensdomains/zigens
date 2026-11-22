@@ -1117,6 +1117,7 @@ fn finalize(ctx: *anyopaque) void {
 
 pub const stmt_vtable = backend.StmtVTable{
     .bindText = bindText,
+    .bindTextBorrowed = bindText,
     .bindInt64 = bindInt64,
     .bindInt = bindInt,
     .bindNull = bindNull,

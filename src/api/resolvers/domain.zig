@@ -11,6 +11,7 @@ const parser = common.parser;
 const pagination = common.pagination;
 const builders = @import("../builders/builders.zig");
 const at_block_mod = @import("../../storage/at_block.zig");
+const constants = @import("../../constants.zig");
 const loaders = common.loaders;
 const namehash = common.namehash_fn;
 const Hash = common.Hash;
@@ -131,7 +132,27 @@ const ParsedDomainFilter = struct {
 /// match-misses silently.
 fn parseDomainWhere(field: *const parser.Field, allocator: std.mem.Allocator) !ParsedDomainFilter {
     const where_args = common.getObjectArg(field, "where") orelse return ParsedDomainFilter{};
-    return parseWhereArgs(where_args, allocator);
+    var parsed = try parseWhereArgs(where_args, allocator);
+    if (listValueCount(parsed) > constants.Pagination.max_limit) {
+        parsed.deinit(allocator);
+        return error.TooManyNames;
+    }
+    return parsed;
+}
+
+/// Values across every list filter in the tree, `and`/`or` children included:
+/// each one becomes a bind in a single statement.
+fn listValueCount(filter: ParsedDomainFilter) usize {
+    var count: usize = 0;
+    inline for (.{ "name_in", "name_not_in", "label_name_in", "label_name_not_in", "owner_in", "owner_not_in" }) |list| {
+        if (@field(filter, list)) |values| count += values.len;
+    }
+    inline for (.{ "and_filters", "or_filters" }) |group| {
+        if (@field(filter, group)) |children| {
+            for (children) |child| count += listValueCount(child);
+        }
+    }
+    return count;
 }
 
 /// Parse a DomainFilter argument list — the top-level `where:` object or a nested

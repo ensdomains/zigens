@@ -467,10 +467,8 @@ test "upsertEACRolesBatch matches direct upsert semantics and preserves id on co
     try testing.expectEqualStrings("0x04", other[0].role_bitmap);
 }
 
-test "upsertEACRolesBatch handles batches past the chunk boundary and tracked-string cap" {
-    // 120 rows crosses both the 90-row chunk split and the 32-tracked-string
-    // statement cap that a copying bind would hit (the 2026-08-21 dual-run
-    // regression: TooManyBoundParams looped the batch forever).
+test "upsertEACRolesBatch handles batches past the chunk boundary" {
+    // 120 rows crosses the 90-row chunk split.
     const allocator = testing.allocator;
     const database = try helpers.createTestDatabase(allocator);
     defer helpers.destroyTestDatabase(allocator, database);
