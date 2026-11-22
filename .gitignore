@@ -40,3 +40,27 @@ node_modules/
 # Environment
 .env
 .env.local
+
+# Environment — every .env except the committed templates and the
+# placeholder-only test fixture. Keeps real credentials out by default.
+.env.*
+!.env.example
+!.env.*.example
+!.env.test
+
+# Local working notes: docs/ is local-by-default, so a new design note or
+# audit can never be published by an `add -A`. Published docs are listed.
+/docs/*
+!/docs/DEPLOYMENT.md
+!/docs/RUN.md
+!/docs/TESTING.md
+!/docs/postgresql-migration-plan.md
+
+# Agent/editor scratch
+CLAUDE.md
+.claude/
+__pycache__/
+
+# Stray build output
+/test_arraylist
+/ramp.csv

@@ -2,6 +2,7 @@ const std = @import("std");
 const zsys = @import("../utils/system.zig");
 const db_module = @import("database.zig");
 const reorg_undo = @import("reorg_undo.zig");
+const names_common = @import("names_common.zig");
 const Database = db_module.Database;
 const Query = db_module.Query;
 const models = @import("../types/models.zig");
@@ -341,6 +342,9 @@ pub fn getResolversByOwner(db: *Database, protocol: models.Protocol, owner: Addr
         \\SELECT DISTINCT n.resolver, n.name, n.namehash, n.created_block, n.created_at
         \\FROM names n
         \\WHERE n.protocol = ? AND n.owner = ? AND n.resolver != '0x0000000000000000000000000000000000000000'
+        \\  AND NOT 
+    ++ names_common.SQL_OWNER_LAPSED ++
+        \\
         \\ORDER BY n.created_at DESC
     ;
 
@@ -349,6 +353,7 @@ pub fn getResolversByOwner(db: *Database, protocol: models.Protocol, owner: Addr
 
     try q.bindTextStatic(protocol.toString());
     try q.bindAddress(owner);
+    try q.bindInt64(zsys.timestamp());
 
     var result: std.ArrayList(models.Resolver) = .empty;
     errdefer {

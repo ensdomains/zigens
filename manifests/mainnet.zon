@@ -13,6 +13,8 @@
         .{ .name = "public_resolver", .address = "0xf29100983e058b709f3d539b0c765937b804ac15" },
         .{ .name = "reverse_registrar", .address = "0xa58e81fe9b61b5c3fe2afd33cf304c454abfc7cb" },
         .{ .name = "name_wrapper", .address = "0xd4416b13d2b3a9abae7acd5d6c2bbdbe25686401" },
+        .{ .name = "wrapped_eth_registrar_controller", .address = "0x253553366da8546fc250f225fe3d25d0c782303b" },
+        .{ .name = "wrapped_eth_registrar_controller_alt", .address = "0x0000000000000000000000000000000000000000" },
         .{ .name = "universal_resolver", .address = "0xcffd2ae680cd110d28739a70922636b5937b022b" },
         .{ .name = "root_registry", .address = "0x2553c09be6447beffdb86fa622ad41fb8f77a91e" },
         .{ .name = "eth_registry", .address = "0xf60aba43e1f7f3dab1186ff03b561401c9df85e2" },
