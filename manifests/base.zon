@@ -17,6 +17,8 @@
         .{ .name = "public_resolver", .address = "0xc6d566a56a1aff6508b41f6c90ff131615583bcd" },
         .{ .name = "reverse_registrar", .address = "0x0000000000000000000000000000000000000000" },
         .{ .name = "name_wrapper", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "wrapped_eth_registrar_controller", .address = "0x0000000000000000000000000000000000000000" },
+        .{ .name = "wrapped_eth_registrar_controller_alt", .address = "0x0000000000000000000000000000000000000000" },
         .{ .name = "universal_resolver", .address = "0x0000000000000000000000000000000000000000" },
         .{ .name = "root_registry", .address = "0x0000000000000000000000000000000000000000" },
         .{ .name = "eth_registry", .address = "0x0000000000000000000000000000000000000000" },

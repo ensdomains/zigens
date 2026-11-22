@@ -18,6 +18,53 @@ const names_storage = @import("../../storage/names.zig");
 const ens_normalize = @import("../../utils/ens_normalize.zig");
 const json_utils = @import("../../utils/json.zig");
 const v1_names = @import("../../utils/v1_names.zig");
+const contract_defs = @import("../../contracts.zig");
+
+/// NameWrapper.GRACE_PERIOD: NameWrapper.renew sets the wrapper expiry to registrar expiry + this.
+pub const NAME_WRAPPER_GRACE_PERIOD: u64 = 90 * 24 * 60 * 60;
+
+pub const PendingWrapperRenewal = struct {
+    namehash: Hash,
+    wrapper_expiry: u64,
+    protocol: models.Protocol,
+    /// The controller's NameRenewed log, for the event row. `topics` and `data` are
+    /// emptied: the log buffers do not outlive the chunk.
+    log: rpc.Log,
+};
+
+/// True when `addr` is an ETHRegistrarController that renews through NameWrapper.renew.
+pub fn isWrappedController(self: *const Indexer, addr: Address) bool {
+    const c = self.config.v1_contracts;
+    return contract_defs.isActiveContract(addr, c.wrapped_eth_registrar_controller) or
+        contract_defs.isActiveContract(addr, c.wrapped_eth_registrar_controller_alt);
+}
+
+/// Apply the wrapper expiries queued by wrapped-controller renewals. Call after the
+/// NameWrapper events of the same logs have been dispatched. The wrapped controller
+/// renews unwrapped names too; NameWrapper.renew leaves those alone, so they get
+/// neither a write nor an ExpiryUpdated row.
+pub fn applyPendingWrapperRenewals(self: *Indexer) !void {
+    defer self.pending_wrapper_renewals.clearRetainingCapacity();
+    for (self.pending_wrapper_renewals.items) |r| {
+        const wrapped = (if (self.write_buffer.active) self.write_buffer.bufferedWrapped(r.namehash) else null) orelse
+            try names_storage.isV1NameWrapped(self.database, r.namehash);
+        if (!wrapped) continue;
+
+        self.markEventBlock(r.protocol, r.log.block_number);
+        if (self.write_buffer.active) {
+            try self.write_buffer.updateV1WrapperRenewal(r.namehash, r.wrapper_expiry);
+        } else {
+            try names_storage.updateV1WrapperRenewal(self.database, r.namehash, r.wrapper_expiry);
+        }
+
+        var node_buf: [66]u8 = undefined;
+        const event_data = try std.fmt.allocPrint(self.allocator, "{{\"node\":\"{s}\",\"expiry\":{d}}}", .{
+            r.namehash.toHexBuf(&node_buf),
+            r.wrapper_expiry,
+        });
+        try utils.emitEvent(self, r.protocol, r.log, .expiry_updated, null, r.namehash, event_data);
+    }
+}
 
 /// Returns true when the log came from the legacy pre-2020 ENS Registry
 /// (0x314159…). The legacy registry continues to emit events post-migration
@@ -1516,6 +1563,22 @@ pub fn handleV1ETHControllerNameRenewed(self: *Indexer, protocol: models.Protoco
     // Populate the in-memory label cache
     try self.putCachedV1Label(label_hash_hex, name);
 
+    // A wrapped controller renews through NameWrapper.renew, which moves the wrapper expiry
+    // to `expires` + 90d without emitting anything; this log is the only trace of it.
+    if (isWrappedController(self, log.address)) {
+        const expires_u64: u64 = if (expires > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(expires);
+        const wrapper_expiry = expires_u64 +| NAME_WRAPPER_GRACE_PERIOD;
+        var queued = log;
+        queued.topics = &.{};
+        queued.data = &.{};
+        try self.pending_wrapper_renewals.append(self.allocator, .{
+            .namehash = namehash,
+            .wrapper_expiry = wrapper_expiry,
+            .protocol = protocol,
+            .log = queued,
+        });
+    }
+
     // Intentionally do NOT emit a `.name_renewed` event here. The canonical
     // renewal event is the BaseRegistrar NameRenewed (handled in
     // handleV1BaseRegistrarNameRenewed). The ETH Controller fires its own
@@ -1527,8 +1590,7 @@ pub fn handleV1ETHControllerNameRenewed(self: *Indexer, protocol: models.Protoco
     // because they're load-bearing for label resolution, but we suppress the
     // duplicate event emit. `name` is duped (no longer transferred to
     // emitEvent), so we free it explicitly here. `cost` is consumed by the
-    // debug log above; `protocol` is unused now that we no longer emit.
-    _ = protocol;
+    // debug log above.
     self.allocator.free(name);
 }
 
@@ -1539,7 +1601,8 @@ pub fn handleV1ETHControllerNameRenewed(self: *Indexer, protocol: models.Protoco
 /// — BaseRegistrar NameRenewed remains the canonical source per Phase 4A
 /// dedup. We deliberately do NOT touch registrations.referrer here: the
 /// referrer on a registration is set at mint time and a renewal does not
-/// change the original attribution.
+/// change the original attribution. That controller calls BaseRegistrar.renew
+/// directly, so unlike a wrapped controller it never moves the wrapper expiry.
 pub fn handleV1ETHControllerNameRenewedWithReferrer(self: *Indexer, protocol: models.Protocol, log: rpc.Log) !void {
     if (log.topics.len < 2) {
         std.log.warn("V1 ETH Controller NameRenewed (with referrer) event has unexpected topic count: {d}, skipping", .{log.topics.len});

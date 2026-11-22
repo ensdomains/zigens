@@ -595,7 +595,7 @@ test "mapRow reconstructs an rpc.Log from a real WithRecord row" {
 
 fn collectAddresses(idx: *Indexer, allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) !void {
     const cfg = idx.config.v1_contracts;
-    const fixed = [_]Address{ cfg.ens_registry, cfg.base_registrar, cfg.eth_registrar_controller, cfg.public_resolver, cfg.eth_reverse_registrar };
+    const fixed = [_]Address{ cfg.ens_registry, cfg.base_registrar, cfg.eth_registrar_controller, cfg.wrapped_eth_registrar_controller, cfg.wrapped_eth_registrar_controller_alt, cfg.public_resolver, cfg.eth_reverse_registrar };
     for (fixed) |a| {
         if (a.isZero()) continue;
         try list.append(allocator, try a.toHex(allocator));
@@ -804,6 +804,8 @@ pub fn runCdpBackfill(idx: *Indexer, from_opt: ?u64, to_opt: ?u64) !void {
                 std.log.warn("CDP intake: handler error at block {d} log {d}: {}", .{ mapped.log.block_number, mapped.log.log_index, err });
                 break :blk false;
             }) {
+                // Rows arrive in log order, so a queued wrapper renewal can land at once.
+                try idx.applyPendingWrapperRenewals();
                 processed += 1;
             } else {
                 skipped_unspecced += 1;

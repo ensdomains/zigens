@@ -14,6 +14,7 @@ const models = @import("../types/models.zig");
 const names_storage = @import("../storage/names.zig");
 const v1_names = @import("../utils/v1_names.zig");
 const Indexer = @import("indexer.zig").Indexer;
+const handlers_v1 = @import("v1/handlers.zig");
 const utils = @import("utils.zig");
 const reorg_undo = @import("../storage/reorg_undo.zig");
 const alias_sync = @import("v2/alias_sync.zig");
@@ -271,6 +272,16 @@ fn replayOneEvent(self: *Indexer, q: *Query) !void {
             if (jsonRawValue(data, "node") != null) {
                 try replayExpiryExtended(self, q);
             }
+        }
+        return;
+    }
+
+    // ── Wrapped controller: NameWrapper.renew wrapper expiry ──
+    if (handlers_v1.isWrappedController(self, contract)) {
+        if (models.EventType.fromString(event_type_str) == .expiry_updated) {
+            const node = try Hash.fromHex(jsonString(data, "node") orelse return);
+            const expiry = jsonU64(data, "expiry") orelse return;
+            names_storage.updateV1WrapperRenewal(self.database, node, expiry) catch {};
         }
         return;
     }
@@ -2691,4 +2702,86 @@ test "replayV2RecordsCore rebuilds record-model resolvers (links, values, defaul
     try std.testing.expectEqual(@as(i64, 0), q.getInt64(0));
     try std.testing.expectEqual(@as(?u256, 1), try database.getEffectiveRecordId(resolver, erin));
     try std.testing.expectEqual(@as(?u256, 2), try database.getEffectiveRecordId(resolver, dave));
+}
+
+test "replay applies a wrapped-controller ExpiryUpdated to a wrapped name only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cfg = try @import("../config.zig").Config.fromEnv(allocator);
+    cfg.status_port = null;
+    cfg.webhooks_enabled = false;
+    cfg.v1_contracts = try @import("../contracts.zig").getContractAddresses(.sepolia);
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    var database = try db_module.Database.init(allocator, ":memory:");
+    defer database.deinit();
+    var idx = try Indexer.init(allocator, threaded.io(), cfg, &database, null);
+    defer idx.deinit();
+
+    const seed = struct {
+        fn go(ix: *Indexer, a: std.mem.Allocator, label: []const u8, wrapped: bool) !Hash {
+            const full = try std.fmt.allocPrint(a, "{s}.eth", .{label});
+            const nh = try hash_mod2.namehash(a, full);
+            try ix.insertName(.{
+                .name = full,
+                .label = label,
+                .label_hash = v1_names.computeLabelHash(label),
+                .parent_name = "eth",
+                .parent_namehash = ix.eth_namehash,
+                .protocol = .v1,
+                .registry = Address.zero,
+                .owner = Address.zero,
+                .registrant = Address.zero,
+                .resolver = Address.zero,
+                .token_id = 0,
+                .canonical_id = 0,
+                .token_version = 0,
+                .namehash = nh,
+                .expiry = 1_753_518_960,
+                .registry_locked = false,
+                .migrated = false,
+                .created_block = 100,
+                .created_at = 1_690_405_056,
+                .registered_at = 1_690_405_056,
+                .updated_block = 100,
+                .updated_at = 1_690_405_056,
+                .is_wrapped = wrapped,
+                .wrapper_fuses = if (wrapped) "196608" else null,
+                .wrapper_expiry = if (wrapped) 1_761_294_960 else null,
+                .is_v1_name = true,
+                .v1_label_hash = null,
+            });
+            return nh;
+        }
+    }.go;
+    const wrapped_nh = try seed(&idx, allocator, "test", true);
+    const plain_nh = try seed(&idx, allocator, "plain", false);
+
+    for ([_]Hash{ wrapped_nh, plain_nh }, 0..) |nh, i| {
+        var node_buf: [66]u8 = undefined;
+        try @import("../storage/events.zig").insertEvent(&database, .{
+            .event_type = .expiry_updated,
+            .protocol = .v1,
+            .block_number = 500,
+            .tx_hash = Hash.zero,
+            .log_index = @intCast(i),
+            .contract_address = cfg.v1_contracts.wrapped_eth_registrar_controller,
+            .name = null,
+            .namehash = nh,
+            .data = try std.fmt.allocPrint(allocator, "{{\"node\":\"{s}\",\"expiry\":2015726758}}", .{nh.toHexBuf(&node_buf)}),
+            .timestamp = 1000,
+        });
+    }
+
+    var q = try Query.init(&database, REPLAY_SQL);
+    defer q.deinit();
+    while (try q.step()) try replayOneEvent(&idx, &q);
+
+    var wrapped_row = (try database.getNameByNamehashAndProtocol(wrapped_nh, .v1)).?;
+    defer wrapped_row.deinit(database.allocator);
+    try std.testing.expectEqual(@as(?i64, 2_015_726_758), wrapped_row.wrapper_expiry);
+    var plain_row = (try database.getNameByNamehashAndProtocol(plain_nh, .v1)).?;
+    defer plain_row.deinit(database.allocator);
+    try std.testing.expectEqual(@as(?i64, null), plain_row.wrapper_expiry);
 }

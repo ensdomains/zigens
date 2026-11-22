@@ -7,6 +7,7 @@
 /// Event, Registration, Domain, Account, Resolver, etc.
 const std = @import("std");
 const models = @import("../types/models.zig");
+const zsys = @import("../utils/system.zig");
 const Address = @import("../types/address.zig").Address;
 const Hash = @import("../types/hash.zig").Hash;
 const keccak256 = @import("../types/hash.zig").keccak256;
@@ -526,6 +527,73 @@ test "effectiveDomainExpiry: grace only for unwrapped V1 .eth 2LDs" {
     try std.testing.expectEqual(@as(i64, 0), effectiveDomainExpiry(Probe{ .expiry = 0, .protocol = .v1, .parent_name = "eth", .is_wrapped = false }));
 }
 
+/// NameWrapper fuse PARENT_CANNOT_CONTROL (an emancipated name).
+pub const PARENT_CANNOT_CONTROL: u64 = 0x10000;
+
+fn wrapperLapsed(name: anytype, now: i64) bool {
+    if (!name.is_wrapped) return false;
+    const exp = name.wrapper_expiry orelse return false;
+    return exp < now;
+}
+
+fn storedWrapperFuses(name: anytype) ?u64 {
+    const s = name.wrapper_fuses orelse return null;
+    return std.fmt.parseInt(u64, s, 10) catch null;
+}
+
+/// Fuses as NameWrapper.getData reports them: 0 once the wrapper expiry has passed.
+pub fn effectiveWrapperFuses(name: anytype, now: i64) ?u64 {
+    const fuses = storedWrapperFuses(name) orelse return null;
+    return if (wrapperLapsed(name, now)) 0 else fuses;
+}
+
+/// NameWrapper.getData/ownerOf return no owner for an emancipated name whose wrapper
+/// expiry has passed, even while its registrar lease runs. The stored owner is kept:
+/// NameWrapper.renew brings it back.
+pub fn wrappedOwnerCleared(name: anytype, now: i64) bool {
+    if (!wrapperLapsed(name, now)) return false;
+    const fuses = storedWrapperFuses(name) orelse return false;
+    return fuses & PARENT_CANNOT_CONTROL != 0;
+}
+
+/// Domain owner as NameWrapper.ownerOf reports it.
+pub fn effectiveOwner(name: anytype, now: i64) Address {
+    return if (wrappedOwnerCleared(name, now)) Address.zero else name.owner;
+}
+
+test "wrapper view: lapsed emancipated name has no owner and no fuses" {
+    const Probe = struct {
+        owner: Address,
+        is_wrapped: bool,
+        wrapper_fuses: ?[]const u8,
+        wrapper_expiry: ?i64,
+    };
+    const owner = Address{ .bytes = [_]u8{0x42} ** 20 };
+    const now: i64 = 1_795_000_000;
+
+    // furyan.eth on Sepolia: emancipated, wrapper lapsed at 1765291236.
+    const lapsed = Probe{ .owner = owner, .is_wrapped = true, .wrapper_fuses = "196608", .wrapper_expiry = 1_765_291_236 };
+    try std.testing.expect(wrappedOwnerCleared(lapsed, now));
+    try std.testing.expect(effectiveOwner(lapsed, now).eql(Address.zero));
+    try std.testing.expectEqual(@as(?u64, 0), effectiveWrapperFuses(lapsed, now));
+
+    // test.eth on Sepolia: emancipated, wrapper renewed to 2015726758.
+    const live = Probe{ .owner = owner, .is_wrapped = true, .wrapper_fuses = "196608", .wrapper_expiry = 2_015_726_758 };
+    try std.testing.expect(!wrappedOwnerCleared(live, now));
+    try std.testing.expect(effectiveOwner(live, now).eql(owner));
+    try std.testing.expectEqual(@as(?u64, 196608), effectiveWrapperFuses(live, now));
+
+    // Lapsed without PARENT_CANNOT_CONTROL: fuses clear, owner stays.
+    const not_emancipated = Probe{ .owner = owner, .is_wrapped = true, .wrapper_fuses = "131072", .wrapper_expiry = 1_765_291_236 };
+    try std.testing.expect(effectiveOwner(not_emancipated, now).eql(owner));
+    try std.testing.expectEqual(@as(?u64, 0), effectiveWrapperFuses(not_emancipated, now));
+
+    // Unwrapped rows are untouched.
+    const unwrapped = Probe{ .owner = owner, .is_wrapped = false, .wrapper_fuses = null, .wrapper_expiry = null };
+    try std.testing.expect(effectiveOwner(unwrapped, now).eql(owner));
+    try std.testing.expectEqual(@as(?u64, null), effectiveWrapperFuses(unwrapped, now));
+}
+
 // ============================================================================
 // DOMAIN BUILD FIELD DEFINITIONS (for json_builder)
 // ============================================================================
@@ -603,11 +671,8 @@ fn getDomainIsWrapped(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue
 /// Parse on read; return .none on null or parse error.
 fn getDomainFuses(ctx: *anyopaque, _: std.mem.Allocator) anyerror!FieldValue {
     const name = getNameCtx(ctx);
-    if (name.wrapper_fuses) |fuses_str| {
-        const parsed = std.fmt.parseInt(u64, fuses_str, 10) catch return FieldValue{ .none = {} };
-        return FieldValue{ .int = @intCast(parsed) };
-    }
-    return FieldValue{ .none = {} };
+    const fuses = effectiveWrapperFuses(name.*, zsys.timestamp()) orelse return FieldValue{ .none = {} };
+    return FieldValue{ .int = @intCast(fuses) };
 }
 
 /// Get domain wrapperExpiry (V1 NameWrapper expiry timestamp)

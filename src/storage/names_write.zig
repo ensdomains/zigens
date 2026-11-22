@@ -637,6 +637,30 @@ pub fn updateNameWrapperExpiry(db: *Database, namehash: Hash, expiry: u64) !void
     db.noteNameWriteByNamehash(namehash);
 }
 
+/// Wrapper expiry from NameWrapper.renew, which a wrapped ETHRegistrarController calls and
+/// which emits no NameWrapper event. On chain it is a no-op for unwrapped names, and a .eth
+/// 2LD's wrapper expiry never decreases while wrapped, so only wrapped rows are touched and
+/// the value only moves up. That also keeps it correct when applied after a NameWrapped
+/// that came earlier in the same chunk.
+pub fn updateV1WrapperRenewal(db: *Database, namehash: Hash, wrapper_expiry: u64) !void {
+    try db.namesBarrier();
+    try reorg_undo.captureWhere(db, "names", "U", "namehash = ? AND protocol = 'v1'", .{namehash});
+    var q = try Query.initCached(db,
+        \\UPDATE names SET wrapper_expiry = ?, updated_at = ?
+        \\WHERE namehash = ? AND protocol = 'v1' AND is_wrapped = 1
+        \\  AND (wrapper_expiry IS NULL OR wrapper_expiry < ?)
+    );
+    defer q.deinit();
+
+    const v = safeU64ToI64(wrapper_expiry);
+    try q.bindInt64(v);
+    try q.bindInt64(zsys.timestamp());
+    try q.bindHash(namehash);
+    try q.bindInt64(v);
+    try q.exec();
+    db.noteNameWriteByNamehash(namehash);
+}
+
 /// PCC-aware Domain expiry mirror. Subgraph parity: when the wrapped name's
 /// PARENT_CANNOT_CONTROL fuse is burned, the wrapper expiry IS the canonical
 /// Domain expiry — mirror it (max with existing) so `Domain.expiryDate` returns
@@ -680,7 +704,7 @@ pub fn updateDomainExpiryIfGreater(db: *Database, namehash: Hash, new_expiry: i6
 ///   handles updates directly (write_buffer is inactive).
 ///
 /// SQL safety:
-/// - `CAST(wrapper_fuses AS INTEGER)` returns 0 for null/non-numeric strings, so
+/// - `CAST(wrapper_fuses AS BIGINT)` returns 0 for null/non-numeric strings, so
 ///   the AND check naturally short-circuits. Combined with the explicit IS NOT
 ///   NULL guards, this avoids touching unrelated rows.
 /// - `wrapper_expiry > COALESCE(expiry, 0)` ensures we never lower Domain.expiry.
@@ -688,7 +712,7 @@ pub fn updateDomainExpiryIfGreater(db: *Database, namehash: Hash, new_expiry: i6
 pub fn materializePccDomainExpiry(db: *Database) !u32 {
     try db.namesBarrier();
     const PARENT_CANNOT_CONTROL: i64 = 0x10000;
-    try reorg_undo.captureWhere(db, "names", "U", "is_wrapped = 1 AND wrapper_expiry IS NOT NULL AND wrapper_fuses IS NOT NULL AND wrapper_fuses != '' AND (CAST(wrapper_fuses AS INTEGER) & ?) != 0 AND wrapper_expiry > COALESCE(expiry, 0)", .{PARENT_CANNOT_CONTROL});
+    try reorg_undo.captureWhere(db, "names", "U", "is_wrapped = 1 AND wrapper_expiry IS NOT NULL AND wrapper_fuses IS NOT NULL AND wrapper_fuses != '' AND (CAST(wrapper_fuses AS BIGINT) & ?) != 0 AND wrapper_expiry > COALESCE(expiry, 0)", .{PARENT_CANNOT_CONTROL});
     var q = try Query.init(db,
         \\UPDATE names
         \\SET expiry = wrapper_expiry,
@@ -697,7 +721,7 @@ pub fn materializePccDomainExpiry(db: *Database) !u32 {
         \\  AND wrapper_expiry IS NOT NULL
         \\  AND wrapper_fuses IS NOT NULL
         \\  AND wrapper_fuses != ''
-        \\  AND (CAST(wrapper_fuses AS INTEGER) & ?) != 0
+        \\  AND (CAST(wrapper_fuses AS BIGINT) & ?) != 0
         \\  AND wrapper_expiry > COALESCE(expiry, 0)
     );
     defer q.deinit();

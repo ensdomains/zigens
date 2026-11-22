@@ -179,6 +179,9 @@ pub const WriteBuffer = struct {
         /// Individual wrapper field updates
         fuses_update: ?u32 = null,
         wrapper_expiry_update: ?u64 = null,
+        /// NameWrapper.renew via a wrapped controller; flushed last, through the guarded
+        /// names_storage.updateV1WrapperRenewal.
+        wrapper_renewal: ?u64 = null,
         /// Set when a V1 token is transferred to a migration controller. Carries
         /// the new owner (the controller address) so the flush can apply both
         /// `owner=controller` and `migrated=true` in a single statement.
@@ -503,6 +506,36 @@ pub const WriteBuffer = struct {
         }
     }
 
+    /// Wrapped state of a V1 name as the buffered updates leave it; null when this
+    /// chunk has not touched it, so the DB row is current.
+    pub fn bufferedWrapped(self: *const WriteBuffer, namehash: Hash) ?bool {
+        const bn = self.names.getPtr(nameKey(.v1, namehash)) orelse return null;
+        if (bn.is_new) return bn.record.?.is_wrapped;
+        if (bn.unwrap) return false;
+        if (bn.wrapper_state != null) return true;
+        return null;
+    }
+
+    /// Buffer a NameWrapper.renew wrapper expiry. Same guard as
+    /// names_storage.updateV1WrapperRenewal: wrapped rows only, never lowered.
+    pub fn updateV1WrapperRenewal(self: *WriteBuffer, namehash: Hash, wrapper_expiry: u64) !void {
+        const key = nameKey(.v1, namehash);
+        const gop = try self.names.getOrPut(key);
+        const v = safeU64ToI64(wrapper_expiry);
+
+        if (gop.found_existing) {
+            if (gop.value_ptr.is_new) {
+                const rec = &gop.value_ptr.record.?;
+                if (rec.is_wrapped and (rec.wrapper_expiry == null or rec.wrapper_expiry.? < v)) rec.wrapper_expiry = v;
+            } else {
+                const prev = gop.value_ptr.wrapper_renewal orelse 0;
+                gop.value_ptr.wrapper_renewal = @max(prev, wrapper_expiry);
+            }
+        } else {
+            gop.value_ptr.* = .{ .is_new = false, .wrapper_renewal = wrapper_expiry };
+        }
+    }
+
     // ========================================================================
     // EVENT OPERATIONS
     // ========================================================================
@@ -777,7 +810,7 @@ pub const WriteBuffer = struct {
                 const key_protocol = entry.key_ptr.protocol;
                 const address_only = bn.migrated_to == null and bn.expiry == null and bn.wrapper_state == null and
                     !bn.unwrap and bn.fuses_update == null and bn.wrapper_expiry_update == null and
-                    (bn.owner != null or bn.resolver != null);
+                    bn.wrapper_renewal == null and (bn.owner != null or bn.resolver != null);
                 if (address_only) {
                     if (bn.owner) |owner| try owner_rows.append(self.allocator, .{ .namehash = namehash, .value = owner });
                     if (bn.resolver) |resolver| try resolver_rows.append(self.allocator, .{ .namehash = namehash, .value = resolver });
@@ -835,6 +868,12 @@ pub const WriteBuffer = struct {
                 if (bn.wrapper_expiry_update) |exp| {
                     const t0 = zsys.nanoTimestamp();
                     try names_storage.updateNameWrapperExpiry(db, namehash, exp);
+                    op_ns[7] += zsys.nanoTimestamp() - t0;
+                    op_count[7] += 1;
+                }
+                if (bn.wrapper_renewal) |exp| {
+                    const t0 = zsys.nanoTimestamp();
+                    try names_storage.updateV1WrapperRenewal(db, namehash, exp);
                     op_ns[7] += zsys.nanoTimestamp() - t0;
                     op_count[7] += 1;
                 }

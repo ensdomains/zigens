@@ -310,15 +310,31 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
             var controller_addrs_heap: ?[]Address = null;
             defer if (controller_addrs_heap) |h| self.allocator.free(h);
 
-            if (active_controllers.len == 0) {
-                // Fallback to config
-                const fallback = try self.allocator.alloc(Address, 1);
-                fallback[0] = self.config.v1_contracts.eth_registrar_controller;
-                controller_addrs_heap = fallback;
-                controller_addrs = fallback;
-                std.log.warn("No active V1 controllers found in database - using config fallback", .{});
-            } else {
-                controller_addrs = active_controllers;
+            {
+                // Wrapped controllers are NameWrapper controllers, so ControllerAdded never
+                // discovers them; their NameRenewed is the only trace of a wrapper renewal.
+                const wrapped = [_]Address{
+                    self.config.v1_contracts.wrapped_eth_registrar_controller,
+                    self.config.v1_contracts.wrapped_eth_registrar_controller_alt,
+                };
+                var addrs: std.ArrayList(Address) = .empty;
+                errdefer addrs.deinit(self.allocator);
+                if (active_controllers.len == 0) {
+                    try addrs.append(self.allocator, self.config.v1_contracts.eth_registrar_controller);
+                    std.log.warn("No active V1 controllers found in database - using config fallback", .{});
+                } else {
+                    try addrs.appendSlice(self.allocator, active_controllers);
+                }
+                for (wrapped) |w| {
+                    if (w.isZero()) continue;
+                    const dup = for (addrs.items) |a| {
+                        if (a.eql(w)) break true;
+                    } else false;
+                    if (!dup) try addrs.append(self.allocator, w);
+                }
+                const owned = try addrs.toOwnedSlice(self.allocator);
+                controller_addrs_heap = owned;
+                controller_addrs = owned;
             }
 
             var requests = try self.allocator.alloc(rpc.Client.MultiAddressLogsRequest, num_requests);
@@ -416,6 +432,7 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
             errdefer {
                 self.write_buffer.active = false;
                 self.write_buffer.reset();
+                self.pending_wrapper_renewals.clearRetainingCapacity();
             }
 
             // Process results in required order, dispatching by topic[0]
@@ -514,6 +531,7 @@ pub fn indexAllV1Events(self: *Indexer, protocol: models.Protocol, client: *rpc.
                 }
                 wrapper_elapsed = zsys.milliTimestamp() - wrapper_timer;
             }
+            try self.applyPendingWrapperRenewals();
 
             // 5. Reverse Registrar events
             const reverse_idx: usize = if (include_name_wrapper) 4 else 3;
